@@ -24,19 +24,18 @@
 //! starts its first block with an endpoint of -128, which reads -1: the one hand-placed byte the
 //! lane uses, kept.
 //!
-//! A device whose driver is not measured to decode a format as Metal does reads it through the
-//! texture's decoded twin and announces `decoded-block-twin` once, which the case allows by naming
-//! that code. It does **not** allow `compressed-texel-decode`: the lane asserts no BC1 to BC5
-//! texture announces it, so a run that does is a divergence this case reports rather than excuses.
-//! That still holds for **this** family's rows -- neither an RTX 5080 Laptop nor llvmpipe
-//! announced it for any of the ten -- but it is a claim about a texture these cases read, not
-//! about BC4 and BC5 everywhere: a **view** of a BC4 or BC5 carrier announces it on both of those
-//! drivers, and `super::compressed_views` declares it for exactly those four rows.
+//! **The device's decode is the answer.** A BC texture keeps no decoded twin: every device samples
+//! its own BC image through its own decode, and one whose driver is not measured to decode a
+//! format as Metal does announces `compressed-texel-decode`, one of the device's native answers the
+//! suite declares for every case ([`crate::replay::NATIVE_NOTES`]). Like every native note it
+//! loosens no value, so where such a device's texels differ from Metal's the site is a
+//! `known-gaps.tsv` row of that venue naming the note and whether its stated bound covers the
+//! difference. On MoltenVK, whose driver has both facts, every texel compares exactly.
 //!
 //! Nothing here can fault a GPU: one compute pass a round, one read-only texture, one buffer, one
 //! thread a texel inside the texture, no loop and no sampling.
 
-use crate::allowance::{Allowance, Justification, Loosening};
+use crate::allowance::Allowance;
 use crate::case::{call, made, Abort, Bindings, Case, Failure, Input, MetalSource, Side};
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
@@ -45,7 +44,6 @@ use crate::transcript::{
     Aspect, ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value,
 };
 use metal2vulkan::metal::PixelFormat;
-use metal2vulkan_runtime::Degradation;
 
 /// The fixture whose kernel reads a texture's texels as floats.
 const FIXTURE: &str = "format_scout";
@@ -64,11 +62,6 @@ const TEXEL_BYTES: usize = 16;
 
 /// The textures read per format, as the lane reads them.
 const ROUNDS: u64 = 4;
-
-/// The bound `docs/FAST-PATHS.md` states for `texel_conversion = TexelConversionPolicy::Device`:
-/// one `f32` ulp for 8- and 16-bit codes. It is the ledger's number, copied here so a run that
-/// exceeds it fails rather than being re-fitted to whatever a device answers.
-const LEDGERS_TEXEL_CONVERSION_ULPS: u32 = 1;
 
 /// How Metal decodes a format's block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,25 +270,13 @@ impl Case for CompressedDecode {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        // A driver not measured to decode this format as Metal does reads it through the texture's
-        // decoded twin, which the runtime announces once per device. The texels themselves still
-        // compare exactly: the only site loosened is the set of notices, which Metal holds empty,
-        // and the allowance fails the case if the notice did not fire. `compressed-texel-decode`
-        // is deliberately absent — the lane asserts no BC1 to BC5 texture announces it, so a run
-        // that does is a divergence to report rather than one to excuse.
-        // Under the default policy a texel's `float` value is the device's conversion of the
-        // twin's 8-bit codes, not Metal's exact one, which the runtime announces as
-        // `device-texel-conversion`. `docs/FAST-PATHS.md`'s row for
-        // `texel_conversion = TexelConversionPolicy::Device` bounds that at one `f32` ulp for 8-
-        // and 16-bit codes, so the bound here is the ledger's number and not a measurement of
-        // this chip: a run that exceeds one ulp is the ledger's claim failing, which is what this
-        // allowance exists to catch. Under `TexelConversionPolicy::Exact` the notice does not
-        // fire, the justification does not hold, and every texel is compared exactly.
-        // A CPU copy that fills such a texture (`replaceRegion`) is decoded on the CPU into that
-        // twin and copied in, announced as `cpu-block-decode`: the host-copy arm of the very
-        // mechanism the line above names, measured on lavapipe for every format of this family. It
-        // is a declaration and not a tolerance -- every texel the case reads still compares
-        // exactly with Metal.
+        // A driver not measured to decode this format as Metal does reads the device's decode of
+        // the texture's own BC image, announced `compressed-texel-decode`, and a texel's `float`
+        // value is the device's conversion of its decoded codes, announced
+        // `device-texel-conversion`: both native notes the suite declares for every case. They
+        // loosen no texel, and a texel they move is a `known-gaps.tsv` row of the venue. On a
+        // device whose sampler is Metal's neither fires, and every texel compares exactly there
+        // too.
         // Every row reads its answer back through a `Shared` buffer, so on a device without
         // unified memory the runtime announces `shared-in-system-memory`
         // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
@@ -307,19 +288,7 @@ impl Case for CompressedDecode {
         // nothing else (replay-nvidia.log). On MoltenVK, where
         // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
         // recording of this suite declares it.
-        let mut all = vec![
-            crate::replay::shared_memory_notice(),
-            crate::replay::notice_allowance(Degradation::DecodedBlockTwin.code()),
-            crate::replay::notice_allowance(Degradation::CpuBlockDecode.code()),
-        ];
-        for round in 0..ROUNDS {
-            all.push(Allowance::new(
-                format!("case/round/{round}/texels"),
-                Loosening::Ulps(LEDGERS_TEXEL_CONVERSION_ULPS),
-                Justification::Degradation(Degradation::DeviceTexelConversion.code().to_owned()),
-            ));
-        }
-        all
+        vec![crate::replay::shared_memory_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

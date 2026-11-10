@@ -61,11 +61,8 @@
 //!   entry is the null entry, and every id resolves as [`lookup_host`] says. A texture no member
 //!   names misses. A member's flags are [`FLAG_OUT_OF_BOUNDS_ALPHA_ONE`] where its pixel format
 //!   has no alpha (`metal::format::out_of_bounds_alpha_one`): a module whose shader-checked heap
-//!   read observes the alpha takes Metal's out-of-bounds alpha from it; and its depth class
-//!   ([`depth_flags`]), [`FLAG_DEPTH_CODES`] for `Depth16Unorm` and [`FLAG_DEPTH_VALUES`] for
-//!   `Depth32Float` and `Depth32Float_Stencil8`: a module whose heap depth comparison the shader
-//!   makes compares as Metal does where one is set, and leaves the comparison to the device
-//!   elsewhere. Every other bit is 0.
+//!   read observes the alpha takes Metal's out-of-bounds alpha from it; and its texel class in
+//!   [`FLAG_TEXEL_CLASS`]. Every other bit is 0.
 //! - **Heap samplers**. A heap image is sampled through a separate sampler binding
 //!   (`BindingSource::HeapSampler`) in set 0: a constexpr sampler is the layout's immutable sampler
 //!   and takes no write; a runtime `[[sampler(n)]]` is written with the sampler bound at slot `n`
@@ -140,9 +137,9 @@ use crate::device::requirements::FormatUsage;
 use crate::device::DeviceProfile;
 use crate::error::{BindError, Feature, Unsupported};
 use crate::memory::handles::{
-    lookup_host, ENTRY_ELEMENT, ENTRY_FLAGS, ENTRY_ID_HI, ENTRY_ID_LO, FLAG_DEPTH_CODES,
-    FLAG_DEPTH_VALUES, FLAG_OUT_OF_BOUNDS_ALPHA_ONE, FLAG_TEXEL_CLASS, NEUTRAL_ELEMENT,
-    TABLE_CAPACITY, TABLE_ENTRY_BYTES,
+    lookup_host, ENTRY_ELEMENT, ENTRY_FLAGS, ENTRY_ID_HI, ENTRY_ID_LO,
+    FLAG_OUT_OF_BOUNDS_ALPHA_ONE, FLAG_TEXEL_CLASS, NEUTRAL_ELEMENT, TABLE_CAPACITY,
+    TABLE_ENTRY_BYTES,
 };
 use crate::metal::format::{
     is_depth_stencil, sampled_type, storage_choice, vk_format, without_format_gaps, StorageUse,
@@ -158,7 +155,7 @@ use crate::pipeline::layout::{BindingSource, DescriptorBinding, PipelineLayout};
 use crate::pipeline::lower_inputs::StorageImageClass;
 use crate::pipeline::sym::{
     CombinedSampler, HandleClass, ImageAccess, ImageDim, ImageHandleClass, SampledType, SamplerRef,
-    SlotClass, SlotRef, Stage, StorageFormatClass, SyntheticBinding,
+    SlotClass, SlotRef, Stage, SyntheticBinding,
 };
 use crate::vk;
 
@@ -172,7 +169,7 @@ pub enum HeapSource {
 
 /// Every heap array class of `profile`, sorted and distinct: the image classes the core can declare
 /// there, then the sampler classes of every use (with comparison or without, of an integer texture
-/// or not, for a cube's explicit gradients or not).
+/// or not).
 pub fn heap_classes(profile: &DeviceProfile) -> Vec<HandleClass> {
     let mut out: Vec<HandleClass> = image_classes(profile)
         .into_iter()
@@ -180,13 +177,7 @@ pub fn heap_classes(profile: &DeviceProfile) -> Vec<HandleClass> {
         .collect();
     for compare in [false, true] {
         for integer in [false, true] {
-            for cube_gradient in [false, true] {
-                out.push(HandleClass::Sampler {
-                    compare,
-                    integer,
-                    cube_gradient,
-                });
-            }
+            out.push(HandleClass::Sampler { compare, integer });
         }
     }
     out.sort();
@@ -274,14 +265,6 @@ pub(crate) fn fit(shape: &TextureShape, class: &ImageHandleClass) -> Fit {
         && (!class.depth_compare || is_depth_stencil(pixel_format))
         && usage.intersects(needs)
         && !(storage && is_depth_stencil(pixel_format));
-    // A float storage group's unsigned integer twin holds exactly the half-float members whose
-    // handles name it ([`half_bits_held`]); every other texture is another class's.
-    if class.format == StorageFormatClass::HalfBits {
-        return match shaped && half_bits_held(shape) {
-            true => Fit::Holds,
-            false => Fit::No,
-        };
-    }
     // A resident texture of a format the table holds no representation of (ASTC's 4x2 and 8x4
     // footprints) fits no class: its element is the neutral, and nothing is refused, since the heap
     // does not know which of its textures the function reads.
@@ -298,56 +281,6 @@ pub(crate) fn fit(shape: &TextureShape, class: &ImageHandleClass) -> Fit {
         Some(_) => Fit::NumericType,
         None => Fit::No,
     }
-}
-
-/// Whether a member of facts `shape` is a texture whose `half` bits a heap write stores through
-/// the unsigned integer twin (`StorageFormatClass::HalfBits`): a texture of
-/// `metal::texel_format::HALF_BITS_FORMATS` that reads unswizzled and whose image takes views in
-/// other formats, whose handle carries its own class (one of `heap_half_bits_indices`). One whose
-/// image takes no view in another format (`TextureFacts::own_format_views`) carries its own-view
-/// index ([`handle_entry_flags`]) and is written through the float class, as before.
-fn half_bits_held(shape: &TextureShape) -> bool {
-    match *shape {
-        TextureShape::Texture {
-            pixel_format,
-            swizzle,
-            own_format_views,
-            ..
-        } => {
-            !own_format_views
-                && crate::metal::texel_format::HALF_BITS_FORMATS.contains(&pixel_format)
-                && crate::metal::texel_format::reads_unswizzled(pixel_format, swizzle)
-        }
-        TextureShape::Buffer { .. } => false,
-    }
-}
-
-/// Whether a write through a heap handle of a function that states
-/// `RuntimeFact::HeapHalfTexelWrites { packed, .. }` stores the device's conversion of a NaN in a
-/// texture of `facts`, not Metal's: a writable (`ShaderWrite` or `BlockWritesOnly`) texture of
-/// `R16Float`, `RG16Float` or `RGBA16Float` that the unsigned integer twin does not hold (a
-/// swizzled one, or one whose image takes no view in another format,
-/// [`TextureFacts::own_format_views`]), and where `packed` a writable `RG11B10Float` or
-/// `RGB9E5Float` one, whose canonical NaN the device converts. Every other texture stores
-/// Metal's answer or is no storage member. A consumer announces
-/// `PrecisionNote::DeviceNanEncoding` at a draw or dispatch of such a function whose heap holds
-/// such a texture.
-pub fn heap_write_nans_converted(facts: &TextureFacts, packed: bool) -> bool {
-    let shape = facts.shape();
-    let TextureShape::Texture {
-        pixel_format,
-        usage,
-        ..
-    } = shape
-    else {
-        return false;
-    };
-    let writable = usage
-        .intersects(metal::TextureUsage::SHADER_WRITE | metal::TextureUsage::BLOCK_WRITES_ONLY);
-    let half = crate::metal::texel_format::HALF_BITS_FORMATS.contains(&pixel_format);
-    let small = !crate::metal::texel_format::half_channels(pixel_format)
-        && crate::metal::format::half_write_nans_converted(pixel_format);
-    writable && ((half && !half_bits_held(&shape)) || (packed && small))
 }
 
 /// Whether a member of facts `shape` is a texture a heap reads by its raw texels: an unswizzled,
@@ -400,12 +333,7 @@ fn member_view(
     class: &ImageHandleClass,
     layout: vk::ImageLayout,
 ) -> Result<ImageViewDesc, BindError> {
-    let TextureShape::Texture {
-        pixel_format,
-        depth_twin,
-        ..
-    } = *shape
-    else {
+    let TextureShape::Texture { pixel_format, .. } = *shape else {
         return Err(internal("a texture-buffer heap member"));
     };
     let raw = raw_held(shape)
@@ -416,45 +344,15 @@ fn member_view(
             Feature::ArgumentBufferTextures,
         )));
     }
-    // The twin holds the member through its unsigned integer alias, which the device writes
-    // without a format.
-    if class.format == StorageFormatClass::HalfBits {
-        let Some(format) = crate::metal::format::heap_half_bits_view(pixel_format, profile) else {
-            return Err(BindError::Unsupported(Unsupported::not_implemented(
-                Feature::ArgumentBufferTextures,
-            )));
-        };
-        return Ok(ImageViewDesc {
-            view_type: view_type(class)?,
-            format,
-            aspect: vk::ImageAspectFlags::COLOR,
-            layout,
-            components: vk::ComponentMapping::IDENTITY,
-            level: None,
-            twin: false,
-            shader_swizzle: false,
-        });
-    }
     if class.access == ImageAccess::Storage {
         // The class does not say which accesses the function makes, so the member serves
         // every access the device lets a heap make.
         let use_ = heap_storage_use(profile);
         let c = storage_choice(pixel_format, use_, profile).map_err(bind_error)?;
-        // The class's one formatless declaration cannot convert per element, but for a
-        // half-float format's rounding, which a heap write takes from the class its handle
-        // carries: such a member is viewed through its own format.
-        let per_element = matches!(
-            c.class,
-            StorageImageClass::Identity
-                | StorageImageClass::HalfTowardZero
-                | StorageImageClass::HalfQuietNan
-                | StorageImageClass::SmallFloatQuietNan
-                | StorageImageClass::OneBitAlpha
-                | StorageImageClass::HalfBits
-        );
-        // A half-float member's writes take the class its handle carries, as before: the alias
-        // a slot only written takes (`StorageImageClass::HalfBits`) is a slot's alone.
-        let aliased = c.alias.is_some() && c.class != StorageImageClass::HalfBits;
+        // The class's one formatless declaration cannot convert per element: a member is viewed
+        // through its own format.
+        let per_element = c.class == StorageImageClass::Identity;
+        let aliased = c.alias.is_some();
         // An `A8Unorm` texture held in red (`StorageImageClass::AlphaInRed`): its `R8_UNORM`
         // image, whose texels a heap access converts where the handle carries `A8Unorm`'s class
         // (`metal::texel_format::heap_alpha_in_red_index`), which a swizzle that moves its alpha
@@ -494,11 +392,10 @@ fn member_view(
             layout,
             components: vk::ComponentMapping::IDENTITY,
             level: None,
-            twin: false,
             shader_swizzle: false,
         });
     }
-    let mut view = sampled_view(profile, pixel_format, class, depth_twin)?;
+    let mut view = sampled_view(profile, pixel_format, class)?;
     view.layout = layout;
     Ok(view)
 }
@@ -550,16 +447,10 @@ pub fn heap_element(
 
 /// The flags word of the handle-table entry of a texture of `facts`, for [`handle_entry`]: bit 1
 /// where its pixel format has no alpha, so a shader-checked read past the texture takes Metal's
-/// out-of-bounds alpha of 1; bit 2 for `Depth16Unorm`, whose depth comparison the shader makes on
-/// codes, and bit 3 for `Depth32Float` and `Depth32Float_Stencil8`, whose comparison it makes on
-/// values; bits 16 to 28 the index of the texture's texel class
+/// out-of-bounds alpha of 1; bits 16 to 28 the index of the texture's texel class
 /// (`metal::texel_format::heap_class_index` of its pixel format and swizzle), by which the shader
 /// emulates Metal's linear filter of the texture's texels, 0 for a swizzled texture; every other
-/// bit 0. A writable half-float texture whose image takes no view in another format
-/// ([`TextureFacts::own_format_views`]) carries its class's own-view index
-/// (`metal::texel_format::heap_own_view_index`), so a heap write reaches it through the float
-/// class and not the unsigned integer twin, which cannot view it. A caller passes the word
-/// through as is.
+/// bit 0. A caller passes the word through as is.
 pub fn handle_entry_flags(facts: &TextureFacts) -> u32 {
     entry_flags(&facts.shape())
 }
@@ -572,23 +463,9 @@ fn entry_flags(shape: &TextureShape) -> u32 {
         Some(true) => FLAG_OUT_OF_BOUNDS_ALPHA_ONE,
         _ => 0,
     };
-    let own_view = match *shape {
-        TextureShape::Texture {
-            usage,
-            own_format_views: true,
-            ..
-        } if usage.intersects(
-            metal::TextureUsage::SHADER_WRITE | metal::TextureUsage::BLOCK_WRITES_ONLY,
-        ) =>
-        {
-            crate::metal::texel_format::heap_own_view_index(pixel_format, swizzle)
-        }
-        _ => None,
-    };
-    let index = own_view
-        .unwrap_or_else(|| crate::metal::texel_format::heap_class_index(pixel_format, swizzle));
+    let index = crate::metal::texel_format::heap_class_index(pixel_format, swizzle);
     let class = index << FLAG_TEXEL_CLASS.trailing_zeros();
-    alpha | depth_flags(pixel_format) | (class & FLAG_TEXEL_CLASS)
+    alpha | (class & FLAG_TEXEL_CLASS)
 }
 
 /// The bytes of one handle-table entry (the module docs' **Tables**): resource ID `id` at heap
@@ -1263,14 +1140,10 @@ impl<'a> HeapPlanner<'a> {
         }
         let image = match class {
             HandleClass::Image(image) => image,
-            // The array's `VkSampler`s are made for its use: the comparison, the texel class, and
-            // a cube's explicit gradients in the isotropic form, which makes a listed anisotropic
-            // state isotropic.
-            HandleClass::Sampler {
-                compare,
-                integer,
-                cube_gradient,
-            } => return self.sampler_array(set, b, (compare, integer, cube_gradient)),
+            // The array's `VkSampler`s are made for its use: the comparison and the texel class.
+            HandleClass::Sampler { compare, integer } => {
+                return self.sampler_array(set, b, (compare, integer))
+            }
             HandleClass::FunctionTable => return self.function_table_array(set, b),
         };
         let expected = if image.access == ImageAccess::Storage {
@@ -1386,14 +1259,14 @@ impl<'a> HeapPlanner<'a> {
         })
     }
 
-    /// The writes of the sampler array `b` of set `set` for the use (`compare`, `integer`,
-    /// `cube_gradient`): element 0 the use's neutral sampler, element `i + 1` argument sampler `i`
-    /// made for the use, through the class's entries.
+    /// The writes of the sampler array `b` of set `set` for the use (`compare`, `integer`):
+    /// element 0 the use's neutral sampler, element `i + 1` argument sampler `i` made for the use,
+    /// through the class's entries.
     fn sampler_array(
         &self,
         set: u32,
         b: &DescriptorBinding,
-        (compare, integer, cube_gradient): (bool, bool, bool),
+        (compare, integer): (bool, bool),
     ) -> Result<Vec<DescriptorWrite>, BindError> {
         if b.ty != vk::DescriptorType::SAMPLER {
             return Err(internal(format!(
@@ -1424,7 +1297,6 @@ impl<'a> HeapPlanner<'a> {
                     index: element - 1,
                     compare,
                     integer,
-                    cube_gradient,
                 },
             ));
         }
@@ -1798,7 +1670,7 @@ fn handle_table_bytes(
         ids.push(member_id(m, &used, state)?);
     }
     // A member's flags: Metal's out-of-bounds read of a pixel format without alpha returns
-    // alpha 1, its depth class, and its texel class.
+    // alpha 1, and its texel class.
     let flags: Vec<u32> = members.iter().map(|m| entry_flags(&m.shape)).collect();
     let mut out = Vec::with_capacity(tables.len());
     for t in tables {
@@ -1814,21 +1686,6 @@ fn handle_table_bytes(
         out.push(table_of(t, entries)?);
     }
     Ok(out)
-}
-
-/// The depth class of a texture of pixel format `pf` in its table entry's flags: how Metal compares
-/// its texels against a depth comparison's reference, as measured. `Depth16Unorm` compares codes,
-/// the texel's against the reference's ([`FLAG_DEPTH_CODES`]); `Depth32Float` compares values, and
-/// `Depth32Float_Stencil8` as `Depth32Float` ([`FLAG_DEPTH_VALUES`]). Every other
-/// format has no measured class, 0: the device compares a heap comparison of it, which the module
-/// records (`DeviceDepthComparison`).
-fn depth_flags(pf: metal::PixelFormat) -> u32 {
-    use metal::PixelFormat as P;
-    match pf {
-        P::Depth16Unorm => FLAG_DEPTH_CODES,
-        P::Depth32Float | P::Depth32FloatStencil8 => FLAG_DEPTH_VALUES,
-        _ => 0,
-    }
 }
 
 /// The bytes of the sampler tables `tables`, planned for the argument samplers' `shape`, for

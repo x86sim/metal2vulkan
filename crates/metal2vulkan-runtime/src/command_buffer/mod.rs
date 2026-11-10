@@ -67,10 +67,11 @@ use super::degradation::Degradation;
 use super::descriptor_arena::DescriptorArena;
 use super::device::lock;
 use super::device::relay::Relayed;
+use super::dirty_pages::DirtyCommit;
 use super::encoder::{Recorded, Segment};
 use super::error::{
     internal, invalid, vulkan, CommandBufferError, DeadlockCause, EncoderCall, Error,
-    FailedPipeline, MeshRecordsOverflow, PipelineCreationCause, Problem,
+    FailedPipeline, FailedState, MeshRecordsOverflow, PipelineCreationCause, Problem,
     TessellationRecordsOverflow, TimedOut,
 };
 use super::event::{EventRef, EventShared, SharedEvent};
@@ -88,7 +89,6 @@ use super::predication::{Event, Predication};
 use super::program_objects;
 use super::queue::Slot;
 use super::rebind::{Holds, SubmittedHolds, Taken};
-use super::recorder::{self, Replays};
 use super::render::EndInFlight;
 use super::replay::Replay;
 use super::residency::Residency;
@@ -100,7 +100,7 @@ use super::sparse::encoder::SparseUpdate;
 use super::sparse::indirect;
 use super::texture::storage_form::Riding;
 use super::texture::Texture;
-use super::tracker::Footprint;
+use super::tracker::{Footprint, Use};
 use super::unique_identifier::ScheduledWork;
 use super::upload::{Upload, Uploads};
 use super::used_resources::{names_any, EncoderKind, EncoderRecord, Reached, ReadRecord};
@@ -118,6 +118,7 @@ use metal2vulkan::bind::{
     ExecutionStatus, IndexBoundsPass, ReplayFaults, ResidentRange, ResidentSet, RootTable,
     StatusReport,
 };
+use metal2vulkan::device::PipelineWaitPolicy;
 use metal2vulkan::error::{Feature, Unsupported};
 use metal2vulkan::metal::DispatchType;
 use own::{
@@ -126,7 +127,7 @@ use own::{
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -223,6 +224,14 @@ pub(super) struct CommandBufferShared {
     /// The numbers its host steps give the variant instances they make, drawn at its commit in
     /// the program's call (`pipeline/kept.rs`).
     step_numbers: OnceLock<StepNumbers>,
+    /// Until when its recordings wait for its draws' and dispatches' pipelines still being made:
+    /// its commit plus the policy's `pipeline_commit_wait`, set at the commit under
+    /// `PipelineWaitPolicy::Bounded`; none under `PipelineWaitPolicy::Exact`, where they wait
+    /// until each is made (`render/pending.rs`, `pending_dispatch.rs`). A cold compile of
+    /// MoltenVK's on a cold Metal compiler service was measured at 11.6 s inside a state creation
+    /// a guest's command buffer encoding made (the guest's 10 s FIFO check ended its task);
+    /// docs/FAST-PATHS.md holds the row.
+    making_deadline: OnceLock<Instant>,
     /// The textures its encoders made for their own commands (`Device::new_planned_texture`),
     /// held from their making until it completes, whichever of its commands use them (its
     /// first batch takes them, `submit.rs`). The device's next submission moves each one's image
@@ -242,11 +251,21 @@ pub(super) struct CommandBufferShared {
     /// step records: the recordings after its commit into its pool take turns, as Vulkan
     /// synchronizes a pool's command buffers' recording externally.
     reencoding: Mutex<()>,
+    /// What its commands did that the device's logs of host pages hear of at its commit
+    /// (`dirty_pages.rs`), and its copied host buffers' merges back (`copied.rs`): collected
+    /// only while the device copied a shadow over logged pages in, imports logged pages in place,
+    /// or keeps a copied host buffer. Apart from the state, which no encoder holds while it
+    /// records.
+    pub(super) dirty: Mutex<DirtyCommit>,
+    /// A command's uses went unnoted, nothing collecting them then (no copied host buffer, and
+    /// no log of host pages, lived): the merge back of copied host buffers takes every copy as
+    /// written by it (`copied.rs`).
+    pub(super) unnoted: AtomicBool,
     /// The `VkCommandBuffer`s of its pool its recordings ended ([`CommandBuffer::end_raw`]):
     /// where they are every one the pool handed out and it completed, it gives the pool back
     /// with none recording (`spares.rs`).
     raws_ended: AtomicU64,
-    /// Its kernel times, apart from the state, which the scheduler holds while it replays and
+    /// Its kernel times, apart from the state, which the scheduler holds while it records and
     /// submits a batch: a read waits for neither (`gpu_time.rs`).
     kernel: KernelTimes,
     /// Its status as `status` answers it, apart from the state for the same reason: each
@@ -503,6 +522,10 @@ pub(super) struct State {
     /// memory, `tests::deferred_calls`).
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     failures_injected: u32,
+    /// The error the making of the next draw's pipeline its recording waits for answers, in place
+    /// of the making's own (a device test's injection, `tests::deferred_calls`).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    making_failure_injected: Option<Error>,
     /// `commit` returned with its own work left to run once a render encoder's end is lowered
     /// (`render/queued_commits.rs`), which has not run: to the program, the command buffer is
     /// committed.
@@ -516,9 +539,6 @@ pub(super) struct State {
     /// The pool every `VkCommandBuffer` of this command buffer comes from, with those made from
     /// it; `None` until the first, and once given back to the device's spares.
     pool: Option<CommandPool>,
-    /// Its encoders' deferred command buffers and their replays, where the device records them
-    /// so (`recorder`): `None` until the first, and once let go of.
-    pub(super) replays: Option<Arc<Replays>>,
     /// The pool of a predicated loop's check while it records again the work its laying left
     /// apart (`rerun.rs`): every `VkCommandBuffer` the command buffer hands out meanwhile comes
     /// from it, and goes back to it for the next run again.
@@ -625,8 +645,6 @@ pub(super) struct State {
     /// A direct mesh draw's object grid lay past what runs (`render/mesh_arguments.rs`): the
     /// command buffer fails as for `ExecutionStatus`'s `MESH_GRID_PAST_LIMITS`.
     mesh_grid_past: bool,
-    /// The captured passes' tile masks, which its completion counts (`render/capture.rs`).
-    pub(super) capture_tallies: Vec<CaptureTally>,
     /// The index pool of the commands' index bounds and rewrite passes (`index_bounds.rs`,
     /// `index_rewrite.rs`), once a draw needs it: its counter in the arena, starting at 0, and
     /// its lease of its queue's block, which its indices lie in (`gpu_pools.rs`).
@@ -649,9 +667,12 @@ pub(super) struct State {
     step_failure: Option<CommandBufferError>,
     /// The refusal of a host step that failed so (`CommandBufferError::Refused`).
     refusal: Option<Error>,
-    /// The first draw's pipeline whose making failed, which a host step met
+    /// The first dispatch's pipeline whose making failed, which a host step met
     /// (`CommandBufferError::PipelineCreation`).
     failed_pipeline: Option<FailedPipeline>,
+    /// The first draw's pipeline whose making failed, which its recording dropped
+    /// (`render/pending.rs`).
+    dropped_draw: Option<FailedPipeline>,
     /// Metal's description of the failure the driver relayed, where the command buffer failed
     /// with it (`CommandBuffer::error_description`).
     relayed_description: Option<String>,
@@ -711,6 +732,11 @@ pub(super) struct State {
     /// submission, which that submission points at the set as it lies then
     /// (`first_submission.rs`).
     replay_tables: Vec<ReplayTable>,
+    /// A command of it may write memory no use it noted names: a root table (a function that
+    /// reaches buffers through addresses), a root table of work on the GPU alone, or work its
+    /// host steps resolve from records (`Deferred::reaches_unnamed`). The merge back of copied
+    /// host buffers then takes every copy as written by it (`copied.rs`).
+    pub(super) reaches_unnamed: bool,
     /// The ended encoders whose submissions failed so: no part of one goes to a queue with work
     /// (`submit.rs` holds it to that).
     unrunnable: BTreeSet<usize>,
@@ -815,6 +841,7 @@ impl State {
     /// recorded after the first submission searches the set as it lay as it was recorded, which
     /// the submitted command buffer holds.
     pub(super) fn replay_table(&mut self, table: ReplayTable) {
+        self.reaches_unnamed = true;
         if !self.submitted {
             self.replay_tables.push(table);
         }
@@ -987,6 +1014,7 @@ impl State {
         noted: NotedTable,
         ranges: Vec<ResidentRange>,
     ) -> Result<(), Error> {
+        self.reaches_unnamed = true;
         if self.status == CommandBufferStatus::NotEnqueued {
             self.root_ranges.extend(ranges);
             self.root_tables.push(noted);
@@ -1196,6 +1224,13 @@ impl State {
             .enter(place, self.batches.events(), dispatch_type)
     }
 
+    /// The failure of the making of a draw's pipeline a device test injected
+    /// ([`CommandBuffer::fail_draw_making`]), taken here.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn injected_making_failure(&mut self) -> Option<Error> {
+        self.making_failure_injected.take()
+    }
+
     /// Keep `error`, a render encoder's call's refused as it was lowered
     /// (`CommandBufferError::CallRefused`): the first such call's.
     pub(super) fn refuse_call(&mut self, error: Error) {
@@ -1230,6 +1265,26 @@ impl State {
     /// Ended encoder `encoder` fails the command buffer from it on with `error` (`fails_from`).
     pub(super) fn fail_from(&mut self, encoder: usize, error: CommandBufferError) {
         self.fails_from.get_or_insert((encoder, error));
+    }
+
+    /// Ended encoder `encoder`, the last, fails the command buffer with `error` from the first
+    /// encoder of the submission Metal holds it in on (`checks::metal_submissions`: a render pass
+    /// alone, a run of blit or of compute encoders that no event command splits), as Metal fails
+    /// a submission that uses a memoryless texture (`CommandBufferError::InvalidResource`); an
+    /// earlier failure keeps its error, from the earlier of the two encoders.
+    pub(super) fn fail_submission_from(&mut self, encoder: usize, error: CommandBufferError) {
+        let records = self.ended.iter().map(|record| {
+            (
+                record.kind,
+                record.event_waits_before,
+                record.event_signals_before,
+            )
+        });
+        let first = checks::submission_start(records, encoder);
+        self.fails_from = Some(match self.fails_from {
+            Some((from, earlier)) => (from.min(first), earlier),
+            None => (first, error),
+        });
     }
 
     /// Note the shadowed textures an ended encoder's pass took as attachments: how many of them
@@ -1718,16 +1773,8 @@ impl Drop for CommandBufferShared {
         // nothing of its pool is pending. The device's spares keep it (`spares.rs`), which
         // release it only with the device. A timestamp slot it still holds goes back with its
         // state.
-        let (pool, replays) = {
-            let mut state = lock(&self.state);
-            (state.pool.take(), state.replays.take())
-        };
+        let pool = lock(&self.state).pool.take();
         if let Some(pool) = pool {
-            let shared = self.device.shared();
-            shared.spares.give_command_pool(shared, pool, false);
-        }
-        // Its replays end likewise.
-        if let Some((pool, _)) = replays.and_then(|replays| replays.release(false)) {
             let shared = self.device.shared();
             shared.spares.give_command_pool(shared, pool, false);
         }
@@ -1758,11 +1805,12 @@ impl CommandBuffer {
                 end_lowered: false,
                 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
                 failures_injected: 0,
+                #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+                making_failure_injected: None,
                 queued_commit: false,
                 called_over_mutable_map: false,
                 committing: false,
                 pool: None,
-                replays: None,
                 rerun_pool: None,
                 recorded: Vec::new(),
                 tail: None,
@@ -1796,7 +1844,6 @@ impl CommandBuffer {
                 descriptors: DescriptorArena::default(),
                 status_words: None,
                 mesh_grid_past: false,
-                capture_tallies: Vec::new(),
                 index_pool: None,
                 mesh_pool: None,
                 mesh_draws: 0,
@@ -1806,6 +1853,7 @@ impl CommandBuffer {
                 step_failure: None,
                 refusal: None,
                 failed_pipeline: None,
+                dropped_draw: None,
                 relayed_description: None,
                 report: None,
                 times: Times::default(),
@@ -1825,6 +1873,7 @@ impl CommandBuffer {
                 failing: Vec::new(),
                 rebound_use: None,
                 replay_tables: Vec::new(),
+                reaches_unnamed: false,
                 unrunnable: BTreeSet::new(),
                 submitted_holds: Vec::new(),
                 failed_at_commit: None,
@@ -1840,10 +1889,13 @@ impl CommandBuffer {
             gate: Arc::default(),
             relayed: Arc::default(),
             step_numbers: OnceLock::new(),
+            making_deadline: OnceLock::new(),
             own_textures: Mutex::new(Vec::new()),
             fill_slot: Mutex::new([0; 16]),
             reencode: AtomicU64::new(0),
             reencoding: Mutex::new(()),
+            dirty: Mutex::new(DirtyCommit::default()),
+            unnoted: AtomicBool::new(false),
             raws_ended: AtomicU64::new(0),
             kernel: KernelTimes::default(),
             status: AtomicU8::new(status_word(CommandBufferStatus::NotEnqueued)),
@@ -1892,6 +1944,24 @@ impl CommandBuffer {
         lock(&self.0.state)
     }
 
+    /// Note a command's `uses` for the device's logs of host pages, where it keeps any
+    /// (`dirty_pages.rs`): its writes let go, at the commit, of the holds of the shadows they meet,
+    /// and those into logged pages imported in place are reported to their logs; and for its
+    /// copied host buffers, where any lives, whose merges back compare those its writes reach
+    /// (`copied.rs`).
+    pub(super) fn note_dirty(&self, uses: &[Use<ResourceKey>]) {
+        let shared = self.0.device.shared();
+        match shared.dirty.collects() || shared.copied.any() {
+            true => lock(&self.0.dirty).note(uses, &shared.dirty),
+            false => self.0.unnoted.store(true, Ordering::Relaxed),
+        }
+    }
+
+    /// What its commands did so far that the device's logs of host pages hear of at its commit.
+    pub(super) fn dirty(&self) -> MutexGuard<'_, DirtyCommit> {
+        lock(&self.0.dirty)
+    }
+
     /// Whether a buffer over host pages a command of its ended encoder at `encoder` named lies
     /// elsewhere now than the command took it (`Rebinds::rebound_now`): a rebind since its commit
     /// that no encoding again reached. The submission holding that encoder runs nothing and the
@@ -1922,6 +1992,14 @@ impl CommandBuffer {
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     pub(crate) fn fail_commit_work(&self, count: u32) {
         self.state().failures_injected = count;
+    }
+
+    /// Answer the making of the next draw's pipeline its recording waits for
+    /// (`render/pending.rs`) with `error`, as the driver's failure: a device test's injection
+    /// (`tests::deferred_calls`).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn fail_draw_making(&self, error: Error) {
+        self.state().making_failure_injected = Some(error);
     }
 
     /// The bytes its upload arena's regions took: a device test's measure (`tests::rerun_arenas`).
@@ -2020,12 +2098,12 @@ impl CommandBuffer {
         Ok(residency.with_live(live))
     }
 
-    /// An encoder's primary command buffer: a deferred one where the device records them so
-    /// (`recorder`), else one from this command buffer's pool, made on first use. The caller holds
+    /// An encoder's primary command buffer, from this command buffer's pool, made on first use:
+    /// the encoder records into it at each call, on the program's thread. The caller holds
     /// `state` (the pool is externally synchronized).
     pub(super) fn allocate_raw(&self, state: &mut State) -> Result<vk::CommandBuffer, Error> {
         self.0
-            .allocate_deferred(state, vk::CommandBufferLevel::PRIMARY)
+            .allocate_encoder(state, vk::CommandBufferLevel::PRIMARY)
     }
 
     /// An encoder's own primary `VkCommandBuffer` from this command buffer's pool, and whether it
@@ -2058,29 +2136,22 @@ impl CommandBuffer {
 
     /// Give up `raw`, a secondary command buffer recording that nothing will execute (a render
     /// pass instance its pass replaced or gave up before running it, or the one instance of a
-    /// pass that changes nothing): a deferred one (`recorder`) is left unended, so its log is
-    /// never replayed, and goes with the command buffer's release, as one never ended goes; one
-    /// of this command buffer's pool ends ([`end_raw`](Self::end_raw)), so the pool goes back to
-    /// the device's spares unreset (`spares.rs`). Nothing executes either, so the GPU does the
-    /// same work and every byte it writes is the same; a deferred one's replay only cost the
-    /// recorder's thread a `vkBeginCommandBuffer`, which ANV makes reset the command buffer's
-    /// whole state, and the commands' recording.
+    /// pass that changes nothing): it ends ([`end_raw`](Self::end_raw)), so its pool goes back
+    /// to the device's spares unreset (`spares.rs`). Nothing executes it, so the GPU does the
+    /// same work and every byte it writes is the same.
     ///
     /// # Safety
     /// As [`end_raw`](Self::end_raw)'s, and no command buffer executes `raw`.
     pub(super) unsafe fn give_up_raw(&self, raw: vk::CommandBuffer) -> Result<(), vk::Result> {
-        if recorder::is_deferred(raw) {
-            return Ok(());
-        }
         // SAFETY: the caller's.
         unsafe { self.end_raw(raw) }
     }
 
-    /// A secondary command buffer (a render encoder's draws), deferred or from this command
-    /// buffer's pool as [`allocate_raw`](Self::allocate_raw)'s. The caller holds `state`.
+    /// A secondary command buffer (a render encoder's draws), from this command buffer's pool as
+    /// [`allocate_raw`](Self::allocate_raw)'s. The caller holds `state`.
     pub(super) fn allocate_secondary(&self, state: &mut State) -> Result<vk::CommandBuffer, Error> {
         self.0
-            .allocate_deferred(state, vk::CommandBufferLevel::SECONDARY)
+            .allocate_encoder(state, vk::CommandBufferLevel::SECONDARY)
     }
 
     /// `addScheduledHandler:`: call `handler` once the command buffer is scheduled, on one of the
@@ -2499,6 +2570,15 @@ impl CommandBuffer {
     ) -> Result<(), Error> {
         let device = &self.0.device;
         let committed = Instant::now();
+        // From here its draws' pipelines still being made are waited for a bound at most: a
+        // driver's cold compile can outlast a guest's watchdog (`PipelineWaitPolicy`).
+        let policy = device.compile_device().policy();
+        if policy.pipeline_waits == PipelineWaitPolicy::Bounded {
+            let _ = self
+                .0
+                .making_deadline
+                .set(committed + policy.pipeline_commit_wait);
+        }
         // Textures' host shadows hold their images' texels only until the program gives the device
         // GPU work of its own, which is what a commit is: raised here, before anything of this
         // command buffer can run, so a `getBytes` after the commit reads the image and not a
@@ -2626,16 +2706,35 @@ impl CommandBuffer {
             if let Some(residency) = &mut state.residency {
                 residency.sync_heaps();
             }
-            let (segments, places) = state
+            let (segments, places): (Vec<(Deferred, bool)>, Vec<usize>) = state
                 .recorded
                 .iter()
                 .filter(|recorded| runs(recorded.encoder))
                 .flat_map(|recorded| (recorded.segments.iter()).map(|at| (at, recorded.encoder)))
                 .map(|(segment, encoder)| ((segment.work.clone(), segment.needs_step()), encoder))
                 .unzip();
+            if segments.iter().any(|(work, _)| work.reaches_unnamed()) {
+                state.reaches_unnamed = true;
+            }
             // What of it the live buffers list once used, held weakly: the device's registries'
             // locks, which take no other, inside this one.
             let reached = state.reached(device.shared(), runs);
+            // The device's logs of host pages hear of its writes and gated copies in, in commit
+            // order, and of the shadows its end left holding their truth (`dirty_pages.rs`).
+            // One that waits for an event or a semaphore may run after work committed later,
+            // whose writes no commit before it noted: its copies in count on no hold.
+            if device.shared().dirty.collects() {
+                let held = match (&failure, &state.shadow_carry) {
+                    (None, Some(carry)) => carry.held_whole(),
+                    _ => Vec::new(),
+                };
+                let waits = (state.batches.all().iter())
+                    .any(|batch| !batch.waits.is_empty() || !batch.binary_waits.is_empty());
+                device
+                    .shared()
+                    .dirty
+                    .committed(&lock(&self.0.dirty), &held, waits);
+            }
             (segments, places, failure, reached, hangs)
         };
         // What the commands of its encoders that run use is resident from its commit on, as
@@ -2693,6 +2792,10 @@ impl CommandBuffer {
             .filter(|(_, prepared)| prepared.pipelines)
             .map(|((work, _), _)| work.clone())
             .collect();
+        // Every byte the CPU changed in a copied host buffer's pages is in its copy before any of
+        // this command buffer's work is submitted (`copied.rs`): copied in with no lock of the
+        // command buffer's held, as a copy over logged pages waits for the log's publication.
+        shared.copied.copy_in(&shared.counts, shared.dirty.tally());
         let (waits, away, reaches, unreplayable, reset) = {
             let mut state = self.state();
             state.committing = false;
@@ -2782,18 +2885,10 @@ impl CommandBuffer {
             // its last command buffer ended: what lay in pages a detach replaced while an encoder
             // held them goes with them (`detach.rs`), and its tail's commands recorded above
             // name the views of an attachment recorded inline (`render/inline_first.rs`).
-            // Its deferred command buffers replay from now on, on the device's recorder thread,
-            // and hold the pages their commands name until they are replayed; such pages go here
-            // all the same, replayed first (`Replays::commit`).
-            match state.replays.clone() {
-                Some(replays) => drop(replays.commit(device.shared().vk(), |held| {
-                    state.wait_for_submission(listing, held)
-                })),
-                None => state.wait_for_submission(listing, &mut Vec::new()),
-            }
+            state.wait_for_submission(listing);
             // Committed, its commands recorded for good: a rebind of what they used takes
             // effect after them (`rebind.rs`); one a host step records holds until completion
-            // (`steps_hold`). Only once its replays hold the pages, so a rebind finds them held.
+            // (`steps_hold`).
             if steps_hold {
                 let held = &mut *state;
                 let kept = held
@@ -2930,24 +3025,156 @@ impl CommandBuffer {
         self.state().refusal.clone()
     }
 
-    /// Once the command buffer failed with [`CommandBufferError::PipelineCreation`]: the draw
-    /// whose `VkPipeline` the driver did not make, by its encoder and its order there, the state
-    /// and the variant it drew, and the driver's error, which the draw returned where the runtime
-    /// made the pipeline at the draw (`FailedPipeline`). The first such draw, in encoding order:
-    /// Metal reports one error per command buffer. No Metal counterpart.
+    /// Once the command buffer failed with [`CommandBufferError::PipelineCreation`]: the
+    /// dispatch whose `VkPipeline` the driver did not make, by its encoder and its order there,
+    /// the state and the variant it ran, and the driver's error, which the dispatch returned
+    /// where the runtime made the pipeline at the dispatch (`FailedPipeline`). The first such
+    /// dispatch, in encoding order: Metal reports one error per command buffer. No Metal
+    /// counterpart.
     pub fn failed_pipeline(&self) -> Option<FailedPipeline> {
         self.settle_end();
         self.state().failed_pipeline.clone()
     }
 
-    /// Keep `failed`, a draw's pipeline whose making failed, which a host step met
-    /// (`render/pending.rs`), unless one was kept already: the steps record in encoding order
-    /// and stop at the first failure, so the one kept is the first.
+    /// The first draw, in encoding order, whose `VkPipeline` the driver did not make after the
+    /// draw returned (the runtime makes a draw's pipeline while the draw goes on,
+    /// `render/pending.rs`): the draw ran nothing, the command buffer running on, without error.
+    /// Named as [`failed_pipeline`](Self::failed_pipeline) names a dispatch. Counted, each such
+    /// draw: `WorkCounts::draws_dropped_unmade`. Under `PipelineWaitPolicy::Bounded` (the
+    /// default), also the first draw or dispatch (a compute dispatch, a render pass's tile
+    /// dispatch) whose `VkPipeline` was still being made once the command buffer's bound passed,
+    /// with the error `VK_TIMEOUT`: `WorkCounts::draws_dropped_still_making` and
+    /// `dispatches_dropped_still_making`. No Metal counterpart: Metal makes a state's pipelines as
+    /// it makes the state.
+    pub fn dropped_draw(&self) -> Option<FailedPipeline> {
+        self.settle_end();
+        self.state().dropped_draw.clone()
+    }
+
+    /// Keep `failed`, a dispatch's pipeline whose making failed, which a host step met
+    /// (`pending_dispatch.rs`, `render/pending_tile.rs`), unless one was kept already: the steps
+    /// record in encoding order and stop at the first failure, so the one kept is the first.
     pub(super) fn fail_pipeline(&self, failed: FailedPipeline) {
         let mut held = self.state();
         if held.failed_pipeline.is_none() {
             held.failed_pipeline = Some(failed);
         }
+    }
+
+    /// Note `failed`, a draw's pipeline whose making failed, whose recording drops the draw
+    /// (`render/pending.rs`): kept where it is the first, counted
+    /// (`WorkCounts::draws_dropped_unmade`).
+    pub(super) fn drop_draw(&self, failed: FailedPipeline) {
+        let device = self.device();
+        device.shared().counts.draw_dropped_unmade();
+        device.degrade(Degradation::DrawDroppedUnmade, || {
+            let state = match &failed.state {
+                FailedState::Render(state) => format!(
+                    "render pipeline state {}{}",
+                    state.unique_identifier(),
+                    state
+                        .label()
+                        .map(|label| format!(" `{label}`"))
+                        .unwrap_or_default()
+                ),
+                FailedState::Compute(state) => {
+                    format!("compute pipeline state {}", state.unique_identifier())
+                }
+            };
+            let variant = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                failed.variant.hash(&mut hasher);
+                failed.specialization.hash(&mut hasher);
+                hasher.finish()
+            };
+            (
+                format!(
+                    "draw {} of render encoder {} of a command buffer, of {state}, variant and \
+                     specialization {variant:016x}",
+                    failed.draw, failed.encoder
+                ),
+                format!("the driver failed to make its pipeline: {}", failed.error),
+            )
+        });
+        self.keep_dropped(failed);
+    }
+
+    /// Note `late`, a draw whose pipeline was still being made once the command buffer's bound
+    /// passed ([`making_deadline`](Self::making_deadline)), whose recording drops the draw
+    /// (`render/pending.rs`): kept where it is the first, its error `VK_TIMEOUT`, which no
+    /// driver's creation returns; counted (`WorkCounts::draws_dropped_still_making`), and
+    /// announced (`draw-dropped-still-making`) where its recording runs, in the program's
+    /// `commit` or a host step.
+    pub(super) fn drop_late_draw(&self, late: FailedPipeline) {
+        let device = self.device();
+        device.shared().counts.draw_dropped_still_making();
+        let (encoder, draw) = (late.encoder, late.draw);
+        device.degrade(Degradation::DrawDroppedStillMaking, || {
+            (
+                format!("draw {draw} of render encoder {encoder} of a command buffer"),
+                format!(
+                    "its pipeline was still being made {} ms after the command buffer's commit",
+                    device
+                        .compile_device()
+                        .policy()
+                        .pipeline_commit_wait
+                        .as_millis()
+                ),
+            )
+        });
+        self.keep_dropped(late);
+    }
+
+    /// Note `late`, a dispatch whose pipeline was still being made once the command buffer's
+    /// bound passed ([`making_deadline`](Self::making_deadline)): a compute encoder's
+    /// (`pending_dispatch.rs`), or a render pass's tile dispatch where `tile`
+    /// (`render/pending_tile.rs`), whose recording records no dispatch. Kept as
+    /// [`drop_late_draw`](Self::drop_late_draw) keeps a draw, its error `VK_TIMEOUT`; counted
+    /// (`WorkCounts::dispatches_dropped_still_making`), and announced
+    /// (`dispatch-dropped-still-making`) where its recording runs, in the program's `commit` or a
+    /// host step.
+    pub(crate) fn drop_late_dispatch(&self, late: FailedPipeline, tile: bool) {
+        let device = self.device();
+        device.shared().counts.dispatch_dropped_still_making();
+        let (encoder, dispatch) = (late.encoder, late.draw);
+        device.degrade(Degradation::DispatchDroppedStillMaking, || {
+            let what = match tile {
+                true => "tile dispatch",
+                false => "dispatch",
+            };
+            let of = match tile {
+                true => "render encoder",
+                false => "compute encoder",
+            };
+            (
+                format!("{what} {dispatch} of {of} {encoder} of a command buffer"),
+                format!(
+                    "its pipeline was still being made {} ms after the command buffer's commit",
+                    device
+                        .compile_device()
+                        .policy()
+                        .pipeline_commit_wait
+                        .as_millis()
+                ),
+            )
+        });
+        self.keep_dropped(late);
+    }
+
+    /// Keep `dropped` as the command buffer's first draw or dispatch that ran nothing, unless one
+    /// was kept already: the recordings run in encoding order.
+    fn keep_dropped(&self, dropped: FailedPipeline) {
+        let mut held = self.state();
+        if held.dropped_draw.is_none() {
+            held.dropped_draw = Some(dropped);
+        }
+    }
+
+    /// Until when its recordings wait for its draws' and dispatches' pipelines still being made:
+    /// set at its commit under `PipelineWaitPolicy::Bounded`, none before it or under `Exact`.
+    pub(crate) fn making_deadline(&self) -> Option<Instant> {
+        self.0.making_deadline.get().copied()
     }
 
     /// What the command buffer's execution status words report, once it completed: resident-set
@@ -3341,10 +3568,20 @@ impl CommandBufferShared {
             && segments()
                 .filter(|segment| segment.steps_after_the_gpu())
                 .all(|segment| matches!(segment.work, Deferred::Loop(_)));
+        // Past its bound its step records the draws and dispatches whose pipelines are still
+        // being made as nothing (`render/pending.rs`, `pending_dispatch.rs`), waiting for no
+        // making.
+        let deadline = self.making_deadline.get().copied();
+        let late = deadline.is_some_and(|at| Instant::now() >= at);
+        let pipelines = match late {
+            false => segments().any(Segment::steps_after_pipelines),
+            true => segments().any(Segment::holds),
+        };
         StepWaits {
             gpu: segments().any(Segment::steps_after_the_gpu) || sparse,
             queue_alone: checks_alone.then(|| self.queue.vk_queue()),
-            pipelines: segments().any(Segment::steps_after_pipelines),
+            pipelines,
+            until: deadline.filter(|_| pipelines && !late),
         }
     }
 
@@ -3652,8 +3889,7 @@ impl CommandBufferShared {
     unsafe fn end_raw(&self, raw: vk::CommandBuffer) -> Result<(), vk::Result> {
         // SAFETY: the caller's.
         let ended = unsafe { self.device.shared().vk().end_command_buffer(raw) };
-        // A deferred one is none of its pool's: its replay ends its own (`recorder`).
-        if ended.is_ok() && !recorder::is_deferred(raw) {
+        if ended.is_ok() {
             self.raws_ended.fetch_add(1, Ordering::Relaxed);
         }
         ended
@@ -3675,13 +3911,10 @@ impl CommandBufferShared {
         }
     }
 
-    /// An encoder's command buffer of `level`: where the device records them so, a deferred one
-    /// of its replays, which take a spare pool of the device's for their replays as the first is
-    /// made (outside a section, where a spare is taken; else the first replay makes one);
-    /// elsewhere, or once every deferred handle is live, one from this command buffer's pool
-    /// ([`allocate`](Self::allocate)). One of a predicated loop's check's pool while it records
-    /// again (`rerun.rs`).
-    fn allocate_deferred(
+    /// An encoder's command buffer of `level`, a driver's the encoder records into at each call:
+    /// one from this command buffer's pool ([`allocate`](Self::allocate)), or one of a
+    /// predicated loop's check's pool while it records again (`rerun.rs`).
+    fn allocate_encoder(
         &self,
         state: &mut State,
         level: vk::CommandBufferLevel,
@@ -3689,33 +3922,7 @@ impl CommandBufferShared {
         if let Some(pool) = &state.rerun_pool {
             return hand_out(&self.device, &mut lock(pool), level);
         }
-        match self.deferred(state, level)? {
-            Some(raw) => Ok(raw),
-            None => self.allocate(state, level),
-        }
-    }
-
-    /// A deferred command buffer of `level` of its replays, where the device records them so and
-    /// a handle is free (`recorder`); `None` elsewhere.
-    fn deferred(
-        &self,
-        state: &mut State,
-        level: vk::CommandBufferLevel,
-    ) -> Result<Option<vk::CommandBuffer>, Error> {
-        let shared = self.device.shared();
-        let Some(recorder) = shared.recorder() else {
-            return Ok(None);
-        };
-        if state.replays.is_none() {
-            let family = shared.queue_family_of(self.queue.vk_queue());
-            let spare = shared.spares.command_pool(shared, family)?;
-            state.replays = Some(recorder.replays(family, spare));
-        }
-        let raw = (state.replays.as_ref()).and_then(|replays| replays.make(level));
-        if raw.is_some() {
-            shared.counts.command_buffer_deferred();
-        }
-        Ok(raw)
+        self.allocate(state, level)
     }
 
     /// A `VkCommandBuffer` of `level` from this command buffer's pool, made on first use: a
@@ -3731,12 +3938,8 @@ impl CommandBufferShared {
         hand_out(&self.device, self.pool(state)?, level)
     }
 
-    /// [`CommandBuffer::encoder_primary`]: a deferred one where the device records them so, to
-    /// begin, whose replay takes the primary its replays' pool holds begun ahead (`recorder`).
+    /// [`CommandBuffer::encoder_primary`].
     fn encoder_primary(&self, state: &mut State) -> Result<(vk::CommandBuffer, bool), Error> {
-        if let Some(raw) = self.deferred(state, vk::CommandBufferLevel::PRIMARY)? {
-            return Ok((raw, false));
-        }
         if let Some(buffer) = self.pool(state)?.take_begun() {
             return Ok((buffer, true));
         }
@@ -4205,9 +4408,6 @@ impl CommandBufferShared {
     /// waiters once the transition's [`Hold`] (and every other) is gone, and they wait for the
     /// trails below the mark. Waits from inside these steps answer as [`own`] says.
     fn complete(self: &Arc<Self>, result: Result<(), CommandBufferError>) {
-        // A capture replay found a primitive whose reach was not measured: its pass rewrote
-        // every tile, announced once the lock is let go (below).
-        let mut unmeasured_reach = false;
         // A thread sleeps on `changed`, as the state's lock below reads.
         let parked;
         // Its command pool, where it settled, whose primary the device's spares begin ahead once
@@ -4236,6 +4436,13 @@ impl CommandBufferShared {
                 }
                 (None, None) => result,
             };
+            // The logs of host pages hear of its shadows' copies back and its writes in place
+            // again, now they ran, and let go of the holds a failed one's copies in set
+            // (`dirty_pages.rs`).
+            if self.device.shared().dirty.collects() {
+                let dirty = lock(&self.dirty);
+                (self.device.shared().dirty).completed(&dirty, result.is_err());
+            }
             match result {
                 Ok(()) => {
                     state.status = CommandBufferStatus::Completed;
@@ -4324,12 +4531,7 @@ impl CommandBufferShared {
                         state.status = CommandBufferStatus::Error;
                         state.error = Some(CommandBufferError::CubicArgumentSampler);
                     }
-                    unmeasured_reach = report.captured_reach_unmeasured;
                     state.report = Some(report);
-                    let counts = &self.device.shared().counts;
-                    for tally in &state.capture_tallies {
-                        counts.capture_reach_tallied(tally.found(), tally.bound);
-                    }
                 }
                 Err(error) => {
                     state.status = CommandBufferStatus::Error;
@@ -4349,7 +4551,6 @@ impl CommandBufferShared {
             // failure turns to `Error`.
             self.answer(&state);
             state.status_words = None;
-            state.capture_tallies.clear();
             // Its heap versions, uploads, pools and descriptor pools go once its completed
             // handlers ran (below).
             released_versions = state.heaps.clear();
@@ -4373,17 +4574,6 @@ impl CommandBufferShared {
                 let shared = self.device.shared();
                 shared.spares.give_command_pool(shared, pool, settled);
             }
-            // Its replays end, any in progress first, and replay nothing more; their pool goes
-            // back as its own does, and holds the primary begun ahead in its place: its encoders'
-            // primaries came from it, and only their replays take that primary (`recorder`).
-            if let Some(replays) = state.replays.take() {
-                let completed = state.status == CommandBufferStatus::Completed;
-                if let Some((pool, settled)) = replays.release(completed) {
-                    settled_pool = settled.then_some(pool.raw);
-                    let shared = self.device.shared();
-                    shared.spares.give_command_pool(shared, pool, settled);
-                }
-            }
             state.unplaced();
             parked = state.parked > 0;
         }
@@ -4391,18 +4581,6 @@ impl CommandBufferShared {
         // handler of its runs: a detach from one of them detaches (`detach.rs`).
         drop(submitted_holds);
         self.wake_parked(parked);
-        if unmeasured_reach {
-            self.device
-                .degrade(Degradation::UnreachedTilesRewritten, || {
-                    (
-                        "a render pass whose draws' tile reach capture replay found".to_owned(),
-                        "a primitive crossed the near or far plane, or lay past what Metal's tile \
-                         rule was measured over, so the pass rewrote every 32x32 tile of its \
-                         render area where Metal's rewrites only the tiles its primitives reach"
-                            .to_owned(),
-                    )
-                });
-        }
         let buffer = CommandBuffer(Arc::clone(self));
         // Each handler leaves the queue under the lock and runs without it, in the order added
         // (a handler may query the command buffer).
@@ -4508,37 +4686,6 @@ impl CommandBufferShared {
     }
 }
 
-/// A captured pass's tile mask, copied where the host reads it once the command buffer completes
-/// (`render/capture.rs`), and the tiles its draws' viewports and scissors reach: the counts
-/// `WorkCounts::capture_reach_tiles_found` and its kin.
-pub(super) struct CaptureTally {
-    /// The mask's copy: one bit a tile, tile `t` bit `t % 32` of word `t / 32`.
-    pub(super) mask: Upload,
-    /// The tiles of the pass's grid: the bits past them count nothing.
-    pub(super) grid: u64,
-    /// The tiles the draws' viewports and scissors reach.
-    pub(super) bound: u64,
-}
-
-impl CaptureTally {
-    /// The tiles the mask names, once the command buffer completed.
-    fn found(&self) -> u64 {
-        let bytes = self.mask.read_bytes();
-        let mut found = 0u64;
-        for (word, bits) in bytes.as_chunks::<4>().0.iter().enumerate() {
-            let first = word as u64 * 32;
-            let within = self.grid.saturating_sub(first).min(32);
-            let live = match within {
-                32 => u32::MAX,
-                n => (1u32 << n) - 1,
-            };
-            let bits = u32::from_le_bytes([bits[0], bits[1], bits[2], bits[3]]);
-            found += u64::from((bits & live).count_ones());
-        }
-        found
-    }
-}
-
 /// A command buffer's transition, run in its queue's context.
 pub(crate) struct Transition {
     /// The command buffer, held until the transition ran.
@@ -4558,14 +4705,9 @@ enum To {
 
 impl Transition {
     /// The transition of the command buffer `buffer` holds to `Completed` or `Error`, with
-    /// `result`: plain where it has no completed handler (none is added after the commit) and no
-    /// pass that captured its tiles' reach, the one notice it announces as it completes
-    /// (`render/capture.rs`).
+    /// `result`: plain where it has no completed handler (none is added after the commit).
     fn finished(buffer: Hold<CommandBufferShared>, result: Result<(), CommandBufferError>) -> Self {
-        let plain = {
-            let state = lock(&buffer.state);
-            state.completed.is_empty() && state.capture_tallies.is_empty()
-        };
+        let plain = lock(&buffer.state).completed.is_empty();
         Transition {
             buffer,
             to: To::Finished(result),

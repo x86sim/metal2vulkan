@@ -43,16 +43,6 @@
 //! ```
 //!
 //! Rows of a fixture whose assembler is not installed (`metal-as` off macOS) are skipped visibly.
-//!
-//! A second table, `golden_hashes_exact.tsv`, pins the same cells of the fixtures that sample,
-//! gather or compute a level of detail (their source declares an `air.sample_texture*`,
-//! `air.gather_texture*` or `air.calculate_*` intrinsic) under every exact form
-//! (`pipeline::testing::EXACT_SAMPLING`: Metal's sampler emulated, `SamplingPolicy::Exact`, and
-//! `DevicePolicy::exact_answers`), whose output the default policy's native device sampling never
-//! reaches. Its profiles' fingerprints are those of that policy, and its snapshot rows carry the
-//! copy's half-bits arm, which the slot's unsigned integer alias feeds under
-//! `HalfTexelBitsPolicy::Exact` and the default policy does not take. The bless writes both
-//! tables, under the same rule.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -67,7 +57,6 @@ use crate::metal::format::storage_image_choice;
 use crate::metal::{PixelFormat, VertexFormat};
 use crate::pipeline::testing::{
     engine_dir, fixtures_dir, link_standalone, llvm_assemble, metal_assemble, AssembleError,
-    EXACT_SAMPLING,
 };
 use crate::pipeline::{
     ColorAttachmentDescriptor, ComputePipelineDescriptor, FramebufferFetchInputs,
@@ -99,30 +88,8 @@ const DEFAULT: Golden = Golden {
     takes: every,
 };
 
-/// The table of the fixtures that sample under every exact form.
-const EXACT: Golden = Golden {
-    table: "tests/golden_hashes_exact.tsv",
-    title: "# Golden output hashes of the engine over the public fixtures that sample x the\n\
-            # committed profiles under EXACT_SAMPLING, every exact form\n\
-            # (src/tests/golden_hashes.rs). Written by the bless; do not edit:\n",
-    policy: EXACT_SAMPLING,
-    takes: samples,
-};
-
 fn every(_: &str) -> bool {
     true
-}
-
-/// Whether a fixture's source declares a sample, a gather or a level-of-detail query: the
-/// intrinsics whose lowering `SamplingPolicy` chooses.
-fn samples(text: &str) -> bool {
-    [
-        "@air.sample_texture",
-        "@air.gather_texture",
-        "@air.calculate_",
-    ]
-    .iter()
-    .any(|family| text.contains(family))
 }
 
 const BLESS: &str = "cargo nextest run -p metal2vulkan --all-features --run-ignored ignored-only \
@@ -174,9 +141,7 @@ enum Subject {
     /// Fragment `entry` compiled under a snapshot of its texture slot 0 in `form`
     /// (`LoweringInputs::snapshot_textures`), linked alone: the two-draw copy-and-read form a draw
     /// that reads a texture its own subpass renders takes, which the entry alone, compiled without
-    /// the input, never reaches. Under the exact table's policy the slot also takes an unsigned
-    /// integer alias beside its image, so a form that holds a 16-bit code carries the copy's
-    /// half-bits arm as well (`lower::fragment`'s `snapshot::fetches_half_bits`).
+    /// the input, never reaches.
     Snapshot {
         entry: &'static str,
         form: SnapshotForm,
@@ -347,12 +312,6 @@ fn snapshot_subject(entry: &'static str, form: SnapshotForm) -> (String, Subject
 }
 
 const STORAGE_FIXTURE: &str = "engine/storage_texture_write.ll";
-
-/// The fixture and entry whose snapshot subjects the tables take, and the form that carries the
-/// copy's half-bits arm under the exact table's policy ([`check_snapshot_half_bits`]).
-const SNAPSHOT_FIXTURE: &str = "engine/tob_renders.ll";
-const SNAPSHOT_ENTRY: &str = "tob_read";
-const SNAPSHOT_HALF_FORM: SnapshotForm = SnapshotForm::Half;
 
 fn storage_subject(format: PixelFormat) -> String {
     format!("compute storage_texture_write, texture 0 as {format:?}")
@@ -856,8 +815,6 @@ fn committed(golden: Golden) -> Option<Table> {
 struct Observed {
     table: Table,
     skipped: BTreeSet<String>,
-    /// The loaded fixtures, so a check beside the table can recompile a subject of one.
-    fixtures: Vec<Fixture>,
 }
 
 fn observe(golden: Golden, devices: &[(String, Device)]) -> Observed {
@@ -900,7 +857,6 @@ fn observe(golden: Golden, devices: &[(String, Device)]) -> Observed {
     Observed {
         table: Table { profiles, rows },
         skipped,
-        fixtures,
     }
 }
 
@@ -1000,49 +956,6 @@ fn check_storage_pair(observed: &Table, devices: &[(String, Device)]) -> usize {
     swizzled
 }
 
-/// The snapshot subject of the half-bits form reaches the copy's half-bits arm on a committed
-/// profile under the exact table's policy: its module fetches the slot twice, the copy's two
-/// exclusive arms, one of them through the slot's unsigned integer alias (an image of unsigned
-/// integer sampled type), as `engine_snapshot_exact` reads it on a whole render variant.
-///
-/// Without this the table's cells would still move with the lowering and still re-bless, but
-/// nothing would say the arm is what they cover: a change that made the arm unreachable would
-/// read as an ordinary re-bless.
-fn check_snapshot_half_bits(fixtures: &[Fixture], devices: &[(String, Device)]) -> usize {
-    let fixture = fixtures
-        .iter()
-        .find(|f| f.name == SNAPSHOT_FIXTURE)
-        .unwrap_or_else(|| panic!("no {SNAPSHOT_FIXTURE} fixture"));
-    let Some(lib) = fixture.library.as_ref() else {
-        return 0;
-    };
-    let subject = Subject::Snapshot {
-        entry: SNAPSHOT_ENTRY,
-        form: SNAPSHOT_HALF_FORM,
-    };
-    let mut armed = 0;
-    for (stem, dev) in devices {
-        // A profile without the pixel interlock, or whose memory model the form does not reach,
-        // refuses the snapshot: its cell is that refusal, and it carries no arm.
-        let Ok(modules) = compiled(lib, &subject, dev) else {
-            continue;
-        };
-        let fetches: Vec<bool> = modules
-            .iter()
-            .flat_map(|m| super::engine_snapshot_exact::fetched_sampled_types(m))
-            .collect();
-        let integer = fetches.iter().filter(|alias| **alias).count();
-        assert_eq!(
-            (fetches.len(), integer),
-            (2, 1),
-            "{stem}: the {SNAPSHOT_HALF_FORM:?} snapshot of {SNAPSHOT_ENTRY} must fetch the slot \
-             twice under exact answers, once through its unsigned integer alias: {fetches:?}"
-        );
-        armed += 1;
-    }
-    armed
-}
-
 #[test]
 #[ignore = "x86Sim: 16-byte leaves no longer use uvec4 units (memory::leaf::VEC4_UNITS), which changes these outputs"]
 fn golden_hashes_match_the_table() {
@@ -1056,24 +969,6 @@ fn golden_hashes_match_the_table() {
         );
     }
     matches_the_table(DEFAULT, &devices, &observed);
-}
-
-/// The fixtures that sample, under every exact form: the sampler's emulation, which the default
-/// table's native device sampling does not reach.
-#[test]
-#[ignore = "x86Sim: 16-byte leaves no longer use uvec4 units (memory::leaf::VEC4_UNITS), which changes these outputs"]
-fn exact_golden_hashes_match_the_table() {
-    let devices = devices(EXACT.policy);
-    let observed = observe(EXACT, &devices);
-    if !observed.skipped.contains(SNAPSHOT_FIXTURE) {
-        let armed = check_snapshot_half_bits(&observed.fixtures, &devices);
-        assert!(
-            armed > 0,
-            "no committed profile reaches the copy's half-bits arm, which the \
-             {SNAPSHOT_HALF_FORM:?} snapshot rows are here to cover"
-        );
-    }
-    matches_the_table(EXACT, &devices, &observed);
 }
 
 /// `golden`'s committed table holds `observed` cell for cell.
@@ -1116,13 +1011,14 @@ fn matches_the_table(golden: Golden, devices: &[(String, Device)], observed: &Ob
     );
 }
 
-/// Rewrite both tables from what this build observes: `BLESS` above. Refuses when an assembler is
+/// Rewrite the table from what this build observes: `BLESS` above. Refuses when an assembler is
 /// missing; names the cells that changed under an unchanged key, which need a
 /// `cache::SEMANTICS_VERSION` bump since the last bless (the master bless checks it).
 #[test]
 #[ignore]
 fn bless_golden_hashes() {
-    for golden in [DEFAULT, EXACT] {
+    {
+        let golden = DEFAULT;
         let table = golden.table;
         let devices = devices(golden.policy);
         let observed = observe(golden, &devices);
@@ -1173,7 +1069,6 @@ fn a_stale_cell_names_the_key_that_moved_and_not_an_unmoved_cell() {
     let observed = |fp: &str, cell: &str| Observed {
         table: table(fp, "src", cell),
         skipped: BTreeSet::new(),
-        fixtures: Vec::new(),
     };
 
     // The profile re-keyed and the cell did not: the two fingerprints, and no word about a cell.
@@ -1204,38 +1099,6 @@ fn a_stale_cell_names_the_key_that_moved_and_not_an_unmoved_cell() {
     assert_eq!(d.changed, ["f.ll | main | a-gpu: was -> now"]);
 }
 
-/// The exact table takes the fixtures whose sampling the policy changes, under the sampler's
-/// emulation and Metal's other answers: its fingerprints are not the default table's.
-#[test]
-fn the_exact_table_takes_the_sampling_fixtures_under_the_emulation() {
-    assert_eq!(EXACT.policy.sampling, crate::device::SamplingPolicy::Exact);
-    assert_eq!(
-        EXACT.policy,
-        DevicePolicy {
-            sampling: crate::device::SamplingPolicy::Exact,
-            ..DevicePolicy::default().exact_answers()
-        }
-    );
-    assert_eq!(DEFAULT.policy, DevicePolicy::default());
-    let all = fixture_paths(DEFAULT);
-    let taken = fixture_paths(EXACT);
-    assert!(!taken.is_empty() && taken.len() < all.len());
-    assert!(taken.iter().all(|f| all.contains(f)));
-    for anisotropic in ["engine/ani_cube_grad.ll", "engine/a4_sample_grad.ll"] {
-        assert!(
-            taken.iter().any(|(name, _)| name == anisotropic),
-            "{anisotropic}"
-        );
-    }
-    let (stem, default) = &devices(DEFAULT.policy)[0];
-    let (_, exact) = &devices(EXACT.policy)[0];
-    assert_ne!(
-        default.profile().fingerprint(),
-        exact.profile().fingerprint(),
-        "{stem}"
-    );
-}
-
 #[test]
 fn the_table_format_round_trips() {
     let mut rows = BTreeMap::new();
@@ -1256,9 +1119,7 @@ fn the_table_format_round_trips() {
         ],
         rows,
     };
-    for golden in [DEFAULT, EXACT] {
-        assert_eq!(Table::parse(&t.render(golden)), Ok(t.clone()));
-    }
+    assert_eq!(Table::parse(&t.render(DEFAULT)), Ok(t.clone()));
 }
 
 /// The rule itself on synthetic tables: a changed cell under unchanged inputs needs a bump; a
@@ -1283,7 +1144,6 @@ fn only_a_cell_changed_under_its_key_needs_a_bump() {
     let observed = |t: Table, skipped: &[&str]| Observed {
         table: t,
         skipped: skipped.iter().map(|s| (*s).to_owned()).collect(),
-        fixtures: Vec::new(),
     };
     let base = table("s", "f", &[("a.ll", "h1")]);
     let d = diff(&base, &observed(table("s", "f", &[("a.ll", "h2")]), &[]));

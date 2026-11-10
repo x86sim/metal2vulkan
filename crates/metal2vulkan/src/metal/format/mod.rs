@@ -24,7 +24,7 @@ use crate::bind::neutral::numeric_type;
 use crate::device::enables::format_exposure_gap;
 use crate::device::requirements::{FormatUsage, VkFeature};
 use crate::device::DeviceProfile;
-use crate::error::{Capability, DescriptorError, DriverDeviation, Error, Feature, Unsupported};
+use crate::error::{Capability, DescriptorError, Error, Feature, Unsupported};
 use crate::metal::{
     PixelFormat, TextureSwizzle, TextureSwizzleChannels, TextureType, TextureUsage,
 };
@@ -137,9 +137,9 @@ pub enum FormatEmulation {
     /// `R16G16B16A16_SFLOAT` of a converted format's (a grid of `1/2048`),
     /// `R32G32B32A32_SFLOAT` of an `_sRGB` twin's (a grid of `1/8192`), and
     /// `A2B10G10R10_UNORM_PACK32` of the codes. Exact for a sampled image a function reads or
-    /// fetches from, and for a linear sample the function emulates (Metal's filter of the texels on
-    /// their grid, `metal::texel_format::PackedTexels::YCbCr2048` and `YCbCr8192`); a linear sample
-    /// the emulation does not reach is the device's filter, noted. Admitted for sampling only:
+    /// fetches from; a linear sample is the device's filter of the texels, noted, off their grid
+    /// (`metal::texel_format::PackedTexels::YCbCr2048` and `YCbCr8192`), but where the function
+    /// reads the planes in place (`bind::YCbCrInPlace`), Metal's filter. Admitted for sampling only:
     /// Metal drops a function's writes to a 4:2:0 or 4:2:2 format ([`writes_dropped`]), stores a
     /// 4:4:4 one's into both planes (which a slot that only writes one of [`ycbcr_writes_stored`]
     /// does through the texture's write shadow; the others are refused), and renders into such a
@@ -188,8 +188,9 @@ pub enum FormatEmulation {
     /// function reads and writes through its slot's [`ExtendedRange`] variant
     /// (`LoweringInputs::extended_range`), converting Metal's values in the shader. Exact for a
     /// sampled image a function fetches from and for a storage image; admitted for those usages
-    /// and for a color attachment, whose render pass clears and loads the raw codes as Metal's does
-    /// (`clear_texel`; the runtime's load pass). Metal filters no bfloat texel (a linear sample
+    /// and for a color attachment, whose render pass clears the raw codes as Metal's does
+    /// (`clear_texel`) and keeps the codes its draws do not write, where Metal's pass takes them
+    /// through `half` (the runtime's `extended-range-bits-kept`). Metal filters no bfloat texel (a linear sample
     /// reads the nearest texel) and blends none (its validation asserts), so a filter and a blend
     /// are not admitted.
     Bfloat,
@@ -201,8 +202,8 @@ pub enum FormatEmulation {
     /// [`EtcDecode`](crate::bind::EtcDecode), [`ChromaDecode`](crate::bind::ChromaDecode)), which
     /// the consumer decodes after each write. The candidate's format is the twin's view of compact
     /// texels, `R8G8B8A8_UNORM` (an `_sRGB` form's `R8G8B8A8_SRGB`), whose texels are 8-bit codes
-    /// of Metal's values (a PVRTC, ETC2, EAC or 4:2:2 format's own codes, an sRGB one's read raw,
-    /// `texel_format::srgb_raw`), or an EAC 11-bit
+    /// of Metal's values (a PVRTC, ETC2, EAC or 4:2:2 format's own codes, an sRGB one's decoded by
+    /// the device through that view, `texel_format::srgb_coded`), or an EAC 11-bit
     /// format's 16-bit normalized codes nearest Metal's values (`R16_UNORM`, `R16_SNORM` and their
     /// two-channel forms); for an ASTC or an EAC 11-bit format the consumer may hold Metal's values
     /// exactly as `float`s instead ([`AstcTexels`](crate::bind::AstcTexels),
@@ -349,9 +350,9 @@ pub enum ExtendedRange {
     /// a `half` read with ties away from zero), and alpha's 2-bit code `a` reads `a / 3`
     /// correctly rounded and a write stores the exact product of the value, clamped to `[0, 1]`
     /// (a NaN 0), with 3, rounded to nearest. A render pass's store rounds a `float` output to
-    /// `half` toward zero first, a clear goes through `half` (nearest even), and a pass that loads
-    /// it and draws elsewhere writes each color code back as `R10Unorm_X6_sRGB`'s
-    /// ([`load_code`](Self::load_code)), alpha kept.
+    /// `half` toward zero first, a clear goes through `half` (nearest even), and Metal's pass that
+    /// loads it and draws elsewhere writes each color code back as `R10Unorm_X6_sRGB`'s, alpha
+    /// kept, where the device's pass keeps the codes (the runtime's `extended-range-bits-kept`).
     Rgb10A2Srgb,
     /// `R16Bfloat` (26): a bfloat code (the top 16 bits of an IEEE `float`) in a little-endian
     /// 16-bit word, held as `R16_UINT` ([`FormatEmulation::Bfloat`]). Measured on an Apple M4
@@ -410,9 +411,9 @@ impl ExtendedRange {
         }
     }
 
-    /// Whether the color channels are sRGB-encoded through the extended-range formats' tables
-    /// (`lower::arith::extended_range::declare`). The padded `_sRGB` twins have tables of their
-    /// own ([`padded_srgb`](Self::padded_srgb)).
+    /// Whether the color channels are sRGB-encoded, `BGR10_XR_sRGB`, `BGRA10_XR_sRGB` and
+    /// `RGB10A8_2P_XR10_sRGB` (`lower::arith::extended_range`'s transfer by the device's `Pow`). The
+    /// padded `_sRGB` twins are [`padded_srgb`](Self::padded_srgb).
     pub fn srgb(self) -> bool {
         match self {
             ExtendedRange::Bgr10 { srgb }
@@ -438,9 +439,9 @@ impl ExtendedRange {
         )
     }
 
-    /// Whether the codes convert through the padded `_sRGB` formats' tables
-    /// (`R10Unorm_X6_sRGB`, `RG10Unorm_X12_sRGB`, and `RGB10A2Unorm_sRGB`'s color channels
-    /// through `R10Unorm_X6_sRGB`'s; `lower::arith::extended_range::declare_padded`).
+    /// Whether the form is a padded `_sRGB` twin: `R10Unorm_X6_sRGB`, `RG10Unorm_X12_sRGB` and
+    /// `RGB10A2Unorm_sRGB` (`lower::arith::extended_range`'s transfer by the device's `Pow`; the
+    /// runtime's clear texels through Metal's tables, `metal::format::padded_srgb`).
     pub fn padded_srgb(self) -> bool {
         matches!(
             self,
@@ -476,9 +477,8 @@ impl ExtendedRange {
 
     /// The forms an argument buffer's texture is read in (a heap element), in the order their
     /// classes follow `metal::texel_format::heap_classes`' own: a function decodes such a texture's
-    /// raw texels, read through the heap's unsigned integer array, without a table. The `_sRGB`
-    /// forms' decodes take the module's tables and the two-plane forms are held in two planes, so a
-    /// heap does not hold them.
+    /// raw texels, read through the heap's unsigned integer array. A heap holds no `_sRGB` form
+    /// (their heap classes are not built) and no two-plane form, which is held in two planes.
     pub const HEAP_READ: [ExtendedRange; 7] = [
         ExtendedRange::Bgr10 { srgb: false },
         ExtendedRange::Bgra10 { srgb: false },
@@ -736,41 +736,6 @@ impl ExtendedRange {
             ExtendedRange::R16Bfloat => [rgba[0], 0, 0, 0],
             ExtendedRange::Rg16Bfloat => [rgba[0], rgba[1], 0, 0],
             ExtendedRange::Rgba16Bfloat => rgba,
-        }
-    }
-
-    /// The code a padded form's word of code `c` holds after a render pass that loads it and
-    /// draws, where no draw writes it: Metal's pass reads the word and writes it back, its
-    /// decoded value encoded again (an Apple M4 and an Apple M3 Max, byte-identical). `c` itself
-    /// for `R10Unorm_X6` and `RG10Unorm_X12`; `R10Unorm_X6_sRGB`'s write of its read, which moves
-    /// the 23 codes no write stores, and so does each color channel's code of `RGB10A2Unorm_sRGB`
-    /// (an Apple M3 Max under macOS 27.0.1, every code; its alpha's code stays);
-    /// `RG10Unorm_X12_sRGB`'s write code of `c`. A bfloat form's code
-    /// `c` (each channel's 16-bit word) holds the code a `Clear` of its value stores under
-    /// [`ClearRoute::ThroughHalf`] ([`clear_texel`](Self::clear_texel)): the `float` of its bits
-    /// rounded to `half` to nearest even (past the largest `half`, the infinity), then the bfloat
-    /// code nearest that, ties to even, a NaN `0x7fc0` (an Apple M4 under macOS 27.0.1: every code
-    /// of each bfloat format through a pass that loads it and draws into another attachment; 56,829
-    /// codes move). The M4's pass alone is measured. `None` for another form, or a code past the
-    /// form's (1023, or a bfloat form's `0xffff`).
-    pub fn load_code(self, c: u32) -> Option<u32> {
-        if self.bfloat() {
-            let c = u16::try_from(c).ok()?;
-            let value = f64::from(f32::from_bits(u32::from(c) << 16));
-            return Some(self.clear_texel([value; 4], ClearRoute::ThroughHalf)[0]);
-        }
-        let at = usize::try_from(c).ok().filter(|&c| c < 1024)?;
-        match self {
-            ExtendedRange::R10X6 | ExtendedRange::Rg10X12 => Some(c),
-            ExtendedRange::R10X6Srgb | ExtendedRange::Rgb10A2Srgb => {
-                let step = padded_srgb::R10X6_SRGB_DECODE_STEPS[at];
-                let first = &padded_srgb::R10X6_SRGB_ENCODE_FIRST;
-                Some(first.partition_point(|&f| f <= step).saturating_sub(1) as u32)
-            }
-            ExtendedRange::Rg10X12Srgb => {
-                Some(u32::from(padded_srgb::RG10X12_SRGB_WRITE_CODES[at]))
-            }
-            _ => None,
         }
     }
 }
@@ -1134,9 +1099,8 @@ macro_rules! formats_named_not_held {
             // component mapping cannot move the function, which format conversion applies
             // before the swizzle, so an image of it would read Metal's alpha decoded and
             // Metal's blue linear: two channels of four wrong, not a near-equivalent. Holding
-            // it exactly needs the raw-code sRGB decode in the shader
-            // (`metal::texel_format::srgb_raw`) as the only read of it, not as a refinement
-            // over the device's decode.
+            // it needs an sRGB decode of the codes in the shader as the only read of it, which
+            // no view gives.
             | PixelFormat::ARGB8UnormSRGB
             | PixelFormat::RGB16Unorm
             | PixelFormat::RGB16Snorm
@@ -1954,12 +1918,12 @@ fn candidates(pf: PixelFormat) -> Result<(vk::ImageAspectFlags, &'static [Candid
     }
 }
 
-/// The UNORM format of an 8-bit sRGB format whose texels Metal decodes from their raw codes
-/// (`R8Unorm_sRGB`, `RG8Unorm_sRGB`, `RGBA8Unorm_sRGB`, `BGRA8Unorm_sRGB`; a BC, PVRTC, ETC2 or
-/// EAC sRGB format's unorm form, the same blocks): the same channels and bits, its texels the sRGB format's codes
-/// read as `c / 255`. A device that cannot sample the sRGB format holds a sampled texture of it in
-/// this format, and a pipeline reads the raw codes through its view and decodes them as Metal does.
-/// `None` for any other format.
+/// The UNORM format of an 8-bit sRGB format (`R8Unorm_sRGB`, `RG8Unorm_sRGB`, `RGBA8Unorm_sRGB`,
+/// `BGRA8Unorm_sRGB`, `RGBX8Unorm_sRGB`; a BC, PVRTC, ETC2 or EAC sRGB format's unorm form, the
+/// same blocks): the same channels and bits, its texels the sRGB format's codes read as `c / 255`.
+/// A device that cannot sample the sRGB format holds a sampled texture of it in this format
+/// (`texel_format::srgb_twin_on`), and a pipeline reads the codes through its view and decodes
+/// them by the MSL transfer through the device's `Pow`, having no sRGB view to decode them. `None` for any other format.
 pub fn srgb_raw_twin(pf: PixelFormat) -> Option<PixelFormat> {
     use PixelFormat as P;
     Some(match pf {
@@ -2014,19 +1978,6 @@ pub(crate) fn integer_channels_word(pf: PixelFormat) -> u32 {
             bits.iter()
                 .zip([0u32, 8, 16, 24])
                 .fold(0, |word, (b, at)| word | (32 - (*b).min(32)) << at)
-        })
-}
-
-/// Whether the device's conversion decides the NaN a `half` texel written to a texture of pixel
-/// format `pf` stores, once the write hands it the half widened (16-bit float channels,
-/// `metal::texel_format::half_channels`) or `0x7fc00000` (a packed small float's, `RG11B10Float`, `RGB9E5Float`):
-/// the stores `DriverDeviation::MetalHalfTexelWrites` states Metal's. A 32-bit float channel stores
-/// its bits, and a normalized or integer one no NaN.
-pub fn half_write_nans_converted(pf: PixelFormat) -> bool {
-    use crate::vk::NumericFormat as N;
-    crate::metal::texel_format::half_channels(pf)
-        || direct_format(pf).and_then(|f| f.block()).is_some_and(|b| {
-            b.packed_bits.is_some() && matches!(b.color, Some(N::Ufloat | N::Sfloat))
         })
 }
 
@@ -2887,9 +2838,8 @@ pub fn storage_image_choice(
 /// `Identity` when the direct format supports the use's storage usage and the shader can declare
 /// it: with the format `Unknown` where the format serves the use without one
 /// ([`accessed_without_format`]; every such format of one numeric type shares one key, and
-/// `StorageImageChoice::numeric` keeps the type), else with its SPIR-V image format. A half-float
-/// format the use writes takes the class its writes need there instead (`half_storage_class`).
-/// Otherwise an alias view of a `MUTABLE_FORMAT` image (or the same bytes viewed as the alias
+/// `StorageImageChoice::numeric` keeps the type), else with its SPIR-V image format: the device
+/// converts every write, a half-float format's included. Otherwise an alias view of a `MUTABLE_FORMAT` image (or the same bytes viewed as the alias
 /// format, for a texture buffer): bgra8 through an rgba8 view and bgr10a2 through an rgb10a2 view
 /// (`A2R10G10B10` through `A2B10G10R10`, which NVIDIA and lavapipe store where they do not store
 /// the former) with `SwizzleBgra`, the 8-bit sRGB formats through their UNORM twin with
@@ -2909,24 +2859,11 @@ pub(crate) fn storage_choice(
     use_: StorageUse,
     profile: &DeviceProfile,
 ) -> Result<StorageImageChoice, Error> {
-    storage_choice_viewed(pf, use_, profile, true)
-}
-
-/// [`storage_choice`] of a texture whose image takes views in other formats only where
-/// `aliased`: an image viewed in its own format alone (a wrapped one made without
-/// `MUTABLE_FORMAT`) takes no half-float alias (`StorageImageClass::HalfBits`) and keeps its
-/// format's own choice, as before.
-pub(crate) fn storage_choice_viewed(
-    pf: PixelFormat,
-    use_: StorageUse,
-    profile: &DeviceProfile,
-    aliased: bool,
-) -> Result<StorageImageChoice, Error> {
     let x = x_channel(pf);
     if x && use_.texel_buffer {
         return Err(Unsupported::not_implemented(Feature::Format).into());
     }
-    let mut choice = held_storage_choice(pf, use_, profile, aliased)?;
+    let mut choice = held_storage_choice(pf, use_, profile)?;
     choice.x_channel = x;
     Ok(choice)
 }
@@ -2936,7 +2873,6 @@ fn held_storage_choice(
     pf: PixelFormat,
     use_: StorageUse,
     profile: &DeviceProfile,
-    aliased: bool,
 ) -> Result<StorageImageChoice, Error> {
     use vk::Format as F;
     let (aspects, candidates) = candidates(pf)?;
@@ -3000,26 +2936,17 @@ fn held_storage_choice(
     // alias, whose encode the shader applies before it moves green into the fourth lane.
     let srgb_x =
         x_channel(pf) && use_.write && matches!(alias, Some((_, StorageImageClass::SrgbEncode)));
-    // A half-float texture the function only writes, on a device not measured to store a written
-    // half's NaN as its bits: viewed through its unsigned integer alias, through which the shader
-    // writes the bits Metal stores (`StorageImageClass::HalfBits`).
-    if let Some(view) = half_bits_view(pf, use_, profile).filter(|_| aliased) {
-        let mut choice = StorageImageChoice::new(view, StorageImageClass::HalfBits);
-        choice.alias = Some(AliasView::new(image));
-        return Ok(choice);
-    }
     // Vulkan's conversion to a shared-exponent texel rounds each mantissa half up, where Metal
     // truncates it: an `RGB9E5Float` write takes its word alias, whose encode is Metal's, even on a
     // device that stores the format.
     let word = matches!(alias, Some((_, StorageImageClass::SharedExponentBits)));
     if storage(image) && declarable(image) && !rotated && !srgb_x && !word {
-        let class = half_storage_class(pf, use_, profile);
         if !formatless(image) {
-            return Ok(StorageImageChoice::new(image, class));
+            return Ok(StorageImageChoice::new(image, StorageImageClass::Identity));
         }
         // The declaration names no format; the choice keeps the format's numeric type for a
         // function that depends on it.
-        let mut choice = StorageImageChoice::new(F::UNDEFINED, class);
+        let mut choice = StorageImageChoice::new(F::UNDEFINED, StorageImageClass::Identity);
         choice.numeric = crate::bind::neutral::numeric_type(image);
         return Ok(choice);
     }
@@ -3050,92 +2977,10 @@ fn held_storage_choice(
     Err(Unsupported::needs_any_of(Feature::Format, alternatives).into())
 }
 
-/// The unsigned integer alias through which a function that writes a half-float texture of `pf`
-/// (`R16Float`, `RG16Float`, `RGBA16Float`, `RGBX16Float`: every format of 16-bit float
-/// channels, `metal::texel_format::half_channels`), and may read it, stores the bits Metal stores
-/// (`StorageImageClass::HalfBits`), on a device not measured to store a written `half`'s NaN as
-/// its bits (`DriverDeviation::MetalHalfTexelWrites`; there the format's own view serves, as
-/// before): `R16_UINT`, `R16G16_UINT` or `R16G16B16A16_UINT`, where the device stores it for
-/// `use_` and the shader can declare it by its SPIR-V image format. `None` elsewhere, where the
-/// format's own choice stands. `RGBX16Float`'s image is `RGBA16Float`'s: its RGBX conversion moves
-/// green's bits into the fourth lane after the class's (`StorageImageChoice:: x_channel`), and its
-/// read takes alpha 1.
-fn half_bits_view(
-    pf: PixelFormat,
-    use_: StorageUse,
-    profile: &DeviceProfile,
-) -> Option<vk::Format> {
-    use vk::Format as F;
-    let view = match pf {
-        PixelFormat::R16Float => F::R16_UINT,
-        PixelFormat::RG16Float => F::R16G16_UINT,
-        PixelFormat::RGBA16Float | PixelFormat::RGBX16Float => F::R16G16B16A16_UINT,
-        _ => return None,
-    };
-    if !use_.write || profile.takes_driver_deviation(DriverDeviation::MetalHalfTexelWrites) {
-        return None;
-    }
-    let declared = spirv_image_format(view)?;
-    let declarable = !crate::spirv::requirements::extended_format(declared)
-        || profile.fields().images.storage_extended_formats;
-    (declarable && profile.supports_format(view, use_.usage())).then_some(view)
-}
-
-/// The unsigned integer alias through which a function reads a 16-bit float texture's texels
-/// without a device decode seeing them (`DevicePolicy::half_texel_bits`,
-/// [`HalfTexelBitsPolicy::Exact`](crate::device::HalfTexelBitsPolicy::Exact)): `R16_UINT`,
-/// `R16G16_UINT` or `R16G16B16A16_UINT` for `R16Float`, `RG16Float`, and `RGBA16Float` or
-/// `RGBX16Float`, where `profile`'s device samples the alias, so the slot's second binding can
-/// view the texture in it. `None` for every other format, and where the device does not sample the
-/// alias. `RGBX16Float`'s alias is `RGBA16Float`'s: its read takes alpha 1 after the widening, as
-/// its own view's does.
-///
-/// Metal's `texture2d<half>` never widens a 16-bit float texel, so the texel's NaN comes back as
-/// its own code; a device whose decode into `f32` canonicalizes a NaN has destroyed the code
-/// before the shader sees it (MoltenVK on an Apple GPU, measured; ANV on Intel's GPUs, from the
-/// conformance suite's replay). Reading the alias hands the shader the 16 bits themselves, which
-/// it widens exactly (`lower::arith::narrow::from_bits` is the translation's, a private item).
-pub fn half_bits_read_view(pf: PixelFormat, profile: &DeviceProfile) -> Option<vk::Format> {
-    use vk::Format as F;
-    let view = match pf {
-        PixelFormat::R16Float => F::R16_UINT,
-        PixelFormat::RG16Float => F::R16G16_UINT,
-        PixelFormat::RGBA16Float | PixelFormat::RGBX16Float => F::R16G16B16A16_UINT,
-        _ => return None,
-    };
-    profile
-        .supports_format(view, FormatUsage::SampledImage)
-        .then_some(view)
-}
-
-/// The unsigned integer alias through which a heap's twin (`StorageFormatClass::HalfBits`, a
-/// formatless declaration) holds a written half-float texture of `pf` on `profile`:
-/// [`half_bits_view`]'s for a write, where the device writes it without a format. `None` for
-/// every other format, and on a device of `DriverDeviation::MetalHalfTexelWrites`.
-pub(crate) fn heap_half_bits_view(pf: PixelFormat, profile: &DeviceProfile) -> Option<vk::Format> {
-    let use_ = StorageUse::texture(false, true);
-    let view = half_bits_view(pf, use_, profile)?;
-    without_format_gaps(view, use_, profile)
-        .is_empty()
-        .then_some(view)
-}
-
-/// Whether a function's `half` and `float` writes through a heap handle store a half-float
-/// member's bits through the heap's unsigned integer twin on `profile`
-/// (`StorageFormatClass::HalfBits`): every format of
-/// `metal::texel_format::HALF_BITS_FORMATS` has its alias there ([`heap_half_bits_view`]), so
-/// the twin's indices (`heap_half_bits_indices`) name only members it holds.
-pub(crate) fn heap_half_bits(profile: &DeviceProfile) -> bool {
-    crate::metal::texel_format::HALF_BITS_FORMATS
-        .iter()
-        .all(|&pf| heap_half_bits_view(pf, profile).is_some())
-}
-
 /// The formats a storage binding views a texture of `pf` as on `profile`, for any use: the
 /// read-and-write choice's ([`storage_image_choice`]: its alias view's format, else the direct
-/// format) and a written-only one's (a half-float texture's unsigned integer alias on a device
-/// not measured to store a written `half`'s NaN as its bits). A texture's image lists each among
-/// its view formats. Empty where the device stores no texture of `pf`.
+/// format) and a written-only one's where it differs. A texture's image lists each among its view
+/// formats. Empty where the device stores no texture of `pf`.
 pub fn storage_view_formats(pf: PixelFormat, profile: &DeviceProfile) -> Vec<vk::Format> {
     let mut formats = Vec::new();
     for use_ in [
@@ -3223,68 +3068,24 @@ pub(crate) fn fetch_view_alias(format: vk::Format, profile: &DeviceProfile) -> O
     }
 }
 
-/// The class of a storage choice that views `pf`'s own format for `use_`: for a half-float
-/// format (`R16Float`, `RG16Float`, `RGBA16Float`, `RGBX16Float`) the function writes, by what the device is
-/// measured to store for a written `float` (Metal rounds each channel toward zero and stores
-/// every NaN as `0x7e00`): `Identity` where it rounds and stores NaNs as Metal
-/// does (`DriverDeviation::MetalHalfStorageWrites` and `MetalHalfStorageNans`), `HalfQuietNan`
-/// where it rounds alone, else `HalfTowardZero`. An `RG11B10Float` texture the function writes
-/// takes `SmallFloatQuietNan` on every device, and one of a 1-bit alpha ([`one_bit_alpha`])
-/// `OneBitAlpha` on a device of `DriverDeviation::MetalNormStorageWrites` (elsewhere the shader
-/// rounds it by its class). Otherwise `Identity`.
-pub(crate) fn half_storage_class(
-    pf: PixelFormat,
-    use_: StorageUse,
-    profile: &DeviceProfile,
-) -> StorageImageClass {
-    let half = matches!(
-        pf,
-        PixelFormat::R16Float
-            | PixelFormat::RG16Float
-            | PixelFormat::RGBA16Float
-            | PixelFormat::RGBX16Float
-    );
-    match (half, pf == PixelFormat::RG11B10Float, use_.write) {
-        (true, _, true) => half_write_class(profile),
-        (_, true, true) => StorageImageClass::SmallFloatQuietNan,
-        (_, _, true)
-            if one_bit_alpha(pf)
-                && profile.takes_driver_deviation(DriverDeviation::MetalNormStorageWrites) =>
-        {
-            StorageImageClass::OneBitAlpha
-        }
-        _ => StorageImageClass::Identity,
-    }
-}
-
 /// Whether `pf`'s alpha is a 1-bit unorm channel (`crate::metal::texel_format::PackedTexels::Rgb5A1`:
 /// `A1BGR5Unorm`, `BGR5A1Unorm`), whose `float` write Metal stores as 1 only above one half, where
 /// a device measured to store every other normalized channel as Metal does rounds the half up
-/// (RADV).
+/// (RADV): the device's conversion of such a write is noted (`lower::texture`'s
+/// `norm_storage_facts`).
 pub(crate) fn one_bit_alpha(pf: PixelFormat) -> bool {
     crate::metal::texel_format::PackedTexels::of(pf)
         == Some(crate::metal::texel_format::PackedTexels::Rgb5A1)
 }
 
 /// Whether `profile` stores a texture (or texture buffer) of a format with a 1-bit alpha
-/// ([`one_bit_alpha`]) for `use_`: a heap write that may reach one tests its handle's class.
+/// ([`one_bit_alpha`]) for `use_`: a write whose bound texture may be one notes the device's
+/// conversion.
 pub(crate) fn one_bit_storage(use_: StorageUse, profile: &DeviceProfile) -> bool {
     PixelFormat::ALL
         .iter()
         .filter(|&&pf| one_bit_alpha(pf))
         .any(|&pf| storage_choice(pf, use_, profile).is_ok())
-}
-
-/// The class a `float` write to a half-float storage image takes on `profile`
-/// ([`half_storage_class`]).
-pub(crate) fn half_write_class(profile: &DeviceProfile) -> StorageImageClass {
-    let rounds = profile.takes_driver_deviation(DriverDeviation::MetalHalfStorageWrites);
-    let nans = profile.takes_driver_deviation(DriverDeviation::MetalHalfStorageNans);
-    match (rounds, nans) {
-        (true, true) => StorageImageClass::Identity,
-        (true, false) => StorageImageClass::HalfQuietNan,
-        (false, _) => StorageImageClass::HalfTowardZero,
-    }
 }
 
 /// The SPIR-V `Image Format` a storage image of Vulkan format `format` is declared with (Vulkan

@@ -19,7 +19,7 @@ use crate::lower::stage_io::{
 use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::lower_inputs::{
-    CaptureForm, FactorLane, RotatedBlendForm, VertexFetch, ViewportCompensation,
+    FactorLane, RotatedBlendForm, VertexFetch, ViewportCompensation,
 };
 use crate::pipeline::stage_io::{
     DepthMode, Interpolation, IoNumeric, IoRole, IoType, IoVariable, Sampling, StageBuiltin,
@@ -171,7 +171,6 @@ pub(super) fn io_type(f: Form) -> IoType {
         },
         components: f.lanes,
         source_bits: f.bits(),
-        bits: 32,
     }
 }
 
@@ -200,13 +199,25 @@ fn user(
     ty: IoType,
     deco: IoDecor,
 ) -> Result<usize, Error> {
+    declare(sp, key, dir, ty, deco, false)
+}
+
+/// [`user`], declared with 16-bit `float` lanes where `half` (`IoObject::User::half`).
+fn declare(
+    sp: &mut StageIoPlan,
+    key: VaryingKey,
+    dir: IoDir,
+    ty: IoType,
+    deco: IoDecor,
+    half: bool,
+) -> Result<usize, Error> {
     let o = IoObject::User {
         key: key.clone(),
         dir,
         numeric: ty.numeric,
         components: ty.components,
         deco,
-        half: ty.bits == 16,
+        half,
     };
     // One key per direction: a second, different declaration of the same key is not a Metal
     // interface.
@@ -433,7 +444,6 @@ pub fn param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<(), Error> {
     let mut at_loop_sample = false;
     let mut uniform = false;
     let mut quad_primitive = false;
-    let mut widened = false;
     let link = match (&b.role, stage) {
         // A merged draw's vertex reads its corner's command's draw values.
         (
@@ -470,9 +480,9 @@ pub fn param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<(), Error> {
                 .copied();
             let pulled = entry.filter(|f| matches!(f, VertexFetch::Pulled { .. }));
             let f = io_form(cx, ty)?;
-            // The indexed capture form's and the de-indexed form's draws have no indices, so
-            // fixed-function input would fetch at the stream position: their projection pulls
-            // every attribute, and a hand-built one that does not is refused.
+            // The de-indexed and private list forms' draws have no indices, so fixed-function
+            // input would fetch at the stream position: their projection pulls every attribute,
+            // and a hand-built one that does not is refused.
             if pulled.is_none() && captured_index_type(cx).is_some() {
                 return Err(Unsupported::not_implemented(indices_feature(cx)).into());
             }
@@ -485,16 +495,9 @@ pub fn param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<(), Error> {
                 });
                 return Ok(());
             }
-            // The device's fixed-function input widens a narrow-float format with a widening of
-            // its own, which carries the field's bits up into the `float` payload; Metal's fetch
-            // answers its canonical NaN. A `float` parameter's load is canonicalized
-            // (`Source::WidenedAttribute`); a `half` one keeps the fetched code's own bits, as
-            // Metal's `half` attribute does, so it is loaded as it is.
-            let narrow_float = matches!(
-                entry,
-                Some(VertexFetch::FixedFunction { narrow_float: true })
-            );
-            widened = narrow_float && f.float_fmt() == Some(FloatFmt::F32);
+            // Fixed-function input: the format is link-time state, and so is what the device's
+            // conversion of it may answer otherwise than Metal's fetch, which link notes on the
+            // pipeline's vertex stage (`pipeline::link::vertex::fixed_function_notes`).
             let key = VaryingKey::attribute(index);
             let sp = &mut cx.families.stage_io;
             let object = user(
@@ -508,10 +511,7 @@ pub fn param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<(), Error> {
                 &mut sp.interface.inputs,
                 IoVariable {
                     key,
-                    role: IoRole::Attribute {
-                        index,
-                        narrow_float,
-                    },
+                    role: IoRole::Attribute { index },
                     ty: io_type(f),
                 },
             );
@@ -720,8 +720,9 @@ pub fn param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<(), Error> {
         {
             return zero_index(cx, b, ty, StageBuiltin::ViewportIndex);
         }
-        // The indexed capture form draws without indices: its vertex is the one its index names,
-        // and its base vertex the layout's, whatever the profile's draw parameters.
+        // The de-indexed and private list forms draw without indices: the vertex is the one its
+        // index names, and its base vertex the layout's (the list's), whatever the profile's draw
+        // parameters.
         (ParamRole::Builtin(Builtin::VertexId), Stage::Vertex)
             if captured_index_type(cx).is_some() =>
         {
@@ -845,9 +846,7 @@ pub fn param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<(), Error> {
     };
     cx.families.stage_io.params.push(PlannedParam {
         param: b.param,
-        source: if widened {
-            Source::WidenedAttribute(link)
-        } else if at_loop_sample {
+        source: if at_loop_sample {
             Source::AtLoopSample(link)
         } else if at_pixel {
             Source::PixelCenter(link)
@@ -949,7 +948,6 @@ fn zeroed_output(
         numeric,
         components: 4,
         source_bits: 32,
-        bits: 32,
     };
     if let Some(rules) = cx.inputs.color_writes.get(&color).copied() {
         cx.families
@@ -1395,7 +1393,6 @@ fn selected_index(sp: &mut StageIoPlan, index: RawIndex) -> Result<usize, Error>
         numeric: IoNumeric::Uint,
         components: 1,
         source_bits: 32,
-        bits: 32,
     };
     let deco = IoDecor {
         packed: true,
@@ -1453,7 +1450,6 @@ pub(super) fn window_depth(sp: &mut StageIoPlan, dir: IoDir) -> Result<usize, Er
         numeric: IoNumeric::Float,
         components: 1,
         source_bits: 32,
-        bits: 32,
     };
     let mut deco = IoDecor {
         packed: true,
@@ -1556,7 +1552,6 @@ fn barycentric_weights(sp: &mut StageIoPlan, perspective: bool) -> Result<usize,
         numeric: IoNumeric::Float,
         components: 2,
         source_bits: 32,
-        bits: 32,
     };
     let deco = IoDecor {
         interpolation: if perspective {
@@ -1649,7 +1644,6 @@ fn flat_uint(
         numeric: IoNumeric::Uint,
         components: 1,
         source_bits: 32,
-        bits: 32,
     };
     let mut deco = IoDecor {
         packed: true,
@@ -2091,26 +2085,14 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             refuse_bfloat_color(cx.entry, ty)?;
             // A `half` output to an attachment the pipeline has: Metal may carry its last
             // operation at `float` precision into the blend and the format's conversion, where
-            // the function rounds it to `half` first. An attachment whose channels take the
-            // output at `float` precision where Metal does is recorded, and the arith family's plan
-            // decides its note (`arith::output_precision`); without the attachment's entry (a
-            // function compiled without the map among them) the output keeps the `half` and the
-            // note, and links all the same.
+            // the function rounds it to `half` first (`arith::output_precision`).
             if let OutputRole::RenderTarget {
                 attachment: AbiInt::Const(color),
                 ..
             } = o.role
             {
-                let lanes = cx.inputs.half_output_lanes.get(&color).copied();
-                match lanes.filter(|_| half_color(cx.entry, ty)) {
-                    Some(lanes) => {
-                        let sp = &mut cx.families.stage_io;
-                        sp.interface.half_output_lanes.insert(color, lanes);
-                    }
-                    None if half_color(cx.entry, ty) && !unattached.contains(&color) => {
-                        crate::lower::arith::output_precision::note_half_output(cx, color);
-                    }
-                    None => {}
+                if half_color(cx.entry, ty) && !unattached.contains(&color) {
+                    crate::lower::arith::output_precision::note_half_output(cx, color);
                 }
                 // A `float` output of a module without fast math: the pipeline decides by the
                 // attachment's blend whether Metal stores it otherwise (`float_blend_colors`).
@@ -2469,10 +2451,6 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             sp.words = sp.words.saturating_add(super::WINDOW_DEPTH_WORDS);
         }
     }
-    // The capture form: each vertex's clip position and point size, written to its record.
-    if let (Some(form), Stage::Vertex) = (cx.inputs.captured_positions, cx.stage) {
-        capture(cx, form)?;
-    }
     // The primitive ID a fragment function reads from its varying (an emulated post-tessellation
     // vertex function's is its patch's position, `lower::tessellation::emulated`).
     if cx.inputs.primitive_id_varying && cx.stage == Stage::Vertex {
@@ -2522,83 +2500,14 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Plan a vertex function's capture form `form` (`LoweringInputs::captured_positions`): the
-/// record of its `Position` output and its own `PointSize` output ([`super::Capture`]), the
-/// record's address and layout push fields, the vertex and instance indices, the indexed form's
-/// index read ([`captured_index`], whatever else the function reads: its record's restart flag
-/// and a strip's restart test need it), and
-/// `RuntimeFact::CapturedPositions`, which every function compiled in the form states, so its
-/// plans state the variant. A function that writes no position rasterizes nothing and plans no
-/// record. Refused [`Feature::TileReach`]: a post-tessellation vertex function (its vertices are
-/// the tessellator's, not the draw's), and a device without device addresses or without the
-/// vertex stage's stores, naming what it needs.
-fn capture(cx: &mut SelectCx<'_>, form: CaptureForm) -> Result<(), Error> {
-    if matches!(cx.entry.ep.stage, AirStage::Vertex { patch: Some(_) }) {
-        return Err(Unsupported::not_implemented(Feature::TileReach).into());
-    }
-    cx.facts.insert(RuntimeFact::CapturedPositions { form });
-    // The indexed form reads its index whatever else it reads: a strip's restart index runs no
-    // body.
-    if let Some(ty) = form.index_type() {
-        captured_index(cx, ty)?;
-    }
-    let output = |o: &IoObject, b| matches!(o, IoObject::Builtin { builtin, dir: IoDir::Output, .. } if *builtin == b);
-    let sp = &cx.families.stage_io;
-    let Some(position) = sp.objects.iter().position(|o| output(o, B::Position)) else {
-        return Ok(());
-    };
-    // The function's own point size: the default one the vertex stage writes is planned later,
-    // and the record takes 1.0 for it.
-    let point_size = sp
-        .outputs
-        .iter()
-        .map(|o| o.link.object)
-        .find(|&i| sp.objects.get(i).is_some_and(|o| output(o, B::PointSize)));
-    refuse_unaddressed(cx)?;
-    let f = cx.profile.fields();
-    let enabled = &f.enabled.features;
-    if let Some(stores) =
-        crate::lower::access::dynamic::stage_stores(Stage::Vertex).find(|s| !enabled.contains(s))
-    {
-        return Err(Unsupported::needs(Feature::TileReach, Capability::Feature(stores)).into());
-    }
-    cx.push.insert(PushField::CaptureAddress);
-    cx.push.insert(PushField::CaptureLayout);
-    let sp = &mut cx.families.stage_io;
-    let vertex = builtin(
-        sp,
-        B::VertexIndex,
-        IoDir::Input,
-        Shape::U32,
-        StageBuiltin::VertexIndex,
-    );
-    let instance = builtin(
-        sp,
-        B::InstanceIndex,
-        IoDir::Input,
-        Shape::U32,
-        StageBuiltin::InstanceIndex,
-    );
-    sp.capture = Some(super::Capture {
-        position,
-        point_size,
-        vertex,
-        instance,
-    });
-    sp.words = sp.words.saturating_add(super::CAPTURE_WORDS);
-    Ok(())
-}
-
 /// The index type of the draw whose indices a vertex function reads at their address: the
-/// indexed capture form's (`CaptureForm::Indexed`), else the private list form's `u32`
-/// (`LoweringInputs::private_list`), else the primitive ID's de-indexed form's
-/// (`LoweringInputs::primitive_id_indices`, under `primitive_id_varying`); `None` for any other
-/// function.
+/// private list form's `u32` (`LoweringInputs::private_list`), else the primitive ID's de-indexed
+/// form's (`LoweringInputs::primitive_id_indices`, under `primitive_id_varying`); `None` for any
+/// other function.
 pub(super) fn captured_index_type(cx: &SelectCx<'_>) -> Option<crate::metal::IndexType> {
-    match (cx.stage, cx.inputs.captured_positions) {
-        (Stage::Vertex, Some(form)) => form.index_type(),
-        (Stage::Vertex, None) if cx.inputs.private_list => Some(crate::metal::IndexType::UInt32),
-        (Stage::Vertex, None) => cx
+    match cx.stage {
+        Stage::Vertex if cx.inputs.private_list => Some(crate::metal::IndexType::UInt32),
+        Stage::Vertex => cx
             .inputs
             .primitive_id_indices
             .filter(|_| cx.inputs.primitive_id_varying),
@@ -2609,22 +2518,20 @@ pub(super) fn captured_index_type(cx: &SelectCx<'_>) -> Option<crate::metal::Ind
 /// Whether a vertex function runs in the private list form (`LoweringInputs::private_list`): its
 /// list's positions from the draw's first vertex, Metal's base vertex in the word before.
 pub(super) fn listed(cx: &SelectCx<'_>) -> bool {
-    cx.stage == Stage::Vertex && cx.inputs.captured_positions.is_none() && cx.inputs.private_list
+    cx.stage == Stage::Vertex && cx.inputs.private_list
 }
 
-/// The feature a form that reads a draw's indices or records at their addresses serves: tile
-/// reach for the capture form, Metal's private primitive types for the private list form, the
-/// primitive ID for its de-indexed form.
+/// The feature a form that reads a draw's indices at their address serves: Metal's private
+/// primitive types for the private list form, the primitive ID for its de-indexed form.
 fn indices_feature(cx: &SelectCx<'_>) -> Feature {
-    match cx.inputs.captured_positions {
-        Some(_) => Feature::TileReach,
-        None if listed(cx) => Feature::PrivatePrimitives,
-        None => Feature::PrimitiveId,
+    match listed(cx) {
+        true => Feature::PrivatePrimitives,
+        false => Feature::PrimitiveId,
     }
 }
 
-/// Refuse the capture form or the de-indexed form ([`indices_feature`]) on a device without
-/// device addresses, naming what it needs: the records and the indices are reached by address.
+/// Refuse the de-indexed or private list form ([`indices_feature`]) on a device without device
+/// addresses, naming what it needs: the indices are reached by address.
 fn refuse_unaddressed(cx: &SelectCx<'_>) -> Result<(), Error> {
     if cx.profile.fields().buffer_access != crate::device::profile::BufferAccess::Addressed {
         return Err(Unsupported::needs_any_of(
@@ -2636,9 +2543,9 @@ fn refuse_unaddressed(cx: &SelectCx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Plan the index read of type `ty` of the indexed capture form, the de-indexed form or the
-/// private list form once ([`super::CapturedIndex`]): its address push field, the capture and
-/// de-indexed forms' layout, the private list form's first vertex (as the primitive ID's,
+/// Plan the index read of type `ty` of the de-indexed form or the private list form once
+/// ([`super::CapturedIndex`]): its address push field, the de-indexed form's layout, the private
+/// list form's first vertex (as the primitive ID's,
 /// [`first_vertex`]) and its fact, and the vertex index builtin. Refused ([`indices_feature`]) on
 /// a device without device addresses.
 pub(super) fn captured_index(
@@ -2674,7 +2581,8 @@ pub(super) fn captured_index(
 }
 
 /// Plan builtin parameter `b` of AIR type `ty`, a scalar integer, of a vertex function in the
-/// indexed capture form of index type `index` (`None` for `[[base_vertex]]`): `[[vertex_id]]` is
+/// de-indexed or private list form of index type `index` (`None` for `[[base_vertex]]`):
+/// `[[vertex_id]]` is
 /// the vertex its index names ([`Source::CapturedVertex`]), `[[base_vertex]]` the layout's base
 /// vertex ([`Source::CapturedBaseVertex`]).
 fn captured_param(
@@ -2713,14 +2621,13 @@ fn captured_param(
 /// (`Unsupported{GpuEncodedIndirectCommands, NotImplemented}`): one compiled without
 /// `replay_bindings`, or under an input that reads the draw's own vertex or instance indices or
 /// draws it more than once (the primitive ID's varying or de-indexed form, the private list form,
-/// the capture form, amplifications drawn apart, tessellation).
+/// amplifications drawn apart, tessellation).
 fn merged(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     let i = cx.inputs;
     if !i.replay_bindings
         || i.primitive_id_varying
         || i.primitive_id_indices.is_some()
         || i.private_list
-        || i.captured_positions.is_some()
         || i.amplification_draws.is_some()
         || i.tessellation.is_some()
     {
@@ -2903,8 +2810,9 @@ fn output(cx: &mut SelectCx<'_>, o: &OutputBinding, ty: AirTypeId) -> Result<Lin
         }
     };
     Ok(match &o.role {
-        // Decorated `Invariant` whether or not Metal's position is `[[invariant]]`: a draw's
-        // captured positions (the tile reach's capture variant) are then its drawn ones.
+        // Decorated `Invariant` whether or not Metal's position is `[[invariant]]`: a draw run
+        // through more than one variant of its pipeline (each color group's) rasterizes the same
+        // positions in each.
         OutputRole::Position { .. } if vertex => {
             let f = io_form(cx, ty)?;
             float_lanes(f, 4)?;
@@ -3067,11 +2975,6 @@ fn output(cx: &mut SelectCx<'_>, o: &OutputBinding, ty: AirTypeId) -> Result<Lin
             }
             let f = io_form(cx, ty)?;
             let io = color_type(cx, attachment, f)?;
-            // Written as a half's bits through 16-bit lanes (`color_write::half_output`).
-            let io = match index == 0 && super::color_write::half_output(cx, attachment, f) {
-                true => IoType { bits: 16, ..io },
-                false => io,
-            };
             // An extended-range attachment's raw texel, through a variable of its raw components,
             // and a word attachment's word; the interface keeps the Metal output's type.
             let declared = match super::word_color::plan(cx, attachment, index, f)? {
@@ -3083,8 +2986,12 @@ fn output(cx: &mut SelectCx<'_>, o: &OutputBinding, ty: AirTypeId) -> Result<Lin
                 index: (index == 1).then_some(1),
                 ..IoDecor::default()
             };
+            let half = declared == io && half_variable(cx, attachment, f);
             let sp = &mut cx.families.stage_io;
-            let object = user(sp, key.clone(), IoDir::Output, declared, deco)?;
+            let object = declare(sp, key.clone(), IoDir::Output, declared, deco, half)?;
+            if half {
+                sp.interface.half_outputs.push(key.clone());
+            }
             push_var(
                 &mut sp.interface.outputs,
                 IoVariable {
@@ -3108,12 +3015,9 @@ fn output(cx: &mut SelectCx<'_>, o: &OutputBinding, ty: AirTypeId) -> Result<Lin
                 DepthQualifier::Greater => (DepthMode::Greater, Some(ExecMode::DepthGreater)),
                 DepthQualifier::Less => (DepthMode::Less, Some(ExecMode::DepthLess)),
             };
-            // A depth rounded to Metal's code can land below the fragment's own, or above it, so
-            // the function promises neither.
-            let codes = depth16_codes(cx);
             let sp = &mut cx.families.stage_io;
             sp.modes.push(ExecMode::DepthReplacing);
-            sp.modes.extend(extra.filter(|_| !codes));
+            sp.modes.extend(extra);
             let link = out(
                 cx,
                 B::FragDepth,
@@ -3127,14 +3031,10 @@ fn output(cx: &mut SelectCx<'_>, o: &OutputBinding, ty: AirTypeId) -> Result<Lin
                 cx.facts.insert(RuntimeFact::DepthClampRange);
                 cx.push.insert(PushField::DepthClampRange);
             }
-            if codes {
-                cx.facts.insert(RuntimeFact::Depth16Codes { biased: false });
-            }
             cx.families.stage_io.depth_clamp = Some(DepthClamp {
                 object: link.object,
                 clamps: clamps_fragment_depth(cx),
                 range,
-                codes,
             });
             cx.families.fragment.depth_output = true;
             link
@@ -3188,9 +3088,6 @@ const UNIFORM_WORDS: u64 = 64;
 /// The words a use of a [`Source::QuadPrimitive`] parameter adds to a load: the shift and its
 /// constant.
 const QUAD_PRIMITIVE_WORDS: u64 = 8;
-/// The words a use of a [`Source::WidenedAttribute`] parameter adds to a load: the NaN test on the
-/// bits, the select, and their constants.
-const CANONICAL_NAN_WORDS: u64 = 32;
 
 /// The per-stage interface limits and the size estimate.
 pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
@@ -3226,10 +3123,7 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     // where Metal shades each vertex the indices name as its GPU shades it: a function that
     // writes memory would write once per index. The private list form runs it once per list
     // position, as Metal runs its private types.
-    let deindexed = cx.stage == Stage::Vertex
-        && cx.inputs.captured_positions.is_none()
-        && captured_index_type(cx).is_some()
-        && !listed(cx);
+    let deindexed = cx.stage == Stage::Vertex && captured_index_type(cx).is_some() && !listed(cx);
     if deindexed && writes {
         return Err(Unsupported::not_implemented(Feature::PrimitiveId).into());
     }
@@ -3321,31 +3215,6 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         });
         sp.interface.sample_mask = Some(masks);
     }
-    // A fragment function that returns no depth under `LoweringInputs::depth16_codes` stores the
-    // depth Metal stores for the fragment at entry, its Vulkan bias recorded as zero: objects of
-    // its own, not the function's interface, which writes no depth. One that reads its position's
-    // depth keeps the device's conversion: whether Metal's position takes the draw's bias is
-    // unmeasured, and without the Vulkan bias it would not. Under a bias of known side
-    // (`LoweringInputs::depth16_bias_raises`) it declares the side (`depth16::bias_side_mode`).
-    if cx.stage == Stage::Fragment
-        && depth16_codes(cx)
-        && !cx.families.fragment.depth_output
-        && !cx.families.stage_io.interface.position_depth
-    {
-        let raises = cx.inputs.depth16_bias_raises;
-        let sp = &mut cx.families.stage_io;
-        let depth = builtin_object(sp, B::FragDepth, IoDir::Output, Shape::F32);
-        let coord = builtin_object(sp, B::FragCoord, IoDir::Input, Shape::FVec(4));
-        sp.modes.push(ExecMode::DepthReplacing);
-        sp.modes.extend(raises.map(super::depth16::bias_side_mode));
-        sp.depth16 = Some(super::Depth16Store {
-            depth,
-            coord,
-            raises,
-        });
-        cx.facts.insert(RuntimeFact::Depth16Codes { biased: true });
-        cx.push.insert(PushField::DepthBias);
-    }
     // Size: every object, the parameters' words, and a store per output element; a count's
     // compare and select (and its constant 0) are a store's words more, and so is an
     // amplification's offset added; an amplified output is a store, an add and a count's.
@@ -3380,7 +3249,7 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         // comparison and the kill.
         + 40 * u64::from(sp.alpha_test.is_some())
         + compensation_stores(sp.compensation)
-        + sp.depth_clamp.map_or(0, |d| match (d.range, d.clamps || d.codes) {
+        + sp.depth_clamp.map_or(0, |d| match (d.range, d.clamps) {
             // The `[0, 1]` selects, the range's two clamps and the negative NaN's select.
             (true, _) => 14,
             (false, true) => 5,
@@ -3393,24 +3262,15 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         .values()
         .filter(|i| matches!(i.kind, crate::air::ir::InstKind::Ret(_)))
         .count() as u64;
-    // Each return also rounds every color output that rounds, writes the halves' bits, and encodes
-    // the extended-range colors' texels.
+    // Each return also rounds every color output that rounds, and encodes the extended-range
+    // colors' texels.
     let rounding = super::color_write::words(sp.rounded.values().copied())
-        .saturating_add(
-            crate::lower::arith::color_write::HALF_BITS_WORDS
-                .saturating_mul(sp.halves.len() as u64),
-        )
         .saturating_add(super::extended_color::WORDS.saturating_mul(sp.extended.len() as u64))
         .saturating_add(
             (sp.words_written.values())
                 .map(|&w| super::word_color::encode_words(w))
                 .fold(0u64, u64::saturating_add),
-        )
-        // A returned depth's code.
-        .saturating_add(match sp.depth_clamp.is_some_and(|d| d.codes) {
-            true => super::depth16::CODE_WORDS,
-            false => 0,
-        });
+        );
     sp.words = (sp.objects.len() as u64)
         .saturating_mul(OBJECT_WORDS)
         .saturating_add(params)
@@ -3420,34 +3280,24 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
                 .saturating_mul(rets)
                 .saturating_mul(STORE_WORDS),
         )
-        .saturating_add(rounding.saturating_mul(rets))
-        // The depth stored at entry.
-        .saturating_add(match sp.depth16 {
-            Some(d) if d.raises.is_some() => {
-                super::depth16::STORE_WORDS + super::depth16::SIDE_WORDS
-            }
-            Some(_) => super::depth16::STORE_WORDS,
-            None => 0,
-        });
+        .saturating_add(rounding.saturating_mul(rets));
     Ok(())
 }
 
-/// Whether a fragment function stores Metal's `Depth16Unorm` codes itself
-/// (`LoweringInputs::depth16_codes`): compiled under the input, it neither declares nor takes
-/// early fragment tests (the storage form's, `fetch_early_tests`) nor runs its draw's tests itself,
-/// where the device's tests take its depth before it runs.
-fn depth16_codes(cx: &SelectCx<'_>) -> bool {
-    let early = matches!(
-        cx.entry.ep.stage,
-        AirStage::Fragment {
-            early_fragment_tests: true
-        }
-    );
-    cx.stage == Stage::Fragment
-        && cx.inputs.depth16_codes
-        && !early
-        && !cx.families.fragment.fetch_early_tests
-        && !cx.inputs.shader_tests
+/// Whether a color output of form `f` to `attachment`, through a variable of its own type, is
+/// declared with 16-bit `float` lanes (`StageIo::half_outputs`): a `half` output on a profile that
+/// enables `storageInputOutput16` and `shaderFloat16`, so the device receives the `half` the
+/// function returns as a `half`, as Metal's attachment does, and blends and converts it as its own
+/// `half` output. Its value is a `half`, also where the attachment's write rounds a lane
+/// (`color_write::plan`: a `half` lane rounds only to a float format of no more precision and the
+/// same exponent range), so the conversion that stores it is exact. Not to an attachment held with
+/// its channels rotated, whose output may be premultiplied in `float` (`rotated_blend_form`).
+fn half_variable(cx: &SelectCx<'_>, attachment: u32, f: Form) -> bool {
+    let leaf = cx.profile.fields().leaf;
+    f.float_fmt() == Some(FloatFmt::Half)
+        && leaf.input_output_16bit
+        && leaf.float16
+        && !cx.inputs.rotated_colors.contains(&attachment)
 }
 
 /// Whether AIR type `ty` of entry `e` is `half` or a vector of it: a `half` color output
@@ -3528,7 +3378,6 @@ fn param_words(cx: &SelectCx<'_>) -> u64 {
                 loaded.push((p.param, USE_WORDS + PIXEL_WORDS))
             }
             Source::Uniform(_) => loaded.push((p.param, USE_WORDS + UNIFORM_WORDS)),
-            Source::WidenedAttribute(_) => loaded.push((p.param, USE_WORDS + CANONICAL_NAN_WORDS)),
             Source::Pulled(r) => fetch_words = fetch_words.saturating_add(u64::from(r.words())),
         }
     }

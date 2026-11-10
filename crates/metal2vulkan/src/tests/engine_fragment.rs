@@ -162,11 +162,14 @@ fn fragment_quads(p: &DeviceProfile) -> bool {
 /// whole-quad exit where the profile has fragment quad operations, else demoted, else refused
 /// needing demote.
 ///
-/// Where the discard form allows it but the profile lacks `shaderQuadControl`, the simdgroup
-/// operation is refused needing it: it counts the helpers Metal runs, which only full quads give.
+/// Where the discard form allows it but the profile lacks `shaderQuadControl` and its driver does
+/// not run Metal's helpers (`DriverDeviation::MetalFullQuads`), the simdgroup operation is refused
+/// needing it: it counts the helpers Metal runs, which only full quads give.
 fn simd_after_discard(bc: &[u8], entry: &str, stem: &str, p: &DeviceProfile) {
     let formed = fragment_quads(p) || p.fields().fragment.demote_to_helper;
-    if formed && !p.fields().subgroup.quad_control {
+    let full_quads = p.fields().subgroup.quad_control
+        || p.takes_driver_deviation(crate::error::DriverDeviation::MetalFullQuads);
+    if formed && !full_quads {
         assert_eq!(
             refusal(bc, entry, p),
             (
@@ -602,15 +605,30 @@ fn framebuffer_fetch_reads_in_an_ordered_form_where_the_device_has_one() {
     assert!(forms.iter().all(|&n| n > 0), "{forms:?}");
 }
 
+/// Whether module `words` holds a constant composite of 256 or more constituents: Metal's sRGB
+/// table (`lower::arith::srgb::declare`), which no other initializer of these fixtures reaches.
+pub(super) fn holds_srgb_table(words: &[u32]) -> bool {
+    const CONSTANT_COMPOSITE: u32 = 44;
+    let mut at = 5;
+    while let Some(&first) = words.get(at) {
+        let count = (first >> 16) as usize;
+        if first & 0xffff == CONSTANT_COMPOSITE && count >= 3 + 256 {
+            return true;
+        }
+        at += count.max(1);
+    }
+    false
+}
+
 /// On a device that reads a fetched color through an input attachment (both lavapipes), an
-/// `RGBA8Unorm_sRGB` or `BGRA8Unorm_sRGB` color the pipeline names (`LoweringInputs::srgb_fetches`)
-/// is read through Metal's decode: the module holds Metal's sRGB table (256 words of initializer)
-/// and the interface records the color; compiled without the input, the read is the device's, and
-/// the interface records nothing. The render pipeline compile names the color from its attachments,
-/// and a fragment compiled without the input is `NeedsInput(ColorWrites)` in that pipeline. Every
-/// module passes L3.
+/// `RGBA8Unorm_sRGB` or `BGRA8Unorm_sRGB` color reads the device's own decode through its input
+/// attachment: the render pipeline's fragment module is the one an `RGBA8Unorm` attachment's
+/// pipeline takes, word for word, holding no Metal sRGB table; the interface records the `float`
+/// colors the device decodes (`StageIo::decoded_fetches`), and the pipeline notes
+/// `PrecisionNote::SrgbTexelDecode` for the sRGB attachment alone. A fragment compiled alone links
+/// into the sRGB pipeline exactly as into the `RGBA8Unorm` one. Every module passes L3.
 #[test]
-fn an_srgb_input_attachment_is_read_through_metals_decode() {
+fn an_srgb_input_attachment_reads_the_devices_decode() {
     let (Some(bc), Some(io)) = (fixture("fragment_fetch"), fixture("stage_io")) else {
         return;
     };
@@ -619,31 +637,20 @@ fn an_srgb_input_attachment_is_read_through_metals_decode() {
         if !p.fields().fragment.rasterization_order_color_access {
             continue;
         }
-        let mut inputs = LoweringInputs::new();
-        inputs.srgb_fetches = std::collections::BTreeSet::from([0]);
-        let snapped =
-            compile_with(&bc, "fetch_blend", &p, &inputs).unwrap_or_else(|e| panic!("{stem}: {e}"));
-        link_and_validate(&snapped, &p).unwrap_or_else(|e| panic!("{stem}: L3: {e}"));
         let plain = compile_with(&bc, "fetch_blend", &p, &LoweringInputs::new())
             .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        assert_eq!(attachments(&snapped), [0, 1, 2], "{stem}");
+        link_and_validate(&plain, &p).unwrap_or_else(|e| panic!("{stem}: L3: {e}"));
+        assert_eq!(attachments(&plain), [0, 1, 2], "{stem}");
         assert_eq!(
-            snapped.interface.io.srgb_fetches,
-            std::collections::BTreeSet::from([0]),
+            plain.interface.io.decoded_fetches,
+            std::collections::BTreeSet::from([0, 2]),
             "{stem}"
         );
-        assert!(plain.interface.io.srgb_fetches.is_empty(), "{stem}");
-        // Metal's table: 256 words of initializer, and the encode and decode around the read.
-        assert!(
-            snapped.module.words.len() > plain.module.words.len() + 256,
-            "{stem}: {} words against {}",
-            snapped.module.words.len(),
-            plain.module.words.len()
-        );
+        assert!(!holds_srgb_table(&plain.module.words), "{stem}");
         checked += 1;
     }
     assert!(checked > 0, "no profile reads through input attachments");
-    // The whole pipeline on `lavapipe`, and a fragment compiled without the input in it.
+    // The whole pipeline on `lavapipe`, and a fragment compiled alone in it.
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/profiles/lavapipe.json");
     let text = std::fs::read_to_string(path).expect("profile");
@@ -657,20 +664,38 @@ fn an_srgb_input_attachment_is_read_through_metals_decode() {
                 .expect("function"),
         )
     };
-    for pf in [PixelFormat::BGRA8UnormSRGB, PixelFormat::RGBA8UnormSRGB] {
+    let pipeline = |first: PixelFormat, fragment: StageSource| {
         let mut d = RenderPipelineDescriptor::new(StageSource::Function(function(
             &io,
             "stage_io_vertex_position",
         )));
-        d.fragment = Some(StageSource::Function(function(&bc, "fetch_blend")));
-        for (i, f) in [pf, PixelFormat::RGBA32Uint, PixelFormat::RG16Float]
+        d.fragment = Some(fragment);
+        for (i, f) in [first, PixelFormat::RGBA32Uint, PixelFormat::RG16Float]
             .into_iter()
             .enumerate()
         {
             d.color_attachments[i] = Some(ColorAttachmentDescriptor::new(f));
         }
         dev.compile_render_pipeline(&d, &Budget::standard())
-            .unwrap_or_else(|e| panic!("{pf:?}: {e}"));
+    };
+    let fragment = || StageSource::Function(function(&bc, "fetch_blend"));
+    let linear = pipeline(PixelFormat::RGBA8Unorm, fragment()).expect("RGBA8Unorm");
+    let linear_stage = &linear.stages[1];
+    assert!(!linear_stage
+        .precision_notes
+        .contains(&PrecisionNote::SrgbTexelDecode));
+    for pf in [PixelFormat::BGRA8UnormSRGB, PixelFormat::RGBA8UnormSRGB] {
+        let srgb = pipeline(pf, fragment()).unwrap_or_else(|e| panic!("{pf:?}: {e}"));
+        let stage = &srgb.stages[1];
+        assert!(!holds_srgb_table(&stage.spirv), "{pf:?}");
+        assert_eq!(stage.spirv, linear_stage.spirv, "{pf:?}");
+        assert!(
+            stage
+                .precision_notes
+                .contains(&PrecisionNote::SrgbTexelDecode),
+            "{pf:?}: {:?}",
+            stage.precision_notes
+        );
         let alone = dev
             .compile_function(
                 &function(&bc, "fetch_blend"),
@@ -678,12 +703,10 @@ fn an_srgb_input_attachment_is_read_through_metals_decode() {
                 &Budget::standard(),
             )
             .expect("the fragment alone");
-        d.fragment = Some(StageSource::Compiled(alone));
-        assert!(
-            matches!(
-                dev.compile_render_pipeline(&d, &Budget::standard()),
-                Err(Error::NeedsInput(RuntimeInput::ColorWrites))
-            ),
+        // The sRGB attachment asks the fragment for nothing the `RGBA8Unorm` one does not.
+        assert_eq!(
+            pipeline(pf, StageSource::Compiled(alone.clone())).map(|_| ()),
+            pipeline(PixelFormat::RGBA8Unorm, StageSource::Compiled(alone)).map(|_| ()),
             "{pf:?}"
         );
     }
@@ -978,7 +1001,6 @@ fn a_shadowed_extended_range_attachment_reads_and_writes_its_half() {
     let mut checked = 0;
     for stem in [
         "moltenvk-m3",
-        "moltenvk-m4",
         "amd-780m-radv",
         "intel-uhd770-rpls-anv",
         "nvidia-rtx5080-laptop",
@@ -2067,24 +2089,22 @@ fn a_replacing_blend_or_a_write_that_stores_nothing_takes_the_storage_form() {
 /// and stencil attachment. On every committed profile that orders fetch through the interlock the
 /// shader blends color 0: it reads the texel, blends the output over its tile value and stores the
 /// encode (one image read and one write more than the pipeline unblended), the fact names the
-/// blend, and the module passes L3. The whole pipeline is made on `moltenvk-m3` and `moltenvk-m4`
+/// blend, and the module passes L3. The whole pipeline is made on `moltenvk-m3`
 /// (no vertex descriptor), color 0 a written storage attachment of the raw format, as are its
 /// pipelines blending one plus one, one and zero, and source alpha over, and a stage compiled under
 /// its state links into no pipeline of another blend there. The `float4` fill
-/// (`rt6_fill_rgba32float`) under the premultiplied blend takes its own model; source alpha over
-/// compiles, and so does the `half4` fill. The function is built without fast math, where the color
-/// channels' blend color difference is built and makes the whole pipeline; the same function
-/// switched to fast math refuses it by its gap (`ExtendedRangeBlend`). The consumer's mask blend
-/// (G345: color source factor zero over one minus the source's alpha) is computed in the shader
-/// too, for the `half4` output and for the `float4` fill (rounded to `half` first), and makes the
-/// whole pipeline on both MoltenVK profiles.
+/// (`rt6_fill_rgba32float`) under the premultiplied blend compiles; so do source alpha over and the
+/// `half4` fill. The function is built without fast math; the color channels' blend color
+/// difference makes the whole pipeline in it and in the same function switched to fast math. The
+/// consumer's mask blend (G345: color source factor zero over one minus the source's alpha) is
+/// computed in the shader too, for the `half4` output and for the `float4` fill, and makes the
+/// whole pipeline on the MoltenVK profile.
 /// A fast-math function's source-alpha-over blend (source alpha and one minus it, added, for
-/// color and alpha, every channel written) into color 0 of `BGR10_XR_sRGB` or
-/// `RGB10A8_2P_XR10_sRGB`, beside an `R8Unorm` color 1 under the same blend (a consumer's
-/// pipeline): on every committed profile that orders fetch through the interlock, the shader
-/// blends color 0, a `half4` output's and a `float4` one's, and the module passes L3. Into
-/// `BGRA10_XR_sRGB`, whose fast blends beyond the narrow ones Metal computes otherwise, the same
-/// blend stays refused by name (`ExtendedRangeBlend::SrgbForm`).
+/// color and alpha, every channel written) into color 0 of `BGR10_XR_sRGB`,
+/// `RGB10A8_2P_XR10_sRGB` or `BGRA10_XR_sRGB`, beside an `R8Unorm` color 1 under the same blend (a
+/// consumer's pipeline): on every committed profile that orders fetch through the interlock, the
+/// shader blends color 0 by the device's arithmetic, a `half4` output's and a `float4` one's, and
+/// the module passes L3.
 #[test]
 fn a_fast_source_alpha_over_blend_into_an_srgb_extended_range_attachment_is_made() {
     use crate::metal::BlendFactor;
@@ -2121,7 +2141,11 @@ fn a_fast_source_alpha_over_blend_into_an_srgb_extended_range_attachment_is_made
         if !crate::lower::fragment::interlock_orders(&p) {
             continue;
         }
-        for pf in [PixelFormat::BGR10XRSRGB, PixelFormat::RGB10A82PXR10SRGB] {
+        for pf in [
+            PixelFormat::BGR10XRSRGB,
+            PixelFormat::RGB10A82PXR10SRGB,
+            PixelFormat::BGRA10XRSRGB,
+        ] {
             let inputs = state(&colors(pf), &p);
             for entry in ["rt6_fill_rgba16float", "rt6_fill_rgba32float"] {
                 let a = match compile_with(&fills, entry, &p, &inputs) {
@@ -2135,16 +2159,6 @@ fn a_fast_source_alpha_over_blend_into_an_srgb_extended_range_attachment_is_made
                     .unwrap_or_else(|e| panic!("{stem}: {pf:?} {entry}: L3: {e}"));
                 checked += 1;
             }
-        }
-        let inputs = state(&colors(PixelFormat::BGRA10XRSRGB), &p);
-        match compile_with(&fills, "rt6_fill_rgba16float", &p, &inputs) {
-            Err(Error::Unsupported(u)) if u.needs != Needs::NotImplemented => {}
-            Err(Error::Unsupported(u)) => assert_eq!(
-                u.feature,
-                Feature::ExtendedRangeBlend(crate::error::ExtendedRangeBlend::SrgbForm),
-                "{stem}"
-            ),
-            other => panic!("{stem}: BGRA10_XR_sRGB: {:?}", other.map(|_| ())),
         }
     }
     assert!(
@@ -2192,8 +2206,7 @@ fn a_premultiplied_blend_into_an_extended_range_attachment_is_computed_in_the_sh
         vec![Some(blended), Some(read), Some(unwritten)]
     };
     let premul = || colors(BlendFactor::One, BlendFactor::OneMinusSourceAlpha);
-    // The color channels' blend color difference, which the fast model refuses by name and the
-    // rounded model builds.
+    // The color channels' blend color difference, which the shader blends under either math.
     let difference = || {
         let mut c = colors(BlendFactor::BlendColor, BlendFactor::OneMinusBlendColor);
         if let Some(a) = c[0].as_mut() {
@@ -2221,13 +2234,6 @@ fn a_premultiplied_blend_into_an_extended_range_attachment_is_computed_in_the_sh
             1,
         ));
         inputs
-    };
-    let ni = |r: Result<std::sync::Arc<crate::library::FunctionArtifact>, Error>,
-              gap: crate::error::ExtendedRangeBlend| match r {
-        Err(Error::Unsupported(u)) => {
-            (u.feature, u.needs) == (Feature::ExtendedRangeBlend(gap), Needs::NotImplemented)
-        }
-        _ => false,
     };
     let fetched = |a: &crate::library::FunctionArtifact, color: u32| {
         a.facts.iter().find_map(|f| match f {
@@ -2308,13 +2314,10 @@ fn a_premultiplied_blend_into_an_extended_range_attachment_is_computed_in_the_sh
             .unwrap_or_else(|e| panic!("{stem}: the blend color difference: {e}"));
         link_and_validate(&made, &p)
             .unwrap_or_else(|e| panic!("{stem}: the blend color difference: L3: {e}"));
-        assert!(
-            ni(
-                compile_with(&fast_coverage, "con_fetch_coverage", &p, &differs),
-                crate::error::ExtendedRangeBlend::ConstantColorDifference
-            ),
-            "{stem}: the blend color difference under fast math"
-        );
+        let made = compile_with(&fast_coverage, "con_fetch_coverage", &p, &differs)
+            .unwrap_or_else(|e| panic!("{stem}: the blend color difference, fast: {e}"));
+        link_and_validate(&made, &p)
+            .unwrap_or_else(|e| panic!("{stem}: the blend color difference, fast: L3: {e}"));
         let fill = state(&[0], &premul(), &p);
         let float = compile_with(&fills, "rt6_fill_rgba32float", &p, &fill)
             .unwrap_or_else(|e| panic!("{stem}: float4: {e}"));
@@ -2358,7 +2361,8 @@ fn a_premultiplied_blend_into_an_extended_range_attachment_is_computed_in_the_sh
                 .expect("function"),
         )
     };
-    for stem in ["moltenvk-m3", "moltenvk-m4"] {
+    {
+        let stem = "moltenvk-m3";
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../metal2vulkan-validation/profiles")
             .join(format!("{stem}.json"));
@@ -2410,8 +2414,8 @@ fn a_premultiplied_blend_into_an_extended_range_attachment_is_computed_in_the_sh
             Error::NeedsInput(RuntimeInput::FramebufferFetch),
             "{stem}"
         );
-        // Each blend the shader computes makes the whole pipeline; the color channels' blend
-        // color difference is refused by its gap under fast math.
+        // Each blend the shader computes makes the whole pipeline, the color channels' blend color
+        // difference under either math.
         for (src, dst) in [
             (BlendFactor::One, BlendFactor::One),
             (BlendFactor::One, BlendFactor::Zero),
@@ -2426,31 +2430,20 @@ fn a_premultiplied_blend_into_an_extended_range_attachment_is_computed_in_the_sh
         pipeline(source, difference())
             .unwrap_or_else(|e| panic!("{stem}: the blend color difference: {e}"));
         let source = StageSource::Function(function(&fast_coverage, "con_fetch_coverage"));
-        match pipeline(source, difference()) {
-            Err(Error::Unsupported(u)) => assert_eq!(
-                (u.feature, u.needs),
-                (
-                    Feature::ExtendedRangeBlend(
-                        crate::error::ExtendedRangeBlend::ConstantColorDifference
-                    ),
-                    Needs::NotImplemented
-                ),
-                "{stem}"
-            ),
-            r => panic!("{stem}: the blend color difference: {:?}", r.map(|_| ())),
-        }
+        pipeline(source, difference())
+            .unwrap_or_else(|e| panic!("{stem}: the blend color difference, fast: {e}"));
     }
 }
 
 /// Without fast math, a blend of the second source into an extended-range attachment reads the
 /// function's index-1 output in the shader. `stage_io`'s dual-source function, its
 /// `air.compile.fast_math_enable` switched to `_disable`, makes the whole pipeline on `moltenvk-m3`
-/// and `moltenvk-m4` into an `RGB10A8_2P_XR10` color 0 blended with the second source's factors in
+/// into an `RGB10A8_2P_XR10` color 0 blended with the second source's factors in
 /// color and alpha: color 0 a written storage attachment, the fact naming the blend and its rounded
 /// math, and no dual-source output (`dualSrcBlend` not required); under a write mask of no channel
-/// it is made too, the second output stored nowhere. Under fast math the same pipeline is refused
-/// `DualSource`; the blend of a function that writes no second output is refused as Metal refuses
-/// its pipeline, `InvalidDescriptor(ColorAttachment)`.
+/// it is made too, the second output stored nowhere. Under fast math the same pipeline is made too;
+/// the blend of a function that writes no second output is refused as Metal refuses its pipeline,
+/// `InvalidDescriptor(ColorAttachment)`.
 /// Into each of the six extended-range formats, unblended (the raw texel through the interface) or
 /// blended premultiplied over (the storage form's blend, which reads no second source), with and
 /// without fast math, the function's two outputs make the pipeline, the second stored nowhere: no
@@ -2498,11 +2491,8 @@ fn a_second_source_blend_without_fast_math_reads_the_second_output() {
     blended.destination_rgb_blend_factor = equation.destination_rgb;
     blended.source_alpha_blend_factor = equation.source_alpha;
     blended.destination_alpha_blend_factor = equation.destination_alpha;
-    let dual_source = |u: &crate::error::Unsupported| {
-        u.feature == Feature::ExtendedRangeBlend(crate::error::ExtendedRangeBlend::DualSource)
-            && u.needs == Needs::NotImplemented
-    };
-    for stem in ["moltenvk-m3", "moltenvk-m4"] {
+    {
+        let stem = "moltenvk-m3";
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../metal2vulkan-validation/profiles")
             .join(format!("{stem}.json"));
@@ -2577,13 +2567,15 @@ fn a_second_source_blend_without_fast_math_reads_the_second_output() {
                 .contains(&VkFeature::DualSrcBlend),
             "{stem}: no channel"
         );
-        match pipeline(&fast, "stage_io_fragment_dual_source") {
-            Err(Error::Unsupported(u)) if dual_source(&u) => {}
-            r => panic!(
-                "{stem}: the second source under fast math: {:?}",
-                r.map(|_| ())
-            ),
-        }
+        let fast_pipe = pipeline(&fast, "stage_io_fragment_dual_source")
+            .unwrap_or_else(|e| panic!("{stem}: the second source under fast math: {e}"));
+        assert!(
+            !fast_pipe
+                .requirements
+                .features
+                .contains(&VkFeature::DualSrcBlend),
+            "{stem}: fast math"
+        );
         match pipeline(&safe, "stage_io_fragment_point") {
             Err(Error::InvalidDescriptor(crate::error::DescriptorError::ColorAttachment {
                 index: 0,
@@ -2609,19 +2601,9 @@ fn a_second_source_blend_without_fast_math_reads_the_second_output() {
                     )));
                     d.color_attachments[0] = Some(color);
                     let what = format!("{stem}: {pf:?} {math} blended {blending}");
-                    // Under fast math a blend of the `float4` output outside its model is
-                    // refused by name, whatever the second output.
-                    let pipe = match dev.compile_render_pipeline(&d, &Budget::standard()) {
-                        Ok(p) => p,
-                        Err(Error::Unsupported(u))
-                            if math == "fast"
-                                && blending
-                                && matches!(u.feature, Feature::ExtendedRangeBlend(_)) =>
-                        {
-                            continue
-                        }
-                        Err(e) => panic!("{what}: {e}"),
-                    };
+                    let pipe = dev
+                        .compile_render_pipeline(&d, &Budget::standard())
+                        .unwrap_or_else(|e| panic!("{what}: {e}"));
                     assert!(
                         !pipe
                             .requirements
@@ -2640,7 +2622,7 @@ fn a_second_source_blend_without_fast_math_reads_the_second_output() {
 /// function computes an extended-range attachment's blend over its input attachment. Into each of
 /// the six forms, under the premultiplied blend (source one, destination one minus the source's
 /// alpha), one plus one, and one and zero, `rt6_samples`' `half4` and `float4` fills make the
-/// pipeline exactly where `moltenvk-m4`, which blends in the pixel interlock, makes it, and refuse
+/// pipeline exactly where `moltenvk-m3`, which blends in the pixel interlock, makes it, and refuse
 /// it by the same gap elsewhere. A made pipeline's color 0 is a color attachment of the raw format
 /// with no Vulkan blend and a write of every raw component, read through an input attachment of
 /// `uint` texels, and states the blend (`RuntimeFact::ExtendedRangeInputBlend`, keeping no channel)
@@ -2648,10 +2630,10 @@ fn a_second_source_blend_without_fast_math_reads_the_second_output() {
 /// its emission. A write mask of the color channels alone keeps alpha: made, the fact naming it,
 /// every raw component written. A mask of no channel stores nothing: made, written nowhere and read
 /// through no input attachment. A function compiled under one blend links into no pipeline of
-/// another (`NeedsInput(FramebufferFetch)`). Without fast math the second source's blend reads
-/// `stage_io`'s index-1 output: made, with no dual-source output; under fast math refused
-/// `DualSource`, as in the interlock. Every made pipeline records the blend-source notes the
-/// interlock's records, `xrb_computed`'s whole-vector `float4` among them.
+/// another (`NeedsInput(FramebufferFetch)`). With and without fast math the second source's blend
+/// reads `stage_io`'s index-1 output: made, with no dual-source output. Every made pipeline records
+/// the blend-source notes the interlock's records, `xrb_computed`'s whole-vector `float4` among
+/// them.
 #[test]
 fn an_extended_range_blend_through_input_attachments_is_computed_in_the_shader() {
     use crate::metal::format::ExtendedRange;
@@ -2694,7 +2676,7 @@ fn an_extended_range_blend_through_input_attachments_is_computed_in_the_shader()
         let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
         Device::new(desc, DevicePolicy::default()).expect("device")
     };
-    let interlock = device("moltenvk-m4");
+    let interlock = device("moltenvk-m3");
     // Color 0 of `pf`, blended with source factor one and destination factor `destination`
     // (color and alpha alike), under `mask`.
     let color = |pf: PixelFormat, destination: BlendFactor, mask: ColorWriteMask| {
@@ -2726,7 +2708,7 @@ fn an_extended_range_blend_through_input_attachments_is_computed_in_the_shader()
         inputs.framebuffer_fetch = Some(FramebufferFetchInputs::of([0], &colors, false, false, 1));
         inputs
     };
-    // The pipeline on `dev` where `moltenvk-m4` makes it too; `None` where both refuse it by the
+    // The pipeline on `dev` where `moltenvk-m3` makes it too; `None` where both refuse it by the
     // same gap of Metal's model.
     // The blend-source notes a pipeline's stages record, which follow the blend whatever form
     // computes it.
@@ -2960,18 +2942,9 @@ fn an_extended_range_blend_through_input_attachments_is_computed_in_the_shader()
             "stage_io_vertex_position",
             "stage_io_fragment_dual_source",
         );
-        match pipeline(&dev, fragment, dual) {
-            Err(Error::Unsupported(u))
-                if u.feature
-                    == Feature::ExtendedRangeBlend(
-                        crate::error::ExtendedRangeBlend::DualSource,
-                    )
-                    && u.needs == Needs::NotImplemented => {}
-            r => panic!(
-                "{stem}: the second source under fast math: {:?}",
-                r.map(|_| ())
-            ),
-        }
+        let a = pipeline(&dev, fragment, dual)
+            .unwrap_or_else(|e| panic!("{stem}: the second source under fast math: {e}"));
+        assert_eq!(blend_of(&a).len(), 1, "{stem}: fast math");
     }
     assert!(checked > 0, "no profile fetches through input attachments");
 }
@@ -2983,8 +2956,8 @@ fn an_extended_range_blend_through_input_attachments_is_computed_in_the_shader()
 /// takes color 0: the write stores Metal's unblended write of the output (`exf_fetch_blend`'s
 /// `float4`, and `exf_fetch_three`'s `float4` and `half4` to two such attachments, the `_sRGB` twin
 /// among them), the fact names no blend, and the module passes L3. A mask of some of the channels
-/// is refused `NotImplemented`; a blend of the `float4` output takes its own model. The whole
-/// pipeline is made on `moltenvk-m3` and `moltenvk-m4` (no vertex descriptor), color 0 a written
+/// is refused `NotImplemented`; a blend of the `float4` output is the device's arithmetic. The whole
+/// pipeline is made on `moltenvk-m3` (no vertex descriptor), color 0 a written
 /// storage attachment of the raw format, and a stage compiled under it links into no pipeline that
 /// blends color 0.
 #[test]
@@ -3100,7 +3073,8 @@ fn a_fetched_extended_range_attachment_is_written_unblended_in_the_shader() {
                 .expect("function"),
         )
     };
-    for stem in ["moltenvk-m3", "moltenvk-m4"] {
+    {
+        let stem = "moltenvk-m3";
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../metal2vulkan-validation/profiles")
             .join(format!("{stem}.json"));
@@ -3446,11 +3420,7 @@ fn a_per_sample_depth_test_takes_each_sample_s_depth_where_measured() {
         .shape()
     };
     // (profile, each sample's depth computed, the stand-in as sample planes)
-    let measured = [
-        ("moltenvk-m3", true, true),
-        ("moltenvk-m4", true, true),
-        ("amd-780m-radv", false, false),
-    ];
+    let measured = [("moltenvk-m3", true, true), ("amd-780m-radv", false, false)];
     for (stem, computed, planes) in measured {
         let dev = device(stem);
         let base = dev
@@ -3590,7 +3560,6 @@ fn a_stencil_test_that_acts_runs_in_the_shader_before_the_depth_test() {
     };
     let shipped = [
         ("moltenvk-m3", 1),
-        ("moltenvk-m4", 1),
         ("amd-780m-radv", 1),
         ("amd-780m-radv", 4),
         ("intel-irisxe-rplp-anv", 1),
@@ -3651,7 +3620,8 @@ fn a_stencil_test_that_acts_runs_in_the_shader_before_the_depth_test() {
     }
     // MoltenVK at four samples: a multisampled stencil the device's single-sample storage images
     // would hold as sample planes, which are not implemented.
-    for stem in ["moltenvk-m3", "moltenvk-m4"] {
+    {
+        let stem = "moltenvk-m3";
         let dev = device(stem);
         let base = dev
             .compile_render_pipeline(&descriptor(4), &Budget::standard())
@@ -3721,12 +3691,7 @@ fn a_returned_depth_is_tested_in_the_shader_at_every_sample_count() {
         }
         .shape()
     };
-    let profiles = [
-        "moltenvk-m3",
-        "moltenvk-m4",
-        "amd-780m-radv",
-        "intel-irisxe-rplp-anv",
-    ];
+    let profiles = ["moltenvk-m3", "amd-780m-radv", "intel-irisxe-rplp-anv"];
     for samples in [1u32, 4] {
         let mut d = RenderPipelineDescriptor::new(function(&io, "stage_io_vertex_position"));
         d.fragment = Some(function(&returned, "fetch_returned_depth"));
@@ -3836,7 +3801,6 @@ fn a_returned_stencil_and_sample_mask_are_tested_in_the_shader() {
         .shape()
     };
     let shipped = [
-        ("moltenvk-m4", 1),
         ("amd-780m-radv", 1),
         ("amd-780m-radv", 4),
         ("intel-irisxe-rplp-anv", 1),
@@ -4808,24 +4772,18 @@ fn an_operation_over_the_active_lanes_records_the_split_quads_note() {
     }
 }
 
-/// A fragment function blended into an `RGB10A8_2P_XR10` attachment (premultiplied over) records
-/// `PrecisionNote::ExtendedRangeBlendSource` exactly where Metal may round the blend's source
-/// otherwise than the computed blend: a `float4` output whose lanes are not each a load
-/// (`rt6_resolve_white`'s constant), or a module built without fast math (`rt6_samples` with its
-/// `air.compile.fast_math_enable` switched to `_disable`, its `half4` and `float4` fills). The
-/// fills under fast math, each lane a load from a buffer, record none, and neither does the
-/// constant output unblended. Every interlock profile that makes the storage form. A `half4` output
-/// computed under fast math records it too (the `half4` fill's load multiplied by ones). Without
-/// fast math the blend is computed as Metal rounds it, so the fills, the computed one too, record
-/// none, into the `_sRGB` form too; a module that names no math mode records it. A `float4`
-/// computed by whole-vector arithmetic over loads (the fill's load times ones) records none under
-/// premultiplied over, but does under a blend whose color key is one of
-/// `extended_range::computed`'s (`One` and `SourceAlpha`, added), and so does one whose alpha is
-/// the load's beside its computed color lanes (a lane moved alone). A `float4` output records
-/// `PrecisionNote::ExtendedRangeFloatBlendSource` in its place, never the `half4` output's note,
-/// and a `half4` output never the `float4`'s.
+/// A fragment function blended into an `RGB10A8_2P_XR10` attachment (premultiplied over, and a
+/// blend of source alpha into the color channels) records its output's blend note on every
+/// interlock profile that makes the storage form, whatever the module's math and however it
+/// computes the output: the shader blends it by the device's arithmetic, where Metal's compiler
+/// folds the blend into the function in forms of its own. A `half4` output records
+/// `PrecisionNote::ExtendedRangeBlendSource` and a `float4` one
+/// `PrecisionNote::ExtendedRangeFloatBlendSource`, never the other's: the fills loaded from a
+/// buffer, `rt6_resolve_white`'s constant, a computed `half4`, a `float4` computed by whole-vector
+/// arithmetic or with a lane moved alone, under fast math, without it (into the `_sRGB` form too)
+/// and naming no math mode. Unblended, the constant output records none.
 #[test]
-fn extended_range_blend_sources_metal_may_round_otherwise_are_noted() {
+fn a_blended_extended_range_output_records_its_blend_note() {
     use crate::metal::BlendFactor;
     let (Some(fills), Some(resolves)) = (fixture("rt6_samples"), fixture("rt6_resolves")) else {
         return;
@@ -4949,10 +4907,10 @@ fn extended_range_blend_sources_metal_may_round_otherwise_are_noted() {
             Err(e) => panic!("{stem}: {e}"),
         };
         checked += 1;
-        assert_eq!(float_fill, None, "{stem}: a loaded float4 under fast math");
+        assert_eq!(float_fill, float, "{stem}: a loaded float4 under fast math");
         assert_eq!(
             noted(&fills, "rt6_fill_rgba16float", &blended),
-            Ok(None),
+            Ok(half),
             "{stem}: a loaded half4 under fast math"
         );
         assert_eq!(
@@ -4965,13 +4923,10 @@ fn extended_range_blend_sources_metal_may_round_otherwise_are_noted() {
             Ok(half),
             "{stem}: a computed half4 under fast math"
         );
-        // A computed `float4` blends as a loaded one under premultiplied over, but not under a
-        // key of the computed class's tables (color `One` and `SourceAlpha`, added), nor with a
-        // lane moved alone.
         let fill = "rt6_fill_rgba32float";
         assert_eq!(
             noted(&float_computed, fill, &blended),
-            Ok(None),
+            Ok(float),
             "{stem}: a computed float4 under fast math"
         );
         let keyed = {
@@ -4983,13 +4938,13 @@ fn extended_range_blend_sources_metal_may_round_otherwise_are_noted() {
         };
         assert_eq!(
             noted(&fills, fill, &keyed),
-            Ok(None),
+            Ok(float),
             "{stem}: keyed, loaded"
         );
         assert_eq!(
             noted(&float_computed, fill, &keyed),
             Ok(float),
-            "{stem}: a computed float4 under a key of the computed class's"
+            "{stem}: keyed, computed"
         );
         assert_eq!(
             noted(&float_mixed, fill, &blended),
@@ -5009,7 +4964,7 @@ fn extended_range_blend_sources_metal_may_round_otherwise_are_noted() {
         ] {
             assert_eq!(
                 noted(&safe, name, &blended),
-                Ok(None),
+                Ok(note),
                 "{stem}: {name} without fast math"
             );
             assert_eq!(
@@ -5017,17 +4972,15 @@ fn extended_range_blend_sources_metal_may_round_otherwise_are_noted() {
                 Ok(note),
                 "{stem}: {name} of no math mode"
             );
-        }
-        for name in ["rt6_fill_rgba32float", "rt6_fill_rgba16float"] {
             assert_eq!(
                 noted(&safe, name, &srgb),
-                Ok(None),
+                Ok(note),
                 "{stem}: {name} without fast math into the sRGB form"
             );
         }
         assert_eq!(
             noted(&safe_computed, "rt6_fill_rgba16float", &blended),
-            Ok(None),
+            Ok(half),
             "{stem}: a computed half4 without fast math"
         );
     }
@@ -5184,14 +5137,15 @@ fn helper_guards(m: &TypedModule) -> usize {
 /// On MoltenVK on an Apple GPU (`DriverWorkaround::DiscardDropsSimdgroupStores`), Apple's compiler
 /// loses a simdgroup's storage writes after an `optnone` call only its helper invocations make,
 /// with no discard: the quad helpers past a primitive's edges take a branch alone. The owned
-/// fixture `rch_helper_branch`'s functions sample, round `half` values (whose conversion barrier
-/// SPIRV-Cross writes as its `optnone` `spvFAdd`) in a branch where the coverage they read is not
-/// 1, and write a buffer after it. There the branch's helper invocations take its empty arm where
-/// nothing they compute differently reaches a derivative: `rch_helper_branch` (no implicit LOD) and
+/// fixture `rch_helper_branch`'s functions sample, blend `half` values with the high word of a
+/// product (`mulhi`, an `OpUMulExtended`, which SPIRV-Cross writes as its `optnone`
+/// `spvMulExtended`) in a branch where the coverage they read is not 1, and write a buffer after
+/// it. There the branch's helper invocations take its empty arm where nothing they compute
+/// differently reaches a derivative: `rch_helper_branch` (no implicit LOD) and
 /// `rch_helper_branch_late` (an implicit-LOD sample after the branch at the pixel) are guarded,
 /// census `fragment.helper-guard`, and record no note. `rch_helper_branch_gradient`, whose
 /// implicit-LOD sample reads a coordinate the branch computes, is not guarded and records no note
-/// either: the sample reads the rounding after it. `rch_helper_branch_loop`, whose rounding is in a
+/// either: the sample reads the product after it. `rch_helper_branch_loop`, whose product is in a
 /// loop as long as the coverage, records `PrecisionNote::HelperBranchDropsSimdgroupStores`. One
 /// that samples nothing (`rch_helper_branch_unsampled`) is left as it is. A device without the
 /// defect (`intel-arl-anv`) guards nothing. Every module passes L3.
@@ -5234,77 +5188,67 @@ fn helper_invocations_skip_an_optnone_branch_on_a_driver_that_drops_a_simdgroups
     }
 }
 
-/// A selection whose condition every invocation of a draw computes alike (a constant block's flag,
-/// or a sampler's specialization constants) holds no branch only helper invocations take, so an
-/// `optnone` call in its arm is neither guarded nor noted. The owned fixture `rch_uniform_branch`
-/// samples a `half` texture through a runtime sampler after a branch on a constant block's flag and
-/// writes a buffer; under the sampler's YCbCr variant the emulated linear filter branches on the
-/// sampler's specialization constants, and its device-sample arm converts the texel through a
-/// rounded add, which SPIRV-Cross writes as an `optnone` call. On `moltenvk-m3` under Metal's
-/// filter of the format (`YCbCrFilterPolicy::Exact`), with and without the variant: no helper
-/// census entry, no guard, no `HelperBranchDropsSimdgroupStores`, the emulated filter only under
-/// the variant, and L3.
+/// A selection whose condition every invocation of a draw computes alike (a constant block's flag)
+/// holds no branch only helper invocations take, so an `optnone` call in its arm is neither guarded
+/// nor noted. The owned fixture `rch_uniform_branch` divides a coordinate by a texture's size and
+/// takes the high word of a product (`mulhi`, an `OpUMulExtended`, which SPIRV-Cross writes
+/// through its `optnone` `spvMulExtended`) in a branch on a constant block's flag, then samples
+/// the texture at the coordinate and writes the sample and the product to a buffer. On
+/// `moltenvk-m3` the module holds the product, and no helper census entry, no guard, no
+/// `HelperBranchDropsSimdgroupStores`, and L3.
 #[test]
 fn a_branch_every_invocation_takes_alike_leaves_no_helper_alone() {
-    use crate::pipeline::sym::{SlotClass, SlotRef, Stage};
+    use crate::spirv::ir::BinOp;
     let Some(bc) = fixture("rch_uniform_branch") else {
         return;
     };
-    let policy = DevicePolicy {
-        ycbcr_filter: crate::device::YCbCrFilterPolicy::Exact,
-        ..DevicePolicy::default()
-    };
-    let p = profile("moltenvk-m3", policy).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
     let noted = PrecisionNote::HelperBranchDropsSimdgroupStores;
-    for ycbcr in [false, true] {
-        let what = format!("rch_uniform_branch on moltenvk-m3, YCbCr variant {ycbcr}");
-        let mut inputs = LoweringInputs::new();
-        if ycbcr {
-            inputs.ycbcr_textures.insert(SlotRef {
-                stage: Stage::Fragment,
-                class: SlotClass::Texture,
-                index: 0,
-            });
-        }
-        let (_, m) = typed_module_with(&bc, "rch_uniform_branch", &p, &inputs)
-            .unwrap_or_else(|e| panic!("{what}: {e}"));
-        let a = compile_with(&bc, "rch_uniform_branch", &p, &inputs)
-            .unwrap_or_else(|e| panic!("{what}: {e}"));
-        let helper: Vec<_> = a
-            .strategies
-            .entries
-            .keys()
-            .filter(|k| k.starts_with("fragment.helper"))
-            .collect();
-        eprintln!(
-            "observed: {what}: {helper:?}, note {}, linear emulation {}",
-            a.precision.contains(&noted),
-            a.strategies.entries.contains_key("sampler.linear")
-        );
-        assert_eq!(
-            a.strategies.entries.contains_key("sampler.linear"),
-            ycbcr,
-            "{what}: the emulated filter"
-        );
-        assert!(helper.is_empty(), "{what}: {helper:?}");
-        assert_eq!(helper_guards(&m), 0, "{what}");
-        assert!(!a.precision.contains(&noted), "{what}: the note");
-        link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
-    }
+    let what = "rch_uniform_branch on moltenvk-m3";
+    let inputs = LoweringInputs::new();
+    let (_, m) = typed_module_with(&bc, "rch_uniform_branch", &p, &inputs)
+        .unwrap_or_else(|e| panic!("{what}: {e}"));
+    let a = compile_with(&bc, "rch_uniform_branch", &p, &inputs)
+        .unwrap_or_else(|e| panic!("{what}: {e}"));
+    let helper: Vec<_> = a
+        .strategies
+        .entries
+        .keys()
+        .filter(|k| k.starts_with("fragment.helper"))
+        .collect();
+    let products = m
+        .blocks()
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|n| {
+            matches!(
+                n.inst,
+                Inst::Binary {
+                    op: BinOp::UMulExtended,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(products, 1, "{what}: the products");
+    assert!(helper.is_empty(), "{what}: {helper:?}");
+    assert_eq!(helper_guards(&m), 0, "{what}");
+    assert!(!a.precision.contains(&noted), "{what}: the note");
+    link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
 }
 
 /// Apple's compiler loses nothing after an `optnone` call only helper invocations make where they
 /// make a tangled instruction (an implicit-LOD sample, a derivative, an LOD query, a simdgroup
 /// operation) after it, so such a call records no note where every path from it passes a tangled
-/// instruction reading what it computes. The owned fixture `rch_helper_tangle` rounds to `half` (a
-/// conversion SPIRV-Cross writes through its `optnone` `spvFAdd`) where only the quad helpers past
-/// a primitive's edges run more than once or at all, beside a tangled instruction, and writes a
-/// texture after it. On `moltenvk-m3` no arm is guarded; the `after` functions, whose tangled
-/// instruction reads the rounded value (in the arm an implicit-LOD sample at it, `dfdx`,
-/// `quad_sum`, the LOD query; a sample after the branch's merge; a sample after a loop only helpers
-/// repeat), record no `HelperBranchDropsSimdgroupStores`; the `before` functions and
-/// `rch_tangle_unread`, whose tangled instruction reads none of it, record it. Every module passes
-/// L3.
+/// instruction reading what it computes. The owned fixture `rch_helper_tangle` takes the high
+/// words of products (`mulhi`, an `OpUMulExtended`, which SPIRV-Cross writes through its `optnone`
+/// `spvMulExtended`) where only the quad helpers past a primitive's edges run more than once or at
+/// all, beside a tangled instruction, and writes a texture after it. On `moltenvk-m3` no arm is
+/// guarded; the `after` functions, whose tangled instruction reads the products (in the arm an
+/// implicit-LOD sample at them, `dfdx`, `quad_sum`, the LOD query; a sample after the branch's
+/// merge; a sample after a loop only helpers repeat), record no
+/// `HelperBranchDropsSimdgroupStores`; the `before` functions and `rch_tangle_unread`, whose
+/// tangled instruction reads none of them, record it. Every module passes L3.
 #[test]
 fn a_tangled_instruction_reading_a_helper_call_keeps_the_note_away() {
     let Some(bc) = fixture("rch_helper_tangle") else {

@@ -592,29 +592,18 @@ fn the_projection_of_the_fixture_is_fixed_function() {
     let v = vertex_under(&bc, &vertex_descriptor(), &p).expect("vertex");
     let attrs = v.interface.io.attributes();
     assert_eq!(attrs.len(), 4);
-    // Every attribute is fixed function, and none carries `narrow_float`: attribute 1's `Half2`
-    // is the one narrow-float format, and a `float` parameter reading it would canonicalize the
-    // device's widening, but this entry reads it as a `half2`, which keeps the fetched code's own
-    // bits whatever the format was. So the bit is not part of what the module depends on
-    // (`link::vertex::narrow_float_of_f32_reads`).
+    // Every attribute is fixed function, which keeps nothing of its format.
     for (a, (_, f)) in &attrs {
-        assert_eq!(
-            *f,
-            VertexFetch::FixedFunction {
-                narrow_float: false
-            },
-            "attribute {a}"
-        );
+        assert_eq!(*f, VertexFetch::FixedFunction, "attribute {a}");
     }
 }
 
 /// A fragment function's write to a half-float channel records the device's NaN encoding
 /// (`PrecisionNote::DeviceNanEncoding`) only where the profile's driver is not measured to store
-/// Metal's NaN: a `float` output's everywhere but MoltenVK, lavapipe and NVIDIA's measured GPUs, a
-/// `half` output's everywhere but NVIDIA's measured GPUs and MoltenVK, which writes it through a
-/// 16-bit output. A write to an `RGBA8Unorm` attachment records none. Where the function selects
-/// the attachment's rules at the draw, the pipeline keeps the note its rule word selects
-/// (`color_writes::pipeline_writes`).
+/// Metal's NaN: a `float` output's everywhere but MoltenVK, whose conversion is Metal's (the
+/// output's own NaN reaches the device's conversion, which no other driver is measured with), a
+/// `half` output's everywhere but NVIDIA's measured GPUs. A write to an `RGBA8Unorm` attachment
+/// records none.
 #[test]
 fn half_float_writes_note_the_nan_encoding_where_the_device_rewrites_it() {
     use crate::pipeline::artifact::PrecisionNote;
@@ -623,14 +612,13 @@ fn half_float_writes_note_the_nan_encoding_where_the_device_rewrites_it() {
     };
     let note = PrecisionNote::DeviceNanEncoding;
     for (stem, float_note, half_note) in [
-        ("lavapipe", false, true),
-        ("gate-lavapipe-x86_64", false, true),
+        ("lavapipe", true, true),
+        ("gate-lavapipe-x86_64", true, true),
         ("amd-rdna3-radv", true, true),
         ("intel-irisxe-rplp-anv", true, true),
         ("nvidia-rtx50-linux", true, true),
-        ("nvidia-rtx5080-laptop", false, false),
-        ("moltenvk-m3", false, false),
-        ("moltenvk-m4", false, false),
+        ("nvidia-rtx5080-laptop", true, false),
+        ("moltenvk-m3", false, true),
     ] {
         let p = prof(stem);
         let v = compile(&bc, "rt6_fill_vertex", &p).expect("vertex");
@@ -651,93 +639,10 @@ fn half_float_writes_note_the_nan_encoding_where_the_device_rewrites_it() {
                 let g = l.graphics.as_ref().expect("graphics");
                 let (notes, _) = crate::pipeline::color_writes::pipeline_writes(
                     &f,
-                    &g.color_write_rules,
                     &g.color_attachments,
                     g.alpha_to_coverage,
-                )
-                .unwrap_or_else(|| panic!("{what}: no rule word"));
-                assert_eq!(notes.contains(&note), want, "{what}: {notes:?}");
-            }
-        }
-    }
-}
-
-/// Where the profile's driver is measured to store a 16-bit output's bits
-/// (`DriverDeviation::HalfColorOutputBits`) and to convert to 16 bits as Metal does
-/// (`MetalHalfConversion`), declares 16-bit outputs (with `Int16` and `Float16`), and does not
-/// store the output's NaN as Metal does, an output to a half-float attachment is written through a
-/// 16-bit output variable as the bits of the half Metal stores, valid and linked: on MoltenVK (the
-/// M3 Max and the M4) a `half` output (it stores a `float`'s NaN as Metal does). Such an output
-/// rounds nothing, so the attachment is listed as written as a half's bits, not as rounded, takes
-/// no Vulkan blend of one and zero, and the module requires both properties. RADV and ANV, which
-/// declare 16-bit outputs but store their NaNs as `0xfe00` too, keep the 32-bit output, as do
-/// lavapipe and NVIDIA, which declare none. An `RGBA8Unorm` attachment keeps the 32-bit output.
-#[test]
-fn half_float_attachments_take_the_halfs_bits_through_a_16_bit_output() {
-    let Some(bc) = assemble("rt6_samples.ll") else {
-        return;
-    };
-    for (stem, float_route, half_route) in [
-        ("amd-rdna3-radv", false, false),
-        ("intel-irisxe-rplp-anv", false, false),
-        ("moltenvk-m3", false, true),
-        ("moltenvk-m4", false, true),
-        ("lavapipe", false, false),
-        ("nvidia-rtx5080-laptop", false, false),
-    ] {
-        let p = prof(stem);
-        let v = compile(&bc, "rt6_fill_vertex", &p).expect("vertex");
-        for (entry, route) in [
-            ("rt6_fill_rgba32float", float_route),
-            ("rt6_fill_rgba16float", half_route),
-        ] {
-            for (pf, want) in [
-                (PixelFormat::RGBA16Float, route),
-                (PixelFormat::R16Float, route),
-                (PixelFormat::RGBA8Unorm, false),
-            ] {
-                let what = format!("{stem} {entry} {pf:?}");
-                let mut r = RenderLinkInputs::new();
-                r.color_attachments[0] = Some(ColorAttachmentDescriptor::new(pf));
-                let f = compile_with(&bc, entry, &p, &fragment_inputs(&r, &p))
-                    .unwrap_or_else(|e| panic!("{what}: {e}"));
-                let l = link(&[&v, &f], &render(&r), &p).unwrap_or_else(|e| panic!("{what}: {e}"));
-                let words = validate_all(&l, &[&v, &f], &p);
-                let text = spirv_dis(&words[1]);
-                assert_eq!(
-                    text.contains("OpCapability StorageInputOutput16"),
-                    want,
-                    "{what}\n{text}"
                 );
-                if want {
-                    assert!(
-                        text.contains("%_ptr_Output_v4half = OpTypePointer Output %v4half"),
-                        "{what}\n{text}"
-                    );
-                    assert!(f.interface.io.half_bit_colors.contains(&0), "{what}");
-                    assert!(!f.interface.io.rounded_colors.contains(&0), "{what}");
-                    for property in [
-                        crate::device::requirements::VkProperty::HalfColorOutputBits,
-                        crate::device::requirements::VkProperty::MetalHalfConversion,
-                    ] {
-                        assert!(
-                            f.requirements.properties.contains(&property),
-                            "{what}: {property:?}"
-                        );
-                    }
-                    let mut blended = r.clone();
-                    if let Some(a) = blended.color_attachments[0].as_mut() {
-                        a.blending_enabled = true;
-                    }
-                    let b = compile_with(&bc, entry, &p, &fragment_inputs(&blended, &p))
-                        .unwrap_or_else(|e| panic!("{what}: {e}"));
-                    let l = link(&[&v, &b], &render(&blended), &p)
-                        .unwrap_or_else(|e| panic!("{what}: {e}"));
-                    let attachment = l.graphics.as_ref().expect("graphics").color_attachments[0]
-                        .as_ref()
-                        .expect("attachment");
-                    assert!(attachment.blend.is_none(), "{what} blended");
-                }
+                assert_eq!(notes.contains(&note), want, "{what}: {notes:?}");
             }
         }
     }
@@ -746,8 +651,7 @@ fn half_float_attachments_take_the_halfs_bits_through_a_16_bit_output() {
 /// Under `TextureWriteRoundingMode::NearestEven` a `float` output to a half-float attachment rounds
 /// to nearest even in the function on every profile, MoltenVK's included (listed as rounded, no
 /// device conversion noted, the device's blend of one and zero dropped), and the pipeline links
-/// valid; a `half` output, already a half, rounds nothing (on MoltenVK it is written as a half's
-/// bits). Under alpha-to-coverage the alpha rounds too, and a pipeline whose function rounds it
+/// valid; a `half` output, already a half, rounds nothing. Under alpha-to-coverage the alpha rounds too, and a pipeline whose function rounds it
 /// records `PrecisionNote::CoverageReadsRoundedAlpha`. After a blend of other factors the device
 /// rounds the blend's result, which Metal rounds to nearest even: the channels are written as
 /// computed and the module announces `PrecisionNote::BlendedWriteRounding` (no device conversion
@@ -762,7 +666,6 @@ fn half_attachments_round_to_nearest_even_under_mode_two() {
     };
     for stem in [
         "moltenvk-m3",
-        "moltenvk-m4",
         "lavapipe",
         "amd-780m-radv",
         "nvidia-rtx5080-laptop",
@@ -800,11 +703,9 @@ fn half_attachments_round_to_nearest_even_under_mode_two() {
             let g = l.graphics.as_ref().expect("graphics");
             let (notes, _) = crate::pipeline::color_writes::pipeline_writes(
                 &f,
-                &g.color_write_rules,
                 &g.color_attachments,
                 g.alpha_to_coverage,
-            )
-            .unwrap_or_else(|| panic!("{what}: no rule word"));
+            );
             assert_eq!(
                 notes.contains(&PrecisionNote::CoverageReadsRoundedAlpha),
                 float && r.alpha_to_coverage,
@@ -881,7 +782,7 @@ fn mode_two_refuses_fragment_texture_writes_it_would_round() {
         Declared,
         Other,
     }
-    for stem in ["moltenvk-m4", "lavapipe", "amd-780m-radv"] {
+    for stem in ["lavapipe", "amd-780m-radv"] {
         let p = prof(stem);
         let v = compile(&bc, "tob_rect", &p).expect("vertex");
         let mut r = RenderLinkInputs::new();
@@ -895,22 +796,9 @@ fn mode_two_refuses_fragment_texture_writes_it_would_round() {
                 choice(vk::Format::UNDEFINED, identity),
                 Goes::Bound,
             ),
-            // The class the profile writes a half-float texture by (`Identity` where its device
-            // is measured to store Metal's halves).
             (
                 "tob_write",
-                choice(
-                    vk::Format::R16G16B16A16_SFLOAT,
-                    crate::metal::format::half_write_class(&p),
-                ),
-                Goes::Declared,
-            ),
-            (
-                "tob_write",
-                choice(
-                    vk::Format::R16G16B16A16_SFLOAT,
-                    StorageImageClass::HalfTowardZero,
-                ),
+                choice(vk::Format::R16G16B16A16_SFLOAT, identity),
                 Goes::Declared,
             ),
             (
@@ -975,21 +863,23 @@ fn mode_two_refuses_fragment_texture_writes_it_would_round() {
     }
 }
 
-/// Where the profile's driver is measured to convert a `float` output to a half-float or unsigned
-/// small float channel as Metal does (`MetalSmallFloatColorWrites`: RADV on the Radeon 780M, ANV on
-/// the Iris Xe of RPL-P, NVIDIA's on the RTX 3090), or an output to a 16-bit unorm or snorm channel
-/// (`MetalNorm16ColorWrites`: the 780M), the fragment function writes it as computed: the
-/// attachment is not listed as rounded (its blend of one and zero kept), the module requires the
-/// property, and it links valid. Only a NaN is chosen, as `0x7fc00000` where the device stores that
-/// as Metal's NaN and its own NaN would not be (an unsigned small float, and a half-float channel
-/// on the 3090), and as -1.0 for a blended snorm channel, so `OpIsNan` appears exactly there.
-/// Elsewhere (the UHD 770 of RPL-S, the RTX 5080 Laptop GPU, lavapipe; a `half` output to
-/// `RG11B10Float`) the output rounds, listed, requiring neither. Each holds of the channels' own
-/// rules (`color_writes::exact_writes`), and where the function selects the attachment's rules at
-/// the draw the pipeline lists the attachment, keeps its blend and requires the property alike.
+/// A fragment function's output to a normalized or small float attachment is written as computed
+/// on every profile, its conversion the device's: nothing rounds (no `OpIsNan` of a rounding), the
+/// attachment is not listed as rounded, and its blend of one and zero takes no Vulkan blend, as
+/// Metal's stores the output as written. Where the profile's
+/// driver is measured to convert a `float` output to a half-float or unsigned small float channel
+/// as Metal does (`MetalSmallFloatColorWrites`: RADV on the Radeon 780M, ANV on the Iris Xe of
+/// RPL-P and the UHD 770 of RPL-S, NVIDIA's on the RTX 3090), or an output to a 16-bit unorm or
+/// snorm channel (`MetalNorm16ColorWrites`: the 780M; a blended snorm channel's NaN aside), the
+/// module requires the property and records no `PrecisionNote::DeviceColorConversion` (a small
+/// float's NaN, as computed, is the device's: `PrecisionNote::DeviceNanEncoding`); elsewhere (the
+/// RTX 5080 Laptop GPU, lavapipe; a `half` output to `RG11B10Float`) it records the conversion and
+/// requires neither, but for a `half` output to a half-float channel, a half already, which records
+/// none.
 #[test]
 fn measured_color_conversions_are_left_to_the_device() {
     use crate::device::requirements::VkProperty;
+    use crate::pipeline::artifact::PrecisionNote;
     let Some(bc) = assemble("rt6_samples.ll") else {
         return;
     };
@@ -1007,21 +897,19 @@ fn measured_color_conversions_are_left_to_the_device() {
             .profile()
             .clone()
     };
-    for (stem, p, small_taken, norm16_taken, nan_selected) in [
-        ("amd-780m-radv", prof("amd-780m-radv"), true, true, false),
+    for (stem, p, small_taken, norm16_taken) in [
+        ("amd-780m-radv", prof("amd-780m-radv"), true, true),
         (
             "intel-irisxe-rplp-anv",
             prof("intel-irisxe-rplp-anv"),
             true,
             false,
-            false,
         ),
-        ("rtx-3090", rtx_3090, true, false, true),
+        ("rtx-3090", rtx_3090, true, false),
         (
             "intel-uhd770-rpls-anv",
             prof("intel-uhd770-rpls-anv"),
             true,
-            false,
             false,
         ),
         (
@@ -1029,31 +917,20 @@ fn measured_color_conversions_are_left_to_the_device() {
             prof("nvidia-rtx5080-laptop"),
             false,
             false,
-            false,
         ),
-        ("lavapipe", prof("lavapipe"), false, false, false),
+        ("lavapipe", prof("lavapipe"), false, false),
     ] {
         let v = compile(&bc, "rt6_fill_vertex", &p).expect("vertex");
         for (entry, float) in [
             ("rt6_fill_rgba32float", true),
             ("rt6_fill_rgba16float", false),
         ] {
-            for (pf, property, taken, nan) in [
-                (
-                    PixelFormat::RGBA16Float,
-                    small,
-                    small_taken && float,
-                    nan_selected,
-                ),
-                (
-                    PixelFormat::R16Float,
-                    small,
-                    small_taken && float,
-                    nan_selected,
-                ),
-                (PixelFormat::RG11B10Float, small, small_taken && float, true),
-                (PixelFormat::RGBA16Unorm, norm16, norm16_taken, false),
-                (PixelFormat::RG16Snorm, norm16, norm16_taken, false),
+            for (pf, property, taken) in [
+                (PixelFormat::RGBA16Float, small, small_taken && float),
+                (PixelFormat::R16Float, small, small_taken && float),
+                (PixelFormat::RG11B10Float, small, small_taken && float),
+                (PixelFormat::RGBA16Unorm, norm16, norm16_taken),
+                (PixelFormat::RG16Snorm, norm16, norm16_taken),
             ] {
                 for blended in [false, true] {
                     let what = format!("{stem} {entry} {pf:?} blended {blended}");
@@ -1061,61 +938,43 @@ fn measured_color_conversions_are_left_to_the_device() {
                     let mut a = ColorAttachmentDescriptor::new(pf);
                     a.blending_enabled = blended;
                     r.color_attachments[0] = Some(a);
-                    let mut exact = fragment_inputs(&r, &p);
-                    exact.color_writes = crate::pipeline::color_writes::exact_writes(
-                        [0],
-                        &r.color_attachments,
-                        (r.alpha_to_coverage, r.texture_write_rounding_mode),
-                        &p,
-                    );
-                    let f = compile_with(&bc, entry, &p, &exact)
+                    let f = compile_with(&bc, entry, &p, &fragment_inputs(&r, &p))
                         .unwrap_or_else(|e| panic!("{what}: {e}"));
                     let l =
                         link(&[&v, &f], &render(&r), &p).unwrap_or_else(|e| panic!("{what}: {e}"));
                     let words = validate_all(&l, &[&v, &f], &p);
                     let text = spirv_dis(&words[1]);
-                    // A `half` output to a half-float channel is a half already: nothing rounds.
-                    let held =
-                        !float && matches!(pf, PixelFormat::RGBA16Float | PixelFormat::R16Float);
-                    let listed = f.interface.io.rounded_colors.contains(&0);
-                    assert_eq!(listed, !taken && !held, "{what}");
+                    assert!(!text.contains("OpIsNan"), "{what}\n{text}");
+                    assert!(!f.interface.io.rounded_colors.contains(&0), "{what}");
+                    // A blended snorm channel's NaN is Metal's -1.0, which no device stores.
+                    let taken = taken && !(blended && pf == PixelFormat::RG16Snorm);
                     assert_eq!(
                         f.requirements.properties.contains(&property),
                         taken,
                         "{what}"
                     );
+                    // A `half` output to a half-float channel is a half already.
+                    let held =
+                        !float && matches!(pf, PixelFormat::RGBA16Float | PixelFormat::R16Float);
+                    assert_eq!(
+                        f.precision.contains(&PrecisionNote::DeviceColorConversion),
+                        !taken && !held,
+                        "{what}: {:?}",
+                        f.precision
+                    );
+                    if taken && property == small {
+                        assert!(
+                            f.precision.contains(&PrecisionNote::DeviceNanEncoding),
+                            "{what}: {:?}",
+                            f.precision
+                        );
+                    }
                     let blend = l.graphics.as_ref().expect("graphics").color_attachments[0]
                         .as_ref()
                         .expect("attachment")
                         .blend
                         .is_some();
-                    assert_eq!(blend, blended && !listed, "{what}");
-                    if taken {
-                        let snorm = blended && pf == PixelFormat::RG16Snorm;
-                        assert_eq!(text.contains("OpIsNan"), nan || snorm, "{what}\n{text}");
-                    }
-                    // The pipeline's map, whose attachment may select its rules at the draw.
-                    let s = compile_with(&bc, entry, &p, &fragment_inputs(&r, &p))
-                        .unwrap_or_else(|e| panic!("{what}: {e}"));
-                    let l =
-                        link(&[&v, &s], &render(&r), &p).unwrap_or_else(|e| panic!("{what}: {e}"));
-                    validate_all(&l, &[&v, &s], &p);
-                    let g = l.graphics.as_ref().expect("graphics");
-                    let (_, rounded) = crate::pipeline::color_writes::pipeline_writes(
-                        &s,
-                        &g.color_write_rules,
-                        &g.color_attachments,
-                        g.alpha_to_coverage,
-                    )
-                    .unwrap_or_else(|| panic!("{what}: no rule word"));
-                    assert_eq!(rounded.contains(&0), listed, "{what} selected");
-                    assert_eq!(
-                        s.requirements.properties.contains(&property),
-                        taken,
-                        "{what} selected"
-                    );
-                    let attachment = g.color_attachments[0].as_ref().expect("attachment");
-                    assert_eq!(attachment.blend.is_some(), blend, "{what} selected");
+                    assert!(!blend, "{what}");
                 }
             }
         }

@@ -135,18 +135,18 @@
         "command_buffers_begun": 26,
         "command_buffers_begun_batch_work": 13,
         "command_buffers_begun_encoders": 13,
-        "command_buffers_deferred": 13,
-        "command_buffers_replayed_inline": 13,
         "command_buffers_submitted": 26,
-        "commands_replayed.begin_command_buffer": 13,
-        "commands_replayed.cmd_bind_descriptor_sets": 41,
-        "commands_replayed.cmd_bind_pipeline": 41,
-        "commands_replayed.cmd_copy_buffer_to_image": 27,
-        "commands_replayed.cmd_copy_image_to_buffer": 41,
-        "commands_replayed.cmd_dispatch": 41,
-        "commands_replayed.cmd_pipeline_barrier": 148,
-        "commands_replayed.cmd_update_buffer": 41,
-        "commands_replayed.end_command_buffer": 13,
+        "commands_recorded.begin_command_buffer": 26,
+        "commands_recorded.cmd_bind_descriptor_sets": 41,
+        "commands_recorded.cmd_bind_pipeline": 41,
+        "commands_recorded.cmd_clear_color_image": 13,
+        "commands_recorded.cmd_copy_buffer": 41,
+        "commands_recorded.cmd_copy_buffer_to_image": 27,
+        "commands_recorded.cmd_copy_image_to_buffer": 41,
+        "commands_recorded.cmd_dispatch": 41,
+        "commands_recorded.cmd_pipeline_barrier": 187,
+        "commands_recorded.cmd_update_buffer": 41,
+        "commands_recorded.end_command_buffer": 26,
         "commits_handed_off": 13,
         "completed_waits": 16,
         "completed_where_seen": 13,
@@ -181,14 +181,15 @@
         "scheduler_sleeps": 13,
         "scheduler_wakes_commit": 13,
         "slot_returns": 13,
-        "spare_command_pools_taken": 26,
+        "spare_command_pools_taken": 13,
         "submit_infos": 13,
         "trail_waits": 13,
         "wakes_completion_waiters": 13,
         "wakes_spared": 91
       },
       "moving": {
-        "batches_submitted_by_waiters": 8
+        "batches_submitted_by_waiters": 7,
+        "gate_waits_slept": 10
       },
       "composed": {
         "addressable_buffers_made": 2,
@@ -196,7 +197,8 @@
         "device_memory_allocated": 201326592,
         "owned_kernel_spirv_bytes": 1228,
         "owned_kernels_made": 1,
-        "pooled_memory_blocks_made": 3
+        "pooled_memory_blocks_made": 3,
+        "queues_sharing_a_vk_queue": 0
       }
     }
   ],

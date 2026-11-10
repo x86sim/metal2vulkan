@@ -121,6 +121,16 @@ pub struct ModuleBuilder {
     /// The vector, lane value, and lane index of each narrow lane insert the lowering noted
     /// (`FunctionBuilder::note_insert`).
     pub(super) inserts: HashMap<Value, (Value, Value, u32)>,
+    /// The 16-bit integer each zero extension to 32 bits the lowering noted widens
+    /// (`FunctionBuilder::note_widened16`).
+    pub(super) widened16: HashMap<Value, Value>,
+    /// The 16-bit float (scalar or vector) each `OpFConvert` to 32 bits widens, by its result
+    /// (`FunctionBuilder::convert`): a conversion of the result back to 16 bits is that float,
+    /// exactly. A widening of a conversion from 32 bits is not listed: that pair is a rounding to
+    /// `half` (`lower::arith::narrow::rounds_by_conversion`), kept whole.
+    pub(super) widened_halves: HashMap<Value, Value>,
+    /// The result of every `OpFConvert` from 32 to 16 bits (`FunctionBuilder::convert`).
+    pub(super) narrowed_floats: HashSet<Value>,
     /// Every `OpUndef` result (`FunctionBuilder::is_undef`).
     pub(super) undefs: HashSet<Value>,
     /// The dynamic texel offsets the lowering asked to be taken as constants, by offset value
@@ -139,24 +149,14 @@ pub struct ModuleBuilder {
     /// How the lowering clears the bits above a narrow integer's width
     /// ([`ModuleBuilder::mask_form`]).
     mask_form: MaskForm,
-    /// How the lowering rounds an `f32` to `half` through `OpQuantizeToF16`
-    /// ([`ModuleBuilder::quantize_form`]).
+    /// How the lowering rounds an `f32` to `half` ([`ModuleBuilder::quantize_form`]).
     quantize_form: QuantizeForm,
     /// Whether that rounding is the device's own rather than one measured to be Metal's
     /// ([`ModuleBuilder::native_half`]).
     native_half: bool,
-    /// Whether a `half` texel keeps the NaN the device decoded under native half rounding too
-    /// ([`ModuleBuilder::texel_nans`]).
-    texel_nans: bool,
     /// Whether a `half`'s NaN bits are the device's conversion's under the float controls
     /// ([`ModuleBuilder::native_half_nans`]).
     native_half_nans: bool,
-    /// Whether the `half`s read from their bits now are the device's widening of them
-    /// ([`ModuleBuilder::widens_halves`]).
-    widens_halves: bool,
-    /// The equal values offered for where no loop holds them (`FunctionBuilder::offer_outside_loops`),
-    /// in offer order.
-    pub(super) loop_free: Vec<Offer>,
 }
 
 /// How a float multiply the device must round on its own and never fuse is emitted
@@ -192,28 +192,21 @@ pub enum MaskForm {
     Extract,
 }
 
-/// How the lowering rounds an `f32` to `half` (`lower::arith::narrow`). Lowering takes it from
-/// the profile's measured driver deviations, its float-controls properties and its half rounding
-/// policy (`ArithPlan::quantize`). Every form gives Metal's conversion to `half` (to nearest even
-/// on the half grid, half denormals kept, infinity from 65520 up) where it is measured, controlled
-/// or integer; under native half rounding `Device` and `Converted` are the device's rounding where
-/// neither is measured, within `PrecisionNote::NativeHalfQuantize`'s or `NativeHalfConversion`'s
-/// bound.
+/// How the lowering rounds an `f32` to `half` (`lower::arith::narrow`): the device's own
+/// rounding. Lowering takes it from the profile's `shaderFloat16` and float-controls properties
+/// (`ArithPlan::quantize`). `Controlled` gives Metal's conversion to `half` (to nearest even on the
+/// half grid, half denormals kept, infinity from 65520 up) by the Vulkan spec; `Device` and
+/// `Converted` are within `PrecisionNote::NativeHalfQuantize`'s or `NativeHalfConversion`'s bound.
+/// It also chooses how a `half` is widened from its bits (`narrow::from_bits`): `OpFConvert` of
+/// the bits read as a 16-bit float in `Converted` and `Controlled`, `UnpackHalf2x16` in `Device`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum QuantizeForm {
-    /// No device rounding: integer arithmetic on the `f32`'s bits, and an exact scaling below
-    /// the smallest normal half, the same on every device; a NaN gives Metal's `half` NaN,
-    /// `0x7E00` (`narrow::round`).
+    /// The device's `OpQuantizeToF16` alone, on a profile without `shaderFloat16`: a result
+    /// below the smallest normal half may be a zero.
     #[default]
-    Integer,
-    /// The device's `OpQuantizeToF16`, where it is measured to round as Metal does
-    /// (`DriverDeviation::MetalHalfQuantize`), or under native half rounding on a profile
-    /// without `shaderFloat16`.
     Device,
-    /// No quantize: `OpFConvert` to a 16-bit float and back, where the device's conversion is
-    /// measured to be Metal's `half(float)` on every `f32`, half denormals included
-    /// (`DriverDeviation::MetalHalfConversion`), or under native half rounding, and the profile has
-    /// `shaderFloat16`.
+    /// No quantize: `OpFConvert` to a 16-bit float and back, on a profile with `shaderFloat16`
+    /// whose float controls do not make the conversion Metal's.
     Converted,
     /// No quantize: `OpFConvert` to a 16-bit float and back, each decorated `NoContraction`, in
     /// an entry that declares `RoundingModeRTE`, `DenormPreserve` and `SignedZeroInfNanPreserve`
@@ -268,8 +261,7 @@ impl ModuleBuilder {
     }
 
     /// Round an `f32` to `half` in `form`. Emission sets it before any instruction, from the
-    /// profile's measured driver deviations; a builder that never sets it emits
-    /// [`QuantizeForm::Integer`].
+    /// profile; a builder that never sets it emits [`QuantizeForm::Device`].
     pub fn set_quantize_form(&mut self, form: QuantizeForm) {
         self.quantize_form = form;
     }
@@ -280,8 +272,8 @@ impl ModuleBuilder {
     }
 
     /// Whether the [`ModuleBuilder::quantize_form`] is the device's own rounding, native half
-    /// rounding, rather than one measured to be Metal's or the integer one. Emission sets it with
-    /// the form; a builder that never sets it rounds as Metal does.
+    /// rounding, rather than one controlled to be Metal's. Emission sets it with the
+    /// form; a builder that never sets it takes its form as Metal's.
     pub fn set_native_half(&mut self, native: bool) {
         self.native_half = native;
     }
@@ -292,26 +284,10 @@ impl ModuleBuilder {
         self.native_half
     }
 
-    /// Whether a `half` texel keeps the NaN the device decoded even where the module's `half`
-    /// rounding is the device's own ([`ModuleBuilder::native_half`]): where the NaN switch asks
-    /// for Metal's NaN (`NanMinMaxPolicy::Exact`). Emission sets it with the form; a builder that
-    /// never sets it keeps the NaN wherever the rounding is Metal's, as before.
-    pub fn set_texel_nans(&mut self, keep: bool) {
-        self.texel_nans = keep;
-    }
-
-    /// Whether a `half` texel keeps its decoded NaN under native half rounding
-    /// ([`ModuleBuilder::set_texel_nans`]).
-    pub fn texel_nans(&self) -> bool {
-        self.texel_nans
-    }
-
     /// Whether a `half`'s NaN bits are left to the device's conversion where the module rounds
-    /// through it under the float controls ([`QuantizeForm::Controlled`]): a `half` read from its
-    /// bits is the device's widening of them, and a `half` texel takes the rounding's NaN, where
-    /// the profile leaves NaN bits to the device (`NanMinMaxPolicy::Native`). Emission sets it
-    /// with the form; a builder that never sets it decodes in integer arithmetic and keeps a
-    /// texel's NaN, as before.
+    /// through it under the float controls ([`QuantizeForm::Controlled`]): a `half` texel takes the
+    /// rounding's NaN. Emission sets it with the form; a builder that never sets it keeps a
+    /// texel's NaN.
     pub fn set_native_half_nans(&mut self, native: bool) {
         self.native_half_nans = native;
     }
@@ -320,20 +296,6 @@ impl ModuleBuilder {
     /// ([`ModuleBuilder::set_native_half_nans`]).
     pub fn native_half_nans(&self) -> bool {
         self.native_half_nans
-    }
-
-    /// Whether the `half`s read from their bits from here on are the device's widening of them
-    /// (`narrow::from_bits`): emission sets it while it emits a load of `half`s the plan leaves to
-    /// that widening (`ArithPlan::widened`), where it is Metal's and no use reads a NaN's bits,
-    /// and clears it after. A builder that never sets it decodes in integer arithmetic.
-    pub fn set_widens_halves(&mut self, widens: bool) {
-        self.widens_halves = widens;
-    }
-
-    /// Whether the `half`s read from their bits now are the device's widening of them
-    /// ([`ModuleBuilder::set_widens_halves`]).
-    pub fn widens_halves(&self) -> bool {
-        self.widens_halves
     }
 
     /// The heap bytes the builder holds, for the byte ledger: every input-scaled container's
@@ -380,8 +342,10 @@ impl ModuleBuilder {
             + map_bytes(&self.bits)
             + map_bytes(&self.lanes)
             + map_bytes(&self.inserts)
+            + map_bytes(&self.widened16)
+            + map_bytes(&self.widened_halves)
+            + self.narrowed_floats.capacity() * std::mem::size_of::<Value>()
             + vec_bytes(&self.offers)
-            + vec_bytes(&self.loop_free)
             + map_bytes(&self.encodes)
             + self.undefs.capacity() * std::mem::size_of::<Value>();
         #[cfg(test)]
@@ -424,12 +388,6 @@ impl ModuleBuilder {
     /// once the module is finalized.
     pub fn offers(&self) -> &[Offer] {
         &self.offers
-    }
-
-    /// The equal values offered for where no loop holds them, for
-    /// [`crate::spirv::dead::take_outside_loops`] once the module's loops are final.
-    pub fn loop_free_offers(&self) -> &[Offer] {
-        &self.loop_free
     }
 
     /// The constant table.
@@ -594,9 +552,15 @@ impl ModuleBuilder {
             })
         );
         let ok = ok && subpass == matches!(sym.kind, ResourceKind::InputAttachment(_));
-        // A combined image sampler is exactly one `OpTypeSampledImage`.
+        // A combined image sampler is exactly one `OpTypeSampledImage`: a texture and sampler's,
+        // or a planes image's through the device's conversion.
         let combined = matches!(self.types.get(ty)?, Type::SampledImage { .. });
-        let ok = ok && combined == matches!(sym.kind, ResourceKind::CombinedTextureSampler(_));
+        let ok = ok
+            && combined
+                == matches!(
+                    sym.kind,
+                    ResourceKind::CombinedTextureSampler(_) | ResourceKind::YCbCrPlanes(_)
+                );
         // An acceleration structure binding is exactly one acceleration structure.
         let accel = matches!(self.types.get(ty)?, Type::AccelerationStructure);
         let ok = ok && accel == matches!(sym.kind, ResourceKind::AccelerationStructure(_));

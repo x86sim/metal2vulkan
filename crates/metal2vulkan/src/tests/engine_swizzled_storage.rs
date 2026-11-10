@@ -300,7 +300,7 @@ declare void @air.write_texture_2d.{suffix}(ptr addrspace(1), <2 x i32>, {vec4},
 /// Every committed profile, and `moltenvk-m3` and `lavapipe` without robustness, whose shader
 /// checks its reads and guards its writes.
 fn profiles() -> Vec<(String, DeviceProfile)> {
-    let mut out = crate::spirv::testing::committed_exact_profiles().expect("profiles");
+    let mut out = crate::spirv::testing::committed_profiles().expect("profiles");
     let all = [
         VkFeature::RobustImageAccess,
         VkFeature::RobustImageAccess2,
@@ -385,8 +385,6 @@ fn resources(plan: &Plan, buffer: Vec<u8>, spec: &[(SpecKey, u64)]) -> Resources
             (PushField::SlotBindOffset(_) | PushField::DispatchRegion, PushLoc::Push { .. }) => {}
             // A bound value read as data, which the interpreter writes from `spec`.
             (PushField::Specialized(_), PushLoc::Push { .. }) => {}
-            // No slot's writes dropped: the word stays 0.
-            (PushField::Specialized(crate::pipeline::sym::SpecKey::DroppedStoreSlots(_)), _) => {}
             other => panic!("unexpected push field {other:?}"),
         }
     }
@@ -705,7 +703,7 @@ fn devices() -> Vec<(String, Device)> {
         let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
         out.push((
             stem,
-            Device::new(desc, crate::pipeline::testing::EXACT_SAMPLING).expect("device"),
+            Device::new(desc, crate::device::DevicePolicy::default()).expect("device"),
         ));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -865,14 +863,6 @@ fn a_storage_slot_bound_to_a_swizzled_texture_joins_the_variant() {
     );
 }
 
-/// The value `plan` binds for `key`, which the function reads from its push field.
-fn pushed_word(plan: &crate::bind::BindingPlan, key: SpecKey) -> u32 {
-    let v = plan
-        .specialized_value(key)
-        .unwrap_or_else(|| panic!("no {key:?} value"));
-    u32::try_from(v).expect("a u32")
-}
-
 /// The value `plan` specializes `pipeline`'s constant `key` to.
 fn spec_word(pipeline: &ComputePipeline, plan: &crate::bind::BindingPlan, key: SpecKey) -> u32 {
     let id = pipeline
@@ -901,14 +891,13 @@ fn spec_word(pipeline: &ComputePipeline, plan: &crate::bind::BindingPlan, key: S
 /// view's swizzle would move a channel's code onto another channel's lane before the function
 /// converts it by its own code scale: the variant's pipeline plans the same key for the same
 /// shape, binds the view unswizzled for the function to swizzle (`shader_swizzle`, the
-/// unswizzled texture's mapping), specializes the slot's `TextureSwizzle` to the swizzle's word, and keeps the class's
-/// packed field (`TexelFormat`, which a swizzled view's class drops). A swizzle that reads every
+/// unswizzled texture's mapping) and specializes the slot's `TextureSwizzle` to the swizzle's word.
+/// A swizzle that reads every
 /// texel as none does (`RGB1` of `B5G6R5Unorm`, whose alpha reads 1) leaves the variant, and a
 /// device with Metal's own sampler keeps the view's swizzle. On every committed profile that
 /// holds the format.
 #[test]
 fn a_sampled_slot_bound_to_a_swizzled_packed_texture_swizzles_in_its_function() {
-    use crate::metal::texel_format::TexelFormat;
     let gbar = C::new(S::Green, S::Blue, S::Alpha, S::Red);
     let rgb1 = C::new(S::Red, S::Green, S::Blue, S::One);
     let Some(bc) = assemble("packed read", &read_kernel(Texel::Float, "read", 0)) else {
@@ -982,11 +971,6 @@ fn a_sampled_slot_bound_to_a_swizzled_packed_texture_swizzles_in_its_function() 
             assert_eq!(v.components, view(&own).components, "{what}");
             let word = spec_word(&variant, &again, SpecKey::TextureSwizzle(SLOT));
             assert_eq!(word, gbar.word(), "{what}");
-            let class = pushed_word(&again, SpecKey::TexelFormat(SLOT));
-            assert!(
-                TexelFormat(class).packed_exact(),
-                "{what}: class {class:#x}"
-            );
             if pf == PixelFormat::B5G6R5Unorm {
                 let own = plain
                     .plan(&dev, &state(facts(pf, rgb1)).shape())
@@ -999,113 +983,14 @@ fn a_sampled_slot_bound_to_a_swizzled_packed_texture_swizzles_in_its_function() 
     assert!(joined > 0 && kept > 0, "{joined} joined, {kept} kept");
 }
 
-/// A sampled slot (`access::read`) that reads a 16-bit float texel's own 16 bits from the
-/// texture's unsigned integer alias view (`HalfTexelBitsPolicy::Exact`,
-/// `RuntimeFact::HalfBitsTexture`), bound to a texture whose swizzle reads a channel the format
-/// has as 1, joins the plan's variant: the alias view holds codes, where a `One` in a view's
-/// component mapping is the code 1, the `half` 2 ^ -24, and plain Metal reads the value 1. Both of
-/// the slot's views then take no swizzle (`shader_swizzle`) and the function swizzles the widened
-/// texel under the slot's `TextureSwizzle`. A permutation, a swizzle that reads every texel as none
-/// does (`R16Float`'s `R001`, whose green, blue and alpha the format lacks and the read's constant
-/// lanes answer), and a bound format with no such alias (`RGBA8Unorm`) leave the variant and keep
-/// the views' swizzle. On every committed profile that holds the format.
-#[test]
-fn a_half_bits_slot_bound_to_a_texture_reading_a_channel_as_one_swizzles_in_its_function() {
-    let rgb1 = C::new(S::Red, S::Green, S::Blue, S::One);
-    let r001 = C::new(S::Red, S::Zero, S::Zero, S::One);
-    let gbar = C::new(S::Green, S::Blue, S::Alpha, S::Red);
-    let Some(bc) = assemble("half bits read", &read_kernel(Texel::Float, "read", 0)) else {
-        return;
-    };
-    let facts = |pf: PixelFormat, swizzle: C| {
-        let mut facts = swizzled_facts(swizzle);
-        facts.pixel_format = pf;
-        facts
-    };
-    let views = |plan: &crate::bind::BindingPlan| {
-        let views: Vec<crate::bind::ImageViewDesc> = plan
-            .descriptors
-            .iter()
-            .filter_map(|d| match &d.source {
-                WriteSource::Texture { view, .. } => Some(*view),
-                _ => None,
-            })
-            .collect();
-        assert!(!views.is_empty(), "no texture view");
-        views
-    };
-    let (mut joined, mut kept) = (0, 0);
-    for (stem, dev) in devices() {
-        let Some(plain) = pipeline(&dev, &bc, &LowerInputs::new()) else {
-            continue;
-        };
-        for (pf, swizzle, joins) in [
-            (PixelFormat::RGBA16Float, rgb1, true),
-            (PixelFormat::RGBA16Float, gbar, false),
-            (PixelFormat::R16Float, r001, false),
-            (PixelFormat::RGBA8Unorm, rgb1, false),
-        ] {
-            let what = format!("{pf:?} {swizzle:?} on {stem}");
-            let shape = state(facts(pf, swizzle)).shape();
-            let plan = match plain.plan(&dev, &shape) {
-                Ok(plan) => plan,
-                // A device that holds no such texture refuses it unswizzled too.
-                Err(e) => {
-                    let own = plain.plan(&dev, &state(facts(pf, C::DEFAULT)).shape());
-                    assert!(own.is_err(), "{what}: {e}, but unswizzled it plans");
-                    continue;
-                }
-            };
-            if !joins {
-                assert!(plan.variant.swizzled_storage.is_empty(), "{what}");
-                assert!(views(&plan).iter().all(|v| !v.shader_swizzle), "{what}");
-                kept += 1;
-                continue;
-            }
-            assert_eq!(
-                plan.variant.swizzled_storage,
-                BTreeSet::from([SLOT]),
-                "{what}"
-            );
-            let key = plan.variant.lowering_inputs(Stage::Kernel);
-            let variant = pipeline(&dev, &bc, &key).expect("the variant's inputs");
-            let again = variant
-                .plan(&dev, &shape)
-                .unwrap_or_else(|e| panic!("{what}: variant {e}"));
-            assert_eq!(again.variant, plan.variant, "{what}");
-            // Both views are the unswizzled texture's: the swizzle is the function's. The slot's
-            // own view and the alias's are two bindings of the bound texture, since the format has
-            // an alias (a format without one binds the alias's neutral there).
-            let own = plain
-                .plan(&dev, &state(facts(pf, C::DEFAULT)).shape())
-                .unwrap_or_else(|e| panic!("{what}: unswizzled {e}"));
-            let mapped = views(&again);
-            let plainly = views(&own);
-            assert_eq!(mapped.len(), 2, "{what}: the slot's two bindings");
-            assert_eq!(mapped.len(), plainly.len(), "{what}");
-            for (v, u) in mapped.iter().zip(&plainly) {
-                assert!(v.shader_swizzle, "{what}");
-                assert_eq!(v.components, u.components, "{what}");
-            }
-            let word = spec_word(&variant, &again, SpecKey::TextureSwizzle(SLOT));
-            assert_eq!(word, swizzle.word(), "{what}");
-            joined += 1;
-        }
-    }
-    assert!(joined > 0 && kept > 0, "{joined} joined, {kept} kept");
-}
-
 /// A sample through a runtime sampler (`fpv_swizzled_reads`' `fpv_swz_sample`, a combined image
 /// sampler) of a swizzled packed normalized texture joins the variant as a read does, on every
 /// committed profile without Metal's own sampler: its combined image's view takes no swizzle
 /// (`shader_swizzle`, the unswizzled texture's mapping), the variant plans the same key again and
-/// specializes the slot's swizzle and a class with the packed field. With Metal's own sampler the
-/// view keeps the swizzle. (The device lane `extended_swizzles` found the samples and gathers
-/// keeping the device's widening before this.)
+/// specializes the slot's swizzle. With Metal's own sampler the view keeps the swizzle.
 #[test]
 fn a_combined_sampler_of_a_swizzled_packed_texture_swizzles_in_its_function() {
     use crate::bind::{BoundSampler, ImageSource, SamplerDescriptor};
-    use crate::metal::texel_format::TexelFormat;
     let gbar = C::new(S::Green, S::Blue, S::Alpha, S::Red);
     let Some(bc) = (match llvm_assemble(&engine_dir().join("fpv_swizzled_reads.ll")) {
         Ok(b) => Some(b),
@@ -1204,11 +1089,6 @@ fn a_combined_sampler_of_a_swizzled_packed_texture_swizzles_in_its_function() {
             assert_eq!(v.components, view(&own).components, "{what}");
             let word = spec_word(&variant, &again, SpecKey::TextureSwizzle(SLOT));
             assert_eq!(word, gbar.word(), "{what}");
-            let class = pushed_word(&again, SpecKey::TexelFormat(SLOT));
-            assert!(
-                TexelFormat(class).packed_exact(),
-                "{what}: class {class:#x}"
-            );
             joined += 1;
         }
     }

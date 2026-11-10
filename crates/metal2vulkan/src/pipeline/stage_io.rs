@@ -46,9 +46,10 @@
 //! link; it reads the role here, never the bytes.
 //!
 //! Every interface variable is 32-bit (narrow varyings are widened at the interface, so no varying
-//! needs `storageInputOutput16`) but a color output written as the bits of the half Metal stores,
-//! 16-bit ([`IoType::bits`]); [`IoType::source_bits`] keeps the AIR element width for format
-//! checks. An attribute or color takes one whole location; a user varying takes one location at
+//! needs `storageInputOutput16`), but a `half` color output on a device that enables
+//! `storageInputOutput16` ([`StageIo::half_outputs`]), declared with 16-bit `float` lanes;
+//! [`IoType::source_bits`] keeps the AIR element width for format checks. An attribute or color
+//! takes one whole location; a user varying takes one location at
 //! component 0 unless link packs varyings into shared locations, for which the module decorates
 //! every varying with a relocatable `Component`.
 //!
@@ -196,18 +197,12 @@ pub struct StageIo {
     /// pipeline's (`NeedsInput(ColorWrites)`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub color_writes: BTreeMap<u32, [Option<ChannelWrite>; 4]>,
-    /// The attachments among `color_writes` whose float writes the function rounds to Metal's
-    /// codes in the shader, sorted: those with a channel it rounds by Metal's rule rather than
-    /// leaving to the device (`StageModule::rounded_colors`).
+    /// The attachments among `color_writes` whose float writes the function rounds in the shader,
+    /// sorted: those with a half-float channel under `TextureWriteRoundingMode::NearestEven`
+    /// (`color_writes::HALF_NEAREST`), which no device's conversion gives
+    /// (`StageModule::rounded_colors`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub rounded_colors: Vec<u32>,
-    /// The attachments among `color_writes` whose output the function writes as the bits of the
-    /// half Metal stores, through a 16-bit output, rounding none of its channels (a `half`
-    /// output to a half-float attachment), sorted: the device's conversion of a 32-bit output
-    /// would not keep a NaN's payload (`StageModule::half_bit_colors`). Link gives these, as
-    /// `rounded_colors`, no Vulkan blend of one and zero.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub half_bit_colors: Vec<u32>,
     /// The extended-range attachments the fragment function writes a `float` or `half` output
     /// to through output variables of dual-source index 0
     /// (`LoweringInputs::extended_range_colors`), by color index: each output variable there is
@@ -226,12 +221,14 @@ pub struct StageIo {
     /// (`NeedsInput(ColorWrites)`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub word_colors: BTreeMap<u32, crate::metal::format::WordAttachment>,
-    /// The input attachments the fragment function reads through Metal's decode of their bytes
-    /// (`LoweringInputs::srgb_fetches`): each read snaps the device's sRGB decode back to its
-    /// byte and decodes that by Metal's table. Link refuses a stage compiled for another set
-    /// than the pipeline's (`NeedsInput(ColorWrites)`).
+    /// The input attachments the fragment function reads as `float` texels through the device's
+    /// decode, on a device that does not decode through Metal's own texture unit (without
+    /// `VkProperty::MetalSampler`): a render pipeline whose attachment there has an 8-bit sRGB
+    /// format records `PrecisionNote::SrgbTexelDecode` for the stage
+    /// (`color_writes::pipeline_writes`), the device's sRGB decode standing for Metal's
+    /// twelve-bit table.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub srgb_fetches: std::collections::BTreeSet<u32>,
+    pub decoded_fetches: std::collections::BTreeSet<u32>,
     /// The attachments held with their channels rotated (`LoweringInputs::rotated_colors`) that
     /// the fragment function writes through an output variable of either dual-source index, by
     /// color index: each such output stores Metal's channels rotated
@@ -298,17 +295,6 @@ pub struct StageIo {
     /// (`NeedsInput(DepthCompareClamp)`). Empty for every other function.
     #[cfg_attr(feature = "serde", serde(default))]
     pub depth_compares: DepthCompares,
-    /// The channels taking a `half` output at `float` precision the function compiled under
-    /// (`LoweringInputs::half_output_lanes`), by color index: those of the attachments it writes
-    /// a `half` output to. Link refuses a stage one of whose entries is not the pipeline's
-    /// (`NeedsInput(ColorWrites)`); an attachment without one, every attachment of a function
-    /// compiled without the map among them, takes the `half` the function rounds, under
-    /// `PrecisionNote::HalfOutputPrecision` (under fast math `HalfOutputFastMathBlend`, by
-    /// [`half_fast_colors`](Self::half_fast_colors)), and links.
-    /// Empty for any other function.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub half_output_lanes:
-        BTreeMap<u32, [Option<crate::pipeline::lower_inputs::HalfOutputLane>; 4]>,
     /// The `textureWriteRoundingMode` under which a fragment function's texture writes that
     /// Apple's mode 2 stores otherwise were compiled (`LoweringInputs::texture_write_rounding`),
     /// where the function writes a `float` texel that may reach a half-float or packed
@@ -345,13 +331,6 @@ pub struct StageIo {
     /// (`InvalidDescriptor(VertexAttribute)`). Empty for every other function.
     #[cfg_attr(feature = "serde", serde(default))]
     pub instanced_attributes: Vec<u32>,
-    /// The attachments among `color_writes` whose rules the draw selects
-    /// (`ChannelWrite::Selected`), by color index, with what the function's write does under each
-    /// code of the attachment's rule word (`PushField::ColorWriteRule`): link derives the word
-    /// from the pipeline's attachment (`GraphicsState::color_write_rules`), and from it whether
-    /// the write rounds in the shader and the notes it keeps.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub selected_colors: BTreeMap<u32, SelectedWrite>,
     /// The attachments a `half` color output of a module compiled without fast math
     /// (`air.compile.fast_math_disable`, safe or relaxed math) reaches, by color index, sorted.
     /// Metal stores there the `half` the function returns, blended into a 16-bit float format with
@@ -375,8 +354,7 @@ pub struct StageIo {
     pub float_blend_colors: Vec<u32>,
     /// The attachments a `half` color output of a module compiled with fast math
     /// (`air.compile.fast_math_enable`) reaches as color attachments, by color index, sorted (not
-    /// one the function writes in the storage form, nor one whose channels take the output at
-    /// `float` precision where Metal computes it so, [`half_output_lanes`](Self::half_output_lanes)).
+    /// one the function writes in the storage form).
     /// Metal's compiler folds the attachment's blend and conversion into the function under fast
     /// math, so the pipeline's stage records `PrecisionNote::HalfOutputFastMathBlend` where one of
     /// these attachments stores some channel (`color_writes::stores_output`). One whose write mask
@@ -384,6 +362,14 @@ pub struct StageIo {
     /// output can differ there. Empty for any other function.
     #[cfg_attr(feature = "serde", serde(default))]
     pub half_fast_colors: Vec<u32>,
+    /// The color outputs declared with 16-bit `float` lanes, in the order of the entry's outputs:
+    /// each `half` color output (a scalar or vector of AIR's `half`) through a variable of its own
+    /// type on a device that enables `storageInputOutput16` and `shaderFloat16`, but to an
+    /// attachment held with its channels rotated, so the device receives the `half` as Metal's
+    /// attachment does. Every other user variable is declared 32-bit (a narrower value widened).
+    /// Empty for every other function.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub half_outputs: Vec<VaryingKey>,
     /// The index builtins, `Layer` and `ViewportIndex`, a fragment function reads as 0 on a device
     /// that cannot declare them (`Layer` needs `geometryShader` or `shaderOutputLayer`,
     /// `ViewportIndex` `multiViewport` or `shaderOutputViewportIndex`), sorted: compiled for a
@@ -403,23 +389,6 @@ pub struct StageIo {
     /// compiled with each color at its own index, and for every other function.
     #[cfg_attr(feature = "serde", serde(default))]
     pub color_group: Option<crate::pipeline::lower_inputs::ColorGroup>,
-}
-
-/// What a fragment function's write of a color attachment whose rules the draw selects does
-/// under each code of the attachment's rule word (`StageIo::selected_colors`): bit `c` of a mask
-/// is code `c` (`pipeline::color_writes`'s codes: no rule, the device's conversion, an 8-bit
-/// unorm channel's, a half-float channel's).
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct SelectedWrite {
-    /// The lanes of the output the rules take, the first `lanes` channels' codes.
-    pub lanes: u8,
-    /// A lane of code `c` rounds the output to Metal's code in the shader.
-    pub rounds: u8,
-    /// A lane of code `c` stores a NaN as the device encodes it
-    /// (`PrecisionNote::DeviceNanEncoding`).
-    pub nans: u8,
 }
 
 /// The samplers a fragment function makes depth comparisons through ([`StageIo::depth_compares`]),
@@ -546,30 +515,11 @@ impl StageIo {
     /// Every vertex attribute the function reads, by attribute index, with its declared numeric
     /// class and the fetch it was compiled under: fixed function for an `Attribute` input
     /// variable, the listed fetch for a pulled one.
-    ///
-    /// A fixed-function entry's `narrow_float` is reported as the module depends on it, which is
-    /// only for an attribute read as a 32-bit `float`
-    /// (`link::vertex::narrow_float_of_f32_reads`): a `half`-declared attribute's module is the
-    /// same either way, so it reads as clear whatever the variable records, and link's
-    /// recomputation of the projection agrees with it.
     pub fn attributes(&self) -> BTreeMap<u32, (IoNumeric, VertexFetch)> {
-        let f32_reads = self.f32_attributes();
         let mut out = BTreeMap::new();
         for v in &self.inputs {
-            if let IoRole::Attribute {
-                index,
-                narrow_float,
-            } = v.role
-            {
-                out.insert(
-                    index,
-                    (
-                        v.ty.numeric,
-                        VertexFetch::FixedFunction {
-                            narrow_float: narrow_float && f32_reads.contains(&index),
-                        },
-                    ),
-                );
+            if let IoRole::Attribute { index } = v.role {
+                out.insert(index, (v.ty.numeric, VertexFetch::FixedFunction));
             }
         }
         for p in &self.pulled {
@@ -579,9 +529,9 @@ impl StageIo {
     }
 
     /// The vertex attributes the function reads in fixed function as a 32-bit `float` (`float`,
-    /// `float2`, `float3`, `float4`), which is where a narrow-float format's widening is
-    /// canonicalized (`link::vertex::narrow_float_of_f32_reads`). A `half`-declared attribute is
-    /// not among them, and neither is a pulled attribute, whose decode the module holds whole.
+    /// `float2`, `float3`, `float4`), which is where link notes a narrow-float format's widening's
+    /// NaN (`link::vertex::fixed_function_notes`). A `half`-declared attribute is not among them,
+    /// and neither is a pulled attribute, whose decode the module holds whole.
     pub fn f32_attributes(&self) -> std::collections::BTreeSet<u32> {
         self.inputs
             .iter()
@@ -613,7 +563,6 @@ impl StageIo {
                 numeric: IoNumeric::Uint,
                 components: 1,
                 source_bits: 32,
-                bits: 32,
             };
         }
         match self.extended_range_colors.get(&attachment) {
@@ -621,7 +570,6 @@ impl StageIo {
                 numeric: IoNumeric::Uint,
                 components: e.form.raw_components() as u8,
                 source_bits: 32,
-                bits: 32,
             },
             None => v.ty,
         }
@@ -756,11 +704,9 @@ pub struct IoVariable {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum IoRole {
-    /// Vertex attribute `index`, fetched by fixed-function vertex input. `narrow_float` is the
-    /// `VertexFetch::FixedFunction` bit the function was compiled under: the Metal format's
-    /// components are floats narrower than 32 bits, whose widening the function canonicalizes
-    /// where it reads the attribute as `float`.
-    Attribute { index: u32, narrow_float: bool },
+    /// Vertex attribute `index`, fetched by fixed-function vertex input, whatever its format: the
+    /// format is link-time state (`VertexFetch::FixedFunction`).
+    Attribute { index: u32 },
     /// A vertex output or fragment input matched by its AIR user key.
     Varying {
         user: AirUserKey,
@@ -878,7 +824,7 @@ pub enum Sampling {
 }
 
 /// The declared type of an interface variable: `components` lanes (1–4) of `numeric`, each of
-/// `bits` bits.
+/// 32 bits.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -886,11 +832,9 @@ pub struct IoType {
     pub numeric: IoNumeric,
     pub components: u8,
     /// The AIR element width (8, 16, or 32; 16 for `half`; 1 for `bool`, carried as `uint` 0 or
-    /// 1): narrower values are widened at the interface.
+    /// 1): narrower values are widened at the interface, but a color output of
+    /// [`StageIo::half_outputs`], declared 16-bit.
     pub source_bits: u8,
-    /// The declared lane width: 32, or 16 for a `float` color output written as the bits of the
-    /// half Metal stores into a half-float attachment (`storageInputOutput16`).
-    pub bits: u8,
 }
 
 /// The numeric class the variable is declared with.

@@ -70,7 +70,6 @@ pub const fn shape(f: PushField) -> FieldShape {
     match f {
         PushField::RootTableAddress
         | PushField::ExecutionStatusAddress
-        | PushField::CaptureAddress
         | PushField::CaptureIndexAddress
         | PushField::MergedDrawAddress
         | PushField::CommandRecordsAddress
@@ -95,11 +94,9 @@ pub const fn shape(f: PushField) -> FieldShape {
         // A draw's clamp of each vertex's depth, two `f32`s' bits.
         PushField::VertexDepthClamp => FieldShape::UVec2,
         // The blend color and one minus it, four `f32`s' bits each.
-        PushField::BlendColor => FieldShape::UVec4Array(2),
         // The blend color as the encoder set it, four `f32`s' bits.
         PushField::HalfBlendColor => FieldShape::UVec4Array(1),
         // A draw's depth bias: its constant, slope and clamp as `f32`s' bits, and a zero word.
-        PushField::DepthBias => FieldShape::UVec4Array(1),
         // Base vertex, base instance.
         PushField::BaseVertexInstance => FieldShape::UVec2,
         // The draw's vertices per primitive.
@@ -110,21 +107,20 @@ pub const fn shape(f: PushField) -> FieldShape {
         PushField::ShaderTestsState => FieldShape::UVec4Array(1),
         // The faces' stencil words, the references, and a zero word.
         PushField::ShaderStencilState => FieldShape::UVec4Array(1),
-        // The draw's first vertex, vertex count, first instance, and a zero word.
+        // A zero word, the index count, the first instance, and the base vertex.
         PushField::CaptureLayout => FieldShape::UVec4Array(1),
         // Four bits of kept channels per color attachment.
         PushField::StorageKeptChannels => FieldShape::U32,
         // A specialization key's value carried as data: every such key is a `u32` or a boolean.
         PushField::Specialized(_) => FieldShape::U32,
-        PushField::ColorWriteRule(_) => FieldShape::U32,
+        // An in-place YCbCr texture's size, planes and conversion.
+        PushField::YCbCrInPlace(_) => FieldShape::UVec4Array(2),
         // The residual is below `min{Storage,Uniform}BufferOffsetAlignment`.
         PushField::SlotBindOffset(_) | PushField::VertexBufferStride(_) => FieldShape::U32,
         // A texture's mipmap level count, an acceleration structure's instance count, the render
         // encoder's viewport count, the render pass's array length, a kernel stage-in buffer's
-        // bound stride, whether a storage texture's channels are 16-bit floats, its integer
-        // channels' widths.
+        // bound stride, a storage texture's integer channels' widths.
         PushField::TextureLevels(_)
-        | PushField::TextureHalfChannels(_)
         | PushField::TextureIntegerChannels(_)
         | PushField::InstanceCount(_)
         | PushField::ViewportCount
@@ -459,12 +455,12 @@ mod tests {
         }
     }
 
-    /// A vertex function's capture addresses are holes the consumer fills, which must be in the
-    /// push block: the placement order puts them right after the two other addresses, so the vertex
-    /// window holds them whatever else the function reads, and its layout follows the window's
+    /// A vertex function's index address is a hole the consumer fills, which must be in the push
+    /// block: the placement order puts it right after the two other addresses, so the vertex
+    /// window holds it whatever else the function reads, and its layout follows the window's
     /// other fields.
     #[test]
-    fn the_capture_address_is_always_placed_in_the_vertex_window() {
+    fn the_index_address_is_always_placed_in_the_vertex_window() {
         let mut later = BTreeSet::from([
             PushField::AmplificationId,
             PushField::AmplificationLayerOffset,
@@ -481,7 +477,6 @@ mod tests {
         let (start, end) = window(Stage::Vertex);
         for (root, status) in [(false, false), (true, false), (false, true), (true, true)] {
             let mut fields = later.clone();
-            fields.insert(PushField::CaptureAddress);
             fields.insert(PushField::CaptureIndexAddress);
             if root {
                 fields.insert(PushField::RootTableAddress);
@@ -490,25 +485,14 @@ mod tests {
                 fields.insert(PushField::ExecutionStatusAddress);
             }
             let placement = check(Stage::Vertex, &fields);
-            let capture = placement
-                .fields
-                .iter()
-                .find(|f| f.field == PushField::CaptureAddress)
-                .expect("placed");
             let at = start + 8 * (u32::from(root) + u32::from(status));
-            assert_eq!(capture.loc, PushLoc::Push { offset: at }, "{root} {status}");
             let index = placement
                 .fields
                 .iter()
                 .find(|f| f.field == PushField::CaptureIndexAddress)
                 .expect("placed");
-            let after = at + capture.size;
-            assert_eq!(
-                index.loc,
-                PushLoc::Push { offset: after },
-                "{root} {status}"
-            );
-            assert!(after + index.size <= end);
+            assert_eq!(index.loc, PushLoc::Push { offset: at }, "{root} {status}");
+            assert!(at + index.size <= end);
             let layout = placement
                 .fields
                 .iter()

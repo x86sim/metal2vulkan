@@ -370,58 +370,6 @@ done:
 }
 "#;
 
-/// `arm_then_loop` whose loop also stores `float(t) * float(i + 5) + 1`, a `contract` multiply
-/// fused into its `contract` addition, to `out[t + 32]`: the multiply stands before the lockstep
-/// barrier (right before the loop's threadgroup store) and the addition after it, so the fused
-/// addition reads the multiply's factors across the synchronization the forced `Emulated` tier's
-/// predicated walk splits the block at, where the multiply itself has no value. Lockstep: as
-/// `arm_then_loop` below 32, and the last iteration's `6 (t - 32) + 1` from 32 on.
-const FUSED_SYNC: &str = r#"
-define void @fused_sync(ptr addrspace(1) %0, i32 %1, i32 %sg) #0 {
-  %3 = zext i32 %1 to i64
-  %4 = getelementptr inbounds [64 x i32], ptr addrspace(3) @tg, i64 0, i64 %3
-  store i32 %1, ptr addrspace(3) %4, align 4
-  tail call void @air.wg.barrier(i32 2, i32 1)
-  %5 = icmp ult i32 %1, 32
-  br i1 %5, label %w, label %done
-
-w:
-  %6 = and i32 %1, 1
-  %7 = icmp eq i32 %6, 0
-  br i1 %7, label %arm, label %loop
-
-arm:
-  %8 = add i32 %1, 2
-  %9 = and i32 %8, 31
-  %10 = zext i32 %9 to i64
-  %11 = getelementptr inbounds [64 x i32], ptr addrspace(3) @tg, i64 0, i64 %10
-  %12 = load i32, ptr addrspace(3) %11, align 4
-  %13 = getelementptr inbounds i32, ptr addrspace(1) %0, i64 %3
-  store i32 %12, ptr addrspace(1) %13, align 4
-  br label %loop
-
-loop:
-  %14 = phi i32 [ 0, %w ], [ 0, %arm ], [ %16, %loop ]
-  %15 = add i32 %14, 5
-  %ft = uitofp i32 %1 to float
-  %fi = uitofp i32 %15 to float
-  %p = fmul contract float %ft, %fi
-  store i32 %15, ptr addrspace(3) %4, align 4
-  %s = fadd contract float %p, 1.000000e+00
-  %r = fptoui float %s to i32
-  %up = add i64 %3, 32
-  %far = getelementptr inbounds i32, ptr addrspace(1) %0, i64 %up
-  store i32 %r, ptr addrspace(1) %far, align 4
-  %16 = add i32 %14, 1
-  %17 = icmp ult i32 %16, 2
-  br i1 %17, label %loop, label %done
-
-done:
-  tail call void @air.wg.barrier(i32 2, i32 1)
-  ret void
-}
-"#;
-
 /// `arm_then_loop` whose threads store a value through a struct merged at the end: the entry block
 /// inserts `out + t`, the loop inserts the same address computed in bytes before its lockstep
 /// barrier, and a phi of the two (a member-wise phi) selects the pointer `done` stores through. The
@@ -1157,6 +1105,140 @@ done:
 }
 "#;
 
+/// A store loop over a word two threads of a simdgroup share: threads `2k` and `2k + 1` store
+/// `4k + i` to word `k` in each of four iterations of a loop every thread runs alike, at one
+/// address through the loop (`t >> 1`, which the analysis cannot tell apart between threads). Each
+/// thread's last store is the last to its word whatever order the threads' iterations take, as
+/// under lockstep, so the store against itself in a later iteration takes no barrier.
+/// `out[k] = 4k + 3` for `k < 16`.
+const DEVICE_SHARED_SLOT: &str = r#"
+define void @device_shared_slot(ptr addrspace(1) %0, i32 %1, i32 %sg) #0 {
+  %h = lshr i32 %1, 1
+  %x = zext i32 %h to i64
+  %p = getelementptr inbounds i32, ptr addrspace(1) %0, i64 %x
+  %b = shl i32 %h, 2
+  br label %loop
+
+loop:
+  %i = phi i32 [ 0, %2 ], [ %n, %loop ]
+  %v = add i32 %b, %i
+  store i32 %v, ptr addrspace(1) %p, align 4
+  %n = add nuw i32 %i, 1
+  %c = icmp ult i32 %n, 4
+  br i1 %c, label %loop, label %done
+
+done:
+  ret void
+}
+"#;
+
+/// [`DEVICE_SHARED_SLOT`] whose loop also reads the word of the other pair (`(t >> 1) ^ 1`), which
+/// another thread of the simdgroup stores in the same iteration: lockstep orders that read after
+/// the iteration's stores and before the next, so the barrier stays.
+const DEVICE_SHARED_SLOT_READ: &str = r#"
+define void @device_shared_slot_read(ptr addrspace(1) %0, i32 %1, i32 %sg) #0 {
+  %h = lshr i32 %1, 1
+  %x = zext i32 %h to i64
+  %p = getelementptr inbounds i32, ptr addrspace(1) %0, i64 %x
+  %o = xor i32 %h, 1
+  %y = zext i32 %o to i64
+  %q = getelementptr inbounds i32, ptr addrspace(1) %0, i64 %y
+  br label %loop
+
+loop:
+  %i = phi i32 [ 0, %2 ], [ %n, %loop ]
+  %a = phi i32 [ 0, %2 ], [ %s, %loop ]
+  %v = add i32 %a, %i
+  store i32 %v, ptr addrspace(1) %p, align 4
+  %r = load i32, ptr addrspace(1) %q, align 4
+  %s = add i32 %a, %r
+  %n = add nuw i32 %i, 1
+  %c = icmp ult i32 %n, 4
+  br i1 %c, label %loop, label %done
+
+done:
+  ret void
+}
+"#;
+
+/// [`DEVICE_SHARED_SLOT`] storing to word `(t >> 1) + i`: the address moves with the iteration,
+/// so a thread's store may land on the word another thread of its simdgroup stores in an earlier
+/// iteration, and lockstep makes the later iteration's store the last; the barrier stays.
+const DEVICE_MOVING_SLOT: &str = r#"
+define void @device_moving_slot(ptr addrspace(1) %0, i32 %1, i32 %sg) #0 {
+  %h = lshr i32 %1, 1
+  br label %loop
+
+loop:
+  %i = phi i32 [ 0, %2 ], [ %n, %loop ]
+  %w = add i32 %h, %i
+  %x = zext i32 %w to i64
+  %p = getelementptr inbounds i32, ptr addrspace(1) %0, i64 %x
+  store i32 %1, ptr addrspace(1) %p, align 4
+  %n = add nuw i32 %i, 1
+  %c = icmp ult i32 %n, 4
+  br i1 %c, label %loop, label %done
+
+done:
+  ret void
+}
+"#;
+
+/// [`DEVICE_SHARED_SLOT`] with a loop each thread leaves after `1 + (t & 1)` iterations: the two
+/// threads of a word store it a different number of times, and lockstep makes the thread that
+/// iterates longer store last; the barrier stays.
+const DEVICE_SHARED_SLOT_DIVERGENT: &str = r#"
+define void @device_shared_slot_divergent(ptr addrspace(1) %0, i32 %1, i32 %sg) #0 {
+  %h = lshr i32 %1, 1
+  %x = zext i32 %h to i64
+  %p = getelementptr inbounds i32, ptr addrspace(1) %0, i64 %x
+  %odd = and i32 %1, 1
+  %end = add nuw i32 %odd, 1
+  br label %loop
+
+loop:
+  %i = phi i32 [ 0, %2 ], [ %n, %loop ]
+  store i32 %1, ptr addrspace(1) %p, align 4
+  %n = add nuw i32 %i, 1
+  %c = icmp ult i32 %n, %end
+  br i1 %c, label %loop, label %done
+
+done:
+  ret void
+}
+"#;
+
+/// Each thread writes a record of two words at `2 gid` and `2 gid + 1`, `gid` its
+/// `thread_position_in_grid`: two threads of a simdgroup hold equal positions (in a threadgroup
+/// narrower than 32) or positions 1 to 1023 apart, so the two stores never meet between two
+/// threads, and nothing is inserted.
+const DEVICE_RECORD: &str = r#"
+define void @device_record(ptr addrspace(1) %0, i32 %1, i32 %sg) #0 {
+  %m = mul i32 %1, 2
+  %x = zext i32 %m to i64
+  %p = getelementptr inbounds i32, ptr addrspace(1) %0, i64 %x
+  store i32 %1, ptr addrspace(1) %p, align 4
+  %q = getelementptr inbounds i32, ptr addrspace(1) %p, i64 1
+  %v = add i32 %1, 1
+  store i32 %v, ptr addrspace(1) %q, align 4
+  ret void
+}
+"#;
+
+/// [`DEVICE_RECORD`] storing both values to word `gid`: two threads of a simdgroup that share a
+/// position store one word in two instructions, and lockstep makes the second last, so the
+/// barrier stays.
+const DEVICE_RECORD_SHARED: &str = r#"
+define void @device_record_shared(ptr addrspace(1) %0, i32 %1, i32 %sg) #0 {
+  %x = zext i32 %1 to i64
+  %p = getelementptr inbounds i32, ptr addrspace(1) %0, i64 %x
+  store i32 %1, ptr addrspace(1) %p, align 4
+  %v = add i32 %1, 1
+  store i32 %v, ptr addrspace(1) %p, align 4
+  ret void
+}
+"#;
+
 /// The words of `out` after one workgroup of `threads` threads ran `m`, in both scheduling
 /// orders (which must agree) at subgroup width `lanes`.
 fn run_words(plan: &Plan, m: &TypedModule, threads: u32, lanes: SubgroupSize) -> Vec<u32> {
@@ -1361,9 +1443,8 @@ fn a_conflict_no_subgroup_barrier_orders_takes_emulated_simdgroups_or_the_device
 /// predicated, and that walk carries what an instruction reads as the plain walk and `select` do:
 /// the pointer a forwarding `extractvalue` forwards, from another block into a block the walk
 /// splits at a synchronization (`forward_cross`) and across the synchronization within its block
-/// (`forward_sync`), and the members a member-wise phi's copy reads across it (`member_sync`), and
-/// the factors a fused addition reads across it where the multiply it folds has no value
-/// (`fused_sync`). Each failed to emit (`Invariant: ValueId(n) has no value in this block`) while
+/// (`forward_sync`), and the members a member-wise phi's copy reads across it (`member_sync`).
+/// Each failed to emit (`Invariant: ValueId(n) has no value in this block`) while
 /// the walk reloaded and demoted an instruction's literal operands. On moltenvk-m3 the device's
 /// lockstep orders the pair, so the kernels keep their tier and no walk is predicated.
 #[test]
@@ -1377,7 +1458,6 @@ fn a_forced_predicated_walk_carries_what_each_instruction_reads() {
     };
     let forward = |t: u32| if t < 32 { arm(t) } else { 6 };
     let member = |t: u32| if t < 32 { arm(t) } else { t };
-    let fused = |t: u32| if t < 32 { arm(t) } else { 6 * (t - 32) + 1 };
     for (name, body, expect, extracts) in [
         (
             "forward_cross",
@@ -1397,7 +1477,6 @@ fn a_forced_predicated_walk_carries_what_each_instruction_reads() {
             &member,
             "arith.aggregate.member",
         ),
-        ("fused_sync", FUSED_SYNC, &fused, "arith.float.folded"),
     ] {
         for profile_name in ["lavapipe", "vk12-floor"] {
             let Some(plan) = check(name, body, profile_name, 64, &CHUNKED, expect) else {
@@ -1411,8 +1490,7 @@ fn a_forced_predicated_walk_carries_what_each_instruction_reads() {
             );
             assert_eq!(plan.simd.1, Tier::Emulated, "{at}");
             assert!(plan.families.simd.predication.is_some(), "{at}");
-            // The struct's pointer is read through the extract, not folded away; the multiply
-            // is folded into its addition.
+            // The struct's pointer is read through the extract, not folded away.
             assert_eq!(uses(&plan, extracts), 1, "{at}");
         }
         let Some(plan) = check(name, body, "moltenvk-m3", 64, &[SubgroupSize::W32], expect) else {
@@ -1959,5 +2037,97 @@ fn the_busy_kernel_takes_no_lockstep_barrier() {
             assert_eq!(uses(&plan, name), 0, "{name} on {profile_name}");
         }
         assert_eq!(plan.simd.1, Tier::NoSubgroup, "{profile_name}");
+    }
+}
+
+/// A store loop at an address each thread keeps through the loop, run alike by every thread of the
+/// simdgroup, takes no barrier between its iterations, even where two threads share the word:
+/// every schedule leaves a thread's last store there, as lockstep does.
+#[test]
+fn a_store_loop_at_one_address_takes_no_barrier() {
+    let last = |t: u32| if t < 16 { 4 * t + 3 } else { 0 };
+    for profile_name in LONE_PROFILES {
+        let Some(plan) = check(
+            "device_shared_slot",
+            DEVICE_SHARED_SLOT,
+            profile_name,
+            32,
+            lanes_of(profile_name),
+            last,
+        ) else {
+            return;
+        };
+        for name in LOCKSTEP_NAMES {
+            assert_eq!(uses(&plan, name), 0, "{name} on {profile_name}");
+        }
+    }
+}
+
+/// The store loop keeps its barrier where lockstep's order is observable: a read in the loop of a
+/// word another thread stores, an address that moves with the iteration, or threads that leave the
+/// loop after different numbers of iterations.
+#[test]
+fn a_store_loop_another_thread_reads_moves_or_leaves_early_keeps_its_barrier() {
+    for (name, body) in [
+        ("device_shared_slot_read", DEVICE_SHARED_SLOT_READ),
+        ("device_moving_slot", DEVICE_MOVING_SLOT),
+        ("device_shared_slot_divergent", DEVICE_SHARED_SLOT_DIVERGENT),
+    ] {
+        let Some(bc) = assemble(name, body) else {
+            return;
+        };
+        for profile_name in LONE_PROFILES {
+            let p = profile(profile_name, DevicePolicy::default()).expect("profile");
+            let (plan, _) = typed_module(&bc, name, &p)
+                .unwrap_or_else(|e| panic!("{name} on {profile_name}: {e}"));
+            let barriers: u32 = LOCKSTEP_NAMES.iter().map(|n| uses(&plan, n)).sum();
+            assert!(
+                barriers >= 1,
+                "{name} on {profile_name}: no lockstep barrier"
+            );
+        }
+    }
+}
+
+/// The lockstep census of kernel `name` (`body`, whose `t` is its `thread_position_in_grid`) on
+/// each of [`LONE_PROFILES`], summed.
+fn grid_barriers(name: &str, body: &str) -> Option<Vec<(&'static str, u32)>> {
+    let text = format!("{HEADER}\n{body}\n{}", footer(name)).replace(
+        "air.thread_index_in_threadgroup",
+        "air.thread_position_in_grid",
+    );
+    let bc = assemble_text(name, &text)?;
+    let mut out = Vec::new();
+    for profile_name in LONE_PROFILES {
+        let p = profile(profile_name, DevicePolicy::default()).expect("profile");
+        let (plan, _) =
+            typed_module(&bc, name, &p).unwrap_or_else(|e| panic!("{name} on {profile_name}: {e}"));
+        out.push((
+            profile_name,
+            LOCKSTEP_NAMES.iter().map(|n| uses(&plan, n)).sum(),
+        ));
+    }
+    Some(out)
+}
+
+/// A record per grid position takes no barrier between its words: positions of two threads of a
+/// simdgroup are equal or 1 to 1023 apart, and its words are apart either way. Two stores to one
+/// word per position keep theirs: threads that share a position meet there.
+#[test]
+fn grid_position_records_take_no_barrier_unless_two_stores_share_a_word() {
+    let Some(record) = grid_barriers("device_record", DEVICE_RECORD) else {
+        return;
+    };
+    for (profile_name, n) in record {
+        assert_eq!(n, 0, "device_record on {profile_name}");
+    }
+    let Some(shared) = grid_barriers("device_record_shared", DEVICE_RECORD_SHARED) else {
+        return;
+    };
+    for (profile_name, n) in shared {
+        assert!(
+            n >= 1,
+            "device_record_shared on {profile_name}: no lockstep barrier"
+        );
     }
 }

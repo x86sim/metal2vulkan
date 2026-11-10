@@ -6,8 +6,9 @@
 //!   sub-word store and the padding, with a zero and a non-zero bind residual.
 //! - Generated kernels load and store every leaf path (aligned words, one word, byte by byte) at
 //!   offsets around the end of the buffer and at `0xFFFF_FFF0..=0xFFFF_FFFF`: with the in-shader
-//!   encoding no access traps, an in-bounds access is exact, and an out-of-bounds load is 0 and an
-//!   out-of-bounds store changes nothing.
+//!   encoding no access traps, an in-bounds access is exact (a `half` NaN loaded a NaN where the
+//!   module reads a `half` by the device's widening, `PrecisionNote::NativeNanEncoding`), and an
+//!   out-of-bounds load is 0 and an out-of-bounds store changes nothing.
 //! - Slot forms: the `constant` fixture gets a uniform view (`u32[]` with standard layout,
 //!   `uvec4[]` without) with robust descriptors and a storage view in shader, where an allocation
 //!   shorter than the window is contained; several slots are storage views decorated `Aliased`, a
@@ -35,6 +36,7 @@ use crate::library::FunctionConstantValues;
 use crate::lower::emit::emit_module;
 use crate::lower::select::{select, LowerInputs, Plan};
 use crate::memory::static_root::analyze_memory;
+use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::compile::{compile_bitcode, plan_bitcode, EntryRef};
 use crate::pipeline::facts::{RuntimeFact, UniformViewChoice};
 use crate::pipeline::interface::{BufferForm, DescriptorView, PushLoc, SlotInterface, Window};
@@ -516,7 +518,8 @@ fn leaf_kernels() -> Vec<LeafKernel> {
         k("load_uint4", "<4 x i32>", 16, 16),
         k("load_uchar4_bytes", "<4 x i8>", 4, 1),
         k("load_short2", "<2 x i16>", 4, 4),
-        // Narrow floats are held widened; their leaves round-trip the 16 format bits.
+        // Narrow floats are held widened; their leaves round-trip the 16 format bits, a `half`
+        // NaN's as the device's widening encodes it where the module reads a `half` so.
         k("load_half", "half", 2, 2),
         k("load_half_bytes", "half", 2, 1),
         k("load_half3", "<3 x half>", 6, 8),
@@ -744,7 +747,9 @@ fn offsets(size: u64) -> Vec<u64> {
 /// Every leaf path, in-shader encoding, at offsets around the end of a 32-byte buffer and near 2^32
 /// (with residuals 0 and 4 wrapping them further): no trap, exact in bounds, 0 or unchanged out of
 /// bounds. Probes are skipped where the offset breaks the access's stated alignment (undefined in
-/// Metal).
+/// Metal). A `half` NaN loaded, or stored from a constant, need only come back a NaN where the
+/// module reads a `half` from its bits by the device's widening or encodes one by its narrowing
+/// (`PrecisionNote::NativeNanEncoding`), whose NaN encoding is the device's.
 #[test]
 fn every_leaf_path_is_exact_in_bounds_and_contained_out_of_bounds() {
     let size = 32u64;
@@ -756,6 +761,11 @@ fn every_leaf_path_is_exact_in_bounds_and_contained_out_of_bounds() {
                 return;
             };
             check_l3(&bc, k.name, &p, &what);
+            let native_halves = k.ty.contains("half")
+                && compile(&bc, k.name, &p)
+                    .unwrap_or_else(|e| panic!("{what}: {e}"))
+                    .precision
+                    .contains(&PrecisionNote::NativeNanEncoding);
             let (plan, m) = typed_module(&bc, k.name, &p).unwrap_or_else(|e| panic!("{what}: {e}"));
             for r in [0u32, 4] {
                 for off in offsets(size) {
@@ -796,18 +806,30 @@ fn every_leaf_path_is_exact_in_bounds_and_contained_out_of_bounds() {
                             } else {
                                 vec![0; k.bytes as usize]
                             };
-                            assert_eq!(
-                                out.buffers[1][..k.bytes as usize],
-                                want[..],
-                                "{what} r={r} off={off:#x}"
-                            );
+                            let got = &out.buffers[1][..k.bytes as usize];
+                            if native_halves {
+                                assert!(
+                                    same_halves(got, &want),
+                                    "{what} r={r} off={off:#x}: {got:?} for {want:?}"
+                                );
+                            } else {
+                                assert_eq!(got, &want[..], "{what} r={r} off={off:#x}");
+                            }
                         }
                         Some((_, bytes)) => {
                             let mut want = dbuf.bytes.clone();
                             if inb {
                                 want[at..at + bytes.len()].copy_from_slice(bytes);
                             }
-                            assert_eq!(out.buffers[0], want, "{what} r={r} off={off:#x}");
+                            if native_halves {
+                                assert!(
+                                    same_halves(&out.buffers[0], &want),
+                                    "{what} r={r} off={off:#x}: {:?}",
+                                    out.buffers[0]
+                                );
+                            } else {
+                                assert_eq!(out.buffers[0], want, "{what} r={r} off={off:#x}");
+                            }
                         }
                     }
                 }
@@ -1034,7 +1056,10 @@ fn push_with_table(plan: &Plan) -> Vec<u8> {
 /// Every leaf path, with bind offsets 0 and 8, at offsets around the end of the allocation and near
 /// 2^32: no trap, exact in bounds, 0 out of bounds, and an out-of-bounds store lands in the sink
 /// and leaves the allocation unchanged. Robust buffer access does not cover device addresses, so
-/// the check is emitted on a robust profile too.
+/// the check is emitted on a robust profile too. A `half` NaN loaded, or stored from a constant,
+/// need only come back a NaN where the module reads a `half` from its bits by the device's
+/// widening or encodes one by its narrowing (`PrecisionNote::NativeNanEncoding`), whose NaN
+/// encoding is the device's.
 #[test]
 fn a_device_address_slot_is_exact_and_contained() {
     let size = 32u64;
@@ -1058,6 +1083,8 @@ fn a_device_address_slot_is_exact_and_contained() {
         )
         .unwrap_or_else(|e| panic!("{what}: {e}"));
         link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
+        let native_halves =
+            k.ty.contains("half") && a.precision.contains(&PrecisionNote::NativeNanEncoding);
         let (plan, m) = typed_module_with(&bc, k.name, &p, &inputs);
         for bind in [0u64, 8] {
             for off in offsets(size) {
@@ -1105,18 +1132,30 @@ fn a_device_address_slot_is_exact_and_contained() {
                         } else {
                             vec![0; k.bytes as usize]
                         };
-                        assert_eq!(
-                            out.buffers[3][..k.bytes as usize],
-                            want[..],
-                            "{what} bind={bind} off={off:#x}"
-                        );
+                        let got = &out.buffers[3][..k.bytes as usize];
+                        if native_halves {
+                            assert!(
+                                same_halves(got, &want),
+                                "{what} bind={bind} off={off:#x}: {got:?} for {want:?}"
+                            );
+                        } else {
+                            assert_eq!(got, &want[..], "{what} bind={bind} off={off:#x}");
+                        }
                     }
                     Some((_, bytes)) => {
                         let mut want = data.clone();
                         if inb {
                             want[at..at + bytes.len()].copy_from_slice(bytes);
                         }
-                        assert_eq!(out.buffers[0], want, "{what} bind={bind} off={off:#x}");
+                        if native_halves {
+                            assert!(
+                                same_halves(&out.buffers[0], &want),
+                                "{what} bind={bind} off={off:#x}: {:?}",
+                                out.buffers[0]
+                            );
+                        } else {
+                            assert_eq!(out.buffers[0], want, "{what} bind={bind} off={off:#x}");
+                        }
                     }
                 }
             }
@@ -1359,10 +1398,7 @@ fn the_highest_storage_slots_fall_back_to_device_addresses() {
             .join(format!("{stem}.json"));
         let text = std::fs::read_to_string(path).expect("profile");
         let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-        // Three storage slots, and on a device that selects a dropped store's place the stage's
-        // store sink beside them, one descriptor of its own (`lower::access::sink`): the limit
-        // leaves room for all but one, so one slot moves either way.
-        desc.limits.max_per_stage_descriptor_storage_buffers = 2 + u32::from(selects_sink(&desc));
+        desc.limits.max_per_stage_descriptor_storage_buffers = 2;
         let p = Device::new(desc, policy())
             .expect("device")
             .profile()
@@ -1404,8 +1440,7 @@ fn the_highest_storage_slots_fall_back_to_device_addresses() {
             link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem}: L3: {e}"));
             // No robust descriptors, or no read-only slot left to move: the limit is refused.
             let mut strict = profile_desc(stem);
-            strict.limits.max_per_stage_descriptor_storage_buffers =
-                2 + u32::from(selects_sink(&strict));
+            strict.limits.max_per_stage_descriptor_storage_buffers = 2;
             strict.features.remove(&VkFeature::RobustBufferAccess);
             strict.features.remove(&VkFeature::RobustBufferAccess2);
             let mut written = profile_desc(stem);
@@ -1426,12 +1461,6 @@ fn the_highest_storage_slots_fall_back_to_device_addresses() {
     }
 }
 
-/// Whether a stage of the device `desc` describes binds a store sink for a dropped store through
-/// a descriptor view, which is one storage descriptor of its own (`lower::access::sink`).
-fn selects_sink(desc: &DeviceDescription) -> bool {
-    desc.has(VkFeature::VariablePointers) && desc.has(VkFeature::VariablePointersStorageBuffer)
-}
-
 /// The description of committed profile `stem`.
 fn profile_desc(stem: &str) -> DeviceDescription {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1442,9 +1471,8 @@ fn profile_desc(stem: &str) -> DeviceDescription {
 }
 
 /// A kernel with a loop reserves no status binding (its modules carry no execution bound), so the
-/// descriptor fallback counts the Metal slots and the stage's store sink. With three storage slots,
-/// the sink and a per-stage limit of three, moving one slot brings the storage count to three: the
-/// highest slot to a device address
+/// descriptor fallback counts the Metal slots alone. With three storage slots and a per-stage limit
+/// of two, moving one slot brings the storage count to two: the highest slot to a device address
 /// where the profile has them, else (Profile F) the uniform-view fallback moves only the bounded
 /// params word, and the `Whole` data slot stays a storage descriptor.
 #[test]
@@ -1469,10 +1497,7 @@ fn a_looping_kernel_reserves_no_status_binding_in_the_fallback() {
             .join(format!("{stem}.json"));
         let text = std::fs::read_to_string(path).expect("profile");
         let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-        // Three storage slots, and on a device that selects a dropped store's place the stage's
-        // store sink beside them, one descriptor of its own (`lower::access::sink`): the limit
-        // leaves room for all but one, so one slot moves either way.
-        desc.limits.max_per_stage_descriptor_storage_buffers = 2 + u32::from(selects_sink(&desc));
+        desc.limits.max_per_stage_descriptor_storage_buffers = 2;
         let p = Device::new(desc, policy())
             .expect("device")
             .profile()
@@ -1695,7 +1720,7 @@ fn the_word_cap_holds_on_the_emitted_words() {
     };
     // (`DriverDeviation::MetalNormStorageWrites`): on an unmeasured device the write's rounding
     // routine, counted whole, lifts the estimate past the emitted words.
-    let p = profile_with("moltenvk-m4", true, true);
+    let p = profile_with("moltenvk-m3", true, true);
     let entry = EntryRef::Name("storage_texture_write");
     let consts = FunctionConstantValues::defaults();
     let inputs = LowerInputs::new();
@@ -1742,7 +1767,10 @@ fn profile_without(stem: &str, features: &[VkFeature]) -> DeviceProfile {
 /// 2023 baseline, both on `moltenvk-m3`), every generated leaf kernel is exact in bounds and
 /// contained out of bounds at bind residuals that are not multiples of 4: a narrow unit's index
 /// follows the binder contract (descriptor base congruent to the Metal address modulo 4), and a
-/// sub-word store through a unit leaves its neighbours unchanged.
+/// sub-word store through a unit leaves its neighbours unchanged. A `half` NaN loaded, or stored
+/// from a constant, need only come back a NaN where the module reads a `half` from its bits by the
+/// device's widening or encodes one by its narrowing (`PrecisionNote::NativeNanEncoding`), whose
+/// NaN encoding is the device's.
 #[test]
 fn narrow_units_are_exact_at_every_bind_residual() {
     let size = 32u64;
@@ -1760,6 +1788,11 @@ fn narrow_units_are_exact_at_every_bind_residual() {
                 return;
             };
             check_l3(&bc, k.name, &p, &what);
+            let native_halves = k.ty.contains("half")
+                && compile(&bc, k.name, &p)
+                    .unwrap_or_else(|e| panic!("{what}: {e}"))
+                    .precision
+                    .contains(&PrecisionNote::NativeNanEncoding);
             let (plan, m) = typed_module(&bc, k.name, &p).unwrap_or_else(|e| panic!("{what}: {e}"));
             let mut probes: Vec<u32> = (0..=9).collect();
             probes.extend(size as u32 - 9..=size as u32 + 1);
@@ -1799,24 +1832,51 @@ fn narrow_units_are_exact_at_every_bind_residual() {
                             } else {
                                 vec![0; k.bytes as usize]
                             };
-                            assert_eq!(
-                                out.buffers[1][..k.bytes as usize],
-                                want[..],
-                                "{what} r={r} off={o}"
-                            );
+                            let got = &out.buffers[1][..k.bytes as usize];
+                            if native_halves {
+                                assert!(
+                                    same_halves(got, &want),
+                                    "{what} r={r} off={o}: {got:?} for {want:?}"
+                                );
+                            } else {
+                                assert_eq!(got, &want[..], "{what} r={r} off={o}");
+                            }
                         }
                         Some((_, bytes)) => {
                             let mut want = dbuf.bytes.clone();
                             if inb {
                                 want[at..at + bytes.len()].copy_from_slice(bytes);
                             }
-                            assert_eq!(out.buffers[0], want, "{what} r={r} off={o}");
+                            if native_halves {
+                                assert!(
+                                    same_halves(&out.buffers[0], &want),
+                                    "{what} r={r} off={o}: {:?}",
+                                    out.buffers[0]
+                                );
+                            } else {
+                                assert_eq!(out.buffers[0], want, "{what} r={r} off={o}");
+                            }
                         }
                     }
                 }
             }
         }
     }
+}
+
+/// Whether the little-endian `half` patterns `got` are `want`'s, a NaN pattern any NaN.
+fn same_halves(got: &[u8], want: &[u8]) -> bool {
+    let nan = |h: u16| h & 0x7C00 == 0x7C00 && h & 0x3FF != 0;
+    got.len() == want.len()
+        && got
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(want.as_chunks::<2>().0)
+            .all(|(g, w)| {
+                let (g, w) = (u16::from_le_bytes(*g), u16::from_le_bytes(*w));
+                g == w || (nan(g) && nan(w))
+            })
 }
 
 /// The variables bound to kernel buffer slot `index`: its word view and its narrow views.
@@ -2054,8 +2114,9 @@ const VEC4_RESIDUALS: [u32; 6] = [0, 4, 12, 16, 36, 0xFFFF_FFF0];
 /// (declared beside the word view, and stored with one `OpStore`), in both encodings, on every
 /// tested profile; aligned to 4 it moves word by word (four stores, no `uvec4` view of the slot it
 /// stores to). At every residual a descriptor offset that is a multiple of 16 reads and writes
-/// exactly the leaf's 16 bytes of a 48-byte range, and with the in-shader check the offset past
-/// the range reads 0 and writes nothing.
+/// exactly the leaf's 16 bytes of a 48-byte range (a `half` NaN stored from a constant a NaN where
+/// the module encodes it by the device's narrowing, `PrecisionNote::NativeNanEncoding`), and with
+/// the in-shader check the offset past the range reads 0 and writes nothing.
 #[test]
 #[ignore = "x86Sim: 16-byte leaves no longer use uvec4 units (memory::leaf::VEC4_UNITS), which changes these outputs"]
 fn sixteen_byte_leaves_move_as_one_uvec4() {
@@ -2088,6 +2149,8 @@ fn sixteen_byte_leaves_move_as_one_uvec4() {
                 "{what}: views of out"
             );
             let a = compile(&bc, k.name, &p).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let native_halves =
+                k.ty.contains("half") && a.precision.contains(&PrecisionNote::NativeNanEncoding);
             let stores = opcodes(&a.module.words)
                 .iter()
                 .filter(|o| **o == OP_STORE)
@@ -2137,7 +2200,15 @@ fn sixteen_byte_leaves_move_as_one_uvec4() {
                             if inb {
                                 want[at..at + 16].copy_from_slice(bytes);
                             }
-                            assert_eq!(out.buffers[0], want, "{what} r={r:#x} {desc}");
+                            if native_halves {
+                                assert!(
+                                    same_halves(&out.buffers[0], &want),
+                                    "{what} r={r:#x} {desc}: {:?}",
+                                    out.buffers[0]
+                                );
+                            } else {
+                                assert_eq!(out.buffers[0], want, "{what} r={r:#x} {desc}");
+                            }
                         }
                     }
                 }

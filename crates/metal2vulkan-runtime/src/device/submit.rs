@@ -18,6 +18,7 @@
 
 use super::functions::Vk;
 use super::relay::By;
+use super::submit_stalls::Uses;
 use super::{lock, Device};
 use crate::error::{vulkan, Error};
 use crate::exit_guard::{self, Call};
@@ -199,7 +200,10 @@ impl Device {
             // SAFETY: recording, outside a render pass, for the queue family; it is submitted
             // first in the work's submission, which is waited for before anything that uses the
             // resources is submitted after it.
-            unsafe { taken.record(raw, objects.buffer, shared.queue_flags_of(0)) };
+            unsafe {
+                let family = shared.queue_flags_of(0);
+                taken.record((raw, &shared.counts), objects.buffer, family);
+            };
         }
         // Host calls' staged copies, after the first work, before the work.
         // SAFETY: recording, outside a render pass; every image's move is recorded before it
@@ -242,7 +246,7 @@ impl Device {
         // SAFETY: the queue is used under its lock; the command buffers are executable; every
         // signal of the timeline is above its value. Where the queue's failures are relayed, a
         // failure of this submission loses the device (`relay.rs`).
-        let made = shared.use_queue(0, By::Runtime, |queue| unsafe {
+        let made = shared.use_queue(0, By::Runtime, Uses::OneSignalling, |queue| unsafe {
             // No buffer of addresses goes while it encodes (`freed_memory.rs`).
             let _gate = (shared.parking.get()).map(|parking| parking.submitting());
             let buffers = submits
@@ -315,7 +319,7 @@ impl Device {
         // family binds sparse memory, and the queue is used under its lock; the signal is above
         // the timeline's value (the internal lock is held).
         shared.counts.queue_submitted(0, 0);
-        let bound = shared.use_queue(0, By::Runtime, |queue| unsafe {
+        let bound = shared.use_queue(0, By::Runtime, Uses::Unknown, |queue| unsafe {
             raw.queue_bind_sparse(queue, &[info], vk::Fence::null())
         });
         exit_guard::called(Call::QueueBindSparse);

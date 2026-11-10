@@ -49,7 +49,7 @@
 //!   own encoding would store 0x2c; alpha takes 0x20 either way. Both `BGRA8` pairs and both
 //!   directions alike, at 2 and 4 samples (the counts an M3 Max makes of these formats), each case
 //!   deterministic over four to six processes. So the runtime resolves it by the crate-owned
-//!   resolve in the resolve texture's format, under either `ResolvePolicy` (`color_resolve.rs`): a
+//!   resolve in the resolve texture's format (`color_resolve.rs`): a
 //!   subpass resolve writes only the attachment's own format
 //!   (`VUID-VkSubpassDescription-pResolveAttachments-00850`), so no device's average resolves
 //!   across the pair. The other channel order of the family, whose probes covered samples that
@@ -137,12 +137,12 @@
 //! - **Color** through the subpass's resolve attachments. Vulkan averages a resolve of a
 //!   normalized or floating-point format (`VK_RESOLVE_MODE_AVERAGE_BIT`) and leaves the
 //!   average's rounding to the device, so a device may differ from Metal by one unit at a tie
-//!   (the exact path is a resolve shader). A resolve into the attachment's format's sRGB twin
+//!   (`device-rounded-resolve`). A resolve into the attachment's format's sRGB twin
 //!   takes no subpass resolve at all: the resolve attachment of a subpass is of the color
 //!   attachment's own format, so only the crate-owned resolve writes the twin's encoding.
 //! - **The samples a resolve after the pass reads.** A resolve the runtime draws after the pass
-//!   (`color_resolve.rs`: the twin's, an extended-range attachment's, and every one under
-//!   `ResolvePolicy::Exact`) reads the samples the pass stores, so the pass stores them
+//!   (`color_resolve.rs`: the twin's and an extended-range attachment's) reads the samples the
+//!   pass stores, so the pass stores them
 //!   (`render_target::color_ops`) where Metal's `MultisampleResolve` stores nothing of the
 //!   attachment and leaves its texture as it was. Such a pass renders the attachment through the
 //!   image its texture keeps for the queue, the samples copied into it where the pass loads them
@@ -242,7 +242,7 @@ use metal2vulkan::error::{Feature, RuntimeDriverDefect, Unsupported};
 use metal2vulkan::metal::format::{aspects, sampled_type, ExtendedRange, FormatMapping};
 use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
 use metal2vulkan::pipeline::SampledType;
-use metal2vulkan::vk::{ImageAspectFlags, ImageCreateFlags, ImageType, ImageUsageFlags};
+use metal2vulkan::vk::{Format, ImageAspectFlags, ImageCreateFlags, ImageType, ImageUsageFlags};
 
 /// A Vulkan resolve mode of a depth or stencil aspect: `NONE` where the aspect does not resolve.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -687,20 +687,25 @@ fn samples_read_after(color: &ColorTarget) -> bool {
 /// pass, as Metal's does, while the resolve still reads the samples the pass rendered.
 ///
 /// In place where the pass executes render commands (`executes`, whose commands record later) or a
-/// draw took a view of the attachment's image (`taken`, as `kept_bytes::settle` asks it: a
-/// framebuffer fetch in place, its sample planes, a view of another format, its extended-range
-/// shadow), where it already renders through a stand-in (whose copy back Metal's store action
-/// decides alike, `attachment_stand_in.rs`), where its texture keeps no texels (memoryless), and
-/// where the device copies no image of the format: there the pass stores the samples it rendered,
-/// Metal's answer where its tiler overflows, which `dont-care-store` announces
-/// (`Device::degrade_pass`). A pass whose color attachments are multisampled has no linear one
-/// (no texture over a buffer is multisampled), so none of this moves what
-/// `VK_NV_linear_color_attachment`'s rule binds (`linear_attachment.rs`).
+/// draw took a view of the attachment's image (`viewed`, as `kept_bytes::settle` asks it of the
+/// attachment it renders apart: a framebuffer fetch in place, its sample planes, a view of another
+/// format, its extended-range shadow), where it already renders through a stand-in (whose copy
+/// back Metal's store action decides alike, `attachment_stand_in.rs`), where its texture keeps no
+/// texels (memoryless), and where the device copies no image of the format: there the pass stores
+/// the samples it rendered, Metal's answer where its tiler overflows, which `dont-care-store`
+/// announces (`Device::degrade_pass`). On a device whose framebuffer fetch reads input
+/// attachments (`PassLayout::fetch_inputs`), whose subpass names every color as an input
+/// attachment too, a color is viewed only where a draw read it so: the input reference takes the
+/// framebuffer's view, the kept image's, as the color reference does. The linear rule's `taken`
+/// counts every color of a pass there (`render.rs`), which would keep no samples on such a device
+/// at all. A pass whose color attachments are multisampled has no linear one (no texture over a
+/// buffer is multisampled), so none of this moves what `VK_NV_linear_color_attachment`'s rule
+/// binds (`linear_attachment.rs`).
 pub(super) fn keep_samples(
     maker: &CommandBuffer,
     colors: &mut [Option<ColorTarget>],
     executes: bool,
-    taken: impl Fn(usize) -> bool,
+    viewed: impl Fn(usize) -> bool,
 ) -> Result<(), Error> {
     if executes {
         return Ok(());
@@ -713,7 +718,7 @@ pub(super) fn keep_samples(
         if !samples_read_after(color)
             || color.stand_in.is_some()
             || color.memoryless
-            || taken(index)
+            || viewed(index)
         {
             continue;
         }
@@ -1409,6 +1414,18 @@ pub(super) fn scratch(
     usage: ImageUsageFlags,
     samples: u32,
 ) -> Result<Target, Error> {
+    scratch_viewed(maker, source, usage, samples, None)
+}
+
+/// [`scratch`], its image also taking views in `view` where one is named (mutable to it alone):
+/// the color resolve's copy that it reads through the device's sRGB decode (`color_resolve.rs`).
+pub(super) fn scratch_viewed(
+    maker: &CommandBuffer,
+    source: &Target,
+    usage: ImageUsageFlags,
+    samples: u32,
+    view: Option<Format>,
+) -> Result<Target, Error> {
     let format = source.format;
     let [width, height] = source.extent;
     let layers = source.layers;
@@ -1432,7 +1449,10 @@ pub(super) fn scratch(
     let aspects = aspects(pixel_format).unwrap_or(ImageAspectFlags::COLOR);
     let plan = ImagePlan {
         pixel_format,
-        flags: ImageCreateFlags::empty(),
+        flags: match view {
+            Some(_) => ImageCreateFlags::MUTABLE_FORMAT,
+            None => ImageCreateFlags::empty(),
+        },
         image_type: ImageType::TYPE_2D,
         format,
         extent: [width, height, 1],
@@ -1441,7 +1461,7 @@ pub(super) fn scratch(
         samples: sample_count(samples)
             .ok_or_else(|| internal("an attachment of a sample count Vulkan lacks"))?,
         usage: usage | ImageUsageFlags::TRANSFER_SRC,
-        view_formats: Vec::new(),
+        view_formats: view.map_or_else(Vec::new, |view| vec![format, view]),
         mapping: FormatMapping::direct(format, aspects),
         unavailable: TextureUsage::SHADER_READ
             | TextureUsage::SHADER_WRITE

@@ -26,6 +26,7 @@ use super::buffer_texture::TexelViews;
 use super::churn_counts::Recycled;
 use super::degradation::Degradation;
 use super::device::{lock, DeviceShared};
+use super::dirty_pages::{DirtySource, PagesLog};
 use super::error::{internal, invalid, nil, vulkan, Error, Problem};
 use super::exit_guard;
 use super::fresh_pages;
@@ -33,6 +34,7 @@ use super::generated_commands::PREPROCESS_BUFFER;
 use super::heap::{Heap, HeapType};
 use super::host_aliases::Alias;
 use super::host_memory::{HeldBack, KeepAlive, Release};
+use super::host_ram::RamOnDevice;
 #[cfg(unix)]
 use super::host_residency::{Again, Residency};
 use super::memory::{Mapped, MemoryClass, Placement, BLOCK_BYTES};
@@ -152,6 +154,9 @@ pub(super) struct HostCell {
     /// and in it), which a detach makes present stand-ins (`detach.rs`), and the textures being
     /// made over them, which a detach refuses while one is.
     textures: Mutex<TexturesOver>,
+    /// The images in place over the buffer's bytes (a no-copy heap's: over its buffers'), which a
+    /// rebind makes again over its new pages (`texture/in_place_image.rs`).
+    in_place: Mutex<Vec<InPlaceWatch>>,
     /// The reasons the buffer's Metal address was handed out for (`Buffer::gpu_address`,
     /// `Buffer::exposed_address`), a bit each ([`ReadApart`]): once any is, its import is kept
     /// imported for good (`host_residency.rs`), and a call for a reason noted need not look
@@ -167,6 +172,24 @@ pub(super) struct HostCell {
     /// The deallocator of the pages its last detach let go of (`detach.rs`), held back until its
     /// next rebind or its release, as Metal runs it then ([`Release::hold_back`]).
     held_back: Mutex<Option<Arc<HeldBack>>>,
+}
+
+/// An image in place over a buffer's host pages ([`HostCell`], `texture/in_place_image.rs`),
+/// which a rebind makes again over the new pages: the image (`texture.rs`'s `Image`), held weakly
+/// and by type erased as [`NotedTexture`] holds it, where its texels lie in bytes from the pages'
+/// first byte, and how Metal lays them out from there.
+#[derive(Clone)]
+pub(super) struct InPlaceWatch {
+    pub(super) image: Weak<dyn Any + Send + Sync>,
+    pub(super) from_base: u64,
+    pub(super) layout: crate::linear_plan::BufferLayout,
+}
+
+impl InPlaceWatch {
+    /// Whether the image lives.
+    fn lives(&self) -> bool {
+        self.image.strong_count() > 0
+    }
 }
 
 /// The textures over a buffer's host pages ([`HostCell`]): their images, which a detach makes
@@ -341,19 +364,6 @@ impl Detached {
     }
 }
 
-impl Drop for HostCell {
-    fn drop(&mut self) {
-        // As in `replace`: the buffer's release lets go of its pages last.
-        let lying = self
-            .pages
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Lying::In(pages) = lying {
-            pages.let_go_by_buffer();
-        }
-    }
-}
-
 impl HostCell {
     /// Whether the GPU's writes to the buffer are dropped (`read_only_view.rs`).
     pub(super) fn drops_writes(&self) -> bool {
@@ -412,11 +422,6 @@ impl HostCell {
             HOST_CELLS_MOVED.fetch_add(1, Ordering::AcqRel);
             lay
         };
-        // The replays that hold the pages it lay in go first, so the caller lets go of them last,
-        // as it would without them (`HostPages::let_go_by_buffer`).
-        if let Lying::In(pages) = &lay {
-            pages.let_go_by_buffer();
-        }
         lay
     }
 
@@ -471,6 +476,20 @@ impl HostCell {
         let mut textures = lock(&self.textures);
         textures.noted.retain(NotedTexture::lives);
         textures.noted.push(noted);
+    }
+
+    /// Note `watch`, an image in place over the buffer's bytes, forgetting those gone.
+    fn watch_in_place(&self, watch: InPlaceWatch) {
+        let mut in_place = lock(&self.in_place);
+        in_place.retain(InPlaceWatch::lives);
+        in_place.push(watch);
+    }
+
+    /// The live images in place over the buffer's bytes, which a rebind makes again.
+    pub(super) fn in_place_images(&self) -> Vec<InPlaceWatch> {
+        let mut in_place = lock(&self.in_place);
+        in_place.retain(InPlaceWatch::lives);
+        in_place.clone()
     }
 
     /// The textures over the buffer's bytes, locked, where none is being made: none is made
@@ -617,13 +636,12 @@ pub(super) struct HostPages {
     release: OnceLock<Release>,
     /// The live buffers' tables' holds on them ([`ListedPages`]).
     listed: AtomicUsize,
-    /// The holds on them of command buffers' replays (`recorder`): what a command buffer's
-    /// commands took, held from its commit until they are replayed, each counted until it is
-    /// gone ([`let_go_by_replay`](Self::let_go_by_replay)), so the count outlives them.
-    replay_holds: Arc<AtomicUsize>,
-    /// Their buffer let go of them: its release, rebind or detach (pages lie in one buffer,
-    /// once) ([`let_go_by_buffer`](Self::let_go_by_buffer)).
-    let_go: AtomicBool,
+    /// The caller's log of the writes to them, where it gave one with their memory
+    /// (`HostMemory::with_dirty_pages`, `dirty_pages.rs`).
+    dirty: OnceLock<Arc<DirtySource>>,
+    /// The guest RAM their caller resolved them to and the runs of it they are, in their byte
+    /// order (`HostMemory::with_runs`, `host_ram.rs`), kept until the rebind or the release.
+    ram_runs: OnceLock<(Arc<RamOnDevice>, Box<[Range<u64>]>)>,
 }
 
 impl HostPages {
@@ -638,53 +656,61 @@ impl HostPages {
             import,
             release: OnceLock::new(),
             listed: AtomicUsize::new(0),
-            replay_holds: Arc::new(AtomicUsize::new(0)),
-            let_go: AtomicBool::new(false),
+            dirty: OnceLock::new(),
+            ram_runs: OnceLock::new(),
         }
     }
 
-    /// A command buffer's replays hold them from now on (`recorder`): counted before its commit
-    /// reads whether their buffer let go of them ([`let_go_by_buffer`](Self::let_go_by_buffer)).
-    pub(super) fn held_for_replay(&self) {
-        self.replay_holds.fetch_add(1, Ordering::SeqCst);
+    /// They lie in a copy of the caller's pages, registered as `copied` (`copied.rs`).
+    pub(super) fn set_copied(&self, copied: crate::copied::Copied) {
+        self.import.set_copied(copied);
     }
 
-    /// A command buffer's replays let go of `pages`: the pages, where that hold was their last.
-    /// Counted out only once the hold is gone, so their buffer's let-go that finds no hold
-    /// finds no replay letting go of one either ([`let_go_by_buffer`](Self::let_go_by_buffer)).
-    pub(super) fn let_go_by_replay(pages: Arc<HostPages>) -> Option<HostPages> {
-        let holds = Arc::clone(&pages.replay_holds);
-        let last = Arc::into_inner(pages);
-        holds.fetch_sub(1, Ordering::AcqRel);
-        last
+    /// Keep the caller's log of the writes to them (`dirty_pages.rs`), given with their memory.
+    pub(super) fn keep_dirty(&self, dirty: Arc<DirtySource>) {
+        let _kept = self.dirty.set(dirty);
     }
 
-    /// Whether their buffer let go of them ([`let_go_by_buffer`](Self::let_go_by_buffer)): read
-    /// by a commit after its replays' holds on them are counted and its replays queued.
-    pub(super) fn buffer_let_go(&self) -> bool {
-        self.let_go.load(Ordering::SeqCst)
+    /// Keep the logs of the writes to them (`dirty_pages::PagesLog`), with their import.
+    pub(super) fn keep_log(&self, log: Arc<PagesLog>) {
+        self.import.keep_log(log);
     }
 
-    /// Their buffer lets go of them (its release, rebind or detach), the caller still holding
-    /// them: where command buffers' replays hold them, every replay waiting runs first, on this
-    /// thread, so the replays let go of them before the caller does, and their deallocator runs
-    /// at the call that lets go of them last, as it does with commands recorded as they are
-    /// encoded (`recorder`). Nothing where none holds them.
-    ///
-    /// Against a commit on another thread whose replays come to hold them, each marks its side
-    /// and then reads the other's, sequentially consistent, so at least one sees the other:
-    /// this finds the commit's hold, and its replays, queued before the commit read the mark,
-    /// and replays them here; or the commit finds the mark and replays them itself, letting go
-    /// of the pages where it lets go of them without a recorder (`Replays::commit`).
-    fn let_go_by_buffer(&self) {
-        self.let_go.store(true, Ordering::SeqCst);
-        if self.replay_holds.load(Ordering::SeqCst) == 0 {
+    /// The logs of the writes to them, where their memory came with one.
+    pub(super) fn log(&self) -> Option<&Arc<PagesLog>> {
+        self.import.log.get()
+    }
+
+    /// Name `key`, a buffer's (or a heap's bytes') lying in them, to their copy, where they are
+    /// one: its merges back compare the copy where a batch wrote that key (`copied.rs`).
+    pub(super) fn copied_as(&self, key: ResourceKey) {
+        if let Some(copied) = self.import.copied.get() {
+            copied.name(key);
+        }
+    }
+
+    /// Report the GPU's writes through the uses of `key`, a buffer's (or a heap's bytes') lying
+    /// in them, to their logs (`DirtyShadows::logged_in_place`), where they have one and lie in
+    /// an import the GPU writes in place: a copy reports its merges back instead (`copied.rs`),
+    /// and a read-only view takes no write.
+    pub(super) fn logged_as(&self, key: ResourceKey) {
+        let import = &self.import;
+        if import.copied.get().is_some() || import.drops_writes() {
             return;
         }
-        let shared = self.import.device.shared();
-        if let Some(recorder) = shared.recorder() {
-            recorder.settle_all(shared.vk());
+        if let Some(log) = import.log.get() {
+            import.device.shared().dirty.logged_in_place(key, log);
         }
+    }
+
+    /// Keep the guest RAM and the runs of it their caller resolved them to (`host_ram.rs`).
+    pub(super) fn keep_runs(&self, runs: (Arc<RamOnDevice>, Box<[Range<u64>]>)) {
+        let _kept = self.ram_runs.set(runs);
+    }
+
+    /// The caller's log of the writes to them, where it gave one.
+    pub(super) fn dirty(&self) -> Option<&Arc<DirtySource>> {
+        self.dirty.get()
     }
 
     /// Keep `objects`, over these pages, until they go.
@@ -705,6 +731,20 @@ impl HostPages {
         self.import.shape.offset
     }
 
+    /// Whether they lie in fresh pages the runtime mapped and imported (`fresh_pages.rs`): a copy
+    /// of the caller's pages that images in place ride on (`Device::copied_pages`).
+    pub(super) fn over_own_pages(&self) -> bool {
+        let pages = self.import.pages(ReadApart::Texture);
+        pages.memory.placement.over_own_pages()
+    }
+
+    /// The bytes of their memory from where the bytes start to the placement's end: the room an
+    /// image bound at their bytes has.
+    pub(super) fn room(&self) -> u64 {
+        let pages = self.import.pages(ReadApart::Texture);
+        pages.memory.placement.size().saturating_sub(pages.offset)
+    }
+
     /// The index of their memory's type.
     pub(super) fn type_index(&self) -> u32 {
         self.import.shape.type_index
@@ -713,6 +753,17 @@ impl HostPages {
     /// Whether they were imported as dma-bufs (`dma_buf.rs`), not by their pointer.
     pub(super) fn over_dma_buf(&self) -> bool {
         self.import.shape.over_dma_buf
+    }
+
+    /// Whether they lie in a copy of the caller's pages (`copied.rs`), not an import of them.
+    pub(super) fn copied(&self) -> bool {
+        self.import.copied()
+    }
+
+    /// Whether they are bound in the device's import of a chunk of a guest RAM (`host_ram.rs`),
+    /// with no import of their own.
+    pub(super) fn in_ram_chunk(&self) -> bool {
+        self.import.shape.in_ram_chunk
     }
 
     /// Where they lie as dma-bufs (`dma_buf.rs`): the imports, with the caller's source; the host
@@ -766,33 +817,6 @@ impl HostPages {
                 "a command buffer that may reach its pages unnamed (a live buffers' table it \
                  holds lists them) holds them as it is released, and the caller gave no \
                  keep-alive"
-                    .to_owned(),
-            )
-        });
-    }
-
-    /// The replay of a command buffer's deferred command buffers held these pages last
-    /// (`recorder`, [`HeldByReplay`]): never as a rule, as their buffer's let-go and each commit
-    /// whose replays hold them agree on which replays them first
-    /// ([`let_go_by_buffer`](Self::let_go_by_buffer)). Were it to, they would have gone at that
-    /// let-go or at the commit, where their deallocator or keep-alive ran; they go now, after
-    /// the replay, announced once per device (`Degradation::HostDeallocatorDelayed`). Nothing
-    /// where neither is left to run.
-    fn held_by_replay(&self) {
-        let Some(release) = self.release.get() else {
-            return;
-        };
-        if !release.deallocates() && !release.keeps_alive() {
-            return;
-        }
-        let device = &self.import.device;
-        device.shared().counts.host_deallocator_delayed();
-        let length = release.length();
-        device.degrade_once(Degradation::HostDeallocatorDelayed, || {
-            (
-                format!("a no-copy buffer of {length} bytes"),
-                "a command buffer committed before its release or rebind names its pages, and \
-                 they stayed until its commands were recorded on the device's recorder thread"
                     .to_owned(),
             )
         });
@@ -871,6 +895,12 @@ pub(super) struct HostImport {
     /// The releases of pages that went while it lived with no keep-alive: their deallocators
     /// run once it is freed.
     after_free: Mutex<Vec<Release>>,
+    /// Its place among its device's copied host buffers, where its memory is a copy of the
+    /// caller's pages, not their import (`copied.rs`): unregistered as it goes, before its memory.
+    copied: OnceLock<crate::copied::Copied>,
+    /// The logs of the writes to its pages, where their memory came with one
+    /// (`dirty_pages::PagesLog`): every buffer lying in it shares them.
+    log: OnceLock<Arc<PagesLog>>,
 }
 
 /// Where a host import's bytes lie in its `VkBuffer` and memory, which reading needs no
@@ -889,6 +919,9 @@ pub(super) struct Shape {
     pub(super) type_index: u32,
     /// The pages were imported as dma-bufs (`dma_buf.rs`), not by their pointer.
     pub(super) over_dma_buf: bool,
+    /// The bytes are bound in the device's import of a chunk of a guest RAM (`host_ram.rs`), with
+    /// no import of their own.
+    pub(super) in_ram_chunk: bool,
     /// The pages were imported through a read-only view of them, which drops the GPU's writes
     /// (`read_only_view.rs`).
     pub(super) drops_writes: bool,
@@ -905,6 +938,7 @@ impl Shape {
             mapped: placement.mapped,
             type_index: placement.type_index(),
             over_dma_buf: placement.over_dma_buf(),
+            in_ram_chunk: placement.over_ram_chunk(),
             drops_writes: placement.over_read_only_view(),
         }
     }
@@ -918,6 +952,7 @@ impl Shape {
             self.reach,
             self.type_index,
             self.over_dma_buf,
+            self.in_ram_chunk,
             self.drops_writes,
         ) == (
             other.offset,
@@ -925,6 +960,7 @@ impl Shape {
             other.reach,
             other.type_index,
             other.over_dma_buf,
+            other.in_ram_chunk,
             other.drops_writes,
         ) && at(self) == at(other)
     }
@@ -1047,6 +1083,8 @@ impl HostImport {
             unlisted: AtomicBool::new(unlisted),
             kept: Mutex::new(None),
             after_free: Mutex::new(Vec::new()),
+            copied: OnceLock::new(),
+            log: OnceLock::new(),
         }
     }
 
@@ -1071,6 +1109,8 @@ impl HostImport {
             unlisted: AtomicBool::new(false),
             kept: Mutex::new(None),
             after_free: Mutex::new(Vec::new()),
+            copied: OnceLock::new(),
+            log: OnceLock::new(),
         }
     }
 
@@ -1080,6 +1120,28 @@ impl HostImport {
         if self.unlisted.load(Ordering::Relaxed) && self.unlisted.swap(false, Ordering::Relaxed) {
             (self.device.shared().counts).host_import_rebound_unlisted(false);
         }
+    }
+
+    /// Its memory is a copy of the caller's pages, registered as `copied` (`copied.rs`), not
+    /// their import.
+    pub(super) fn set_copied(&self, copied: crate::copied::Copied) {
+        // Set once, as the copied buffer is made.
+        let _ = self.copied.set(copied);
+    }
+
+    /// Whether its memory is a copy of the caller's pages (`copied.rs`), not their import.
+    pub(super) fn copied(&self) -> bool {
+        self.copied.get().is_some()
+    }
+
+    /// Keep the logs of the writes to its pages (set once, as its first buffer is made), which
+    /// its copy, where it is one, reports its merges back to (`copied.rs`).
+    pub(super) fn keep_log(&self, log: Arc<PagesLog>) {
+        if let Some(copied) = self.copied.get() {
+            copied.set_log(&log);
+        }
+        self.device.shared().dirty.note_logged();
+        let _ = self.log.set(log);
     }
 
     /// Whether its pages were imported through a read-only view of them, which drops the GPU's
@@ -1217,6 +1279,8 @@ impl Device {
 
 impl Drop for HostImport {
     fn drop(&mut self) {
+        // A copy leaves its device's comparisons before its memory can go (`copied.rs`).
+        drop(self.copied.take());
         // The Vulkan teardown is a section of the exit guard.
         let Some(busy) = exit_guard::enter() else {
             // The process is exiting: the pages stay imported to its end (`exit_guard`), so no
@@ -1425,17 +1489,6 @@ impl Drop for AfterFree {
         for release in &self.releases {
             release.run();
         }
-    }
-}
-
-/// Host pages the replay of a command buffer's deferred command buffers held last (`recorder`),
-/// let go of on one of the device's handler threads: announced as they go
-/// ([`HostPages::held_by_replay`]), then dropped, which runs their deallocator.
-pub(super) struct HeldByReplay(pub(super) HostPages);
-
-impl Drop for HeldByReplay {
-    fn drop(&mut self) {
-        self.0.held_by_replay();
     }
 }
 
@@ -2418,6 +2471,7 @@ impl Device {
             pages: Mutex::new(Lying::In(Arc::new(host))),
             texels: Mutex::new(Vec::new()),
             textures: Mutex::new(TexturesOver::default()),
+            in_place: Mutex::new(Vec::new()),
             exposed: AtomicU8::new(0),
             device: self.clone(),
             drops_writes,
@@ -2517,7 +2571,7 @@ impl Device {
 
     /// Place `raw` (for a buffer of `length` bytes) in memory of `class` and at `at` in the
     /// address space; released again when either fails.
-    fn place_buffer(
+    pub(super) fn place_buffer(
         &self,
         raw: vk::Buffer,
         length: u64,
@@ -2531,7 +2585,7 @@ impl Device {
 
     /// [`place_buffer`](Device::place_buffer) for a heap's own buffer: where the heap's textures
     /// can lie too (`Device::heap_requirements`).
-    fn place_heap_buffer(
+    pub(super) fn place_heap_buffer(
         &self,
         raw: vk::Buffer,
         length: u64,
@@ -2673,6 +2727,18 @@ impl Buffer {
     /// The length padded to 16 bytes: the bytes the `VkBuffer` holds from [`Buffer::base`].
     pub(super) fn padded_length(&self) -> u64 {
         self.0.length.next_multiple_of(16)
+    }
+
+    /// The bytes of the buffer's memory from its byte 0 ([`Buffer::memory`]'s offset) to the end
+    /// of the memory's placement: an import's, for a buffer over host pages (its last page's bytes
+    /// past the buffer's among them), or a heap's.
+    pub(super) fn memory_room(&self) -> u64 {
+        match &self.0.bytes {
+            Bytes::Own(own) => own.with(ReadApart::Texture, |pages| {
+                pages.memory.placement.size().saturating_sub(pages.offset)
+            }),
+            Bytes::Heap(bytes) => bytes.bytes.memory_room().saturating_sub(bytes.offset),
+        }
     }
 
     /// Set the buffer's padded length of bytes to zero: through the mapping for `Shared` and
@@ -3160,7 +3226,7 @@ impl Buffer {
     /// The hold on the host pages the buffer's bytes lie in: a no-copy buffer's own, a buffer
     /// of a no-copy heap its heap's buffer's; `None` for bytes of the runtime's memory or of the
     /// caller's `VkBuffer`.
-    fn pages_cell(&self) -> Option<&Arc<HostCell>> {
+    pub(super) fn pages_cell(&self) -> Option<&Arc<HostCell>> {
         match &self.0.bytes {
             Bytes::Own(OwnBytes {
                 lie: Lie::Host(cell),
@@ -3232,6 +3298,20 @@ impl Buffer {
         self.pages_cell()?.current()
     }
 
+    /// The runtime wrote the host addresses `addresses` of the buffer's bytes through its
+    /// `contents` itself (a `replaceRegion`, an argument encoder's or a rasterization-rate map's
+    /// write): reported to the logs of the writes to its pages, where their memory came with one
+    /// (`dirty_pages::PagesLog`, writer 0), so every copy of the pages takes them. The pages are
+    /// looked at only on a device some of whose pages came with a log.
+    pub(super) fn wrote_host(&self, addresses: Range<u64>) {
+        if !self.0.device.shared().dirty.logged() {
+            return;
+        }
+        if let Some(log) = self.host_pages().as_ref().and_then(|pages| pages.log()) {
+            log.wrote_at(addresses);
+        }
+    }
+
     /// The host imports `buffers` lie in now, each counted once however many lie in it
     /// (`host_aliases.rs`): a committed command buffer's used buffers'
     /// (`WorkCounts::host_imports_used`). Buffers over no host pages count none.
@@ -3257,6 +3337,15 @@ impl Buffer {
                 self.device().note_stale(cell, reached);
             }
             cell.watch_texture(noted);
+        }
+    }
+
+    /// Note `watch`, an image in place over the buffer's bytes, where they are host pages (a
+    /// no-copy buffer's, or for a heap's buffer its heap's): a rebind makes it again over its new
+    /// pages (`texture/in_place_image.rs`).
+    pub(super) fn watch_in_place(&self, watch: InPlaceWatch) {
+        if let Some(cell) = self.pages_cell() {
+            cell.watch_in_place(watch);
         }
     }
 
@@ -3288,6 +3377,13 @@ impl Buffer {
         }
     }
 
+    /// Whether the buffer's bytes lie in a copy of the caller's pages (a copied host buffer,
+    /// `copied.rs`), not an import of them ([`Buffer::host_backing`]); false for a buffer over no
+    /// host pages, or detached.
+    pub(crate) fn copied(&self) -> bool {
+        self.host_backing() == Some(crate::HostBacking::Copied)
+    }
+
     /// Whether the host pages the buffer's bytes lie in (a no-copy buffer's, or for a heap's
     /// buffer its heap's), or lay in while they are detached, were imported as dma-bufs
     /// (`dma_buf.rs`); false for a buffer over no host pages.
@@ -3297,17 +3393,6 @@ impl Buffer {
             Some(Lying::Detached(detached)) => detached.over_dma_buf,
             None => false,
         }
-    }
-
-    /// Whether the GPU's writes into the buffer's bytes are dropped, as Metal drops them for
-    /// no-copy memory of its private option bit 24 and for pages replaced read-only
-    /// (`read_only_view.rs`): a heap's buffer answers its heap's. A dispatch's or draw's stores
-    /// through a slot the buffer is bound at are dropped in the shader
-    /// (`StageTable::dropped_store_buffers`, `SpecKey::DroppedStoreSlots`), and the buffer's
-    /// memory keeps them out as well where the device imports the pages through a read-only view
-    /// of them.
-    pub(super) fn drops_writes(&self) -> bool {
-        self.pages_cell().is_some_and(|cell| cell.drops_writes())
     }
 
     /// `device`.

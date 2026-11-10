@@ -51,14 +51,13 @@ use crate::device::{Device, DeviceDescription, DevicePolicy};
 use crate::error::{BindError, Capability, Feature, Needs, Unsupported};
 use crate::library::{FunctionArtifact, Library};
 use crate::memory::handles::{
-    declare_table, define_lookup, lookup_host, Lookup, FLAG_DEPTH_CODES, FLAG_DEPTH_VALUES,
-    FLAG_OUT_OF_BOUNDS_ALPHA_ONE, FLAG_TEXEL_CLASS, HANDLE_ALPHA_ONE, HANDLE_DEPTH_CODES,
-    HANDLE_DEPTH_VALUES, TABLE_ENTRY_BYTES,
+    declare_table, define_lookup, lookup_host, Lookup, FLAG_OUT_OF_BOUNDS_ALPHA_ONE,
+    FLAG_TEXEL_CLASS, HANDLE_ALPHA_ONE, TABLE_ENTRY_BYTES,
 };
 use crate::memory::leaf::k32;
 use crate::memory::views;
 use crate::metal::format::storage_image_choice;
-use crate::metal::sampler::{OpaqueBlackBorder, SamplerUse, SamplerWord};
+use crate::metal::sampler::SamplerWord;
 use crate::metal::{
     PixelFormat, RenderStages, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter,
     TextureType, TextureUsage,
@@ -183,8 +182,7 @@ fn heap_writes(plan: &BindingPlan) -> Vec<&WriteSource> {
 /// other numeric types beside a sampled class (the unsigned integer twin a float read or query
 /// declares, and the classes a read or query of a member of another numeric class reads it
 /// through), where the array is the one whose neutral at element 0 is of numeric type `own`: a
-/// sampled one, or where there is none a storage one (beside the unsigned integer twin a half-float
-/// write declares for a storage class).
+/// sampled one, or where there is none a storage one.
 fn heap_writes_of(plan: &BindingPlan, own: SampledType) -> Vec<&WriteSource> {
     let heap: Vec<_> = plan.descriptors.iter().filter(|d| d.set == 1).collect();
     let numeric = |binding: u32, storage: bool| {
@@ -249,8 +247,8 @@ fn table(bytes: &[DescriptorBytes], set: u32, binding: u32) -> Vec<(u64, u32)> {
 }
 
 /// The entries `(id, element, flags)` of the table bytes at `(set, binding)`: a texture entry's
-/// flags hold its out-of-bounds-alpha flag, its depth class, and its texel class's index alone, and
-/// the null entry's none.
+/// flags hold its out-of-bounds-alpha flag and its texel class's index alone, and the null entry's
+/// none.
 fn entries(bytes: &[DescriptorBytes], set: u32, binding: u32) -> Vec<(u64, u32, u32)> {
     let b = &bytes
         .iter()
@@ -263,10 +261,7 @@ fn entries(bytes: &[DescriptorBytes], set: u32, binding: u32) -> Vec<(u64, u32, 
             let w = |i: usize| u32::from_le_bytes(e[4 * i..4 * i + 4].try_into().expect("word"));
             let id = u64::from(w(0)) | (u64::from(w(1)) << 32);
             assert_eq!(
-                w(3) & !(FLAG_OUT_OF_BOUNDS_ALPHA_ONE
-                    | FLAG_DEPTH_CODES
-                    | FLAG_DEPTH_VALUES
-                    | FLAG_TEXEL_CLASS),
+                w(3) & !(FLAG_OUT_OF_BOUNDS_ALPHA_ONE | FLAG_TEXEL_CLASS),
                 0,
                 "other flags are reserved"
             );
@@ -577,7 +572,7 @@ fn a_sampled_heap_writes_each_member_and_its_table() {
     assert_eq!(emitted_lookup(bytes, &keys), want.to_vec());
     // Each entry's flags are its member's out-of-bounds alpha: token 2's `R32Uint` has no alpha,
     // every other member's format has one, and the null entries have none (beside its texel class,
-    // which `table_entries_state_each_members_depth_class` reads).
+    // which `table_entries_state_each_members_texel_class` reads).
     let flag = FLAG_OUT_OF_BOUNDS_ALPHA_ONE;
     let flags: Vec<u32> = entries(&cmds.descriptor_bytes, set, binding)
         .iter()
@@ -592,7 +587,6 @@ fn a_sampled_heap_writes_each_member_and_its_table() {
         .collect();
     let flagged = Lookup::Flagged {
         alpha: true,
-        depth: false,
         class: false,
     };
     assert_eq!(emitted_lookup_in(bytes, &keys, flagged), alpha);
@@ -927,8 +921,7 @@ fn a_depth_member_is_held_by_the_float_class_through_its_depth_view() {
     };
     let plan = pipe.plan(&dev, &state.shape()).expect("plan");
     let heap = &pipe.layout.sets[1].bindings;
-    let twin = crate::metal::format::heap_half_bits(dev.profile());
-    assert_eq!(heap.len(), 2 + usize::from(twin));
+    assert_eq!(heap.len(), 2);
     for b in heap {
         let BindingSource::Heap(HandleClass::Image(class)) = b.source else {
             panic!("{:?}", b.source);
@@ -948,10 +941,6 @@ fn a_depth_member_is_held_by_the_float_class_through_its_depth_view() {
             })
             .collect();
         match class.access {
-            // The twin holds half-float members alone: every element its neutral.
-            _ if class.format == crate::pipeline::sym::StorageFormatClass::HalfBits => {
-                assert_eq!(views, vec![None, None, None]);
-            }
             ImageAccess::Sampled => {
                 assert_eq!(class.sampled_type, SampledType::Float);
                 assert!(!class.depth_compare);
@@ -1057,15 +1046,12 @@ fn a_compared_depth_member_is_held_by_the_depth_comparison_class() {
         .any(|d| d.set == 0 && d.binding == samplers[0].binding));
 }
 
-/// Each member's table entry states its depth class beside its out-of-bounds alpha, by its pixel
-/// format: `Depth16Unorm` compares codes ([`FLAG_DEPTH_CODES`]), `Depth32Float` and
-/// `Depth32Float_Stencil8` values ([`FLAG_DEPTH_VALUES`]), and a color format neither (a depth
-/// format has no alpha). The search's flagged form carries the class into the handle's bits 29 and
-/// 30, beside the alpha in bit 31 where it carries that too; a miss carries nothing. Each entry
-/// also states its texel class's index (`heap_class_index`, in [`FLAG_TEXEL_CLASS`]), which the
-/// flagged form carries in place where it carries the class.
+/// Each member's table entry states its texel class's index (`heap_class_index`, in
+/// [`FLAG_TEXEL_CLASS`]) beside its out-of-bounds alpha (a depth format has no alpha). The
+/// search's flagged form carries the alpha in the handle's bit 31 and the class in place where it
+/// carries them; a miss carries nothing.
 #[test]
-fn table_entries_state_each_members_depth_class() {
+fn table_entries_state_each_members_texel_class() {
     let dev = m3();
     let Some(bc) = assembled("handles", llvm_assemble(&engine_dir().join("handles.ll"))) else {
         return;
@@ -1128,9 +1114,9 @@ fn table_entries_state_each_members_depth_class() {
         vec![
             (0, 0, 0),
             (D, 4, rgba8),
-            (A, 1, alpha | FLAG_DEPTH_CODES | d16),
-            (B, 2, alpha | FLAG_DEPTH_VALUES | d32),
-            (C, 3, alpha | FLAG_DEPTH_VALUES | d32s8),
+            (A, 1, alpha | d16),
+            (B, 2, alpha | d32),
+            (C, 3, alpha | d32s8),
         ]
     );
     let bytes = &cmds
@@ -1140,30 +1126,17 @@ fn table_entries_state_each_members_depth_class() {
         .expect("bytes")
         .bytes;
     let keys = [D, A, B, C, 0, E];
-    let depth = Lookup::Flagged {
-        alpha: false,
-        depth: true,
-        class: false,
-    };
-    let codes = HANDLE_DEPTH_CODES;
-    let values = HANDLE_DEPTH_VALUES;
-    assert_eq!(
-        emitted_lookup_in(bytes, &keys, depth),
-        vec![4, 1 | codes, 2 | values, 3 | values, 0, 0]
-    );
-    let both = Lookup::Flagged {
+    let flagged = Lookup::Flagged {
         alpha: true,
-        depth: true,
         class: false,
     };
     let one = HANDLE_ALPHA_ONE;
     assert_eq!(
-        emitted_lookup_in(bytes, &keys, both),
-        vec![4, 1 | one | codes, 2 | one | values, 3 | one | values, 0, 0]
+        emitted_lookup_in(bytes, &keys, flagged),
+        vec![4, 1 | one, 2 | one, 3 | one, 0, 0]
     );
     let classes = Lookup::Flagged {
         alpha: false,
-        depth: false,
         class: true,
     };
     assert_eq!(
@@ -1309,7 +1282,6 @@ fn a_runtime_heap_sampler_is_written_with_the_bound_sampler() {
             slot: s0,
             compare: false,
             integer: false,
-            cube_gradient: false,
             opaque_black: crate::metal::sampler::OpaqueBlackBorder::Stated,
         }]
     );
@@ -1980,12 +1952,7 @@ fn sampler_layout(p: &ComputePipeline) -> (Vec<SamplerArray>, (u32, u32)) {
         .bindings
         .iter()
         .filter_map(|b| match b.source {
-            BindingSource::Heap(HandleClass::Sampler {
-                compare,
-                integer,
-                cube_gradient,
-            }) => {
-                assert!(!cube_gradient, "the fixture samples no cube with gradients");
+            BindingSource::Heap(HandleClass::Sampler { compare, integer }) => {
                 assert_eq!(b.ty, vk::DescriptorType::SAMPLER);
                 assert_eq!(b.flags, super::engine_handles::heap_flags(&p.requirements));
                 Some((b.binding, (compare, integer)))
@@ -2096,7 +2063,6 @@ fn argument_samplers_fill_their_arrays_and_tables() {
                 index: e as u32 - 1,
                 compare: false,
                 integer: false,
-                cube_gradient: false,
             }
         );
     }
@@ -2161,7 +2127,6 @@ fn argument_samplers_fill_their_arrays_and_tables() {
                         index: 0,
                         compare: use_.0,
                         integer: use_.1,
-                        cube_gradient: false,
                     },
                     "{entry}"
                 );
@@ -2208,14 +2173,10 @@ declare { <4 x float>, i8 } @air.sample_texture_cube_grad.v4f32(ptr addrspace(1)
 
 /// A cube's explicit gradients through an argument buffer's sampler take their footprint by the
 /// sampler's table entry word, so the plan takes every listed sampler for that use, an anisotropic
-/// one included: its array has no cube-gradient bit, and an isotropic sampler plans with the
-/// array's `ArgumentSampler` writes, as an anisotropic one does. On a driver whose cube-gradient
-/// route is not measured (`moltenvk-m3` without its measured route) the kernel keeps the isotropic
-/// form, its array carries the bit, and the plan takes an anisotropic listed sampler there too,
-/// made isotropic for that use (where the refusal was): the array's writes carry the bit, and
-/// `sampler_desc` makes the `VkSampler` of a write with it isotropic. It takes the same sampler for
-/// a use without cube gradients (`argument_sampler_sample`). Run on every committed profile that
-/// compiles the use, and the unmeasured description.
+/// one included: an isotropic sampler plans with the array's `ArgumentSampler` writes, as an
+/// anisotropic one does. A driver whose cube-gradient route is not measured (`moltenvk-m3` without
+/// its measured route) takes Vulkan's rule, the device's reading, alike. Run on every committed
+/// profile that compiles the use, and the unmeasured description.
 #[test]
 fn a_cube_gradient_use_takes_an_anisotropic_argument_sampler_by_its_word() {
     let Some(bc) = assemble("argument_sampler_cube_grad", CUBE_GRADIENT) else {
@@ -2245,7 +2206,7 @@ fn a_cube_gradient_use_takes_an_anisotropic_argument_sampler_by_its_word() {
     )
     .expect("device");
     devices.push(("unmeasured".to_string(), unmeasured));
-    let (mut taken_on, mut isotropic_on) = (0, 0);
+    let (mut taken_on, mut unmeasured_on) = (0, 0);
     for (stem, dev) in devices {
         let lib = Library::from_air(&bc).expect("library");
         let f = lib.function("argument_sampler_cube_grad").expect("entry");
@@ -2257,9 +2218,10 @@ fn a_cube_gradient_use_takes_an_anisotropic_argument_sampler_by_its_word() {
             );
             continue;
         };
-        let isotropic = dev.profile().fields().cube_gradients.compute
-            == crate::device::profile::CubeGradientRoute::Unmeasured;
-        assert_eq!(isotropic, stem == "unmeasured", "{stem}");
+        let route = dev.profile().fields().cube_gradients.compute;
+        if stem == "unmeasured" {
+            assert_eq!(route, crate::device::profile::CubeGradientRoute::Vulkan);
+        }
         let arrays: Vec<(u32, HandleClass)> = pipe.layout.sets[1]
             .bindings
             .iter()
@@ -2271,7 +2233,6 @@ fn a_cube_gradient_use_takes_an_anisotropic_argument_sampler_by_its_word() {
         let cube_class = HandleClass::Sampler {
             compare: false,
             integer: false,
-            cube_gradient: isotropic,
         };
         assert_eq!(arrays.len(), 1, "{stem}");
         assert_eq!(arrays[0].1, cube_class, "{stem}");
@@ -2297,78 +2258,26 @@ fn a_cube_gradient_use_takes_an_anisotropic_argument_sampler_by_its_word() {
             d.max_anisotropy = 4;
             d
         };
-        let plan = pipe
-            .plan(&dev, &cube_state(vec![argument_sampler(linear, C)]).shape())
-            .unwrap_or_else(|e| panic!("{stem}: an isotropic sampler plans: {e}"));
-        let writes = sampler_writes(&plan, arrays[0].0);
-        assert_eq!(
-            writes[1],
-            WriteSource::ArgumentSampler {
-                index: 0,
-                compare: false,
-                integer: false,
-                cube_gradient: isotropic,
-            },
-            "{stem}"
-        );
-        let planned = pipe.plan(
-            &dev,
-            &cube_state(vec![argument_sampler(anisotropic, C)]).shape(),
-        );
-        if !isotropic {
-            let plan = planned.unwrap_or_else(|e| panic!("{stem}: by its word: {e}"));
+        let write = WriteSource::ArgumentSampler {
+            index: 0,
+            compare: false,
+            integer: false,
+        };
+        for (what, desc) in [("isotropic", linear), ("anisotropic", anisotropic)] {
+            let plan = pipe
+                .plan(&dev, &cube_state(vec![argument_sampler(desc, C)]).shape())
+                .unwrap_or_else(|e| panic!("{stem}: an {what} sampler plans: {e}"));
             assert_eq!(
                 sampler_writes(&plan, arrays[0].0)[1],
-                WriteSource::ArgumentSampler {
-                    index: 0,
-                    compare: false,
-                    integer: false,
-                    cube_gradient: false,
-                },
-                "{stem}"
+                write,
+                "{stem} {what}"
             );
-            taken_on += 1;
-            continue;
         }
-        let plan = planned
-            .unwrap_or_else(|e| panic!("{stem}: an anisotropic sampler, made isotropic: {e}"));
-        let write = sampler_writes(&plan, arrays[0].0)[1].clone();
-        assert_eq!(
-            write,
-            WriteSource::ArgumentSampler {
-                index: 0,
-                compare: false,
-                integer: false,
-                cube_gradient: true,
-            },
-            "{stem}"
-        );
-        // The binder's `VkSampler` of that write (the runtime's and the executor's) is isotropic;
-        // the same sampler for a use without the bit keeps its anisotropy.
-        let made = |cube_gradient| {
-            let use_ = SamplerUse::new(false, false).with_cube_gradient(cube_gradient);
-            crate::bind::sampler_desc(&dev, &anisotropic, use_, OpaqueBlackBorder::Stated, None)
-                .unwrap_or_else(|e| panic!("{stem}: {e}"))
-                .max_anisotropy
-        };
-        assert_eq!(made(true), None, "{stem}");
-        assert!(made(false).is_some(), "{stem}");
-        isotropic_on += 1;
-        let Some(plain) = argument_sampler_pipeline(&dev, "argument_sampler_sample") else {
-            return;
-        };
-        plain
-            .plan(
-                &dev,
-                &sampler_state(vec![argument_sampler(anisotropic, C)]).shape(),
-            )
-            .unwrap_or_else(|e| panic!("{stem}: the same sampler without cube gradients: {e}"));
+        taken_on += 1;
+        unmeasured_on += usize::from(stem == "unmeasured");
     }
     assert!(taken_on > 0, "no profile took the anisotropic sampler");
-    assert_eq!(
-        isotropic_on, 1,
-        "the unmeasured description takes it isotropic"
-    );
+    assert_eq!(unmeasured_on, 1, "the unmeasured description takes it");
 }
 
 /// A plan depends on the argument samplers only through their shape (`ArgumentSamplersShape`: the

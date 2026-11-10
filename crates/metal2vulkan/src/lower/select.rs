@@ -240,9 +240,7 @@ impl FamilyPlans {
     /// Call `f` with each value instruction `id` (`inst`) of `body` reads where it stands, as
     /// the families lower it: none for an instruction that emits nothing (a planned index
     /// extension, or a `ptrtoint` whose bits go only into forwarding cells); the value a forwarding
-    /// `extractvalue` forwards, instead of its aggregate; none for a multiply folded into the
-    /// additions that use it, and a fused addition's two factors and addend instead of its product;
-    /// and otherwise each operand, a use of an index extension reading the extension's narrow
+    /// `extractvalue` forwards, instead of its aggregate; and otherwise each operand, a use of an index extension reading the extension's narrow
     /// operand. A typed access whose chain takes its `getelementptr`'s index operands reads those
     /// too. A phi reads nothing where it stands: its copies read at the end of each incoming block
     /// ([`FamilyPlans::incoming_reads`]).
@@ -287,10 +285,6 @@ impl FamilyPlans {
         for &id in self.arith.forwards.keys() {
             mark(id, ReadIndex::FORWARDED);
         }
-        let contract = &self.arith.contract;
-        for &id in contract.folded.iter().chain(contract.fused.keys()) {
-            mark(id, ReadIndex::CONTRACTED);
-        }
         for &id in self.access.typed_indices.keys() {
             mark(id, ReadIndex::TYPED_INDICES);
         }
@@ -322,13 +316,7 @@ impl FamilyPlans {
         match (&inst.kind, forwarded) {
             (InstKind::Phi { .. }, _) => {}
             (_, Some(v)) => f(read(v)),
-            (kind, None) => {
-                if !(named(id, ReadIndex::CONTRACTED)
-                    && self.arith.contract.reads(id, |v| f(read(v))))
-                {
-                    kind.for_each_value(|v| f(read(v)));
-                }
-            }
+            (kind, None) => kind.for_each_value(|v| f(read(v))),
         }
         // A typed access whose chain takes its GEP's index operands reads them too.
         if named(id, ReadIndex::TYPED_INDICES) {
@@ -375,10 +363,8 @@ impl ReadIndex {
     const READS_NOTHING: u8 = 1;
     /// A forwarding `extractvalue` (`arith::aggregate::forwarded`).
     const FORWARDED: u8 = 2;
-    /// A folded multiply or a fused addition (`arith::contract::Plan::reads`).
-    const CONTRACTED: u8 = 4;
     /// A typed access that reads its GEP's index operands (`access::AccessPlan::typed_indices`).
-    const TYPED_INDICES: u8 = 8;
+    const TYPED_INDICES: u8 = 4;
 
     /// Whether a plan of kind `bit` may name instruction `id`.
     fn names(&self, id: InstId, bit: u8) -> bool {
@@ -550,9 +536,6 @@ pub struct SelectCx<'a> {
     func: FuncId,
     /// Whether each instruction's result is observed, by `InstId` ([`observed_results`]).
     observed: Vec<bool>,
-    /// Whether each instruction's result may carry its NaN's bits to an observation, by `InstId`
-    /// (`arith::nan::observed_payloads`).
-    nan_payloads: Vec<bool>,
 }
 
 impl SelectCx<'_> {
@@ -653,15 +636,6 @@ impl SelectCx<'_> {
     /// other than a phi, or by a phi whose result is observed ([`observed_results`]).
     pub fn is_observed(&self, id: InstId) -> bool {
         self.observed
-            .get(id.raw() as usize)
-            .copied()
-            .unwrap_or(true)
-    }
-
-    /// Whether the result of instruction `id` may carry its NaN's bits to an observation: read
-    /// by an instruction or terminator that does not drop them (`arith::nan::drops_payload`).
-    pub fn nan_payload_observed(&self, id: InstId) -> bool {
-        self.nan_payloads
             .get(id.raw() as usize)
             .copied()
             .unwrap_or(true)
@@ -1208,15 +1182,6 @@ pub fn select(
         }
     };
     let root_bytes = root_sets.charged();
-    let nan_payloads = match arith::nan::observed_payloads(e, e.func, body, m) {
-        Ok(n) => n,
-        Err(err) => {
-            m.release(observed_bytes);
-            m.release(root_bytes);
-            return Err(err);
-        }
-    };
-    let nan_bytes = nan_payloads.len();
     let cx = SelectCx {
         entry: e,
         body,
@@ -1250,12 +1215,10 @@ pub fn select(
         phis: access::phis::PhiFacts::default(),
         func: e.func,
         observed,
-        nan_payloads,
     };
     let result = select_entry(cx, body, func.params.len(), m);
     m.release(observed_bytes);
     m.release(root_bytes);
-    m.release(nan_bytes);
     result
 }
 
@@ -1395,13 +1358,11 @@ fn select_body(
     select_params(cx, &used)?;
     // The member-wise phis' representations, before any use of one is selected.
     arith::aggregate::plan_phis(cx, m)?;
-    // The multiply-add pairs Metal fuses, before either of a pair is selected.
-    arith::contract::plan(cx, m)?;
-    // The `half` outputs' last operations Metal computes at `float` precision, after the pairs
-    // it fuses and before any of them is selected.
-    arith::output_precision::plan(cx, m)?;
-    // A blended extended-range output whose source Metal may round otherwise than the model.
-    arith::output_precision::note_extended_range_sources(cx, m)?;
+    // A blended extended-range output, whose blend the function computes by the device's
+    // arithmetic.
+    arith::output_precision::note_extended_range_sources(cx)?;
+    // The `half` chains' operations held at `float` precision, before any of them is selected.
+    cx.families.arith.held_at_float = arith::half_chain::plan(cx, m)?;
 
     let mut blocks = 0u64;
     for (b, block) in body.blocks.iter() {
@@ -1630,10 +1591,8 @@ fn finish(
     sync::barrier::finish(&mut cx)?;
     sync::memory_model::finish(&mut cx)?;
     arith::finish(&mut cx)?;
-    cx.families.arith.widened = arith::widening::widened_loads(&cx, &sel.strategy, m)?;
 
     let slots = access::finish_slots(&mut cx, m)?;
-    access::sink::finish(&mut cx)?;
     access::absent::finish(&mut cx);
     sync::memory_model::finish_interlock(&mut cx, &slots)?;
     charge_facts(&cx, fact_bytes, m)?;
@@ -1789,13 +1748,11 @@ fn finish(
     })
 }
 
-/// The constant a [`NoteTest`] reads: a texture slot's `TexelFormat` class or a sampler slot's
-/// `SamplerState` word, by the function's slot index, or a texture slot's `UnmeasuredTexels`
-/// boolean, or the class of the format bound at a texture slot, which no constant carries
-/// (`SpecKey::BoundTexelFormat`).
+/// The constant a [`NoteTest`] reads: a sampler slot's `SamplerState` word, by the function's slot
+/// index, or a texture slot's `UnmeasuredTexels` boolean, or the class of the format bound at a
+/// texture slot, which no constant carries (`SpecKey::BoundTexelFormat`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum NoteOn {
-    Texel(u32),
     Sampler(u32),
     Unmeasured(u32),
     Bound(u32),
@@ -1847,13 +1804,6 @@ fn clause_bytes(c: &NoteClause) -> usize {
         .saturating_add(tree_bytes(c.len(), test).max(NODE_TESTS * test))
 }
 
-/// The clauses of `a` and of `b` both holding: each pair's conjunction.
-pub(crate) fn both(a: &[NoteClause], b: &[NoteClause]) -> Vec<NoteClause> {
-    a.iter()
-        .flat_map(|x| b.iter().map(move |y| x.union(y).copied().collect()))
-        .collect()
-}
-
 /// Each test of `tests` alone, as clauses: the disjunction of the tests.
 pub(crate) fn any_of(tests: impl IntoIterator<Item = NoteTest>) -> Vec<NoteClause> {
     tests.into_iter().map(|t| [t].into()).collect()
@@ -1865,11 +1815,6 @@ pub(crate) fn any_of(tests: impl IntoIterator<Item = NoteTest>) -> Vec<NoteClaus
 /// which the runtime takes from the bound texture.
 fn declared(families: &FamilyPlans, t: NoteTest) -> Option<SpecTest> {
     let key = match t.on {
-        NoteOn::Texel(index) => {
-            let s = families.texture.slots.get(&index)?;
-            s.declares_texel_format()
-                .then_some(SpecKey::TexelFormat(s.slot))?
-        }
         NoteOn::Unmeasured(index) => {
             let s = families.texture.slots.get(&index)?;
             s.unmeasured.then_some(SpecKey::UnmeasuredTexels(s.slot))?
@@ -1893,8 +1838,7 @@ fn declared(families: &FamilyPlans, t: NoteTest) -> Option<SpecTest> {
     })
 }
 
-/// `clause` over the function's declared constants, or `None` where a test reads none, or reads
-/// a gated sampler word in a way the binder's key does not keep (`pixel_gated`).
+/// `clause` over the function's declared constants, or `None` where a test reads none.
 fn declared_clause(families: &FamilyPlans, clause: &NoteClause) -> Option<SpecClause> {
     let mut all = clause
         .iter()
@@ -1902,7 +1846,7 @@ fn declared_clause(families: &FamilyPlans, clause: &NoteClause) -> Option<SpecCl
         .collect::<Option<Vec<_>>>()?;
     all.sort_unstable();
     all.dedup();
-    pixel_gated(&all).then_some(SpecClause { all })
+    Some(SpecClause { all })
 }
 
 /// The module's notes and its specialized notes: every note `precision` holds, and each of
@@ -1933,34 +1877,6 @@ fn resolve_notes(
         }
     }
     (precision.into_iter().collect(), kept)
-}
-
-/// Whether the clause `all` holds of every `SamplerState` word as it holds of its key: a word
-/// whose fields state `SamplerWord::PIXEL_GATED` keys as 0 where it states normalized coordinates
-/// (its pixel-coordinates bit clear), so each such word's tests must agree on every such word and
-/// on 0. A test agrees where it reads the bit alone, or tests it set (the masked word then never
-/// equals the bits): its value is the one it takes of 0. The tests of a word agree together where
-/// every one agrees, or where one that agrees fails of 0, failing the clause for every such word.
-fn pixel_gated(all: &[SpecTest]) -> bool {
-    use crate::metal::sampler::SamplerWord;
-    const PIXEL: u32 = SamplerWord::PIXEL_COORDINATES;
-    let agrees = |t: &SpecTest| t.mask == PIXEL || (t.mask & PIXEL != 0 && t.bits & PIXEL != 0);
-    let of_zero = |t: &SpecTest| (t.bits == 0) == t.equal;
-    let words: BTreeSet<SlotRef> = all
-        .iter()
-        .filter_map(|t| match t.key {
-            SpecKey::SamplerState { slot, fields } if fields & SamplerWord::PIXEL_GATED != 0 => {
-                Some(slot)
-            }
-            _ => None,
-        })
-        .collect();
-    words.into_iter().all(|slot| {
-        let tests = all
-            .iter()
-            .filter(|t| matches!(t.key, SpecKey::SamplerState { slot: s, .. } if s == slot));
-        tests.clone().all(agrees) || tests.clone().any(|t| agrees(t) && !of_zero(t))
-    })
 }
 
 #[cfg(test)]
@@ -2283,55 +2199,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// A clause over a gated sampler word holds of its key, which is 0 for every word of
-    /// normalized coordinates, only where its tests of the word agree on every such word and on
-    /// 0, or one of them fails wherever the coordinates bit is clear; an ungated word's clause is
-    /// kept whatever it tests.
-    #[test]
-    fn a_gated_word_s_clause_must_hold_of_its_key() {
-        use crate::metal::sampler::SamplerWord as W;
-        use crate::pipeline::sym::SlotClass;
-        let slot = SlotRef {
-            stage: Stage::Fragment,
-            class: SlotClass::Sampler,
-            index: 2,
-        };
-        let key = |fields| SpecKey::SamplerState { slot, fields };
-        let gated = key(W::PIXEL_NEAREST | W::PIXEL_GATED);
-        let test = |key, mask, bits, equal| SpecTest {
-            key,
-            mask,
-            bits,
-            equal,
-        };
-        let pixel = test(gated, W::PIXEL_COORDINATES, 0, false);
-        let normalized = test(gated, W::PIXEL_COORDINATES, 0, true);
-        let linear_min = test(gated, W::MIN_LINEAR, 0, false);
-        let nearest_pixel = test(gated, W::PIXEL_NEAREST, W::PIXEL_COORDINATES, true);
-        assert!(pixel_gated(&[pixel]));
-        assert!(pixel_gated(&[normalized]));
-        assert!(pixel_gated(&[pixel, linear_min]));
-        assert!(pixel_gated(&[nearest_pixel]));
-        assert!(pixel_gated(&[nearest_pixel, linear_min]));
-        // A filter test alone, or beside a test that holds for normalized coordinates, reads
-        // what the key clears.
-        assert!(!pixel_gated(&[linear_min]));
-        assert!(!pixel_gated(&[normalized, linear_min]));
-        // A word that is not a nearest pixel sampler: every word of normalized coordinates, as
-        // its key 0 is.
-        let not_nearest_pixel = test(gated, W::PIXEL_NEAREST, W::PIXEL_COORDINATES, false);
-        assert!(pixel_gated(&[not_nearest_pixel]));
-        assert!(!pixel_gated(&[not_nearest_pixel, linear_min]));
-        // An ungated word keeps every bit it reads.
-        let plain = key(W::PIXEL_NEAREST);
-        assert!(pixel_gated(&[test(plain, W::MIN_LINEAR, 0, false)]));
-        // Each gated word answers for itself.
-        let other = SpecKey::SamplerState {
-            slot: SlotRef { index: 3, ..slot },
-            fields: W::PIXEL_NEAREST | W::PIXEL_GATED,
-        };
-        assert!(!pixel_gated(&[pixel, test(other, W::MIN_LINEAR, 0, false)]));
     }
 }

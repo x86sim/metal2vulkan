@@ -40,8 +40,8 @@
 //! memory is its parameter's (what either side stores through it the other may load), and the
 //! values the callee returns reach the call's result. The callee's instructions are the module's,
 //! judged as any other; a callee called from several sites takes the reach of them all. Lowering's
-//! texel routines (Metal's exact conversion of a texel, `lower::texture::float_texel`) are such
-//! calls, whose selects carry the texel to the result alone.
+//! texel routines (Metal's conversion of a `half` texel, `lower::texture::half`) are such calls,
+//! whose selects carry the texel to the result alone.
 //!
 //! A module that already holds an interlock critical section has none: the variant's entry opens
 //! its own. Nor has one with a `Coherent` resource or under the Vulkan memory model: the variant
@@ -117,8 +117,8 @@ fn reach(m: &TypedModule, own: &[u32], n: usize) -> Result<Vec<u32>, Error> {
         if let GlobalKind::Resource(slot) = &g.kind {
             let texture = match slot.kind {
                 ResourceKind::Texture
-                | ResourceKind::RawTexture
-                | ResourceKind::CombinedTextureSampler(_) => Some(slot.index),
+                | ResourceKind::CombinedTextureSampler(_)
+                | ResourceKind::YCbCrPlanes(_) => Some(slot.index),
                 ResourceKind::SeparateTexture(_) => slot.separate_texture_of().map(|(t, _)| t),
                 _ => None,
             };
@@ -314,16 +314,14 @@ fn reach(m: &TypedModule, own: &[u32], n: usize) -> Result<Vec<u32>, Error> {
 
 /// Whether module `m`, compiled to read texture slots `slots` through snapshots
 /// (`LoweringInputs::snapshot_textures`), reads each slot's texels in the entry's copy alone,
-/// each with the `OpImageFetch`es that copy makes: one of the slot's image, and a second of its
-/// unsigned integer alias where the snapshot holds the texel's own 16 bits under the bound
-/// format's class, the two the copy's exclusive arms (`lower::fragment`'s
-/// `snapshot::fetches_half_bits`). Every other use of the slot's images is one that carries them
+/// with the one `OpImageFetch` of the slot's image that copy makes. Every other use of the slot's
+/// images is one that carries them
 /// on or queries their size. A read the lowering left on the texture would race the draw's own
 /// color writes, and shows here as a fetch the copy does not make. It charges `meter` for its
 /// table while it holds it.
 pub fn snapshot_copies_alone(
     m: &TypedModule,
-    slots: &[(u32, u32)],
+    slots: &[u32],
     meter: &mut Meter,
 ) -> Result<bool, Error> {
     let n = m.values().len();
@@ -335,14 +333,14 @@ pub fn snapshot_copies_alone(
 }
 
 /// [`snapshot_copies_alone`] once its table is charged.
-fn copies_alone(m: &TypedModule, slots: &[(u32, u32)], n: usize) -> Result<bool, Error> {
+fn copies_alone(m: &TypedModule, slots: &[u32], n: usize) -> Result<bool, Error> {
     let mut carried = vec![NONE; n];
     for g in m.globals() {
         if let GlobalKind::Resource(slot) = &g.kind {
             let texture = match slot.kind {
                 ResourceKind::Texture
-                | ResourceKind::RawTexture
-                | ResourceKind::CombinedTextureSampler(_) => Some(slot.index),
+                | ResourceKind::CombinedTextureSampler(_)
+                | ResourceKind::YCbCrPlanes(_) => Some(slot.index),
                 ResourceKind::SeparateTexture(_) => slot.separate_texture_of().map(|(t, _)| t),
                 _ => None,
             };
@@ -378,7 +376,7 @@ fn copies_alone(m: &TypedModule, slots: &[(u32, u32)], n: usize) -> Result<bool,
         carried
             .get(v.index())
             .copied()
-            .filter(|s| slots.iter().any(|(w, _)| w == s))
+            .filter(|s| slots.contains(s))
     };
     let mut fetches = vec![0u32; slots.len()];
     let mut elsewhere = false;
@@ -402,7 +400,7 @@ fn copies_alone(m: &TypedModule, slots: &[(u32, u32)], n: usize) -> Result<bool,
                 match use_of(node, v) {
                     Use::NoTexel => {}
                     Use::Fetch { .. } => {
-                        let at = slots.iter().position(|&(s, _)| s == slot);
+                        let at = slots.iter().position(|&s| s == slot);
                         if let Some(f) = at.and_then(|i| fetches.get_mut(i)) {
                             *f += 1;
                         }
@@ -412,7 +410,7 @@ fn copies_alone(m: &TypedModule, slots: &[(u32, u32)], n: usize) -> Result<bool,
             });
         }
     }
-    Ok(!elsewhere && fetches.iter().zip(slots).all(|(&f, &(_, want))| f == want))
+    Ok(!elsewhere && fetches.iter().all(|&f| f == 1))
 }
 
 /// Add `reach` to `table[v]`; whether it grew.

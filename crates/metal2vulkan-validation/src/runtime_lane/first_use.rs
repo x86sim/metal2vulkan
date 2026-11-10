@@ -14,23 +14,6 @@
 //!   texture over it is rebound. The end mark reads 0 as each call returns. Afterwards every
 //!   texture and buffer holds what Metal's holds: zero where new, the bytes it was made with, the
 //!   bytes it lies over where it aliases, what a blit wrote.
-//! - **Making waits for no submission's replay.** A command buffer whose deferred command buffers
-//!   take long to replay (`recorder`) and to submit is committed, and a `Private` texture made
-//!   while its submission replays and submits them waits for no submission's place
-//!   (`WorkCounts::registrations_waited` stays 0): a submission replays them before it takes the
-//!   new resources' first work, and from its take until its `vkQueueSubmit` returned (MoltenVK
-//!   encodes the Metal commands inside it) it holds the texture slots' writes, not the texture's
-//!   registration (`WorkCounts::heap_slot_writes_deferred`), or, on a device whose heap sets take
-//!   no writes while pending, the registrations, which then wait only for that span. The making's
-//!   time is printed, not bounded: it holds the host's and the driver's waits. On lavapipe under
-//!   the validation layer, beside 128 busy threads on 32 CPUs, its `vkCreateImage` slept up to
-//!   6 ms on the layer's lock, which the replay's own Vulkan calls on the recorder's thread held
-//!   while the host ran another thread, and once waited 8 ms for a CPU. It makes a
-//!   `Private` texture: its move waits for a submission, so its making registers it, where a new
-//!   `Shared` texture's move is made on the host on a device with host image copies
-//!   (`texture/host_copy.rs`), registering nothing, whatever the order. One is made before,
-//!   untimed: a device's first texture making took 4 to 9 ms on RADV
-//!   and the Iris Xe, 32 ms on a loaded Iris Xe, waiting for nothing.
 //! - **The zeros come before every use, on every queue** (the coordinator's conditions). A new
 //!   `Private` buffer whose memory held other bytes is read through its address unnamed, and
 //!   through its heap made resident, by a command buffer on another queue, after a command
@@ -39,6 +22,10 @@
 //!   (`commit_failed`, a failing submission check) still runs it: a later read is zero. Bytes a
 //!   command buffer writes through a resource placed in a new heap, and through one aliasing it,
 //!   stay: the heap's fill comes before its first command.
+//! - **A large `Private` buffer reads zero through its first fill.** One past the device's zeros'
+//!   length, over memory a released buffer had filled, reads all zero; on a device without unified
+//!   memory whose fills are not transfers its zeros are one `vkCmdFillBuffer`
+//!   (`WorkCounts::new_buffer_zero_fills`), elsewhere copies of the device's zeros.
 //! - **A heap texture's `replace_region` waits for nothing**: its copy is staged for the device's
 //!   next submission; a later command buffer reads the later of two calls' bytes, and `get_bytes`
 //!   the staged bytes. A new heap texture's staged copy lands where that submission also carries
@@ -883,89 +870,6 @@ fn new_resources_wait_for_no_gpu_work() {
     });
 }
 
-/// The fills the long replay's command buffer encodes at first
-/// ([`a_new_texture_waits_for_no_submission_s_replay`]), doubled until its submission comes at
-/// least [`LONG_REPLAY`] after its commit, up to [`MOST_REPLAY_FILLS`].
-const REPLAY_FILLS: usize = 1 << 12;
-const MOST_REPLAY_FILLS: usize = 1 << 20;
-
-/// The least time from the long replay's commit until its command buffer is scheduled.
-const LONG_REPLAY: Duration = Duration::from_millis(40);
-
-/// How long after that commit the texture is made: past the scheduler's first look at the
-/// command buffer, well inside its replay.
-const AFTER_COMMIT: Duration = Duration::from_millis(2);
-
-/// Making a texture waits for no submission's replay of deferred command buffers, nor for its
-/// `vkQueueSubmit` (Metal's makes wait for no GPU work, nor for a submission). One blit encoder of
-/// fills of distinct words, whose replay into a `VkCommandBuffer` (`recorder`) and submission take
-/// at least [`LONG_REPLAY`] (its fills doubled until they do), is committed, and a `Private`
-/// texture, whose making registers its move and writes its slot (the module docs), is made
-/// [`AFTER_COMMIT`] later, after one made untimed before: its registration waits for no
-/// submission's place (`WorkCounts::registrations_waited`), and its time is printed. A device that
-/// records as it encodes (no recorder) replays nothing, printed.
-#[test]
-fn a_new_texture_waits_for_no_submission_s_replay() {
-    on_device(|device| {
-        let queue = device.new_command_queue().unwrap();
-        let name = device.name();
-        let first = device.new_texture(&descriptor(tracked_private())).unwrap();
-        let mut fills = REPLAY_FILLS;
-        loop {
-            let target = (device.new_buffer(4 * fills as u64, ResourceOptions::private())).unwrap();
-            let deferred = device.work_counts().command_buffers_deferred;
-            let command_buffer = queue.command_buffer().unwrap();
-            let mut blit = command_buffer.blit_command_encoder().unwrap();
-            for at in 0..fills as u64 {
-                blit.fill_buffer(&target, 4 * at..4 * at + 4, at as u8)
-                    .unwrap();
-            }
-            blit.end_encoding().unwrap();
-            if device.work_counts().command_buffers_deferred == deferred {
-                eprintln!("FIRST-USE {name}: records as it encodes, so no submission replays");
-                return;
-            }
-            let committed = Instant::now();
-            command_buffer.commit().unwrap();
-            std::thread::sleep(AFTER_COMMIT);
-            let waited = device.work_counts().registrations_waited;
-            let making = Instant::now();
-            let texture = device.new_texture(&descriptor(tracked_private())).unwrap();
-            let made = making.elapsed();
-            let waited = device.work_counts().registrations_waited - waited;
-            scheduled(&command_buffer);
-            let submitted = committed.elapsed();
-            command_buffer.wait_until_completed_for(WAIT).unwrap();
-            assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
-            drop(texture);
-            eprintln!(
-                "FIRST-USE {name}: a Private texture made {:.1} ms after the commit of {fills} \
-                 fills took {:.3} ms, its registration waiting {waited} times for a \
-                 submission's place; the command buffer was scheduled {:.1} ms after its commit",
-                AFTER_COMMIT.as_secs_f64() * 1e3,
-                made.as_secs_f64() * 1e3,
-                submitted.as_secs_f64() * 1e3,
-            );
-            if submitted < LONG_REPLAY && fills < MOST_REPLAY_FILLS {
-                fills *= 2;
-                continue;
-            }
-            assert!(
-                submitted >= LONG_REPLAY,
-                "{MOST_REPLAY_FILLS} fills were scheduled {submitted:?} after their commit, \
-                 short of {LONG_REPLAY:?}"
-            );
-            assert_eq!(
-                waited, 0,
-                "a texture made {AFTER_COMMIT:?} after the commit, {submitted:?} before its \
-                 command buffer was scheduled, waited for a submission's place"
-            );
-            break;
-        }
-        drop(first);
-    });
-}
-
 /// A `Private` buffer of `len` bytes made where a buffer that held `node(A)` was just released
 /// (most likely its memory): a fill that did not run would leave those bytes. Whether the
 /// memory was the released one's, printed.
@@ -1120,6 +1024,60 @@ fn a_new_resource_s_zeros_come_before_every_use_on_every_queue() {
                 Err(error) => panic!("new_buffer {options:?}: {error:?}"),
             }
         }
+    });
+}
+
+/// A new `Private` buffer larger than the device's zeros (`ZERO_BYTES`, 4 MiB), made where one
+/// whose every byte was `0xa7` was just released (most likely its memory), reads all zero after
+/// the submission that took its first work: zeroed by one `vkCmdFillBuffer` on a device without
+/// unified memory whose fills are not transfers (`WorkCounts::new_buffer_zero_fills` counts
+/// exactly one), by copies of the device's zeros elsewhere (it counts none).
+#[test]
+fn a_new_private_buffer_reads_zero_through_its_first_fill() {
+    on_device(|device| {
+        let name = device.name();
+        let len = (5 << 20) + 48;
+        let queue = device.new_command_queue().unwrap();
+        let dirty = device.new_buffer(len, ResourceOptions::private()).unwrap();
+        let command_buffer = queue.command_buffer().unwrap();
+        let mut blit = command_buffer.blit_command_encoder().unwrap();
+        blit.fill_buffer(&dirty, 0..len, 0xa7).unwrap();
+        blit.end_encoding().unwrap();
+        command_buffer.commit().unwrap();
+        command_buffer.wait_until_completed_for(WAIT).unwrap();
+        assert_eq!(command_buffer.error(), None, "the dirty fill on {name}");
+        let address = dirty.gpu_address();
+        drop((command_buffer, dirty));
+        let before = device.work_counts().new_buffer_zero_fills;
+        let made = device.new_buffer(len, ResourceOptions::private()).unwrap();
+        let reused = made.gpu_address() == address;
+        let command_buffer = queue.command_buffer().unwrap();
+        let out = buffer_out(&command_buffer, &made, len);
+        command_buffer.commit().unwrap();
+        command_buffer.wait_until_completed_for(WAIT).unwrap();
+        assert_eq!(command_buffer.error(), None, "on {name}");
+        let filled = device.work_counts().new_buffer_zero_fills - before;
+        let properties = device.properties();
+        let by_transfers =
+            (properties.driver_facts).contains(&DriverFact::FillCompiledPerCommandPool);
+        let fills = !properties.has_unified_memory && !by_transfers;
+        println!(
+            "FIRST-USE on {name}: a new {len}-byte Private buffer {} the released one's memory, \
+             its zeros {}",
+            if reused { "took" } else { "did not take" },
+            if fills { "a fill" } else { "copies" }
+        );
+        let bytes = read_buffer(&out, 0, len).unwrap();
+        let other = bytes.iter().filter(|&&b| b != 0).count();
+        assert_eq!(
+            other, 0,
+            "bytes of a new Private buffer that read other than zero on {name}"
+        );
+        assert_eq!(
+            filled,
+            u64::from(fills),
+            "fills of the new Private buffer's zeros on {name}"
+        );
     });
 }
 

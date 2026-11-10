@@ -777,6 +777,13 @@ impl RenderLowering {
         // Any other depth runs as 1, as plain Metal runs it: the threadgroups below are one deep.
         let tile = self.layout.tile_size()?;
         let kernel = state.kernel().clone();
+        // A tile function that statically uses a texture slot that holds a memoryless texture
+        // fails the command buffer as plain Metal's does, from its pass on, and records nothing
+        // (`EncoderCore::fail_memoryless_use`; an M3 Max under macOS 27.0.1).
+        if (self.tile).uses_memoryless(kernel.interface(), Stage::Kernel) {
+            self.core.fail_memoryless_use();
+            return Ok(());
+        }
         // A tile function's explicit imageblock aliased onto the attachments is threadgroup
         // memory of its dispatch, staged from and to them, where Metal's is the tile memory the
         // pass's imageblock storage stands in for (`fragment_imageblock.rs`); an explicit one
@@ -1106,10 +1113,6 @@ impl RenderLowering {
                 .objects()
                 .tested_formats(&|slot| tables.bound_format(slot))
         });
-        device.degrade_half_texel_writes(
-            &variant.pipeline().dependencies,
-            Some(&|slot| tables.bound_format(slot)),
-        );
         device.degrade_bound_formats(
             std::slice::from_ref(&variant.pipeline().stage),
             Some(&|slot| tables.bound_format(slot)),
@@ -1234,8 +1237,6 @@ impl RenderLowering {
         // Its pixels are not bounded by a viewport the host knows of.
         self.drawn.everywhere();
         self.coverage.everywhere();
-        // Nor do its positions run again before the pass (`render/capture.rs`).
-        self.keeping = super::capture::Keeping::Stopped;
         let executed = || ExecutedPipeline::Compute(Arc::clone(variant.shared_pipeline()));
         match (&made_pipelines, creation) {
             (Some(made), _) => self.core.executed(|| {

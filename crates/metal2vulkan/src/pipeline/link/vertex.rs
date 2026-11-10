@@ -53,25 +53,21 @@
 //!    shape binds such a layout at an offset or with a per-bind stride fixed-function input
 //!    cannot fetch. It runs after the items above, so the variant's fixed-function bindings are
 //!    exactly the projection's others, attribute for attribute;
-//! 8. the **indexed capture form** (`CaptureForm::Indexed`) pulls every remaining fixed-function
-//!    attribute: its draw runs without indices, so fixed-function input would fetch at the stream
-//!    position, where the function reads the vertex its index names. The layouts it pulls are not a
-//!    pulled-vertex-buffer variant's (`variant_pulled` keeps item 7's).
+//! 8. the **de-indexed and private list forms** (`VariantKey::primitive_id_indices`,
+//!    `VariantKey::private_list`) pull every remaining fixed-function attribute in the projection
+//!    their compile takes: their draw runs without indices, so fixed-function input would fetch at
+//!    the stream position, where the function reads the vertex its index names. The layouts they
+//!    pull are not a pulled-vertex-buffer variant's (`variant_pulled` keeps item 7's).
 //!
-//! 9. a **normalized** format (the 8- and 16-bit `Normalized` formats of either sign,
-//!    `UChar4Normalized_BGRA`, `Int1010102Normalized`, `UInt1010102Normalized`) is pulled where
-//!    the profile asks for Metal's own division (`VertexNormalizedPolicy::Exact`,
-//!    [`normalized_exactly`]): Metal divides a code by its own maximum, correctly rounded, and
-//!    `lower::stage_io::fetch`'s `div_exact` computes that in integer arithmetic, while a driver
-//!    that multiplies by the reciprocal in fixed-function input is one `f32` ulp off at some
-//!    codes. Under the default the device's `UNORM` or `SNORM` conversion delivers it, which is
-//!    the conversion Vulkan states and Metal states, and every such format then shares the one
-//!    fixed-function module (`docs/FAST-PATHS.md`).
-//!
-//! A fixed-function entry then keeps of the format only what the module's own instructions depend
-//! on, which is `narrow_float` and nothing else, and that bit only for an attribute the function
-//! reads as a 32-bit `float` ([`narrow_float_of_f32_reads`]): every other format the device
-//! fetches in fixed function compiles one module, whatever its encoding, offset or stride.
+//! A fixed-function entry keeps nothing of the format (`VertexFetch::FixedFunction`): no
+//! instruction of the module names it, so every format the device fetches in fixed function
+//! compiles one module, whatever its encoding, offset or stride. The format is the
+//! `VertexAttribute` state this module emits, and what the device's conversion of it may answer
+//! otherwise than Metal's fetch is noted where the pipeline links, on its vertex stage
+//! ([`fixed_function_notes`]): a normalized format's quotient
+//! (`PrecisionNote::DeviceVertexConversion`; on a profile whose conversion is measured to be
+//! Metal's, `VkProperty::MetalNormalizedVertexFetch` among the pipeline's requirements in its
+//! place) and a narrow float's NaN read as `float` (`PrecisionNote::DeviceNanEncoding`).
 //!
 //! The projection is part of the vertex function's compile key; link recomputes it from the
 //! function's stage-IO contract and refuses a stage compiled under another one
@@ -80,15 +76,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::device::policy::VertexNormalizedPolicy;
-use crate::device::requirements::VkFeature;
+use crate::device::requirements::{VkFeature, VkProperty};
 use crate::device::DeviceProfile;
-use crate::error::{DescriptorError, Error, InternalError, InternalKind};
+use crate::error::{DescriptorError, DriverDeviation, Error, InternalError, InternalKind};
 use crate::lower::stage_io::fetch::{class_match, encoding, ClassMatch, Encoding};
 use crate::metal::vertex::{
     fetch_as, vertex_alignment, vk_scaled_vertex_format, vk_vertex_format, AttributeFetch,
 };
 use crate::metal::VertexFormat;
+use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::descriptor::{
     VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
@@ -110,8 +106,8 @@ use crate::vk;
 ///
 /// A signed **normalized** format is not that case: it is a float-class format (`Encoding`'s
 /// `is_float`), so `fetch::class_match` admits it to a `float` variable alone and refuses it to
-/// an integer one, and Vulkan's `SNORM` vertex formats deliver floats. Item 9 of the module docs
-/// decides who converts it.
+/// an integer one, and Vulkan's `SNORM` vertex formats deliver floats: the device converts it
+/// where fixed-function input fetches it ([`fixed_function_notes`]).
 fn class_format(
     format: VertexFormat,
     declared: IoNumeric,
@@ -139,26 +135,6 @@ fn class_format(
                 ))
             }),
     }
-}
-
-/// Whether `format` is a normalized format whose conversion the shader must compute (item 9 of
-/// the module docs): the profile asks for Metal's normalized vertex conversion
-/// (`VertexNormalizedPolicy::Exact`) and the format's codes are divided by their own maximum --
-/// the 8- and 16-bit `Normalized` formats of either sign, `UChar4Normalized_BGRA`, and the two
-/// `1010102Normalized` words. Under the default the device's fixed-function `UNORM` or `SNORM`
-/// conversion delivers it, which Vulkan states as Metal states it.
-fn normalized_exactly(format: VertexFormat, p: &DeviceProfile) -> Result<bool, Error> {
-    if p.fields().vertex_normalized != VertexNormalizedPolicy::Exact {
-        return Ok(false);
-    }
-    Ok(matches!(
-        encoding(format)?,
-        Encoding::Int {
-            normalized: true,
-            ..
-        } | Encoding::Bgra8Unorm
-            | Encoding::Rgb10A2 { .. }
-    ))
 }
 
 /// The stride the Vulkan binding of `fetch` on `layout` is emitted with (`None`: set per bind, a
@@ -230,7 +206,6 @@ fn resolve<'a>(
             _ => false,
         };
         let pulled = !fits
-            || normalized_exactly(attr.format, p)?
             || (beyond_stride
                 && p.fields()
                     .enabled
@@ -302,7 +277,7 @@ fn resolve<'a>(
             moved.insert(r.attr.buffer_index);
         }
     }
-    // The indexed capture form (item 8).
+    // The de-indexed and private list forms (item 8).
     if pull_every {
         for r in out.values_mut() {
             r.fetch = AttributeFetch::Pulled;
@@ -338,9 +313,10 @@ pub fn vertex_fetch_projection(
     vertex_fetch_projection_for(desc, attributes, p, &BTreeSet::new(), false)
 }
 
-/// `vertex_fetch_projection` under a pulled-vertex-buffer variant and capture form: the
-/// attributes of the layouts in `pulled_vertex_buffers` (`VariantKey::pulled_vertex_buffers`)
-/// are pulled (item 7), and every attribute when `pull_every` (the indexed capture form, item 8).
+/// `vertex_fetch_projection` under a pulled-vertex-buffer variant and a form that pulls every
+/// attribute: the attributes of the layouts in `pulled_vertex_buffers`
+/// (`VariantKey::pulled_vertex_buffers`) are pulled (item 7), and every attribute when
+/// `pull_every` (the de-indexed and private list forms, item 8).
 pub fn vertex_fetch_projection_for(
     desc: Option<&VertexDescriptor>,
     attributes: &BTreeMap<u32, IoNumeric>,
@@ -350,79 +326,126 @@ pub fn vertex_fetch_projection_for(
 ) -> Result<VertexFetchProjection, Error> {
     let mut out = VertexFetchProjection::new();
     for (a, r) in resolve(desc, attributes, p, pulled_vertex_buffers, pull_every)?.0 {
-        out.attributes.insert(a, fetch_of(&r)?);
+        out.attributes.insert(a, fetch_of(&r));
     }
     Ok(out)
 }
 
-/// Clear `narrow_float` on every fixed-function attribute of `projection` that `f32_read` does
-/// not hold.
-///
-/// The bit asks the function to canonicalize the device's widening of a narrow-float format, and
-/// `lower::stage_io::plan` emits that canonicalization only where the attribute's declared form is
-/// a 32-bit `float`: a `half`-declared attribute keeps the fetched code's own bits, as Metal's
-/// `half` attribute does, whatever the format was. So the bit changes no instruction of such a
-/// stage, and carrying it in the compile key would make one program two keys
-/// (`tests::engine_vertex_variants`). Both sides of the key apply this: the compile
-/// (`pipeline::compile::lower_inputs`, from the specialized entry's parameter forms) and link's
-/// recomputation ([`vertex_input_state`], from the stage's own declared types), so a stage
-/// compiled under one is linked under the same.
-pub fn narrow_float_of_f32_reads(
-    projection: &mut VertexFetchProjection,
-    f32_read: impl Fn(u32) -> bool,
-) {
-    for (&a, fetch) in &mut projection.attributes {
-        if let VertexFetch::FixedFunction { narrow_float } = fetch {
-            *narrow_float = *narrow_float && f32_read(a);
-        }
+/// The projection entry of a resolved attribute: fixed function, or the pulled fetch of its
+/// format, offset and step.
+fn fetch_of(r: &Resolved<'_>) -> VertexFetch {
+    match r.fetch {
+        AttributeFetch::FixedFunction { .. } => VertexFetch::FixedFunction,
+        _ => VertexFetch::pulled(r.attr, r.layout),
     }
 }
 
-/// The projection entry of a resolved attribute. A fixed-function entry carries whether the Metal
-/// format's components are floats narrower than 32 bits, which the function canonicalizes after
-/// the device's widening (`VertexFetch::FixedFunction`); the rest of the format is `VertexAttribute`
-/// state.
-fn fetch_of(r: &Resolved<'_>) -> Result<VertexFetch, Error> {
-    Ok(match r.fetch {
-        AttributeFetch::FixedFunction { .. } => VertexFetch::FixedFunction {
-            narrow_float: encoding(r.attr.format)?.widens_narrow_float(),
-        },
-        _ => VertexFetch::pulled(r.attr, r.layout),
+/// What the device's fixed-function operations give a render pipeline: the precision notes one of
+/// its stages records and the measured properties it relies on in their place. The conversions of
+/// its vertex stage's fixed-function attributes ([`fixed_function_notes`]) and its alpha to
+/// coverage (`graphics::coverage_notes`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FixedFunctionNotes {
+    /// The notes, sorted, each once.
+    pub(crate) notes: Vec<PrecisionNote>,
+    /// The measured properties an attribute that records no note relies on.
+    pub(crate) properties: BTreeSet<VkProperty>,
+}
+
+/// The precision notes of vertex stage `vs`'s attributes that fixed-function vertex input fetches
+/// for descriptor `desc` on `p` (its `IoRole::Attribute` inputs, which [`vertex_input_state`]
+/// holds to the descriptor's projection), sorted, each once, and the measured properties the
+/// pipeline requires in place of a note: the device converts each attribute's format, and the
+/// module, which every such format shares, cannot say what it was.
+///
+/// - `PrecisionNote::DeviceVertexConversion` for a normalized format (the 8- and 16-bit
+///   `Normalized` formats of either sign, `UChar4Normalized_BGRA`, `Int1010102Normalized`,
+///   `UInt1010102Normalized`), whatever width the function reads it at: the device's `UNORM` or
+///   `SNORM` conversion of the codes, where Metal's quotient is correctly rounded (but an
+///   `Int1010102Normalized` 10-bit field's, the code times `float(1 / 511)`). Where `p` takes
+///   `DriverDeviation::MetalNormalizedVertexFetch`, the device's `float` is Metal's at every code:
+///   an attribute the function reads as a 32-bit `float` records no note and the pipeline requires
+///   `VkProperty::MetalNormalizedVertexFetch`, and so does one read as `half` of an 8- or 10-bit
+///   format, whose `float` rounds to Metal's `half` at every code. A 16-bit format read as `half`
+///   ([`rounds_twice_to_half`]) records the note there too;
+/// - `PrecisionNote::DeviceNanEncoding` for a float format narrower than 32 bits
+///   (`Encoding::widens_narrow_float`) that the function reads as a 32-bit `float`
+///   (`StageIo::f32_attributes`): Metal widens its NaN to `0x7fc00000`, the device's widening
+///   need not. A `half`-declared attribute keeps the fetched code's own bits, as Metal's does.
+///
+/// A pulled attribute's decode is the module's and records its own notes. An attribute the
+/// descriptor lacks is [`vertex_input_state`]'s refusal, which runs first.
+pub(crate) fn fixed_function_notes(
+    vs: &StageInterface,
+    desc: Option<&VertexDescriptor>,
+    p: &DeviceProfile,
+) -> Result<FixedFunctionNotes, Error> {
+    let f32_reads = vs.io.f32_attributes();
+    let metal = p.takes_driver_deviation(DriverDeviation::MetalNormalizedVertexFetch);
+    let mut notes = BTreeSet::new();
+    let mut properties = BTreeSet::new();
+    for (a, (_, fetch)) in vs.io.attributes() {
+        if fetch != VertexFetch::FixedFunction {
+            continue;
+        }
+        let attr = desc
+            .and_then(|d| d.attributes.get(&a))
+            .ok_or(Error::InvalidDescriptor(DescriptorError::VertexAttribute {
+                attribute: a,
+            }))?;
+        let e = encoding(attr.format)?;
+        let f32_read = f32_reads.contains(&a);
+        if e.is_normalized() {
+            if metal && (f32_read || !rounds_twice_to_half(e)) {
+                properties.insert(VkProperty::MetalNormalizedVertexFetch);
+            } else {
+                notes.insert(PrecisionNote::DeviceVertexConversion);
+            }
+        }
+        if e.widens_narrow_float() && f32_read {
+            notes.insert(PrecisionNote::DeviceNanEncoding);
+        }
+    }
+    Ok(FixedFunctionNotes {
+        notes: notes.into_iter().collect(),
+        properties,
     })
 }
 
+/// Whether normalized encoding `e`'s `float` quotient, rounded to `half` as the module rounds an
+/// attribute the function reads as `half`, can differ from Metal's `half`, which rounds the
+/// quotient once: a 16-bit field's can land on a `half` midpoint (codes 65455 and 65519 unsigned,
+/// and 32759 and -32759 signed, each one `half` ulp from Metal's), an 8-, 10- or 2-bit field's
+/// at no code (`Int1010102Normalized`'s 10-bit fields through Metal's reciprocal product too).
+fn rounds_twice_to_half(e: Encoding) -> bool {
+    matches!(
+        e,
+        Encoding::Int {
+            bits: 16,
+            normalized: true,
+            ..
+        }
+    )
+}
+
 /// The vertex input state of vertex stage `vs` for descriptor `desc` under the
-/// pulled-vertex-buffer variant `pulled_vertex_buffers` and, when `pull_every`, the indexed
-/// capture form (see the module docs), with each fixed-function attribute at the location link
-/// assigned its key. Fixed-function bindings are numbered densely in Metal buffer-index order;
+/// pulled-vertex-buffer variant `pulled_vertex_buffers` (see the module docs), with each
+/// fixed-function attribute at the location link assigned its key. Fixed-function bindings are numbered densely in Metal buffer-index order;
 /// `variant_pulled` records the layouts the variant moved.
 pub fn vertex_input_state(
     vs: &StageInterface,
     desc: Option<&VertexDescriptor>,
     pulled_vertex_buffers: &BTreeSet<u32>,
-    pull_every: bool,
     locations: &Locations,
     p: &DeviceProfile,
 ) -> Result<VertexInputState, Error> {
     let used = vs.io.attributes();
     let numeric: BTreeMap<u32, IoNumeric> = used.iter().map(|(a, (n, _))| (*a, *n)).collect();
-    let (resolved, moved) = resolve(desc, &numeric, p, pulled_vertex_buffers, pull_every)?;
-    let f32_reads = vs.io.f32_attributes();
+    let (resolved, moved) = resolve(desc, &numeric, p, pulled_vertex_buffers, false)?;
     for (a, (_, fetch)) in &used {
         // The stage was compiled under another projection (a `Compiled` stage source whose
         // `LowerInputs` do not fit this descriptor).
-        let got = match resolved.get(a) {
-            Some(r) => {
-                let mut got = fetch_of(r)?;
-                // The same narrowing the compile applied, from the stage's declared types.
-                if let VertexFetch::FixedFunction { narrow_float } = &mut got {
-                    *narrow_float = *narrow_float && f32_reads.contains(a);
-                }
-                Some(got)
-            }
-            None => None,
-        };
-        if got != Some(*fetch) {
+        if resolved.get(a).map(fetch_of) != Some(*fetch) {
             return Err(Error::InvalidDescriptor(DescriptorError::VertexAttribute {
                 attribute: *a,
             }));

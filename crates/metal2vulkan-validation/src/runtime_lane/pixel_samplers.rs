@@ -16,17 +16,25 @@
 //! reads its border color, here opaque white, as clamp to the border does, and a constexpr one
 //! transparent black.
 //!
-//! Each configuration here runs the same grid through the runtime: the hash of its results must
-//! be Metal's, and each pixel configuration's results must equal the device's own `norm` control's
-//! cell by cell, which names the cells that differ. On a device with `VkProperty::MetalSampler`
-//! none announces `pixel-sampler-scaling`, and an argument buffer's pixel sampler announces
-//! `argument-pixel-sampler-scaling` only on a device without it, at the first dispatch while a
-//! pixel state with a linear filter lives
-//! ([`the_argument_buffer_note_waits_for_a_filtering_pixel_state`]).
+//! Each configuration here runs the same grid through the runtime. A pixel coordinate reaches
+//! the device divided by the texture's size, and the device's sampler reads that normalized
+//! coordinate in its own arithmetic: the stages record it (`PrecisionNote::PixelSamplerScaling`,
+//! and `ArgumentPixelSamplerScaling` for an argument buffer's sampler) and every device announces
+//! it. Each pixel configuration is held to its normalized control on the same device (the runtime
+//! state's `norm`; for `const`, a constexpr sampler of the same words in normalized coordinates):
+//! a cell that differs from the control at the same coordinate must be the control's answer at a
+//! coordinate within [`REACH`] ulps of it on each axis, and the widest shift each configuration
+//! needed is printed (`PIXEL-SAMPLER-REACH` lines). On a device with `VkProperty::MetalSampler`
+//! (MoltenVK) each `norm` control's hash must be Metal's. Elsewhere every sample is the device's
+//! sampler's, which the stages record (`PrecisionNote::DeviceSampling`) and the device announces.
+//! Every configuration that is not Metal's is printed (`PIXEL-SAMPLER-DIFFERS` lines) without
+//! failing. An argument buffer's note waits for a dispatch while a pixel state lives
+//! ([`the_argument_buffer_note_waits_for_a_pixel_state`]).
 
 use super::argument_linear_samples::kernel;
 use super::degrade_notices::counts;
 use super::depth_compares::{pipeline_of, run_held, Held, Through};
+use super::driver_deviations::stage_notes;
 use super::extended_range_targets::half_bits;
 use super::{layer_reported_nothing_at_all, validated_device, Messages, ScratchCache};
 use crate::gpu::TEST_DEVICE;
@@ -35,6 +43,7 @@ use metal2vulkan::device::VkProperty;
 use metal2vulkan::metal::{
     PixelFormat, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter,
 };
+use metal2vulkan::pipeline::PrecisionNote;
 use metal2vulkan_devtools::llvm_assemble_text;
 use metal2vulkan_runtime::{
     ComputePipelineState, Degradation, Device, Region, SamplerState, SamplerStateOptions, Texture,
@@ -423,27 +432,45 @@ fn pixel_words(code: u64, linear: bool, border: u64) -> u64 {
     (code | code << 3 | code << 6) | filters | 1 << 15 | 8 << 16 | 0x7bff << 40 | border << 56
 }
 
-/// The kernels sampling a slot's texture through runtime sampler slot 0, and an argument
-/// buffer's texture through its sampler.
-struct Kernels {
-    slot: ComputePipelineState,
-    argument: ComputePipelineState,
+/// The widest shift [`compare`] searches for a pixel configuration's cell, in ulps of the
+/// normalized coordinate on each axis.
+pub(super) const REACH: i32 = 4;
+
+/// `v` moved by `k` ulps, up where `k` is positive.
+pub(super) fn shifted(mut v: f32, k: i32) -> f32 {
+    for _ in 0..k.unsigned_abs() {
+        v = if k > 0 { v.next_up() } else { v.next_down() };
+    }
+    v
 }
 
-/// A configuration's results beside Metal's.
+/// The normalized coordinate of each cell at `cells`, the probe's divided by the size.
+fn normalized(cells: &[[f32; 2]]) -> Vec<[f32; 4]> {
+    cells
+        .iter()
+        .map(|&[x, y]| [x / W as f32, y / H as f32, 0.0, 0.0])
+        .collect()
+}
+
+/// A configuration's results beside Metal's and beside its normalized control.
 struct Outcome {
     /// The configuration's name (the module docs).
     name: String,
-    /// Its source: `slot`, `arg`, `norm` or `const`.
-    source: &'static str,
     /// Whether its results hash as Metal's.
     metal: bool,
-    /// Its hash, and its first cells that differ from the device's `norm` control (none for the
-    /// control itself).
+    /// Whether it is a `norm` control.
+    control: bool,
+    /// Its cells that differ from its control at the same coordinate (none for a control).
+    differ: usize,
+    /// The widest shift, in ulps on either axis, of the control's coordinate at which the control
+    /// answers each such cell as the configuration does; `None` where one is not the control's
+    /// within [`REACH`].
+    reach: Option<u32>,
+    /// Its hash where it is not Metal's, then its first cells that differ from its control.
     differs: Vec<String>,
 }
 
-/// Every configuration's results on `device` beside Metal's.
+/// Every configuration's results on `device` beside Metal's and beside its control.
 fn compare(device: &Device) -> Vec<Outcome> {
     let make = |heap: bool, through: Through| {
         pipeline_of(
@@ -452,22 +479,10 @@ fn compare(device: &Device) -> Vec<Outcome> {
             "k",
         )
     };
-    let kernels = Kernels {
-        slot: make(false, Through::Runtime),
-        argument: make(true, Through::Argument),
-    };
+    let (slot, argument) = (make(false, Through::Runtime), make(true, Through::Argument));
     let metal: BTreeMap<&str, &str> = METAL.into_iter().collect();
     let cells = grid();
-    let jobs = |scale: bool| -> Vec<[f32; 4]> {
-        cells
-            .iter()
-            .map(|&[x, y]| match scale {
-                true => [x / W as f32, y / H as f32, 0.0, 0.0],
-                false => [x, y, 0.0, 0.0],
-            })
-            .collect()
-    };
-    let (pixel, normalized) = (jobs(false), jobs(true));
+    let pixel: Vec<[f32; 4]> = cells.iter().map(|&[x, y]| [x, y, 0.0, 0.0]).collect();
     let n = cells.len();
     let run = |texture: &Texture,
                held: Held<'_>,
@@ -475,9 +490,11 @@ fn compare(device: &Device) -> Vec<Outcome> {
                state: &ComputePipelineState,
                jobs: &[[f32; 4]]| {
         let mut out = run_held(device, (texture, held, sampler), state, jobs, 1);
-        out.truncate(4 * n);
+        out.truncate(4 * jobs.len());
         out
     };
+    let texel =
+        |out: &[f32], j: usize| -> [u32; 4] { std::array::from_fn(|c| out[4 * j + c].to_bits()) };
     let mut outcomes = Vec::new();
     for (format, fname) in [
         (PixelFormat::RGBA8Unorm, "rgba8"),
@@ -491,70 +508,120 @@ fn compare(device: &Device) -> Vec<Outcome> {
             for &(aname, address, constexpr) in &ADDRESSES {
                 let pixel_state = sampler(device, filter, address, false);
                 let norm_state = sampler(device, filter, address, true);
-                let norm = run(
-                    &texture,
-                    Held::Argument(Some(&norm_state)),
-                    None,
-                    &kernels.argument,
-                    &normalized,
-                );
+                // A configuration's control at `jobs`: the normalized state through the argument
+                // buffer, or a constexpr sampler of `words` in normalized coordinates.
+                let control = |words: Option<u64>, jobs: &[[f32; 4]]| match words {
+                    None => run(
+                        &texture,
+                        Held::Argument(Some(&norm_state)),
+                        None,
+                        &argument,
+                        jobs,
+                    ),
+                    Some(words) => run(
+                        &texture,
+                        Held::Slot,
+                        None,
+                        &make(false, Through::Constexpr(words & !(1 << 15))),
+                        jobs,
+                    ),
+                };
+                let norm = control(None, &normalized(&cells));
                 let mut results = vec![
-                    ("norm", norm.clone()),
+                    ("norm", None, None),
                     (
                         "slot",
-                        run(
-                            &texture,
-                            Held::Slot,
-                            Some(&pixel_state),
-                            &kernels.slot,
-                            &pixel,
-                        ),
+                        Some(run(&texture, Held::Slot, Some(&pixel_state), &slot, &pixel)),
+                        None,
                     ),
                     (
                         "arg",
-                        run(
+                        Some(run(
                             &texture,
                             Held::Argument(Some(&pixel_state)),
                             None,
-                            &kernels.argument,
+                            &argument,
                             &pixel,
-                        ),
+                        )),
+                        None,
                     ),
                 ];
                 if let Some((code, border)) = constexpr {
                     let words = pixel_words(code, filter == SamplerMinMagFilter::Linear, border);
                     let state = make(false, Through::Constexpr(words));
-                    results.push(("const", run(&texture, Held::Slot, None, &state, &pixel)));
+                    let out = run(&texture, Held::Slot, None, &state, &pixel);
+                    results.push(("const", Some(out), Some(words)));
                 }
-                for (source, out) in results {
+                for (source, out, words) in results {
                     let name = format!("{fname}_{source}_{lname}_{aname}");
+                    let out = out.as_ref().unwrap_or(&norm);
                     let bytes: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
                     let hash = crate::hash::hex_encode(Sha256::digest(&bytes));
-                    let metal = metal.get(name.as_str()) == Some(&hash.as_str());
-                    // The cells that differ from the `norm` control, which Metal answered alike
-                    // but where a constexpr sampler clamps to zero.
-                    let mut cells_wrong = Vec::new();
-                    for (j, &[x, y]) in cells.iter().enumerate() {
-                        let (got, control) = (&out[4 * j..4 * j + 4], &norm[4 * j..4 * j + 4]);
-                        if got
+                    let is_metal = metal.get(name.as_str()) == Some(&hash.as_str());
+                    let mut differs = Vec::new();
+                    if !is_metal {
+                        differs.push(format!("hash {hash}"));
+                    }
+                    if source == "norm" {
+                        outcomes.push(Outcome {
+                            name,
+                            metal: is_metal,
+                            control: true,
+                            differ: 0,
+                            reach: Some(0),
+                            differs,
+                        });
+                        continue;
+                    }
+                    let own = match words {
+                        None => norm.clone(),
+                        Some(words) => control(Some(words), &normalized(&cells)),
+                    };
+                    let wrong: Vec<usize> = (0..n)
+                        .filter(|&j| texel(out, j) != texel(&own, j))
+                        .collect();
+                    // Each such cell's control at every shift of its coordinate within `REACH`.
+                    let shifts: Vec<(i32, i32)> = (-REACH..=REACH)
+                        .flat_map(|kx| (-REACH..=REACH).map(move |ky| (kx, ky)))
+                        .collect();
+                    let jobs: Vec<[f32; 4]> = wrong
+                        .iter()
+                        .flat_map(|&j| {
+                            let [u, v, ..] = normalized(&cells[j..=j])[0];
+                            shifts
+                                .iter()
+                                .map(move |&(kx, ky)| [shifted(u, kx), shifted(v, ky), 0.0, 0.0])
+                        })
+                        .collect();
+                    let around = match jobs.is_empty() {
+                        true => Vec::new(),
+                        false => control(words, &jobs),
+                    };
+                    let mut reach = Some(0);
+                    for (w, &j) in wrong.iter().enumerate() {
+                        let widest = shifts
                             .iter()
-                            .zip(control)
-                            .any(|(a, b)| a.to_bits() != b.to_bits())
-                            && cells_wrong.len() < 6
-                        {
-                            cells_wrong.push(format!(
-                                "({x:e}, {y:e}): {got:?}, the normalized control {control:?}"
+                            .enumerate()
+                            .filter(|&(s, _)| texel(&around, w * shifts.len() + s) == texel(out, j))
+                            .map(|(_, &(kx, ky))| kx.unsigned_abs().max(ky.unsigned_abs()))
+                            .min();
+                        reach = reach.zip(widest).map(|(a, b)| a.max(b));
+                        if differs.len() < 7 {
+                            let [x, y] = cells[j];
+                            differs.push(format!(
+                                "({x:e}, {y:e}): {:?}, the control {:?}, matched at a shift of {widest:?}",
+                                &out[4 * j..4 * j + 4],
+                                &own[4 * j..4 * j + 4]
                             ));
                         }
                     }
-                    if !metal {
-                        cells_wrong.insert(0, format!("hash {hash}"));
-                    }
                     outcomes.push(Outcome {
                         name,
-                        source,
-                        metal,
-                        differs: cells_wrong,
+                        metal: is_metal,
+                        control: false,
+                        differ: wrong.len(),
+                        reach,
+                        differs,
                     });
                 }
             }
@@ -563,65 +630,85 @@ fn compare(device: &Device) -> Vec<Outcome> {
     outcomes
 }
 
-/// Every configuration answers Metal's results (the module docs), but where the device announced
-/// `float-sample-filter` (no `VkProperty::MetalSampler`): there an argument buffer's texture
-/// sampled with a `float` result keeps the device's conversion of its texels (an `RGBA8Unorm`
-/// code `k` read as other than `k / 255` rounded once, lavapipe), so a `norm` configuration may
-/// differ from Metal's, and an `arg` one only as its `norm` control does, cell by cell: its pixel
-/// coordinates still read Metal's texels.
+/// Every device announces both pixel samplers' notes, and every pixel configuration's cell is its
+/// normalized control's within [`REACH`] ulps of the control's coordinate (the module docs). On a
+/// device with Metal's own sampler each `norm` control answers Metal's results; elsewhere the
+/// samples are the device's sampler's and the device announces `device-sampling`. Each
+/// configuration that is not Metal's is printed with the cells where it differs from its control.
 #[test]
 fn pixel_samplers_answer_metal_s_texels() {
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
-    let (outcomes, metal_sampler) = {
+    let (outcomes, metal_sampler, name) = {
         let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
         eprintln!("pixel samplers on {}", device.name());
-        (compare(&device), metal_sampler(&device))
+        (
+            compare(&device),
+            metal_sampler(&device),
+            device.name().to_owned(),
+        )
     };
     layer_reported_nothing_at_all(&messages);
     let announced: BTreeSet<Degradation> = counts(&messages.take_notices()).into_keys().collect();
     eprintln!("announced: {announced:?}");
-    let converted = announced.contains(&Degradation::FloatSampleFilter);
-    // A device with Metal's own sampler reads each configuration's texels exactly; elsewhere a
-    // linear pixel sample the emulation does not reach divides by the size (`OpFDiv`, Vulkan's
-    // bound) and filters on the device, which keeps the note.
-    if metal_sampler {
-        assert!(!announced.contains(&Degradation::PixelSamplerScaling));
+    for kind in [
+        Degradation::PixelSamplerScaling,
+        Degradation::ArgumentPixelSamplerScaling,
+    ] {
+        assert!(announced.contains(&kind), "{name}: {kind:?} not announced");
     }
     assert_eq!(
-        announced.contains(&Degradation::ArgumentPixelSamplerScaling),
+        announced.contains(&Degradation::DeviceSampling),
         !metal_sampler,
-        "the argument buffer's pixel note where the device lacks Metal's sampler"
+        "{name}: device-sampling exactly where the device's sampler is not Metal's"
     );
     assert_eq!(outcomes.len(), METAL.len());
-    let mut allowed = Vec::new();
-    let mut wrong = BTreeMap::new();
-    for o in outcomes {
-        if o.metal {
-            continue;
-        }
-        let pixel_exact = match o.source {
-            "norm" => true,
-            "arg" => o.differs.len() == 1,
-            _ => false,
-        };
-        if converted && pixel_exact {
-            allowed.push(o.name);
-        } else {
-            wrong.insert(o.name, o.differs);
-        }
+    for o in outcomes.iter().filter(|o| !o.control) {
+        eprintln!(
+            "PIXEL-SAMPLER-REACH {name}: {}: {} of {} cells differ from the control, widest \
+             shift {:?} ulp",
+            o.name,
+            o.differ,
+            grid().len(),
+            o.reach
+        );
     }
-    eprintln!("the device's conversion under float-sample-filter: {allowed:?}");
-    assert!(
-        wrong.is_empty(),
-        "{} of {} configurations are not Metal's: {wrong:#?}",
+    let wrong: BTreeMap<&str, &Outcome> = outcomes
+        .iter()
+        .filter(|o| !o.metal)
+        .map(|o| (o.name.as_str(), o))
+        .collect();
+    eprintln!(
+        "{name}: {} of {} configurations are not Metal's",
         wrong.len(),
         METAL.len()
     );
+    for (configuration, o) in &wrong {
+        eprintln!(
+            "PIXEL-SAMPLER-DIFFERS {name}: {configuration}: {:?}",
+            o.differs
+        );
+    }
+    let beyond: Vec<(&str, &[String])> = outcomes
+        .iter()
+        .filter(|o| o.reach.is_none())
+        .map(|o| (o.name.as_str(), o.differs.as_slice()))
+        .collect();
+    assert!(
+        beyond.is_empty(),
+        "{name}: cells beyond {REACH} ulps of the control: {beyond:#?}"
+    );
+    if metal_sampler {
+        let controls: Vec<&&str> = wrong.keys().filter(|n| n.contains("_norm_")).collect();
+        assert!(
+            controls.is_empty(),
+            "{name}: normalized controls not Metal's: {controls:?}"
+        );
+    }
 }
 
 /// Whether `device` samples through Metal's own sampler (`VkProperty::MetalSampler`).
-fn metal_sampler(device: &Device) -> bool {
+pub(super) fn metal_sampler(device: &Device) -> bool {
     device
         .compile_device()
         .profile()
@@ -630,70 +717,66 @@ fn metal_sampler(device: &Device) -> bool {
         .contains(&VkProperty::MetalSampler)
 }
 
-/// `argument-pixel-sampler-scaling` fires at a dispatch, never at a state's making: an argument
-/// buffer's linear sample, dispatched while the device holds a normalized linear state and a
-/// nearest pixel state, announces nothing; making a pixel state of linear filters announces
-/// nothing; the next dispatch, through the normalized state still, announces it on a device without
-/// `VkProperty::MetalSampler`, where the kernel records the note, and nowhere else.
+/// Whether `device` samples by its own sampler, not Metal's (`VkProperty::MetalSampler`), checking
+/// that the device announced `device-sampling` among `messages`' notices exactly then.
+pub(super) fn own_sampler(device: &Device, messages: &Messages) -> bool {
+    let own = !metal_sampler(device);
+    let announced = counts(&messages.take_notices());
+    assert_eq!(
+        announced.contains_key(&Degradation::DeviceSampling),
+        own,
+        "{}: device-sampling exactly where the device's sampler is not Metal's",
+        device.name()
+    );
+    own
+}
+
+/// `argument-pixel-sampler-scaling` fires at a dispatch, never at a state's making. An argument
+/// buffer's sample through the sampler it holds, whose stage records the note on every device
+/// (which state a program's argument buffer names, the module cannot see), dispatched while the
+/// device holds only a normalized state, announces nothing; making a pixel state of nearest
+/// filters announces nothing; the next dispatch, through the normalized state still, announces it
+/// once.
 #[test]
-fn the_argument_buffer_note_waits_for_a_filtering_pixel_state() {
+fn the_argument_buffer_note_waits_for_a_pixel_state() {
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
     let kind = Degradation::ArgumentPixelSamplerScaling;
     {
         let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
-        let argument = pipeline_of(
-            &device,
-            &llvm_assemble_text(&kernel(true, Through::Argument, false, false)).unwrap(),
-            "k",
+        let bitcode = llvm_assemble_text(&kernel(true, Through::Argument, false, false)).unwrap();
+        assert!(
+            stage_notes(&device, &bitcode, "k")
+                .contains(&PrecisionNote::ArgumentPixelSamplerScaling),
+            "an argument buffer's sample records the note"
         );
+        let argument = pipeline_of(&device, &bitcode, "k");
         let texture = texture(&device, PixelFormat::RGBA8Unorm);
-        let jobs: Vec<[f32; 4]> = grid()
-            .iter()
-            .take(64)
-            .map(|&[x, y]| [x / W as f32, y / H as f32, 0.0, 0.0])
-            .collect();
-        let normalized = sampler(
-            &device,
-            SamplerMinMagFilter::Linear,
+        let jobs = normalized(&grid());
+        let (nearest, edge) = (
+            SamplerMinMagFilter::Nearest,
             SamplerAddressMode::ClampToEdge,
-            true,
         );
-        let dispatch = |state: &SamplerState| {
+        let normalized = sampler(&device, nearest, edge, true);
+        let dispatch = || {
             run_held(
                 &device,
-                (&texture, Held::Argument(Some(state)), None),
+                (&texture, Held::Argument(Some(&normalized)), None),
                 &argument,
                 &jobs,
                 1,
             );
         };
-        let nearest = sampler(
-            &device,
-            SamplerMinMagFilter::Nearest,
-            SamplerAddressMode::ClampToEdge,
-            false,
-        );
-        dispatch(&normalized);
-        dispatch(&nearest);
+        dispatch();
         let before = counts(&messages.take_notices());
         assert!(!before.contains_key(&kind), "{before:?}");
-        let linear = sampler(
-            &device,
-            SamplerMinMagFilter::Linear,
-            SamplerAddressMode::ClampToEdge,
-            false,
-        );
+        let pixel = sampler(&device, nearest, edge, false);
         let made = counts(&messages.take_notices());
         assert!(!made.contains_key(&kind), "{made:?}");
-        dispatch(&normalized);
+        dispatch();
         let after = counts(&messages.take_notices());
-        assert_eq!(
-            after.get(&kind).copied(),
-            (!metal_sampler(&device)).then_some(1),
-            "{after:?}"
-        );
-        drop(linear);
+        assert_eq!(after.get(&kind).copied(), Some(1), "{after:?}");
+        drop(pixel);
     }
     layer_reported_nothing_at_all(&messages);
 }

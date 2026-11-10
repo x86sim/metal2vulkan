@@ -10,8 +10,8 @@
 //! - A read outside the texture is Metal's zero texel, alpha the format's (measured), on a profile
 //!   whose device robustness would return the raw zero.
 //! - `ARGB8Unorm`'s storage slot rotates its bytes in the shader (`RotateArgb`), and a half-float
-//!   storage slot of `HalfTowardZero` rounds each written `float` toward zero, one of
-//!   `HalfQuietNan` its NaN alone.
+//!   storage slot leaves each written `float` to the device's conversion, noting where it is not
+//!   measured to be Metal's.
 //! - The binder joins a slot bound in an extended-range format to the plan's variant, the
 //!   variant's plan states the same key, and it views the image in the raw format.
 //! - Samples of such a texture are Metal's (`samples`), at Metal's level and through a linear
@@ -30,7 +30,6 @@ use crate::device::{Device, DeviceDescription, DevicePolicy};
 use crate::error::Feature;
 use crate::library::{FunctionConstantValues, Library};
 use crate::lower::select::{LowerInputs, Plan};
-use crate::metal::format::extended_srgb::{SRGB_DECODE_STEPS, SRGB_ENCODE_FIRST};
 use crate::metal::format::ExtendedRange;
 use crate::metal::{self, PixelFormat, TextureType};
 use crate::pipeline::compile::{compile_bitcode, plan_bitcode, EntryRef};
@@ -285,62 +284,29 @@ fn written(form: ExtendedRange, n: u32) -> [u32; 4] {
     }
 }
 
-/// `k / d` (`0 <= k <= d`, `d` even but `k / d` dyadic only when exact) correctly rounded to
-/// `f32`.
-fn ratio_f32(k: u64, d: u64) -> f32 {
-    if k == 0 {
-        return 0.0;
-    }
-    let (k, d) = (u128::from(k), u128::from(d));
-    let mut e = 0;
-    while k << e < d << 23 {
-        e += 1;
-    }
-    let n = k << e;
-    let (q, r) = (n / d, n % d);
-    let q = q + u128::from(2 * r > d || (2 * r == d && q % 2 == 1));
-    (q as f64 * 2f64.powi(-e)) as f32
-}
-
-/// Metal's value of code `c` of channel `channel` of `form` (red 0, alpha 3).
+/// The device's value of code `c` of channel `channel` of linear `form` (red 0, alpha 3): the code
+/// less 384 times the `f32` nearest `1 / 510` (`extended_range::decode`), a two-plane texel's
+/// alpha byte times that of `1 / 255`. An `_sRGB` form's is the device's `Pow`'s, which the
+/// interpreter does not model.
 fn value(form: ExtendedRange, channel: usize, c: u32) -> f32 {
+    assert!(!form.srgb(), "{form:?}: the interpreter models no Pow");
     if channel == 3 {
         return match form {
             ExtendedRange::Bgr10 { .. } => 1.0,
             // The alpha byte, an 8-bit unorm code.
-            ExtendedRange::Planes { .. } => ratio_f32(u64::from(c), 255),
-            _ => ratio_f32(u64::from(c.clamp(384, 894) - 384), 510),
+            ExtendedRange::Planes { .. } => c as f32 * (1.0 / 255.0f32),
+            _ => (c.clamp(384, 894) - 384) as f32 * (1.0 / 510.0f32),
         };
     }
-    let n = c.abs_diff(384);
-    let m = if form.srgb() {
-        f32::from(SRGB_DECODE_STEPS[n as usize]) / 8192.0
-    } else {
-        ratio_f32(u64::from(n), 510)
-    };
-    if c < 384 {
-        -m
-    } else {
-        m
-    }
+    (c as i32 - 384) as f32 * (1.0 / 510.0f32)
 }
 
-/// `x` rounded to `half` with ties away from zero, Metal's rounding of an extended-range read
+/// `x` narrowed to `half`, nearest even, the device's narrowing of an extended-range read
 /// (`extended_range::decode`; every value here is a normal `half` or zero).
 fn half_bits(x: f32) -> u16 {
-    let b = x.to_bits();
-    let sign = ((b >> 16) & 0x8000) as u16;
-    let a = b & 0x7fff_ffff;
-    if a == 0 {
-        return sign;
-    }
-    let exp = (a >> 23) as i32 - 127 + 15;
-    assert!(exp > 0 && exp < 31, "{x} is no normal half");
-    let mant = (a & 0x7f_ffff) | 0x80_0000;
-    let (q, r) = (mant >> 13, mant & 0x1fff);
-    let q = q + u32::from(r >= 0x1000);
-    let bits = ((exp as u32) << 10) + (q - 0x400);
-    sign | bits as u16
+    let h = crate::float16::f32_to_f16_bits(x);
+    assert!(h & 0x7c00 != 0 || h & 0x7fff == 0, "{x} is no normal half");
+    h
 }
 
 /// The image of slot `index` of `kind`'s texels.
@@ -373,8 +339,6 @@ fn resources(plan: &Plan, bytes: usize, spec: &[(SpecKey, u64)]) -> Resources {
             (PushField::SlotBindOffset(_) | PushField::DispatchRegion, PushLoc::Push { .. }) => {}
             // A bound value read as data, which the interpreter writes from `spec`.
             (PushField::Specialized(_), PushLoc::Push { .. }) => {}
-            // No slot's writes dropped: the word stays 0.
-            (PushField::Specialized(crate::pipeline::sym::SpecKey::DroppedStoreSlots(_)), _) => {}
             other => panic!("unexpected push field {other:?}"),
         }
     }
@@ -434,8 +398,10 @@ fn texels_of(images: &[Image], index: u32) -> &[[u32; 4]] {
         .texels
 }
 
-/// Every code of each format, read through a sampled and a storage slot with a `half` and a
-/// `float` result, is Metal's value bit for bit; written back, it is Metal's raw texel.
+/// Every code of each linear format, read through a sampled and a storage slot with a `half` and a
+/// `float` result, is the device's product (`value`), narrowed to `half` to nearest even; written
+/// back, it is Metal's raw texel. An `_sRGB` form's transfer takes the device's `Pow`, which the
+/// interpreter does not model: its values are the device lanes'.
 #[test]
 fn reads_and_writes_of_every_code_are_metals() {
     for source in [Source::Read, Source::ReadWrite] {
@@ -445,7 +411,7 @@ fn reads_and_writes_of_every_code_are_metals() {
                 return;
             };
             for (stem, p) in profiles() {
-                for form in FORMS {
+                for form in FORMS.into_iter().filter(|f| !f.srgb()) {
                     let what = format!("{what} {form:?} on {stem}");
                     let (plan, m) = typed_module_with(&bc, "k", &p, &inputs(form, source))
                         .unwrap_or_else(|e| panic!("{what}: {e}"));
@@ -495,8 +461,9 @@ fn reads_outside_the_texture_are_metals_zero() {
     let Some(bc) = assemble("outside", &kernel(Source::Read, false, SIDE)) else {
         return;
     };
+    // An `_sRGB` form's decode takes the device's `Pow`, which the interpreter does not model.
     for (stem, p) in profiles() {
-        for form in FORMS {
+        for form in FORMS.into_iter().filter(|f| !f.srgb()) {
             let what = format!("{form:?} on {stem}");
             let (plan, m) = typed_module_with(&bc, "k", &p, &inputs(form, Source::Read))
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
@@ -524,9 +491,11 @@ fn bfloat_codes(n: u32) -> [u32; 4] {
 }
 
 /// Every texel of each bfloat form, read through a sampled and a storage slot with a `half` and
-/// a `float` result, is Metal's value bit for bit, the channels a form lacks 0 and alpha 1
-/// whatever the image's other components hold; written back, it is Metal's code of that value
-/// (a `half` read's `half` widened): the code itself, a NaN `0x7fc0`. A read outside the texture
+/// a `float` result, is its code shifted up 16 bits (a NaN code a NaN, as the device computes
+/// it, where Metal reads `0x7fc00000`), a `half` result the device's narrowing of it (to nearest
+/// even, a result below the smallest normal `half` its zero where the device's quantize flushes
+/// it), the channels a form lacks 0 and alpha 1 whatever the image's other components hold;
+/// written back, it is that value's top 16 bits (a NaN a NaN code). A read outside the texture
 /// is Metal's zero texel, alpha 1 where the form has none.
 #[test]
 fn bfloat_reads_and_writes_are_metals() {
@@ -535,14 +504,10 @@ fn bfloat_reads_and_writes_are_metals() {
         (ExtendedRange::Rg16Bfloat, 2),
         (ExtendedRange::Rgba16Bfloat, 4),
     ];
-    let read = |c: u32| match c & 0x7FFF > 0x7F80 {
-        true => 0x7FC0_0000u32,
-        false => c << 16,
-    };
-    let write = |b: u32| match b & 0x7FFF_FFFF > 0x7F80_0000 {
-        true => 0x7FC0u32,
-        false => b >> 16,
-    };
+    let read = |c: u32| c << 16;
+    let nan32 = |b: u32| b & 0x7FFF_FFFF > 0x7F80_0000;
+    let nan16 = |h: u32| h & 0x7FFF > 0x7C00;
+    let bfloat_nan = |c: u32| c & 0x7FFF > 0x7F80;
     let one = 1.0f32.to_bits();
     for source in [Source::Read, Source::ReadWrite] {
         for half in [false, true] {
@@ -580,20 +545,34 @@ fn bfloat_reads_and_writes_are_metals() {
                                 (false, _) => 0,
                             };
                             let h = crate::float16::f32_to_f16_bits(f32::from_bits(v));
-                            let want = match half {
-                                true => u32::from(h),
-                                false => v,
-                            };
                             let got = lane(&out, half, n, c);
-                            assert_eq!(got, want, "{what}: texel {n} channel {c}");
+                            let held = match (half, nan32(v)) {
+                                (_, true) => {
+                                    let nan = if half { nan16(got) } else { nan32(got) };
+                                    assert!(nan, "{what}: texel {n} channel {c}: {got:#x}");
+                                    if c < ch {
+                                        let w = target[at][c];
+                                        assert!(bfloat_nan(w), "{what}: texel {n} {c}: {w:#x}");
+                                    }
+                                    continue;
+                                }
+                                (true, false) => {
+                                    // The device's quantize may flush a `half` denormal.
+                                    let flushed = u32::from(h & 0x8000);
+                                    let ok =
+                                        got == u32::from(h) || (h & 0x7C00 == 0 && got == flushed);
+                                    assert!(ok, "{what}: texel {n} channel {c}: {got:#x}");
+                                    crate::float16::f16_bits_to_f32(got as u16).to_bits()
+                                }
+                                (false, false) => {
+                                    assert_eq!(got, v, "{what}: texel {n} channel {c}");
+                                    v
+                                }
+                            };
                             if c < ch {
-                                let held = match half {
-                                    true => crate::float16::f16_bits_to_f32(h).to_bits(),
-                                    false => v,
-                                };
                                 assert_eq!(
                                     target[at][c],
-                                    write(held),
+                                    held >> 16,
                                     "{what}: texel {n} channel {c} written"
                                 );
                             }
@@ -625,10 +604,8 @@ fn bfloat_reads_and_writes_are_metals() {
 }
 
 /// `ARGB8Unorm`'s storage slot holds its bytes in an `R8G8B8A8_UNORM` image, alpha in red: a
-/// read rotates them into Metal's channels, and a write back stores each channel's code as Metal
-/// writes it (the value clamped to `[0, 1]`, the exact product with 255 rounded to nearest, ties
-/// to even) as that code times the `f32` nearest `1 / 255`, which every device stores as the code.
-/// The held lanes run from below 0 to above 1.
+/// read rotates them into Metal's channels, and a write back rotates them into the image's lanes
+/// as computed, which the device's conversion stores. The held lanes run from below 0 to above 1.
 #[test]
 fn argb8_storage_slots_rotate_their_bytes() {
     let Some(bc) = assemble("argb8", &kernel(Source::ReadWrite, false, 0)) else {
@@ -644,11 +621,6 @@ fn argb8_storage_slots_rotate_their_bytes() {
     // The image's lanes as the view reads them (the interpreter holds `f32` bits).
     let value = |k: u32| k as f32 / 3600.0 - 0.1;
     let held = |n: u32| -> [u32; 4] { [0, 1, 2, 3].map(|c| value(4 * n + c).to_bits()) };
-    // The lanes a write of `held(n)` stores.
-    let code = |bits: u32| -> u32 {
-        let product = f64::from(f32::from_bits(bits).clamp(0.0, 1.0)) * 255.0;
-        (product.round_ties_even() as f32 * (1.0f32 / 255.0)).to_bits()
-    };
     for (stem, p) in profiles() {
         let (plan, m) =
             typed_module_with(&bc, "k", &p, &i).unwrap_or_else(|e| panic!("{stem}: {e}"));
@@ -664,24 +636,26 @@ fn argb8_storage_slots_rotate_their_bytes() {
             let at = layout
                 .index(0, 0, 0, [n % SIDE, n / SIDE, 0])
                 .expect("texel");
-            assert_eq!(target[at], held(n).map(code), "{stem}: texel {n} written");
+            assert_eq!(target[at], held(n), "{stem}: texel {n} written");
         }
     }
 }
 
-/// A half-float storage slot of `HalfTowardZero` (formatless, and declared `Rgba16f`) writes each
-/// `float` channel rounded toward zero to the `half` Metal stores, as the `f32` that holds it: a
-/// finite value past 65504 as 65504, an infinity kept, a NaN as `0x7fc00000`;
-/// one of `HalfQuietNan` (a device's that rounds as Metal does: MoltenVK's here) writes it as
-/// computed but a NaN as `0x7fc00000`. The held lanes cover
-/// every tie between neighbouring halves and its neighbours, past the largest, the infinities
-/// and NaNs. The NaN is Metal's where the profile takes `DriverDeviation::MetalFloatStorageNans`
-/// (MoltenVK's and lavapipe's: the module requires its property, and `HalfQuietNan`'s also
-/// `MetalHalfStorageWrites`), else the device's (ANV's on the Iris Xe of RPL-P:
-/// `PrecisionNote::DeviceNanEncoding`).
+/// A half-float storage slot (formatless, and declared `Rgba16f`) writes each `float` channel as
+/// computed, the device's conversion rounding it and storing its NaN. The rounding is Metal's
+/// toward zero where the profile takes `DriverDeviation::MetalHalfStorageWrites` (the module
+/// requires its property), else the device's own (`PrecisionNote::DeviceColorConversion`); the
+/// NaN is Metal's `0x7e00` where it takes `DriverDeviation::MetalHalfStorageNans` (MoltenVK's: the
+/// module requires its property), else the device's (`PrecisionNote::DeviceNanEncoding`); a
+/// formatless slot's notes hold under the format bound there (`tests::engine_half_storage_notes`).
+/// A formatless slot may also reach a packed small float image, whose NaN is the device's on every
+/// profile (noted too), or a normalized one, whose conversion is the device's on every profile
+/// (noted too). The held lanes cover every tie between neighbouring halves and its
+/// neighbours, past the largest, the infinities and NaNs.
 #[test]
-fn half_float_storage_slots_round_toward_zero() {
+fn half_float_storage_slots_leave_their_writes_to_the_device() {
     use crate::device::requirements::VkProperty;
+    use crate::error::DriverDeviation;
     use crate::pipeline::artifact::PrecisionNote;
     let Some(bc) = assemble("halves", &kernel(Source::ReadWrite, false, 0)) else {
         return;
@@ -713,97 +687,84 @@ fn half_float_storage_slots_round_toward_zero() {
         }
     };
     let held = move |n: u32| -> [u32; 4] { [0, 1, 2, 3].map(|c| value(n, c)) };
-    for class in [
-        StorageImageClass::HalfTowardZero,
-        StorageImageClass::HalfQuietNan,
+    let class = StorageImageClass::Identity;
+    let mut nans_seen = std::collections::BTreeSet::new();
+    for choice in [
+        StorageImageChoice {
+            numeric: Some(crate::pipeline::sym::SampledType::Float),
+            ..StorageImageChoice::new(crate::vk::Format::UNDEFINED, class)
+        },
+        StorageImageChoice::new(crate::vk::Format::R16G16B16A16_SFLOAT, class),
     ] {
-        for choice in [
-            StorageImageChoice {
-                numeric: Some(crate::pipeline::sym::SampledType::Float),
-                ..StorageImageChoice::new(crate::vk::Format::UNDEFINED, class)
-            },
-            StorageImageChoice::new(crate::vk::Format::R16G16B16A16_SFLOAT, class),
-        ] {
-            let mut i = LowerInputs::new();
-            i.storage_images.insert(TARGET, choice);
-            let anv = "intel-irisxe-rplp-anv";
-            let anv = (anv, profile(anv, DevicePolicy::default()).expect("profile"));
-            for (stem, p) in profiles().into_iter().chain([anv]) {
-                // `HalfQuietNan` is the class of a device measured to round as Metal does.
-                let rounds =
-                    p.takes_driver_deviation(crate::error::DriverDeviation::MetalHalfStorageWrites);
-                if class == StorageImageClass::HalfQuietNan && !rounds {
+        let mut i = LowerInputs::new();
+        i.storage_images.insert(TARGET, choice);
+        let anv = "intel-irisxe-rplp-anv";
+        let anv = (anv, profile(anv, DevicePolicy::default()).expect("profile"));
+        for (stem, p) in profiles().into_iter().chain([anv]) {
+            // The kernel reads both textures: without formatless reads, the target's choice
+            // declares its format and the source's `RGBA32Float`'s.
+            let mut i = i.clone();
+            if !p.fields().images.storage_read_without_format {
+                if choice.vk_format == crate::vk::Format::UNDEFINED {
                     continue;
                 }
-                // The kernel reads both textures: without formatless reads, the target's choice
-                // declares its format and the source's `RGBA32Float`'s.
-                let mut i = i.clone();
-                if !p.fields().images.storage_read_without_format {
-                    if choice.vk_format == crate::vk::Format::UNDEFINED {
-                        continue;
-                    }
-                    let held = crate::vk::Format::R32G32B32A32_SFLOAT;
-                    let source = StorageImageChoice::new(held, StorageImageClass::Identity);
-                    i.storage_images.insert(SOURCE, source);
-                }
-                let what = format!("{stem} {class:?} {:?}", choice.vk_format);
-                let (plan, m) =
-                    typed_module_with(&bc, "k", &p, &i).unwrap_or_else(|e| panic!("{what}: {e}"));
-                validate(&bc, &i, &p, &what);
-                let images = [image(0, held), image(1, |_| [0; 4])];
-                let (_, images) = run(&m, &resources(&plan, 16, &[]), &images);
-                let target = texels_of(&images, 1);
-                let layout = image(1, |_| [0; 4]);
-                for n in 0..SIDE * SIDE {
-                    let at = layout
-                        .index(0, 0, 0, [n % SIDE, n / SIDE, 0])
-                        .expect("texel");
-                    let want = held(n).map(|x| match f32::from_bits(x) {
-                        v if v.is_nan() => 0x7fc0_0000,
-                        v if class == StorageImageClass::HalfTowardZero => {
-                            half_value(half_toward_zero(v)).to_bits()
-                        }
-                        _ => x,
-                    });
-                    assert_eq!(target[at], want, "{what}: texel {n}");
-                }
-                let a = compile_bitcode(
-                    &bc,
-                    EntryRef::Name("k"),
-                    &FunctionConstantValues::defaults(),
-                    &p,
-                    &i,
-                    &mut meter(),
-                    SPIRV_WORDS,
-                )
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-                let measured =
-                    p.takes_driver_deviation(crate::error::DriverDeviation::MetalFloatStorageNans);
-                assert_eq!(measured, stem != "intel-irisxe-rplp-anv", "{what}");
-                let relied = &a.requirements.properties;
-                assert_eq!(
-                    relied.contains(&VkProperty::MetalFloatStorageNans),
-                    measured,
-                    "{what}"
-                );
-                assert_eq!(
-                    relied.contains(&VkProperty::MetalHalfStorageWrites),
-                    class == StorageImageClass::HalfQuietNan,
-                    "{what}"
-                );
-                assert!(
-                    !relied.contains(&VkProperty::MetalHalfStorageNans),
-                    "{what}"
-                );
-                assert_eq!(
-                    a.precision.contains(&PrecisionNote::DeviceNanEncoding),
-                    !measured,
-                    "{what}: {:?}",
-                    a.precision
-                );
+                let held = crate::vk::Format::R32G32B32A32_SFLOAT;
+                let source = StorageImageChoice::new(held, StorageImageClass::Identity);
+                i.storage_images.insert(SOURCE, source);
             }
+            let what = format!("{stem} {:?}", choice.vk_format);
+            let (plan, m) =
+                typed_module_with(&bc, "k", &p, &i).unwrap_or_else(|e| panic!("{what}: {e}"));
+            validate(&bc, &i, &p, &what);
+            let images = [image(0, held), image(1, |_| [0; 4])];
+            let (_, images) = run(&m, &resources(&plan, 16, &[]), &images);
+            let target = texels_of(&images, 1);
+            let layout = image(1, |_| [0; 4]);
+            for n in 0..SIDE * SIDE {
+                let at = layout
+                    .index(0, 0, 0, [n % SIDE, n / SIDE, 0])
+                    .expect("texel");
+                assert_eq!(target[at], held(n), "{what}: texel {n}");
+            }
+            let a = compile_bitcode(
+                &bc,
+                EntryRef::Name("k"),
+                &FunctionConstantValues::defaults(),
+                &p,
+                &i,
+                &mut meter(),
+                SPIRV_WORDS,
+            )
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let rounds = p.takes_driver_deviation(DriverDeviation::MetalHalfStorageWrites);
+            let nans = p.takes_driver_deviation(DriverDeviation::MetalHalfStorageNans);
+            nans_seen.insert(nans);
+            let relied = &a.requirements.properties;
+            assert_eq!(
+                relied.contains(&VkProperty::MetalHalfStorageWrites),
+                rounds,
+                "{what}"
+            );
+            let formatless = choice.vk_format == crate::vk::Format::UNDEFINED;
+            let converted = a.precision.contains(&PrecisionNote::DeviceColorConversion);
+            assert!(converted || rounds, "{what}: {:?}", a.precision);
+            if !formatless {
+                assert_eq!(converted, !rounds, "{what}: {:?}", a.precision);
+            }
+            assert_eq!(
+                relied.contains(&VkProperty::MetalHalfStorageNans),
+                nans,
+                "{what}"
+            );
+            assert_eq!(
+                a.precision.contains(&PrecisionNote::DeviceNanEncoding),
+                !nans || formatless,
+                "{what}: {:?}",
+                a.precision
+            );
         }
     }
+    assert_eq!(nans_seen.len(), 2, "both NaN facts: {nans_seen:?}");
 }
 
 /// The value of a `half`'s bits (not a NaN).
@@ -817,24 +778,6 @@ fn half_value(bits: u16) -> f32 {
         _ => (1.0 + fraction / 1024.0) * 2f64.powi(exponent - 15),
     };
     (sign * magnitude) as f32
-}
-
-/// `x` (not a NaN) rounded toward zero to `half`: a finite value past 65504 is 65504.
-fn half_toward_zero(x: f32) -> u16 {
-    let sign = if x.is_sign_negative() { 0x8000u16 } else { 0 };
-    let a = x.abs();
-    if a.is_infinite() {
-        return sign | 0x7c00;
-    }
-    if a >= 65504.0 {
-        return sign | 0x7bff;
-    }
-    if a < 2f32.powi(-14) {
-        return sign | (a * 2f32.powi(24)).floor() as u16;
-    }
-    let bits = a.to_bits();
-    let exponent = ((bits >> 23) & 0xff) as u16 - (127 - 15);
-    sign | (exponent << 10) | ((bits >> 13) & 0x3ff) as u16
 }
 
 fn devices() -> Vec<(String, Device)> {
@@ -1097,19 +1040,6 @@ fn a_swizzled_extended_texture_joins_the_variant_at_a_sampled_slot() {
         }
     }
     assert!(planned > 0);
-}
-
-/// The sRGB tables are Metal's: each offset's decode step encodes back to it, so a texel read
-/// and written back keeps its codes (`reads_and_writes_of_every_code_are_metals` relies on it).
-#[test]
-fn every_srgb_step_encodes_to_its_own_offset() {
-    for (n, &step) in SRGB_DECODE_STEPS.iter().enumerate() {
-        let back = SRGB_ENCODE_FIRST
-            .iter()
-            .rposition(|&first| first <= step)
-            .expect("offset");
-        assert_eq!(back, n, "offset {n} step {step}");
-    }
 }
 
 /// A storage slot of `YCbCrWrite`, a 4:4:4 two-plane YCbCr texture's write shadow, stores each

@@ -17,6 +17,8 @@ mod argument_table;
 mod attachmentless;
 mod attributes;
 mod batches;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod bc_own_image;
 mod binary;
 mod binary_archive;
 mod binding_view;
@@ -39,9 +41,15 @@ mod completion;
 mod completion_here;
 mod completion_seen;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod compressed_rows_out;
 mod compute;
 mod contexts;
+mod copied;
+mod copied_bench;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod copied_device;
+mod copied_log;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod copied_log_device;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod copy_bounds;
 mod copy_plan;
@@ -74,6 +82,8 @@ mod device_registry;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod direct_arguments_from_compiled;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod dirty_pages_device;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod dispatch_pending;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod draw_shape_notices;
@@ -97,7 +107,6 @@ mod fences;
 mod fill_value;
 mod first_moves;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod fitted_variant_notice;
 mod framebuffer_fetch;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod freed_memory;
@@ -108,6 +117,7 @@ mod function_table;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod functions_translated;
 mod gate;
+mod general_form;
 mod gpu_pools;
 mod gpu_time;
 mod heap;
@@ -128,6 +138,8 @@ mod host_bytes;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod host_import_counts;
 mod host_memory;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod host_ram_device;
 #[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
 mod host_residency;
 mod host_settable_event_waits;
@@ -136,6 +148,7 @@ mod host_shadow;
 mod host_step_neutrals;
 mod image_barriers;
 mod image_plan;
+mod in_place;
 mod inbox;
 mod indirect_command_buffer;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
@@ -161,8 +174,7 @@ mod memory_frees;
 mod memory_reads;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod mesh_reflection_derived;
-mod metal_level;
-mod mipmap;
+mod metal_release;
 mod mipmap_plan;
 mod mipmap_scratch;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
@@ -211,6 +223,8 @@ mod rebind_descriptor_slip;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod rebind_making_wait;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod recorded_at_the_call;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod recycle;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod relay_facts;
@@ -225,7 +239,6 @@ mod render_directory_trips;
 mod render_sibling_work;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod render_stage_digests;
-mod replays;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod rerun_arenas;
 mod resource;
@@ -264,6 +277,9 @@ mod srgb_fetch_images;
 mod stage_entries_shared;
 mod stand_in;
 mod storage_form;
+mod submit_stalls;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod submit_stalls_idle;
 mod surface_depth;
 mod surface_two_planes;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
@@ -289,11 +305,20 @@ mod unique_identifier;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod upload_chunk_zeros;
 mod values;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod vertex_conversion_notices;
 mod view_plan;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod waiter_submits;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod warm;
+mod warm_record;
 mod word_fill;
 mod wrapped;
 mod written_commands;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod ycbcr_device;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod ycbcr_in_place_loop;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod ycbcr_refresh;

@@ -243,16 +243,13 @@ const MEASURED_RUNS: u32 = 1;
 const PASS_NOTICES: &[Degradation] = &[
     // A `Shared` buffer the device keeps in system memory, which the triangle's vertices are.
     Degradation::SharedInSystemMemory,
-    // The device's own compiler rewrote the stage's fast-math arithmetic as it made the pipeline.
-    Degradation::FastMathRewrites,
     // The fixture's vertex function writes `[[point_size]]`, which a device without
     // `shaderPointSize`'s guarantee takes as its own point size. Announced on lavapipe.
     Degradation::DevicePointSize,
     // A device that resolves the multisampled attachment through a pass of its own rather than in
-    // the store, and converts the colour in a shader to do it. Announced on lavapipe, where the
-    // whole resolve is emulated; MoltenVK resolves in the store and announces neither.
+    // the store. Announced on lavapipe, where the whole resolve is emulated; MoltenVK resolves in
+    // the store and announces nothing.
     Degradation::ShaderResolve,
-    Degradation::ShaderColorConversion,
     // The multisampled attachment of a `MultisampleResolve` store is Vulkan's `DONT_CARE`, which
     // Apple's GPU is measured to leave at the earlier texels unless its tiler overflows. Announced
     // on MoltenVK, where that driver fact holds. Nothing of this case reads the multisampled

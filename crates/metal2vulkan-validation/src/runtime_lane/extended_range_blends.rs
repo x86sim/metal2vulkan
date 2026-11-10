@@ -9,7 +9,7 @@
 //! `extended_range_targets`) under the load action `Load` and a blend of source factor one, added,
 //! for color and alpha, with destination factor zero (`one_zero`), one (`add`), or one minus the
 //! source's alpha (`premul`, the consumer's). The runtime blends such an attachment in the shader,
-//! inside the pixel interlock, from the texel's tile value (`extended_range::blend::blend`), or on
+//! inside the pixel interlock, from the texel's tile value (`extended_range::blend::native`), or on
 //! a device with raster-order attachment access (lavapipe) over the attachment's input attachment;
 //! any refusal fails.
 //!
@@ -37,9 +37,9 @@ use metal2vulkan::metal::{
 };
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_runtime::{
-    BlitOption, Buffer, ClearColor, Degradation, Error, IndirectCommandBufferDescriptor,
-    LoadAction, PipelineOptions, Region, RenderPassDescriptor, ResourceOptions, StoreAction,
-    Texture, TextureDescriptor,
+    BlitOption, Buffer, ClearColor, DebugMessage, Degradation, Error,
+    IndirectCommandBufferDescriptor, LoadAction, PipelineOptions, Region, RenderPassDescriptor,
+    ResourceOptions, StoreAction, Texture, TextureDescriptor,
 };
 use std::collections::BTreeSet;
 
@@ -385,16 +385,21 @@ fn first_texels(got: &[u8], size: usize) -> String {
 }
 
 /// Each format's blends of the probe's `half` outputs over its random texels, of source factor
-/// one, added, with destination factor zero, one, and one minus the source's alpha, store
-/// Metal's bytes.
+/// one, added, with destination factor zero, one, and one minus the source's alpha. Where the
+/// blend computes nothing (one and zero) every format stores Metal's bytes, which is asserted.
+/// Under one and one minus the source's alpha the function blends in the device's arithmetic,
+/// where Metal's compiler rounds each step to `half` (`extended-range-blend-source`): how many
+/// outputs differ from Metal's is printed, not asserted; the conformance suite's `xr-blend-*`
+/// cases hold Metal's bytes and each site the device's arithmetic moves.
 #[test]
-fn blends_of_half_outputs_store_metals_extended_range_texels() {
+fn blends_of_half_outputs_into_extended_range_texels() {
     let (messages, _cache, lane) = lane();
     let name = lane.device.name().to_owned();
     let halves = halves();
     let read = kernel(&lane, "xr2p_read_float");
     let size = (WIDTH as u64, HEIGHT as u64);
     let mut wrong = Vec::new();
+    let mut moved = Vec::new();
     let mut checked = 0;
     for (pf, probe) in FORMATS {
         let form = ExtendedRange::of(pf).expect("an extended-range format");
@@ -410,8 +415,13 @@ fn blends_of_half_outputs_store_metals_extended_range_texels() {
             draw(&lane, &t, &halves, color).unwrap_or_else(|e| panic!("{case}: the pipeline: {e}"));
             let got = lane.read(&t, (0, 0), texel as u64, BlitOption::None);
             checked += 1;
+            // The device's arithmetic answers a blend that computes something.
+            let differs = match dst {
+                BlendFactor::Zero => &mut wrong,
+                _ => &mut moved,
+            };
             if digest(&got) != metal(&format!("{case}.out0")) {
-                wrong.push(format!(
+                differs.push(format!(
                     "{case}.out0: the first texels {}",
                     first_texels(&got, texel)
                 ));
@@ -427,20 +437,21 @@ fn blends_of_half_outputs_store_metals_extended_range_texels() {
                 })
                 .collect();
             if digest(&bytes) != metal(&format!("{case}.outa")) {
-                wrong.push(format!(
+                differs.push(format!(
                     "{case}.outa: the first alpha bytes {:02x?}",
                     &bytes[..8]
                 ));
             }
         }
     }
-    for line in &wrong {
+    for line in wrong.iter().chain(&moved) {
         println!("XR-BLENDS-DIFFERS {name}: {line}");
     }
     println!(
-        "XR-BLENDS {name}: {checked} blends of {COUNT} texels checked, {} outputs differ from \
-         Metal",
-        wrong.len()
+        "XR-BLENDS {name}: {checked} blends of {COUNT} texels checked, {} outputs of one and zero \
+         and {} of the device's arithmetic differ from Metal",
+        wrong.len(),
+        moved.len()
     );
     assert!(
         wrong.is_empty(),
@@ -598,113 +609,66 @@ fn a_blend_onto_a_clear_between_two_codes_reads_the_clears_half() {
     }
 }
 
-/// A pipeline blending (premultiplied over) a `float4` output into a two-plane extended-range
-/// color announces `extended-range-blend-source` once where the output's lanes are not loads
-/// (`rt6_resolves`' `rt6_resolve_white`, a constant), and none where each is a load from a buffer
-/// (`rt6_samples`' `rt6_fill_rgba32float` and `rt6_fill_rgba16float`, fast math): Metal's
-/// compiler folds the blend into the function and rounds the source by how it was computed. A
-/// device with raster-order attachment access (lavapipe) blends over the color's input attachment
-/// and announces alike. So does a `half4` computed under fast math (`rt6_fill_rgba16float`'s load
-/// multiplied by ones), on a device of its own. The `float4` output announces
-/// `extended-range-float-blend-source`, and the `half4` one `extended-range-blend-source`, each
-/// never the other's.
+/// A pipeline blending (premultiplied over) an output into a two-plane extended-range color
+/// announces its blend's note once, whatever the output computes: the function blends in the
+/// shader in the device's arithmetic, where Metal's compiler rounds each step to `half`. The
+/// `float4` output (`rt6_samples`' `rt6_fill_rgba32float`) announces
+/// `extended-range-float-blend-source`, and the `half4` one (`rt6_fill_rgba16float`)
+/// `extended-range-blend-source`, each never the other's; the same color unblended announces
+/// neither. A device with raster-order attachment access (lavapipe) blends over the color's input
+/// attachment and announces alike.
 #[test]
-fn a_blend_of_a_computed_float4_into_extended_range_announces_its_source() {
-    use crate::air_library::AirLibrary;
-    use metal2vulkan_devtools::{engine_dir, llvm_assemble, llvm_assemble_text};
+fn a_blend_into_extended_range_announces_its_source_note() {
     let (messages, _cache, lane) = lane();
     let pf = PixelFormat::RGB10A82PXR10;
     let source = Degradation::ExtendedRangeBlendSource;
     let float_source = Degradation::ExtendedRangeFloatBlendSource;
     let fills = library(&lane.device).unwrap();
-    let bitcode = llvm_assemble(&engine_dir().join("rt6_resolves.ll")).unwrap();
-    let resolves = lane.device.new_library_with_air(&bitcode).unwrap();
-    let function = |library: &metal2vulkan_runtime::Library, name: &str| {
+    let function = |name: &str| {
         StageSource::Function(
-            library
+            fills
                 .new_function_with_name(name)
                 .unwrap()
                 .function_descriptor(),
         )
     };
-    let made = |library: &metal2vulkan_runtime::Library, vertex: &str, name: &str| {
-        let vertex_library = match vertex {
-            "rt6_fill_vertex" => &fills,
-            _ => &resolves,
-        };
-        let mut pipeline = RenderPipelineDescriptor::new(function(vertex_library, vertex));
-        pipeline.fragment = Some(function(library, name));
+    let made = |name: &str, blended: bool| {
+        let mut pipeline = RenderPipelineDescriptor::new(function("rt6_fill_vertex"));
+        pipeline.fragment = Some(function(name));
         let mut color = ColorAttachmentDescriptor::new(pf);
-        color.blending_enabled = true;
+        color.blending_enabled = blended;
         color.destination_rgb_blend_factor = BlendFactor::OneMinusSourceAlpha;
         color.destination_alpha_blend_factor = BlendFactor::OneMinusSourceAlpha;
         pipeline.color_attachments[0] = Some(color);
         lane.device
             .new_render_pipeline_state(&pipeline, &PipelineOptions::default())
-            .map(|_| ())
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        counts(&messages.take_notices())
     };
     for name in ["rt6_fill_rgba32float", "rt6_fill_rgba16float"] {
-        made(&fills, "rt6_fill_vertex", name).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let notices = counts(&messages.take_notices());
+        let notices = made(name, false);
         assert!(!notices.contains_key(&source), "{name}: {notices:?}");
         assert!(!notices.contains_key(&float_source), "{name}: {notices:?}");
     }
-    made(&resolves, "rt6_resolve_full", "rt6_resolve_white")
-        .unwrap_or_else(|e| panic!("rt6_resolve_white: {e}"));
-    let notices = messages.take_notices();
-    assert_eq!(counts(&notices).get(&float_source), Some(&1), "{notices:?}");
-    assert_eq!(counts(&notices).get(&source), None, "{notices:?}");
-    // A `half4` computed under fast math (the fill's load multiplied by ones) announces it too,
-    // on a device of its own (each kind is announced once per device).
-    let (messages, _cache, lane) = super::resolves::lane();
-    let fills = library(&lane.device).unwrap();
-    let made = |library: &metal2vulkan_runtime::Library, name: &str| {
-        let mut pipeline = RenderPipelineDescriptor::new(function(&fills, "rt6_fill_vertex"));
-        pipeline.fragment = Some(function(library, name));
-        let mut color = ColorAttachmentDescriptor::new(pf);
-        color.blending_enabled = true;
-        color.destination_rgb_blend_factor = BlendFactor::OneMinusSourceAlpha;
-        color.destination_alpha_blend_factor = BlendFactor::OneMinusSourceAlpha;
-        pipeline.color_attachments[0] = Some(color);
-        lane.device
-            .new_render_pipeline_state(&pipeline, &PipelineOptions::default())
-            .map(|_| ())
-    };
-    let text = std::fs::read_to_string(engine_dir().join("rt6_samples.ll")).unwrap();
-    let load = "  ret <4 x half> %19\n";
-    assert_eq!(text.matches(load).count(), 1);
-    let text = text.replace(
-        load,
-        "  %computed = fmul fast <4 x half> %19, <half 0xH3C00, half 0xH3C00, half 0xH3C00, \
-         half 0xH3C00>\n  ret <4 x half> %computed\n",
-    );
-    let computed = lane
-        .device
-        .new_library_with_air(&llvm_assemble_text(&text).unwrap())
-        .unwrap();
-    made(&computed, "rt6_fill_rgba16float")
-        .unwrap_or_else(|e| panic!("a computed rt6_fill_rgba16float: {e}"));
-    let notices = messages.take_notices();
-    assert_eq!(counts(&notices).get(&source), Some(&1), "{notices:?}");
-    assert_eq!(counts(&notices).get(&float_source), None, "{notices:?}");
+    let notices = made("rt6_fill_rgba32float", true);
+    assert_eq!(notices.get(&float_source), Some(&1), "{notices:?}");
+    assert_eq!(notices.get(&source), None, "{notices:?}");
+    let notices = made("rt6_fill_rgba16float", true);
+    assert_eq!(notices.get(&source), Some(&1), "{notices:?}");
+    assert_eq!(notices.get(&float_source), None, "{notices:?}");
 }
 
-/// The kind a draw in a pass that loads an extended-range color the load pass does not take
-/// announces.
+/// The kind a draw in a pass that loads an extended-range, padded or bfloat color announces.
 pub(super) const EXTENDED_RANGE_BITS: [Degradation; 1] = [Degradation::ExtendedRangeBitsKept];
 
-/// The kind a pass whose load pass rewrites every tile of its render area, where none of its
-/// color attachments is cleared, announces.
-pub(super) const UNREACHED_TILES: [Degradation; 1] = [Degradation::UnreachedTilesRewritten];
-
 /// A draw into `BGR10_XR` holding the probe's random texels under a write mask of none of its
-/// channels: every texel ends with its codes and its bits 30 and 31 ones, as Metal's pass leaves
-/// each tile a draw reaches (on an Apple M4 and an Apple M3 Max; the full-screen
-/// triangle reaches every tile), through the load pass (`render/unused_bits_load.rs`).
-/// `extended-range-bits-kept` is not announced, and `unreached-tiles-rewritten` is, once (the pass
-/// clears no color). A draw under every channel announces neither bits kind.
+/// channels: every texel keeps its bytes, the device's store (`render/tile_store.rs`), where
+/// Metal's pass leaves each tile a draw reaches with its bits 30 and 31 ones (on an Apple M4 and
+/// an Apple M3 Max; the full-screen triangle reaches every tile); `extended-range-bits-kept` is
+/// announced once. A draw under every channel, whose texels the draw writes, announces it no
+/// more (once per device).
 #[test]
-fn a_draw_under_an_empty_mask_leaves_metals_unused_bits() {
+fn a_draw_under_an_empty_mask_keeps_the_unused_bits_and_says_so() {
     let (messages, _cache, lane) = lane();
     let halves = halves();
     let pf = PixelFormat::BGR10XR;
@@ -716,17 +680,21 @@ fn a_draw_under_an_empty_mask_leaves_metals_unused_bits() {
     let first = made(&lane, &[draw_descriptor(&lane, none)]);
     draw(&lane, &t, &halves, none).expect("no channel");
     let got = lane.read(&t, (0, 0), 4, BlitOption::None);
-    let want: Vec<u8> = plane
+    let canonical = plane
         .chunks(4)
-        .flat_map(|w| (u32::from_le_bytes([w[0], w[1], w[2], w[3]]) | 0xc000_0000).to_le_bytes())
-        .collect();
+        .filter(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) >> 30 != 3)
+        .count();
+    println!("EXTENDED-RANGE-BITS-KEPT {canonical} texels Metal's pass would rewrite");
     assert!(
-        got == want,
-        "the texels differ from Metal's: {}",
+        canonical > 0,
+        "the probe's texels hold no bits Metal rewrites"
+    );
+    assert!(
+        got == plane,
+        "the texels differ from their bytes: {}",
         first_texels(&got, 4)
     );
-    let counts = assert_made_once(&messages, &UNREACHED_TILES, &first);
-    assert!(!counts.contains_key(&EXTENDED_RANGE_BITS[0]), "{counts:?}");
+    assert_made_once(&messages, &EXTENDED_RANGE_BITS, &first);
     let t = filled(&lane, pf, (&plane, &alpha));
     let every = ColorAttachmentDescriptor::new(pf);
     let first = made(&lane, &[draw_descriptor(&lane, every)]);
@@ -736,11 +704,9 @@ fn a_draw_under_an_empty_mask_leaves_metals_unused_bits() {
     quiet(lane, &messages);
 }
 
-/// A pass that loads a 4x multisampled `BGR10_XR` attachment, which the load pass does not take
-/// (no copy reaches a multisampled image's samples, `render/unused_bits_load.rs`), and draws
-/// announces `extended-range-bits-kept` once, naming color 0, and not
-/// `unreached-tiles-rewritten`: the attachment keeps the bits its draws do not write, which
-/// Metal's pass rewrites in each tile a draw reaches.
+/// A pass that loads a 4x multisampled `BGR10_XR` attachment and draws announces
+/// `extended-range-bits-kept` once, naming color 0: the attachment keeps the bits its draws do not
+/// write, which Metal's pass rewrites in each tile a draw reaches.
 #[test]
 fn a_multisampled_extended_range_color_keeps_its_unused_bits_and_says_so() {
     let (messages, _cache, lane) = lane();
@@ -775,8 +741,7 @@ fn a_multisampled_extended_range_color_keeps_its_unused_bits_and_says_so() {
     descriptor.color_attachments[0] = Some(ColorAttachmentDescriptor::new(pf));
     descriptor.raster_sample_count = 4;
     messages.restore_notices(notices);
-    let counts = assert_made_once(&messages, &EXTENDED_RANGE_BITS, &made(&lane, &[descriptor]));
-    assert!(!counts.contains_key(&UNREACHED_TILES[0]), "{counts:?}");
+    assert_made_once(&messages, &EXTENDED_RANGE_BITS, &made(&lane, &[descriptor]));
     quiet(lane, &messages);
 }
 
@@ -784,16 +749,13 @@ fn a_multisampled_extended_range_color_keeps_its_unused_bits_and_says_so() {
 /// buffers of words of all ones), every one loaded, of a state that writes white to color 0
 /// under a write mask of none of its channels, on a device that asks for the kinds at every
 /// occurrence (`DeviceOptions::announce_each`), with a draw and an indirect command buffer's
-/// execution of a draw: the load pass (`render/unused_bits_load.rs`) takes every color, so
-/// `extended-range-bits-kept` is not announced, and the padded
-/// colors' words are Metal's, every one `0xffc0` (Metal rewrites a padded attachment's words in
-/// a loading pass that draws, the colors its function does not write too). The pass clears no
-/// color, so `unreached-tiles-rewritten` is announced, naming the three. A pass that clears and
-/// stores the padded colors announces none of the kinds: Metal's pass then rewrites every tile. One
-/// that draws nothing announces nothing.
+/// execution of a draw: `extended-range-bits-kept` is announced, naming the three loaded colors,
+/// and the padded colors, which the function does not write, keep their bytes, the device's store
+/// (Metal's pass leaves each word `0xffc0`, its low six bits zeroed). A pass that clears and
+/// stores the padded colors names color 0 alone; one that draws nothing announces nothing.
 #[test]
-fn a_pass_of_extended_range_and_padded_colors_names_unreached_tiles_unless_one_is_cleared() {
-    let kinds = [EXTENDED_RANGE_BITS[0], UNREACHED_TILES[0]];
+fn a_pass_of_extended_range_and_padded_colors_names_each_loaded_color() {
+    let kinds = [EXTENDED_RANGE_BITS[0]];
     let (messages, _cache, lane) =
         lane_with(|options| options.announce_each = kinds.into_iter().collect());
     let (w, h) = (WIDTH as u64, HEIGHT as u64);
@@ -879,36 +841,41 @@ fn a_pass_of_extended_range_and_padded_colors_names_unreached_tiles_unless_one_i
         .unwrap();
         messages.take_notices()
     };
-    let notices = drawn(LoadAction::Load, true);
-    let announced = counts(&notices);
-    assert!(
-        !announced.contains_key(&EXTENDED_RANGE_BITS[0]),
-        "{announced:?}"
-    );
-    assert!(announced.contains_key(&UNREACHED_TILES[0]), "{announced:?}");
-    for message in &notices {
-        let notice = message.degradation.as_ref().unwrap();
-        if notice.degradation == UNREACHED_TILES[0] {
-            for color in ["color 0", "color 1", "color 2"] {
-                assert!(notice.object.contains(color), "{}", message.text);
+    // The colors each announcement names, of the passes' notices.
+    let named = |notices: &[DebugMessage]| -> Vec<bool> {
+        let colors = ["color 0", "color 1", "color 2"];
+        let mut named = vec![false; colors.len()];
+        for message in notices {
+            let notice = message.degradation.as_ref().unwrap();
+            if notice.degradation != EXTENDED_RANGE_BITS[0] {
+                continue;
+            }
+            for (seen, color) in named.iter_mut().zip(colors) {
+                *seen |= notice.object.contains(color);
             }
         }
-    }
+        named
+    };
+    let notices = drawn(LoadAction::Load, true);
+    assert!(
+        counts(&notices).contains_key(&EXTENDED_RANGE_BITS[0]),
+        "{:?}",
+        counts(&notices)
+    );
+    assert_eq!(named(&notices), [true, true, true]);
     for (pf, buffer) in padded.iter().zip(&buffers) {
-        let row = 2 * u64::from(ExtendedRange::of(*pf).unwrap().raw_components()) * w;
         let bytes = read_buffer(buffer, 0, bpr * h).unwrap();
         for (y, line) in bytes.chunks(bpr as usize).enumerate() {
-            let (words, rest) = line.split_at(row as usize);
             assert!(
-                words.chunks(2).all(|word| word == [0xc0, 0xff]),
+                line.iter().all(|&b| b == 0xff),
                 "{pf:?} row {y}: {:02x?}",
-                &words[..8]
+                &line[..8]
             );
-            assert!(rest.iter().all(|&b| b == 0xff), "{pf:?} row {y}'s padding");
         }
     }
-    let announced = counts(&drawn(LoadAction::Clear, true));
-    assert!(announced.is_empty(), "{announced:?}");
+    let notices = drawn(LoadAction::Clear, true);
+    assert!(!notices.is_empty(), "a pass of a loaded BGR10_XR color");
+    assert_eq!(named(&notices), [true, false, false]);
     let announced = counts(&drawn(LoadAction::Load, false));
     assert!(announced.is_empty(), "{announced:?}");
     quiet(lane, &messages);
@@ -982,8 +949,9 @@ fn tile_read(held: [f32; 4]) -> [f32; 4] {
 /// to the source range and alpha to `[0, 1]` (`tile_read`; where the earlier model,
 /// each draw reading the codes the one before stored, differed from Metal at 3, 558 of 4, 096
 /// texels of the probe's own such pass), and the store writes the last `half`'s encode as a
-/// kernel's write (`ExtendedRange::clear_texel`); colors 1 and 2 keep their texels, color 2's color
-/// words' top two bits zeroed as Metal's pass leaves them. The pipeline is made on every device:
+/// kernel's write (`ExtendedRange::clear_texel`); colors 1 and 2 keep their bytes, the device's
+/// store, where Metal's pass zeroes color 2's color words' top two bits (`extended-range-bits-kept`
+/// says so, `render/tile_store.rs`). The pipeline is made on every device:
 /// one that fetches through the interlock writes the storage form and holds color 0's `half` shadow
 /// from the second draw on (`render/extended_shadow.rs`), one with raster-order attachment access
 /// reads an input attachment of the raw texels and writes the raw output, each draw reading the
@@ -1131,13 +1099,9 @@ fn a_fetched_two_plane_attachment_written_unblended_stores_metals_write() {
     let count = (0..COUNT)
         .filter(|&i| got_words[i] != want_words[i] || got_alpha[i] != want_alpha[i])
         .count();
-    // Color 2, loaded and unwritten, keeps its codes and alpha bytes, its color words' top two
-    // bits zeroed as Metal's pass leaves each tile a draw reaches.
-    let canonical: Vec<u8> = other_plane
-        .chunks(4)
-        .flat_map(|w| (u32::from_le_bytes([w[0], w[1], w[2], w[3]]) & 0x3fff_ffff).to_le_bytes())
-        .collect();
-    let kept = lane.read(&other, (0, 0), 4, BlitOption::None) == canonical
+    // Color 2, loaded and unwritten, keeps its bytes, the device's store, where Metal's pass
+    // zeroes its color words' top two bits in each tile a draw reaches.
+    let kept = lane.read(&other, (0, 0), 4, BlitOption::None) == other_plane
         && alpha_of(&other) == other_alpha
         && lane.read(&covered, (0, 0), 4, BlitOption::None) == covered_texels;
     println!(

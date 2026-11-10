@@ -44,8 +44,8 @@
 //! layouts of equal shapes (`WorkCounts::set_zero_equal_shape_switches` and kin), the passes whose
 //! first instance recorded inline and the others by the check that ruled it out
 //! (`WorkCounts::inline_passes`, `WorkCounts::passes_not_inline_actions` and kin)
-//! with the render pass begins and secondary executions the recorder's replays called
-//! (`WorkCounts::commands_replayed`), and the device's live
+//! with the render pass begins and secondary executions recorded
+//! (`WorkCounts::commands_recorded`), and the device's live
 //! `VkDeviceMemory` by kind after the timed frames (ANV on i915 lists each in every kernel
 //! submission). Then the CPU time of the
 //! process's other threads over the timed frames, their waits included, per command buffer (on
@@ -1594,11 +1594,10 @@ fn other_threads_cpu() -> Option<BTreeMap<String, Cpu>> {
 
 /// The groups of the process's other threads [`other_threads_cpu`] reports: the runtime's by the
 /// prefix of their names, and the rest.
-const THREAD_GROUPS: [(&str, &str); 4] = [
+const THREAD_GROUPS: [(&str, &str); 3] = [
     ("scheduler", "metal2vulkan-sc"),
     ("queue waits", "metal2vulkan-qu"),
     ("handlers", "metal2vulkan-ha"),
-    ("recorder", "metal2vulkan-re"),
 ];
 
 /// What the other threads spent between `before` and `after` ([`other_threads_cpu`]), by
@@ -1822,7 +1821,7 @@ fn measure(runs: &[Run]) {
             "FRAME-COST {name} {label}: a frame's passes: {:.1} recorded their first instance \
              inline; not inline for the encoder {:.1}, the layout {:.1}, a memoryless color {:.1}, \
              a color's actions {:.1} (a DontCare load {:.1}, a reach not shared {:.1}, \
-             a clear to a NaN {:.1}, a resolve {:.1}, a store {:.1}), a texture over a buffer \
+             a resolve {:.1}, a store {:.1}), a texture over a buffer \
              {:.1}, another attachment kind \
              {:.1}, a storage color {:.1}, a stand-in {:.1}, a draw {:.1}; {:.1} split instances \
              recorded inline, {:.1} instances ended unrun; the replays' {:.1} render pass begins \
@@ -1834,7 +1833,6 @@ fn measure(runs: &[Run]) {
             per_frame(|c| c.passes_not_inline_actions),
             per_frame(|c| c.passes_not_inline_actions_dont_care_load),
             per_frame(|c| c.passes_not_inline_actions_unequal_reach),
-            per_frame(|c| c.passes_not_inline_actions_nan_clear),
             per_frame(|c| c.passes_not_inline_actions_resolve),
             per_frame(|c| c.passes_not_inline_actions_store),
             per_frame(|c| c.passes_not_inline_buffer_textures),
@@ -1844,8 +1842,8 @@ fn measure(runs: &[Run]) {
             per_frame(|c| c.passes_not_inline_draws),
             per_frame(|c| c.inline_split_instances),
             per_frame(|c| c.unrun_instances_ended),
-            per_frame(|c| c.commands_replayed.cmd_begin_render_pass),
-            per_frame(|c| c.commands_replayed.cmd_execute_commands),
+            per_frame(|c| c.commands_recorded.cmd_begin_render_pass),
+            per_frame(|c| c.commands_recorded.cmd_execute_commands),
         );
         eprintln!(
             "FRAME-COST {name} {label}: a frame's command buffers: {:.1} begun ({:.2} a pass), \
@@ -1868,8 +1866,7 @@ fn measure(runs: &[Run]) {
         eprintln!(
             "FRAME-COST {name} {label}: a frame's command buffers begun by what for: {:.1} \
              encoders' own, {:.1} segments, {:.1} continuations, {:.1} draws' secondaries, {:.1} \
-             batches' work, {:.1} batches' barriers, {:.1} barriers kept, {:.1} internal; their \
-             logs replayed: {:.1} by the recorder's thread, {:.1} by threads that submit",
+             batches' work, {:.1} batches' barriers, {:.1} barriers kept, {:.1} internal",
             per_frame(|c| c.command_buffers_begun_encoders),
             per_frame(|c| c.command_buffers_begun_segments),
             per_frame(|c| c.command_buffers_begun_continuations),
@@ -1878,8 +1875,6 @@ fn measure(runs: &[Run]) {
             per_frame(|c| c.command_buffers_begun_batch_barriers),
             per_frame(|c| c.command_buffers_begun_kept_barriers),
             per_frame(|c| c.command_buffers_begun_internal),
-            per_frame(|c| c.command_buffers_replayed),
-            per_frame(|c| c.command_buffers_replayed_inline),
         );
         eprintln!(
             "FRAME-COST {name} {label}: a frame's groups of batches by what sent them: {:.1} \

@@ -30,11 +30,10 @@ const DRAWS: usize = 8;
 const SIDE: u64 = 16;
 
 /// The kinds a consumer announces at every occurrence so that its calls hear them, and those its
-/// process dies at by default: kinds of textures, heaps, buffers, devices, command states and a
-/// variant's bind, none of which a draw's shape meets.
-const UNRELATED: [Degradation; 11] = [
+/// process dies at by default: kinds of textures, heaps, buffers, command states and a variant's
+/// bind, none of which a draw's shape meets.
+const UNRELATED: [Degradation; 10] = [
     Degradation::HeapTwoPlaneTexture,
-    Degradation::MetalLevelBelowHost,
     Degradation::OptimizedDepthStencilTexture,
     Degradation::RasterizationRateMap,
     Degradation::HeapTextureUntiledLayout,
@@ -48,12 +47,8 @@ const UNRELATED: [Degradation; 11] = [
 
 /// The kinds a `Depth16Unorm` draw's state announces (`render_state::announce_unorm_depth`),
 /// which of them depending on the device's profile.
-const UNORM_DEPTH: [Degradation; 4] = [
-    Degradation::ShaderUnormDepth,
-    Degradation::UnormDepthRounding,
-    Degradation::UnormDepthSlope,
-    Degradation::UnormDepthBias,
-];
+const UNORM_DEPTH: [Degradation; 2] =
+    [Degradation::UnormDepthRounding, Degradation::UnormDepthBias];
 
 /// The notices a device announced.
 type Heard = Arc<Mutex<Vec<DegradeNotice>>>;

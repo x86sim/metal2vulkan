@@ -17,7 +17,7 @@ use crate::event_timeline::{EventTimeline, Signal, WaitFor};
 /// Submit a GPU signal of `value` on `queue`, kept when it is.
 fn submit(timeline: &mut EventTimeline<usize>, value: u64, queue: usize) {
     if let Signal::Kept { index, .. } = timeline.signal(value, queue) {
-        timeline.keep(index, value, queue);
+        timeline.keep(index, value, queue, false);
     }
 }
 
@@ -87,7 +87,7 @@ fn the_signals_of_either_kind_take_the_same_indices() {
                 after: None
             }
         );
-        timeline.keep(1, 4, 0);
+        timeline.keep(1, 4, 0, false);
         assert_eq!(timeline.signal(4, 1), Signal::Dropped);
         assert_eq!(
             timeline.signal(5, 1),
@@ -145,4 +145,35 @@ fn the_waits_counted_as_held_are_the_ones_that_chained_on_the_vk_queue() {
             );
         }
     }
+}
+
+/// A wait held on the host still lands at a submitted GPU signal's index, which the host may wait
+/// for itself (the scheduler's thread, `scheduler/mod.rs`): a shared event's `landing` answers
+/// each value as a plain event's `wait` does, held or not, so a checked head waiting for a shared
+/// event's value has the index the thread waits on the GPU for, as for a plain event's
+/// (`runtime_lane::event_round_trips` checks the thread does).
+#[test]
+fn a_held_wait_lands_where_a_plain_event_s_wait_chains() {
+    let mut shared: EventTimeline<usize> = EventTimeline::new(true);
+    let mut plain: EventTimeline<usize> = EventTimeline::new(false);
+    for timeline in [&mut shared, &mut plain] {
+        submit(timeline, 3, 0);
+        submit(timeline, 8, 1);
+    }
+    for value in 0..12 {
+        assert_eq!(shared.landing(value), plain.wait(value), "value {value}");
+        assert_eq!(plain.landing(value), plain.wait(value), "value {value}");
+    }
+    // Held, and yet landing at the indices the plain event's batches wait for.
+    assert_eq!(shared.wait(5), None);
+    assert_eq!(shared.landing(5), Some(WaitFor::Index(2)));
+    // Past every submitted signal, neither the host nor a batch has an index to wait for.
+    assert_eq!(shared.landing(9), None);
+    // A host set reaches it: nothing to wait for.
+    assert!(shared.set(5));
+    assert_eq!(shared.landing(5), Some(WaitFor::Reached));
+    assert_eq!(shared.landing(6), Some(WaitFor::Index(2)));
+    // Observed: the value the signal carries.
+    assert!(shared.observe(2));
+    assert_eq!(shared.landing(8), Some(WaitFor::Reached));
 }

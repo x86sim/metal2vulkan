@@ -287,13 +287,11 @@
         "command_buffers_begun": 10,
         "command_buffers_begun_batch_work": 5,
         "command_buffers_begun_encoders": 5,
-        "command_buffers_deferred": 5,
-        "command_buffers_replayed_inline": 5,
         "command_buffers_submitted": 10,
-        "commands_replayed.begin_command_buffer": 5,
-        "commands_replayed.cmd_copy_buffer": 8,
-        "commands_replayed.cmd_pipeline_barrier": 8,
-        "commands_replayed.end_command_buffer": 5,
+        "commands_recorded.begin_command_buffer": 10,
+        "commands_recorded.cmd_copy_buffer": 11,
+        "commands_recorded.cmd_pipeline_barrier": 19,
+        "commands_recorded.end_command_buffer": 10,
         "commits_handed_off": 5,
         "completed_waits": 8,
         "completed_where_seen": 5,
@@ -331,17 +329,19 @@
         "scheduler_wakes_commit": 5,
         "shadowed_textures": 8,
         "slot_returns": 5,
-        "spare_command_pools_taken": 10,
+        "spare_command_pools_taken": 5,
         "submit_infos": 5,
         "trail_waits": 5,
         "wakes_completion_waiters": 5,
         "wakes_spared": 35
       },
       "moving": {
-        "batches_submitted_by_waiters": 3
+        "batches_submitted_by_waiters": 3,
+        "gate_waits_slept": 4
       },
       "composed": {
-        "device_memory_allocated": 201326592
+        "device_memory_allocated": 201326592,
+        "queues_sharing_a_vk_queue": 0
       },
       "ceilings": {
         "addressable_buffers_made": 2,

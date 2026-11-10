@@ -45,7 +45,8 @@
 //!   both are refusals ([`import_refused`]). NVIDIA and lavapipe imported the same shared memory.
 //! - **Dma-bufs of the pages** ([`HostMemory::with_dma_buf`]), the last resort before that
 //!   refusal: where the device refuses the pointer ([`refused`]: the import window, the buffer's
-//!   binding in it, the memory types, or the driver) and imports dma-bufs, the buffer is bound in
+//!   binding in it, the memory types, the driver, or the runtime for a driver that breaks on
+//!   pages the kernel cannot pin, [`unpinnable`]) and imports dma-bufs, the buffer is bound in
 //!   imports of the source's dma-bufs of the pages instead (`dma_buf.rs`). Every import the device
 //!   takes by its pointer is made exactly as before, with no call more.
 //! - **When**. The pages are imported when the buffer is made, on every platform, as Metal wires
@@ -101,6 +102,7 @@
 //!   (held now) and `WorkCounts::host_keep_alives_covered` (dropped at the release).
 
 use super::device::lock;
+use super::dirty_pages::{hook, DirtyHook, DirtyPages, DirtySource};
 #[cfg(unix)]
 use super::dma_buf::DmaBufSource;
 use super::error::{vulkan, Error};
@@ -110,22 +112,89 @@ use super::program_objects::ProgramObject;
 use super::work_counts::Counters;
 use ash::vk;
 use metal2vulkan::device::{EnableSet, VkExtension};
-use metal2vulkan::error::{Feature, Unsupported};
+use metal2vulkan::error::{Feature, RuntimeDriverDefect, Unsupported};
 use std::ffi::c_void;
+use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
 /// Host memory a buffer or heap wraps without a copy: a pointer whose bytes the caller vouches for
-/// (the `pointer` of `newBufferWithBytesNoCopy:length:options:deallocator:`), and, as a runtime
-/// extension, a source of dma-bufs of its pages for a device that refuses the pointer itself
-/// ([`HostMemory::with_dma_buf`]).
+/// (the `pointer` of `newBufferWithBytesNoCopy:length:options:deallocator:`), and, as runtime
+/// extensions, a source of dma-bufs of its pages for a device that refuses the pointer itself
+/// ([`HostMemory::with_dma_buf`]) and a log of the writes to its pages
+/// ([`HostMemory::with_dirty_pages`]).
 pub struct HostMemory {
     pointer: NonNull<u8>,
     source: Option<Source>,
     /// The caller vouched that the process maps every page writable
     /// ([`HostMemory::assume_writable`]), so the runtime asks the kernel nothing of them.
     writable: bool,
+    /// The caller's log of the pages written ([`HostMemory::with_dirty_pages`]).
+    dirty: Option<Arc<dyn DirtyHook>>,
+    /// The caller's gate over the import of the pages ([`HostMemory::with_import_gate`]).
+    gate: Option<ImportGate>,
+    /// The caller's resolver of the pages' runs in its guest RAM ([`HostMemory::with_runs`]).
+    runs: Option<RunResolver>,
 }
+
+/// A consumer's resolver of a no-copy object's pages to the runs of guest RAM they are views of
+/// (a runtime extension, [`HostMemory::with_runs`]): asked with the first byte and the length of
+/// the whole host pages the runtime would import for the object (its import window, as an
+/// [`ImportRequest`] names it), it answers the host addresses of the same bytes in the RAM's
+/// ranges ([`HostRam`](crate::HostRam)), in the object's byte order, as runs of whole host pages
+/// that together cover exactly the length asked; or `None` where the pages are no view of the
+/// RAM (or not all of them, or some are read-only), which leaves the object on the runtime's
+/// other paths. Asked at most once per object, as a no-copy buffer or heap is made over the
+/// pages, and once at each rebind of either to new pages (but for bytes moved in their page under
+/// a texture, which take a copy without asking), on the calling thread, holding no lock of the
+/// runtime's, before the import gate ([`ImportGate`]);
+/// only on a device that uses a RAM
+/// ([`Device::use_host_ram`](crate::Device::use_host_ram)), and only where the object would import
+/// the pages itself (not one that lies in a live import of the same bytes, nor one whose GPU
+/// writes Metal's private option bit 24 drops). The answer is kept with the object until its
+/// rebind or release; a later remap of the view does not change it. An answer that breaks this
+/// contract is refused (`Invalid`, `Problem::HostRam`). No Metal counterpart: Metal wires the
+/// pages at the pointer.
+pub type RunResolver = Arc<dyn Fn(u64, u64) -> Option<Vec<Range<u64>>> + Send + Sync + 'static>;
+
+/// A consumer's gate over the import of a no-copy object's pages (a runtime extension,
+/// [`HostMemory::with_import_gate`]): asked once, just before the runtime imports the pages for a
+/// no-copy buffer or heap made over them, or for a buffer's rebind to them
+/// (`Buffer::rebind_bytes_no_copy`), with the pages the import would map. `true` lets the import
+/// go on; `false` refuses it, and the buffer is a copied host buffer instead (the heap's own
+/// buffer too, the rebind's new pages a copy of them), whose bytes the GPU uses in memory of the
+/// device's own, kept coherent with the pages at each commit and each completion, so the pages
+/// take no kernel mapping (`copied.rs`, docs/HOWTO.md, "Copied host buffers"). Asked before the
+/// runtime asks the kernel whether the process may write the pages (Linux): pages it refuses are a
+/// copy whatever their permission, and a copy of pages the process maps read-only drops the GPU's
+/// writes, as Metal drops them. Called on the
+/// thread that makes the buffer, heap or rebind, holding no lock of the runtime's. Not asked for a
+/// buffer or rebind that lies in a live import (one made over the same bytes), nor where the device
+/// refused the import before it (no host-pointer import, an import alignment the range cannot
+/// meet), nor for memory whose GPU writes Metal's private option bit 24 drops, nor for a buffer's
+/// rebind to bytes at another offset in their page under a texture planned at the old one, which
+/// is a copy without asking. A heap's rebind asks it as a heap's making does. An import it lets go
+/// on that then fails (out of memory, another Vulkan error), of the pointer or of the dma-bufs of
+/// the caller's source, makes the copy all the same. Every copy is announced
+/// (`copied-host-pages`). No Metal counterpart.
+pub type ImportGate = Arc<dyn Fn(ImportRequest) -> bool + Send + Sync + 'static>;
+
+/// The pages an [`ImportGate`] is asked about: those an import would map for the buffer, from the
+/// host page its first byte lies in through the one its last lies in.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportRequest {
+    /// The first byte of the first page.
+    pub start: NonNull<u8>,
+    /// The bytes of the pages.
+    pub length: u64,
+}
+
+// SAFETY: a request is an address and a length, plain data: nothing is reached through the
+// address.
+unsafe impl Send for ImportRequest {}
+// SAFETY: as above.
+unsafe impl Sync for ImportRequest {}
 
 /// What a [`HostMemory`] may carry besides its pointer: a [`DmaBufSource`] where the system has
 /// file descriptors, nothing elsewhere.
@@ -150,6 +219,9 @@ impl std::fmt::Debug for HostMemory {
             .field("pointer", &self.pointer)
             .field("dma_buf", &self.source.is_some())
             .field("writable", &self.writable)
+            .field("dirty_pages", &self.dirty.is_some())
+            .field("import_gate", &self.gate.is_some())
+            .field("runs", &self.runs.is_some())
             .finish()
     }
 }
@@ -179,15 +251,20 @@ impl HostMemory {
     /// failed every command buffer submitted after a page of an import was made read-only
     /// (`mprotect`). With a dma-buf source ([`HostMemory::with_dma_buf`]) pages the process maps
     /// read-only are instead imported from the source alone, announced
-    /// (`read-only-pages-written`). Some drivers also refuse shared memory (RADV refused anonymous
-    /// shared memory and mappings of shared memory objects, `memfd` mappings among them); private
-    /// memory imports everywhere measured. [`HostMemory::with_dma_buf`] imports such memory where
-    /// the device imports dma-bufs.
+    /// (`read-only-pages-written`). Under a gate that refuses their import
+    /// ([`HostMemory::with_import_gate`]), or where the source's import fails, they are a copy
+    /// whose GPU writes are dropped, as Metal drops them (`copied-host-pages`). Some drivers also
+    /// refuse shared memory (RADV refused anonymous shared memory and mappings of shared memory
+    /// objects, `memfd` mappings among them); private memory imports everywhere measured.
+    /// [`HostMemory::with_dma_buf`] imports such memory where the device imports dma-bufs.
     pub unsafe fn new(pointer: NonNull<u8>) -> HostMemory {
         HostMemory {
             pointer,
             source: None,
             writable: false,
+            dirty: None,
+            gate: None,
+            runs: None,
         }
     }
 
@@ -233,6 +310,9 @@ impl HostMemory {
             pointer,
             source: Some(source),
             writable: false,
+            dirty: None,
+            gate: None,
+            runs: None,
         }
     }
 
@@ -258,16 +338,126 @@ impl HostMemory {
         }
     }
 
+    /// This memory, with the caller's log of the writes to its pages (a runtime extension,
+    /// [`DirtyPages`], whose offsets are bytes from [`pointer`](Self::pointer)). Every import made
+    /// from this memory keeps the log, on every device, discrete and integrated alike: the
+    /// buffer's or the heap's, and the pages a rebind gives either. A tracked 2D texture's shadow
+    /// over the pages (`shadowed-texture`), whose texels a command buffer's first use copies
+    /// straight from them into its image, then copies in only the full-width bands of rows of
+    /// the pages the log reports changed since the command buffer whose end last left the image
+    /// holding every texel, where no command of the device wrote the bytes or the image since,
+    /// and nothing where no page changed (bands 8 rows apart or less are one; half the rows or
+    /// more, or more than 1024 bands, are every row). The decision is made as the command
+    /// buffer's commands are recorded for the GPU, after its commit and before its submission: a
+    /// stamp asked at the commit ([`DirtyPages::request`], once per log and commit, only where the
+    /// command buffer has such a copy in) and waited for then ([`DirtyPages::wait`], for the
+    /// latest stamp asked of the log so far, so one wait serves every command buffer committed
+    /// before it; none where the copy has no earlier copy to count on). A command buffer that
+    /// waits for an event or a semaphore, or wrote the bytes before the copy, copies every row.
+    /// The runtime reports its own writes into the pages back to the log: a shadow's copy back
+    /// or merge ([`DirtyPages::wrote_as`], the shadow its writer, at the commit and again at the
+    /// completion), which that shadow's own copies in leave out
+    /// ([`DirtyPages::changed_except`]), a copied host buffer's merge back of the GPU's writes
+    /// (`copied.rs`; [`DirtyPages::wrote_as`], the copy its writer, before the batch is seen
+    /// complete), the GPU's writes into them where they are imported in place
+    /// ([`DirtyPages::wrote`]: the bytes a command buffer's commands wrote through the buffers,
+    /// heaps and textures over them, at the commit, again before the batch is seen complete, and
+    /// at the completion), and its CPU writes into them ([`DirtyPages::wrote`]): a
+    /// `replaceRegion` of a texture over them or of a heap's texture held in them, an argument
+    /// encoder's writes, and `copyParameterDataToBuffer`. A wait the log answers `false` makes
+    /// the copy take every row, and is not made again for a stamp at or below it. Such a shadow's
+    /// copy in is never cut to the rectangle a pass's scissors bound, so its image holds every
+    /// texel for the next command buffer. A copied host buffer or heap over the pages
+    /// (`copied-host-pages`) compares at each commit only the pages the log reports written since
+    /// its last commit: a stamp asked of the log once per commit for every copy and waited for on
+    /// the committing thread, every byte compared at its first commit and where the wait answers
+    /// `false` (`WorkCounts::copied_copy_in_bytes_skipped`). Every other copy of the pages (a
+    /// shadow copied through a staging buffer, of another kind, or untracked) takes every byte,
+    /// as without a log. Counted:
+    /// `WorkCounts::dirty_copies_in_gated` and kin.
+    ///
+    /// `source` is any [`DirtyPages`]: a concrete type, or a trait object that names its watch
+    /// type (`Arc<dyn DirtyPages<Watch = W>>`). No Metal counterpart: Metal's GPU reads a no-copy
+    /// object's pages in place.
+    ///
+    /// Exact where the log is true: every byte a skipped copy would have moved is one the copy
+    /// holds already.
+    pub fn with_dirty_pages<D>(self, source: Arc<D>) -> HostMemory
+    where
+        D: DirtyPages + ?Sized + 'static,
+        D::Watch: 'static,
+    {
+        HostMemory {
+            dirty: Some(hook(source)),
+            ..self
+        }
+    }
+
+    /// This memory, with the caller's gate over the import of its pages (a runtime extension,
+    /// [`ImportGate`]): asked once, just before a no-copy buffer or heap made over it, or a
+    /// buffer's or heap's rebind to it, imports the pages; where it answers `false`, the buffer is a
+    /// copied host buffer (the heap's own buffer too, the rebind's new pages a copy), which no
+    /// import maps,
+    /// announced (`copied-host-pages`) and counted (`WorkCounts::host_imports_refused_by_host`,
+    /// `WorkCounts::copied_host_buffers_refused`). No Metal counterpart.
+    pub fn with_import_gate(self, gate: ImportGate) -> HostMemory {
+        HostMemory {
+            gate: Some(gate),
+            ..self
+        }
+    }
+
+    /// This memory, with the caller's resolver of its pages to the runs of guest RAM they are
+    /// views of (a runtime extension, [`RunResolver`]). On a device that uses that RAM
+    /// ([`Device::use_host_ram`](crate::Device::use_host_ram)), a no-copy buffer or heap (or a
+    /// rebind of either, `rebind_bytes_no_copy`, but for a buffer's whose bytes moved in their
+    /// page under a texture, which is a copy) whose pages the resolver answers as one run inside
+    /// one of the device's chunks of the RAM is a
+    /// `VkBuffer` bound in that chunk's import, at the run, sized and bound against the object's
+    /// own pages as an import of them would be, so no access through the buffer reaches the rest
+    /// of the chunk: no import of its own, no kernel mapping of the pages, and the import gate
+    /// ([`HostMemory::with_import_gate`]) is not asked. Pages of more than one run, or of a run
+    /// crossing a chunk's end, take the runtime's other paths (the gate, then an import or a
+    /// copy), the runs kept with the object. Counted: `WorkCounts::chunk_bound_buffers_made`. No
+    /// Metal counterpart.
+    pub fn with_runs(self, resolver: RunResolver) -> HostMemory {
+        HostMemory {
+            runs: Some(resolver),
+            ..self
+        }
+    }
+
     /// The pointer.
     pub fn pointer(&self) -> NonNull<u8> {
         self.pointer
     }
 
-    /// The pointer, the dma-buf source where the caller gave one, and whether the caller vouched
-    /// for the pages' write permission ([`HostMemory::assume_writable`]).
-    pub(super) fn into_parts(self) -> (NonNull<u8>, Option<Source>, bool) {
-        (self.pointer, self.source, self.writable)
+    /// The pointer, the dma-buf source where the caller gave one, whether the caller vouched
+    /// for the pages' write permission ([`HostMemory::assume_writable`]), and its log of the pages
+    /// written ([`HostMemory::with_dirty_pages`]), kept with the pointer its offsets count from,
+    /// its gate over their import ([`HostMemory::with_import_gate`]), and its resolver of their
+    /// runs in guest RAM ([`HostMemory::with_runs`]).
+    pub(super) fn into_parts(self) -> HostParts {
+        let dirty = (self.dirty).map(|hook| DirtySource::new(hook, self.pointer.as_ptr() as u64));
+        HostParts {
+            pointer: self.pointer,
+            source: self.source,
+            writable: self.writable,
+            dirty,
+            gate: self.gate,
+            runs: self.runs,
+        }
     }
+}
+
+/// A [`HostMemory`]'s parts ([`HostMemory::into_parts`]).
+pub(super) struct HostParts {
+    pub(super) pointer: NonNull<u8>,
+    pub(super) source: Option<Source>,
+    pub(super) writable: bool,
+    pub(super) dirty: Option<Arc<DirtySource>>,
+    pub(super) gate: Option<ImportGate>,
+    pub(super) runs: Option<RunResolver>,
 }
 
 /// A no-copy buffer's deallocator (Metal's block): called once, with the pointer and the length,
@@ -432,9 +622,22 @@ pub(super) fn not_importable() -> Error {
 
 /// Whether `error` is the refusal of host memory this device cannot import exactly
 /// ([`not_importable`]): the window, the buffer's binding in it, the memory types or the driver
-/// refused the pointer, which a dma-buf of its pages may serve ([`DmaBufSource`]).
+/// refused the pointer, or the runtime refused it for the driver ([`unpinnable`]); a dma-buf of
+/// its pages may serve it ([`DmaBufSource`]).
 pub(super) fn refused(error: &Error) -> bool {
-    *error == not_importable()
+    *error == not_importable() || *error == unpinnable()
+}
+
+/// The runtime's refusal of host pages the kernel cannot pin, made before a driver that breaks as
+/// it fails their import sees their pointer (`RuntimeDriverDefect::UnpinnablePagesBreakHostMemory`,
+/// `Device::refuse_unpinnable`): a dma-buf of the pages may serve them, as where the driver
+/// refuses the pointer ([`refused`]), and else a no-copy object is a copy of them (`copied.rs`),
+/// as where their import fails.
+pub(super) fn unpinnable() -> Error {
+    Error::Unsupported(Unsupported::runtime_driver_defect(
+        Feature::HostMemory,
+        RuntimeDriverDefect::UnpinnablePagesBreakHostMemory,
+    ))
 }
 
 /// The error of a failed import call (`vkGetMemoryHostPointerPropertiesEXT` or the allocation): a
@@ -451,18 +654,23 @@ pub(super) fn import_refused(error: vk::Result) -> Error {
 /// Refuse the window's pages, typed, unless the process maps every one of them writable: Linux
 /// drivers pin imported pages for writing. Asked by each call that imports the pages itself, not
 /// by a buffer that lies in a live import of them. The kernel answers for the mappings over the
-/// window ([`queried_writable`]) at each call, so a page remapped or reprotected since an earlier
+/// window ([`queried_permitted`]) at each call, so a page remapped or reprotected since an earlier
 /// import is judged as it is now: one query per mapping, so its cost grows with the mappings over
 /// the window (a view of scattered pages maps each run apart). The queries go through the file
 /// the process keeps open ([`kept_maps`]). A kernel without the query (before Linux 6.11) has the
-/// lines of `/proc/self/maps` read up to the window instead ([`writable`]), from a file opened for
+/// lines of `/proc/self/maps` read up to the window instead ([`permitted`]), from a file opened for
 /// the reading, which cost about 4.5 ms per import in a process of 34,000 mappings. Each mapping
 /// asked is counted in `counts` (`WorkCounts::host_mappings_queried`). When the file cannot be
 /// opened, every import is refused as not implemented here.
 #[cfg(target_os = "linux")]
 pub(super) fn refuse_unwritable(window: &ImportWindow, counts: &Counters) -> Result<(), Error> {
     let mut asked = 0;
-    let answer = mappings_writable(window.start, window.start + window.size, &mut asked);
+    let answer = mappings_permitted(
+        window.start,
+        window.start + window.size,
+        Access::Write,
+        &mut asked,
+    );
     counts.host_mappings_queried(asked);
     match answer {
         Some(true) => Ok(()),
@@ -473,25 +681,190 @@ pub(super) fn refuse_unwritable(window: &ImportWindow, counts: &Counters) -> Res
     }
 }
 
-/// Whether the process maps `[start, end)` without a gap, each page with write permission, as the
-/// kernel answers now: for the mappings over it ([`queried_writable`]), or from the lines of
-/// `/proc/self/maps` where the kernel predates the query ([`writable`]); `None` when that file
+impl super::Device {
+    /// Refuse `size` bytes of host pages at `pages` before the driver is handed their pointer
+    /// ([`unpinnable`]), where the device's driver breaks its later allocations as it fails an
+    /// import of pages the kernel cannot pin (`RuntimeDriverDefect::UnpinnablePagesBreakHostMemory`)
+    /// and the kernel does not pin every mapping over them (`Access::Pin`: one `PROCMAP_QUERY`
+    /// and one read a mapping, or the lines of `/proc/self/maps` before Linux 6.11); counted
+    /// (`WorkCounts::host_imports_unpinnable`). Pages whose mappings cannot be asked are refused
+    /// too. On every other driver, and off Linux, nothing is asked.
+    pub(super) fn refuse_unpinnable(&self, pages: NonNull<u8>, size: u64) -> Result<(), Error> {
+        let defect = RuntimeDriverDefect::UnpinnablePagesBreakHostMemory;
+        if !self.properties().driver_defects.contains(&defect) || kernel_pins(pages, size) {
+            return Ok(());
+        }
+        self.shared().counts.host_import_unpinnable();
+        Err(unpinnable())
+    }
+}
+
+/// Whether the kernel pins every mapping over `size` bytes of host pages at `pages`
+/// ([`Access::Pin`]); `false` where the mappings cannot be asked.
+#[cfg(target_os = "linux")]
+fn kernel_pins(pages: NonNull<u8>, size: u64) -> bool {
+    let start = pages.as_ptr() as u64;
+    mappings_permitted(start, start.saturating_add(size), Access::Pin, &mut 0) == Some(true)
+}
+
+/// [`kernel_pins`] off Linux, where no driver is kept from host pages: `true`.
+#[cfg(not(target_os = "linux"))]
+fn kernel_pins(_pages: NonNull<u8>, _size: u64) -> bool {
+    true
+}
+
+/// Whether the process maps every page of `[start, end)` with read permission, as the kernel
+/// answers now ([`mappings_permitted`]): where it does, the CPU reads the bytes with plain loads,
+/// as a copied host buffer's comparisons read them at each commit (`copied.rs`). `false` where
+/// the mappings cannot be read (`/proc/self/maps` does not open).
+#[cfg(target_os = "linux")]
+pub(super) fn mapped_readable(start: u64, end: u64) -> bool {
+    mappings_permitted(start, end, Access::Read, &mut 0) == Some(true)
+}
+
+/// [`mapped_readable`] where the runtime does not ask the system for its mappings: `false`.
+#[cfg(not(target_os = "linux"))]
+pub(super) fn mapped_readable(_start: u64, _end: u64) -> bool {
+    false
+}
+
+/// Whether the process maps every page of `[start, end)` with write permission, as the kernel
+/// answers now ([`mappings_permitted`]): where it does not, a copied host buffer of the pages drops
+/// the GPU's writes rather than write them back (`copied.rs`). `false` where the mappings cannot be
+/// read (`/proc/self/maps` does not open), so that no write back faults.
+#[cfg(target_os = "linux")]
+pub(super) fn mapped_writable(start: u64, end: u64) -> bool {
+    mappings_permitted(start, end, Access::Write, &mut 0) == Some(true)
+}
+
+/// [`mapped_writable`] on macOS: the regions of this task over `[start, end)`, without a gap,
+/// each with write protection now (`mach_vm_region`, `VM_REGION_BASIC_INFO_64`); `false` where the
+/// kernel answers no region.
+#[cfg(target_os = "macos")]
+pub(super) fn mapped_writable(start: u64, end: u64) -> bool {
+    unsafe extern "C" {
+        /// `<mach/mach_init.h>`: the port of this process's task.
+        static mach_task_self_: libc::mach_port_t;
+        fn mach_vm_region(
+            target_task: libc::vm_map_t,
+            address: *mut libc::mach_vm_address_t,
+            size: *mut libc::mach_vm_size_t,
+            flavor: libc::c_int,
+            info: *mut libc::c_int,
+            count: *mut libc::mach_msg_type_number_t,
+            object_name: *mut libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+    // `<mach/vm_region.h>`: `VM_REGION_BASIC_INFO_64`, whose `struct vm_region_basic_info_64`
+    // (packed to 4 bytes) is 9 words, the current protection its first.
+    const VM_REGION_BASIC_INFO_64: libc::c_int = 9;
+    const WORDS: usize = 9;
+    let mut covered = start;
+    while covered < end {
+        let (mut address, mut size) = (covered, 0);
+        let mut info = [0 as libc::c_int; WORDS];
+        let mut count = WORDS as libc::mach_msg_type_number_t;
+        let mut object = 0;
+        // SAFETY: the call writes the region's address and size, at most `count` words of `info`,
+        // and a port name (none for this flavour) into the values given.
+        let answer = unsafe {
+            mach_vm_region(
+                mach_task_self_,
+                &mut address,
+                &mut size,
+                VM_REGION_BASIC_INFO_64,
+                info.as_mut_ptr(),
+                &mut count,
+                &mut object,
+            )
+        };
+        // The region answered is the first at or past the address: past it is a gap.
+        if answer != libc::KERN_SUCCESS || address > covered || size == 0 {
+            return false;
+        }
+        if info[0] & libc::VM_PROT_WRITE == 0 {
+            return false;
+        }
+        covered = address.saturating_add(size);
+    }
+    true
+}
+
+/// [`mapped_writable`] where the runtime does not ask the system for its mappings: `false` (and no
+/// copy is made here: the runtime reads no caller's page, [`mapped_readable`]).
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(super) fn mapped_writable(_start: u64, _end: u64) -> bool {
+    false
+}
+
+/// A permission the process's mappings are asked for.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Access {
+    /// `VM_READ`, the `r` of a mapping's line in the maps: a copy reads the pages (`copied.rs`).
+    Read,
+    /// `VM_WRITE`, the `w`: Linux drivers pin imported pages for writing ([`refuse_unwritable`]).
+    Write,
+    /// `VM_READ`, and the kernel pins the mapping's pages: it reads a byte of the mapping's first
+    /// page in the window through `process_vm_readv`, which pins each page it reads
+    /// (`copied::read_pages`). The kernel pins no page of a `VM_IO` or `VM_PFNMAP` mapping, such
+    /// as a mapping of a dma-buf, and answers that for the whole mapping (`check_vma_flags` in
+    /// `mm/gup.c`), so one read a mapping answers for all of its pages
+    /// (`Device::refuse_unpinnable`).
+    Pin,
+}
+
+#[cfg(target_os = "linux")]
+impl Access {
+    /// The mapping's flag of the permission in `PROCMAP_QUERY`'s answer (`vma_flags`).
+    fn queried(self) -> u64 {
+        match self {
+            Access::Read | Access::Pin => PROCMAP_QUERY_VMA_READABLE,
+            Access::Write => PROCMAP_QUERY_VMA_WRITABLE,
+        }
+    }
+
+    /// Whether the mapping holding `address` meets the access beyond its permission: for
+    /// [`Access::Pin`], whether the kernel reads the byte at `address` through a pin of its page;
+    /// for the others, always.
+    fn pinned(self, address: u64) -> bool {
+        if self != Access::Pin {
+            return true;
+        }
+        let Some(page) = NonNull::new(address as *mut u8) else {
+            return false;
+        };
+        super::copied::read_pages(page, &mut [0])
+    }
+
+    /// The permission's place and letter in a maps line's permissions (`rw-p`).
+    fn letter(self) -> (usize, u8) {
+        match self {
+            Access::Read | Access::Pin => (0, b'r'),
+            Access::Write => (1, b'w'),
+        }
+    }
+}
+
+/// Whether the process maps `[start, end)` without a gap, each page with `access`, as the kernel
+/// answers now: for the mappings over it ([`queried_permitted`]), or from the lines of
+/// `/proc/self/maps` where the kernel predates the query ([`permitted`]); `None` when that file
 /// cannot be opened. Each mapping asked is added to `asked`.
 #[cfg(target_os = "linux")]
-fn mappings_writable(start: u64, end: u64, asked: &mut u64) -> Option<bool> {
+fn mappings_permitted(start: u64, end: u64, access: Access, asked: &mut u64) -> Option<bool> {
     use std::io::BufRead;
     let maps = kept_maps()?;
-    if let Some(writable) = queried_writable(&maps, start, end, asked) {
-        return Some(writable);
+    if let Some(permitted) = queried_permitted(&maps, start, end, access, asked) {
+        return Some(permitted);
     }
     // The lines are read from a file of their own: reading moves its position, which the kept
     // one's queries share among threads.
     let maps = std::fs::File::open("/proc/self/maps").ok()?;
     let lines = std::io::BufReader::new(maps).lines().map_while(Result::ok);
-    Some(writable(lines, start, end, asked))
+    Some(permitted(lines, start, end, access, asked))
 }
 
-/// This process's `/proc/self/maps`, opened once for [`queried_writable`] and kept with the id of
+/// This process's `/proc/self/maps`, opened once for [`queried_permitted`] and kept with the id of
 /// the process that opened it, or opened again (`None` where it cannot be): each `PROCMAP_QUERY`
 /// answers from the process's mappings as they are at the call, so a file kept open reads the same
 /// answers as one opened for the call, without the opening, which cost each import about as much
@@ -542,20 +915,26 @@ const _: () = assert!(std::mem::size_of::<ProcmapQuery>() == 104);
 const PROCMAP_QUERY: u64 =
     (3 << 30) | ((std::mem::size_of::<ProcmapQuery>() as u64) << 16) | ((b'f' as u64) << 8) | 17;
 
+/// `PROCMAP_QUERY_VMA_READABLE`: the mapping's `VM_READ`, the `r` of its line in the maps.
+#[cfg(target_os = "linux")]
+const PROCMAP_QUERY_VMA_READABLE: u64 = 0x01;
+
 /// `PROCMAP_QUERY_VMA_WRITABLE`: the mapping's `VM_WRITE`, the `w` of its line in the maps.
 #[cfg(target_os = "linux")]
 const PROCMAP_QUERY_VMA_WRITABLE: u64 = 0x02;
 
-/// Whether the process maps `[start, end)` without a gap, each mapping with write permission, as
-/// the kernel answers `PROCMAP_QUERY` on `maps` (this process's `/proc/self/maps`): one query per
+/// Whether the process maps `[start, end)` without a gap, each mapping with `access`, as the
+/// kernel answers `PROCMAP_QUERY` on `maps` (this process's `/proc/self/maps`): one query per
 /// mapping the window touches, each for the mapping covering the first address not yet covered,
 /// and each added to `asked`. `None` where the kernel does not answer the query (before Linux
-/// 6.11, `ENOTTY`) or fails it otherwise; a missing mapping (`ENOENT`) is an answer, not writable.
+/// 6.11, `ENOTTY`) or fails it otherwise; a missing mapping (`ENOENT`) is an answer, not
+/// permitted.
 #[cfg(target_os = "linux")]
-pub(super) fn queried_writable(
+pub(super) fn queried_permitted(
     maps: &std::fs::File,
     start: u64,
     end: u64,
+    access: Access,
     asked: &mut u64,
 ) -> Option<bool> {
     use std::os::fd::AsRawFd;
@@ -584,7 +963,7 @@ pub(super) fn queried_writable(
         if query.vma_start > covered || query.vma_end <= covered {
             return None;
         }
-        if query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE == 0 {
+        if query.vma_flags & access.queried() == 0 || !access.pinned(covered) {
             return Some(false);
         }
         covered = query.vma_end;
@@ -600,14 +979,15 @@ pub(super) fn refuse_unwritable(_window: &ImportWindow, _counts: &Counters) -> R
 }
 
 /// Whether the mappings of `maps` (lines of `/proc/<pid>/maps`, in address order) cover
-/// `[start, end)` without a gap, each with write permission, adding to `asked` each mapping it
-/// judged (one ending past the address it reached). Reading stops at the first line past `end`; a
-/// line that does not parse is skipped.
+/// `[start, end)` without a gap, each with `access`, adding to `asked` each mapping it judged (one
+/// ending past the address it reached). Reading stops at the first line past `end`; a line that
+/// does not parse is skipped.
 #[cfg(target_os = "linux")]
-pub(super) fn writable(
+pub(super) fn permitted(
     maps: impl IntoIterator<Item = String>,
     start: u64,
     end: u64,
+    access: Access,
     asked: &mut u64,
 ) -> bool {
     let mut covered = start;
@@ -615,14 +995,14 @@ pub(super) fn writable(
         if covered >= end {
             break;
         }
-        let Some((from, to, write)) = mapping(&line) else {
+        let Some((from, to, allowed)) = mapping(&line, access) else {
             continue;
         };
         if to <= covered {
             continue;
         }
         *asked += 1;
-        if from > covered || !write {
+        if from > covered || !allowed || !access.pinned(covered) {
             return false;
         }
         covered = to;
@@ -630,16 +1010,17 @@ pub(super) fn writable(
     covered >= end
 }
 
-/// One line of `/proc/<pid>/maps`: the mapping's start, its end, and whether it is writable.
+/// One line of `/proc/<pid>/maps`: the mapping's start, its end, and whether it has `access`.
 #[cfg(target_os = "linux")]
-fn mapping(line: &str) -> Option<(u64, u64, bool)> {
+fn mapping(line: &str, access: Access) -> Option<(u64, u64, bool)> {
     let mut fields = line.split_ascii_whitespace();
     let (from, to) = fields.next()?.split_once('-')?;
     let permissions = fields.next()?;
+    let (place, letter) = access.letter();
     Some((
         u64::from_str_radix(from, 16).ok()?,
         u64::from_str_radix(to, 16).ok()?,
-        permissions.as_bytes().get(1) == Some(&b'w'),
+        permissions.as_bytes().get(place) == Some(&letter),
     ))
 }
 
@@ -776,6 +1157,36 @@ impl Importer {
             )
         };
         result.result_with_success(properties.memory_type_bits)
+    }
+
+    /// A dma-buf of `memory`, an allocation of the importer's device made exportable as one
+    /// (`vkGetMemoryFdKHR`): the device's check of textures over dma-buf pages makes its pages so
+    /// (`in_place_check.rs`). `ERROR_FEATURE_NOT_PRESENT` where the device imports no dma-bufs.
+    ///
+    /// # Safety
+    ///
+    /// `device` is the importer's device, and `memory` a live allocation of it made with
+    /// `VkExportMemoryAllocateInfo` naming dma-bufs.
+    #[cfg(unix)]
+    pub(super) unsafe fn exported_dma_buf(
+        &self,
+        device: &ash::Device,
+        memory: vk::DeviceMemory,
+    ) -> Result<std::os::fd::OwnedFd, vk::Result> {
+        use std::os::fd::FromRawFd;
+        let functions = self
+            .dma_buf
+            .as_ref()
+            .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+        let info = vk::MemoryGetFdInfoKHR::default()
+            .memory(memory)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut fd = -1;
+        // SAFETY: the caller's contract; the function was loaded for this device.
+        let result = unsafe { (functions.get_memory_fd_khr)(device.handle(), &info, &mut fd) };
+        result.result()?;
+        // SAFETY: a new descriptor Vulkan handed over, which the caller owns from here on.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
     }
 
     /// The memory types `pointer` can be imported into (`vkGetMemoryHostPointerPropertiesEXT`).

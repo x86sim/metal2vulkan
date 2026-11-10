@@ -10,7 +10,7 @@ use super::command_buffer::GroupEnd;
 use super::degradation::Degradation;
 use super::device::lock;
 use super::memory::FreeCause;
-use super::recorder::{CommandsReplayed, ReplayCounts};
+use super::recorder::CommandsRecorded;
 use super::scheduler::HeldFor;
 use super::shadow::{Backing, CarryTally, CopyCause, Lost, ShadowCopy, ShadowSource};
 use super::Device;
@@ -38,7 +38,6 @@ pub(crate) struct Counters {
     /// Released objects and shadow keeps by kind (`churn_counts.rs`).
     pub(crate) churn: super::churn_counts::ChurnCounters,
     command_pools_made: AtomicU64,
-    command_buffers_deferred: AtomicU64,
     spare_command_pools_taken: AtomicU64,
     spare_command_pools_reset: AtomicU64,
     live_tables_uploaded: AtomicU64,
@@ -63,8 +62,8 @@ pub(crate) struct Counters {
     calibration_disagreements: AtomicU64,
     storage_forms_taken: AtomicU64,
     addressable_buffers_made: AtomicU64,
+    mipmaps_filtered: AtomicU64,
     mipmap_first_levels_fetched: AtomicU64,
-    compressed_rows_rewritten: AtomicU64,
     pipelines_pooled: AtomicU64,
     residual_form_draws: AtomicU64,
     residual_form_makings: AtomicU64,
@@ -83,8 +82,12 @@ pub(crate) struct Counters {
     predicated_loop_runs_again: AtomicU64,
     variants_taken_back: AtomicU64,
     unlisted_argument_sampler_buffers: AtomicU64,
+    draws_dropped_unmade: AtomicU64,
+    draws_dropped_still_making: AtomicU64,
+    dispatches_dropped_still_making: AtomicU64,
     host_step_sampler_sets_made: AtomicU64,
     creation_pipelines_made: AtomicU64,
+    creations_left_making: AtomicU64,
     creation_pipelines_drawn: AtomicU64,
     creation_render_pipelines_made: AtomicU64,
     creation_render_pipelines_drawn: AtomicU64,
@@ -103,14 +106,6 @@ pub(crate) struct Counters {
     color_resolve_passes_made: AtomicU64,
     color_resolve_passes_kept: AtomicU64,
     ahead_nanos: AtomicU64,
-    unused_bits_load_passes: AtomicU64,
-    unused_bits_load_texels: AtomicU64,
-    capture_reach_passes: AtomicU64,
-    capture_reach_primitives: AtomicU64,
-    capture_reach_tiles_found: AtomicU64,
-    capture_reach_tiles_bound: AtomicU64,
-    capture_reach_bound_passes: AtomicU64,
-    capture_reach_narrower_passes: AtomicU64,
     driver_diagnostics_withheld: AtomicU64,
     stand_ins_made: AtomicU64,
     stand_in_bytes: AtomicU64,
@@ -131,6 +126,14 @@ pub(crate) struct Counters {
     fills_by_transfers: AtomicU64,
     ycbcr_refreshes: AtomicU64,
     ycbcr_whole_conversions: AtomicU64,
+    ycbcr_textures_in_place: AtomicU64,
+    ycbcr_images_kept: [AtomicU64; 7],
+    ycbcr_planes_bound: AtomicU64,
+    ycbcr_planes_images: AtomicU64,
+    ycbcr_planes_images_kept: [AtomicU64; 3],
+    ycbcr_planes_images_bound: AtomicU64,
+    ycbcr_device_conversions: AtomicU64,
+    ycbcr_device_samples: AtomicU64,
     attachment_clears_recorded: AtomicU64,
     image_blits_recorded: AtomicU64,
     query_result_copies_recorded: AtomicU64,
@@ -147,6 +150,9 @@ pub(crate) struct Counters {
     submit_infos: AtomicU64,
     command_buffers_submitted: AtomicU64,
     batch_submit_nanos: AtomicU64,
+    submit_stalls_on_work: AtomicU64,
+    submits_behind_idle_stalls: AtomicU64,
+    wait_behind_idle_stall_longest_nanos: AtomicU64,
     command_buffers_begun: AtomicU64,
     encoder_command_buffers_begun: AtomicU64,
     command_buffers_begun_by: [AtomicU64; Begun::COUNT],
@@ -189,6 +195,7 @@ pub(crate) struct Counters {
     completed_waits: AtomicU64,
     event_waits_met: AtomicU64,
     shared_event_waits_held: AtomicU64,
+    event_signals_behind_merge: AtomicU64,
     bare_starts: AtomicU64,
     prefixed_starts: AtomicU64,
     command_barriers: AtomicU64,
@@ -211,6 +218,8 @@ pub(crate) struct Counters {
     uncached_host_images: AtomicU64,
     cpu_block_decodes: AtomicU64,
     block_decode_passes: AtomicU64,
+    chroma_device_twins: AtomicU64,
+    chroma_device_decodes: AtomicU64,
     second_twins: AtomicU64,
     second_twin_checks: AtomicU64,
     second_twin_decodes: AtomicU64,
@@ -226,7 +235,6 @@ pub(crate) struct Counters {
     no_copy_lies_read: AtomicU64,
     commands_noted_as_before: AtomicU64,
     draws_settled: AtomicU64,
-    depth16_sided_draws: AtomicU64,
     two_plane_draws: AtomicU64,
     provoking_last_pipeline_draws: AtomicU64,
     provoking_listed_draws: AtomicU64,
@@ -239,10 +247,6 @@ pub(crate) struct Counters {
     linear_passes_in_place: AtomicU64,
     linear_passes_through_copies: AtomicU64,
     kept_bytes_passes: AtomicU64,
-    signed_depth_switch_ons: AtomicU64,
-    magnitude_stand_in_passes: AtomicU64,
-    magnitude_write_backs: AtomicU64,
-    sign_strips: AtomicU64,
     color_group_passes: AtomicU64,
     color_group_twins: AtomicU64,
     color_group_draws_skipped: AtomicU64,
@@ -286,6 +290,25 @@ pub(crate) struct Counters {
     host_imports_remapped: AtomicU64,
     host_pointer_imports_made: AtomicU64,
     host_pointer_import_bytes_made: AtomicU64,
+    host_imports_unpinnable: AtomicU64,
+    host_imports_refused_by_host: AtomicU64,
+    copied_host_buffers_made: AtomicU64,
+    copied_host_buffers_refused: AtomicU64,
+    copied_host_buffers_degraded: AtomicU64,
+    copied_rebind_pages_moved: AtomicU64,
+    copied_rebind_pages_made: AtomicU64,
+    copied_rebind_images_made: AtomicU64,
+    copied_heaps_made: AtomicU64,
+    copied_copy_in_bytes: AtomicU64,
+    copied_copy_in_bytes_skipped: AtomicU64,
+    copied_merge_back_bytes: AtomicU64,
+    copied_merges_compared: AtomicU64,
+    copied_merges_skipped: AtomicU64,
+    copied_dropped_bytes: AtomicU64,
+    host_ram_chunks_imported: AtomicU64,
+    host_ram_chunk_bytes: AtomicU64,
+    host_ram_chunks_live: AtomicU64,
+    chunk_bound_buffers_made: AtomicU64,
     dma_buf_sparse_buffers: AtomicU64,
     dma_buf_images: AtomicU64,
     dma_buf_image_fallbacks: AtomicU64,
@@ -293,9 +316,27 @@ pub(crate) struct Counters {
     shadowed_textures: AtomicU64,
     shadows_zeroed: AtomicU64,
     shadows_over_fresh_pages: AtomicU64,
+    host_textures_in_place: AtomicU64,
+    device_copy_textures: AtomicU64,
+    dma_buf_textures_in_place: AtomicU64,
+    fresh_page_textures_in_place: AtomicU64,
+    pitched_host_images: AtomicU64,
+    host_texture_shadows_exact: AtomicU64,
+    host_texture_shadows_render_target: AtomicU64,
+    host_texture_shadows_shader_write: AtomicU64,
+    host_texture_shadows_check_pending: AtomicU64,
+    host_texture_shadows_check_failed: AtomicU64,
+    host_texture_shadows_unchecked: AtomicU64,
+    host_texture_shadows_refused: [AtomicU64; 7],
+    in_place_checks_run: AtomicU64,
+    in_place_checks_passed: AtomicU64,
+    in_place_checks_failed: AtomicU64,
+    in_place_checks_unchecked: AtomicU64,
+    in_place_checks_recalled: AtomicU64,
     fresh_page_buffers_made: AtomicU64,
     fresh_page_bytes: AtomicU64,
     new_buffer_bytes_cleared: AtomicU64,
+    new_buffer_zero_fills: AtomicU64,
     shadow_copies: AtomicU64,
     shadow_texels_copied_in: AtomicU64,
     shadow_texels_first_copied_in: AtomicU64,
@@ -330,9 +371,11 @@ pub(crate) struct Counters {
     shadow_texels_copied_back: AtomicU64,
     shadow_copies_back_dispatched: AtomicU64,
     shadow_copies_in_dispatched: AtomicU64,
+    shadow_keeps_from_staging: AtomicU64,
     shadow_merge_copies_dispatched: AtomicU64,
     shadow_merge_dispatches_planned: AtomicU64,
     shadow_merge_words_examined: AtomicU64,
+    shadow_merge_dispatches_in_blocks: AtomicU64,
     shadow_merge_scratches_reused: AtomicU64,
     shadow_merge_scratches_zeroed: AtomicU64,
     row_copies: AtomicU64,
@@ -440,7 +483,7 @@ impl Begun {
 
 /// Where the runtime began a render pass instance of a render encoder's pass
 /// (`WorkCounts::render_passes_begun_instances` and kin); every other `vkCmdBeginRenderPass` it
-/// records (clears, resolves and copies of its own) is among `commands_replayed`'s alone.
+/// records (clears, resolves and copies of its own) is among `commands_recorded`'s alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PassBegun {
     /// An instance whose draws a secondary holds, begun where the pass is recorded
@@ -570,8 +613,6 @@ pub(crate) enum ActionsRefused {
     /// of whole tiles (`clear_reach.rs`) reaches another extent than another color's, or loaded,
     /// or a memoryless color smaller, where another's clear reaches past the render area.
     UnequalReach,
-    /// Cleared to a NaN whose bits the device's clear would not keep (`clear_value::nan_texel`).
-    NanClear,
     /// Resolved, into a resolve attachment or by a copy after the pass.
     Resolve,
     /// Stored other than by `Store`, or late (`storeActionOptions` set after the encoder).
@@ -636,16 +677,70 @@ impl Counters {
         self.ycbcr_whole_conversions.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A two-plane YCbCr texture was made with its planes read in place
+    /// (`texture/ycbcr_image.rs`).
+    pub(crate) fn ycbcr_texture_in_place(&self) {
+        self.ycbcr_textures_in_place.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A two-plane YCbCr texture was made keeping its image alone for `kept`
+    /// (`texture/ycbcr_image.rs`).
+    pub(crate) fn ycbcr_image_kept(&self, kept: crate::texture::KeptImage) {
+        let at = crate::texture::KeptImage::ALL
+            .iter()
+            .position(|k| *k == kept)
+            .unwrap_or(0);
+        if let Some(counter) = self.ycbcr_images_kept.get(at) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A binding of a two-plane YCbCr texture's planes read in place was written
+    /// (`binding.rs`).
+    pub(crate) fn ycbcr_planes_bound(&self) {
+        self.ycbcr_planes_bound.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A two-plane YCbCr texture's planes read in place were made an image the device's
+    /// conversion samples (`texture/ycbcr_planes.rs`).
+    pub(crate) fn ycbcr_planes_image(&self) {
+        self.ycbcr_planes_images.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A two-plane YCbCr texture's planes read in place were made no image the device's
+    /// conversion samples, for `kept` (`texture/ycbcr_planes.rs`).
+    pub(crate) fn ycbcr_planes_image_kept(&self, kept: crate::texture::KeptTexels) {
+        let at = crate::texture::KeptTexels::ALL
+            .iter()
+            .position(|k| *k == kept)
+            .unwrap_or(0);
+        if let Some(counter) = self.ycbcr_planes_images_kept.get(at) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A binding of a two-plane YCbCr texture's planes image was written (`binding.rs`).
+    pub(crate) fn ycbcr_planes_image_bound(&self) {
+        self.ycbcr_planes_images_bound
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A YCbCr texture's conversion, or a render shadow's load, was made to sample its planes'
+    /// image through the device's own Y′CbCr conversion (`ycbcr_device.rs`).
+    pub(crate) fn ycbcr_device_conversion(&self) {
+        self.ycbcr_device_conversions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A sampling of a YCbCr texture's planes' image through the device's own Y′CbCr conversion
+    /// was recorded (`ycbcr_device.rs`).
+    pub(crate) fn ycbcr_device_sampled(&self) {
+        self.ycbcr_device_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A `VkCommandPool` was made for a command buffer, none of the device's spares taken.
     pub(crate) fn command_pool_made(&self) {
         self.command_pools_made.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// An encoder took a deferred command buffer, which the device's recorder replays
-    /// (`recorder`).
-    pub(crate) fn command_buffer_deferred(&self) {
-        self.command_buffers_deferred
-            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// A command buffer took one of the device's spare command pools (`spares.rs`).
@@ -782,18 +877,17 @@ impl Counters {
         }
     }
 
+    /// A `generate_mipmaps` ran the compute filter rather than the device's blits
+    /// (`mipmap_filter.rs`).
+    pub(crate) fn mipmaps_filtered(&self) {
+        self.mipmaps_filtered.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A `generate_mipmaps` read its texture's first level in place, through a sampled view,
     /// rather than copying it in (`mipmap_filter.rs`).
     pub(crate) fn mipmap_first_level_fetched(&self) {
         self.mipmap_first_levels_fetched
             .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// A blit rewrote `rows` rows of a buffer's bytes as Metal's blit through a texture it keeps
-    /// compressed writes them (`compressed_blit.rs`, `compressed_rows`).
-    pub(crate) fn compressed_rows_rewritten(&self, rows: u64) {
-        self.compressed_rows_rewritten
-            .fetch_add(rows, Ordering::Relaxed);
     }
 
     /// A draw handed the making of its `VkPipeline` to the device's pool and went on
@@ -802,13 +896,13 @@ impl Counters {
         self.pipelines_pooled.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A draw or dispatch whose key's `VkPipeline` was not made took its residual form's
+    /// A draw or dispatch whose key's `VkPipeline` was not made took its general form's
     /// (`pipeline/render/residual.rs`).
     pub(crate) fn residual_form_drawn(&self) {
         self.residual_form_draws.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A draw or dispatch that began its key's making took its residual form's `VkPipeline`
+    /// A draw or dispatch that began its key's making took its general form's `VkPipeline`
     /// meanwhile (`pipeline/render/residual.rs`).
     pub(crate) fn residual_form_making(&self) {
         self.residual_form_makings.fetch_add(1, Ordering::Relaxed);
@@ -943,6 +1037,26 @@ impl Counters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A draw whose pipeline the driver did not make after the draw returned ran nothing
+    /// (`CommandBuffer::drop_draw`).
+    pub(crate) fn draw_dropped_unmade(&self) {
+        self.draws_dropped_unmade.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A draw whose pipeline was still being made at its command buffer's bound ran nothing
+    /// (`CommandBuffer::drop_late_draw`).
+    pub(crate) fn draw_dropped_still_making(&self) {
+        self.draws_dropped_still_making
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A dispatch, or a render pass's tile dispatch, whose pipeline was still being made at its
+    /// command buffer's bound ran nothing (`CommandBuffer::drop_late_dispatch`).
+    pub(crate) fn dispatch_dropped_still_making(&self) {
+        self.dispatches_dropped_still_making
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// `count` records of an indirect command buffer's commands were read from its storage and
     /// decoded (`indirect_command_buffer.rs`).
     pub(crate) fn indirect_records_read(&self, count: u64) {
@@ -998,6 +1112,13 @@ impl Counters {
             Predicted::Dispatch => &self.creation_dispatch_pipelines_made,
         }
         .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A state's creation returned while its predicted key's making, handed to the device's pool,
+    /// was still running at the bound (`PipelineWaitPolicy::Bounded`, `pipeline/render.rs`,
+    /// `pipeline/dispatch_making.rs`).
+    pub(crate) fn creation_left_making(&self) {
+        self.creations_left_making.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A draw or dispatch took a `VkPipeline` a state's creation made for `predicted`, its first
@@ -1077,36 +1198,6 @@ impl Counters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// An encoder recorded the load pass of an extended-range or padded color attachment over a
-    /// region of `texels` texels (`render/unused_bits_load.rs`).
-    pub(crate) fn unused_bits_load_recorded(&self, texels: u64) {
-        self.unused_bits_load_passes.fetch_add(1, Ordering::Relaxed);
-        self.unused_bits_load_texels
-            .fetch_add(texels, Ordering::Relaxed);
-    }
-
-    /// An encoder recorded a pass's capture replay over `primitives` primitives
-    /// (`render/capture.rs`).
-    pub(crate) fn capture_reach_recorded(&self, primitives: u64) {
-        self.capture_reach_passes.fetch_add(1, Ordering::Relaxed);
-        self.capture_reach_primitives
-            .fetch_add(primitives, Ordering::Relaxed);
-    }
-
-    /// A captured pass's command buffer completed: its primitives reach `found` tiles, of the
-    /// `bound` its draws' viewports and scissors reach.
-    pub(crate) fn capture_reach_tallied(&self, found: u64, bound: u64) {
-        self.capture_reach_tiles_found
-            .fetch_add(found, Ordering::Relaxed);
-        self.capture_reach_tiles_bound
-            .fetch_add(bound, Ordering::Relaxed);
-        match found >= bound {
-            true => &self.capture_reach_bound_passes,
-            false => &self.capture_reach_narrower_passes,
-        }
-        .fetch_add(1, Ordering::Relaxed);
-    }
-
     /// A driver call reported `withheld` diagnostics its driver facts measure it to report, which
     /// the device's sink was not handed (`driver_facts.rs`).
     pub(crate) fn driver_diagnostics_withheld(&self, withheld: u64) {
@@ -1131,6 +1222,19 @@ impl Counters {
     /// nanoseconds in the driver (`device/relay.rs`).
     pub(crate) fn batch_submitted_in(&self, nanos: u64) {
         self.batch_submit_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    /// A signalling call of work took the driver's stall (`device/submit_stalls.rs`).
+    pub(crate) fn submit_stall_on_work(&self) {
+        self.submit_stalls_on_work.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A submission waited `nanos` nanoseconds for its queue's lock behind a stall taken idle
+    /// (`device/submit_stalls.rs`).
+    pub(crate) fn submit_behind_idle_stall(&self, nanos: u64) {
+        self.submits_behind_idle_stalls
+            .fetch_add(1, Ordering::Relaxed);
+        (self.wait_behind_idle_stall_longest_nanos).fetch_max(nanos, Ordering::Relaxed);
     }
 
     /// A render encoder ended (`RenderCommandEncoder::end_encoding`).
@@ -1377,6 +1481,13 @@ impl Counters {
             .fetch_add(waits as u64, Ordering::Relaxed);
     }
 
+    /// A batch was submitted with `signals` kept event signals while the device kept a copied
+    /// host buffer: they are seen at its completion turn alone (`event_timeline.rs`).
+    pub(crate) fn event_signals_behind_merge(&self, signals: usize) {
+        self.event_signals_behind_merge
+            .fetch_add(signals as u64, Ordering::Relaxed);
+    }
+
     /// A batch with work was submitted with no command buffer of barriers before its first
     /// encoder.
     pub(crate) fn bare_start(&self) {
@@ -1428,8 +1539,7 @@ impl Counters {
     }
 
     /// A render pass instance its pass replaced or gave up before running it had its draws
-    /// recording given up (`render.rs`, `RenderCommandEncoder::end_unrun`): never replayed where
-    /// deferred, else ended.
+    /// recording given up (`render.rs`, `RenderCommandEncoder::end_unrun`): ended.
     pub(crate) fn unrun_instance_ended(&self) {
         self.unrun_instances_ended.fetch_add(1, Ordering::Relaxed);
     }
@@ -1466,6 +1576,18 @@ impl Counters {
     /// A GPU decode pass into a decoded twin was made (`Image::decode_pass`).
     pub(crate) fn block_decode_pass(&self) {
         self.block_decode_passes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A 4:2:2 texture's decoded twin was made to hold the device's own Y′CbCr conversion of its
+    /// pairs (`ycbcr_device::PairsSampling`).
+    pub(crate) fn chroma_device_twin(&self) {
+        self.chroma_device_twins.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A GPU decode pass into a 4:2:2 texture's decoded twin through the device's own Y′CbCr
+    /// conversion was made (`Image::decode_pass`).
+    pub(crate) fn chroma_device_decode(&self) {
+        self.chroma_device_decodes.fetch_add(1, Ordering::Relaxed);
     }
 
     /// An ASTC carrier's second decoded twin was made (`Image::make_second_twin`).
@@ -1561,12 +1683,6 @@ impl Counters {
         self.draws_settled.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A draw ran the variant whose fragment stage declares its `Depth16Unorm` depth bias's side
-    /// (`VariantKey::depth16_bias_raises`).
-    pub(crate) fn depth16_sided_draw(&self) {
-        self.depth16_sided_draws.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// A draw ran a variant that takes a slot bound to a two-plane extended-range texture
     /// (`VariantKey::extended_range`).
     pub(crate) fn two_plane_draw(&self) {
@@ -1634,29 +1750,6 @@ impl Counters {
     /// keeps (`kept_bytes.rs`).
     pub(crate) fn kept_bytes_pass(&self) {
         self.kept_bytes_passes.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// A render target's 32-bit float depth was switched on to render over its magnitude
-    /// stand-in, or to have its words stripped of their signs (`texture/signed_depth.rs`): once
-    /// per texture image.
-    pub(crate) fn signed_depth_switch_on(&self) {
-        self.signed_depth_switch_ons.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// A pass rendered a depth over its magnitude stand-in (`texture/signed_depth.rs`), and
-    /// wrote what it changed back into the depth where `written_back`.
-    pub(crate) fn magnitude_stand_in_pass(&self, written_back: bool) {
-        self.magnitude_stand_in_passes
-            .fetch_add(1, Ordering::Relaxed);
-        if written_back {
-            self.magnitude_write_backs.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// A depth's words were stored without their signs after a pass with depth writes whose
-    /// stores the device's pass left signed (`texture/signed_depth.rs`, `SignStrip`).
-    pub(crate) fn sign_strip(&self) {
-        self.sign_strips.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A render encoder drew one of its pass's later color groups (`render/color_groups.rs`).
@@ -1924,6 +2017,91 @@ impl Counters {
         (self.host_pointer_import_bytes_made).fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// The runtime kept host pages the kernel cannot pin from the driver
+    /// (`Device::refuse_unpinnable`).
+    pub(crate) fn host_import_unpinnable(&self) {
+        (self.host_imports_unpinnable).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The caller's import gate refused a no-copy buffer's import (`HostMemory::with_import_gate`).
+    pub(crate) fn host_import_refused_by_host(&self) {
+        (self.host_imports_refused_by_host).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A copied host buffer was made (`copied.rs`), for `cause`.
+    pub(crate) fn copied_host_buffer_made(&self, cause: CopiedBecause) {
+        (self.copied_host_buffers_made).fetch_add(1, Ordering::Relaxed);
+        match cause {
+            CopiedBecause::Failed => &self.copied_host_buffers_degraded,
+            CopiedBecause::Refused => &self.copied_host_buffers_refused,
+            CopiedBecause::Moved => &self.copied_rebind_pages_moved,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A no-copy heap's own buffer was made a copy of its pages (`copied.rs`).
+    pub(crate) fn copied_heap_made(&self) {
+        (self.copied_heaps_made).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A rebind gave a buffer a copy of its new pages (`copied.rs`).
+    pub(crate) fn copied_rebind_pages_made(&self) {
+        (self.copied_rebind_pages_made).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The device imported a chunk of `bytes` of a guest RAM it uses (`host_ram.rs`).
+    pub(crate) fn host_ram_chunk_imported(&self, bytes: u64) {
+        (self.host_ram_chunks_imported).fetch_add(1, Ordering::Relaxed);
+        (self.host_ram_chunk_bytes).fetch_add(bytes, Ordering::Relaxed);
+        (self.host_ram_chunks_live).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The device freed a chunk of a guest RAM (`host_ram.rs`).
+    pub(crate) fn host_ram_chunk_freed(&self) {
+        (self.host_ram_chunks_live).fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// A no-copy buffer (or heap's own buffer) was bound in a chunk of a guest RAM
+    /// (`host_ram.rs`).
+    pub(crate) fn chunk_bound_buffer_made(&self) {
+        (self.chunk_bound_buffers_made).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A rebind made an image again over a copy of its new pages (`copied.rs`).
+    pub(crate) fn copied_rebind_image_made(&self) {
+        (self.copied_rebind_images_made).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A commit copied `bytes` the CPU changed into copied host buffers (`copied.rs`).
+    pub(crate) fn copied_copied_in(&self, bytes: u64) {
+        (self.copied_copy_in_bytes).fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// A commit's copy in left `bytes` of copied host buffers uncompared: no log of their pages
+    /// reported them written since the copy last synced (`copied.rs`).
+    pub(crate) fn copied_copy_in_skipped(&self, bytes: u64) {
+        (self.copied_copy_in_bytes_skipped).fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// A batch's completion merged `bytes` the GPU changed back into the caller's pages
+    /// (`copied.rs`).
+    pub(crate) fn copied_merged_back(&self, bytes: u64) {
+        (self.copied_merge_back_bytes).fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// A completion turn's merge back compared `compared` copied host buffers and left `skipped`
+    /// uncompared, which no batch it finished could have written (`copied.rs`).
+    pub(crate) fn copied_merges(&self, compared: u64, skipped: u64) {
+        (self.copied_merges_compared).fetch_add(compared, Ordering::Relaxed);
+        (self.copied_merges_skipped).fetch_add(skipped, Ordering::Relaxed);
+    }
+
+    /// A batch's completion dropped `bytes` the GPU changed in copies of pages the process
+    /// cannot write, taking them out of the copies (`copied.rs`).
+    pub(crate) fn copied_dropped(&self, bytes: u64) {
+        (self.copied_dropped_bytes).fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// A host import the device never releases while idle, for `because`, was made (`kept`), or
     /// went.
     pub(crate) fn host_import_kept(&self, because: KeptBecause, kept: bool) {
@@ -2009,6 +2187,65 @@ impl Counters {
         (self.shadows_over_fresh_pages).fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A texture over host pages was made a device copy of them (`texture.rs`).
+    pub(crate) fn device_copy_texture(&self) {
+        self.device_copy_textures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A texture over host pages of `class` was made an image in place over them (`in_place.rs`),
+    /// its rows at Metal's pitch in a `DRM_FORMAT_MOD_LINEAR` image made for host allocations
+    /// where `pitched`.
+    pub(crate) fn host_texture_in_place(&self, class: crate::in_place::PagesClass, pitched: bool) {
+        use crate::in_place::PagesClass as P;
+        self.host_textures_in_place.fetch_add(1, Ordering::Relaxed);
+        match class {
+            P::Pointer => {}
+            P::DmaBuf => {
+                self.dma_buf_textures_in_place
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            P::Fresh => {
+                (self.fresh_page_textures_in_place).fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if pitched {
+            self.pitched_host_images.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A texture over host pages was made a shadow of them for `cause` (`in_place.rs`).
+    pub(crate) fn host_texture_shadowed(&self, cause: &crate::in_place::ShadowCause) {
+        use crate::in_place::ShadowCause as C;
+        let counter = match cause {
+            C::Exact => &self.host_texture_shadows_exact,
+            C::RenderTarget => &self.host_texture_shadows_render_target,
+            C::ShaderWrite => &self.host_texture_shadows_shader_write,
+            C::CheckPending(_) => &self.host_texture_shadows_check_pending,
+            C::CheckFailed(_) => &self.host_texture_shadows_check_failed,
+            C::Unchecked(_) => &self.host_texture_shadows_unchecked,
+            C::Refused(refusal, _) => &self.host_texture_shadows_refused[refusal.index()],
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The device's check of the first move over host pages answered `verdict` for a class it
+    /// ran (`in_place_check.rs`).
+    pub(crate) fn in_place_check_ran(&self, verdict: crate::in_place::Verdict) {
+        use crate::in_place::Verdict as V;
+        self.in_place_checks_run.fetch_add(1, Ordering::Relaxed);
+        let counter = match verdict {
+            V::Passed => &self.in_place_checks_passed,
+            V::Failed => &self.in_place_checks_failed,
+            V::Unchecked | V::Pending => &self.in_place_checks_unchecked,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A class's verdict was read from the record of an earlier check (`in_place.rs`).
+    pub(crate) fn in_place_check_recalled(&self) {
+        (self.in_place_checks_recalled).fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A buffer was made in `bytes` of fresh pages it imported, which read zero unwritten
     /// (`fresh_pages.rs`).
     pub(crate) fn fresh_page_buffer_made(&self, bytes: u64) {
@@ -2021,6 +2258,12 @@ impl Counters {
     /// as the arena hands the region out of a chunk made without a clear (`upload.rs`).
     pub(crate) fn new_buffer_cleared(&self, bytes: u64) {
         (self.new_buffer_bytes_cleared).fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// A submission's first work zeroed a new buffer's bytes the host cannot write with one
+    /// `vkCmdFillBuffer` in place of copies of the device's zeros (`texture/first_move.rs`).
+    pub(crate) fn new_buffer_zero_filled(&self) {
+        (self.new_buffer_zero_fills).fetch_add(1, Ordering::Relaxed);
     }
 
     /// An encoder planned `n` copies between shadowed textures' truths and their shadows
@@ -2036,10 +2279,10 @@ impl Counters {
 
     /// An encoder planned `copy`, a copy in of a shadowed texture: its texels
     /// (`shadow::ShadowCopy::texels_copied_in`) counted by why it is made
-    /// (`shadow::ShadowCopy::cause`, a change of the truth by its reason), by what holds the truth (`shadow::Backing`), apart where
-    /// the truth is an IOSurface's plane under a texture of at least [`LARGE_SURFACE_TEXELS`]
-    /// texels, and apart where the shadow is an image's, copied image to image. Nothing for any
-    /// other step.
+    /// (`shadow::ShadowCopy::cause`, a change of the truth by its reason), by what holds the truth
+    /// (`shadow::Backing`), apart where the truth is an IOSurface's plane under a texture of at
+    /// least [`LARGE_SURFACE_TEXELS`](crate::shadow::LARGE_SURFACE_TEXELS) texels, and apart where
+    /// the shadow is an image's, copied image to image. Nothing for any other step.
     pub(crate) fn shadow_copy_in_planned<M>(&self, copy: &ShadowCopy<M>) {
         let Some(cause) = copy.cause else {
             return;
@@ -2115,6 +2358,13 @@ impl Counters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// An encoder recorded a heap's tiled texture's keep as a copy of the staging buffer its copy
+    /// in just filled (`ShadowCopies::record_kept_from_staging`).
+    pub(crate) fn shadow_keep_from_staging(&self) {
+        self.shadow_keeps_from_staging
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// An encoder recorded a copy of `regions` rows between two buffers (`row_copies.rs`), as one
     /// dispatch where `dispatched`.
     pub(crate) fn row_copy(&self, regions: usize, dispatched: bool) {
@@ -2142,6 +2392,13 @@ impl Counters {
             .fetch_add(dispatches as u64, Ordering::Relaxed);
         self.shadow_merge_words_examined
             .fetch_add(words, Ordering::Relaxed);
+    }
+
+    /// `dispatches` of a merge planned in whole blocks (`shadow_merge.rs`: a command's that replaces
+    /// every texel, or a render pass's that stores the tiles of its area).
+    pub(crate) fn shadow_merge_in_blocks(&self, dispatches: usize) {
+        self.shadow_merge_dispatches_in_blocks
+            .fetch_add(dispatches as u64, Ordering::Relaxed);
     }
 
     /// A merge of a shadowed texture took its scratch from its shadow's spares (`shadow_merge.rs`,
@@ -2664,28 +2921,20 @@ pub struct MemoryFrees {
 pub struct WorkCounts {
     /// `VkCommandPool`s made for command buffers, where no spare one was free.
     pub command_pools_made: u64,
-    /// The command buffers encoders took that the program's thread logged and the device's
-    /// recorder replays into `VkCommandBuffer`s once their command buffer is committed
-    /// (`recorder`): every encoder's, on a device with a recorder.
-    pub command_buffers_deferred: u64,
-    /// Those the recorder's thread replayed.
-    pub command_buffers_replayed: u64,
-    /// Those another thread replayed itself where the recorder's had not yet reached them: one
-    /// that submits them, or that releases, rebinds or detaches host pages their commands name.
-    pub command_buffers_replayed_inline: u64,
-    /// The commands their replays called, by kind, on whichever thread replayed them
-    /// (`recorder`): one per call made into a `VkCommandBuffer`, the begins and ends among them.
-    pub commands_replayed: CommandsReplayed,
     /// Released objects MoltenVK commits its residency set for, by kind (`churn_counts.rs`).
     pub object_churn: super::churn_counts::ObjectChurn,
     /// Merged-back shadows' keeps by who planned them (`churn_counts.rs`).
     pub shadow_keeps: super::churn_counts::ShadowKeeps,
+    /// The commands recorded into the device's `VkCommandBuffer`s, by kind, as each was recorded
+    /// (`recorder`): one per call, the begins and ends among them, whatever the command buffer
+    /// (an encoder's, a batch's submission's, the device's own) and the thread; none on a device
+    /// past the slots.
+    pub commands_recorded: CommandsRecorded,
     /// The places in the runtime that recorded `vkCmdCopyBuffer`, `vkCmdCopyBufferToImage`,
     /// `vkCmdCopyImageToBuffer` and `vkCmdCopyImage` through the device's functions, as encoders
-    /// and the runtime's own work recorded them (whichever thread replays them later): the first
-    /// 32 places met, each with its calls, their regions and the most regions one had. What
-    /// names the copy behind a recorder's time on a driver that records each region as an
-    /// operation of its own (`row_copies.rs`).
+    /// and the runtime's own work recorded them: the first 32 places met, each with its calls,
+    /// their regions and the most regions one had. What names the copy behind a recording's time
+    /// on a driver that records each region as an operation of its own (`row_copies.rs`).
     pub copy_sites: [CopySite; 32],
     /// The `vkCmdCopyBuffer` regions over 16 KiB whose size is no multiple of 4 KiB that the
     /// device's functions recorded as two, the bytes up to the last whole multiple of 4 KiB and
@@ -2749,8 +2998,8 @@ pub struct WorkCounts {
     /// runtime thread held to make what the command buffer's work waited for had not gone yet.
     pub trail_waits_blocked: u64,
     /// Command buffers whose transition to `Completed` or `Error` ran on the queue waiter that
-    /// saw their work complete, with no handler thread woken: those with no completed handler, no
-    /// pass that captured its tiles' reach, and no earlier transition of their queue that runs
+    /// saw their work complete, with no handler thread woken: those with no completed handler and
+    /// no earlier transition of their queue that runs
     /// the program's code or runs on a handler thread then, while the runtime held none of the
     /// program's objects a release drops or runs (`command_buffer/completion.rs`).
     pub completed_where_seen: u64,
@@ -2791,22 +3040,24 @@ pub struct WorkCounts {
     /// no-copy buffer's, a preprocess buffer's). None per buffer placed in the runtime's memory:
     /// MoltenVK makes each such buffer resident in every encoder whose pipeline reads pointers.
     pub addressable_buffers_made: u64,
+    /// `generate_mipmaps` calls that ran the compute filter, of a format the device's blits
+    /// cannot filter, rather than the blit chain (`mipmap_filter.rs`; the chain's blits count in
+    /// [`image_blits_recorded`](Self::image_blits_recorded)): the lanes that make mipmaps hold
+    /// themselves to them.
+    pub mipmaps_filtered: u64,
     /// `generate_mipmaps` calls that read the first level in place through a sampled view, not
     /// copied in (`mipmap_filter.rs`): the lane that measures the fetch holds itself to them.
     pub mipmap_first_levels_fetched: u64,
-    /// Rows of a buffer's bytes that a blit out of (or between buffer-backed views of) a texture
-    /// Metal keeps compressed rewrote as Metal's blit writes them (`compressed_blit.rs`): the
-    /// device test of a copy out at an offset off the texel holds itself to them.
-    pub compressed_rows_rewritten: u64,
     /// Draws that handed the making of their `VkPipeline` to the device's pool and went on,
     /// rather than make it at the draw.
     pub pipelines_pooled: u64,
     /// Draws and dispatches whose key's `VkPipeline` was not made, which were recorded at once
-    /// with the made one of its residual form, each of the key's uniform-view slots read at its
-    /// residual (which reads the same bytes at every bind offset): none waited for its key's
-    /// making.
+    /// with the made one of its general form, each of the key's uniform-view slots read at its
+    /// residual (which reads the same bytes at every bind offset) and, for a draw on a device that
+    /// samples through Metal's own texture unit, each texture slot converted to `half` by its
+    /// class's routine (exact for every class): none waited for its key's making.
     pub residual_form_draws: u64,
-    /// Of the makings draws and dispatches began, those whose command took its key's residual
+    /// Of the makings draws and dispatches began, those whose command took its key's general
     /// form meanwhile: makings on the device's pool that nothing waits for.
     pub residual_form_makings: u64,
     /// The pieces the device's pipeline pool holds as the counts are read, waiting or running:
@@ -2952,6 +3203,23 @@ pub struct WorkCounts {
     /// (`Degradation::UnlistedArgumentSampler`), and is counted once whether or not its
     /// functions reach the state left out.
     pub unlisted_argument_sampler_buffers: u64,
+    /// Draws whose `VkPipeline` the driver did not make after the draw returned (the runtime makes
+    /// a draw's pipeline while the draw goes on): each ran nothing, its command buffer running on
+    /// without error (`CommandBuffer::dropped_draw` names the first of a command buffer).
+    pub draws_dropped_unmade: u64,
+    /// Draws whose `VkPipeline` was still being made once their command buffer's bound passed
+    /// (`PipelineWaitPolicy::Bounded`, the default: its commit plus the policy's
+    /// `pipeline_commit_wait`): each ran nothing, its command buffer running on without error, and the command buffers after it draw with
+    /// the pipeline once it is made (`CommandBuffer::dropped_draw` names the first of a command
+    /// buffer, with the error `VK_TIMEOUT`).
+    pub draws_dropped_still_making: u64,
+    /// Compute dispatches and render passes' tile dispatches whose `VkPipeline` was still being
+    /// made once their command buffer's bound passed (`PipelineWaitPolicy::Bounded`, the default:
+    /// its commit plus the policy's `pipeline_commit_wait`): each ran nothing, so wrote nothing, its command buffer running on
+    /// without error, and the command buffers after it dispatch with the pipeline once it is made
+    /// (`CommandBuffer::dropped_draw` names the first of a command buffer, with the error
+    /// `VK_TIMEOUT`).
+    pub dispatches_dropped_still_making: u64,
     /// Immutable sampler sets a command buffer's host step made, counting samplers on the
     /// scheduler's thread, because the device's map held no set of its variant's samplers: the
     /// open break (a render execution's step drawing a state made after its commit, on the variant
@@ -2977,6 +3245,13 @@ pub struct WorkCounts {
     /// Of [`creation_dispatch_pipelines_made`](Self::creation_dispatch_pipelines_made), the ones a
     /// dispatch took so far.
     pub creation_dispatch_pipelines_drawn: u64,
+    /// Render and compute states' creations that returned while the making of their predicted
+    /// key's `VkPipeline`, which they handed to the device's pool, was still running the policy's
+    /// `pipeline_creation_wait` after they handed it there (`PipelineWaitPolicy::Bounded`, the
+    /// default): their draws and dispatches take the making in flight, their command buffer
+    /// waiting its own bound for it in turn. Each is counted in
+    /// [`creation_pipelines_made`](Self::creation_pipelines_made) too once made.
+    pub creations_left_making: u64,
     /// Immutable sampler sets variants made (the device's map's, and a host step's or a pool
     /// piece's own): none for a variant without immutable samplers.
     pub sampler_sets_made: u64,
@@ -3029,35 +3304,6 @@ pub struct WorkCounts {
     /// Nanoseconds commits spent making ahead for their render passes' host steps, kept
     /// backings included.
     pub ahead_nanos: u64,
-    /// Load passes render encoders recorded: one per extended-range, padded 10-bit or bfloat
-    /// color attachment (and under `TileStorePolicy::Exact` signed normalized or `RGB9E5Float`
-    /// one) that a pass which draws loads and stores, whose words a dispatch rewrote in the tiles
-    /// the pass's draws reach before the pass, as Metal's tile store leaves them
-    /// (`render/unused_bits_load.rs`).
-    pub unused_bits_load_passes: u64,
-    /// The texels of those passes' regions (the render area rounded up to 32 texels a side,
-    /// within the texture, of every layer the pass renders).
-    pub unused_bits_load_texels: u64,
-    /// Passes whose draws' tile reach capture replay found before the pass, from the positions
-    /// their own vertex functions compute (`render/capture.rs`): the load pass rewrites the tiles
-    /// those reach, as Metal's pass does.
-    pub capture_reach_passes: u64,
-    /// The primitives those passes' capture draws assembled and binned.
-    pub capture_reach_primitives: u64,
-    /// The tiles those passes' primitives reach, as their masks held them once their command
-    /// buffers completed (every tile of the pass where its capture fell back, a primitive's
-    /// reach not measured): those the load passes rewrote.
-    pub capture_reach_tiles_found: u64,
-    /// The tiles their draws' viewports and scissors reach (`clear_reach::DrawnArea`): those the
-    /// load passes would rewrite without the capture.
-    pub capture_reach_tiles_bound: u64,
-    /// Those passes whose primitives reach every tile their viewports and scissors reach (a
-    /// full-screen draw's, say): the capture changed nothing the load pass rewrote, but for the
-    /// announcement.
-    pub capture_reach_bound_passes: u64,
-    /// Those passes whose primitives reach fewer: the tiles between were kept, as Metal keeps
-    /// them, where the load pass would have rewritten them.
-    pub capture_reach_narrower_passes: u64,
     /// Driver diagnostics withheld from the device's message sink: messages a driver diagnostic
     /// fact (`DriverFact::pipeline_creation_diagnostics`) measures the driver to report inside a
     /// call the runtime made, reported there (`driver_facts.rs`). MoltenVK 1.4.1's warning of a
@@ -3173,6 +3419,59 @@ pub struct WorkCounts {
     /// over every texel, where the refresh is not made (planes not whole words, or past one
     /// storage binding) or the planes' `VkBuffer` is not the one it binds.
     pub ycbcr_whole_conversions: u64,
+    /// Two-plane YCbCr textures made with their planes read in place: a slot whose function reads
+    /// the texture only as the in-place form reads binds a uniform texel buffer over the planes'
+    /// bytes, and its draws and dispatches convert no image (`texture/ycbcr_image.rs`).
+    pub ycbcr_textures_in_place: u64,
+    /// Two-plane YCbCr textures that keep their image alone because the device keeps every one's:
+    /// a discrete, virtual or other GPU, whose image reads the planes across the bus once per
+    /// change where the planes in place would read them at every pass.
+    pub ycbcr_images_kept_device: u64,
+    /// Two-plane YCbCr textures that keep their image alone because the form reads no such
+    /// layout: a format other than `YCBCR8_420_2P` and `YCBCR10_420_2P`, plane 1, a P3 surface.
+    pub ycbcr_images_kept_layout: u64,
+    /// Two-plane YCbCr textures that keep their image alone because of their swizzle.
+    pub ycbcr_images_kept_swizzle: u64,
+    /// Two-plane YCbCr textures that keep their image alone because their planes' first byte is
+    /// off the device's `minTexelBufferOffsetAlignment` in their buffer.
+    pub ycbcr_images_kept_alignment: u64,
+    /// Two-plane YCbCr textures that keep their image alone because their planes hold more
+    /// elements than the device's `maxTexelBufferElements`.
+    pub ycbcr_images_kept_elements: u64,
+    /// Two-plane YCbCr textures that keep their image alone because their planes reach past their
+    /// buffer, whose bytes past its end Metal reads as zeros.
+    pub ycbcr_images_kept_reach: u64,
+    /// Two-plane YCbCr textures that keep their image alone because the device views no uniform
+    /// texel buffer of their planes' format in a buffer of the runtime's usage.
+    pub ycbcr_images_kept_view: u64,
+    /// Bindings of two-plane YCbCr textures' planes read in place written into descriptor sets.
+    pub ycbcr_planes_bound: u64,
+    /// Two-plane YCbCr textures whose planes read in place are also an image the device's own
+    /// sampler Y′CbCr conversion samples, a linear image of the multi-planar 4:2:0 format over
+    /// their bytes (`texture/ycbcr_planes.rs`): a slot whose every sample the device's sampler
+    /// takes samples it through the device's conversion.
+    pub ycbcr_planes_images: u64,
+    /// Two-plane YCbCr textures whose planes read in place take no such image because the device
+    /// does not convert the format with Metal's reconstruction as a linear image of their size (no
+    /// such format features, a driver defect in it, an odd size or one past its limits).
+    pub ycbcr_planes_images_kept_conversion: u64,
+    /// Two-plane YCbCr textures whose planes read in place take no such image because the planes
+    /// lie in memory no such image is made over: fresh pages, a no-copy buffer's pages, the
+    /// caller's `VkBuffer`.
+    pub ycbcr_planes_images_kept_memory: u64,
+    /// Two-plane YCbCr textures whose planes read in place take no such image because the driver's
+    /// image lays the planes out otherwise than the surface, or does not fit their buffer there.
+    pub ycbcr_planes_images_kept_layout: u64,
+    /// Bindings of two-plane YCbCr textures' planes images written into descriptor sets.
+    pub ycbcr_planes_images_bound: u64,
+    /// Two-plane YCbCr textures' conversions, and render shadows' loads, made to sample the
+    /// planes' image through the device's own Y′CbCr conversion where it converts their format
+    /// (`ycbcr_device.rs`), in place of Metal's arithmetic.
+    pub ycbcr_device_conversions: u64,
+    /// Samplings of two-plane YCbCr textures' planes' images through the device's own Y′CbCr
+    /// conversion recorded: one per conversion or load of such a texture, run through the
+    /// refresh's indirect arguments where it has one.
+    pub ycbcr_device_samples: u64,
     // The commands MoltenVK 1.4.1 compiles a pipeline for per command pool on Apple's GPUs
     // (`PoolCompiled`), each counted as the runtime records it: a run's survey of which can
     // stall a commit behind a compile storm, as the fill did.
@@ -3236,6 +3535,26 @@ pub struct WorkCounts {
     /// the driver, so a lane that times the scheduler thread's take-up of later commits leaves it
     /// out (`runtime_lane::queue_order`).
     pub batch_submit_nanos: u64,
+    /// Empty submissions the scheduler's thread made while idle to take the driver's stall in
+    /// one signalling submission of every 1024 to a `VkQueue` then, on a driver that has it
+    /// (NVIDIA's; `device/submit_stalls.rs`): the calls left before the stall, where it was due
+    /// within the queue's next burst of work.
+    pub idle_submits: u64,
+    /// Of those, the ones that took the stall: 1.97 ms or more each on the RTX 5080 measured.
+    pub submit_stalls_idle: u64,
+    /// Signalling submissions of work the runtime took for the driver's stall: 1 ms or more in
+    /// the driver, where the count of the queue's calls puts the stall, or anywhere before that
+    /// place is confirmed (`device/submit_stalls.rs`). On a driver with the stall above, the stall
+    /// where none was taken idle (before the first was seen, or after a use of the queue the
+    /// runtime cannot count), and before the place is confirmed, another long call of the
+    /// driver's too (a device's first batches).
+    pub submit_stalls_on_work: u64,
+    /// Work that came while a stall taken idle ran: a submission that waited 10 us or more for
+    /// its queue's lock behind it, and a commit that reached the scheduler meanwhile.
+    pub submits_behind_idle_stalls: u64,
+    /// The longest of those waits, in nanoseconds: a submission's wait for the lock, and for a
+    /// commit, the stall it came during (its wait at most).
+    pub wait_behind_idle_stall_longest_nanos: u64,
     /// `VkCommandBuffer`s the runtime began once the device was made: each encoder's, a render
     /// encoder's draws' secondary ones, segments', a batch's barrier and first-work ones, internal
     /// and staging submissions'. A driver may clear a command buffer's state as it begins one
@@ -3273,8 +3592,7 @@ pub struct WorkCounts {
     /// Of `encoder_command_buffers_begun`, the encoders' own `VkCommandBuffer`s begun ahead: a
     /// settled spare command pool's primary, begun by the thread that completed the command
     /// buffer that gave it back where no thread waited for that one, which the first encoder of
-    /// the command buffer that takes the pool records into, begun no more on its thread (on a
-    /// device with a recorder, the first encoder's replay, `recorder`).
+    /// the command buffer that takes the pool records into, begun no more on its thread.
     pub encoder_primaries_begun_ahead: u64,
     /// The spare command pools' primaries begun ahead (`encoder_primaries_begun_ahead`), taken
     /// by an encoder or not yet: not among `command_buffers_begun` until one is taken. Each is
@@ -3407,8 +3725,8 @@ pub struct WorkCounts {
     /// a submission holding its place in the submissions' order and waited until that submission
     /// was made: only on a device whose heap sets take no writes while a command buffer that binds
     /// them is pending (no `descriptorBindingUpdateUnusedWhilePending`), where a submission holds
-    /// the order from its take of the first work, after replaying its encoders' deferred command
-    /// buffers, to its `vkQueueSubmit` (`texture/first_move.rs`). Elsewhere a registration takes
+    /// the order from its take of the first work to its `vkQueueSubmit`
+    /// (`texture/first_move.rs`). Elsewhere a registration takes
     /// no place, and this stays 0.
     pub registrations_waited: u64,
     /// Submissions (a batch's, or one of the device's own) that found another holding its place in
@@ -3518,6 +3836,14 @@ pub struct WorkCounts {
     /// A plain event's wait (`MTLEvent`, which no host call signals) is never among them: it
     /// chains on the `VkQueue`, where that is exact.
     pub shared_event_waits_held: u64,
+    /// Event signals (`encodeSignalEvent:value:`, kept: above every value known before them)
+    /// submitted while the device kept a copied host buffer, and so seen at their batch's
+    /// completion turn alone, after the copies' merge put the GPU's writes in the caller's pages
+    /// (`copied-host-pages`): no read of the event's value observes them earlier, a host wait
+    /// returns at that turn, and a wait for them, a plain event's (`MTLEvent`) too, is held on
+    /// the host until it rather than chained on the `VkQueue`. Metal's writes before a signal are
+    /// in the pages once its value is seen.
+    pub event_signals_behind_merge: u64,
     /// Batches with work submitted with no command buffer of barriers before their first
     /// encoder: nothing planned before it, and no start timestamp to write there (none, or one
     /// its first encoder wrote, `WorkCounts::prefixed_starts`).
@@ -3532,10 +3858,9 @@ pub struct WorkCounts {
     /// **Inside an encoder**, orders a blit's untracked uses by key and range).
     pub command_barriers: u64,
     /// Render pass instances a pass replaced or gave up before running them (a draw that needed
-    /// another shape before any draw recorded, a reroute's instance left behind, a capture that
-    /// recorded nothing, a first instance whose draws record inline instead), whose draws
-    /// recording the runtime gave up: never replayed where deferred (`recorder`), else ended, so
-    /// their command pool goes back to the device's spares unreset
+    /// another shape before any draw recorded, a reroute's instance left behind, a first instance
+    /// whose draws record inline instead), whose draws
+    /// recording the runtime gave up: ended, so their command pool goes back to the device's spares unreset
     /// (`WorkCounts::spare_command_pools_reset` counts the others). A pass's first instance that
     /// may record inline begins its draws' secondary only where a command records into it, so
     /// one replaced or recording inline before then began none, ended none, and is not counted.
@@ -3591,7 +3916,7 @@ pub struct WorkCounts {
     /// running a secondary of its draws (`render/pass_steps.rs`): an encoder's instances not
     /// recorded inline, and the runs of executions' commands. With the three fields after this
     /// one, every render pass instance of a render encoder's pass; the rest of
-    /// `commands_replayed.cmd_begin_render_pass` are the runtime's own clears, resolves and
+    /// `commands_recorded.cmd_begin_render_pass` are the runtime's own clears, resolves and
     /// copies.
     pub render_passes_begun_instances: u64,
     /// Passes' first instances begun at their first draw, recording their draws inline
@@ -3650,9 +3975,6 @@ pub struct WorkCounts {
     /// smaller memoryless texture. A pass whose attachments share the reach records its first
     /// instance inline over it.
     pub passes_not_inline_actions_unequal_reach: u64,
-    /// Of those, the ones where it is a clear to a NaN whose bits the device's clear would not
-    /// keep.
-    pub passes_not_inline_actions_nan_clear: u64,
     /// Of those, the ones where it is a resolve, into a resolve attachment or by a copy after the
     /// pass.
     pub passes_not_inline_actions_resolve: u64,
@@ -3717,9 +4039,16 @@ pub struct WorkCounts {
     /// finished it (`texture/twin_decode.rs`).
     pub cpu_block_decodes: u64,
     /// GPU decode passes made into decoded twins (`texture/decoded_twin.rs`, `Image::decode_pass`):
-    /// a blit's or a copy's into a BC texture, a heap texture's start, a write through
+    /// a blit's or a copy's into a carried texture, a heap texture's start, a write through
     /// submissions. None for a twin that takes CPU copies, whose texels only the CPU decodes.
     pub block_decode_passes: u64,
+    /// 4:2:2 textures' decoded twins made to hold the device's own Y′CbCr conversion of their
+    /// pairs, where it converts their format with Metal's reconstruction (`ycbcr_device.rs`), in
+    /// place of Metal's decode: their writes all decode through GPU passes.
+    pub chroma_device_twins: u64,
+    /// GPU decode passes into such twins made (among `block_decode_passes`), each band's pairs
+    /// sampled through the device's conversion.
+    pub chroma_device_decodes: u64,
     /// ASTC textures' second decoded twins made (`texture/decoded_twin.rs`): one at a texture's
     /// first view in its other colour space (an `_sRGB` texture's as its LDR form, or the other
     /// way), which reads Metal's decode of the blocks in that form.
@@ -3781,11 +4110,6 @@ pub struct WorkCounts {
     /// Draws that settled their variant and plan from their bind shapes: none for a draw whose
     /// bind shape is one of the latest its pipeline state settled in the same buffer forms.
     pub draws_settled: u64,
-    /// Draws that ran the variant whose fragment stage adds a `Depth16Unorm` depth's bias itself
-    /// and declares its side (`DepthGreater` or `DepthLess`), where the bias's side is known: the
-    /// device may then test the depth before the stage runs, which a stage that writes its depth
-    /// otherwise keeps it from.
-    pub depth16_sided_draws: u64,
     /// Draws that ran a variant taking a texture slot bound to a two-plane extended-range texture
     /// (`RGB10A8_2P_XR10` or its sRGB twin), read or sampled: the variant's function reads the
     /// slot's raw texels and decodes them, and filters each linear sample of the slot itself over
@@ -3836,29 +4160,6 @@ pub struct WorkCounts {
     /// (`DontCare`, `MultisampleResolve`), through the image its texture keeps, so that the buffer
     /// keeps its bytes (`kept_bytes.rs`).
     pub kept_bytes_passes: u64,
-    /// Render targets' 32-bit float depths switched on to render over their magnitude stand-in,
-    /// or to have their words stripped of their signs after a pass with depth writes whose stores
-    /// the device's pass leaves signed: a write that may store a negative value, a NaN, or a
-    /// denormal the device's depth test compares as zero, once per texture image
-    /// (`texture/signed_depth.rs`). None where no such write was made: every other pass renders
-    /// its depth in place.
-    pub signed_depth_switch_ons: u64,
-    /// Passes that loaded such a depth and rendered over its magnitude stand-in: its words copied
-    /// out, their stand-ins written by a dispatch and copied into the stand-in before the pass.
-    pub magnitude_stand_in_passes: u64,
-    /// Those written back into the depth, a pass that stores it and may have written it (a
-    /// depth/stencil state with depth writes, or an indirect command buffer's own states):
-    /// the stand-in copied out after the pass, merged into the depth's words by a dispatch, and
-    /// copied back.
-    pub magnitude_write_backs: u64,
-    /// Passes after which such a depth, rendered in place or through another image copied back
-    /// into it, not over its magnitude stand-in, was stored without its signs, as Metal stores
-    /// it: the pass set a depth/stencil state with depth writes, and the device's pass left the
-    /// words signed (every such pass, or, on a device whose depth test and stores are Metal's
-    /// own, one that drew under none). A single-sample depth's words copied out, stripped by a
-    /// dispatch and copied back; a multisampled one's samples copied out, stripped by a
-    /// sample-rate draw of each layer and copied back, or copied out and drawn back stripped.
-    pub sign_strips: u64,
     /// Passes a render encoder drew past its first for a pass of more color attachments than the
     /// device draws at once, one per later color group, each of that group's colors over a twin
     /// of the depth and stencil (`render/color_groups.rs`).
@@ -4068,6 +4369,74 @@ pub struct WorkCounts {
     pub host_pointer_imports_made: u64,
     /// Their bytes: whole pages, rounded out to the import's unit.
     pub host_pointer_import_bytes_made: u64,
+    /// The imports of host pages by their pointer the runtime refused before the driver saw them,
+    /// because the kernel pins no page of a mapping over them (a mapping of a dma-buf), on a
+    /// driver whose failed import of such pages breaks its later allocations
+    /// (`RuntimeDriverDefect::UnpinnablePagesBreakHostMemory`): no-copy objects', rebinds' and
+    /// guest RAM's chunks'. Such an object takes the caller's dma-bufs of the pages, or else a
+    /// copy of them (`copied_host_buffers_degraded`). None on every other driver, and off Linux.
+    pub host_imports_unpinnable: u64,
+    /// The no-copy buffers' imports the caller's gate refused (`HostMemory::with_import_gate`):
+    /// each made a copied host buffer instead (`copied_host_buffers_refused`).
+    pub host_imports_refused_by_host: u64,
+    /// The copied host buffers made (`copied-host-pages`): no-copy buffers whose bytes the GPU
+    /// uses in a copy of the caller's pages in memory of the device's own, which no import maps.
+    /// Each is one of the next three.
+    pub copied_host_buffers_made: u64,
+    /// Of those, the ones made because the caller's gate refused the import.
+    pub copied_host_buffers_refused: u64,
+    /// Of those, the ones made because an import the device and the gate admitted failed (out
+    /// of memory, another Vulkan error), or because the runtime refused the pages for the driver
+    /// and no dma-buf of them served (`host_imports_unpinnable`).
+    pub copied_host_buffers_degraded: u64,
+    /// Of those, the ones a rebind made because the new bytes lie at another offset in their
+    /// page than the old, where a texture over the buffer was planned at the old offset
+    /// (`Buffer::rebind_bytes_no_copy`): the copy keeps the bytes at the old offset.
+    pub copied_rebind_pages_moved: u64,
+    /// Of the copies made, those a rebind gave a buffer as its new pages
+    /// (`Buffer::rebind_bytes_no_copy`), in `copied_host_buffers_made` and its kin too.
+    pub copied_rebind_pages_made: u64,
+    /// The images rebinds made again over such a copy (`Buffer::rebind_bytes_no_copy`,
+    /// `Heap::rebind_bytes_no_copy`): a heap's textures bound to its bytes, and the images in place
+    /// of textures over the buffer, each a linear image of the copy's memory at its texels.
+    pub copied_rebind_images_made: u64,
+    /// Of the copies made, the no-copy heaps' own buffers (`Device::new_heap_with_bytes_no_copy`),
+    /// in `copied_host_buffers_made` and its kin too: the heap's buffers lie in the copy, and its
+    /// textures are shadows of its bytes.
+    pub copied_heaps_made: u64,
+    /// The bytes the CPU changed in copied host buffers' pages that commits copied into the
+    /// copies.
+    pub copied_copy_in_bytes: u64,
+    /// The bytes of copied host buffers that commits' copies in did not compare: their pages'
+    /// memory came with a log of the writes to them (`HostMemory::with_dirty_pages`,
+    /// `HostRam::with_dirty_pages`), which reported none of them written since the copy last
+    /// synced to it.
+    pub copied_copy_in_bytes_skipped: u64,
+    /// The bytes the GPU changed in copied host buffers' copies that batches' completions merged
+    /// back into the caller's pages.
+    pub copied_merge_back_bytes: u64,
+    /// The copied host buffers completion turns' merges back compared, one per copy and turn.
+    pub copied_merges_compared: u64,
+    /// The copied host buffers completion turns' merges back left uncompared: no batch the turn
+    /// finished could have written them (no use of their command buffers' commands wrote one of
+    /// their keys, and none may have written memory its uses do not name).
+    pub copied_merges_skipped: u64,
+    /// The bytes the GPU changed in copies of pages the process cannot write (read-only pages)
+    /// that batches' completions dropped: taken out of the copies, the pages' bytes in their
+    /// place, never written to the pages, as Metal drops the GPU's writes to read-only memory.
+    pub copied_dropped_bytes: u64,
+    /// The chunks of guest RAM the device imported (`Device::use_host_ram`): 64 MiB of a RAM's
+    /// range each (its last fewer), imported the first time a no-copy object over it was made.
+    pub host_ram_chunks_imported: u64,
+    /// Their bytes.
+    pub host_ram_chunk_bytes: u64,
+    /// The chunks of guest RAM imported and not yet freed (a gauge): a chunk is freed once the
+    /// device's use of its RAM ended and nothing holds it.
+    pub host_ram_chunks_live: u64,
+    /// The no-copy buffers (and no-copy heaps' own buffers) bound in a chunk of guest RAM, whose
+    /// pages their caller resolved to one run inside one chunk (`HostMemory::with_runs`): each
+    /// made with no import of its own, its import gate not asked.
+    pub chunk_bound_buffers_made: u64,
     /// The live host imports the device never releases while idle as a heap's own import (a
     /// no-copy heap's). With the next three and `host_imports_kept_for_fds`, they are every live
     /// no-copy import the device keeps imported whatever reads it.
@@ -4123,6 +4492,83 @@ pub struct WorkCounts {
     /// (`fresh_page_buffers_made`): an image bound to imported memory starts `UNDEFINED`, and its
     /// first move may write any byte bound to it.
     pub shadows_over_fresh_pages: u64,
+    /// Textures over host pages (a no-copy buffer's, a no-copy heap's buffer's, or a buffer in
+    /// fresh pages it imported) that only sample or read, made an image aliasing the pages in
+    /// place, where the device's check passed for their class (`HostPageTexturePolicy::InPlace`):
+    /// no shadow, and no copy in or back.
+    pub host_textures_in_place: u64,
+    /// Textures over host pages that `host_textures_in_place` would count (or a shadow made
+    /// before the check answered or where it failed), made instead a copy in the device's memory
+    /// on a discrete GPU, where their memory carries a log of its writes
+    /// (`HostMemory::with_dirty_pages`): a shadow whose copies in take only the rows the log
+    /// reports changed (`dirty_copies_in_gated` and kin), announced nowhere.
+    pub device_copy_textures: u64,
+    /// Of `host_textures_in_place`, those over pages imported as dma-bufs: each a
+    /// `DRM_FORMAT_MOD_LINEAR` image over a dma-buf of its own pages (also counted in
+    /// `dma_buf_images`).
+    pub dma_buf_textures_in_place: u64,
+    /// Of `host_textures_in_place`, those over a buffer in fresh pages it imported.
+    pub fresh_page_textures_in_place: u64,
+    /// Of `host_textures_in_place`, those whose rows lie at Metal's pitch in a
+    /// `DRM_FORMAT_MOD_LINEAR` image made for host allocations, where the driver's own linear
+    /// image lays them out otherwise.
+    pub pitched_host_images: u64,
+    /// Textures over host pages made shadows because the device's policy asks it
+    /// (`HostPageTexturePolicy::Shadow`).
+    pub host_texture_shadows_exact: u64,
+    /// Textures over host pages made shadows because their usage renders into them
+    /// (`RenderTarget`, whatever else it holds; an `Unknown` usage among them).
+    pub host_texture_shadows_render_target: u64,
+    /// Textures over host pages made shadows because their usage writes them through a shader
+    /// (`ShaderWrite` or `ShaderAtomic`) and does not render into them.
+    pub host_texture_shadows_shader_write: u64,
+    /// Textures over host pages made shadows because the device's check of their class had not
+    /// answered yet (a first session's, before the verdict is kept).
+    pub host_texture_shadows_check_pending: u64,
+    /// Textures over host pages made shadows because the device's check of their class found a
+    /// byte changed.
+    pub host_texture_shadows_check_failed: u64,
+    /// Textures over host pages made shadows because the device's check made no image of their
+    /// class.
+    pub host_texture_shadows_unchecked: u64,
+    /// Textures over host pages made shadows because their rows share bytes (an IOSurface
+    /// plane's GPU rows).
+    pub host_texture_shadows_refused_rows: u64,
+    /// Textures over host pages made shadows because their bytes were detached from their pages.
+    pub host_texture_shadows_refused_detached: u64,
+    /// Textures over host pages made shadows because the device makes no such linear image of
+    /// their plan (format features, usage, limits, an import only a dedicated allocation takes).
+    pub host_texture_shadows_refused_image: u64,
+    /// Textures over host pages made shadows because no image the device makes lays their rows
+    /// (or slices) at the buffer's pitch.
+    pub host_texture_shadows_refused_pitch: u64,
+    /// Textures over host pages made shadows because the image's alignment, size or memory type
+    /// misses their bytes' place.
+    pub host_texture_shadows_refused_placement: u64,
+    /// Textures over host pages imported as dma-bufs made shadows because the caller's source
+    /// made no one dma-buf of their own pages: it failed (a source of `udmabuf`s does where the
+    /// pages are more runs of its file than one `udmabuf` takes; its error is in the notice), or
+    /// answered with several chunks. Whether the buffer's own import took several chunks does not
+    /// decide it: the image asks for its own pages alone.
+    pub host_texture_shadows_refused_source: u64,
+    /// Textures over host pages imported as dma-bufs made shadows because no
+    /// `DRM_FORMAT_MOD_LINEAR` image over one dma-buf of their own pages was made for another
+    /// reason than the source or the pitch (counted in `host_texture_shadows_refused_pitch`): the
+    /// modifier's features or limits, the image's memory past the pages, or the driver's import.
+    pub host_texture_shadows_refused_dma_buf: u64,
+    /// Classes of host pages (pointer, dma-buf, fresh) the device's check of the first move ran
+    /// for in this process: `in_place_checks_passed`, `in_place_checks_failed` and
+    /// `in_place_checks_unchecked` together.
+    pub in_place_checks_run: u64,
+    /// Of `in_place_checks_run`, those whose every image's first move left every byte alone.
+    pub in_place_checks_passed: u64,
+    /// Of `in_place_checks_run`, those that found a byte changed (or were made to fail).
+    pub in_place_checks_failed: u64,
+    /// Of `in_place_checks_run`, those that made no image of the class.
+    pub in_place_checks_unchecked: u64,
+    /// Classes whose verdict was read from the record of an earlier check of the same driver,
+    /// device and runtime: no check ran for them.
+    pub in_place_checks_recalled: u64,
     /// Buffers of the runtime's own made in fresh anonymous pages imported by their pointer
     /// (`VK_EXT_external_memory_host`), which read zero with nothing written: host-visible ones
     /// longer than half a pooled block, not of a heap, where the device takes such pages. A
@@ -4136,6 +4582,12 @@ pub struct WorkCounts {
     /// data, since a command buffer's arena chunks are made without a clear and each region zeroes
     /// what its data does not cover (`upload.rs`).
     pub new_buffer_bytes_cleared: u64,
+    /// New buffers' bytes the host cannot write (`Private` storage, a `Managed` buffer's device
+    /// copy, the device's neutral buffers) that a submission's first work set to zero with one
+    /// `vkCmdFillBuffer`, on a device without unified memory whose fills are not transfers, in
+    /// place of copies of the device's host-visible zeros, which such a device reads over the bus
+    /// (`texture/first_move.rs`); fills apart from `fills_recorded`.
+    pub new_buffer_zero_fills: u64,
     /// Copies between a shadowed texture's truth and its shadow that encoders planned
     /// (`shadow.rs`): copies in before a command, copies back after one or as the encoder ends,
     /// and the keeps and merges of a command that writes the bytes two ways or writes through a
@@ -4257,6 +4709,34 @@ pub struct WorkCounts {
     /// the shadow and in the merge's scratch, where the device runs them faster so
     /// (`DriverFact::ShadowCopyInDispatchFaster`): the same bytes either way.
     pub shadow_copies_in_dispatched: u64,
+    /// Of the keeps of merged shadowed textures, those of a heap's tiled texture recorded right
+    /// after its copy in as one copy of the staging buffer that copy filled with the heap's
+    /// bytes, in place of a move of the shadow's texels back into Metal's tiles: the same bytes
+    /// either way (`shadow.rs`).
+    pub shadow_keeps_from_staging: u64,
+    /// The copies in of shadows over host pages a consumer logs whose regions the log decided as
+    /// their batch was submitted (`dirty_pages.rs`).
+    pub dirty_copies_in_gated: u64,
+    /// Of those, the ones that copied every region: no hold to count on, a wait the log answered
+    /// `false`, or half the rows or more changed.
+    pub dirty_copies_in_whole: u64,
+    /// Of those, the ones that copied nothing: no page changed.
+    pub dirty_copies_in_skipped: u64,
+    /// The bytes the gated copies in would have moved copying every region.
+    pub dirty_copy_in_bytes_whole: u64,
+    /// The bytes the gated copies in moved.
+    pub dirty_copy_in_bytes_copied: u64,
+    /// The stamps the commits of command buffers with a gated copy in asked of the logs: one per
+    /// log and commit, and one per log and commit for copied host buffers over logged pages.
+    pub dirty_stamps_asked: u64,
+    /// The waits the submissions (and, for copied host buffers, the commits) made for a log's
+    /// publication (`DirtyPages::wait`): one per log serves every stamp asked of it before the
+    /// wait.
+    pub dirty_waits: u64,
+    /// Of the waits, those the log answered `false`.
+    pub dirty_waits_unanswered: u64,
+    /// The nanoseconds the waits took, on the threads that submit and commit command buffers.
+    pub dirty_wait_nanos: u64,
     /// Of the keeps and merges among `shadow_copies`, those whose copy of the shadow's texels into
     /// the merge's scratch is the dispatch a copy back takes, where the device runs one faster
     /// than its copy (`DriverFact::ShadowCopyBackDispatchFaster`): the same bytes either way.
@@ -4273,13 +4753,22 @@ pub struct WorkCounts {
     /// after them and stores into the buffer's bytes only where they differ, so the words stored
     /// are at most these and are not counted (only the GPU knows them).
     pub shadow_merge_words_examined: u64,
+    /// Those dispatches that store whole 256-byte blocks (`bind::ShadowMergeStores::Blocks`): a
+    /// merge of a command that replaced every texel of a shadow over logged host pages, cut to its
+    /// texels' rows, every byte of which the command wrote (`shadow.rs`, **Overwrites over logged
+    /// pages**), or of a render pass that loaded and stored its color attachment inside its draws'
+    /// scissors, cut to that rectangle's rows, whose tiles Metal's own store writes back
+    /// (**Stored attachments**). Of the blocks they examine, each holding a changed word is stored
+    /// whole and each other is neither read nor written; which ones changed only the GPU knows.
+    pub shadow_merge_dispatches_in_blocks: u64,
     /// The merges of shadowed textures whose scratch was a buffer their shadow kept from an
     /// earlier merge whose command buffers completed (`shadow_merge.rs`): no buffer made.
     pub shadow_merge_scratches_reused: u64,
     /// The merges of shadowed textures whose scratch was made zero, as their kernel reads bytes
     /// no copy writes (those between the texture's rows): a merge not cut to rows of whole words,
     /// through a copy or of rows that start or end inside a word. A cut merge's copies write
-    /// every byte its kernel reads, so its scratch is not zeroed.
+    /// every byte its kernel reads, as a heap's tiled texture's merge in place copies the
+    /// texture's bytes whole, so neither scratch is zeroed.
     pub shadow_merge_scratches_zeroed: u64,
     /// Copies of rows of bytes between two buffers (`row_copies.rs`): a blit between a buffer and
     /// a texture over a buffer or between two textures over buffers, and a buffer-texture copy's
@@ -4543,6 +5032,7 @@ impl Device {
             |cause: Split| counters.instance_splits_by[cause as usize].load(Ordering::Relaxed);
         let (sleeps, [by_commit, by_completion, by_host, by_slice], scheduler_spared, gpu_waits) =
             self.shared().scheduler.sleeps_and_wakings();
+        let idle_stalls = self.shared().scheduler.idle_stall_counts();
         let (completion_wakes, completion_spared) = self.shared().completion.wakes();
         let (handler_wakes, handler_spared) = self.shared().contexts.wakes();
         let command_buffer_wakes = counters.command_buffer_wakes.load(Ordering::Relaxed);
@@ -4560,15 +5050,10 @@ impl Device {
                 memory.frees(),
             )
         };
-        let replays = (self.shared().recorder())
-            .map_or_else(ReplayCounts::default, |recorder| recorder.counts());
+        let dirty = self.shared().dirty.tally();
         WorkCounts {
-            command_pools_made: counters.command_pools_made.load(Ordering::Relaxed)
-                + replays.pools_made,
-            command_buffers_deferred: counters.command_buffers_deferred.load(Ordering::Relaxed),
-            command_buffers_replayed: replays.by_recorder,
-            command_buffers_replayed_inline: replays.by_submitter,
-            commands_replayed: replays.commands,
+            command_pools_made: counters.command_pools_made.load(Ordering::Relaxed),
+            commands_recorded: self.shared().commands_recorded(),
             object_churn: churn.0,
             shadow_keeps: churn.1,
             copy_sites: self.shared().vk().copy_sites(),
@@ -4601,10 +5086,10 @@ impl Device {
             calibration_disagreements: (counters.calibration_disagreements).load(Ordering::Relaxed),
             storage_forms_taken: counters.storage_forms_taken.load(Ordering::Relaxed),
             addressable_buffers_made: counters.addressable_buffers_made.load(Ordering::Relaxed),
+            mipmaps_filtered: counters.mipmaps_filtered.load(Ordering::Relaxed),
             mipmap_first_levels_fetched: counters
                 .mipmap_first_levels_fetched
                 .load(Ordering::Relaxed),
-            compressed_rows_rewritten: counters.compressed_rows_rewritten.load(Ordering::Relaxed),
             pipelines_pooled: counters.pipelines_pooled.load(Ordering::Relaxed),
             residual_form_draws: counters.residual_form_draws.load(Ordering::Relaxed),
             residual_form_makings: counters.residual_form_makings.load(Ordering::Relaxed),
@@ -4632,10 +5117,16 @@ impl Device {
             unlisted_argument_sampler_buffers: counters
                 .unlisted_argument_sampler_buffers
                 .load(Ordering::Relaxed),
+            draws_dropped_unmade: counters.draws_dropped_unmade.load(Ordering::Relaxed),
+            draws_dropped_still_making: counters.draws_dropped_still_making.load(Ordering::Relaxed),
+            dispatches_dropped_still_making: counters
+                .dispatches_dropped_still_making
+                .load(Ordering::Relaxed),
             host_step_sampler_sets_made: counters
                 .host_step_sampler_sets_made
                 .load(Ordering::Relaxed),
             creation_pipelines_made: counters.creation_pipelines_made.load(Ordering::Relaxed),
+            creations_left_making: counters.creations_left_making.load(Ordering::Relaxed),
             creation_pipelines_drawn: counters.creation_pipelines_drawn.load(Ordering::Relaxed),
             creation_render_pipelines_made: counters
                 .creation_render_pipelines_made
@@ -4664,16 +5155,6 @@ impl Device {
             color_resolve_passes_made: counters.color_resolve_passes_made.load(Ordering::Relaxed),
             color_resolve_passes_kept: counters.color_resolve_passes_kept.load(Ordering::Relaxed),
             ahead_nanos: counters.ahead_nanos.load(Ordering::Relaxed),
-            unused_bits_load_passes: counters.unused_bits_load_passes.load(Ordering::Relaxed),
-            unused_bits_load_texels: counters.unused_bits_load_texels.load(Ordering::Relaxed),
-            capture_reach_passes: counters.capture_reach_passes.load(Ordering::Relaxed),
-            capture_reach_primitives: counters.capture_reach_primitives.load(Ordering::Relaxed),
-            capture_reach_tiles_found: counters.capture_reach_tiles_found.load(Ordering::Relaxed),
-            capture_reach_tiles_bound: counters.capture_reach_tiles_bound.load(Ordering::Relaxed),
-            capture_reach_bound_passes: counters.capture_reach_bound_passes.load(Ordering::Relaxed),
-            capture_reach_narrower_passes: counters
-                .capture_reach_narrower_passes
-                .load(Ordering::Relaxed),
             driver_diagnostics_withheld: counters
                 .driver_diagnostics_withheld
                 .load(Ordering::Relaxed),
@@ -4726,6 +5207,25 @@ impl Device {
             fills_by_transfers: counters.fills_by_transfers.load(Ordering::Relaxed),
             ycbcr_refreshes: counters.ycbcr_refreshes.load(Ordering::Relaxed),
             ycbcr_whole_conversions: counters.ycbcr_whole_conversions.load(Ordering::Relaxed),
+            ycbcr_textures_in_place: counters.ycbcr_textures_in_place.load(Ordering::Relaxed),
+            ycbcr_images_kept_device: counters.ycbcr_images_kept[0].load(Ordering::Relaxed),
+            ycbcr_images_kept_layout: counters.ycbcr_images_kept[1].load(Ordering::Relaxed),
+            ycbcr_images_kept_swizzle: counters.ycbcr_images_kept[2].load(Ordering::Relaxed),
+            ycbcr_images_kept_alignment: counters.ycbcr_images_kept[3].load(Ordering::Relaxed),
+            ycbcr_images_kept_elements: counters.ycbcr_images_kept[4].load(Ordering::Relaxed),
+            ycbcr_images_kept_reach: counters.ycbcr_images_kept[5].load(Ordering::Relaxed),
+            ycbcr_images_kept_view: counters.ycbcr_images_kept[6].load(Ordering::Relaxed),
+            ycbcr_planes_bound: counters.ycbcr_planes_bound.load(Ordering::Relaxed),
+            ycbcr_planes_images: counters.ycbcr_planes_images.load(Ordering::Relaxed),
+            ycbcr_planes_images_kept_conversion: counters.ycbcr_planes_images_kept[0]
+                .load(Ordering::Relaxed),
+            ycbcr_planes_images_kept_memory: counters.ycbcr_planes_images_kept[1]
+                .load(Ordering::Relaxed),
+            ycbcr_planes_images_kept_layout: counters.ycbcr_planes_images_kept[2]
+                .load(Ordering::Relaxed),
+            ycbcr_planes_images_bound: counters.ycbcr_planes_images_bound.load(Ordering::Relaxed),
+            ycbcr_device_conversions: counters.ycbcr_device_conversions.load(Ordering::Relaxed),
+            ycbcr_device_samples: counters.ycbcr_device_samples.load(Ordering::Relaxed),
             attachment_clears_recorded: counters.attachment_clears_recorded.load(Ordering::Relaxed),
             image_blits_recorded: counters.image_blits_recorded.load(Ordering::Relaxed),
             query_result_copies_recorded: counters
@@ -4744,6 +5244,14 @@ impl Device {
             submit_infos: counters.submit_infos.load(Ordering::Relaxed),
             command_buffers_submitted: counters.command_buffers_submitted.load(Ordering::Relaxed),
             batch_submit_nanos: counters.batch_submit_nanos.load(Ordering::Relaxed),
+            idle_submits: idle_stalls.empty,
+            submit_stalls_idle: idle_stalls.idle,
+            submit_stalls_on_work: counters.submit_stalls_on_work.load(Ordering::Relaxed),
+            submits_behind_idle_stalls: idle_stalls.behind
+                + counters.submits_behind_idle_stalls.load(Ordering::Relaxed),
+            wait_behind_idle_stall_longest_nanos: idle_stalls
+                .behind_longest
+                .max((counters.wait_behind_idle_stall_longest_nanos).load(Ordering::Relaxed)),
             command_buffers_begun: counters.command_buffers_begun.load(Ordering::Relaxed),
             command_buffers_begun_encoders: begun(Begun::Encoder),
             command_buffers_begun_segments: begun(Begun::Segment),
@@ -4756,8 +5264,7 @@ impl Device {
             encoder_command_buffers_begun: (counters.encoder_command_buffers_begun)
                 .load(Ordering::Relaxed),
             encoder_primaries_begun_ahead: (counters.encoder_primaries_begun_ahead)
-                .load(Ordering::Relaxed)
-                + replays.begun_ahead_taken,
+                .load(Ordering::Relaxed),
             primaries_begun_ahead: counters.primaries_begun_ahead.load(Ordering::Relaxed),
             barrier_buffers_kept: counters.barrier_buffers_kept.load(Ordering::Relaxed),
             stamped_buffers_kept: counters.stamped_buffers_kept.load(Ordering::Relaxed),
@@ -4827,6 +5334,7 @@ impl Device {
             completed_waits: counters.completed_waits.load(Ordering::Relaxed),
             event_waits_met: counters.event_waits_met.load(Ordering::Relaxed),
             shared_event_waits_held: counters.shared_event_waits_held.load(Ordering::Relaxed),
+            event_signals_behind_merge: counters.event_signals_behind_merge.load(Ordering::Relaxed),
             bare_starts: counters.bare_starts.load(Ordering::Relaxed),
             prefixed_starts: counters.prefixed_starts.load(Ordering::Relaxed),
             command_barriers: counters.command_barriers.load(Ordering::Relaxed),
@@ -4871,7 +5379,6 @@ impl Device {
                 .load(Ordering::Relaxed),
             passes_not_inline_actions_dont_care_load: actions(ActionsRefused::DontCareLoad),
             passes_not_inline_actions_unequal_reach: actions(ActionsRefused::UnequalReach),
-            passes_not_inline_actions_nan_clear: actions(ActionsRefused::NanClear),
             passes_not_inline_actions_resolve: actions(ActionsRefused::Resolve),
             passes_not_inline_actions_store: actions(ActionsRefused::Store),
             passes_not_inline_buffer_textures: not_inline(NotInline::BufferTextures),
@@ -4891,6 +5398,8 @@ impl Device {
             uncached_host_images: counters.uncached_host_images.load(Ordering::Relaxed),
             cpu_block_decodes: counters.cpu_block_decodes.load(Ordering::Relaxed),
             block_decode_passes: counters.block_decode_passes.load(Ordering::Relaxed),
+            chroma_device_twins: counters.chroma_device_twins.load(Ordering::Relaxed),
+            chroma_device_decodes: counters.chroma_device_decodes.load(Ordering::Relaxed),
             second_twins: counters.second_twins.load(Ordering::Relaxed),
             second_twin_checks: counters.second_twin_checks.load(Ordering::Relaxed),
             second_twin_decodes: counters.second_twin_decodes.load(Ordering::Relaxed),
@@ -4908,7 +5417,6 @@ impl Device {
             no_copy_lies_read: counters.no_copy_lies_read.load(Ordering::Relaxed),
             commands_noted_as_before: counters.commands_noted_as_before.load(Ordering::Relaxed),
             draws_settled: counters.draws_settled.load(Ordering::Relaxed),
-            depth16_sided_draws: counters.depth16_sided_draws.load(Ordering::Relaxed),
             two_plane_draws: counters.two_plane_draws.load(Ordering::Relaxed),
             provoking_last_pipeline_draws: counters
                 .provoking_last_pipeline_draws
@@ -4927,10 +5435,6 @@ impl Device {
                 .linear_passes_through_copies
                 .load(Ordering::Relaxed),
             kept_bytes_passes: counters.kept_bytes_passes.load(Ordering::Relaxed),
-            signed_depth_switch_ons: counters.signed_depth_switch_ons.load(Ordering::Relaxed),
-            magnitude_stand_in_passes: counters.magnitude_stand_in_passes.load(Ordering::Relaxed),
-            magnitude_write_backs: counters.magnitude_write_backs.load(Ordering::Relaxed),
-            sign_strips: counters.sign_strips.load(Ordering::Relaxed),
             color_group_passes: counters.color_group_passes.load(Ordering::Relaxed),
             color_group_twins: counters.color_group_twins.load(Ordering::Relaxed),
             color_group_draws_skipped: counters.color_group_draws_skipped.load(Ordering::Relaxed),
@@ -4997,6 +5501,32 @@ impl Device {
             host_pointer_import_bytes_made: counters
                 .host_pointer_import_bytes_made
                 .load(Ordering::Relaxed),
+            host_imports_unpinnable: counters.host_imports_unpinnable.load(Ordering::Relaxed),
+            host_imports_refused_by_host: counters
+                .host_imports_refused_by_host
+                .load(Ordering::Relaxed),
+            copied_host_buffers_made: counters.copied_host_buffers_made.load(Ordering::Relaxed),
+            copied_host_buffers_refused: counters
+                .copied_host_buffers_refused
+                .load(Ordering::Relaxed),
+            copied_host_buffers_degraded: counters
+                .copied_host_buffers_degraded
+                .load(Ordering::Relaxed),
+            copied_rebind_pages_moved: counters.copied_rebind_pages_moved.load(Ordering::Relaxed),
+            copied_rebind_pages_made: counters.copied_rebind_pages_made.load(Ordering::Relaxed),
+            copied_rebind_images_made: counters.copied_rebind_images_made.load(Ordering::Relaxed),
+            copied_heaps_made: counters.copied_heaps_made.load(Ordering::Relaxed),
+            copied_copy_in_bytes: counters.copied_copy_in_bytes.load(Ordering::Relaxed),
+            copied_copy_in_bytes_skipped: (counters.copied_copy_in_bytes_skipped)
+                .load(Ordering::Relaxed),
+            copied_merge_back_bytes: counters.copied_merge_back_bytes.load(Ordering::Relaxed),
+            copied_merges_compared: counters.copied_merges_compared.load(Ordering::Relaxed),
+            copied_merges_skipped: counters.copied_merges_skipped.load(Ordering::Relaxed),
+            copied_dropped_bytes: counters.copied_dropped_bytes.load(Ordering::Relaxed),
+            host_ram_chunks_imported: counters.host_ram_chunks_imported.load(Ordering::Relaxed),
+            host_ram_chunk_bytes: counters.host_ram_chunk_bytes.load(Ordering::Relaxed),
+            host_ram_chunks_live: counters.host_ram_chunks_live.load(Ordering::Relaxed),
+            chunk_bound_buffers_made: counters.chunk_bound_buffers_made.load(Ordering::Relaxed),
             host_imports_lost: counters.host_imports_lost.load(Ordering::Relaxed),
             host_import_fds_kept: counters.host_import_fds_kept.load(Ordering::Relaxed),
             host_imports_kept_for_fds: counters.host_imports_kept_for_fds.load(Ordering::Relaxed),
@@ -5006,9 +5536,52 @@ impl Device {
             modifier_feature_queries: counters.modifier_feature_queries.load(Ordering::Relaxed),
             shadowed_textures: counters.shadowed_textures.load(Ordering::Relaxed),
             shadows_over_fresh_pages: counters.shadows_over_fresh_pages.load(Ordering::Relaxed),
+            host_textures_in_place: counters.host_textures_in_place.load(Ordering::Relaxed),
+            device_copy_textures: counters.device_copy_textures.load(Ordering::Relaxed),
+            dma_buf_textures_in_place: counters.dma_buf_textures_in_place.load(Ordering::Relaxed),
+            fresh_page_textures_in_place: counters
+                .fresh_page_textures_in_place
+                .load(Ordering::Relaxed),
+            pitched_host_images: counters.pitched_host_images.load(Ordering::Relaxed),
+            host_texture_shadows_exact: counters.host_texture_shadows_exact.load(Ordering::Relaxed),
+            host_texture_shadows_render_target: counters
+                .host_texture_shadows_render_target
+                .load(Ordering::Relaxed),
+            host_texture_shadows_shader_write: counters
+                .host_texture_shadows_shader_write
+                .load(Ordering::Relaxed),
+            host_texture_shadows_check_pending: counters
+                .host_texture_shadows_check_pending
+                .load(Ordering::Relaxed),
+            host_texture_shadows_check_failed: counters
+                .host_texture_shadows_check_failed
+                .load(Ordering::Relaxed),
+            host_texture_shadows_unchecked: counters
+                .host_texture_shadows_unchecked
+                .load(Ordering::Relaxed),
+            host_texture_shadows_refused_rows: counters.host_texture_shadows_refused[0]
+                .load(Ordering::Relaxed),
+            host_texture_shadows_refused_detached: counters.host_texture_shadows_refused[1]
+                .load(Ordering::Relaxed),
+            host_texture_shadows_refused_image: counters.host_texture_shadows_refused[2]
+                .load(Ordering::Relaxed),
+            host_texture_shadows_refused_pitch: counters.host_texture_shadows_refused[3]
+                .load(Ordering::Relaxed),
+            host_texture_shadows_refused_placement: counters.host_texture_shadows_refused[4]
+                .load(Ordering::Relaxed),
+            host_texture_shadows_refused_source: counters.host_texture_shadows_refused[5]
+                .load(Ordering::Relaxed),
+            host_texture_shadows_refused_dma_buf: counters.host_texture_shadows_refused[6]
+                .load(Ordering::Relaxed),
+            in_place_checks_run: counters.in_place_checks_run.load(Ordering::Relaxed),
+            in_place_checks_passed: counters.in_place_checks_passed.load(Ordering::Relaxed),
+            in_place_checks_failed: counters.in_place_checks_failed.load(Ordering::Relaxed),
+            in_place_checks_unchecked: counters.in_place_checks_unchecked.load(Ordering::Relaxed),
+            in_place_checks_recalled: counters.in_place_checks_recalled.load(Ordering::Relaxed),
             fresh_page_buffers_made: counters.fresh_page_buffers_made.load(Ordering::Relaxed),
             fresh_page_bytes: counters.fresh_page_bytes.load(Ordering::Relaxed),
             new_buffer_bytes_cleared: counters.new_buffer_bytes_cleared.load(Ordering::Relaxed),
+            new_buffer_zero_fills: counters.new_buffer_zero_fills.load(Ordering::Relaxed),
             views_through_swizzle: counters.views_through_swizzle.load(Ordering::Relaxed),
             view_shadows: counters.view_shadows.load(Ordering::Relaxed),
             attachment_reads_through_copies: counters
@@ -5119,6 +5692,16 @@ impl Device {
             shadow_copies_in_dispatched: counters
                 .shadow_copies_in_dispatched
                 .load(Ordering::Relaxed),
+            shadow_keeps_from_staging: counters.shadow_keeps_from_staging.load(Ordering::Relaxed),
+            dirty_copies_in_gated: dirty.gated.load(Ordering::Relaxed),
+            dirty_copies_in_whole: dirty.whole.load(Ordering::Relaxed),
+            dirty_copies_in_skipped: dirty.skipped.load(Ordering::Relaxed),
+            dirty_copy_in_bytes_whole: dirty.bytes_whole.load(Ordering::Relaxed),
+            dirty_copy_in_bytes_copied: dirty.bytes_copied.load(Ordering::Relaxed),
+            dirty_stamps_asked: dirty.stamps.load(Ordering::Relaxed),
+            dirty_waits: dirty.waits.load(Ordering::Relaxed),
+            dirty_waits_unanswered: dirty.waits_unanswered.load(Ordering::Relaxed),
+            dirty_wait_nanos: dirty.wait_nanos.load(Ordering::Relaxed),
             shadow_merge_copies_dispatched: counters
                 .shadow_merge_copies_dispatched
                 .load(Ordering::Relaxed),
@@ -5127,6 +5710,9 @@ impl Device {
                 .load(Ordering::Relaxed),
             shadow_merge_words_examined: counters
                 .shadow_merge_words_examined
+                .load(Ordering::Relaxed),
+            shadow_merge_dispatches_in_blocks: counters
+                .shadow_merge_dispatches_in_blocks
                 .load(Ordering::Relaxed),
             shadow_merge_scratches_reused: counters
                 .shadow_merge_scratches_reused
@@ -5203,4 +5789,16 @@ impl Device {
             tile_dispatches_recorded: counters.tile_dispatches_recorded.load(Ordering::Relaxed),
         }
     }
+}
+
+/// Why a no-copy buffer's bytes lie in a copy of the caller's pages (`copied.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopiedBecause {
+    /// The caller's gate refused their import (`HostMemory::with_import_gate`).
+    Refused,
+    /// The import the device and the gate admitted failed.
+    Failed,
+    /// A rebind's new bytes lie at another offset in their page than the old, where a texture
+    /// over the buffer was planned at the old offset: no import lays them there.
+    Moved,
 }

@@ -30,7 +30,6 @@ use super::device::DeviceKind;
 use super::driver_defects;
 use super::error::{invalid, Error, Problem, RuntimeGap};
 use super::linear_plan::linear_alignment;
-use super::metal_level::MetalLevel;
 use super::texture_descriptor::TextureRules;
 use super::values::Size;
 use metal2vulkan::device::{DeviceDescription, DriverFact, VkFeature};
@@ -140,23 +139,9 @@ pub struct DeviceProperties {
     /// ([`Needs::RuntimeDriverDefect`](metal2vulkan::error::Needs::RuntimeDriverDefect)).
     pub driver_defects: BTreeSet<RuntimeDriverDefect>,
     /// What the device's driver is measured to answer where Vulkan leaves the result undefined,
-    /// from its identity and release ([`DeviceDescription::driver_facts`]): the runtime relies on
-    /// one only where the driver has it, and elsewhere takes the exact path that needs none.
+    /// from its identity and GPU ([`DeviceDescription::driver_facts`]): the runtime relies on one
+    /// only where the driver has it, and elsewhere takes the exact path that needs none.
     pub driver_facts: BTreeSet<DriverFact>,
-    /// The answer facts the device's driver is measured to give on another release or GPU, which
-    /// the device does not take because its identity (driver, GPU and release) is not measured
-    /// ([`DeviceDescription::driver_facts_withheld`]): the runtime takes the exact path instead,
-    /// assumes the driver's measured defects ([`driver_facts`](Self::driver_facts),
-    /// [`driver_defects`](Self::driver_defects)), and says so once as it is made in an
-    /// informational message, `metal2vulkan-unmeasured-driver` (`driver_facts.rs`, no degrade
-    /// notice, as the paths it takes are exact).
-    pub driver_facts_withheld: BTreeSet<DriverFact>,
-    /// The macOS release whose Metal the device answers as, where releases answer differently
-    /// ([`MetalLevel`]): the options' (`DeviceOptions::metal_level`), else on macOS the host's
-    /// release or the newest measured below it, else the newest. A consumer that answers its
-    /// guest as Metal does takes its descriptor's pixel formats from it
-    /// ([`MetalLevel::knows`]).
-    pub metal_level: MetalLevel,
     /// The pixel interlock is enabled, so every fragment function's raster order groups are
     /// ordered.
     raster_order_groups: bool,
@@ -203,12 +188,11 @@ pub(crate) struct DeviceIdentity {
 
 impl DeviceProperties {
     /// The properties of the device `identity` names, created with `description` (what it
-    /// enables), whose compile-layer device is `compile`, answering at `metal_level`.
+    /// enables), whose compile-layer device is `compile`.
     pub(crate) fn new(
         identity: DeviceIdentity,
         description: DeviceDescription,
         compile: &metal2vulkan::device::Device,
-        metal_level: MetalLevel,
     ) -> DeviceProperties {
         let metal = compile.metal_properties();
         let [width, height, depth] = metal.max_threads_per_threadgroup.map(u64::from);
@@ -245,8 +229,6 @@ impl DeviceProperties {
             max_vertex_amplification_count,
             driver_defects: driver_defects::of(&description),
             driver_facts: description.driver_facts(),
-            driver_facts_withheld: description.driver_facts_withheld(),
-            metal_level,
             description,
         }
     }
@@ -266,7 +248,7 @@ impl DeviceProperties {
     /// `isDepth24Stencil8PixelFormatSupported`: no, on every device, as Metal answers on an
     /// Apple GPU (an M3 Max under macOS 26.7 and an M4 under 27.0.1), whose Metal stops a
     /// texture and an attachment of `Depth24Unorm_Stencil8` and `X24_Stencil8` as of no format
-    /// ([`MetalLevel::describes`]). Every device answers as Apple's GPU, whatever its Vulkan
+    /// (it describes neither: [`Device::pixel_format_info`](crate::Device::pixel_format_info)). Every device answers as Apple's GPU, whatever its Vulkan
     /// driver's `D24_UNORM_S8_UINT`, so one guest gets one answer on every vendor.
     pub fn is_depth24_stencil8_pixel_format_supported(&self) -> Result<bool, RuntimeGap> {
         Query::Depth24Stencil8.answer(false)
@@ -302,11 +284,10 @@ impl DeviceProperties {
 
     /// What a texture's descriptor takes of the device (`texture_descriptor`): the sample counts
     /// [`supports_texture_sample_count`](Self::supports_texture_sample_count) answers yes for,
-    /// which a multisample texture takes, and the Metal level, whose formats it takes.
+    /// which a multisample texture takes.
     pub(super) fn texture_rules(&self) -> TextureRules {
         TextureRules {
             sample_counts: self.texture_sample_counts,
-            level: self.metal_level,
         }
     }
 
@@ -354,12 +335,10 @@ impl DeviceProperties {
     /// `replaceBackingWithRanges:readOnly:`). Metal has no query of its own for this: it is one of
     /// the runtime's, so that a consumer can tell what it may stop guarding.
     ///
-    /// A shader's stores through a buffer slot bound to such memory are dropped on **every**
-    /// device, whatever this answers: the stage's dropped-store word gates them
-    /// (`read_only_view.rs`). This answers yes only where the memory itself takes the GPU's
-    /// writes nowhere, so that Metal's other shapes hold too: a store through an address loaded out
-    /// of an argument buffer or a pointer, a blit fill and a visibility result all complete and
-    /// leave the pages as they were, and a colour attachment with
+    /// This answers yes only where the memory itself takes the GPU's writes nowhere, as Metal's
+    /// does, so that every shape Metal answers holds: a shader's stores through a buffer slot or
+    /// through an address loaded out of an argument buffer or a pointer, a blit fill and a
+    /// visibility result all complete and leave the pages as they were, and a colour attachment with
     /// [`StoreAction::Store`](crate::StoreAction::Store), a resolve target or a depth or stencil
     /// attachment over such memory ends its command buffer in error. On macOS, where the device
     /// imports the pages through a read-only view of them, that is yes; elsewhere the import is of
@@ -373,13 +352,14 @@ impl DeviceProperties {
     /// rows in a buffer, 16 bytes for every format a buffer can back, as Metal answers on an M3 Max
     /// and an M4. Refused, `Invalid` with
     /// [`BufferTextureProblem::NotLinear`](crate::BufferTextureProblem::NotLinear), for a
-    /// compressed, depth or stencil format, on which Metal's query asserts, and for a format the
-    /// device's Metal level describes none of ([`MetalLevel::describes`]), on which it asserts too.
+    /// compressed, depth or stencil format, on which Metal's query asserts, and for a format Metal
+    /// describes none of ([`Device::pixel_format_info`](crate::Device::pixel_format_info) answers
+    /// [`PixelFormatInfo::INVALID`](crate::PixelFormatInfo::INVALID)), on which it asserts too.
     pub fn minimum_linear_texture_alignment_for_pixel_format(
         &self,
         format: PixelFormat,
     ) -> Result<u64, Error> {
-        linear_alignment(format, self.metal_level).map_err(|problem| {
+        linear_alignment(format).map_err(|problem| {
             invalid(
                 "minimum_linear_texture_alignment_for_pixel_format",
                 Problem::BufferTexture(problem),

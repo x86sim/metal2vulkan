@@ -18,13 +18,13 @@
 //!   `Depth32Float`, `Depth16Unorm`, `Stencil8` and `Depth32Float_Stencil8` of shader-read usage
 //!   alone cleared, loaded, drawn and stored as a render target is, and left as they were under a
 //!   `DontCare` store): one texture through a stand-in, separate depth and stencil textures through
-//!   their combined scratch image (`depth_stencil_scratch.rs`). A memoryless one, one whose format
-//!   the device does not copy both ways, and a `Depth32Float` texture held in a color image beside
-//!   its depth twin are not built (`NotImplemented(Render)`). Every attachment has one sample
-//!   count, which the pipelines drawn must have. Metal renders into the smallest attachment's
-//!   extent, further limited by a nonzero `renderTargetWidth` and `renderTargetHeight` (measured:
-//!   an 8x8 color and a 4x4 depth attachment, or an 8x8 one under a 4x4 target size, render 4x4). A
-//!   pass without attachments needs both target sizes, and rasterizes `defaultRasterSampleCount`
+//!   their combined scratch image (`depth_stencil_scratch.rs`). A memoryless one, and one whose
+//!   format the device does not copy both ways, are not built (`NotImplemented(Render)`). Every
+//!   attachment has one sample count, which the pipelines drawn must have. Metal renders into the
+//!   smallest attachment's extent, further limited by a nonzero `renderTargetWidth` and
+//!   `renderTargetHeight` (measured: an 8x8 color and a 4x4 depth attachment, or an 8x8 one under a
+//!   4x4 target size, render 4x4). A pass without attachments needs both target sizes, and
+//!   rasterizes `defaultRasterSampleCount`
 //!   samples (0, the default, is `Invalid`, as Metal ends the process there). Past 16384 on a side
 //!   Metal makes its encoder and fails the command buffer from the pass on (measured): the encoder
 //!   records into the device's largest framebuffer within it, and the command buffer's commit runs
@@ -114,7 +114,7 @@ use super::render_values::{
 use super::resolve::{self, DepthStencilResolve, Resolve, Wanted};
 use super::sample_planes::Planes;
 use super::sample_positions::{self, Sixteenths};
-use super::texture::{signed_depth, Texture};
+use super::texture::Texture;
 use super::tile_pass::{self, TilePass, TileRefusal};
 use super::view_plan::ViewRecord;
 use super::Device;
@@ -749,6 +749,14 @@ pub(super) struct ColorTarget {
     /// The attachment's sample planes, where a draw of the pass reads it as them
     /// (`sample_planes.rs`; the encoder makes them at the first such draw).
     pub(super) planes: Option<Planes>,
+    /// The clear color of a `Clear` load the device converts with its rounding in question
+    /// (`clear_value::rounds_apart`), whose `device-color-conversion` the pass's load operation
+    /// does not owe: on a driver whose load operation clears as Metal's `Clear` load action does
+    /// (`DriverFact::ColorClearIsMetals`), of an attachment the pass's render area covers. The
+    /// clear made otherwise, before the pass, of an attachment its first instance leaves out
+    /// (`render.rs`), announces it ([`degrade_clear_conversion`]). `None` elsewhere: such a
+    /// clear's note is announced as the pass is laid out ([`layout`]).
+    pub(super) withheld_clear: Option<[f64; 4]>,
 }
 
 impl std::fmt::Debug for ColorTarget {
@@ -772,6 +780,7 @@ impl std::fmt::Debug for ColorTarget {
             .field("unresolved_across", &self.unresolved_across)
             .field("stand_in", &self.stand_in)
             .field("planes", &self.planes)
+            .field("withheld_clear", &self.withheld_clear)
             .finish()
     }
 }
@@ -860,13 +869,6 @@ pub(super) fn degrade_depth_clear(device: &Device, layout: &PassLayout) {
     }
     let facts = (device.shared().textures).facts(device.compile_device().profile());
     if let Some(loss) = facts.denormal_loss(false) {
-        // Where the device stores it, a later pass that loads the depth tests it over the
-        // smallest normal (`texture/signed_depth.rs`); this one tests it as the device does.
-        if facts.depth_images.denormals {
-            let own = ds.stand_in.as_ref().map_or(&ds.target, |s| &s.own);
-            own.texture
-                .switch_on_signed_depth("render_command_encoder", true);
-        }
         device.degrade(Degradation::DepthDenormals, || {
             let format = ds.target.texture.pixel_format();
             let why = format!("a pass clears its depth to the denormal {cleared:e}: {loss}");
@@ -1589,6 +1591,13 @@ pub(super) fn layout(
             ),
         }
         .ok_or_else(not_yet)?;
+        // The device converts a float clear its own way, which can stand a code from Metal's
+        // where the rounding is in question (`clear_value::rounds_apart`), announced once the
+        // render area is known (below); a word attachment's clear is Metal's codes.
+        let withheld_clear = (color.load_action == LoadAction::Clear
+            && word.is_none()
+            && clear_value::rounds_apart(texture.pixel_format(), channels))
+        .then_some(channels);
         let straight_clear = ExtendedRange::of(texture.pixel_format()).and_then(|_| {
             clear_value::color(texture.pixel_format(), channels, ClearRoute::Straight)
         });
@@ -1634,6 +1643,7 @@ pub(super) fn layout(
             unresolved_across,
             stand_in,
             planes: None,
+            withheld_clear,
         }));
     }
     while colors.last().is_some_and(Option::is_none) {
@@ -1770,6 +1780,22 @@ pub(super) fn layout(
         TileRefusal::Nil(problem) => nil(call, Problem::RenderPass(problem)),
         TileRefusal::NotMeasured => Error::NotImplemented(RuntimeGap::TileAtSampleCount),
     })?;
+    // A clear whose rounding is in question is announced, but by the load operation of an
+    // attachment the render area covers on a driver whose load operation clears as Metal's does,
+    // which keeps it for a clear made otherwise (`ColorTarget::withheld_clear`).
+    let metals = device
+        .properties()
+        .driver_facts
+        .contains(&DriverFact::ColorClearIsMetals);
+    for color in colors.iter_mut().flatten() {
+        let Some(clear) = color.withheld_clear else {
+            continue;
+        };
+        if !(metals && color.target.extent == extent) {
+            degrade_clear_conversion(device, color.target.texture.pixel_format(), clear);
+            color.withheld_clear = None;
+        }
+    }
     let fetch_inputs = !colors.is_empty()
         && super::framebuffer_fetch::through_inputs(device.compile_device().profile());
     Ok(PassLayout {
@@ -1876,9 +1902,7 @@ fn target(
     }
     // A view of another format renders in that format (`attachment_format`); a texture without
     // `RenderTarget` usage, through its stand-in, in its own (the module docs), which for a depth
-    // or stencil attachment must hold the aspect: a `Depth32Float` texture held in an
-    // `R32_SFLOAT` image beside a depth twin (`image_plan.rs`) copies into no depth stand-in
-    // exactly.
+    // or stencil attachment must hold the aspect.
     let holds = |format: metal2vulkan::vk::Format| match which {
         Attachment::Color(_) => true,
         Attachment::Depth => format.block().is_some_and(|b| b.depth.is_some()),
@@ -1898,6 +1922,21 @@ fn target(
         samples: facts.samples,
         extent: sub.extent,
     })
+}
+
+/// Announce `device-color-conversion` for a clear of a color attachment of `pf` to `color` that
+/// the device converts with its rounding in question (`clear_value::rounds_apart`).
+pub(super) fn degrade_clear_conversion(device: &Device, pf: PixelFormat, color: [f64; 4]) {
+    device.degrade(Degradation::DeviceColorConversion, || {
+        (
+            format!("a {pf:?} color attachment's clear to {color:?}"),
+            "the device converts the clear color to the format's codes its own way, where \
+             Vulkan leaves a tie, an sRGB encode and a float's rounding to it and Metal's clear \
+             rounds each channel to nearest, a tie to even (a small float's and a shared \
+             exponent's mantissas truncated): a channel can store a code next to Metal's"
+                .to_owned(),
+        )
+    });
 }
 
 /// Whether `target` is not of a 2D image: planes of a 3D image (a 2D view of them), or a 1D
@@ -2070,7 +2109,7 @@ fn depth_stencil(
     let written_nan = nan == Some(NanDepth::Written);
     if written_nan {
         if let Some(target) = &depth {
-            target.texture.degrade_signed_depth(call, true);
+            target.texture.degrade_signed_depth(call);
         }
     }
     let depth_load = match written_nan {
@@ -2078,14 +2117,11 @@ fn depth_stencil(
         false => d.load_action,
     };
     // A new texture's depth pattern, a NaN with the sign set, that the pass loads before a write
-    // covered it: Metal's test compares its magnitude, so the depth is switched on as a write that
-    // may store one switches it, before the pass decides its magnitude stand-in below
+    // covered it: Metal's test compares its magnitude, the device's the value as it is
     // (`fresh_unwritten.rs`).
     if let Some(target) = depth.as_ref().filter(|_| d.load_action == LoadAction::Load) {
-        if FreshUnwritten::loads_signed_depth(device, target)?
-            && !target.texture.switch_on_fresh_pattern()
-        {
-            target.texture.degrade_signed_depth("new_texture", true);
+        if FreshUnwritten::loads_signed_depth(device, target)? {
+            target.texture.degrade_signed_depth("new_texture");
         }
     }
     let clear_depth = match nan {
@@ -2176,39 +2212,13 @@ fn depth_stencil(
     // through a stand-in made for them, each aspect copied in where the pass loads it and back
     // where it stores it (`attachment_stand_in.rs`), as plain Metal renders it at them; so does
     // one without depth/stencil attachment usage.
-    // A depth that may hold a negative value or a NaN, which the pass loads, renders over its
-    // magnitude stand-in, so the device's depth test answers as Metal's
-    // (`texture/signed_depth.rs`): one flag read where the pass loads its depth.
-    let signed = depth
-        .as_ref()
-        .filter(|t| depth_load == LoadAction::Load && t.texture.renders_over_magnitude());
     let cause = match separate.is_none() {
         false => None,
         true if unattachable(&target)? => Some(Cause::Unattachable),
         true if positioned_stand_in(device, descriptor, &target)? => Some(Cause::Positions),
-        true if signed.is_some() => Some(Cause::Magnitude),
         true => None,
     };
-    // Through another image, the pass tests the depth as it is.
-    if let Some(own) = signed.filter(|_| cause != Some(Cause::Magnitude)) {
-        let through = match separate.is_some() {
-            true => "the scratch image of separate depth and stencil textures",
-            false => "a stand-in for the pass's custom sample positions",
-        };
-        signed_depth::degrade_through(device, own, through);
-    }
     let (target, stand_in) = match cause {
-        // The image its texture keeps for the queue, which the pass's copies fill first.
-        Some(Cause::Magnitude) => {
-            let queue = maker.command_queue().id();
-            let stood = attachment_stand_in::kept_backing(maker, &target, queue, true)?;
-            let own = StandIn {
-                own: target,
-                cause: Cause::Magnitude,
-                area: None,
-            };
-            (stood, Some(own))
-        }
         Some(cause) => {
             let stood = attachment_stand_in::stand_in(maker, &target, true)?;
             let own = StandIn {
@@ -2253,6 +2263,23 @@ fn depth_stencil(
         d.depth_resolve_filter,
         s.stencil_resolve_filter,
     )?;
+    // A `Depth16Unorm` clear the device may round up, where Metal's clear truncates
+    // (`clear_value::depth16_rounded`).
+    let depth_pf = d.texture.as_ref().map(Texture::pixel_format);
+    if let Some(pf) = depth_pf.filter(|&pf| {
+        depth_load == LoadAction::Clear
+            && clear_value::depth16_rounded(pf, clear_depth.clamp(0.0, 1.0))
+    }) {
+        device.degrade(Degradation::UnormDepthRounding, || {
+            (
+                format!("a {pf:?} depth attachment's clear to {clear_depth}"),
+                "the device converts the clear depth to its 16-bit code its own way, where \
+                 Metal's clear truncates the depth scaled by 65535: the code can be the one \
+                 above Metal's"
+                    .to_owned(),
+            )
+        });
+    }
     Ok(Some(DepthStencilTarget {
         target,
         depth: depth.map(|_| AspectTarget {
@@ -2261,12 +2288,7 @@ fn depth_stencil(
             late_store: d.store_action == StoreAction::Unknown,
             options: d.store_action_options,
             memoryless: d.texture.as_ref().is_some_and(memoryless),
-            clear: AspectClear::Depth(clear_value::depth(
-                d.texture
-                    .as_ref()
-                    .map_or(PixelFormat::Depth32Float, Texture::pixel_format),
-                clear_depth.clamp(0.0, 1.0),
-            )),
+            clear: AspectClear::Depth(clear_value::depth(clear_depth.clamp(0.0, 1.0))),
             written_nan,
         }),
         stencil: stencil.map(|_| AspectTarget {

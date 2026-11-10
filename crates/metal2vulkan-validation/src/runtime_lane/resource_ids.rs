@@ -55,6 +55,10 @@ use std::time::{Duration, Instant};
 /// the device's or the pipeline's sampler arrays hold (and expects absent elsewhere).
 pub(super) const UNLISTED: [Degradation; 1] = [Degradation::UnlistedArgumentSampler];
 
+/// What a dispatch sampling through an argument buffer announces while a sampler state of pixel
+/// coordinates lives.
+const PIXEL_ARGUMENT: [Degradation; 1] = [Degradation::ArgumentPixelSamplerScaling];
+
 /// The kind [`a_texture_its_heap_array_cannot_view_is_announced_once`] takes.
 pub(super) const UNVIEWABLE: [Degradation; 1] = [Degradation::UnnamedTextureUnviewable];
 
@@ -102,11 +106,31 @@ pub(super) const DELAYED_DEALLOCATORS: [Degradation; 1] = [Degradation::HostDeal
 /// single-sample colour images bound to memory lie as Metal lays a heap texture out
 /// (`DriverFact::ColorImagesLieAsMetalHeapTextures`), or whose route is another than the
 /// optimal image bound there (`texture/heap.rs`, `Device::device_heap_layout`).
-fn heap_texture_kinds(device: &Device, descriptor: &TextureDescriptor) -> BTreeSet<Degradation> {
+///
+/// A texture the device made as a shadow of its elements in Metal's tiles in the heap's bytes
+/// (`tiled`: it moved `WorkCounts::heap_textures_tiled`, the route `texture/heap.rs` takes where
+/// the image it would bind there is itself a shadow or keeps a layout Metal does not, and the
+/// device moves the tiles) lies as Metal lays it out at Metal's answer: it announces that shadow
+/// (`shadowed-texture`) and no route or layout of an image bound there. The lavapipe of the Linux
+/// gate's container takes that route for a `Private` heap's texture.
+fn heap_texture_kinds(
+    device: &Device,
+    descriptor: &TextureDescriptor,
+    tiled: bool,
+) -> BTreeSet<Degradation> {
     let answer = device.heap_texture_size_and_align(descriptor).unwrap();
     let metal = device
         .metal_heap_texture_size_and_align(descriptor)
         .unwrap();
+    if tiled {
+        return forced(&[
+            (
+                Degradation::HeapTextureLargerThanMetal,
+                metal.is_some_and(|metal| answer != metal),
+            ),
+            (Degradation::ShadowedTexture, true),
+        ]);
+    }
     let facts = &device.properties().driver_facts;
     let hides = facts.contains(&DriverFact::CompressedImagesHideAliasedWrites);
     let format = direct_format(descriptor.pixel_format).expect("a direct format");
@@ -618,9 +642,12 @@ fn a_texture_made_in_a_used_heap_after_a_dispatch_is_reached() {
         let mut descriptor = texture_descriptor(&sampling.literal, sampling.usage).unwrap();
         descriptor.resource_options = ResourceOptions::private();
         let mut first = sampling.forced(device);
-        first.extend(heap_texture_kinds(device, &descriptor));
+        let unplaced = descriptor;
         descriptor.placement = IdPlacement::At(id);
+        let made = device.work_counts().heap_textures_tiled;
         let late = heap.new_texture(&descriptor).unwrap();
+        let tiled = device.work_counts().heap_textures_tiled > made;
+        first.extend(heap_texture_kinds(device, &unplaced, tiled));
         let upload = sampling.queue.command_buffer().unwrap();
         sampling.upload(device, &upload, &late);
         upload.commit().unwrap();
@@ -981,6 +1008,7 @@ fn a_heap_s_token_drops_at_its_release_whatever_keeps_its_textures_images() {
         let texture = sampling.texture();
         let mut d = texture_descriptor(&sampling.literal, sampling.usage).unwrap();
         d.resource_options = ResourceOptions::private();
+        let made = device.work_counts().heap_textures_tiled;
         for heap_type in [HeapType::Automatic, HeapType::Placement] {
             for case in ["through its ID", "first move"] {
                 let dropped = Arc::new(AtomicBool::new(false));
@@ -1025,8 +1053,14 @@ fn a_heap_s_token_drops_at_its_release_whatever_keeps_its_textures_images() {
                 assert_eq!(&output, expected, "{what}");
             }
         }
+        let tiled = device.work_counts().heap_textures_tiled > made;
         let mut first = sampling.forced(device);
-        first.extend(heap_texture_kinds(device, &d));
+        first.extend(heap_texture_kinds(device, &d, tiled));
+        // A shadow is announced as its ID's holder once: the command that reaches it through its
+        // ID alone binds the heap set holding it, neither naming it nor making it resident.
+        if tiled {
+            first.insert(UNNAMED_SHADOWS[0]);
+        }
         assert_made_once(messages, &[], &first);
     });
 }
@@ -2136,8 +2170,9 @@ fn late_sampler_states_past_twice_the_class_are_reached_by_their_ids() {
 /// 100003 and sampled through an argument buffer as their address modes say). With 100000
 /// reserved before anything takes a sampler ID, the case's states take IDs past it, and a state
 /// in pixel coordinates standing in the argument buffer for the case's, at the next plain ID,
-/// reads texel (0, 0), where the neutral sampler reads the case's own answer. Nothing is
-/// announced.
+/// reads texel (0, 0), where the neutral sampler reads the case's own answer. The dispatch
+/// samples through an argument buffer while that pixel state lives, which announces
+/// `argument-pixel-sampler-scaling` and nothing else.
 #[test]
 fn sampler_states_past_the_low_window_are_reached_by_their_ids() {
     on_device(|device, messages| {
@@ -2177,7 +2212,7 @@ fn sampler_states_past_the_low_window_are_reached_by_their_ids() {
             corner(),
             "through ID {id}"
         );
-        sampling.announced(device, messages, &[]);
+        sampling.announced(device, messages, &PIXEL_ARGUMENT);
     });
 }
 
@@ -2222,7 +2257,9 @@ const CROWD: u64 = 2048;
 /// ID Metal makes (16380), in pixel coordinates and standing in the argument buffer for the case's
 /// state, reads texel (0, 0) at all four of the case's coordinates (each below 1), as Metal's does
 /// (the M3 Max: bound and through an argument buffer alike), where the neutral
-/// sampler the state would miss to reads the case's own answer; nothing is announced. A state is
+/// sampler the state would miss to reads the case's own answer; the dispatch announces
+/// `argument-pixel-sampler-scaling` alone, sampling through an argument buffer while the pixel
+/// state lives. A state is
 /// left out only where more states live than the arrays hold: the line `SAMPLER-CAPACITY` reports
 /// the device's and the case's pipeline's, and where either holds at most [`CROWD`] elements the
 /// lane makes states past it, announced once (`UNLISTED`), and the command buffer completes with
@@ -2268,7 +2305,7 @@ fn a_sampler_state_at_any_id_is_listed() {
             corner,
             "through ID {high}"
         );
-        sampling.announced(device, messages, &[]);
+        sampling.announced(device, messages, &PIXEL_ARGUMENT);
         let [execution] = &command_buffer.executions()[..] else {
             panic!("one dispatch");
         };
@@ -3251,31 +3288,30 @@ fn reservations_keep_ids_from_plain_allocation() {
     {
         let keep = Arc::clone(&seen);
         // The device's creation notices reach this sink, not the lane's: they are checked here.
-        let (device, level_named) =
-            made_lane_device(TEST_DEVICE, &messages, cache.path(), |options| {
-                options.messages = Some(MessageSink::new(move |message: &DebugMessage| {
-                    let mut seen = keep.lock().unwrap_or_else(|p| p.into_inner());
-                    if message.id_name == LATE_RESERVATION {
-                        seen.0.push(message.clone());
-                    } else if message.degradation.is_some() {
-                        seen.2.push(message.clone());
-                    } else if message.severity == MessageSeverity::Error
-                        || (message.severity == MessageSeverity::Warning && message.kind.validation)
-                    {
-                        let announced = seen.2.iter().any(|notice| {
-                            notice.degradation.as_ref().is_some_and(|notice| {
-                                notice.degradation == Degradation::SetPastLayoutSupport
-                            })
-                        });
-                        if !(announced && unsupported_set::shape(&message.id_name, &message.text)) {
-                            seen.1.push(message.clone());
-                        }
+        let device = made_lane_device(TEST_DEVICE, &messages, cache.path(), |options| {
+            options.messages = Some(MessageSink::new(move |message: &DebugMessage| {
+                let mut seen = keep.lock().unwrap_or_else(|p| p.into_inner());
+                if message.id_name == LATE_RESERVATION {
+                    seen.0.push(message.clone());
+                } else if message.degradation.is_some() {
+                    seen.2.push(message.clone());
+                } else if message.severity == MessageSeverity::Error
+                    || (message.severity == MessageSeverity::Warning && message.kind.validation)
+                {
+                    let announced = seen.2.iter().any(|notice| {
+                        notice.degradation.as_ref().is_some_and(|notice| {
+                            notice.degradation == Degradation::SetPastLayoutSupport
+                        })
+                    });
+                    if !(announced && unsupported_set::shape(&message.id_name, &message.text)) {
+                        seen.1.push(message.clone());
                     }
-                }));
-            })
-            .unwrap();
+                }
+            }));
+        })
+        .unwrap();
         let created = seen.lock().unwrap().2.clone();
-        creation_checked(&device, level_named, &created).unwrap();
+        creation_checked(&device, &created).unwrap();
         let kind = ResourceIdKind::Texture;
         device
             .reserve_resource_ids(kind, &[ResourceId(2), ResourceId(4)])

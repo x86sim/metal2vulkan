@@ -10,7 +10,6 @@ use crate::compare::{compare_run, Unfired};
 use crate::recording::{self, Answer, Lookup, Recording};
 use crate::transcript::{Node, Sites, Transcript};
 use crate::verdict::Verdict;
-use metal2vulkan_runtime::MetalLevel;
 
 /// The reserved site replay emits the degrade notices our run announced at. Metal announces none,
 /// so a recording holds an empty set here and any notice of ours must be justified by naming its
@@ -63,8 +62,6 @@ pub enum ReplayError {
     Stale { case: String, why: String },
     /// The case could not state its own inputs or shaders.
     Case { case: String, why: String },
-    /// The venue answers at a Metal level no release of this runtime names.
-    UnknownMetalLevel { case: String, level: String },
 }
 
 impl std::fmt::Display for ReplayError {
@@ -75,12 +72,6 @@ impl std::fmt::Display for ReplayError {
             }
             ReplayError::Stale { case, why } => write!(out, "{case}: a stale recording: {why}"),
             ReplayError::Case { case, why } => write!(out, "{case}: {why}"),
-            ReplayError::UnknownMetalLevel { case, level } => {
-                write!(
-                    out,
-                    "{case}: the venue answers at an unknown Metal level {level}"
-                )
-            }
         }
     }
 }
@@ -121,13 +112,6 @@ pub fn replay_against(
 ) -> Result<Replayed, ReplayError> {
     let name = case.name();
     let venue = side.venue();
-    let level = MetalLevel::ALL
-        .into_iter()
-        .find(|level| level.macos() == venue.metal_level)
-        .ok_or_else(|| ReplayError::UnknownMetalLevel {
-            case: name.to_owned(),
-            level: venue.metal_level.clone(),
-        })?;
     let inputs = case.inputs().map_err(|why| ReplayError::Case {
         case: name.to_owned(),
         why,
@@ -155,14 +139,14 @@ pub fn replay_against(
     let ours = sites.finish();
     announced.extend(ours.announced_notices().into_keys());
 
-    let answer = match recording.answer(level) {
+    let answer = match recording.answer() {
         Ok(answer) => answer,
-        Err(Lookup::Unrecorded { level }) => {
+        Err(Lookup::Unrecorded { release }) => {
             return Ok(Replayed {
                 case: name.to_owned(),
                 venue,
                 verdict: Verdict::Unrecorded {
-                    why: format!("no Metal answer at Metal level {level}"),
+                    why: format!("no Metal answer at macOS {release}"),
                 },
                 allowances: Allowances::default(),
                 measured_on: None,
@@ -371,4 +355,156 @@ pub fn notice_allowance(code: &str) -> crate::allowance::Allowance {
 /// which run it rests on.
 pub fn shared_memory_notice() -> crate::allowance::Allowance {
     notice_allowance(metal2vulkan_runtime::Degradation::SharedInSystemMemory.code())
+}
+
+/// The declaration a case needs where its kernel reaches a texture or a sampler through an
+/// **argument buffer**: `set-past-layout-support`, which the runtime announces where it makes a
+/// descriptor set layout its driver's `vkGetDescriptorSetLayoutSupport` refuses though the driver
+/// runs it ([`metal2vulkan_runtime::Degradation::SetPastLayoutSupport`]).
+///
+/// **Why it is the venue's and the case's shape.** Such a kernel takes the handle heap, set 1,
+/// whose arrays hold the device's update-after-bind capacity (65536 descriptors each on the M3
+/// Max). MoltenVK answers the layout query by the sum of the bindings' counts against
+/// `maxPerSetDescriptors` (1212 there), ignoring the update-after-bind limits it reports, so it
+/// refuses every such set though it makes and runs it; Vulkan's validation layer reports each one
+/// (`VUID-vkCreateDescriptorSetLayout-support-09582`), and the notice says so. lavapipe supports
+/// the same layouts and announces nothing; Metal recorded nothing. The query is not ours to answer
+/// otherwise: it is asked of the create info the layout is made from.
+///
+/// **It is a declaration and never an excuse**, like [`shared_memory_notice`]: it loosens the
+/// notices site alone, so every value of a case that names it still compares exactly. A case names
+/// it from its own shape (a texture or sampler in an argument buffer that a dispatch reads), never
+/// from the venue, and says in a comment which run it rests on.
+pub fn set_past_layout_notice() -> crate::allowance::Allowance {
+    notice_allowance(metal2vulkan_runtime::Degradation::SetPastLayoutSupport.code())
+}
+
+/// The notices that state **the device's own answer** to an arithmetic or value question, which the
+/// suite holds declared at the notices site for every case ([`native_note_declarations`]).
+///
+/// **Why the suite declares them and no case does.** The owner's rule (AGENTS.md, rule 1) makes the
+/// GPU's native arithmetic the contract: where the device has a native form of an operation, that
+/// form is the only one the runtime builds, and the artifact records a note where it can differ
+/// from Metal's. So such a notice says what the device is, not what a case did wrong, and it fires
+/// in almost every case that does arithmetic, converts a texel or samples. A case naming each one
+/// would state one rule of the suite's a thousand times, and two statements of one rule drift
+/// apart.
+///
+/// **Which notes, and from where.** A kind is here where its documentation (the `PrecisionNote`'s
+/// in the translator, or the runtime's own `Degradation`'s) says the answer is the device's own
+/// native form of an operation rule 1 names, and that no other form is built:
+///
+/// - **maths**: the native-maths class (`native-transcendentals`, `native-division`,
+///   `native-fma`, `native-dot`, `native-mix`, `native-min-max`, `native-nan-encoding`), the
+///   device's functions and precision bounds (`device-transcendentals`, `device-arithmetic`), the
+///   device's denormals and NaN bits (`device-denormals`, `device-nan-encoding`), the device's
+///   rounding of a tiny product (`float-tininess-after-rounding`), and the device's compiler's
+///   grouping and fusion of the fast-math arithmetic the AIR's flags let it rewrite
+///   (`fast-math-rewrites`: the module states each operation in the AIR's order and reproduces no
+///   grouping of Metal's);
+/// - **rounding**: the native-half class (`native-half-conversion`, `native-half-quantize`), and
+///   the device's own depth conversion and depth test (`unorm-depth-rounding`, `depth-denormals`,
+///   `signed-depth-test`);
+/// - **texel, vertex and colour conversions**: `device-texel-conversion`,
+///   `half-texel-conversion`, `srgb-texel-decode`, the device's decode of a BC texture's blocks
+///   (`compressed-texel-decode`), the device's fixed-function conversion of a
+///   normalized vertex attribute (`device-vertex-conversion`), `device-color-conversion`;
+/// - **sampling and filtering**: `device-sampling`, `device-sample-level`, the device's filter of a
+///   generated mipmap chain (`device-filtered-mipmaps`), and Metal's own sampler filtering a
+///   two-plane texture on MoltenVK (`half-sample-filter`, `float-sample-filter`,
+///   `ycbcr-filter-not-exact`);
+/// - **blending**: the device's arithmetic of the blend a function computes into an extended-range
+///   attachment, whose raw codes no blend unit reads (`extended-range-blend-source`,
+///   `extended-range-float-blend-source`: `S·Fs op D·Fd` in `float`, where Metal's compiler rounds
+///   each step to `half`);
+/// - **resolves**: `device-rounded-resolve`;
+/// - **coverage**: the device's own conversion of a fragment's alpha to its coverage under
+///   alpha-to-coverage (`device-alpha-coverage`).
+///
+/// **What is not here**, and stays each case's to declare: a note of what the device **lacks**
+/// (`device-signed-zero-inf-nan`, `device-anisotropic-filter`, `device-point-size`,
+/// `restricted-depth-range`), of an emulation's own precision (`decoded-texel-precision`,
+/// `grad-from-bias`, `pixel-sampler-scaling`, `bicubic-filter-arithmetic`), of a Metal form not
+/// measured or not built (`blended-write-rounding`, `unmeasured-resolve`, `device-interpolation`,
+/// `reduction-order`), and every performance or validity notice.
+///
+/// **It declares the notice, and nothing about a value.** Each entry loosens the notices site
+/// alone, exactly as a case's own [`notice_allowance`] does, so every value of every case still
+/// compares field by field. A value the device's answer moves is still a divergence at its own
+/// site: where the note says validation derives no tolerance from it, as nearly every one of these
+/// does, the suite loosens no value by it either, and the site is a `known-gaps.tsv` row that says
+/// what differs and whose answer it is.
+pub const NATIVE_NOTES: &[metal2vulkan_runtime::Degradation] = {
+    use metal2vulkan_runtime::Degradation as D;
+    &[
+        D::NativeTranscendentals,
+        D::NativeDivision,
+        D::NativeFma,
+        D::NativeDot,
+        D::NativeMix,
+        D::DevicePackConversion,
+        D::NativeMinMax,
+        D::NativeNanEncoding,
+        D::DeviceTranscendentals,
+        D::DeviceArithmetic,
+        D::DeviceDenormals,
+        D::DeviceNanEncoding,
+        D::FloatTininessAfterRounding,
+        D::FastMathRewrites,
+        D::NativeHalfConversion,
+        D::NativeHalfQuantize,
+        D::UnormDepthRounding,
+        D::DepthDenormals,
+        D::SignedDepthTest,
+        D::DeviceTexelConversion,
+        D::HalfTexelConversion,
+        D::SrgbTexelDecode,
+        D::CompressedTexelDecode,
+        D::DeviceVertexConversion,
+        D::DeviceColorConversion,
+        D::DeviceSampling,
+        D::DeviceSampleLevel,
+        D::DeviceFilteredMipmaps,
+        D::HalfSampleFilter,
+        D::FloatSampleFilter,
+        D::YCbCrFilterNotExact,
+        D::ExtendedRangeBlendSource,
+        D::ExtendedRangeFloatBlendSource,
+        D::DeviceRoundedResolve,
+        D::DeviceAlphaCoverage,
+    ]
+};
+
+/// The codes of `announced` the cost and times halves' degraded-set rule counts, sorted and once
+/// each: every one but the device's native answers ([`NATIVE_NOTES`]).
+///
+/// **What the rule is for.** A notice can say the device lacked the exact form and the runtime did
+/// something cheaper, so a count or a time taken with it is of a different amount of work, and
+/// comparing it with one taken without it would read the device's gap as a saving
+/// ([`crate::cost::judge`], [`crate::times::classify`]). A native note never says that: the
+/// device's native form of the operation is the only form the runtime builds, under either policy,
+/// so the work is the same whether the note fired or not. Counting one withheld a verdict from
+/// nearly every case that computes, converts or samples, and made a record taken on a run that did
+/// not provoke a note incomparable with the same work on one that did.
+pub fn degrading(announced: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut codes: Vec<String> = announced
+        .into_iter()
+        .filter(|code| !NATIVE_NOTES.iter().any(|kind| kind.code() == code))
+        .collect();
+    codes.sort();
+    codes.dedup();
+    codes
+}
+
+/// The suite's standing declarations: one [`notice_allowance`] per [`NATIVE_NOTES`] kind, which
+/// [`crate::compare::compare_run`] holds beside every case's own allowances.
+///
+/// They are checked by the same rules as a case's declaration — each covers the notices site
+/// alone, and justifies a difference there only where its own code was announced — but they are
+/// not the case's: they never count among the allowances a case named, so a native note a case's
+/// run did not announce is not reported as an allowance that never fired.
+pub fn native_note_declarations() -> impl Iterator<Item = crate::allowance::Allowance> {
+    NATIVE_NOTES
+        .iter()
+        .map(|kind| notice_allowance(kind.code()))
 }

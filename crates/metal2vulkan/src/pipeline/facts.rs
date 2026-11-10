@@ -284,37 +284,25 @@ pub enum RuntimeFact {
     /// kernel in the emulated tier votes in its scratch instead
     /// (`RuntimeFact::SimdgroupEmulation`).
     PredicationVote,
-    /// The function reads or samples the texture (or texture buffer) bound to the slot with a
-    /// `half` result, or samples it through an emulated linear filter, and Metal's conversion of
-    /// a texel to `half`, or its linear filter's sum, depends on the bound pixel format (a read
-    /// of a 32-bit float texel rounds to nearest even, a sample of one toward zero; a normalized
-    /// texel's value is rounded onto its format's grid first): the slot's `SpecKey::TexelFormat`
-    /// specialization (`metal::texel_format::texel_format`), which the binder sets from the
-    /// bound format.
+    /// The function reads the class of the texture (or texture buffer) bound to the slot, which
+    /// the binder sets from the bound format: the slot's `SpecKey::TexelFormat` specialization
+    /// (`metal::texel_format::texel_format`). A read, gather or sample with a `half` result on a
+    /// device that samples through Metal's own sampler converts its texel by it, Metal's conversion
+    /// depending on the format (a read of a 32-bit float texel rounds to nearest even, a sample of
+    /// one toward zero; a normalized texel's value is rounded onto its format's grid first); an
+    /// 8-bit sRGB slot's raw read, a fetched gather and a NaN texel's rule (the NaN switch) read
+    /// it too.
     TexelFormat { slot: SlotRef },
-    /// The function reads, samples, or gathers the texture bound to the slot in a form whose
-    /// result Metal takes from the raw code of an 8-bit sRGB texel, decoded through its
-    /// twelve-bit table (a read, a nearest sample, or a pixel-coordinate fetch with a `half` or
-    /// `float` result, and a gather with a `half` result; `metal::texel_format`), which the
-    /// device's decode does not reproduce. Bound in such a format
-    /// (`metal::texel_format::srgb_raw`), the slot joins the plan's variant
-    /// (`VariantKey::srgb_textures`, `LoweringInputs::srgb_textures`), under which the function
-    /// reads those texels through a UNORM view of the same image: the slot's
-    /// `ResourceKind::RawTexture` binding and its combined bindings with
-    /// `CombinedSampler::raw`. Bound in any other format, or unbound, the slot leaves the variant,
-    /// and the function reads the texture's own view.
+    /// The function reads, samples, or gathers the texture bound to the slot with a `half` or
+    /// `float` result, which an 8-bit sRGB format bound there would decode. Bound in such a
+    /// format that the device cannot sample, which the runtime holds as the format's UNORM twin
+    /// (`metal::format::srgb_raw_twin`, `metal::texel_format::srgb_twin_on`), the slot joins the
+    /// plan's variant (`VariantKey::srgb_textures`, `LoweringInputs::srgb_textures`), under which
+    /// the function decodes the codes its own binding reads by the MSL transfer through the
+    /// device's `Pow` (`PrecisionNote::SrgbTexelDecode`).
+    /// Bound in any other format, or unbound, the slot leaves the variant, and the function reads
+    /// the device's decode through the texture's own view.
     SrgbTexture { slot: SlotRef },
-    /// The function reads a 16-bit float texel's own 16 bits from a second binding of texture slot
-    /// `slot`, the texture's unsigned integer alias view
-    /// (`metal::format::half_bits_read_view`: `R16_UINT`, `R16G16_UINT` or `R16G16B16A16_UINT`),
-    /// and widens them exactly, as Metal's `texture2d<half>` read answers a 16-bit float texel's
-    /// own code (`HalfTexelBitsPolicy::Exact`). The binder views a bound texture of such a format
-    /// at the slot's `ResourceKind::RawTexture` binding in the alias, and binds the unsigned
-    /// integer neutral there for any other format and for an unbound slot, which the read's own
-    /// arm on the bound class never reads. The slot's own binding stays the texture's own view,
-    /// which its queries and its other classes read.
-    HalfBitsTexture { slot: SlotRef },
-
     /// A `ulong` atomic (`atomic_{min,max}`) updates the `ulong` texture bound to the slot, so the
     /// slot is declared as an `R64ui` storage image: the binder views the bound `RG32Uint` texture
     /// as `R64_UINT`, each texel's low word in R and high word in G one little-endian 64-bit
@@ -440,15 +428,6 @@ pub enum RuntimeFact {
     /// after the command buffer reports its execution as failed, since none of its results is then
     /// Metal's. A run that never reaches such a read is Metal's exactly. Nothing binds it.
     AbsentArgumentRead { stage: Stage },
-    /// Under its `SrgbTexture` variant (`LoweringInputs::srgb_textures`), the function still
-    /// decodes texels of the 8-bit sRGB texture bound to the slot through the device's sampled
-    /// view, in a form the raw codes do not serve (a `float` gather on Metal's own sampler, a
-    /// linear mip filter, a runtime sampler's sample; `PrecisionNote::SrgbTexelDecode`). Where the
-    /// device cannot sample the bound sRGB format, whose texture it holds as the format's UNORM
-    /// twin, the slot's own binding takes the twin's view, and the plan's variant names the slot
-    /// in `VariantKey::srgb_twins`, under which the function decodes what the device samples
-    /// there; without the fact that binding serves queries alone.
-    SrgbDeviceDecode { slot: SlotRef },
     /// The fragment function was compiled under `VariantKey::zeroed_colors`
     /// (`LoweringInputs::zeroed_colors`): it writes zero to color attachment `color`, of pixel
     /// format `format`, which its Metal pipeline lacks and the pass has, as plain Metal stores
@@ -536,19 +515,6 @@ pub enum RuntimeFact {
     /// serve (tests the draw does not state) is refused, as any draw whose variant is refused: the
     /// runtime keeps the color out of the storage form there (the pass splits, or the shadow ends).
     MovableStorageWrites { early_variant: bool },
-    /// On a device that samples through Metal's own sampler (`VkProperty::MetalSampler`:
-    /// MoltenVK on Apple's GPU), the function samples the texture bound to the slot through a
-    /// linear filter, which the device's filter answers as Metal does for every format but the
-    /// two-plane YCbCr ones, whose view holds texels Metal filters by the YCbCr format's own rule
-    /// (`metal::format::ycbcr_format`): bound in such a format, the slot joins the plan's variant
-    /// (`VariantKey::ycbcr_textures`, `LoweringInputs::ycbcr_textures`), under which the function
-    /// emulates Metal's filter of the slot's samples as a device without the property does, and
-    /// notes the samples the emulation does not reach. Bound in any other format, or unbound, the
-    /// slot leaves the variant. Recorded only under `YCbCrFilterPolicy::Exact`, and through Metal's
-    /// own sampler also under `SamplingPolicy::Exact`, as is the same fact on a device that samples
-    /// natively (`VkProperty::DeviceSampling`; `ProfileFields::ycbcr_variant`); under the default
-    /// the device's filter answers the slot as any other's, noted, and no draw makes the variant.
-    YCbCrTexture { slot: SlotRef },
     /// The tile function reads a builtin whose answer depends on its pipeline's
     /// `threadgroupSizeMatchesTileSize` (its threads per threadgroup, simdgroups or quadgroups
     /// per threadgroup or their `dispatch_` forms, its position in the grid, the threads per
@@ -607,22 +573,6 @@ pub enum RuntimeFact {
         formatless: bool,
         multisampled: bool,
         planes: bool,
-    },
-    /// The function writes `half` texels to the storage texture bound to the slot, whose storage
-    /// choice declares no format, and reads whether its channels are 16-bit floats
-    /// (`PushField::TextureHalfChannels`): Metal stores a written half's NaN as the half's own
-    /// bits in a 16-bit float channel and as its conversion of `0x7fc00000` in any other. The
-    /// binder writes 1 for a bound `R16Float`, `RG16Float` or `RGBA16Float` texture
-    /// (`metal::format::half_channels`), and 0 for any other and a neutral.
-    StorageTextureHalfChannels { slot: SlotRef },
-    /// The vertex function was compiled in capture form `form` (`VariantKey::captured_positions`,
-    /// `LoweringInputs::captured_positions`): each vertex it runs writes a 32-byte record of its
-    /// clip position, point size and restart flag from `PushField::CaptureAddress`, at the slot
-    /// `PushField::CaptureLayout` gives it, which the binder writes per draw; the indexed form
-    /// reads its vertices' indices from `PushField::CaptureIndexAddress`. Its plans state the
-    /// variant.
-    CapturedPositions {
-        form: crate::pipeline::lower_inputs::CaptureForm,
     },
     /// The `stage` function samples, gathers, or queries a level of a heap texture of a sampled
     /// float class of one sample, where for a texture a heap holds by its raw texels alone
@@ -731,44 +681,6 @@ pub enum RuntimeFact {
     /// where a Vulkan write of a value the channel cannot represent is undefined. The binder
     /// writes `metal::format::integer_channels_word` of the bound format, and 0 for a neutral.
     StorageTextureIntegerChannels { slot: SlotRef },
-    /// The `stage` function writes `half` texels (where `packed`), or `float` ones, through heap
-    /// handles on a device not measured to store a written `half`'s NaN as its bits
-    /// (`DriverDeviation::MetalHalfTexelWrites`), and stores each half-float member's bits
-    /// through its group's unsigned integer twin (`StorageFormatClass::HalfBits`), which every
-    /// device stores exactly. A member the twin does not hold stores the device's conversion of a
-    /// NaN, not Metal's: a half-float texture that is swizzled or whose image takes no view in
-    /// another format, and where `packed` a packed small float one (`RG11B10Float`,
-    /// `RGB9E5Float`); `bind::heap_write_nans_converted` names such a texture. The module records
-    /// no `PrecisionNote::DeviceNanEncoding` for these writes: the consumer announces it at a
-    /// draw or dispatch whose heap holds such a texture.
-    HeapHalfTexelWrites { stage: Stage, packed: bool },
-    /// The fragment stage writes each depth of a `Depth16Unorm` attachment as Metal's code
-    /// (`LoweringInputs::depth16_codes`), so the device stores Metal's codes without its own
-    /// conversion deciding them. Where `biased`, it stores the depth Metal stores for each fragment,
-    /// its depth bias included: it reads the draw's bias from `PushField::DepthBias`, which the
-    /// binder writes from `BindState::depth_bias`, and adds it to `FragCoord.z` itself, so the
-    /// consumer records the draw's Vulkan depth bias as zero. Otherwise the function returns its
-    /// own depth, which Metal does not bias.
-    Depth16Codes { biased: bool },
-    /// The render pipeline was compiled under `VariantKey::depth16_pass` holding `depth16`: for a
-    /// render pass whose depth is (`depth16`) or is not `Depth16Unorm`, where its own depth format
-    /// says otherwise, so its fragment stage takes Metal's 16-bit codes by the pass's depth
-    /// (`LoweringInputs::depth16_codes`). Its plans state the variant the shape asks for
-    /// (`BindShape::depth16_pass`).
-    Depth16Pass { depth16: bool },
-    /// The render pipeline was compiled under `VariantKey::depth16_biased`: for a draw that biases
-    /// a `Depth16Unorm` depth, on a profile whose unbiased depths the device stores as Metal's
-    /// codes but not its biased ones (`DriverDeviation::MetalDepth16Stores` without
-    /// `DriverDeviation::MetalDepth16BiasedStores`), so its fragment stage adds the bias and
-    /// writes Metal's code itself (`LoweringInputs::depth16_codes`). Its plans state the variant
-    /// the shape asks for (`BindShape::depth16_biased`).
-    Depth16Biased,
-    /// The render pipeline was compiled under `VariantKey::depth16_bias_raises` holding `raises`:
-    /// for a draw whose bias of a `Depth16Unorm` depth the runtime proved never lowers the depth
-    /// (`raises`) or never raises it, so a fragment stage that adds the bias itself declares that
-    /// side (`LoweringInputs::depth16_bias_raises`). Its plans state the variant the shape asks for
-    /// (`BindShape::depth16_bias_raises`).
-    Depth16BiasSide { raises: bool },
     /// The render pipeline draws through synthesized geometry stages, one per topology class, of
     /// which a draw runs its class's (`RenderPipeline::runs_stage`): its fragment function reads
     /// `[[barycentric_coord]]` on a device without `fragmentShaderBarycentric` (`weights`), or its
@@ -792,30 +704,6 @@ pub enum RuntimeFact {
         static_bytes: u32,
         payload: Option<u32>,
     },
-    /// The pipeline (render, mesh render, compute or tile render) was retranslated with some of the
-    /// consumer's exact forms dropped to native, because its largest stage module exceeded the
-    /// device's compiler word bound and that driver faults compiling a module past it
-    /// ([`DriverWorkaround::RegisterAllocatorOverflowsLargeModules`](crate::device::DriverWorkaround::RegisterAllocatorOverflowsLargeModules):
-    /// ANV's register allocator). Each `true` field is an exact form the pipeline would carry under
-    /// the consumer's policy that the fitting translation gave up to fit the bound (`sampling`
-    /// also for Metal's filter of a two-plane YCbCr texture, `YCbCrFilterPolicy::Exact`, which is
-    /// dropped with it; `half_texel_bits` for a 16-bit float texel's own bits, read through the
-    /// unsigned integer alias of a slot the function declares `access::read`
-    /// ([`HalfTexelBitsPolicy::Exact`](crate::device::HalfTexelBitsPolicy::Exact)), whose widening
-    /// at each such read grows the module); the stages carry
-    /// the reduced policy's own precision notes besides. The consumer announces it once per device
-    /// (the runtime's `Degradation::ExactFormsOverCompilerLimit`), naming the pipeline and the forms
-    /// dropped. Nothing binds it.
-    ExactFormsOverCompilerLimit {
-        sampling: bool,
-        float_maths: bool,
-        texel_conversion: bool,
-        half_rounding: bool,
-        nan_and_min_max: bool,
-        rounding_order: bool,
-        half_blend: bool,
-        half_texel_bits: bool,
-    },
     /// The render pipeline was compiled under `VariantKey::quad_primitive_ids`, and its fragment
     /// function reads `[[primitive_id]]` from Vulkan's `PrimitiveId` shifted right by one
     /// (`LoweringInputs::quad_primitive_ids`): for a draw of Metal's private quads or quad strip,
@@ -828,6 +716,29 @@ pub enum RuntimeFact {
     /// `PushHole::CaptureIndexAddress`, each list position run once. Its plans state the variant
     /// the shape asks for (`BindShape::private_list`).
     PrivateList,
+    /// The function reads the texture bound to the slot only as the in-place form of a two-plane
+    /// YCbCr texture reads it (`bind::YCbCrInPlace`): sampled through a constexpr sampler or
+    /// through the runtime sampler slots whose bits `samplers` holds (bit `n` for
+    /// `[[sampler(n)]]` of the slot's stage), read, or its size queried, as a 2D `float` texture.
+    /// Recorded on a profile that reads planes in place (`ProfileFields::ycbcr_in_place`). Where
+    /// the binder binds a texture whose planes are read so (`TextureShape::Texture::ycbcr_in_place`)
+    /// and each of those samplers states a filter the form reads (one filter for minification and
+    /// magnification, no anisotropy, no cubic filter, comparison or reduction), the slot joins the
+    /// plan's variant (`VariantKey::ycbcr_in_place`, `LoweringInputs::ycbcr_in_place`), under
+    /// which the slot's one binding is the planes' texel buffer (`WriteSource::YCbCrInPlace`) and
+    /// every access of it reads the codes and converts them as Metal does, its words in the slot's
+    /// push field (`PushField::YCbCrInPlace`). Elsewhere the slot binds the texture's image as
+    /// before. `device`: every sample of the slot is one the device's own sampler Y′CbCr
+    /// conversion takes (none addresses a border through a constexpr sampler or places a texel
+    /// offset by a parent's size): where the bound texture's planes are also held as an image it
+    /// samples (`TextureShape::Texture::ycbcr_planes_sampler`) and each runtime sampler addresses
+    /// no border on either axis, the slot samples that image instead
+    /// (`VariantKey::ycbcr_planes_sampled`, `bind::YCbCrPlanesSampler`).
+    YCbCrInPlace {
+        slot: SlotRef,
+        samplers: u32,
+        device: bool,
+    },
 }
 
 /// What one compile made of a slot of a `RuntimeFact::UniformViewRange`.

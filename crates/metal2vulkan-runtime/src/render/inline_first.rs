@@ -134,7 +134,6 @@ use crate::clear_reach;
 use crate::device::Device;
 use crate::error::Error;
 use crate::linear_attachment;
-use crate::nan_clear::keeps_nan_sign;
 use crate::render_pass::{ColorTarget, PassLayout};
 use crate::render_target::{
     self, Feedback, FramebufferObject, PassShape, Position, RenderPassObject,
@@ -248,15 +247,8 @@ pub(super) fn opens_inline(
             // late. Else the first action ruled out.
             let loaded = match color.load {
                 LoadAction::Load => (area != layout.extent).then_some(ActionsRefused::UnequalReach),
-                LoadAction::Clear => {
-                    let signed = keeps_nan_sign(target, true);
-                    let format = texture.pixel_format();
-                    match clear_reach::cleared(layout, target.extent, true) == area {
-                        false => Some(ActionsRefused::UnequalReach),
-                        true => crate::clear_value::nan_texel(format, &color.clear, signed)
-                            .map(|_| ActionsRefused::NanClear),
-                    }
-                }
+                LoadAction::Clear => (clear_reach::cleared(layout, target.extent, true) != area)
+                    .then_some(ActionsRefused::UnequalReach),
                 LoadAction::DontCare => Some(ActionsRefused::DontCareLoad),
             };
             let refused = loaded
@@ -314,8 +306,8 @@ impl RenderLowering {
 
     /// Where the pass's first instance may record inline (`Inline::Open`) and the draw about to
     /// record into `next` is its first that records (`records`), decide: where the instance
-    /// allows it (the module docs; `made` its pipeline, `capture` a capture draw, `writes` that
-    /// the draw writes a memoryless color, `stood` a stand-in arriving with it), its render pass
+    /// allows it (the module docs; `made` its pipeline, `writes` that the draw writes a
+    /// memoryless color, `stood` a stand-in arriving with it), its render pass
     /// and framebuffer, and the command buffer the
     /// encoder holds for it, for [`begin_inline`](Self::begin_inline) once the draw installed
     /// its instance; else `None`, and the pass records as before: so for a draw whose `feedback`
@@ -329,14 +321,14 @@ impl RenderLowering {
         &mut self,
         next: &Next,
         stood: Option<&PassLayout>,
-        (records, made, capture, writes): (bool, bool, bool, bool),
+        (records, made, writes): (bool, bool, bool),
         feedback: Feedback,
     ) -> Result<Option<InlineBegin>, Error> {
         let begin = match feedback == Feedback::NONE {
-            true => self.decide_inline(next, stood, (records, made, capture, writes))?,
+            true => self.decide_inline(next, stood, (records, made, writes))?,
             false => {
                 // Decided at this draw: the pass records its first instance in a secondary.
-                if matches!(self.inline, Inline::Open { .. }) && records && !capture {
+                if matches!(self.inline, Inline::Open { .. }) && records {
                     self.inline = Inline::Never;
                     (self.core.device().shared().counts).pass_not_inline(NotInline::Draws);
                 }
@@ -358,12 +350,12 @@ impl RenderLowering {
         &mut self,
         next: &Next,
         stood: Option<&PassLayout>,
-        (records, made, capture, writes): (bool, bool, bool, bool),
+        (records, made, writes): (bool, bool, bool),
     ) -> Result<Option<InlineBegin>, Error> {
         let Inline::Open { splits } = self.inline else {
             return Ok(None);
         };
-        if !records || capture {
+        if !records {
             return Ok(None);
         }
         // Decided at this draw, either way.

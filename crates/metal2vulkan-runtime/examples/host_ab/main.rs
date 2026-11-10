@@ -405,17 +405,15 @@ fn child(side: &str, options: &Options) {
                  requirement_images_made {} arena_pools_made {} owned_descriptor_pools {} \
                  draws_settled {} stage_tables_read {} graphics_pipelines_looked_up {} \
                  draws_pushing_set_zero {} set_zero_writes_pushed {} set_zero_sets_reused {} \
-                 set_zero_sets_found {} draw_shapes_reused {} signed_depth_switch_ons {} \
-                 sign_strips {} \
-                 magnitude_stand_in_passes {} \
+                 set_zero_sets_found {} draw_shapes_reused {} \
                  completed_waits {} bare_starts {} submit_infos {} finales_folded {} \
                  finales_apart {} pending_none {} pending_one {} pending_two_three {} \
                  pending_four_more {}",
                 c.queue_submissions,
                 c.command_buffers_submitted,
-                c.commands_replayed.cmd_pipeline_barrier,
-                c.commands_replayed.cmd_draw,
-                c.commands_replayed.cmd_dispatch,
+                c.commands_recorded.cmd_pipeline_barrier,
+                c.commands_recorded.cmd_draw,
+                c.commands_recorded.cmd_dispatch,
                 c.variant_pipelines_made,
                 c.device_memory_allocated,
                 c.host_pointer_imports_made,
@@ -433,9 +431,6 @@ fn child(side: &str, options: &Options) {
                 c.set_zero_sets_reused,
                 c.set_zero_sets_found,
                 c.draw_shapes_reused,
-                c.signed_depth_switch_ons,
-                c.sign_strips,
-                c.magnitude_stand_in_passes,
                 c.completed_waits,
                 c.bare_starts,
                 c.submit_infos,
@@ -447,14 +442,20 @@ fn child(side: &str, options: &Options) {
                 c.batches_with_four_or_more_pending,
             );
             eprintln!(
-                "runtime replays: command_buffers_replayed {} command_buffers_replayed_inline {} \
-                 scheduler_sleeps {} scheduler_wakes_commit {}",
-                c.command_buffers_replayed,
-                c.command_buffers_replayed_inline,
-                c.scheduler_sleeps,
-                c.scheduler_wakes_commit,
+                "runtime scheduler: scheduler_sleeps {} scheduler_wakes_commit {}",
+                c.scheduler_sleeps, c.scheduler_wakes_commit,
             );
-            eprintln!("runtime commands replayed: {:?}", c.commands_replayed);
+            eprintln!(
+                "runtime submit stalls: idle_submits {} submit_stalls_idle {} \
+                 submit_stalls_on_work {} submits_behind_idle_stalls {} \
+                 wait_behind_idle_stall_longest_nanos {}",
+                c.idle_submits,
+                c.submit_stalls_idle,
+                c.submit_stalls_on_work,
+                c.submits_behind_idle_stalls,
+                c.wait_behind_idle_stall_longest_nanos,
+            );
+            eprintln!("runtime commands recorded: {:?}", c.commands_recorded);
             eprintln!(
                 "runtime notices: {} (bound notices made {}), other messages heard {}",
                 runtime::NOTICES.load(std::sync::atomic::Ordering::Relaxed),

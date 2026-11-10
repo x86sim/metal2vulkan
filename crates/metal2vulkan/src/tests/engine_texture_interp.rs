@@ -56,15 +56,27 @@ fn without(stem: &str, drop: &[VkFeature]) -> DeviceProfile {
     for f in drop {
         desc.features.remove(f);
     }
-    Device::new(desc, crate::pipeline::testing::EXACT_SAMPLING)
+    Device::new(desc, crate::device::DevicePolicy::default())
         .expect("device")
         .profile()
         .clone()
 }
 
 /// Every committed profile, and two without any robustness (so the shader contains itself).
+/// Half `h` as profile `p`'s rounding answers it on the interpreter: itself, but in
+/// `QuantizeForm::Device` (no `shaderFloat16`), whose quantize alone rounds, a half denormal is the
+/// zero of its sign.
+fn quantized(p: &DeviceProfile, h: u16) -> u16 {
+    let device = crate::lower::arith::narrow::quantize_form(p)
+        == crate::spirv::builder::QuantizeForm::Device;
+    match device && h & 0x7C00 == 0 {
+        true => h & 0x8000,
+        false => h,
+    }
+}
+
 fn profiles() -> Vec<(String, DeviceProfile)> {
-    let mut out = crate::spirv::testing::committed_exact_profiles().expect("profiles");
+    let mut out = crate::spirv::testing::committed_profiles().expect("profiles");
     let all = [
         VkFeature::RobustImageAccess,
         VkFeature::RobustImageAccess2,
@@ -121,8 +133,6 @@ fn resources(plan: &Plan, init: &[Vec<u8>]) -> Resources {
             // 0: no channel narrower than the written word, every integer lane as written (the
             // interpreter's images hold words; the kernels write in-range values).
             (PushField::TextureIntegerChannels(_), PushLoc::Push { .. }) => {}
-            // No slot's writes dropped: the word stays 0.
-            (PushField::Specialized(crate::pipeline::sym::SpecKey::DroppedStoreSlots(_)), _) => {}
             other => panic!("unexpected push field {other:?}"),
         }
     }
@@ -533,13 +543,17 @@ fn short_texels_sign_extend_and_half_reads_round() {
     assert!(ran > 0);
 }
 
-/// A `half` read converts its texel by the bound format's class, the slot's `TexelFormat`
-/// specialization: a 32-bit float texel to nearest even, half denormals kept; a 16-bit normalized
-/// texel's code value `c / 65535` correctly rounded, where rounding the `f32` value would round
-/// twice (`65455` and `65519`); a format whose conversion is not measured (the default) takes every
-/// other `half` texel's exact rounding, which keeps a half denormal.
+/// A `half` read rounds its `f32` texel to nearest even, half denormals kept, on every profile: on
+/// one with Metal's own sampler (`VkProperty::MetalSampler`) whatever the bound format's class,
+/// the slot's `TexelFormat` specialization, a 16-bit normalized texel's `f32` value of `65455 /
+/// 65535` and `65519 / 65535` too, which rounds twice there (one `half` unit in the last place
+/// above Metal's correctly rounded `c / 65535`, noted under the bound format); on any other
+/// profile with no class. Both record `PrecisionNote::HalfTexelConversion`. On a profile without `shaderFloat16` the rounding is the
+/// device's quantize alone (`PrecisionNote::NativeHalfQuantize`), whose result below the smallest
+/// normal half the interpreter gives as the zero of its sign.
 #[test]
 fn half_reads_convert_by_the_bound_format() {
+    use crate::device::requirements::VkProperty;
     use crate::metal::texel_format::texel_format;
     use crate::metal::PixelFormat;
     use crate::pipeline::artifact::PrecisionNote;
@@ -565,7 +579,7 @@ fn half_reads_convert_by_the_bound_format() {
         (
             Some(texel_format(PixelFormat::RGBA16Unorm).0),
             [unorm16(65455), unorm16(65519), unorm16(1), unorm16(65535)],
-            [0x3BFD, 0x3BFF, 0x0100, 0x3C00],
+            [0x3BFE, 0x3C00, 0x0100, 0x3C00],
         ),
     ];
     let mut ran = 0;
@@ -573,8 +587,14 @@ fn half_reads_convert_by_the_bound_format() {
         let Some((plan, m)) = module(&bc, "short_texels", &stem, &p) else {
             continue;
         };
-        assert!(
+        let metal = p
+            .fields()
+            .enabled
+            .properties
+            .contains(&VkProperty::MetalSampler);
+        assert_eq!(
             plan.facts.contains(&RuntimeFact::TexelFormat { slot }),
+            metal,
             "{stem}"
         );
         assert!(
@@ -582,6 +602,9 @@ fn half_reads_convert_by_the_bound_format() {
             "{stem}"
         );
         for (class, texel, want) in cases {
+            if class.is_some() && !metal {
+                continue;
+            }
             let s = Image::new(texture(0), [2, 2, 1], 1, 1, 1);
             let d = Image::new(texture(1), [2, 2, 1], 1, 1, 1);
             let mut h = Image::new(texture(2), [4, 4, 2], 1, 2, 1);
@@ -605,7 +628,11 @@ fn half_reads_convert_by_the_bound_format() {
                 .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
-            assert_eq!(halves, want, "{stem} class {class:?}");
+            assert_eq!(
+                halves,
+                want.map(|h| quantized(&p, h)),
+                "{stem} class {class:?}"
+            );
         }
         ran += 1;
     }
@@ -613,11 +640,12 @@ fn half_reads_convert_by_the_bound_format() {
 }
 
 /// A `half` read keeps the texel's exact value: a half-float texel, which the device decodes to its
-/// exact `f32` value, reads back bit for bit, every half subnormal, both zeros, both infinities,
-/// `±65504`, and NaN payloads included; a 32-bit float texel rounds to nearest even onto the half
-/// grid, subnormals kept, past `65504` to the infinity. The interpreter gives `OpQuantizeToF16`'s
-/// result below the smallest normal half as the zero of the input's sign and its NaN as `0x7E00`,
-/// so a bare quantize fails here.
+/// exact `f32` value, reads back bit for bit, every half subnormal, both zeros, both infinities and
+/// `±65504` included, and a NaN as a NaN, its bits the rounding's (`DeviceNanEncoding`); a 32-bit
+/// float texel rounds to nearest even onto the half grid, subnormals kept, past `65504` to the
+/// infinity. On a profile without `shaderFloat16` the rounding is the device's quantize alone
+/// (`PrecisionNote::NativeHalfQuantize`), whose result below the smallest normal half the
+/// interpreter gives as the zero of the input's sign; every other answer is the same.
 #[test]
 fn half_reads_keep_subnormals_zeros_infinities_and_nans() {
     let Some(bc) = fixture() else {
@@ -670,16 +698,28 @@ fn half_reads_keep_subnormals_zeros_infinities_and_nans() {
                 .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
-            assert_eq!(got, want, "{stem}: texel {texel:08x?}");
+            let nan = |h: u16| h & 0x7C00 == 0x7C00 && h & 0x3FF != 0;
+            let want = want.map(|h| quantized(&p, h));
+            let same = got.len() == want.len()
+                && got
+                    .iter()
+                    .zip(&want)
+                    .all(|(&g, &w)| g == w || (nan(g) && nan(w)));
+            assert!(
+                same,
+                "{stem}: texel {texel:08x?}: {got:04x?} for {want:04x?}"
+            );
         }
         ran += 1;
     }
     assert!(ran > 0);
 }
 
-/// A depth read is the texel's first component; a multisampled read reads its sample.
+/// A depth read is the texel's first component, the device's value with no class of the bound
+/// format; a multisampled read reads its sample.
 #[test]
 fn depth_and_multisample_reads_read_their_texel() {
+    use crate::pipeline::facts::RuntimeFact;
     let Some(bc) = fixture() else {
         return;
     };
@@ -688,6 +728,13 @@ fn depth_and_multisample_reads_read_their_texel() {
         let Some((plan, m)) = module(&bc, "depth_ms", &stem, &p) else {
             continue;
         };
+        assert!(
+            !plan
+                .facts
+                .iter()
+                .any(|f| matches!(f, RuntimeFact::TexelFormat { .. })),
+            "{stem}"
+        );
         let mut dp = Image::new(texture(0), [2, 2, 1], 1, 1, 1);
         dp.texels[0] = [fl(0.75), fl(9.0), fl(9.0), fl(9.0)];
         let mut ms = Image::new(texture(1), [2, 2, 1], 1, 1, 4);
@@ -699,73 +746,6 @@ fn depth_and_multisample_reads_read_their_texel() {
         let (bufs, _) =
             run_both(&m, &res, &[dp, ms], [1, 1, 1]).unwrap_or_else(|e| panic!("{stem}: {e:?}"));
         assert_eq!(words(&bufs[0]), [fl(0.75), fl(-5.0)], "{stem}");
-        ran += 1;
-    }
-    assert!(ran > 0);
-}
-
-/// A depth read with a `float` result converts its texel by the bound format's class, the slot's
-/// `TexelFormat` specialization, on a profile without Metal's own sampler: a `Depth16Unorm`
-/// texel the device gives as its code times the reciprocal (lavapipe) reads `c / 65535`
-/// correctly rounded, Metal's, and a `Depth32Float` texel reads as given. On
-/// a profile with Metal's own sampler the device's value is Metal's, and the read takes no class.
-#[test]
-fn a_depth_read_converts_by_the_bound_format() {
-    use crate::device::requirements::VkProperty;
-    use crate::metal::texel_format::texel_format;
-    use crate::metal::PixelFormat;
-    use crate::pipeline::facts::RuntimeFact;
-    use crate::pipeline::sym::{SlotClass, SlotRef};
-    let Some(bc) = fixture() else {
-        return;
-    };
-    let slot = SlotRef {
-        stage: Stage::Kernel,
-        class: SlotClass::Texture,
-        index: 0,
-    };
-    // A code whose reciprocal product is not its quotient.
-    let code = (1..65535u16)
-        .find(|&c| f32::from(c) * (1.0 / 65535.0) != f32::from(c) / 65535.0)
-        .expect("a code the reciprocal misses");
-    let reciprocal = f32::from(code) * (1.0 / 65535.0);
-    let metal = f32::from(code) / 65535.0;
-    let mut ran = 0;
-    for (stem, p) in profiles() {
-        let Some((plan, m)) = module(&bc, "depth_ms", &stem, &p) else {
-            continue;
-        };
-        let metal_sampler = p
-            .fields()
-            .enabled
-            .properties
-            .contains(&VkProperty::MetalSampler);
-        assert_eq!(
-            plan.facts.contains(&RuntimeFact::TexelFormat { slot }),
-            !metal_sampler,
-            "{stem}"
-        );
-        if metal_sampler {
-            continue;
-        }
-        for (pf, texel, want) in [
-            (PixelFormat::Depth16Unorm, reciprocal, metal),
-            (PixelFormat::Depth32Float, reciprocal, reciprocal),
-        ] {
-            let mut dp = Image::new(texture(0), [2, 2, 1], 1, 1, 1);
-            dp.texels[0] = [fl(texel), fl(9.0), fl(9.0), fl(9.0)];
-            let ms = Image::new(texture(1), [2, 2, 1], 1, 1, 4);
-            let mut res = resources(&plan, &[vec![0; 8]]);
-            res.spec
-                .insert(SpecKey::TexelFormat(slot), u64::from(texel_format(pf).0));
-            res.spec.insert(
-                SpecKey::PlainHalfTexels(slot),
-                u64::from(texel_format(pf).plain_on_metal_sampler()),
-            );
-            let (bufs, _) = run_both(&m, &res, &[dp, ms], [1, 1, 1])
-                .unwrap_or_else(|e| panic!("{stem}: {e:?}"));
-            assert_eq!(words(&bufs[0])[0], fl(want), "{stem} {pf:?} code {code}");
-        }
         ran += 1;
     }
     assert!(ran > 0);

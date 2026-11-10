@@ -66,17 +66,6 @@ impl Drop for Scratch {
     }
 }
 
-/// The default policy with Metal's sampler emulated exactly (`SamplingPolicy::Exact`): the policy
-/// of a test of the sampler's emulation, which native device sampling, the default, skips on a
-/// device whose sampler is not Metal's. Every other answer is Metal's too
-/// (`DevicePolicy::exact_answers`): the emulation's arithmetic (its cube face reciprocal and fused
-/// multiply-adds), its texels and a read's, its `half` roundings, and its NaNs, minimum and maximum
-/// and rounding order.
-pub const EXACT_SAMPLING: DevicePolicy = DevicePolicy {
-    sampling: crate::device::SamplingPolicy::Exact,
-    ..DevicePolicy::UNTRUSTED.exact_answers()
-};
-
 /// The description of committed profile `stem` (`validation/profiles/<stem>.json`).
 pub fn description(stem: &str) -> Result<DeviceDescription, String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -160,28 +149,10 @@ pub fn storage_buffers(a: &FunctionArtifact) -> u32 {
         .sum()
 }
 
-/// The default policy with the translation's routines of Metal's maths
-/// (`FloatMathsPolicy::Exact`), Metal's `half` rounding (`HalfRoundingPolicy::Exact`), and Metal's
-/// NaN, minimum and maximum and rounding order (`NanMinMaxPolicy::Exact`,
-/// `RoundingOrderPolicy::Exact`): the policy of the tests of those routines, which the device's
-/// forms, the defaults, leave off a device whose functions are not Metal's. The texel conversions
-/// are the default's.
+/// The default policy with Metal's answers wherever a choice still offers them
+/// ([`DevicePolicy::exact_answers`]).
 pub fn exact_maths() -> DevicePolicy {
-    let native = DevicePolicy::default();
-    DevicePolicy {
-        texel_conversion: native.texel_conversion,
-        ..native.exact_answers()
-    }
-}
-
-/// The default policy with Metal's `half` rounding (`HalfRoundingPolicy::Exact`): the policy of a
-/// test of the integer rounding's or a measured form's words, which native half rounding, the
-/// default, replaces off Apple's GPUs.
-pub fn exact_half() -> DevicePolicy {
-    DevicePolicy {
-        half_rounding: crate::device::HalfRoundingPolicy::Exact,
-        ..DevicePolicy::default()
-    }
+    DevicePolicy::default().exact_answers()
 }
 
 /// A fresh per-attempt meter with the standard caps and no deadline.
@@ -250,8 +221,6 @@ pub fn fragment_inputs(
     inputs.rotated_colors = crate::pipeline::color_writes::rotated_colors(&r.color_attachments, p);
     inputs.alpha_in_red_colors =
         crate::pipeline::color_writes::alpha_in_red_colors(&r.color_attachments, p);
-    inputs.half_output_lanes =
-        crate::pipeline::color_writes::half_output_lanes(&r.color_attachments);
     inputs.rotated_factors =
         crate::pipeline::color_writes::rotated_factors(&r.color_attachments, p);
     inputs.rotated_blends = crate::pipeline::color_writes::rotated_blends(&r.color_attachments, p);
@@ -273,25 +242,6 @@ pub fn compile_with(
         &FunctionConstantValues::defaults(),
         p,
         inputs,
-        &mut meter(),
-        SPIRV_WORDS,
-    )
-}
-
-/// [`compile`] with the function constants `consts` supplied: the artifact a pipeline built with
-/// those values holds.
-pub fn compile_specialized(
-    bitcode: &[u8],
-    entry: &str,
-    p: &DeviceProfile,
-    consts: &FunctionConstantValues,
-) -> Result<Arc<FunctionArtifact>, Error> {
-    compile_bitcode(
-        bitcode,
-        EntryRef::Name(entry),
-        consts,
-        p,
-        &LowerInputs::new(),
         &mut meter(),
         SPIRV_WORDS,
     )
@@ -423,13 +373,9 @@ fn typed_module_of(
     )?;
     let memory = crate::memory::static_root::analyze_memory(&spec, p, m)?;
     let plan = crate::lower::select::select(&spec, &memory, p, inputs, m)?;
-    let crate::lower::emit::Emitted {
-        mut module,
-        loop_free,
-        ..
-    } = crate::lower::emit::emit_module(&spec, &plan, m)?;
+    let crate::lower::emit::Emitted { mut module, .. } =
+        crate::lower::emit::emit_module(&spec, &plan, m)?;
     crate::spirv::roll::roll_entry(&mut module, m)?;
-    crate::spirv::dead::take_outside_loops(&mut module, &loop_free, m)?;
     crate::spirv::helper_branches::guard_for(&mut module, p, m)?;
     crate::spirv::verify::verify(&module, p, m)?;
     Ok((plan, module))
@@ -470,98 +416,6 @@ pub fn zero_relocations(a: &FunctionArtifact, words: &[u32]) -> Vec<u32> {
         }
     }
     out
-}
-
-/// The result ids of each product check's scaling multiply in module `words`
-/// (`denormal::tiny_product` under `TinyCheck::Fused`, `|a| · 2^48`): an `OpFMul` of a 32-bit
-/// `float` constant `2^48`, or of a vector of them. So a test counts the check's own instructions
-/// apart from the caller's.
-pub fn tiny_check_scales(words: &[u32]) -> Vec<u32> {
-    use crate::spv::Op;
-    const SCALE: u32 = 0x5780_0000;
-    let (mut floats, mut scales, mut results) = (Vec::new(), Vec::new(), Vec::new());
-    let mut i = 5;
-    while i < words.len() {
-        let (len, op) = ((words[i] >> 16) as usize, words[i] & 0xFFFF);
-        assert!(len > 0 && i + len <= words.len(), "malformed module");
-        let at = &words[i..i + len];
-        if op == Op::TypeFloat as u32 && at[2] == 32 {
-            floats.push(at[1]);
-        }
-        if op == Op::Constant as u32 && len == 4 && floats.contains(&at[1]) && at[3] == SCALE {
-            scales.push(at[2]);
-        }
-        if op == Op::ConstantComposite as u32
-            && len > 3
-            && at[3..].iter().all(|c| scales.contains(c))
-        {
-            scales.push(at[2]);
-        }
-        if op == Op::FMul as u32 && (scales.contains(&at[3]) || scales.contains(&at[4])) {
-            results.push(at[2]);
-        }
-        i += len;
-    }
-    results
-}
-
-/// The module `words` without the math library's routines: the functions of exactly one
-/// parameter, which answer Metal's function of one operand where the device's instruction does
-/// not, and the functions only they call, which they divide and take roots through (the precise
-/// division's routine). So a test reads an entry's own instructions around their calls. The entry
-/// (no parameter), and what it calls itself (the fast division's routine of two), stay.
-pub fn without_math_routines(words: &[u32]) -> Vec<u32> {
-    // Each function: its words, its result id, its parameters, and the functions it calls.
-    let mut functions: Vec<(std::ops::Range<usize>, u32, usize, Vec<u32>)> = Vec::new();
-    let mut entries = Vec::new();
-    let mut i = 5;
-    while i < words.len() {
-        let (len, op) = ((words[i] >> 16) as usize, words[i] & 0xFFFF);
-        assert!(len > 0 && i + len <= words.len(), "malformed module");
-        if op == crate::spv::Op::EntryPoint as u32 {
-            entries.push(words[i + 2]);
-        }
-        if op == crate::spv::Op::Function as u32 {
-            functions.push((i..i, words[i + 2], 0, Vec::new()));
-        }
-        if let Some((range, _, params, calls)) = functions.last_mut().filter(|f| f.0.is_empty()) {
-            if op == crate::spv::Op::FunctionParameter as u32 {
-                *params += 1;
-            }
-            if op == crate::spv::Op::FunctionCall as u32 {
-                calls.push(words[i + 3]);
-            }
-            if op == crate::spv::Op::FunctionEnd as u32 {
-                range.end = i + len;
-            }
-        }
-        i += len;
-    }
-    let mut dropped: Vec<u32> = functions.iter().filter(|f| f.2 == 1).map(|f| f.1).collect();
-    loop {
-        let only_theirs = functions.iter().map(|f| f.1).find(|&id| {
-            let mut callers = functions.iter().filter(|f| f.3.contains(&id));
-            !dropped.contains(&id)
-                && !entries.contains(&id)
-                && callers.clone().next().is_some()
-                && callers.all(|f| dropped.contains(&f.1))
-        });
-        match only_theirs {
-            Some(id) => dropped.push(id),
-            None => break,
-        }
-    }
-    let mut keep = vec![true; words.len()];
-    for (range, id, _, _) in &functions {
-        if dropped.contains(id) {
-            keep[range.clone()].fill(false);
-        }
-    }
-    words
-        .iter()
-        .zip(keep)
-        .filter_map(|(w, k)| k.then_some(*w))
-        .collect()
 }
 
 /// The instructions of the module `words` after its header: each opcode with its whole
@@ -656,7 +510,6 @@ pub fn interlocked_coherence(words: &[u32]) -> Result<CoherentAccesses, String> 
     let mut constants: HashMap<u32, u32> = HashMap::new();
     let mut types: HashMap<u32, u32> = HashMap::new();
     let mut roots: HashMap<u32, u32> = HashMap::new();
-    let mut selected: HashMap<u32, (u32, u32)> = HashMap::new();
     let at = |inst: &[u32], i: usize| -> Result<u32, String> {
         inst.get(i)
             .copied()
@@ -697,25 +550,11 @@ pub fn interlocked_coherence(words: &[u32]) -> Result<CoherentAccesses, String> 
                     roots.insert(at(inst, 2)?, r);
                 }
             }
-            // A selected pointer (a dropped store's place, `lower::access::sink`) has the roots of
-            // both arms: it is coherent only where each one is.
-            Op::Select => {
-                let (a, b) = (at(inst, 4)?, at(inst, 5)?);
-                if roots.contains_key(&a) && roots.contains_key(&b) {
-                    selected.insert(at(inst, 2)?, (a, b));
-                }
-            }
             _ => {}
         }
     }
     let device_scope = |id: u32| constants.get(&id) == Some(&DEVICE);
-    let decorated = |id: u32| {
-        let own = |id: u32| roots.get(&id).is_some_and(|r| coherent.contains(r));
-        match selected.get(&id) {
-            Some(&(a, b)) => own(a) && own(b),
-            None => own(id),
-        }
-    };
+    let decorated = |id: u32| roots.get(&id).is_some_and(|r| coherent.contains(r));
     for (op, inst) in &insts {
         let (ptr, mask_at, load) = match op {
             Op::Load => (at(inst, 3)?, 4, true),

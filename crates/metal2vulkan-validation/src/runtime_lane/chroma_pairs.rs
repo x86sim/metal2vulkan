@@ -14,19 +14,26 @@
 //! - A kernel that only writes the texture completes and leaves it as it was, as plain Metal's
 //!   `write()` does (its validation stops the binding).
 //! - A kernel reads and samples Metal's texels (`metal2vulkan::bind::ChromaDecode`, matched
-//!   against an Apple M3 Max's reads by its own tests) through the texture's decoded twin,
-//!   announced `carried-decoded-twin` once and `decoded-texel-precision` never: a new texture's
-//!   opaque black, then after a CPU copy of the whole texture and of part of two rows, a blit
-//!   from a buffer of the whole texture and of part of a row, and a copy from another texture,
-//!   each decoded into the twin in whole rows (a blit's by a GPU decode pass, a CPU copy's by one
-//!   or on the CPU, counted in `WorkCounts`; [`four_two_two_texels_read_as_metal_s`]).
+//!   against an Apple M3 Max's reads by its own tests; where the device does not sample through
+//!   Metal's own texture unit, within its conversion of the codes, announced
+//!   `device-texel-conversion`: `converted_holds`) through the texture's decoded twin,
+//!   announced `carried-decoded-twin` once: a new texture's opaque black, then after a CPU copy
+//!   of the whole texture and of part of two rows, a blit from a buffer of the whole texture and
+//!   of part of a row, and a copy from another texture, each decoded into the twin in whole rows
+//!   (a blit's by a GPU decode pass, a CPU copy's by one or on the CPU, counted in `WorkCounts`;
+//!   [`four_two_two_texels_read_as_metal_s`]). Where the device converts the format itself with
+//!   Metal's reconstruction (`WorkCounts::chroma_device_twins`: MoltenVK), the twin holds the
+//!   device's own conversion of the pairs, its red and blue within a code of Metal's and its
+//!   green Metal's, every decode a GPU pass, announced `decoded-texel-precision` once; elsewhere
+//!   never.
 //! - A render pipeline state of the format, which Metal's own validation aborts plain too, and a
 //!   render pass into the texture, whose clear plain Metal stores in the format's encoding (not
 //!   built), are refused typed (`Unsupported`, `Feature::Format`).
 
 use super::astc_textures::{read_whole, reader};
 use super::degrade_notices::{counts, on_device};
-use super::{buffer_with, read_buffer, WAIT};
+use super::pixel_samplers::metal_sampler;
+use super::{buffer_with, converted_holds, read_buffer, WAIT};
 use crate::air_library::AirLibrary;
 use metal2vulkan::bind::ChromaDecode;
 use metal2vulkan::error::Feature;
@@ -511,26 +518,38 @@ fn metal_texels(pf: PixelFormat, bytes: &[u8]) -> Vec<[f32; 4]> {
 /// rows, whose red and blue change beside the region too, then after a blit of the whole texture
 /// and of 6 x 1 texels; a `Private` texture's after a copy from the `Shared` one. Each read is a
 /// command buffer after the write. The CPU copies' decodes are a GPU pass or the CPU's, the
-/// blits' GPU passes; the twin announces `carried-decoded-twin` once.
+/// blits' GPU passes; the twin announces `carried-decoded-twin` once, and `cpu-block-decode` once
+/// where a CPU copy decoded on the CPU.
 #[test]
 fn four_two_two_texels_read_as_metal_s() {
     on_device(|device, messages| {
         let name = device.name().to_owned();
         let state = reader(device);
+        let exact = metal_sampler(device);
         let usage = TextureUsage::SHADER_READ;
         let decodes = |device: &Device| {
             let counts = device.work_counts();
             (counts.block_decode_passes, counts.cpu_block_decodes)
         };
         let mut wrong = Vec::new();
+        // The device's own conversion of the pairs (the module docs): red and blue within a
+        // code of Metal's, each the device's nearest code.
+        let converts = |device: &Device| device.work_counts().chroma_device_twins > 0;
         let check =
             |wrong: &mut Vec<String>, what: &str, pf: PixelFormat, t: &Texture, bytes: &[u8]| {
                 assert_eq!(bytes_of(device, t), bytes, "{pf:?} {what}: its bytes");
                 let got = read_whole(device, &state, t);
                 let want = metal_texels(pf, bytes);
+                let device_conversion = converts(device);
                 for (at, (got, want)) in got.iter().zip(&want).enumerate() {
                     for c in 0..4 {
-                        if got[c].to_bits() != want[c].to_bits() && wrong.len() < 24 {
+                        let holds = match c {
+                            0 | 2 if device_conversion => {
+                                (got[c] - want[c]).abs() <= 1.0 / 255.0 + 1e-6
+                            }
+                            _ => converted_holds(got[c], want[c], exact),
+                        };
+                        if !holds && wrong.len() < 24 {
                             wrong.push(format!(
                                 "{pf:?} {what}, texel {at} channel {c}: {} against Metal's {}",
                                 got[c], want[c]
@@ -617,8 +636,25 @@ fn four_two_two_texels_read_as_metal_s() {
                 announced(Degradation::CarriedDecodedTwin),
                 announced(Degradation::DecodedTexelPrecision)
             ),
-            (1, 0),
+            (1, usize::from(converts(device))),
             "on {name}"
+        );
+        if converts(device) {
+            assert_eq!(
+                device.work_counts().cpu_block_decodes,
+                0,
+                "every decode a GPU pass where the device converts the format, on {name}"
+            );
+        }
+        assert_eq!(
+            announced(Degradation::DeviceTexelConversion),
+            usize::from(!exact),
+            "the device's conversion of the codes, on {name}"
+        );
+        assert_eq!(
+            announced(Degradation::CpuBlockDecode),
+            usize::from(device.work_counts().cpu_block_decodes > 0),
+            "the CPU copies' decodes on the CPU, on {name}"
         );
     });
 }

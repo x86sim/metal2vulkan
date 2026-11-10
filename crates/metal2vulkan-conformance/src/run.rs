@@ -89,12 +89,10 @@ fn one_replay_pass(
             (Ok(before), Ok(after)) => Ok(after.since(&before)),
             (Err(why), _) | (_, Err(why)) => Err(why),
         };
-        let mut degraded: Vec<String> = match &replayed {
-            Ok(replayed) => replayed.ours.announced_notices().into_keys().collect(),
+        let degraded = match &replayed {
+            Ok(replayed) => crate::replay::degrading(replayed.ours.announced_notices().into_keys()),
             Err(_) => Vec::new(),
         };
-        degraded.sort();
-        degraded.dedup();
         report.add_cost(cost_row(
             case.as_ref(),
             &venue_label,
@@ -269,8 +267,7 @@ pub fn cost_on_under(
                 format!("{what}, at {}", abort.at)
             });
             announced.extend(sites.finish().announced_notices().into_keys());
-            announced.sort();
-            announced.dedup();
+            let announced = crate::replay::degrading(announced);
             if round == 0 {
                 held.push(CaseCost {
                     case: case.name().to_owned(),
@@ -335,7 +332,7 @@ pub fn cost_alone_on_under(
 ) -> Result<(String, Vec<CaseCost>), String> {
     // This is the leg that must not be chained onto a whole-set leg inside one process, however
     // convenient that looks: it inherits the other leg's threads and reads a different number.
-    // `bc1-rgba` reads `commands_replayed.cmd_dispatch` 4 and `command_buffers_deferred` 6 in
+    // `bc1-rgba` reads `commands_recorded.cmd_dispatch` 4 and `command_buffers_deferred` 6 in
     // three invocations out of three on its own, and 0 for both when this leg follows a whole-set
     // one, because whether a deferred replay lands inside a case's window is not the same question
     // after 393 cases have run. Measured that way the contrast called 6,843 counts
@@ -498,12 +495,11 @@ pub fn record_all(cases: &[Box<dyn Case>]) -> Vec<(String, Result<std::path::Pat
 #[cfg(target_os = "macos")]
 fn record_one(case: &dyn Case) -> Result<std::path::PathBuf, String> {
     use crate::recording::Validated;
-    let level = metal2vulkan_runtime::MetalLevel::NEWEST;
     let answer = match case.metal_source() {
         crate::case::MetalSource::Run => {
             let validated = crate::validated::take(case).map_err(|error| error.to_string())?;
             let mut side = crate::metal_side::MetalSide::new()?;
-            crate::record::record(case, &mut side, case.record_runs(), level, validated)
+            crate::record::record(case, &mut side, case.record_runs(), validated)
                 .map_err(|error| error.to_string())?
         }
         // Never run, and never written from here either: the call this row names is the call
@@ -524,7 +520,6 @@ fn record_one(case: &dyn Case) -> Result<std::path::PathBuf, String> {
                 .carried_transcript()?
                 .ok_or_else(|| format!("{}: it carries no answer", case.name()))?;
             crate::record::carried(
-                level,
                 from,
                 measured_on,
                 crate::recording::ORACLE_CHIP,
@@ -610,7 +605,7 @@ fn open(venues: Venues, policy: Policy) -> Result<Open, String> {
 /// descriptor sets across cases, and **a fresh device each round**, because a warm recycler is not
 /// what a first run meets.
 ///
-/// This leg and [`metal_times`] are run as two phases rather than case by case, and the reason is
+/// This leg and `metal_times` (macOS) are run as two phases rather than case by case, and the reason is
 /// a measurement hazard rather than tidiness: the `elsewhere` attribution reads the **whole
 /// process's** CPU, so interleaving the legs would put Metal's own threads inside our cases'
 /// readings and ours inside Metal's. Phases confine that to the first case or two of a phase. The
@@ -778,10 +773,9 @@ fn timed<S: Side>(case: &dyn Case, side: S) -> Result<crate::times::CaseRound, S
     let on_cpu_after = crate::clocks::thread_cpu_nanos();
     let process_cpu_after = crate::clocks::process_cpu_nanos();
     let observed = timer.take();
-    let mut degraded = side.announced();
-    degraded.extend(sites.finish().announced_notices().into_keys());
-    degraded.sort();
-    degraded.dedup();
+    let mut announced = side.announced();
+    announced.extend(sites.finish().announced_notices().into_keys());
+    let degraded = crate::replay::degrading(announced);
     let stopped = abort.map(|abort| {
         let what = abort
             .failure

@@ -21,6 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::bind::YCbCrPlanesSampler;
 use crate::device::profile::Independence;
 use crate::device::requirements::{
     ApiVersion, FloatControl, FloatWidth, FormatUsage, Requirements, ResolveMode, SpirvCapability,
@@ -53,13 +54,13 @@ use crate::pipeline::layout::{
     BindingSource, DescriptorBinding, DescriptorSetLayout, PipelineLayout, PushConstantRange,
 };
 use crate::pipeline::lower_inputs::{
-    BlendEquation, CaptureForm, ChannelWrite, ColorGroup, ExtendedRangeColor, FactorLane,
-    HalfOutputLane, RotatedBlendForm, VertexFetch,
+    BlendEquation, ChannelWrite, ColorGroup, ExtendedRangeColor, FactorLane, RotatedBlendForm,
+    VertexFetch,
 };
 use crate::pipeline::stage_io::{
     CoverageLoop, CoverageLoopRefusal, DepthCompares, DepthMode, Interpolation as IoInterpolation,
-    IoNumeric, IoRole, IoType, IoVariable, PulledInput, Sampling as IoSampling, SelectedWrite,
-    StageBuiltin, StageInFetch, StageInInput, StageIo,
+    IoNumeric, IoRole, IoType, IoVariable, PulledInput, Sampling as IoSampling, StageBuiltin,
+    StageInFetch, StageInInput, StageIo,
 };
 use crate::pipeline::sym::{
     AccelerationStructureLevel, AirUserKey, Axis, CombinedSampler, HandleClass, ImageAccess,
@@ -794,9 +795,10 @@ codec_struct! {
     SamplerDesc {
         mag_filter, min_filter, mipmap_mode, address_mode_u, address_mode_v, address_mode_w,
         mip_lod_bias, max_anisotropy, compare, min_lod, max_lod, border_color, reduction,
-        border_components,
+        border_components, ycbcr,
     }
     ComponentMapping { r, g, b, a }
+    YCbCrPlanesSampler { conversion }
 }
 
 // ---- Link symbols (`pipeline::sym`) ----
@@ -811,7 +813,7 @@ codec_struct! {
 codec_struct! {
     SlotRef { stage, class, index }
     ImageHandleClass { dim, arrayed, multisampled, sampled_type, depth_compare, access, format }
-    CombinedSampler { sampler, compare, integer, cube_gradient, raw }
+    CombinedSampler { sampler, compare, integer }
     ResourceSlot { stage, kind, index }
 }
 
@@ -824,8 +826,8 @@ codec_enum! {
     ImageDim { D1, D2, D3, Cube, Buffer }
     SampledType { Float, Sint, Uint, Uint64 }
     ImageAccess { Sampled, Storage }
-    StorageFormatClass { NotStorage, Unknown, Format(f0), HalfBits }
-    HandleClass { Image(f0), Sampler { compare, integer, cube_gradient }, FunctionTable }
+    StorageFormatClass { NotStorage, Unknown, Format(f0) }
+    HandleClass { Image(f0), Sampler { compare, integer }, FunctionTable }
     SyntheticBinding {
         ArgumentTable, ExecutionStatus, RootTable, HandleTable, ConstantBlob, TessellationFactors, Imageblock,
         SamplerTable,
@@ -839,18 +841,16 @@ codec_enum! {
         MeshWork,
         TessellationWork,
         TessellationRecords,
-        ColorWriteTable,
         DepthStandIn,
         StencilStandIn,
-        StoreSink,
     }
     ResourceKind {
         Buffer, Texture, Sampler, Heap(f0), Synthetic(f0), InputAttachment(f0),
         CombinedTextureSampler(f0), HeapSampler(f0), AccelerationStructure(f0), TileAttachment(f0),
         TileMap, SeparateTexture(f0), SeparateSampler(f0),
-        RawTexture,
         ExtendedShadow(f0),
         SnapshotTexels(f0),
+        YCbCrPlanes(f0),
     }
     AccelerationStructureLevel { Primitive, Instance }
     SamplerRef { Slot(f0), Constexpr(f0) }
@@ -863,7 +863,6 @@ codec_enum! {
         ObjectLocalSize(f0), ObjectFlatLocalSize, ObjectMultiRegion, SamplerMinLevel(f0),
         ConstantLanes(f0), UnmeasuredTexels(f0), BoundTexelFormat(f0), OffsetBaseAxes(f0),
         SamplerAnisotropy(f0), RangeAtBindOffset(f0), PlainHalfTexels(f0),
-        DroppedStoreSlots(f0),
     }
     PushField {
         RootTableAddress, ExecutionStatusAddress, DispatchRegion, BaseVertexInstance,
@@ -878,24 +877,20 @@ codec_enum! {
         DepthClampRange,
         ViewportMirrors,
         VertexDepthClamp,
-        BlendColor,
         ShaderTestsState,
-        TextureHalfChannels(f0),
-        CaptureAddress,
         CaptureLayout,
         CaptureIndexAddress,
         StorageKeptChannels,
         ShaderStencilState,
         TextureIntegerChannels(f0),
         Specialized(f0),
-        ColorWriteRule(f0),
         HalfBlendColor,
-        DepthBias,
         SnapshotPhase,
         VerticesPerPrimitive,
         TessellationChunk,
         MergedDrawAddress,
         AlphaTestReference,
+        YCbCrInPlace(f0),
     }
     Symbol { Binding(f0), DescriptorSet(f0), Location(f0), Component(f0), SpecId(f0) }
 }
@@ -923,7 +918,6 @@ codec_enum! {
         ShaderSharedFloat32AtomicMinMax, ShaderImageFloat32Atomics, ShaderImageFloat32AtomicAdd,
         ShaderImageFloat32AtomicMinMax, BufferDeviceAddress, ScalarBlockLayout,
         UniformBufferStandardLayout, VulkanMemoryModel, VulkanMemoryModelDeviceScope,
-        VariablePointersStorageBuffer, VariablePointers,
         WorkgroupMemoryExplicitLayout, WorkgroupMemoryExplicitLayout8BitAccess,
         WorkgroupMemoryExplicitLayout16BitAccess, ShaderZeroInitializeWorkgroupMemory,
         VertexPipelineStoresAndAtomics, FragmentStoresAndAtomics, ShaderDrawParameters,
@@ -1026,14 +1020,15 @@ codec_enum! {
         InterpolateAtOffsetCentered, SimdgroupLockstep, MetalSampler, StorageImageSampleCount(f0),
         DepthResolveMode(f0), StencilResolveMode(f0), IndependentResolveNone, IndependentResolve,
         VariableSampleLocations, SampleLocationSampleCount(f0), ColorAttachmentSampleCount(f0, f1),
-        MetalColorWrites, MetalFloatColorNans, MetalHalfColorNans, HalfColorOutputBits,
-        MetalHalfFma, MetalFloatDenormals, MetalHalfQuantize, MetalHalfConversion,
+        MetalColorWrites, MetalFloatColorNans, MetalHalfColorNans,
+        MetalHalfFma, MetalFloatDenormals,
         MetalCenterVaryings, MetalSmallFloatColorWrites, MetalNorm16ColorWrites, MetalMinMax,
-        MetalHalfArithmetic, MetalHalfStorageWrites, MetalHalfStorageNans, MetalFloatStorageNans,
+        MetalHalfArithmetic, MetalHalfStorageWrites, MetalHalfStorageNans,
         MetalFragmentSimdgroups, MetalVertexSimdgroups, CenterFragCoordDepth, SampleFragCoordDepth,
-        MetalHalfTexelWrites, MetalNormStorageWrites, Unorm8LinearFilter, DeviceSampling,
+        MetalHalfTexelWrites, MetalNormStorageWrites, DeviceSampling,
         MetalDepth16Stores, MetalDepth16BiasedStores, MetalInterpolation, MetalFirstVertexIndices,
         MetalFullQuads, ProvokingVertexModePerPipeline, DepthImageKeepsValuesOutsideUnitRange,
+        MetalNormalizedVertexFetch, MetalAlphaCoverage,
     }
     VkLimit {
         MaxComputeWorkGroupSize(f0), MaxComputeWorkGroupCount(f0), MaxComputeWorkGroupInvocations,
@@ -1130,23 +1125,21 @@ codec_struct! {
     StageIo {
         inputs, outputs, builtins, pulled, stage_in, multisampled, varyings_at_pixel,
         position_depth, coverage_loop, color_writes, rounded_colors, primitive_inputs,
-        early_fragment_tests, extended_range_colors, unattached_colors, half_bit_colors,
-        sample_mask, rotated_colors, rotated_factors, rotated_blends, srgb_fetches,
-        half_output_lanes, texture_write_rounding, uniform_outputs, uniform_inputs,
-        instanced_attributes, selected_colors, half_blend_colors, half_fast_colors,
-        float_blend_colors, zero_indices, color_group, word_colors, alpha_in_red_colors,
-        alpha_test, depth_compares,
+        early_fragment_tests, extended_range_colors, unattached_colors, sample_mask,
+        rotated_colors, rotated_factors, rotated_blends, decoded_fetches,
+        texture_write_rounding, uniform_outputs, uniform_inputs, instanced_attributes,
+        half_blend_colors, half_fast_colors, half_outputs, float_blend_colors, zero_indices,
+        color_group, word_colors, alpha_in_red_colors, alpha_test, depth_compares,
     }
     DepthCompares { samplers, clamped }
     ColorGroup { present, width, group }
     WordField { shift, bits }
-    SelectedWrite { lanes, rounds, nans }
     ExtendedRangeColor { form, blended, nearest_even }
     PulledInput { index, ty, fetch }
     StageInInput { index, ty, fetch }
     StageInFetch { format, buffer_index, offset, stride, step_function, step_rate, index }
     IoVariable { key, role, ty }
-    IoType { numeric, components, source_bits, bits }
+    IoType { numeric, components, source_bits }
 }
 
 codec_enum! {
@@ -1164,7 +1157,7 @@ codec_enum! {
     DescriptorView { Storage, UniformWords, UniformVec4 }
     PushLoc { Push { offset }, ArgumentTable { offset } }
     IoRole {
-        Attribute { index, narrow_float }, Varying { user, interpolation },
+        Attribute { index }, Varying { user, interpolation },
         Color { attachment, index },
         ViewportIndex, RenderTargetArrayIndex, PrimitiveVarying { user }, WindowDepth,
         Barycentric { perspective }, SelectedLayer, SelectedViewport, PrimitiveId,
@@ -1176,7 +1169,6 @@ codec_enum! {
         Unorm { bits }, Snorm { bits, blended }, Srgb, FloatTowardZero { mantissa, signed }, Device,
         FloatNearestEven { mantissa, signed }, BlendedNearestEven { mantissa, signed },
         HalfUnorm { bits },
-        Selected,
     }
     ExtendedRange {
         Bgr10 { srgb }, Bgra10 { srgb }, Planes { srgb }, R10X6, Rg10X12, R10X6Srgb, Rg10X12Srgb,
@@ -1185,8 +1177,6 @@ codec_enum! {
     WordAttachment { Packed16 { fields }, Srgb8 { fields }, Rgb9e5 }
     FactorLane { Zero, One, Output(f0) }
     RotatedBlendForm { Premultiplied, Unmeasured }
-    CaptureForm { Vertices, Indexed(f0) }
-    HalfOutputLane { Float32, Float32Added }
     TextureWriteRoundingMode { TowardZero, NearestEven }
     CompareFunction { Never, Less, Equal, LessEqual, Greater, NotEqual, GreaterEqual, Always }
     CoverageLoopRefusal {
@@ -1201,7 +1191,7 @@ codec_enum! {
     }
     DepthMode { Any, Greater, Less }
     VertexFetch {
-        FixedFunction { narrow_float },
+        FixedFunction,
         Pulled { format, buffer_index, offset, step_function, step_rate },
     }
     RuntimeFact {
@@ -1230,7 +1220,6 @@ codec_enum! {
         InterlockedFramebufferFetch { color, format, writes, early_tests, kept, blend, rounded },
         ShadowStencil { formatless, multisampled },
         PredicationVote, TexelFormat { slot }, SrgbTexture { slot },
-        HalfBitsTexture { slot },
         UlongAtomicView { slot },
         ViewportCount,
         AliasedImageblock { data_size },
@@ -1245,7 +1234,6 @@ codec_enum! {
         FoldedGroups,
         ReplayBindings,
         AbsentArgumentRead { stage },
-        SrgbDeviceDecode { slot },
         ZeroedColor { color, format },
         DroppedColor { color },
         DepthClampRange,
@@ -1254,14 +1242,11 @@ codec_enum! {
         ConstantLanes { slot },
         FunctionTableRange { addressed },
         TestedStorageWrites { early_tests, early_variant },
-        YCbCrTexture { slot },
         TileThreadgroup { tile_sized },
         ConstexprSampled { slot, modes },
         CubicSampler { slot },
         CubicArgumentSampler { stage },
         ShaderTests { formatless, multisampled, planes },
-        StorageTextureHalfChannels { slot },
-        CapturedPositions { form },
         HeapRawSamples { stage, sampler },
         ShaderStencilTest { formatless },
         ExtendedRangeInputBlend { color, blend, kept },
@@ -1272,27 +1257,13 @@ codec_enum! {
         HeapCrossClassNeutral { stage, class, every_member },
         AnisotropicSampler { slot },
         StorageTextureIntegerChannels { slot },
-        HeapHalfTexelWrites { stage, packed },
         MovableStorageWrites { early_variant },
-        Depth16Codes { biased },
-        Depth16Pass { depth16 },
-        Depth16Biased,
-        Depth16BiasSide { raises },
         SynthesizedGeometry { weights, layer, viewport },
         ObjectThreadgroupArena { static_bytes, payload },
-        ExactFormsOverCompilerLimit {
-            sampling,
-            float_maths,
-            texel_conversion,
-            half_rounding,
-            nan_and_min_max,
-            rounding_order,
-            half_blend,
-            half_texel_bits
-        },
         MergedDraws,
         QuadPrimitiveIds,
         PrivateList,
+        YCbCrInPlace { slot, samplers, device },
     }
     UniformViewChoice { Viewed, Spare, Kept }
     Mechanism {
@@ -1345,8 +1316,7 @@ codec_struct! {
     StageModule {
         stage, entry_point, spirv, specialization, required_subgroup_size, stage_flags,
         reconvergence, precision_notes, strategies, constant_blob, rounded_colors,
-        specialized_notes, half_bit_colors, own_pixel_textures, snapshot_textures, private_bytes,
-        stats,
+        specialized_notes, own_pixel_textures, snapshot_textures, private_bytes, stats,
     }
     SpecializedNote { note, when }
     SpecClause { all }
@@ -1384,8 +1354,7 @@ codec_struct! {
         writes_point_size, flat_fragment_inputs,
         clip_distances, writes_depth, reads_barycentric_coord, reads_primitive_id,
         reads_position_depth,
-        fragment_writes_memory, color_outputs, sample_mask, shader_tests, color_write_rules,
-        snapshot_reads,
+        fragment_writes_memory, color_outputs, sample_mask, shader_tests, snapshot_reads,
         color_group, logic_op,
     }
     TessellationState {
@@ -1430,13 +1399,8 @@ codec_enum! {
         HalfSampleFilter,
         SrgbTexelDecode,
         FloatSampleFilter,
-        DeviceGatherFootprint,
-        CubeFaceReciprocal,
         FunctionStorageAssumed,
         QuadsCountedBeforeDiscard,
-        DeviceDepthComparison,
-        DeviceTexelDenormals,
-        BeyondMeasuredDeviation,
         ViewBaseTexelOffset,
         DeviceColorConversion,
         DeviceInterpolation,
@@ -1458,7 +1422,6 @@ codec_enum! {
         DevicePointSize,
         ClippedCoverageSplit,
         LoopedSampleOutputs,
-        DeviceUnorm8LinearFilter,
         HalfOutputFastMathBlend,
         DeviceSampling,
         NativeTranscendentals,
@@ -1471,6 +1434,7 @@ codec_enum! {
         NativeMinMax,
         NativeDot,
         NativeMix,
+        DevicePackConversion,
         ColorAttachmentGroups,
         TessellationTriangleOrder,
         UnmeasuredGroupSpeculation,
@@ -1478,15 +1442,17 @@ codec_enum! {
         DeviceSampleLevel,
         CoverageReadsRoundedAlpha,
         UnmeasuredFetchBlend,
+        DeviceVertexConversion,
+        DeviceAlphaCoverage,
     }
     BindingSource {
         Buffer(f0), Texture(f0), Sampler(f0), CombinedTextureSampler { texture, sampler },
         Synthetic { stage, binding }, Heap(f0), InputAttachment(f0), HeapSampler { stage, sampler },
         AccelerationStructure { slot, level }, TileAttachment(f0), TileMap(f0),
         SeparateTexture { texture, sampler }, SeparateSampler { stage, sampler },
-        RawTexture(f0),
         ExtendedShadow(f0),
         SnapshotTexels(f0),
+        YCbCrPlanes(f0),
     }
     VertexStride { Static(f0), PerBind }
 }

@@ -189,68 +189,6 @@ fn render_state(scale_offset: u64) -> BindState {
     s
 }
 
-/// A fragment function that writes a float to an sRGB attachment reads the color table at a
-/// fragment binding of its own, which the plan writes as `WriteSource::ColorWriteTable`: a uniform
-/// buffer on ANV (`DriverWorkaround::UniformReadsOutpaceStorageReads`), a storage buffer on RADV,
-/// NVIDIA and lavapipe. MoltenVK, whose conversion is Metal's, rounds nothing and has none, and an
-/// `RGBA8Unorm` attachment has none anywhere.
-#[test]
-fn an_srgb_color_write_binds_the_color_table() {
-    use crate::pipeline::sym::SyntheticBinding;
-    let Some(bc) = fixture("stage_io") else {
-        return;
-    };
-    let (uniform, storage) = (
-        Some(vk::DescriptorType::UNIFORM_BUFFER),
-        Some(vk::DescriptorType::STORAGE_BUFFER),
-    );
-    let table = BindingSource::Synthetic {
-        stage: Stage::Fragment,
-        binding: SyntheticBinding::ColorWriteTable,
-    };
-    for (stem, ty) in [
-        ("intel-irisxe-rplp-anv", uniform),
-        ("intel-uhd770-rpls-anv", uniform),
-        ("amd-780m-radv", storage),
-        ("nvidia-rtx5080-laptop", storage),
-        ("lavapipe", storage),
-        ("moltenvk-m3", None),
-    ] {
-        let dev = device(stem);
-        for (pf, want) in [
-            (PixelFormat::RGBA8UnormSRGB, ty),
-            (PixelFormat::RGBA8Unorm, None),
-        ] {
-            let what = format!("{stem} {pf:?}");
-            let mut d = render_descriptor(&bc);
-            d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(pf));
-            let p = dev
-                .compile_render_pipeline(&d, &Budget::standard())
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-            let bound = p
-                .layout
-                .sets
-                .iter()
-                .flat_map(|s| &s.bindings)
-                .find(|b| b.source == table)
-                .map(|b| (b.ty, b.stages, b.count));
-            assert_eq!(
-                bound,
-                want.map(|t| (t, vk::ShaderStageFlags::FRAGMENT, 1)),
-                "{what}"
-            );
-            let plan = p.plan(&dev, &render_state(16).shape()).expect("plan");
-            let written: Vec<vk::DescriptorType> = plan
-                .descriptors
-                .iter()
-                .filter(|w| w.source == WriteSource::ColorWriteTable)
-                .map(|w| w.ty)
-                .collect();
-            assert_eq!(written, want.into_iter().collect::<Vec<_>>(), "{what}");
-        }
-    }
-}
-
 /// `Device::compile_render_pipeline` compiles a `Function` fragment stage with no output at a color
 /// it writes that the pipeline has no attachment for, whose write Metal discards: the fixture's
 /// fragment, writing colors 0 and 2, states color 0 alone among its color outputs in a pipeline of
@@ -1080,86 +1018,6 @@ fn stage_push(
     u32::from_le_bytes(w.bytes[at..at + 4].try_into().expect("four bytes"))
 }
 
-/// Where the device does not store Metal's color writes, `stage_io_fragment`'s `float4` output to a
-/// `BGRA8Unorm`, an `RGBA8Unorm` or an `RGBA16Float` attachment 0 compiles to one fragment module
-/// (one key, the same words), which reads the attachment's rule word at each draw
-/// (`PushField::ColorWriteRule`): the plan writes `0x2222` for the four 8-bit unorm channels and
-/// `0x3333` for the half-float ones. Each pipeline lists the attachment as rounded in the shader
-/// (its stage module's `rounded_colors`) where its rules round: the unorm channels always, the
-/// half-float ones where the device does not convert a `float` to a half as Metal does
-/// (`DriverDeviation::MetalSmallFloatColorWrites`). On MoltenVK, which stores Metal's codes, no
-/// fragment reads a word.
-#[test]
-fn a_draw_writes_its_attachments_color_write_rule() {
-    use crate::error::DriverDeviation;
-    let Some(bc) = fixture("stage_io") else {
-        return;
-    };
-    for stem in [
-        "moltenvk-m3",
-        "lavapipe",
-        "amd-rdna3-radv",
-        "intel-irisxe-rplp-anv",
-        "nvidia-rtx5080-laptop",
-    ] {
-        let dev = device(stem);
-        let takes = |d| dev.profile().takes_driver_deviation(d);
-        let metal = takes(DriverDeviation::MetalColorWrites);
-        let small = takes(DriverDeviation::MetalSmallFloatColorWrites);
-        let mut modules = BTreeSet::new();
-        let mut keys = Vec::new();
-        for (pf, word, rounds) in [
-            (PixelFormat::BGRA8Unorm, 0x2222, true),
-            (PixelFormat::RGBA8Unorm, 0x2222, true),
-            (PixelFormat::RGBA16Float, 0x3333, !small),
-        ] {
-            let what = format!("{stem} {pf:?}");
-            let mut d = render_descriptor(&bc);
-            d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(pf));
-            keys.push(
-                dev.render_pipeline_key(&d, &Budget::standard())
-                    .unwrap_or_else(|e| panic!("{what}: {e}"))
-                    .fragment,
-            );
-            let p = dev
-                .compile_render_pipeline(&d, &Budget::standard())
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-            let fragment = p
-                .stages
-                .iter()
-                .find(|m| m.stage == vk::ShaderStage::FRAGMENT)
-                .expect("a fragment stage");
-            modules.insert(fragment.spirv.clone());
-            let reads = p.interface.push.iter().any(|pl| {
-                pl.fields
-                    .iter()
-                    .any(|f| f.field == PushField::ColorWriteRule(0))
-            });
-            assert_eq!(reads, !metal, "{what}");
-            if metal {
-                continue;
-            }
-            assert_eq!(fragment.rounded_colors.contains(&0), rounds, "{what}");
-            let state = render_state(16);
-            let plan = p.plan(&dev, &state.shape()).expect("plan");
-            let draw = DrawCall::Primitives {
-                vertex_start: 0,
-                vertex_count: 3,
-                instance_count: 1,
-                base_instance: 0,
-            };
-            let cmds = plan.instantiate_draw(&state, &draw).expect("draw");
-            let fragment_stage = (Stage::Fragment, vk::ShaderStageFlags::FRAGMENT);
-            let got = stage_push(&plan, &cmds, fragment_stage, PushField::ColorWriteRule(0));
-            assert_eq!(got, word, "{what}");
-        }
-        if !metal {
-            assert!(keys.windows(2).all(|k| k[0] == k[1]), "{stem}: {keys:?}");
-            assert_eq!(modules.len(), 1, "{stem}");
-        }
-    }
-}
-
 /// Pulled attributes (signed formats into the `uint` attributes) from layout 1, the `scale`
 /// argument's index, with a static stride, and from layout 2 with a per-bind stride. Buffer 1 is
 /// one binding (the argument's slot, widened to a `Whole` storage view); the static stride fills
@@ -1521,8 +1379,7 @@ fn sampled_textures_and_runtime_samplers() {
         }
         assert!(plan.diagnostics.is_empty(), "{stem}");
         // The pixel-coordinate path is selected by specialization when the kernel declares it:
-        // the bound sampler's word masked by the fields the kernel reads, 0 for a word of
-        // normalized coordinates where the fields are gated by the coordinates bit.
+        // the bound sampler's word masked by the fields the kernel reads.
         let state = p
             .stage
             .specialization
@@ -1552,13 +1409,7 @@ fn sampled_textures_and_runtime_samplers() {
                 u32::from_le_bytes(bytes.try_into().expect("a u32"))
             };
             let normalized = sampler(true, SamplerReductionMode::WeightedAverage);
-            let keyed = |word: u32| {
-                let gated = fields & SamplerWord::PIXEL_GATED != 0;
-                match gated && word & SamplerWord::PIXEL_COORDINATES == 0 {
-                    true => 0,
-                    false => word & fields,
-                }
-            };
+            let keyed = |word: u32| word & fields;
             assert_eq!(
                 value(&plan),
                 keyed(SamplerWord::of(&normalized.desc).0),
@@ -2235,14 +2086,15 @@ fn out_of_bounds_alpha_follows_the_bound_format() {
 
 /// `a2_sparse_status` observes the residency of a sample and a gather of texture 0 through a
 /// nearest, clamp-to-edge constexpr sampler, and of a read of texture 1. Each slot states
-/// `RuntimeFact::SparseTexture`. On every device, with `shaderResourceResidency` or without, both
-/// slots have the tile-map arm, slot 0's sample and gather through Metal's footprint: each slot's
-/// `SparseTexture` specialization, which the plan sets from the bound texture's `sparse`
-/// (`MTLTexture.isSparse`), and a `ResourceKind::TileMap` binding the plan writes as the slot's
-/// `WriteSource::TileMap` (read by the kernel) for a sparse texture and as the zero buffer
-/// otherwise.
+/// `RuntimeFact::SparseTexture`, its `SparseTexture` specialization, which the plan sets from the
+/// bound texture's `sparse` (`MTLTexture.isSparse`). Slot 1's read has the tile-map arm on every
+/// device, and so has slot 0 where the device has no `shaderResourceResidency`, its sample and
+/// gather through Metal's footprint: a `ResourceKind::TileMap` binding the plan writes as the
+/// slot's `WriteSource::TileMap` (read by the kernel) for a sparse texture and as the zero buffer
+/// otherwise. Where the device has residency, slot 0's sample and gather are the device's sparse
+/// accesses (the sparse arm), with no tile map.
 #[test]
-fn a_sparse_texture_is_answered_from_its_tile_map_on_every_device() {
+fn a_sparse_texture_is_answered_from_its_tile_map_where_the_device_has_no_residency() {
     use crate::device::requirements::VkFeature;
     use crate::pipeline::facts::RuntimeFact;
     let Some(bc) = fixture("a2_sparse_status") else {
@@ -2266,11 +2118,11 @@ fn a_sparse_texture_is_answered_from_its_tile_map_on_every_device() {
             .features
             .contains(&VkFeature::ShaderResourceResidency);
         let slots = [0, 1].map(|i| slot(Stage::Kernel, SlotClass::Texture, i));
-        for s in slots {
+        for (s, sampled) in slots.into_iter().zip([true, false]) {
             let fact = RuntimeFact::SparseTexture {
                 slot: s,
-                sparse_arm: false,
-                tile_map: true,
+                sparse_arm: sampled && residency,
+                tile_map: !(sampled && residency),
             };
             assert!(
                 p.dependencies.iter().any(|d| d.fact == fact),
@@ -2315,12 +2167,16 @@ fn a_sparse_texture_is_answered_from_its_tile_map_on_every_device() {
             "{stem}"
         );
         // Each sparse slot's tile map bound and read.
-        assert_eq!(tile_maps(&plan), [slots[0]], "{stem}");
+        let mapped: &[SlotRef] = match residency {
+            true => &slots[1..],
+            false => &slots,
+        };
+        assert_eq!(tile_maps(&plan), mapped[..mapped.len() - 1], "{stem}");
         let both = p
             .plan(&dev, &state(true, true).shape())
             .unwrap_or_else(|e| panic!("{stem}: sparse slots: {e}"));
-        assert_eq!(tile_maps(&both), slots, "{stem}");
-        for s in slots {
+        assert_eq!(tile_maps(&both), mapped, "{stem}");
+        for &s in mapped {
             assert!(
                 both.uses
                     .iter()
@@ -2355,12 +2211,13 @@ fn opcodes(words: &[u32]) -> BTreeSet<u32> {
 
 /// `sps2_residency_probes` observes the residency of nearest and linear samples and a gather
 /// through clamp-to-zero constexpr samplers at level 0, every one inside Metal's measured footprint
-/// rule. On every device the module answers them from the texels Metal counts, through the tile map
-/// of both slots, which bind a sparse texture: no sparse access. `PrecisionNote::SparseResidency`
-/// stays only where the device has residency: there a sparse texture is a sparse image, whose
-/// blocks that hold no mapped tile a filtered sample reads as the device does.
+/// rule. Where the device has no `shaderResourceResidency` the module answers them from the texels
+/// Metal counts, through the tile map of both slots, which bind a sparse texture: no sparse
+/// access, and no note. Where it has, each is the device's sparse access, its residency the
+/// device's, recorded as `PrecisionNote::SparseResidency`, and the sampled slot has no tile map;
+/// the slot read alone keeps its own.
 #[test]
-fn a_sample_with_metals_footprint_is_answered_on_every_device() {
+fn a_sample_with_metals_footprint_is_answered_where_the_device_has_no_residency() {
     use crate::device::requirements::VkFeature;
     use crate::pipeline::artifact::PrecisionNote;
     use crate::pipeline::facts::RuntimeFact;
@@ -2385,11 +2242,12 @@ fn a_sample_with_metals_footprint_is_answered_on_every_device() {
             .enabled
             .features
             .contains(&VkFeature::ShaderResourceResidency);
-        for i in [0, 1] {
+        // Slot 1 is read alone, from its tile map on every device.
+        for (i, sampled) in [(0, true), (1, false)] {
             let fact = RuntimeFact::SparseTexture {
                 slot: slot(Stage::Kernel, SlotClass::Texture, i),
-                sparse_arm: false,
-                tile_map: true,
+                sparse_arm: sampled && residency,
+                tile_map: !(sampled && residency),
             };
             assert!(
                 p.dependencies.iter().any(|d| d.fact == fact),
@@ -2397,9 +2255,14 @@ fn a_sample_with_metals_footprint_is_answered_on_every_device() {
             );
         }
         let ops = opcodes(&p.stage.spirv);
-        assert!(!ops.contains(&SPARSE_SAMPLE_EXPLICIT_LOD), "{stem}");
-        assert!(!ops.contains(&SPARSE_GATHER), "{stem}");
-        assert!(!ops.contains(&SPARSE_FETCH), "{stem}");
+        assert_eq!(
+            ops.contains(&SPARSE_SAMPLE_EXPLICIT_LOD),
+            residency,
+            "{stem}"
+        );
+        assert_eq!(ops.contains(&SPARSE_GATHER), residency, "{stem}");
+        // The sampled slot's read through its sparse arm: one texel's residency, exact.
+        assert_eq!(ops.contains(&SPARSE_FETCH), residency, "{stem}");
         assert_eq!(
             p.stage
                 .precision_notes

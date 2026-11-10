@@ -134,10 +134,6 @@ pub(super) struct Tables<'a> {
     tile_memory: Option<&'a Buffer>,
     /// The address-mode maps the command's runtime samplers are bound with (`address_map.rs`).
     sampler_maps: SamplerMaps,
-    /// A capture draw's addresses (`render/capture.rs`): of its first capture record, and of its
-    /// first index where it is indexed. Its `PushHole::CaptureAddress` and
-    /// `PushHole::CaptureIndexAddress` take them.
-    capture: Option<(u64, Option<u64>)>,
     /// A de-indexed draw's first index's address (`VariantKey::primitive_id_indices`): its
     /// `PushHole::CaptureIndexAddress` takes it.
     indices: Option<u64>,
@@ -180,7 +176,6 @@ impl<'a> Tables<'a> {
             control_point_indices: None,
             tile_memory: None,
             sampler_maps: SamplerMaps::default(),
-            capture: None,
             indices: None,
             snapshots: None,
             merged_header: None,
@@ -204,15 +199,6 @@ impl<'a> Tables<'a> {
             && self
                 .snapshots
                 .is_some_and(|s| s.slots.contains(&slot.index))
-    }
-
-    /// The tables, with a capture draw's addresses: of its first capture `records`, and of its
-    /// first index (`indices`) where it is indexed (`render/capture.rs`).
-    pub(super) fn with_capture(self, records: u64, indices: Option<u64>) -> Tables<'a> {
-        Tables {
-            capture: Some((records, indices)),
-            ..self
-        }
     }
 
     /// The tables, with a merged draw replay's header's address (`Tables::merged_header`).
@@ -725,24 +711,13 @@ pub(super) fn bind_into(
             PushHole::CommandRecordsAddress { .. } => {
                 return Err(Error::NotImplemented(RuntimeGap::CommandReplay));
             }
-            // A capture draw's first record, and its first index where it is indexed
-            // (`Tables::with_capture`).
-            PushHole::CaptureAddress { stages, offset } => Hole {
-                stages: stages.into(),
-                offset,
-                address: tables
-                    .capture
-                    .map(|(records, _)| records)
-                    .ok_or_else(|| internal("a capture hole without capture records"))?,
-            },
+            // A de-indexed draw's first index, or a private list's (`Tables::with_indices`).
             PushHole::CaptureIndexAddress { stages, offset } => Hole {
                 stages: stages.into(),
                 offset,
                 address: tables
-                    .capture
-                    .and_then(|(_, indices)| indices)
-                    .or(tables.indices)
-                    .ok_or_else(|| internal("a capture index hole without capture indices"))?,
+                    .indices
+                    .ok_or_else(|| internal("an index hole without its indices"))?,
             },
             // A merged draw replay's header, which its vertex function finds its command in.
             PushHole::MergedDrawAddress { stages, offset } => Hole {
@@ -1374,6 +1349,13 @@ fn texel_descriptor(
         WriteSource::Neutral(NeutralResource::TexelBuffer { format }) => {
             device.neutral_texel_view(*format, storage)
         }
+        // The planes of a two-plane YCbCr texture read in place (`texture/ycbcr_image.rs`).
+        WriteSource::YCbCrInPlace { slot } => {
+            let texture = slot_texture(tables, *slot)
+                .ok_or_else(|| internal("the plan binds an unbound texture slot's planes"))?;
+            device.shared().counts.ycbcr_planes_bound();
+            texture.planes_view()
+        }
         other => Err(unexpected(other)),
     }
 }
@@ -1394,7 +1376,7 @@ const KEPT_VIEWS: usize = 256;
 /// weakly, so it keeps none alive:
 ///
 /// - **A view** of a texture slot is a function of the texture (its storage, image, decoded and
-///   depth twins and record are fixed as it is made; its usage shadow is made once and kept), the
+///   twin and record are fixed as it is made; its usage shadow is made once and kept), the
 ///   view's description, whether the binding is a storage one, and its images' views, which an
 ///   image keeps once made until it lets them all go under its views lock (a rebind's or a
 ///   storage form's new `VkImage`, a detach's stand-in, a reattach). Each letting go counts in
@@ -1621,11 +1603,10 @@ fn image_descriptor(
                     slot,
                     compare,
                     integer,
-                    cube_gradient,
                     opaque_black,
                 } => sampler(
                     *slot,
-                    SamplerUse::new(*compare, *integer).with_cube_gradient(*cube_gradient),
+                    SamplerUse::new(*compare, *integer),
                     *opaque_black,
                     format,
                 )?,
@@ -1641,11 +1622,10 @@ fn image_descriptor(
             slot,
             compare,
             integer,
-            cube_gradient,
             opaque_black,
         } => vk::DescriptorImageInfo::default().sampler(sampler(
             *slot,
-            SamplerUse::new(*compare, *integer).with_cube_gradient(*cube_gradient),
+            SamplerUse::new(*compare, *integer),
             *opaque_black,
             None,
         )?),
@@ -1771,13 +1751,12 @@ fn image_descriptor(
             index,
             compare,
             integer,
-            cube_gradient,
         } => match tables.argument_samplers.get(*index as usize) {
             Some(state) => {
                 let desc = metal2vulkan::bind::sampler_desc(
                     device.compile_device(),
                     state.descriptor(),
-                    SamplerUse::new(*compare, *integer).with_cube_gradient(*cube_gradient),
+                    SamplerUse::new(*compare, *integer),
                     OpaqueBlackBorder::Stated,
                     None,
                 )
@@ -1790,6 +1769,17 @@ fn image_descriptor(
             // An element past the listed states: no handle names it.
             None => vk::DescriptorImageInfo::default().sampler(device.neutral_sampler(*compare)?),
         },
+        // The planes of a two-plane YCbCr texture as the image the device's conversion samples
+        // (`texture/ycbcr_planes.rs`), its sampler the layout's immutable one of that conversion.
+        WriteSource::YCbCrPlanesImage { slot }
+            if ty == vk::DescriptorType::COMBINED_IMAGE_SAMPLER =>
+        {
+            let texture = slot_texture(tables, *slot)
+                .ok_or_else(|| internal("the plan binds an unbound texture slot's planes image"))?;
+            let view = texture.planes_image_view()?;
+            device.shared().counts.ycbcr_planes_image_bound();
+            image(view)
+        }
         _ => return Err(unexpected(&write.source)),
     })
 }
@@ -1997,40 +1987,13 @@ fn descriptor(
         // The command buffer's status words, the ones every command of it writes, on a device
         // that does not address buffers (`status_address` elsewhere).
         WriteSource::ExecutionStatus => whole(state.status_words(device)?),
-        // The fragment stage's sRGB color table, the same bytes for every pipeline.
-        WriteSource::ColorWriteTable => {
-            let table = metal2vulkan::bind::color_write_table();
-            whole(upload(table, padded(table.len()))?)
-        }
         // A read-only binding takes the device's kept zero buffer, made once for its lifetime
         // (`neutral.rs`): zeros of a length the device's own limits fix cannot have changed since
         // it was made, and before this every draw and dispatch that bound one took a fresh
         // zero-filled region, each past half the upload arena's chunk and so a dedicated 64 KiB
-        // `VkBuffer` allocated and written to zero.
-        //
-        // A WRITABLE binding keeps a region of its own per command, for either of two reasons:
-        //
-        // - A `ZeroBuffer` at a writable binding is one a shader may READ as well as store
-        //   through, and it must read zero, so one buffer shared by every command of the device
-        //   would hand a later command the zeros an earlier one overwrote.
-        // - A `Sink` is never read by anything (the kind's own contract: "No shader ever observes
-        //   its contents"; it holds dropped and out-of-bounds stores, `lower::access::sink`), so
-        //   sharing one would hand no command another's bytes. What forbids sharing it is the
-        //   Vulkan memory model: two commands with no memory dependency between them, both
-        //   storing to the same bytes, are "operations that access overlapping sets of memory
-        //   locations ... at least one of [which] is a write" with no location-ordered relation,
-        //   which is a data race, and "Applications must ensure that no data races occur during
-        //   the execution of their application" (the Memory Model appendix's "Data Race"; the
-        //   synchronization chapter puts the same thing as "write-after-write hazards need
-        //   appropriate memory dependencies ... If an application does not include dependencies
-        //   to solve these hazards, it results in a data race"). The rule asks for no reader, and
-        //   failing a normative requirement is undefined behaviour for the whole application, not
-        //   just for the bytes raced over. A shared sink would therefore need a barrier between
-        //   every pair of commands that bind one, which costs more than the region it saves and
-        //   would order dispatches Metal lets run concurrently.
-        //
-        // What a sink's region costs a dispatch is one region and nothing else
-        // (`tests::neutral_zeros_shared`).
+        // `VkBuffer` allocated and written to zero. A WRITABLE binding keeps its own region, as
+        // every binding did: the one buffer is shared by every command of the device, so a
+        // shader that could store through the binding would write zeros another command reads.
         WriteSource::Neutral(
             NeutralResource::ZeroBuffer { min_bytes } | NeutralResource::Sink { min_bytes },
         ) => {
@@ -2199,6 +2162,17 @@ pub(super) fn command_uses_into(
                     // An unbound slot takes a neutral image; a texture whose image and usage
                     // lack the binding's usage, its shadow (`texture/usage_shadow.rs`), as does
                     // a draw's sampled one its instance renders (`texture/attached_reads.rs`).
+                    // A two-plane YCbCr texture's planes read in place: their bytes, not the
+                    // image, which converts for no such read (`texture/ycbcr_image.rs`).
+                    if let (Some(texture), AccessClass::YCbCrPlanes) =
+                        (slot_texture(tables, slot), resource.class)
+                    {
+                        let read = vk::AccessFlags2::SHADER_SAMPLED_READ;
+                        let used = texture.planes_use(access(read, resource.access.read))?;
+                        name(&mut named, &reached, used.key);
+                        uses.push(used);
+                        continue;
+                    }
                     if let Some(texture) = slot_texture(tables, slot) {
                         let (read, write) = image_access(resource.class)?;
                         let storage = resource.class == AccessClass::StorageImage;
@@ -2301,24 +2275,6 @@ pub(super) struct CommandUses {
 }
 
 impl CommandUses {
-    /// Add `other`'s uses, as one command's: a key either names stays named, and the keys both
-    /// reach through the resident set alone stay so (`render/capture.rs`, whose draws record
-    /// as one command).
-    pub(super) fn merge(&mut self, other: CommandUses) {
-        let named = |uses: &CommandUses| -> BTreeSet<ResourceKey> {
-            uses.uses
-                .iter()
-                .map(|used| used.key)
-                .filter(|key| !uses.resident.contains(key))
-                .collect()
-        };
-        let (own, theirs) = (named(self), named(&other));
-        self.resident.retain(|key| !theirs.contains(key));
-        let reached = other.resident.into_iter().filter(|key| !own.contains(key));
-        self.resident.extend(reached);
-        self.uses.extend(other.uses);
-    }
-
     /// Add `used`, which names its key.
     pub(super) fn push(&mut self, used: Use<ResourceKey>) {
         self.resident.remove(&used.key);

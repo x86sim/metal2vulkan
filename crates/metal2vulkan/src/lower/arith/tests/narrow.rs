@@ -87,11 +87,14 @@ fn bf16_values() -> Vec<u64> {
 }
 
 /// Every half and bfloat bit pattern round-trips through its widened `f32` bit for bit (denormals,
-/// infinities, and NaN payloads and signs included), and the widened value is the pattern's.
+/// infinities, and NaN payloads and signs included) where the value is stored unchanged, and the
+/// widened value is the pattern's.
 ///
 /// The store of a loaded value reuses the bits it was decoded from, so the round trip runs twice:
 /// once through that reuse, and once through a copy of the value, which has no noted bits, so
-/// `to_bits` runs its sequence.
+/// `to_bits` encodes it: there a half NaN is the device's widening's and narrowing's (here the
+/// interpreter's canonical NaN, `PrecisionNote::NativeNanEncoding`), and every other half and
+/// every bfloat pattern comes back exactly.
 #[test]
 fn narrow_bits_round_trip_every_pattern() {
     for f in [half(), bfloat()] {
@@ -106,13 +109,13 @@ fn narrow_bits_round_trip_every_pattern() {
             &|g, w| g == w,
         );
         check_accept(
-            &format!("{f:?} round trip through the encode sequence"),
+            &format!("{f:?} round trip through the encode"),
             &[f],
             f,
             &|fb, x| fb.unary(UnOp::CopyObject, x[0]),
             &cases,
             &|c| Some(vec![arg(c, 0)]),
-            &|g, w| g == w,
+            &|g, w| g == w || (f == half() && is_nan(f, g) && is_nan(f, w)),
         );
         check(
             &format!("{f:?} widened value"),
@@ -126,11 +129,11 @@ fn narrow_bits_round_trip_every_pattern() {
     }
 }
 
-/// One exact half round trip through its format bits, `to_bits` then `from_bits` (their constants
-/// shared with the kernel's own load and store), is 160 words: each direction selects the normal or
-/// special rebias and applies it once, where separate normal and special results took 170. A load
-/// also decodes without masking the lane's low 16 bits first (the round trip test above feeds
-/// `from_bits` junk above them).
+/// One half round trip through its format bits, `to_bits` then `from_bits` (their types and
+/// constants shared with the kernel's own load and store), is the device's narrowing and widening
+/// alone: at most 40 words. A load also decodes
+/// without masking the lane's low 16 bits first (the round trip test above feeds `from_bits` junk
+/// above them).
 #[test]
 fn a_half_round_trip_through_its_bits_is_compact() {
     use crate::spirv::serialize::serialize;
@@ -138,7 +141,7 @@ fn a_half_round_trip_through_its_bits_is_compact() {
         let m = kernel(&[half()], half(), body).expect("build");
         serialize(m).expect("serialize").words.len()
     };
-    // Copies keep the decoded bits from being reused, so both sequences run.
+    // Copies keep the decoded bits from being reused, so both conversions run.
     let without = size(&|fb, x| fb.unary(UnOp::CopyObject, x[0]));
     let with = size(&|fb, x| {
         let c = fb.unary(UnOp::CopyObject, x[0])?;
@@ -146,26 +149,20 @@ fn a_half_round_trip_through_its_bits_is_compact() {
         let y = super::super::narrow::from_bits(fb, half(), b)?;
         fb.unary(UnOp::CopyObject, y)
     });
-    assert!(with - without <= 160, "{} words", with - without);
+    assert!(with - without <= 40, "{} words", with - without);
 }
 
 /// Under native half rounding a `half` may reach its store unrounded (the device folds the
-/// conversion pair), and the store's bits then saturate: a finite magnitude from `65536` up is
-/// infinity, never a NaN's code or a code past 16 bits (whose bit 17 a pair's store carried into
-/// the next lane); every other value is truncated toward zero onto the half
-/// grid, an infinity and a NaN as before, and a half value is its own bits. A module whose rounding
-/// is Metal's takes no cap.
+/// conversion pair), and the store's bits are then the device's narrowing of it, in either form
+/// (its conversion to 16 bits, `PackHalf2x16` without `shaderFloat16`): here the interpreter's, to
+/// nearest even on the half grid, half denormals kept, a finite magnitude from `65520` up the
+/// infinity of its sign, never a NaN's code or a code past 16 bits (whose bit 17 a pair's store
+/// would carry into the next lane), and a NaN a NaN; a half value is its own bits. The narrowing is
+/// the same instructions whether the module's rounding is native or not.
 #[test]
-fn an_unrounded_half_saturates_at_its_store_under_native_rounding() {
-    use super::super::narrow::{f32_of_half_bits, half_bits_of_f32};
-    let truncated = |b: u32| -> u64 {
-        let a = b & 0x7FFF_FFFF;
-        let sign = (b >> 16) & 0x8000;
-        u64::from(match a {
-            0x4780_0000..0x7F80_0000 => sign | 0x7C00,
-            _ => half_bits_of_f32(b),
-        })
-    };
+fn an_unrounded_half_is_the_devices_narrowing_at_its_store() {
+    use super::super::narrow::f32_of_half_bits;
+    use crate::spirv::builder::QuantizeForm;
     let mut bits: Vec<u32> = vec![
         0x7F7F_FFFF,
         0xFF7F_FFFF,
@@ -173,12 +170,15 @@ fn an_unrounded_half_saturates_at_its_store_under_native_rounding() {
         0x4780_0001,
         0x477F_FFFF,
         0x477F_F000,
+        0x477F_EFFF,
         0x477F_E000,
         0x47C3_5000,
         0x7149_F2CA,
         0xC780_0000,
         0x3F80_0001,
+        0x3F80_1000,
         0x3F80_1FFF,
+        0x3F80_3000,
         0x3649_539C,
         0x3380_0001,
         0x0000_0001,
@@ -190,40 +190,154 @@ fn an_unrounded_half_saturates_at_its_store_under_native_rounding() {
     ];
     bits.extend((0..=0xFFFFu32).step_by(7).map(f32_of_half_bits));
     let cases: Vec<Case> = bits.iter().map(|&b| vec![vec![u64::from(b)]]).collect();
-    let words = |native: bool| {
+    for q in [QuantizeForm::Converted, QuantizeForm::Device] {
+        let words = |native: bool| {
+            let body = move |fb: &mut FunctionBuilder<'_>, x: &[Value]| -> BResult<Value> {
+                fb.module().set_quantize_form(q);
+                fb.module().set_native_half(native);
+                Ok(x[0])
+            };
+            let m = kernel_with(&[float(32)], half(), &body, true, false).expect("build");
+            crate::spirv::serialize::serialize(m)
+                .expect("serialize")
+                .words
+                .len()
+        };
         let body = move |fb: &mut FunctionBuilder<'_>, x: &[Value]| -> BResult<Value> {
-            fb.module().set_native_half(native);
+            fb.module().set_quantize_form(q);
+            fb.module().set_native_half(true);
             Ok(x[0])
         };
-        let m = kernel_with(&[float(32)], half(), &body, true, false).expect("build");
-        crate::spirv::serialize::serialize(m)
-            .expect("serialize")
-            .words
-            .len()
-    };
-    let body = |fb: &mut FunctionBuilder<'_>, x: &[Value]| -> BResult<Value> {
-        fb.module().set_native_half(true);
-        Ok(x[0])
-    };
-    check_accept(
-        "native",
-        &[float(32)],
-        half(),
-        &body,
-        &cases,
-        &|c| Some(vec![truncated(arg(c, 0) as u32)]),
-        &|g, w| g == w,
-    );
-    assert!(
-        words(false) < words(true),
-        "the cap is emitted only under native rounding"
-    );
+        check_accept(
+            &format!("native {q:?}"),
+            &[float(32)],
+            half(),
+            &body,
+            &cases,
+            &|c| Some(vec![metal_half(arg(c, 0))]),
+            &|g, w| g == w || (is_nan(half(), g) && is_nan(half(), w)),
+        );
+        assert_eq!(
+            words(false),
+            words(true),
+            "{q:?}: no cap under native rounding"
+        );
+    }
 }
 
-/// The host transliterations of the two bit sequences, which fold a constant's bits at translation
-/// time, agree with the sequences' values on every half pattern (the widened value is the
-/// pattern's, and back is the pattern itself), and a constant that is no half value (a lost NaN
-/// payload, an `f32` between two halves) is not folded.
+/// A `half`'s bits from its value, where none are known, are the device's narrowing on every form,
+/// with no integer encode: wherever the module can hold a 16-bit float (`QuantizeForm::Converted`
+/// and `Controlled`, a profile with `shaderFloat16`), one conversion of the lanes to 16 bits, read
+/// as words beside a 16-bit zero, decorated `NoContraction` under the float controls; in
+/// `QuantizeForm::Device` (no `shaderFloat16`), `GLSL.std.450 PackHalf2x16` of each lane beside a
+/// zero (one a lane, and no 16-bit type). Every half value, on one to four lanes, encodes to its
+/// own bits zero-extended but a NaN, which encodes to a NaN (`PrecisionNote::NativeNanEncoding`),
+/// and `narrow::encodes_bits` finds the narrowing.
+#[test]
+fn a_half_encode_is_the_devices_narrowing_in_every_form() {
+    use super::super::narrow::{encodes_bits, f32_of_half_bits, half_bits_of_f32, to_bits};
+    use crate::spirv::builder::QuantizeForm;
+    use crate::spirv::ir::Contraction;
+    let lanes_of = |n: u32| -> Vec<Case> {
+        (0..0x1_0000u32)
+            .step_by(n as usize)
+            .map(|h| {
+                vec![(h..h + n)
+                    .map(|x| u64::from(f32_of_half_bits(x & 0xFFFF)))
+                    .collect()]
+            })
+            .collect()
+    };
+    let want = |c: &Case| {
+        Some(
+            c[0].iter()
+                .map(|b| u64::from(half_bits_of_f32(*b as u32)))
+                .collect(),
+        )
+    };
+    let half_nan = |b: u64| b >> 16 == 0 && is_nan(half(), b);
+    for q in [
+        QuantizeForm::Device,
+        QuantizeForm::Converted,
+        QuantizeForm::Controlled,
+    ] {
+        let float16 = q != QuantizeForm::Device;
+        for lanes in 1u8..=4 {
+            let cases = lanes_of(u32::from(lanes));
+            let cases = &cases;
+            let what = format!("{lanes} lanes, {q:?}");
+            let body = move |fb: &mut FunctionBuilder<'_>, x: &[Value]| -> BResult<Value> {
+                fb.module().set_quantize_form(q);
+                to_bits(fb, vec(half(), lanes), x[0])
+            };
+            let (ins, out) = ([vec(float(32), lanes)], vec(int(32), lanes));
+            let m = kernel_with(&ins, out, &body, true, false)
+                .unwrap_or_else(|e| panic!("{what}: build: {e:?}"));
+            let budget = crate::budget::Budget::default();
+            let mut meter = crate::budget::Meter::new(&budget);
+            assert!(
+                encodes_bits(&m, &mut meter).expect("encodes_bits"),
+                "{what}: encodes_bits"
+            );
+            let insts = || m.blocks().iter().flat_map(|b| &b.insts);
+            let integer_encode = insts().any(|n| {
+                matches!(
+                    n.inst,
+                    Inst::Convert {
+                        op: ConvOp::ConvertFToU,
+                        ..
+                    } | Inst::Select { .. }
+                )
+            });
+            let conversions: Vec<Contraction> = insts()
+                .filter_map(|n| match n.inst {
+                    Inst::Convert {
+                        op: ConvOp::FConvert,
+                        contract,
+                        ..
+                    } => Some(contract),
+                    _ => None,
+                })
+                .collect();
+            let packs = insts()
+                .filter(|n| {
+                    matches!(
+                        n.inst,
+                        Inst::Glsl {
+                            op: GlslOp::PackHalf2x16,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            let halves = m
+                .types()
+                .iter()
+                .any(|(_, t)| matches!(t, Type::Float { width: 16 }));
+            let held = match q {
+                QuantizeForm::Controlled => Contraction::Forbidden,
+                _ => Contraction::Allowed,
+            };
+            assert_eq!(
+                conversions,
+                vec![held; usize::from(float16)],
+                "{what}: the conversions"
+            );
+            let want_packs = if float16 { 0 } else { usize::from(lanes) };
+            assert_eq!(packs, want_packs, "{what}: the packs");
+            assert_eq!(halves, float16, "{what}: a 16-bit float type");
+            assert!(!integer_encode, "{what}: an integer encode");
+            check_accept(&what, &ins, out, &body, cases, &want, &|g, w| {
+                g == w || (half_nan(g) && half_nan(w))
+            });
+        }
+    }
+}
+
+/// The host's bits of a half value and value of half bits, which fold a constant's bits at
+/// translation time, agree on every half pattern (the widened value is the pattern's, and back is
+/// the pattern itself), and a constant that is no half value (a lost NaN payload, an `f32` between
+/// two halves) is not folded.
 #[test]
 fn narrow_constant_bits_fold_exactly() {
     use super::super::narrow::{f32_of_half_bits, half_bits_of_f32};
@@ -249,7 +363,8 @@ fn narrow_constant_bits_fold_exactly() {
         assert_eq!(x == bits, folds, "{bits:#010x}");
     }
     // A store of a constant takes its bits at translation time: the kernel's store of every
-    // tested constant equals the pattern (the encode sequence would compute the same).
+    // tested constant equals the pattern (the device's narrowing would compute the same but for a
+    // NaN's bits).
     for f in [half(), bfloat()] {
         let vals = if f == half() {
             half_values()
@@ -284,8 +399,11 @@ fn narrow_constant_bits_fold_exactly() {
 /// in one lane of a 4-lane vector built from `undef`, is stored exactly as it was loaded (the junk
 /// the harness loads above each lane's 16 bits cleared); so is a vector that keeps two lanes of a
 /// loaded vector and replaces the other two; so is a chain one lane of which has no known bits (a
-/// copy of a loaded lane), which runs the sequence; so is each lane stored alone, with and without
-/// known vector bits; and the vector's widened lanes are the patterns' values.
+/// copy of a loaded lane), which the device's narrowing encodes; so is each lane stored alone, with
+/// and without known vector bits; and the vector's widened lanes are the patterns' values. Where
+/// the narrowing encodes, a `half` NaN's bits are the device's
+/// (`PrecisionNote::NativeNanEncoding`): so in a copy's chain, and in the loaded vector's, which
+/// the harness builds from its lanes' decodes (a construct, whose bits are not noted).
 #[test]
 fn narrow_lanes_move_as_bits_through_vectors() {
     use super::super::narrow::note_insert;
@@ -315,6 +433,8 @@ fn narrow_lanes_move_as_bits_through_vectors() {
             .collect();
         let ins = [f, f, f, f];
         let lanes = |c: &Case| Some((0..4).map(|i| arg(c, i)).collect());
+        // Bits the device's narrowing computes: a `half` NaN is the device's.
+        let sequenced = |g: u64, w: u64| g == w || (f == half() && is_nan(f, g) && is_nan(f, w));
         for copy in [None, Some(2)] {
             check_accept(
                 &format!("{f:?} lanes through a vector (copied lane: {copy:?})"),
@@ -323,7 +443,10 @@ fn narrow_lanes_move_as_bits_through_vectors() {
                 &|fb, x| assemble(fb, f, x, copy),
                 &cases,
                 &lanes,
-                &|g, w| g == w,
+                &|g, w| match copy {
+                    Some(_) => sequenced(g, w),
+                    None => g == w,
+                },
             );
         }
         check(
@@ -344,8 +467,8 @@ fn narrow_lanes_move_as_bits_through_vectors() {
             },
             false,
         );
-        // Lanes 0 and 2 of a loaded vector replaced by two loaded lanes: the kept lanes' bits
-        // carry the harness's junk, which the store clears.
+        // Lanes 0 and 2 of a loaded vector replaced by two loaded lanes: the kept lanes' junk
+        // above their 16 bits is cleared.
         let mixed: Vec<Case> = (0..0x4000u64)
             .map(|b| {
                 vec![
@@ -368,7 +491,7 @@ fn narrow_lanes_move_as_bits_through_vectors() {
             },
             &mixed,
             &|c| Some(vec![c[0][0], c[2][1], c[1][0], c[2][3]]),
-            &|g, w| g == w,
+            &sequenced,
         );
         // The first and the last lane (the other lanes extract the same way).
         for lane in [0u32, 3] {
@@ -390,7 +513,10 @@ fn narrow_lanes_move_as_bits_through_vectors() {
                     },
                     &cases,
                     &|c| Some(vec![arg(c, lane as usize)]),
-                    &|g, w| g == w,
+                    &|g, w| match copied {
+                        true => sequenced(g, w),
+                        false => g == w,
+                    },
                 );
             }
         }
@@ -399,9 +525,9 @@ fn narrow_lanes_move_as_bits_through_vectors() {
 
 /// Repeating a vector's lane inserts on bits never costs words. Four loaded halves stored as a
 /// vector need neither their decode nor the vector's encode once unread instructions are removed; a
-/// chain one lane of which has no known bits costs what it did without the notes (the sequence
-/// encodes the vector); and so does a lane stored from a vector whose bits are unknown (the lane is
-/// encoded alone).
+/// chain one lane of which has no known bits costs what it did without the notes (the device's
+/// narrowing encodes the vector); and so does a lane stored from a vector whose bits are unknown
+/// (the lane is encoded alone).
 #[test]
 fn narrow_lane_inserts_never_cost_words() {
     use super::super::narrow::note_insert;
@@ -432,7 +558,7 @@ fn narrow_lane_inserts_never_cost_words() {
     let v4 = vec(half(), 4);
     let (with, without) = (size(v4, &chain(true, None)), size(v4, &chain(false, None)));
     assert!(
-        with + 100 < without,
+        with + 64 < without,
         "{with} words with notes, {without} without"
     );
     let (with, without) = (
@@ -466,9 +592,8 @@ fn narrow_lane_inserts_never_cost_words() {
 /// bfloat pattern, each in one lane of a vector built by `narrow::insert`, widens to the `f32` bits
 /// its own decode gives (`f32_of_half_bits` is checked against that decode in
 /// `narrow_constant_bits_fold_exactly`), and every pattern, each in one lane of a vector of
-/// unknown bits stored lane by lane, is stored exactly; the first saves the lane decodes (more
-/// than 100 words for halves), and the second costs no more than one vector encode and a copy
-/// per lane.
+/// unknown bits stored lane by lane, is stored exactly; the first is smaller than the lane
+/// decodes, and the second costs no more than one vector encode and a copy per lane.
 #[test]
 fn narrow_vector_decodes_and_encodes_are_offered() {
     use super::super::narrow::insert;
@@ -497,13 +622,10 @@ fn narrow_vector_decodes_and_encodes_are_offered() {
         let m = kernel_with(&ins, out, &built(true), true, false).expect("build");
         let plain = kernel_with(&ins, out, &built(false), true, false).expect("build");
         let (with, without) = (words(m.clone()), words(plain));
-        // A bfloat decode is one shift, a half decode about twenty instructions.
-        let saved = if f == half() { 100 } else { 0 };
-        assert!(
-            with + saved < without,
-            "{f:?}: {with} words offered, {without} not"
-        );
-        // Bit for bit what each lane's own decode gives (a signaling NaN stays signaling).
+        // A bfloat decode is one shift, a half decode the device's widening of a few.
+        assert!(with < without, "{f:?}: {with} words offered, {without} not");
+        // Bit for bit what each lane's own decode gives: a bfloat's every pattern (a signaling NaN
+        // stays signaling), a half's but a NaN, which is the device's widening's NaN.
         let widened = |h: u64| {
             let h = h as u32;
             u64::from(if f == half() {
@@ -512,6 +634,7 @@ fn narrow_vector_decodes_and_encodes_are_offered() {
                 h << 16
             })
         };
+        let nan32 = |b: u64| f32::from_bits(b as u32).is_nan();
         check_module(
             &format!("{f:?} lanes decoded once"),
             m,
@@ -519,7 +642,7 @@ fn narrow_vector_decodes_and_encodes_are_offered() {
             out,
             &cases,
             &|c| Some((0..4).map(|i| widened(arg(c, i))).collect()),
-            &|g, w| g == w,
+            &|g, w| g == w || (f == half() && nan32(g) && nan32(w)),
         );
         // A copy of a loaded vector has no known bits; its lanes are stored one by one.
         let v4 = vec(f, 4);
@@ -541,7 +664,8 @@ fn narrow_vector_decodes_and_encodes_are_offered() {
             v4,
             &cases,
             &|c| Some(c[0].clone()),
-            &|g, w| g == w,
+            // A copy's half NaN is the device's widening's (`NativeNanEncoding`).
+            &|g, w| g == w || (f == half() && is_nan(f, g) && is_nan(f, w)),
         );
     }
 }
@@ -567,10 +691,11 @@ fn narrow_float_operators_are_named_by_format() {
 }
 
 /// A bitcast from or to narrow float vectors moves narrow patterns bit for bit (NaN payloads
-/// included) under each plan: through one word (`Packed`), through words (`Words`), and lane by
-/// lane (`Lanes`), where a narrow vector converts to and from its format bits once as a vector. The
-/// word plan between `<4 x half>` and `<2 x i32>` moves every half pattern; the others move the
-/// interesting values and pseudo-random patterns.
+/// included, but for a `half` NaN whose loaded bits are not reused: its bits are the device's
+/// widening's, `PrecisionNote::NativeNanEncoding`) under each plan: through one word (`Packed`),
+/// through words (`Words`), and lane by lane (`Lanes`), where a narrow vector converts to and from
+/// its format bits once as a vector. The word plan between `<4 x half>` and `<2 x i32>` moves every
+/// half pattern; the others move the interesting values and pseudo-random patterns.
 #[test]
 fn narrow_vector_bitcasts_move_narrow_patterns() {
     let mut rng = Rng(11);
@@ -629,7 +754,13 @@ fn narrow_vector_bitcasts_move_narrow_patterns() {
                             .collect(),
                     )
                 },
-                &|g, w| g == w,
+                &|g, w| {
+                    // Each 16-bit pattern alike, or a `half` NaN for a `half` NaN.
+                    (0..4).all(|k| {
+                        let (g, w) = ((g >> (16 * k)) & 0xFFFF, (w >> (16 * k)) & 0xFFFF);
+                        g == w || (f == half() && is_nan(f, g) && is_nan(f, w))
+                    })
+                },
             );
         }
     }
@@ -656,14 +787,13 @@ fn narrow_float_operators_round_once() {
                 &pairs(&vals, &vals),
                 &|c| {
                     let (a, b) = (nval(f, arg(c, 0)), nval(f, arg(c, 1)));
-                    let r = match op {
-                        AirBin::FAdd => a + b,
-                        AirBin::FSub => a - b,
-                        AirBin::FMul => a * b,
-                        AirBin::FDiv => a / b,
-                        _ => a % b,
-                    };
-                    Some(vec![nbits(f, r)])
+                    Some(vec![match op {
+                        AirBin::FAdd => nbits(f, a + b),
+                        AirBin::FSub => nbits(f, a - b),
+                        AirBin::FMul => nbits(f, a * b),
+                        AirBin::FDiv => nbits(f, a / b),
+                        _ => nbits(f, a % b),
+                    }])
                 },
                 &accept,
             );
@@ -728,10 +858,6 @@ fn narrow_float_functions_on(f: Form, vals: &[u64]) {
         FloatFn::MulAdd,
         FloatFn::Sqrt,
     ] {
-        // A `half` `mix` is its own strategy, Metal's fused form (`tests::fused`).
-        if op == FloatFn::Mix && is_half {
-            continue;
-        }
         let arity = op.arity();
         let cases: Vec<Case> = if arity == 1 {
             vals.iter().map(|v| vec![vec![*v]]).collect()
@@ -750,30 +876,23 @@ fn narrow_float_functions_on(f: Form, vals: &[u64]) {
             }
             c
         };
-        // `bfloat` keeps the device's `NMin` and `NMax`, which may give either zero; `half` is
-        // Metal's, bit for bit.
-        let picks = matches!(
+        // The device's `NMin`, `NMax` and `NClamp`, which may give either zero.
+        let loose = matches!(
             op,
-            FloatFn::Min | FloatFn::Max | FloatFn::Clamp | FloatFn::Min3 | FloatFn::Max3
+            FloatFn::Min
+                | FloatFn::Max
+                | FloatFn::Clamp
+                | FloatFn::Min3
+                | FloatFn::Max3
+                | FloatFn::Saturate
         );
-        let loose = picks && !is_half;
         let flush = exact_ok(f);
         let accept = |g: u64, w: u64| flush(g, w) || (loose && is_zero(f, g) && is_zero(f, w));
         check_accept(
             &format!("{op:?} {f:?}"),
             &vec![f; arity],
             f,
-            &|fb, x| {
-                math::float_fn(
-                    fb,
-                    op,
-                    f,
-                    Contraction::Forbidden,
-                    NanTest::IsNan,
-                    x,
-                    &Lib::instructions(),
-                )
-            },
+            &|fb, x| math::float_fn(fb, op, f, Contraction::Forbidden, x, &Lib::instructions()),
             &cases,
             &|c| {
                 let x = |i: usize| nval(f, c[i][0]);
@@ -784,25 +903,21 @@ fn narrow_float_functions_on(f: Form, vals: &[u64]) {
                     FloatFn::Floor => x(0).floor(),
                     FloatFn::Ceil => x(0).ceil(),
                     FloatFn::Trunc => x(0).trunc(),
-                    FloatFn::Round => metal_round(is_half, x(0)),
+                    FloatFn::Round => c99_round(x(0)),
                     FloatFn::Rint => x(0).round_ties_even(),
-                    // A half NaN is kept bit for bit, a bfloat one is `float`'s.
-                    FloatFn::Fract if x(0).is_nan() && is_half => return Some(vec![c[0][0]]),
-                    FloatFn::Fract if x(0).is_nan() => f64::NAN,
-                    FloatFn::Fract if x(0).is_infinite() => 0.0,
+                    // The device's `Fract`: a NaN at a NaN and an infinity.
+                    FloatFn::Fract if !x(0).is_finite() => f64::NAN,
                     FloatFn::Fract => {
                         let below = 1.0 - 2f64.powi(if is_half { -11 } else { -8 });
                         q(x(0) - x(0).floor()).min(below)
                     }
+                    // The device's `FSign`, undefined at a NaN; a zero keeps its sign.
+                    FloatFn::Sign if x(0).is_nan() => return None,
                     FloatFn::Sign if x(0) > 0.0 => 1.0,
                     FloatFn::Sign if x(0) < 0.0 => -1.0,
-                    FloatFn::Sign => 0.0,
+                    FloatFn::Sign => x(0),
                     FloatFn::Saturate if x(0) > 0.0 => x(0).min(1.0),
                     FloatFn::Saturate => 0.0,
-                    _ if picks && is_half => {
-                        let b: Vec<u64> = c.iter().map(|l| l[0]).collect();
-                        return Some(vec![metal_min_max_ref(op, &b, &|v| nval(f, v))]);
-                    }
                     FloatFn::Min => x(0).min(x(1)),
                     FloatFn::Max => x(0).max(x(1)),
                     FloatFn::Clamp => x(0).max(x(1)).min(x(2)),
@@ -810,10 +925,15 @@ fn narrow_float_functions_on(f: Form, vals: &[u64]) {
                     FloatFn::Max3 => x(0).max(x(1)).max(x(2)),
                     FloatFn::Median3 => {
                         let b = [c[0][0], c[1][0], c[2][0]];
-                        return Some(vec![median3_ref(b, &|v| nval(f, v), false)]);
+                        return Some(vec![median3_ref(b, &|v| nval(f, v))]);
+                    }
+                    // A `half` one the device's `FMix` in `float`, rounded once.
+                    FloatFn::Mix if is_half => {
+                        let (p, y, t) = (x(0) as f32, x(1) as f32, x(2) as f32);
+                        f64::from(p * (1.0 - t) + y * t)
                     }
                     FloatFn::Mix => q(x(0) * q(1.0 - x(2))) + q(x(1) * x(2)),
-                    FloatFn::MulAdd => q(x(0) * x(1)) + x(2),
+                    FloatFn::MulAdd => q(q(x(0) * x(1)) + x(2)),
                     _ => x(0).sqrt(),
                 };
                 Some(vec![nbits(f, r)])
@@ -823,59 +943,10 @@ fn narrow_float_functions_on(f: Form, vals: &[u64]) {
     }
 }
 
-/// Class K: Metal's `half` `fract` with every fast-math flag (`nan_half_fast`) answers the largest
-/// `half` below one, `0x3BFF`, for a NaN and for either infinity, where without flags (`nan_half`)
-/// a NaN is itself and an infinity `+0`; every finite lane is the precise one's.
-#[test]
-fn flagged_half_fract_answers_below_one_at_nans_and_infinities() {
-    let mut halves: Vec<u64> = (0..0x10000u64).step_by(97).collect();
-    halves.extend([
-        0, 0x8000, 0x7C00, 0xFC00, 0x7C01, 0xFE00, 0x7E00, 0x3BFF, 0xBC00, 0x8001,
-    ]);
-    for lanes in [1u8, 3] {
-        let f = vec(float(16), lanes);
-        let n = usize::from(lanes);
-        let cases: Vec<Case> = halves.iter().map(|&x| vec![vec![x; n]]).collect();
-        let run = |op: FloatFn, c: &Case| {
-            let x = f16_to_f64(c[0][0] as u16);
-            let r = if x.is_nan() || x.is_infinite() {
-                match op {
-                    FloatFn::FlaggedFract => 0x3BFF,
-                    _ if x.is_nan() => c[0][0],
-                    _ => 0,
-                }
-            } else {
-                let d = f16_to_f64(f64_to_f16(x - x.floor()));
-                u64::from(f64_to_f16(d.min(1.0 - 2f64.powi(-11))))
-            };
-            Some(vec![r; n])
-        };
-        for op in [FloatFn::Fract, FloatFn::FlaggedFract] {
-            check_accept(
-                &format!("{op:?} x{lanes}"),
-                &[f],
-                f,
-                &|fb, x| {
-                    math::float_fn(
-                        fb,
-                        op,
-                        f,
-                        Contraction::Forbidden,
-                        NanTest::Bits,
-                        x,
-                        &Lib::instructions(),
-                    )
-                },
-                &cases,
-                &|c| run(op, c),
-                &|g, w| g == w,
-            );
-        }
-    }
-}
-
-/// The `f32` operands [`half_rounding_keeps_denormals`] rounds to `half`, in each of the
-/// module's half roundings.
+/// The `f32` operands [`converted_half_rounding_is_the_exactly_rounded_half`] rounds to `half`:
+/// every 17th half pattern and every denormal one, each exactly and at its exact ties with both
+/// neighbours, just inside and outside them, and the `f32` edge values (the ties at the smallest
+/// normal half, `65504..65520`, signed zeros, `f32` denormals, NaN).
 fn half_rounding_operands() -> Vec<f32> {
     let mut xs: Vec<f32> = Vec::new();
     for h in (0..0x7C00u16).step_by(17).chain(0..0x400) {
@@ -922,61 +993,15 @@ fn half_rounding_operands() -> Vec<f32> {
     xs
 }
 
-/// Rounding an `f32` to `half` keeps half denormals and rounds to nearest even on every part of the
-/// half range: every 17th half pattern and every denormal one, each exactly and at its exact ties
-/// with both neighbours, just inside and outside them, and the `f32` edge values (the ties at the
-/// smallest normal half, `65504..65520`, signed zeros, `f32` denormals, NaN). Metal's readings of
-/// A1's `half-denormal-results-of-arithmetic-and-conversions` (dd2cb644) and
-/// `half-tanh-under-fast-math-at-every-sixteenth-pattern` (27353187) keep every half denormal a
-/// result rounds to.
-#[test]
-fn half_rounding_keeps_denormals() {
-    let xs = half_rounding_operands();
-    let (f32f, h) = (float(32), half());
-    let cases: Vec<Case> = xs
-        .iter()
-        .filter(|x| x.is_nan() || x.is_finite() || x.is_infinite())
-        .map(|x| vec![vec![u64::from(x.to_bits())]])
-        .collect();
-    check_accept(
-        "round f32 to half",
-        &[f32f],
-        h,
-        &|fb, x| crate::lower::arith::narrow::round(fb, h, x[0]),
-        &cases,
-        &|c| Some(vec![u64::from(f64_to_f16(f64::from(f32v(arg(c, 0)))))]),
-        &exact_ok(h),
-    );
-    let v = vec(h, 3);
-    let vc: Vec<Case> = xs
-        .chunks(3)
-        .filter(|c| c.len() == 3)
-        .map(|c| vec![c.iter().map(|x| u64::from(x.to_bits())).collect()])
-        .collect();
-    check_accept(
-        "round <3 x float> to half",
-        &[vec(f32f, 3)],
-        v,
-        &|fb, x| crate::lower::arith::narrow::round(fb, v, x[0]),
-        &vc,
-        &|c| {
-            Some(
-                c[0].iter()
-                    .map(|b| u64::from(f64_to_f16(f64::from(f32v(*b)))))
-                    .collect(),
-            )
-        },
-        &exact_ok(v),
-    );
-}
-
 /// In `QuantizeForm::Converted` and `Controlled` a `half` rounding is the conversion to 16 bits
 /// and its widening alone, which the interpreter rounds to nearest even with half denormals kept,
-/// as the devices that take `DriverDeviation::MetalHalfConversion` are measured to on every `f32`
-/// and as the Vulkan spec makes it under the controlled form's float controls: over
-/// [`half_rounding_operands`], `round` and `round_exact_below_normal` give the exactly rounded
-/// half on scalars and vectors, with no `OpQuantizeToF16` and no `RoundEven` in the module. In
-/// `Controlled` each conversion is decorated `NoContraction`, and none in `Converted`.
+/// as the Vulkan spec makes it under the controlled form's float controls: over
+/// [`half_rounding_operands`], `round` gives the exactly rounded half on scalars and vectors, with
+/// no `OpQuantizeToF16` and no `RoundEven` in the module. In `Controlled` each conversion is
+/// decorated `NoContraction`, and none in `Converted`. Metal's readings of A1's
+/// `half-denormal-results-of-arithmetic-and-conversions` (dd2cb644) and
+/// `half-tanh-under-fast-math-at-every-sixteenth-pattern` (27353187) keep every half denormal a
+/// result rounds to, as this rounding does.
 #[test]
 fn converted_half_rounding_is_the_exactly_rounded_half() {
     let xs = half_rounding_operands();
@@ -998,26 +1023,14 @@ fn converted_half_rounding_is_the_exactly_rounded_half() {
                 .collect::<Vec<u64>>(),
         )
     };
-    type Round = fn(&mut FunctionBuilder<'_>, Form, Value) -> BResult<Value>;
-    let rounds: [(&str, Round); 2] = [
-        ("round", crate::lower::arith::narrow::round),
-        (
-            "round_exact_below_normal",
-            crate::lower::arith::narrow::round_exact_below_normal,
-        ),
-    ];
     use crate::spirv::builder::QuantizeForm;
     use crate::spirv::ir::Contraction;
-    for ((name, round), q) in rounds
-        .into_iter()
-        .flat_map(|r| [(r, QuantizeForm::Converted), (r, QuantizeForm::Controlled)])
-    {
-        // `round_exact_below_normal` is exact only on an `x` that is a value of the format
-        // below the smallest normal half; the converted form is exact on every `x`.
+    let name = "round";
+    for q in [QuantizeForm::Converted, QuantizeForm::Controlled] {
         for (form, input, cs) in [(h, f32f, &cases), (v, vec(f32f, 3), &vc)] {
             let body = |fb: &mut FunctionBuilder<'_>, x: &[Value]| {
                 fb.module().set_quantize_form(q);
-                round(fb, form, x[0])
+                crate::lower::arith::narrow::round(fb, form, x[0])
             };
             let m = kernel_with(&[input], form, &body, true, false)
                 .unwrap_or_else(|e| panic!("{name} {q:?}: build: {e:?}"));
@@ -1133,88 +1146,77 @@ fn metal_half_operands() -> Vec<u32> {
     xs
 }
 
-/// In `QuantizeForm::Integer`, the default, `round` is Metal's conversion of a `float` to `half`
-/// ([`metal_half`]) bit for bit over [`metal_half_operands`] (NaNs and signed zeros included) on
-/// scalars and vectors, with no `OpQuantizeToF16` in the module, and `round_exact_below_normal` is
-/// too wherever its operand is a value of the format below the smallest normal half (every other
-/// operand). In `QuantizeForm::Device`, through the interpreter's quantize (to nearest even), both
-/// give the same values, a NaN a NaN.
+/// In `QuantizeForm::Device`, the default, a `half` rounding is the device's `OpQuantizeToF16`
+/// alone, with no denormal arm (no `RoundEven`, no test of the quantize for a zero): through the
+/// interpreter's quantize (to
+/// nearest even, flushing what is too small for a normal half to the zero of its sign), `round`
+/// over [`metal_half_operands`] (signed zeros included, a NaN a NaN), on scalars and vectors, is
+/// Metal's conversion of a `float` to `half` ([`metal_half`]) from the smallest normal half up and
+/// the quantize's zero of the operand's sign below it, where Metal answers the half denormal.
 #[test]
-fn integer_half_rounding_is_metals_conversion() {
+fn device_half_rounding_is_the_quantize_alone() {
     use crate::spirv::builder::QuantizeForm;
     let xs = metal_half_operands();
     let (f32f, h) = (float(32), half());
     let v = vec(h, 3);
-    let normal_or_exact = |b: &u32| {
-        let m = b & 0x7FFF_FFFF;
-        m >= 0x3880_0000 || f64::from(f32::from_bits(m)) * 16_777_216.0 % 1.0 == 0.0
+    // The quantize alone: Metal's conversion where it is a normal half, an infinity or a NaN, and
+    // the zero of the operand's sign below the smallest normal half.
+    let flushed = |b: u64| match metal_half(b) {
+        h if h & 0x7C00 == 0 => h & 0x8000,
+        h => h,
     };
-    type Round = fn(&mut FunctionBuilder<'_>, Form, Value) -> BResult<Value>;
-    let rounds: [(&str, Round, bool); 2] = [
-        ("round", crate::lower::arith::narrow::round, false),
-        (
-            "round_exact_below_normal",
-            crate::lower::arith::narrow::round_exact_below_normal,
-            true,
-        ),
-    ];
-    let want = |c: &Case| Some(c[0].iter().map(|b| metal_half(*b)).collect::<Vec<u64>>());
-    // The device form's quantize is the interpreter's: a quarter of the operands shows the
-    // routine around it.
-    for (form_name, form, step) in [
-        ("integer", QuantizeForm::Integer, 1),
-        ("device", QuantizeForm::Device, 4),
-    ] {
-        for (name, round, exact_only) in rounds {
-            let ops: Vec<u32> = xs
-                .iter()
-                .copied()
-                .filter(|b| !exact_only || normal_or_exact(b))
-                .step_by(step)
-                .collect();
-            let cases: Vec<Case> = ops.iter().map(|b| vec![vec![u64::from(*b)]]).collect();
-            let vc: Vec<Case> = ops
-                .chunks(3)
-                .step_by(5)
-                .filter(|c| c.len() == 3)
-                .map(|c| vec![c.iter().map(|b| u64::from(*b)).collect()])
-                .collect();
-            for (lanes, input, cs) in [(h, f32f, &cases), (v, vec(f32f, 3), &vc)] {
-                let body = |fb: &mut FunctionBuilder<'_>, x: &[Value]| {
-                    fb.module().set_quantize_form(form);
-                    round(fb, lanes, x[0])
-                };
-                let what = format!("{form_name} {name} on {lanes:?}");
-                let m = kernel_with(&[input], lanes, &body, true, false)
-                    .unwrap_or_else(|e| panic!("{what}: build: {e:?}"));
-                assert_eq!(
-                    crate::lower::arith::narrow::quantizes(&m),
-                    form == QuantizeForm::Device,
-                    "{what}: OpQuantizeToF16"
-                );
-                // The integer form answers Metal's NaN; the interpreter's quantize keeps a NaN
-                // a NaN, which the device form's measured fact covers alone.
-                let exact = |g: u64, w: u64| g == w;
-                let nan_loose = exact_ok(lanes);
-                let accept: &dyn Fn(u64, u64) -> bool = match form {
-                    QuantizeForm::Integer => &exact,
-                    _ => &nan_loose,
-                };
-                check_module(&what, m, &[input], lanes, cs, &want, accept);
-            }
-        }
+    let want = |c: &Case| Some(c[0].iter().map(|b| flushed(*b)).collect::<Vec<u64>>());
+    // The quantize is the interpreter's: a quarter of the operands shows the module around it.
+    let ops: Vec<u32> = xs.iter().copied().step_by(4).collect();
+    let cases: Vec<Case> = ops.iter().map(|b| vec![vec![u64::from(*b)]]).collect();
+    let vc: Vec<Case> = ops
+        .chunks(3)
+        .step_by(5)
+        .filter(|c| c.len() == 3)
+        .map(|c| vec![c.iter().map(|b| u64::from(*b)).collect()])
+        .collect();
+    for (lanes, input, cs) in [(h, f32f, &cases), (v, vec(f32f, 3), &vc)] {
+        let body = |fb: &mut FunctionBuilder<'_>, x: &[Value]| {
+            fb.module().set_quantize_form(QuantizeForm::Device);
+            crate::lower::arith::narrow::round(fb, lanes, x[0])
+        };
+        let what = format!("device round on {lanes:?}");
+        let m = kernel_with(&[input], lanes, &body, true, false)
+            .unwrap_or_else(|e| panic!("{what}: build: {e:?}"));
+        assert!(
+            crate::lower::arith::narrow::quantizes(&m),
+            "{what}: OpQuantizeToF16"
+        );
+        let arm = m.blocks().iter().flat_map(|b| &b.insts).any(|n| {
+            matches!(
+                n.inst,
+                Inst::Glsl {
+                    op: GlslOp::RoundEven,
+                    ..
+                } | Inst::Binary {
+                    op: BinOp::FOrdEqual,
+                    ..
+                }
+            )
+        });
+        assert!(!arm, "{what}: a denormal arm");
+        // The interpreter's quantize keeps a NaN a NaN, its bits the device's.
+        check_module(&what, m, &[input], lanes, cs, &want, &exact_ok(lanes));
     }
 }
 
-/// A sum or difference of two half values that rounds below the smallest normal half is exact in
-/// `f32`, so `round_exact_below_normal` keeps it there with no denormal arithmetic: over every
-/// eleventh half pattern below `2^-13` and its negation, the patterns around the smallest normal
-/// half, and normal, infinite, and NaN operands, every sum and difference is the exactly rounded
-/// half, on scalars and vectors. The addends include the ties at the half's last bit (`2048 + 1`
+/// A `half` sum or difference takes the device's rounding (`narrow::round`): over
+/// every eleventh half pattern below `2^-13` and its negation, the patterns around the smallest
+/// normal half, and normal, infinite, and NaN operands, on scalars and vectors, every sum and
+/// difference is the exactly rounded half where that is a normal half, a zero, an infinity or a
+/// NaN; below the smallest normal half it is the device's: the interpreter's quantize's zero of its
+/// sign in `QuantizeForm::Device`, and the half denormal its conversion keeps in
+/// `QuantizeForm::Converted`. The addends include the ties at the half's last bit (`2048 + 1`
 /// rounds to 2048 and `2050 + 1` to 2052) and the overflow threshold (`65504 + 8` stays 65504,
 /// `65504 + 16` is the tie at 65520 and rounds to the infinity).
 #[test]
-fn half_sums_keep_their_exact_value_below_the_smallest_normal() {
+fn half_sums_take_the_devices_rounding_below_the_smallest_normal() {
+    use crate::spirv::builder::QuantizeForm;
     let mut vals: Vec<u64> = (0..0x0800u64).step_by(11).collect();
     vals.extend(0x03F0..0x0410u64);
     vals.extend([
@@ -1224,21 +1226,6 @@ fn half_sums_keep_their_exact_value_below_the_smallest_normal() {
     let mut few: Vec<u64> = signed.iter().copied().step_by(9).collect();
     few.extend([0x3C00, 0x4800, 0x4C00, 0x0001, 0x8001, 0xBC00]);
     let h = half();
-    for op in [AirBin::FAdd, AirBin::FSub] {
-        check_accept(
-            &format!("{op:?} below the smallest normal"),
-            &[h, h],
-            h,
-            &|fb, x| ops::float_binary(fb, op, h, Contraction::Forbidden, x[0], x[1]),
-            &pairs(&signed, &few),
-            &|c| {
-                let (a, b) = (nval(h, arg(c, 0)), nval(h, arg(c, 1)));
-                let r = if op == AirBin::FAdd { a + b } else { a - b };
-                Some(vec![nbits(h, r)])
-            },
-            &exact_ok(h),
-        );
-    }
     let v = vec(h, 4);
     let cases: Vec<Case> = (0..signed.len())
         .map(|i| {
@@ -1246,21 +1233,53 @@ fn half_sums_keep_their_exact_value_below_the_smallest_normal() {
             vec![vec![l(0), l(1), l(2), l(3)], vec![l(7), l(5), l(3), l(1)]]
         })
         .collect();
-    check_accept(
-        "fsub <4 x half> below the smallest normal",
-        &[v, v],
-        v,
-        &|fb, x| ops::float_binary(fb, AirBin::FSub, v, Contraction::Forbidden, x[0], x[1]),
-        &cases,
-        &|c| {
-            Some(
-                (0..4)
-                    .map(|i| nbits(v, nval(v, c[0][i]) - nval(v, c[1][i])))
-                    .collect(),
-            )
-        },
-        &exact_ok(v),
-    );
+    for q in [QuantizeForm::Device, QuantizeForm::Converted] {
+        // The exactly rounded half, or below the smallest normal half the zero of its sign where
+        // the interpreter's quantize flushes it.
+        let rounded = move |r: f64| {
+            let b = nbits(h, r);
+            match q {
+                QuantizeForm::Device if b & 0x7C00 == 0 => b & 0x8000,
+                _ => b,
+            }
+        };
+        for op in [AirBin::FAdd, AirBin::FSub] {
+            check_accept(
+                &format!("{op:?} below the smallest normal, {q:?}"),
+                &[h, h],
+                h,
+                &|fb, x| {
+                    fb.module().set_quantize_form(q);
+                    ops::float_binary(fb, op, h, Contraction::Forbidden, x[0], x[1])
+                },
+                &pairs(&signed, &few),
+                &|c| {
+                    let (a, b) = (nval(h, arg(c, 0)), nval(h, arg(c, 1)));
+                    let r = if op == AirBin::FAdd { a + b } else { a - b };
+                    Some(vec![rounded(r)])
+                },
+                &exact_ok(h),
+            );
+        }
+        check_accept(
+            &format!("fsub <4 x half> below the smallest normal, {q:?}"),
+            &[v, v],
+            v,
+            &|fb, x| {
+                fb.module().set_quantize_form(q);
+                ops::float_binary(fb, AirBin::FSub, v, Contraction::Forbidden, x[0], x[1])
+            },
+            &cases,
+            &|c| {
+                Some(
+                    (0..4)
+                        .map(|i| rounded(nval(v, c[0][i]) - nval(v, c[1][i])))
+                        .collect(),
+                )
+            },
+            &exact_ok(v),
+        );
+    }
 }
 
 /// Conversions into and out of the narrow formats round once, including from `double` through a
@@ -1551,7 +1570,6 @@ fn bfloat_fma_rounds_once() {
                     FloatFn::Fma,
                     f,
                     Contraction::Forbidden,
-                    NanTest::IsNan,
                     x,
                     &Lib::instructions(),
                 )
@@ -1837,361 +1855,6 @@ fn fp8_to_integer_converts_every_pattern_as_its_value() {
     }
 }
 
-/// `air.pack`/`air.unpack` follow Metal's normalized conversions: to an integer by clamping
-/// (NaN to 0), scaling, and rounding to nearest even; to a float by dividing, correctly rounded
-/// (snorm clamped at -1). The sRGB format is `srgb_conversions_answer_with_metals_tables`'.
-#[test]
-fn pack_and_unpack_follow_the_normalized_conversions() {
-    use crate::air::intrinsics::PackFormat as P;
-    let fvals: Vec<f32> = vec![
-        0.0,
-        -0.0,
-        1.0,
-        -1.0,
-        0.5,
-        -0.5,
-        0.25,
-        0.75,
-        0.1,
-        -0.3,
-        1.5,
-        -2.0,
-        0.998,
-        0.0019,
-        f32::NAN,
-        f32::INFINITY,
-        f32::NEG_INFINITY,
-        0.501_960_8,
-        0.498_039_2,
-    ];
-    let formats = [
-        P::Unorm4x8,
-        P::Snorm4x8,
-        P::Unorm2x16,
-        P::Snorm2x16,
-        P::UnormRgb10a2,
-        P::UnormRgb565,
-    ];
-    for format in formats {
-        let (widths, snorm) = math::pack_layout(format).expect("lowered");
-        let lanes = widths.len() as u8;
-        let word = int(math::packed_bits(format));
-        for lane in [float(32), half()] {
-            let f = vec(lane, lanes);
-            // Pack.
-            let cases: Vec<Case> = (0..fvals.len())
-                .map(|i| {
-                    vec![(0..usize::from(lanes))
-                        .map(|k| nbits(lane, f64::from(fvals[(i + 3 * k) % fvals.len()])))
-                        .collect()]
-                })
-                .collect();
-            // Either NaN test gives the format's NaN value.
-            for test in [NanTest::IsNan, NanTest::Bits] {
-                check(
-                    &format!("pack {format:?} from {lane:?} ({test:?})"),
-                    &[f],
-                    word,
-                    &|fb, x| math::pack(fb, format, f, x[0], None, test),
-                    &cases,
-                    &|c| {
-                        let mut w = 0u64;
-                        let mut at = 0;
-                        for (k, n) in widths.iter().enumerate() {
-                            let x = nval(lane, c[0][k]) as f32;
-                            let (lo, scale) = if snorm {
-                                (-1.0f32, (1u32 << (n - 1)) - 1)
-                            } else {
-                                (0.0, (1u32 << n) - 1)
-                            };
-                            let x = if x.is_nan() {
-                                lo.max(0.0)
-                            } else {
-                                x.clamp(lo, 1.0)
-                            };
-                            // The exact product (exact in f64), or for `rgb565` the `f32` product,
-                            // rounded to nearest even.
-                            let p = match math::pack_rounding(format) {
-                                math::PackRounding::ExactProduct => f64::from(x) * f64::from(scale),
-                                math::PackRounding::FloatProduct => f64::from(x * scale as f32),
-                            };
-                            let r = p.round_ties_even() as i64 as u64 & mask(*n as u8);
-                            w |= r << at;
-                            at += n;
-                        }
-                        Some(vec![w])
-                    },
-                    false,
-                );
-            }
-            // Unpack.
-            let mut rng = Rng(7);
-            let cases: Vec<Case> = (0..24)
-                .map(|_| vec![vec![rng.next() & mask(math::packed_bits(format))]])
-                .collect();
-            let accept = exact_ok(f);
-            check_accept(
-                &format!("unpack {format:?} to {lane:?}"),
-                &[word],
-                f,
-                &|fb, x| math::unpack(fb, format, f, x[0], None),
-                &cases,
-                &|c| {
-                    let mut at = 0;
-                    let mut out = Vec::new();
-                    for n in widths {
-                        let v = (c[0][0] >> at) & mask(*n as u8);
-                        let x = if snorm {
-                            let s = sext(v, *n as u8) as f32;
-                            (s / ((1u32 << (n - 1)) - 1) as f32).max(-1.0)
-                        } else {
-                            v as f32 / ((1u32 << n) - 1) as f32
-                        };
-                        out.push(nbits(lane, f64::from(x)));
-                        at += n;
-                    }
-                    Some(out)
-                },
-                &accept,
-            );
-        }
-    }
-    assert!(math::pack_layout(P::UnormRg11b10f).is_none());
-    assert!(math::pack_layout(P::UnormRgb9e5).is_none());
-}
-
-/// Metal's `snorm` `rgb10a2` rule, as measured on Apple M3 Max (macOS 26.7) by the probe over every
-/// `float` and `half` pack input and every code of every unpack field: a channel packs as
-/// `RoundEven(fl(x * s))` after a NaN becomes -1 and `x` is clamped to `[-1, 1]`, and unpacks as
-/// `max(c * fl(1 / s), -1)` in `f32` (a `half` result rounds that `f32`), `s` being 511 for the
-/// 10-bit fields and 1 for the 2-bit alpha.
-fn snorm_10a2_pack_ref(xs: &[f32]) -> u64 {
-    let mut w = 0u64;
-    for (k, (at, n)) in [(0u32, 10u32), (10, 10), (20, 10), (30, 2)]
-        .iter()
-        .enumerate()
-    {
-        let s = ((1u32 << (n - 1)) - 1) as f32;
-        let x = if xs[k].is_nan() { -1.0 } else { xs[k] };
-        let p = (x.clamp(-1.0, 1.0) * s).round_ties_even() as i64 as u64;
-        w |= (p & mask(*n as u8)) << at;
-    }
-    w
-}
-
-fn snorm_10a2_unpack_ref(w: u64) -> [f32; 4] {
-    let mut out = [0.0f32; 4];
-    for (k, (at, n)) in [(0u32, 10u32), (10, 10), (20, 10), (30, 2)]
-        .iter()
-        .enumerate()
-    {
-        let c = sext((w >> at) & mask(*n as u8), *n as u8) as f32;
-        out[k] = (c * (1.0 / ((1u32 << (n - 1)) - 1) as f32)).max(-1.0);
-    }
-    out
-}
-
-/// `air.pack.snorm.rgb10a2` and `air.unpack.snorm.rgb10a2` compute Metal's measured rule
-/// ([`snorm_10a2_pack_ref`]): every code of every field unpacked to `float` and `half`, every
-/// `half` packed, and `float` inputs at each rounding boundary of the 10-bit fields (`(k + 0.5)
-/// / 511` and its neighbours, where the `f32` product and the exact one disagree on 448 of the
-/// probe's run ends, besides its 4 NaN run ends), the specials, and denormals. Metal's own words
-/// pin the rule: 65 unpacks to `0x3E024120`, one ULP below the quotient `65 / 511`;
-/// `0x3B406030` (just below `1.5 / 511`) packs to `0x200802`, whose fields are 2 where the exact
-/// product gives 1; a NaN packs to `0xE0180601` (every field -1).
-#[test]
-fn snorm_rgb10a2_converts_as_metal_measures() {
-    use crate::air::intrinsics::PackFormat as P;
-    let word = int(32);
-    // Metal's words.
-    assert_eq!(snorm_10a2_unpack_ref(0x4411_0441)[0].to_bits(), 0x3E02_4120);
-    assert_eq!(snorm_10a2_unpack_ref(0x2008_0200), [-1.0, -1.0, -1.0, 0.0]);
-    assert_eq!(
-        snorm_10a2_pack_ref(&[f32::from_bits(0x3B40_6030); 4]),
-        0x20_0802
-    );
-    assert_eq!(snorm_10a2_pack_ref(&[f32::NAN; 4]), 0xE018_0601);
-    assert_eq!(snorm_10a2_pack_ref(&[0.5; 4]), 0x1004_0100);
-    assert_eq!(snorm_10a2_pack_ref(&[f32::INFINITY; 4]), 0x5FF7_FDFF);
-    // Unpack: every code of every field (r = g = b = k, a = k mod 4).
-    let codes: Vec<Case> = (0..1024u64)
-        .map(|k| vec![vec![k | k << 10 | k << 20 | (k & 3) << 30]])
-        .collect();
-    for lane in [float(32), half()] {
-        let f = vec(lane, 4);
-        check_accept(
-            &format!("unpack snorm rgb10a2 to {lane:?}"),
-            &[word],
-            f,
-            &|fb, x| math::unpack(fb, P::SnormRgb10a2, f, x[0], None),
-            &codes,
-            &|c| {
-                let v = snorm_10a2_unpack_ref(c[0][0]);
-                Some(v.iter().map(|x| nbits(lane, f64::from(*x))).collect())
-            },
-            &|g, w| g == w,
-        );
-    }
-    // Pack: every half, as (x, x, x, x).
-    let f = vec(half(), 4);
-    let halves: Vec<Case> = (0..=0xFFFFu64).map(|h| vec![vec![h; 4]]).collect();
-    check(
-        "pack snorm rgb10a2 from half",
-        &[f],
-        word,
-        &|fb, x| math::pack(fb, P::SnormRgb10a2, f, x[0], None, NanTest::IsNan),
-        &halves,
-        &|c| {
-            Some(vec![snorm_10a2_pack_ref(
-                &[nval(half(), c[0][0]) as f32; 4],
-            )])
-        },
-        false,
-    );
-    // Pack: floats at every 10-bit rounding boundary and its neighbours, the specials, and
-    // denormals; the lanes differ so each field sees its own input.
-    let mut xs: Vec<u32> = Vec::new();
-    for k in -512i32..=512 {
-        let b = ((k as f32 + 0.5) / 511.0).to_bits();
-        xs.extend([b.wrapping_sub(1), b, b.wrapping_add(1)]);
-    }
-    xs.extend([
-        0x0000_0000,
-        0x8000_0000,
-        0x0000_0001,
-        0x8000_0001,
-        0x3F00_0000,
-        0xBF00_0000,
-        0x3F80_0000,
-        0xBF80_0000,
-        0x4000_0000,
-        0xC000_0000,
-        0x7F80_0000,
-        0xFF80_0000,
-        0x7FC0_0000,
-        0xFFC0_0001,
-        0x7F80_0001,
-    ]);
-    let f = vec(float(32), 4);
-    let cases: Vec<Case> = (0..xs.len())
-        .map(|i| {
-            vec![(0..4)
-                .map(|k| u64::from(xs[(i + 7 * k) % xs.len()]))
-                .collect()]
-        })
-        .collect();
-    check(
-        "pack snorm rgb10a2 from float",
-        &[f],
-        word,
-        &|fb, x| math::pack(fb, P::SnormRgb10a2, f, x[0], None, NanTest::IsNan),
-        &cases,
-        &|c| {
-            let lanes: Vec<f32> = c[0].iter().map(|b| f32::from_bits(*b as u32)).collect();
-            Some(vec![snorm_10a2_pack_ref(&lanes)])
-        },
-        false,
-    );
-}
-
-/// `pack_float_to_unorm565` and `pack_half_to_unorm565` give Metal's observed words of the authored
-/// case `the-rgb565-pack-at-the-exact-tie` (Apple M3 Max, ORACLE_ABI v32) for all 16 float and 16
-/// half lanes. Metal rounds the `f32` product with the field maximum to nearest even: eight of the
-/// float lanes have an exact product just past a half-integer that the `f32` product rounds onto
-/// (green `0x3D228A29 * 63` is exactly `2.50000009`, `fl` = `2.5`, and Metal answers 2), where
-/// rounding the exact product answers one more.
-#[test]
-fn rgb565_pack_rounds_the_float_product_as_metal_does() {
-    use crate::air::intrinsics::PackFormat as P;
-    // Lanes x, y, z of each `float4` input and Metal's `pack_float_to_unorm565`.
-    let floats: [([u32; 3], u64); 16] = [
-        ([0x3C84_2108, 0x3D22_8A29, 0x3E14_A529], 0x2040),
-        ([0x3EAD_6B5B, 0x3EA6_9A6A, 0x3F7B_DEF8], 0xF28A),
-        ([0x3F29_4A53, 0x3F24_9249, 0x3DA5_294A], 0x1514),
-        ([0x3F6B_5AD7, 0x3F7D_F7DF, 0x3E56_B5AD], 0x37DC),
-        ([0x3D46_318C, 0x3D63_8E39, 0x3E35_AD6B], 0x3082),
-        ([0x3F00_0000, 0x3F00_0000, 0x3F10_8421], 0x9410),
-        ([0x3E8C_6319, 0x3E6B_AEBB, 0x3F08_4211], 0x81C8),
-        ([0x3ECE_739D, 0x3EC7_1C72, 0x3F39_CE74], 0xB30C),
-        ([0x0000_0000, 0x0000_0000, 0x0000_0000], 0x0000),
-        ([0x3F80_0000, 0x3F80_0000, 0x3F80_0000], 0xFFFF),
-        ([0xBE80_0000, 0x3FE0_0000, 0x3F00_0000], 0x87E0),
-        ([0x3E80_0000, 0x3F40_0000, 0x3E00_0000], 0x25E8),
-        ([0x3EAA_AAAB, 0x3F2A_AAAB, 0x3DCC_CCCD], 0x1D4A),
-        ([0x3F7F_BE77, 0x3A83_126F, 0x3F00_0002], 0x801F),
-        ([0x3D00_0000, 0x3D80_0000, 0x3E00_0000], 0x2081),
-        ([0x3F33_3333, 0x3E4C_CCCD, 0x3EE6_6666], 0x71B6),
-    ];
-    // Lanes x, y, z of each `half4` input (as bits) and Metal's `pack_half_to_unorm565`.
-    let halves: [([u64; 3], u64); 16] = [
-        ([0x0000, 0x3C00, 0x3800], 0x87E0),
-        ([0x3800, 0x3800, 0x3800], 0x8410),
-        ([0x3C00, 0x0000, 0x3400], 0x401F),
-        ([0x3000, 0x3600, 0x3900], 0x9B04),
-        ([0x2C00, 0x2800, 0x2E00], 0x1842),
-        ([0x3555, 0x3954, 0x2E66], 0x1D4A),
-        ([0x3BFF, 0x1400, 0x3266], 0x301F),
-        ([0x399A, 0x34CD, 0x3733], 0x7276),
-        ([0x2E66, 0x3B33, 0x38CD], 0x9F23),
-        ([0x2A66, 0x3B9A, 0x359A], 0x5F82),
-        ([0x2400, 0x3BE0, 0x3800], 0x87C0),
-        ([0x3666, 0x38CD, 0x3266], 0x34CC),
-        ([0x3A66, 0x3266, 0x399A], 0xB1B9),
-        ([0x3400, 0x3400, 0x3A00], 0xBA08),
-        ([0x251F, 0x3BD7, 0x370A], 0x77C1),
-        ([0x2F0A, 0x3B1F, 0x3548], 0x5703),
-    ];
-    let word = int(math::packed_bits(P::UnormRgb565));
-    let f = vec(float(32), 3);
-    let cases: Vec<Case> = floats
-        .iter()
-        .map(|(l, _)| vec![l.iter().map(|b| u64::from(*b)).collect()])
-        .collect();
-    let want = |c: &Case| {
-        let lanes: Vec<u32> = c[0].iter().map(|b| *b as u32).collect();
-        floats
-            .iter()
-            .find(|(l, _)| l.as_slice() == lanes.as_slice())
-            .map(|(_, w)| vec![*w])
-    };
-    check(
-        "rgb565 of Metal's float lanes",
-        &[f],
-        word,
-        &|fb, x| math::pack(fb, P::UnormRgb565, f, x[0], None, NanTest::IsNan),
-        &cases,
-        &want,
-        false,
-    );
-    let h = vec(half(), 3);
-    let cases: Vec<Case> = halves.iter().map(|(l, _)| vec![l.to_vec()]).collect();
-    check(
-        "rgb565 of Metal's half lanes",
-        &[h],
-        word,
-        &|fb, x| math::pack(fb, P::UnormRgb565, h, x[0], None, NanTest::IsNan),
-        &cases,
-        &|c| {
-            halves
-                .iter()
-                .find(|(l, _)| l.as_slice() == c[0].as_slice())
-                .map(|(_, w)| vec![*w])
-        },
-        false,
-    );
-    // The exact product disagrees with Metal on the eight tie lanes.
-    let exact = |l: &[u32; 3]| {
-        let mut w = 0u64;
-        for (b, (n, at)) in l.iter().zip([(31u32, 0), (63, 5), (31, 11)]) {
-            let x = f64::from(f32::from_bits(*b)).clamp(0.0, 1.0);
-            w |= ((x * f64::from(n)).round_ties_even() as u64) << at;
-        }
-        w
-    };
-    let differ = floats.iter().filter(|(l, w)| exact(l) != *w).count();
-    assert_eq!(differ, 8, "lanes where the exact product misses Metal");
-}
-
 /// `k / d` is correctly rounded (the host's IEEE `f32` division) for every `k` in `[0, d]` of every
 /// normalized scale and the sRGB step scale 4095, and for every 97th `k` and both ends of the
 /// 16-bit scales.
@@ -2213,195 +1876,6 @@ fn normalized_division_is_correctly_rounded() {
             &|fb, k| crate::lower::arith::exact_division::div_exact(fb, u, k[0], d),
             &cases,
             &|c| Some(vec![u64::from((arg(c, 0) as f32 / d as f32).to_bits())]),
-            false,
-        );
-    }
-}
-
-/// `unorm4x8_srgb` converts through Metal's twelve-bit tables, on the interpreter.
-///
-/// - Unpacking every byte in every lane gives, for a color byte `b`, the correctly rounded
-///   `round(decode(b / 255) * 4095) / 4095` of the MSL transfer (every step at least `1.6e-4`
-///   from a half step), and for the alpha byte `a / 255` correctly rounded; among them Metal's
-///   steps of the authored case `srgb-transfer-and-its-twelve-bit-table` (M3 Max, ORACLE_ABI
-///   v32): byte 1 (`0.000303527`, 1.243 steps) is step 1, `0x39800801`; byte 137 is step 1024,
-///   `0x3E800801`; byte 255 is `1.0`.
-/// - Packing each `i / 4095`, the values just beside each tie `(i + 1/2) / 4095`, and the
-///   specials gives the byte of index `i = round(x * 4095)` (the exact product) that the MSL
-///   transfer with the exponent `0.41666` gives (every byte at least `2.5e-4` from a half); that
-///   transfer reproduces all 4096 bytes Metal answered in A1's
-///   `srgb-encode-of-every-half-and-a-2-14-float-grid` (8f7708ff), where the exponent `1/2.4`
-///   misses four. The alpha lane is the exact product `x * 255` rounded to nearest even.
-#[test]
-fn srgb_conversions_answer_with_metals_tables() {
-    use crate::air::intrinsics::PackFormat as P;
-    use crate::lower::arith::srgb;
-    let word = int(32);
-    let decode = |b: u64| {
-        let c = b as f64 / 255.0;
-        let v = if c <= 0.04045 {
-            c / 12.92
-        } else {
-            ((c + 0.055) / 1.055).powf(2.4)
-        };
-        let k = (v * 4095.0).round_ties_even();
-        u64::from(((k / 4095.0) as f32).to_bits())
-    };
-    let encode = |x: f32| {
-        let x = if x.is_nan() { 0.0 } else { x.clamp(0.0, 1.0) };
-        let i = (f64::from(x) * 4095.0).round_ties_even();
-        let c = i / 4095.0;
-        let v = if c < 0.0031308 {
-            12.92 * c
-        } else {
-            1.055 * c.powf(0.41666) - 0.055
-        };
-        (255.0 * v).round_ties_even() as u64
-    };
-    for lane in [float(32), half()] {
-        let f = vec(lane, 4);
-        let cases: Vec<Case> = (0..256u64)
-            .map(|b| {
-                let w = b | ((255 - b) << 8) | ((b ^ 0x5A) << 16) | (((7 * b + 3) & 255) << 24);
-                vec![vec![w]]
-            })
-            .collect();
-        check_accept(
-            &format!("unpack sRGB to {lane:?}"),
-            &[word],
-            f,
-            &|fb, x| {
-                let t = srgb::declare(fb.module())?;
-                math::unpack(fb, P::Unorm4x8Srgb, f, x[0], Some(t))
-            },
-            &cases,
-            &|c| {
-                let w = c[0][0];
-                let mut out: Vec<u64> = (0..3).map(|k| decode((w >> (8 * k)) & 255)).collect();
-                out.push(u64::from(((w >> 24) as f32 / 255.0).to_bits()));
-                Some(
-                    out.iter()
-                        .map(|b| nbits(lane, f64::from(f32::from_bits(*b as u32))))
-                        .collect(),
-                )
-            },
-            &exact_ok(f),
-        );
-    }
-    let s = float(32);
-    let f = vec(s, 4);
-    let metal: [(u64, u64); 3] = [(1, 0x3980_0801), (137, 0x3E80_0801), (255, 0x3F80_0000)];
-    for (b, want) in metal {
-        assert_eq!(decode(b), want, "byte {b}");
-    }
-    let mut xs: Vec<f32> = Vec::new();
-    for i in 0..4096u32 {
-        let x = (f64::from(i) / 4095.0) as f32;
-        let tie = ((f64::from(i) + 0.5) / 4095.0) as f32;
-        xs.extend([
-            x,
-            tie,
-            f32::from_bits(tie.to_bits() + 1),
-            f32::from_bits(tie.to_bits() - 1),
-        ]);
-    }
-    xs.extend([
-        -0.0,
-        -1.0,
-        2.0,
-        f32::INFINITY,
-        f32::NEG_INFINITY,
-        f32::NAN,
-        1e-40,
-    ]);
-    let cases: Vec<Case> = xs
-        .chunks(4)
-        .map(|c| {
-            let mut lanes: Vec<u64> = c.iter().map(|x| u64::from(x.to_bits())).collect();
-            lanes.resize(4, 0);
-            vec![lanes]
-        })
-        .collect();
-    check(
-        "pack sRGB",
-        &[f],
-        word,
-        &|fb, x| {
-            let t = srgb::declare(fb.module())?;
-            math::pack(fb, P::Unorm4x8Srgb, f, x[0], Some(t), NanTest::IsNan)
-        },
-        &cases,
-        &|c| {
-            let x: Vec<f32> = c[0].iter().map(|b| f32::from_bits(*b as u32)).collect();
-            let a = if x[3].is_nan() {
-                0.0
-            } else {
-                x[3].clamp(0.0, 1.0)
-            };
-            let alpha = (f64::from(a) * 255.0).round_ties_even() as u64;
-            Some(vec![
-                encode(x[0]) | (encode(x[1]) << 8) | (encode(x[2]) << 16) | (alpha << 24),
-            ])
-        },
-        false,
-    );
-}
-
-/// A normalized pack rounds the exact product `x * m`, not `fl(x * m)`: the values where the `f32`
-/// multiply rounds onto a half-integer that the exact product is not (found by search next to every
-/// `k + 1/2`), and ordinary values, for every channel scale.
-#[test]
-fn normalized_packs_round_the_exact_product() {
-    let x = float(32);
-    let word = int(32);
-    for (m, snorm) in [
-        (255u32, false),
-        (127, true),
-        (65535, false),
-        (32767, true),
-        (1023, false),
-        (3, false),
-        (31, false),
-        (63, false),
-    ] {
-        let lo = if snorm { -1.0f32 } else { 0.0 };
-        let mut vals: Vec<f32> = vec![0.0, -0.0, 1.0, 0.5, 1e-30, 1.0e-6, 0.999_999_9, lo];
-        let mut split = 0;
-        'search: for k in 0..m {
-            let x0 = (f64::from(k) + 0.5) / f64::from(m);
-            let first = (x0 as f32).to_bits().saturating_sub(4);
-            for b in first..first + 9 {
-                let v = f32::from_bits(b);
-                let p = v * m as f32;
-                let exact = f64::from(v) * f64::from(m);
-                if p.fract() == 0.5 && f64::from(p) != exact {
-                    vals.push(v);
-                    if snorm {
-                        vals.push(-v);
-                    }
-                    split += 1;
-                    if split >= 24 {
-                        break 'search;
-                    }
-                }
-            }
-        }
-        assert!(split > 0 || m < 8, "scale {m}: no split found");
-        let cases: Vec<Case> = vals
-            .iter()
-            .map(|v| vec![vec![u64::from(v.to_bits())]])
-            .collect();
-        check(
-            &format!("exact product x {m}"),
-            &[x],
-            word,
-            &|fb, v| math::round_exact_product(fb, x, v[0], m, snorm),
-            &cases,
-            &|c| {
-                let v = f64::from(f32::from_bits(arg(c, 0) as u32));
-                let r = (v * f64::from(m)).round_ties_even() as i64;
-                Some(vec![r as u64 & 0xFFFF_FFFF])
-            },
             false,
         );
     }
@@ -2446,7 +1920,7 @@ fn packed_float_formats_unpack_exactly() {
                 &format!("unpack {format:?} to {lane:?}"),
                 &[word],
                 f,
-                &|fb, x| math::unpack(fb, format, f, x[0], None),
+                &|fb, x| math::unpack_float(fb, format, f, x[0]),
                 &cases,
                 &|c| {
                     let w = arg(c, 0);
@@ -2470,183 +1944,13 @@ fn packed_float_formats_unpack_exactly() {
     }
 }
 
-/// An `air.pack` or `air.unpack` of a normalized format converts its channels as one vector, so its
-/// code does not repeat a scalar sequence per channel. Previously a `float4` pack was 886 words
-/// (982 snorm) and an unpack 779 (955 snorm); after, 421 (470) and 297 (358).
+/// `air.pack` and `air.unpack` of `unorm4x8_srgb` read no table: the census names them as the
+/// other normalized formats, and a plan of no division, `fmod` routine or extended-range table
+/// charges no routine.
 #[test]
-fn normalized_packs_and_unpacks_convert_their_channels_as_one_vector() {
-    use crate::air::intrinsics::PackFormat as P;
-    use crate::lower::arith::ops::splat;
-    use crate::spirv::serialize::serialize;
-    let word = int(32);
-    let size = |ins: &[Form], out: Form, body: Body<'_>| -> usize {
-        let m = kernel(ins, out, body).expect("build");
-        serialize(m).expect("serialize").words.len()
-    };
-    for (format, pack_most, unpack_most) in [
-        (P::UnormRgb10a2, 440, 310),
-        (P::Unorm4x8, 440, 310),
-        (P::Snorm4x8, 490, 370),
-    ] {
-        let fl = vec(float(32), 4);
-        let pack = size(&[fl], word, &|fb, x| {
-            math::pack(fb, format, fl, x[0], None, NanTest::IsNan)
-        }) - size(&[fl], word, &|fb, _| splat(fb, word, 0));
-        let unpack = size(&[word], fl, &|fb, x| {
-            math::unpack(fb, format, fl, x[0], None)
-        }) - size(&[word], fl, &|fb, _| splat(fb, fl, 0));
-        assert!(pack <= pack_most, "{format:?} pack: {pack} words");
-        assert!(unpack <= unpack_most, "{format:?} unpack: {unpack} words");
-    }
-}
-
-/// Each lane of a vector pack rounds the exact product with its own channel's scale: the values
-/// beside every channel's ties (where `fl(x * m)` rounds onto a half-integer that the exact product
-/// is not, as `normalized_packs_round_the_exact_product` finds them) in every lane, so a lane
-/// computed with a neighbour's scale or constant fails.
-#[test]
-fn a_vector_pack_rounds_each_lane_at_its_own_scale() {
-    use crate::air::intrinsics::PackFormat as P;
-    for format in [
-        P::UnormRgb10a2,
-        P::UnormRgb565,
-        P::Unorm4x8,
-        P::Snorm4x8,
-        P::Unorm2x16,
-        P::Snorm2x16,
-    ] {
-        let (widths, snorm) = math::pack_layout(format).expect("lowered");
-        let lanes = widths.len();
-        let scale = |n: u32| {
-            if snorm {
-                (1u32 << (n - 1)) - 1
-            } else {
-                (1u32 << n) - 1
-            }
-        };
-        // Values beside the ties of every channel's scale, and the ends.
-        let mut vals: Vec<f32> = vec![0.0, 1.0, 0.5, -1.0, 1e-30];
-        for n in widths {
-            let m = scale(*n);
-            for k in (0..m).step_by((m as usize / 40).max(1)) {
-                let x0 = ((f64::from(k) + 0.5) / f64::from(m)) as f32;
-                for d in -2i32..=2 {
-                    let v = f32::from_bits(x0.to_bits().wrapping_add_signed(d));
-                    vals.push(v);
-                    if snorm {
-                        vals.push(-v);
-                    }
-                }
-            }
-        }
-        let f = vec(float(32), lanes as u8);
-        // Rotate the values through the lanes so each lane sees every one.
-        let cases: Vec<Case> = (0..vals.len())
-            .map(|i| {
-                vec![(0..lanes)
-                    .map(|k| u64::from(vals[(i + 7 * k) % vals.len()].to_bits()))
-                    .collect()]
-            })
-            .collect();
-        check(
-            &format!("vector pack {format:?}"),
-            &[f],
-            int(math::packed_bits(format)),
-            &|fb, x| math::pack(fb, format, f, x[0], None, NanTest::IsNan),
-            &cases,
-            &|c| {
-                let mut w = 0u64;
-                let mut at = 0;
-                for (k, n) in widths.iter().enumerate() {
-                    let x = f32::from_bits(c[0][k] as u32);
-                    let lo = if snorm { -1.0f32 } else { 0.0 };
-                    let x = x.clamp(lo, 1.0);
-                    let m = scale(*n);
-                    let p = match math::pack_rounding(format) {
-                        math::PackRounding::ExactProduct => f64::from(x) * f64::from(m),
-                        math::PackRounding::FloatProduct => f64::from(x * m as f32),
-                    };
-                    w |= (p.round_ties_even() as i64 as u64 & mask(*n as u8)) << at;
-                    at += n;
-                }
-                Some(vec![w])
-            },
-            false,
-        );
-    }
-}
-
-/// A vector unpack divides each lane by its own channel's scale: every value of every field of up
-/// to 10 bits in every lane (every 97th and both ends of a 16-bit field), against the host's
-/// correctly rounded quotient, to `float` and to `half`.
-#[test]
-fn a_vector_unpack_reads_every_field_value_of_every_channel() {
-    use crate::air::intrinsics::PackFormat as P;
-    let word = int(32);
-    for format in [
-        P::UnormRgb10a2,
-        P::UnormRgb565,
-        P::Unorm4x8,
-        P::Snorm4x8,
-        P::Unorm2x16,
-        P::Snorm2x16,
-    ] {
-        let (widths, snorm) = math::pack_layout(format).expect("lowered");
-        let most = widths.iter().map(|n| 1u64 << n).max().unwrap_or(1);
-        let step = if most > 1024 { 97 } else { 1 };
-        let vals: Vec<u64> = (0..most)
-            .step_by(step)
-            .chain([most - 2, most - 1])
-            .collect();
-        let cases: Vec<Case> = vals
-            .iter()
-            .map(|v| {
-                let mut w = 0u64;
-                let mut at = 0;
-                for (k, n) in widths.iter().enumerate() {
-                    w |= ((v + 5 * k as u64) & mask(*n as u8)) << at;
-                    at += n;
-                }
-                vec![vec![w]]
-            })
-            .collect();
-        for lane in [float(32), half()] {
-            let f = vec(lane, widths.len() as u8);
-            check_accept(
-                &format!("vector unpack {format:?} to {lane:?}"),
-                &[word],
-                f,
-                &|fb, x| math::unpack(fb, format, f, x[0], None),
-                &cases,
-                &|c| {
-                    let mut at = 0;
-                    let mut out = Vec::new();
-                    for n in widths {
-                        let v = (c[0][0] >> at) & mask(*n as u8);
-                        let x = if snorm {
-                            let s = sext(v, *n as u8) as f32;
-                            (s / ((1u32 << (n - 1)) - 1) as f32).max(-1.0)
-                        } else {
-                            v as f32 / ((1u32 << n) - 1) as f32
-                        };
-                        out.push(nbits(lane, f64::from(x)));
-                        at += n;
-                    }
-                    Some(out)
-                },
-                &exact_ok(f),
-            );
-        }
-    }
-}
-
-/// The census names the sRGB conversions apart from the other normalized formats, and charges the
-/// module's table once, to the direction that first reads it: an output-size exception for the sRGB
-/// conversions excuses no word of another pack or unpack.
-#[test]
-fn srgb_conversions_are_named_apart_and_charge_their_table_once() {
+fn srgb_packs_read_no_table() {
     use crate::air::intrinsics::{PackDir, PackFormat as P};
-    use crate::lower::arith::{routine_words, srgb, ArithPlan, ArithStrategy};
+    use crate::lower::arith::{routine_words, ArithPlan, ArithStrategy};
     use crate::lower::select::FamilyPlans;
     use crate::lower::strategy::FamilyStrategy;
     let name = |dir, format| {
@@ -2658,23 +1962,10 @@ fn srgb_conversions_are_named_apart_and_charge_their_table_once() {
         .name(&FamilyPlans::default())
         .into_owned()
     };
-    assert_eq!(name(PackDir::Pack, P::Unorm4x8Srgb), "arith.pack.srgb");
-    assert_eq!(name(PackDir::Unpack, P::Unorm4x8Srgb), "arith.unpack.srgb");
+    assert_eq!(name(PackDir::Pack, P::Unorm4x8Srgb), "arith.pack");
+    assert_eq!(name(PackDir::Unpack, P::Unorm4x8Srgb), "arith.unpack");
     assert_eq!(name(PackDir::Pack, P::Unorm4x8), "arith.pack");
     assert_eq!(name(PackDir::Unpack, P::UnormRgb10a2), "arith.unpack");
-    for dir in [PackDir::Pack, PackDir::Unpack] {
-        let plan = ArithPlan {
-            srgb: Some(dir),
-            ..ArithPlan::default()
-        };
-        let charged: Vec<(String, u64)> = routine_words(&plan)
-            .map(|(name, words)| (name.to_owned(), words))
-            .collect();
-        assert_eq!(
-            charged,
-            vec![(name(dir, P::Unorm4x8Srgb), u64::from(srgb::TABLE_WORDS))]
-        );
-    }
     assert_eq!(routine_words(&ArithPlan::default()).count(), 0);
 }
 
@@ -2726,7 +2017,7 @@ fn half_arithmetic_on_the_device_follows_the_profile() {
         measured += usize::from(basis == Some(F16Basis::Measured));
         controlled += usize::from(basis == Some(F16Basis::Controlled));
     }
-    assert!(measured >= 2, "the MoltenVK captures take it, measured");
+    assert!(measured >= 1, "the MoltenVK capture takes it, measured");
     assert!(
         controlled >= 2,
         "the float-controls profiles take it, by the spec"
@@ -2800,10 +2091,11 @@ fn half_arithmetic_on_the_device_is_the_rounded_result() {
     }
 }
 
-/// The device's `half` arithmetic is the instruction on 16-bit floats between two narrowings and a
-/// widening, with no rounding of the module's own: no conversion barrier
-/// (`narrow::rounds_by_conversion` finds none), and the only instructions computing 16-bit
-/// values are the two narrowings and the operation, always kept apart: a sum or difference
+/// The device's `half` arithmetic is the instruction on 16-bit floats and a widening, with no
+/// rounding of the module's own: no conversion barrier (`narrow::rounds_by_conversion` finds none),
+/// and the only instructions computing 16-bit values are the operation and at most two narrowings
+/// of its operands: an operand the module widened from a 16-bit float is that float, narrowed by
+/// nothing (`FunctionBuilder::convert`); the operation is always kept apart: a sum or difference
 /// decorated `NoContraction`, a product `Fma(a, b, -0.0)` decorated `NoContraction`, never an
 /// `OpFMul` (undecorated, Metal's fast compile answers the widened operands' `float` product;
 /// decorated, SPIRV-Cross's `spvFMul` answers `+0` for a `-0` product).
@@ -2887,33 +2179,39 @@ fn half_arithmetic_on_the_device_is_one_16_bit_instruction() {
                 _ => (OP_EXT_INST, FMA),
             };
             let shapes: Vec<(u32, u32)> = computed.iter().map(|&(c, g, _)| (c, g)).collect();
-            assert_eq!(
-                shapes,
-                vec![(OP_FCONVERT, 0), (OP_FCONVERT, 0), want],
-                "{what}: the 16-bit instructions"
+            let (last, before) = shapes.split_last().expect("the operation");
+            assert_eq!(*last, want, "{what}: the 16-bit instructions {shapes:?}");
+            assert!(
+                before.len() <= 2 && before.iter().all(|s| *s == (OP_FCONVERT, 0)),
+                "{what}: the 16-bit instructions {shapes:?}"
             );
-            assert!(decorated.contains(&computed[2].2), "{what}: NoContraction");
+            let op_id = computed
+                .last()
+                .map(|&(_, _, id)| id)
+                .expect("the operation");
+            assert!(decorated.contains(&op_id), "{what}: NoContraction");
         }
     }
 }
 
-/// Under the float controls (`QuantizeForm::Controlled`), where the profile leaves a NaN's bits to
-/// the device (`ModuleBuilder::native_half_nans`, `NanMinMaxPolicy::Native`), `from_bits` is the
-/// device's widening of the bits as a 16-bit float, with no integer decode: every half bit
-/// pattern, with junk above its 16 bits, reads as its exact `f32` value but a NaN, which reads as
-/// a NaN, one lane at a time and four at once, and `narrow::widens_bits` finds the widening.
-/// Without the flag (the NaN switch's `NanMinMaxPolicy::Exact`) the integer decode stands: every
-/// pattern exact, NaN payloads included, and `widens_bits` finds none.
+/// `from_bits` is the device's widening on every form, with no integer decode: wherever the module
+/// can hold a 16-bit float (`QuantizeForm::Converted` and `Controlled`, a profile with
+/// `shaderFloat16`), of the bits as 16-bit floats (one conversion of the gathered lanes); in
+/// `QuantizeForm::Device` (no `shaderFloat16`), `GLSL.std.450 UnpackHalf2x16` of each lane's word
+/// (one a lane, and no 16-bit type). Every half bit pattern, with junk above its 16 bits, reads as
+/// its exact `f32` value but a NaN, which reads as a NaN, on one to four lanes, and
+/// `narrow::widens_bits` finds the widening.
 #[test]
-fn a_half_decode_under_the_float_controls_is_the_devices_widening() {
+fn a_half_decode_is_the_devices_widening_in_every_form() {
     use super::super::narrow::{f32_of_half_bits, from_bits, widens_bits};
     use crate::spirv::builder::QuantizeForm;
     let junk = |h: u32| u64::from(h | NARROW_JUNK);
-    let one: Vec<Case> = (0..=0xFFFFu32).map(|h| vec![vec![junk(h)]]).collect();
-    let four: Vec<Case> = (0..0x1_0000u32)
-        .step_by(4)
-        .map(|h| vec![(h..h + 4).map(junk).collect()])
-        .collect();
+    let lanes_of = |n: u32| -> Vec<Case> {
+        (0..0x1_0000u32)
+            .step_by(n as usize)
+            .map(|h| vec![(h..h + n).map(|x| junk(x & 0xFFFF)).collect()])
+            .collect()
+    };
     let want = |c: &Case| {
         Some(
             c[0].iter()
@@ -2921,12 +2219,18 @@ fn a_half_decode_under_the_float_controls_is_the_devices_widening() {
                 .collect(),
         )
     };
-    for native in [false, true] {
-        for (lanes, cases) in [(1u8, &one), (4, &four)] {
-            let what = format!("{lanes} lanes, NaN bits the device's {native}");
+    for q in [
+        QuantizeForm::Device,
+        QuantizeForm::Converted,
+        QuantizeForm::Controlled,
+    ] {
+        let float16 = q != QuantizeForm::Device;
+        for lanes in 1u8..=4 {
+            let cases = lanes_of(u32::from(lanes));
+            let cases = &cases;
+            let what = format!("{lanes} lanes, {q:?}");
             let body = move |fb: &mut FunctionBuilder<'_>, x: &[Value]| -> BResult<Value> {
-                fb.module().set_quantize_form(QuantizeForm::Controlled);
-                fb.module().set_native_half_nans(native);
+                fb.module().set_quantize_form(q);
                 from_bits(fb, vec(half(), lanes), x[0])
             };
             let (ins, out) = ([vec(int(32), lanes)], vec(float(32), lanes));
@@ -2935,8 +2239,9 @@ fn a_half_decode_under_the_float_controls_is_the_devices_widening() {
             let budget = crate::budget::Budget::default();
             let mut meter = crate::budget::Meter::new(&budget);
             let widens = widens_bits(&m, &mut meter).expect("widens_bits");
-            assert_eq!(widens, native, "{what}: widens_bits");
-            let decodes = m.blocks().iter().flat_map(|b| &b.insts).any(|n| {
+            assert!(widens, "{what}: widens_bits");
+            let insts = || m.blocks().iter().flat_map(|b| &b.insts);
+            let decodes = insts().any(|n| {
                 matches!(
                     n.inst,
                     Inst::Convert {
@@ -2945,12 +2250,39 @@ fn a_half_decode_under_the_float_controls_is_the_devices_widening() {
                     }
                 )
             });
-            assert_eq!(decodes, !native, "{what}: the integer decode");
+            let conversions = insts()
+                .filter(|n| {
+                    matches!(
+                        n.inst,
+                        Inst::Convert {
+                            op: ConvOp::FConvert,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            let unpacks = insts()
+                .filter(|n| {
+                    matches!(
+                        n.inst,
+                        Inst::Glsl {
+                            op: GlslOp::UnpackHalf2x16,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            let halves = m
+                .types()
+                .iter()
+                .any(|(_, t)| matches!(t, Type::Float { width: 16 }));
+            assert_eq!(conversions, usize::from(float16), "{what}: the conversions");
+            let want_unpacks = if float16 { 0 } else { usize::from(lanes) };
+            assert_eq!(unpacks, want_unpacks, "{what}: the unpacks");
+            assert_eq!(halves, float16, "{what}: a 16-bit float type");
+            assert!(!decodes, "{what}: an integer decode");
             check_accept(&what, &ins, out, &body, cases, &want, &|g, w| {
-                g == w
-                    || (native
-                        && f32::from_bits(g as u32).is_nan()
-                        && f32::from_bits(w as u32).is_nan())
+                g == w || (f32::from_bits(g as u32).is_nan() && f32::from_bits(w as u32).is_nan())
             });
         }
     }

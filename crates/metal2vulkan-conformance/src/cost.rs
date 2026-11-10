@@ -55,7 +55,7 @@ use std::collections::BTreeMap;
 /// A `*_sites` field is a table of the runtime's own source positions — a file, a line and what
 /// was recorded there — rather than a count, so the difference of two readings of it is not a
 /// case's cost. What those tables name is already counted elsewhere: `copy_sites` says *where* the
-/// copies were recorded, and the copies themselves are `commands_replayed.cmd_copy_*`. The rule is
+/// copies were recorded, and the copies themselves are `commands_recorded.cmd_copy_*`. The rule is
 /// a suffix rather than a list of names because the runtime keeps growing such tables.
 const NOT_A_COUNT: [(&str, &str); 1] = [(
     "_sites",
@@ -347,6 +347,21 @@ const AHEAD: &str = "whether this case's first encoder found a primary command b
      begun, which the thread that completed an earlier command buffer does ahead when nothing \
      waits for it. Its total, encoder_command_buffers_begun, stays gated, so nothing is lost";
 
+/// Why `commands_recorded.begin_command_buffer` is reported and never gated.
+///
+/// The recorder counts every `vkBeginCommandBuffer` at its call, whatever the command buffer and
+/// the thread, so the spare pools' primaries a completion thread begins ahead (`AHEAD`) are
+/// counted where that thread began them, in whichever case's window it ran. The runtime's
+/// `command_buffers_begun` counts such a primary as an encoder takes it, so it holds the case's
+/// own begins and stays gated.
+///
+/// Measured on this M3 Max: the eight rounds of a whole-set measurement saw it move in 238
+/// cases, and a whole-set replay of the records it wrote read 3 against a bound of 2 on
+/// `buffer-target-clears-pitch-16-stored`, whose `command_buffers_begun` stayed at 2.
+const BEGUN: &str = "every vkBeginCommandBuffer the device recorded, among them the primaries a \
+     completion thread begins ahead when nothing waits, so it moves with when that thread ran. \
+     The case's own begins, command_buffers_begun, stay gated, so nothing is lost";
+
 /// Why `completed_where_seen` is reported and never gated: it is the **complement of a count the
 /// rule already names**, so it cannot be deterministic while that one is not.
 ///
@@ -477,6 +492,7 @@ const RACY: [(&str, &str); 33] = [
     ("pipeline_pool_busy", POOL_STATE),
     ("encoder_primaries_begun_ahead", AHEAD),
     ("primaries_begun_ahead", AHEAD),
+    ("commands_recorded.begin_command_buffer", BEGUN),
     ("completed_where_seen", COMPLEMENT),
     ("pooled_memory_blocks_freed", QUIET),
     ("finales_folded", FOLDED),
@@ -492,11 +508,6 @@ const RACY: [(&str, &str); 33] = [
         "wakes_",
         "whether a transition had to wake a thread or found one already running, which is a \
          question about timing rather than about the case's work",
-    ),
-    (
-        "command_buffers_replayed",
-        "which thread replayed a deferred command buffer: the recorder's, or one that reached it \
-         first. Their total is command_buffers_deferred, which is gated, so nothing is lost",
     ),
     (
         "object_churn.",
@@ -600,7 +611,7 @@ pub fn monotone(name: &str) -> Option<&'static str> {
 /// truncated and it reran. The other read the counters behind its own movements and found every one
 /// of them process-shared. Neither symptom could be read off a single run, which is the property
 /// that makes this class worth naming rather than discovering again.
-const SHARED: [(&str, &str); 9] = [
+const SHARED: [(&str, &str); 21] = [
     // `work_counts.rs`: "every batch, by how far its queue's work ran behind its submission".
     // Four buckets of one histogram, and which bucket a batch lands in is decided by how fast the
     // GPU drained what was submitted before it, earlier cases included. The sum is the case's own
@@ -636,7 +647,41 @@ const SHARED: [(&str, &str); 9] = [
     // reason a count is reported is what the counter counts.
     ("scheduled_where_submitted", COMPLEMENT),
     ("finales_apart", FOLDED),
+    // "Signalling submissions of work that took 2 ms or more in the driver", and of the idle
+    // submissions "the ones that took the stall: 2.2 ms or more": a threshold on how long the
+    // driver took, which is a question about elapsed time. Corroborated on this M3 Max: the
+    // eight rounds of one whole-set measurement saw `submit_stalls_on_work` move in 160 cases,
+    // and two whole-set replays of the records it wrote went over its bound of 0 in three
+    // cases and in one, `sample-fills-rgba8-2` both times.
+    ("submit_stalls_on_work", ELAPSED),
+    ("submit_stalls_idle", ELAPSED),
+    // Every reason a look of the scheduler's found a head held, "each counted at every look that
+    // found it, so a head held through many looks is counted at each", the two "Times a look
+    // left a head" splits of them, and the "Batches that a look of the scheduler's had found
+    // held": how many looks the scheduler's thread made while a batch waited, which is when
+    // that thread ran (`scheduler_` above). Corroborated: the same measurement saw
+    // `heads_held_for_host_steps` move in 119 cases and `batches_held_past_a_look` in 51, and
+    // one replay read them 2 and 1 against bounds of 0 on `xr-clears-planes` and
+    // `xr-clears-planes-srgb`, the next within. The rest are here on the same definition.
+    ("heads_held_for_binary_semaphores", LOOKS),
+    ("heads_held_for_reencodes", LOOKS),
+    ("heads_held_for_decodes", LOOKS),
+    ("heads_held_for_host_steps", LOOKS),
+    ("heads_held_for_checks", LOOKS),
+    ("heads_held_for_event_values", LOOKS),
+    ("heads_held_for_earlier_commits", LOOKS),
+    ("heads_waiting_at_their_gate", LOOKS),
+    ("heads_awaiting_check_signals", LOOKS),
+    ("batches_held_past_a_look", LOOKS),
 ];
+
+/// Why a count of driver calls past a time threshold is reported and never gated.
+const ELAPSED: &str = "a submission the driver took longer than a threshold over, which is a \
+     question about elapsed time on a shared machine rather than about the case's work";
+
+/// Why a count of what the scheduler's looks found held is reported and never gated.
+const LOOKS: &str = "how many times the scheduler's thread looked while a batch was held, \
+     which is when that thread ran and not what the case asked for";
 
 /// Why a count of how far a queue's work ran behind is reported and never gated.
 const QUEUE_DEPTH: &str = "how far this `VkQueue`'s work ran behind when the case submitted, or \
@@ -673,7 +718,7 @@ pub enum Region {
     Translation,
     /// What a call does on the calling thread: the region the plan names as the gap.
     DeviceApi,
-    /// What the commit path, our own other threads and the GPU do: the commands replayed into
+    /// What the commit path, our own other threads and the GPU do: the commands recorded into
     /// `VkCommandBuffer`s, the submissions, the scheduler's passes and the waits. Work a call
     /// queues for later is counted here, so a call that returns at once cannot score as a win.
     Submission,
@@ -741,7 +786,7 @@ const TRANSLATION: [&str; 19] = [
 /// The name prefixes that put a count in [`Region::Submission`]: the commit path, our own other
 /// threads and the GPU.
 const SUBMISSION: [&str; 48] = [
-    "commands_replayed.",
+    "commands_recorded.",
     "command_buffers_",
     "command_pools_made",
     "spare_command_pools_",
@@ -829,7 +874,7 @@ pub fn region_of(name: &str) -> Region {
 /// The counts one run moved, by name: the cost half's reading of [`WorkCounts`].
 ///
 /// The names are the runtime's own field names, nested ones joined with a dot
-/// (`commands_replayed.cmd_draw`), so a failure names the counter a reader can grep for.
+/// (`commands_recorded.cmd_draw`), so a failure names the counter a reader can grep for.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Counts(BTreeMap<String, u64>);
 
@@ -1044,14 +1089,17 @@ pub struct CostRecord {
     /// venue, and then nothing in the record is claimed to be independent of the selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contrasted: Option<String>,
-    /// The degrade-notice codes the measurement's runs announced, sorted.
+    /// The degrade-notice codes the measurement's runs announced, sorted, but the device's native
+    /// answers ([`crate::replay::degrading`]).
     ///
     /// **This is what keeps a device's gap from reading as a cost win.** A count that is lower
     /// because the device did less of the case — it lacks the exact form, so the runtime announced
     /// a notice and did something cheaper — is not work we saved. A run whose announced set is not
     /// this one did a different amount of work, so it is [`CostVerdict::Unmeasured`] against these
     /// bounds rather than compared with them: the same rule the correctness half applies when it
-    /// keeps a device's honest gap out of the pass and the failure counts.
+    /// keeps a device's honest gap out of the pass and the failure counts. A native note is not in
+    /// it, here or in the run's set: the native form is the only one built, so it marks no
+    /// different amount of work.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded: Vec<String>,
     /// The most each count the runs moved reached. A count absent from here is bounded at zero, so
@@ -1647,14 +1695,17 @@ pub fn judge(
     }
     // A device that could not do the case exactly did less of it, and its lower counts are its
     // gap and not our saving. Comparing such a run with a measurement of a different gap would
-    // read the gap as a win, so the two are not comparable at all.
-    if record.degraded != degraded {
+    // read the gap as a win, so the two are not comparable at all. The device's native answers
+    // count on neither side, the record's included, since one taken before the rule left them out
+    // may still hold them.
+    let degraded = crate::replay::degrading(degraded.iter().cloned());
+    let measured = crate::replay::degrading(record.degraded.iter().cloned());
+    if measured != degraded {
         return CostVerdict::Unmeasured {
             why: format!(
-                "this run announced {degraded:?} and the measurement announced {:?}, so the two \
-                 did not do the same amount of the case: a count lower because the device lacks \
-                 the exact form is the device's gap, not a cost we saved",
-                record.degraded
+                "this run announced {degraded:?} and the measurement announced {measured:?}, so \
+                 the two did not do the same amount of the case: a count lower because the \
+                 device lacks the exact form is the device's gap, not a cost we saved",
             ),
         };
     }
@@ -1767,8 +1818,9 @@ pub struct CaseCost {
     /// Why the run stopped before the case finished, where it did. Its counts are of a part of the
     /// case, so nothing is recorded or gated from them.
     pub stopped: Option<String>,
-    /// The degrade-notice codes the runs announced, sorted: what the device could not do exactly,
-    /// and so how much of the case the counts are of.
+    /// The degrade-notice codes the runs announced, sorted, but the device's native answers
+    /// ([`crate::replay::degrading`]): what the device could not do exactly, and so how much of
+    /// the case the counts are of.
     pub degraded: Vec<String>,
     /// How long the longest run took, in nanoseconds. **Advisory, and it stays advisory.**
     ///
@@ -1836,7 +1888,7 @@ impl CaseCost {
     /// wrote: every count the two shapes read differently becomes one the selection decides.
     ///
     /// The two shapes are two commands and not two legs of one, because one process cannot measure
-    /// both cleanly. Measured: `bc1-rgba` run on its own reads `commands_replayed.cmd_dispatch` 4
+    /// both cleanly. Measured: `bc1-rgba` run on its own reads `commands_recorded.cmd_dispatch` 4
     /// and `command_buffers_deferred` 6 in three invocations out of three, and **0** for both when
     /// the same leg runs after a whole-set leg in the same process — the deferred replay is a
     /// thread of ours, and whether it lands inside a case's window is not the same question after
@@ -2413,7 +2465,7 @@ mod the_ratio {
 ///
 /// `creation_pipelines_made` is one count over the render prediction (`pipeline/predicted.rs`) and
 /// the compute one (`pipeline/dispatch_making.rs`), so 631 says nothing about either. Split by the
-/// commands each record's own counts say our leg replayed ([`Speculated`], and no new counter was
+/// commands each record's own counts say our leg recorded ([`Speculated`], and no new counter was
 /// needed for it), the two are nothing like each other: **the render prediction is taken 754 times
 /// in 799 over the 154 rows that draw and do not dispatch, and the compute prediction 0 times in
 /// 461 over the 277 rows that dispatch and do not draw.** 461 of the 631 is one prediction with no
@@ -2525,16 +2577,16 @@ mod the_creation_prediction {
     /// render prediction (`pipeline/predicted.rs`) and the compute one
     /// (`pipeline/dispatch_making.rs`) together.
     ///
-    /// It is read off the commands the record's own counts say our leg replayed, and from nothing
+    /// It is read off the commands the record's own counts say our leg recorded, and from nothing
     /// else — no case name, no family, no list. A `VkPipeline` made at a creation can only ever be
-    /// taken by a command of its own kind, so a record that replayed draws and no dispatch can
-    /// only hold the render prediction's pipelines, and one that replayed dispatches and no draw
+    /// taken by a command of its own kind, so a record that recorded draws and no dispatch can
+    /// only hold the render prediction's pipelines, and one that recorded dispatches and no draw
     /// only the compute one's. That is a structural fact about the record, available in every
     /// committed recording today, which is why this needed no new counter.
     ///
-    /// **The signal is `commands_replayed.cmd_draw*` and `cmd_dispatch*` and not
+    /// **The signal is `commands_recorded.cmd_draw*` and `cmd_dispatch*` and not
     /// `draw_states_recorded`**, which looks like the same question and is not: 22 of these rows
-    /// replay a `vkCmdDraw` while reading `draw_states_recorded` 0 — every `sample-fills-*` and
+    /// record a `vkCmdDraw` while reading `draw_states_recorded` 0 — every `sample-fills-*` and
     /// `buffer-depth-samples-*` row — so classifying by it would file a drawing case under
     /// [`Speculated::NoCommand`] and hide exactly the rows this family already knows mispredict.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2560,8 +2612,8 @@ mod the_creation_prediction {
                     .any(|(count, most)| count.starts_with(prefix) && *most > 0)
             };
             match (
-                any("commands_replayed.cmd_draw"),
-                any("commands_replayed.cmd_dispatch"),
+                any("commands_recorded.cmd_draw"),
+                any("commands_recorded.cmd_dispatch"),
             ) {
                 (true, false) => Speculated::Draws,
                 (false, true) => Speculated::Dispatches,
@@ -2796,16 +2848,16 @@ mod the_creation_prediction {
     /// The census above reads committed files, so a classifier that answered one class for
     /// everything would still make its ceilings add up. This is the input that says it does not.
     #[test]
-    fn a_record_is_classed_by_the_commands_it_replayed() {
+    fn a_record_is_classed_by_the_commands_it_recorded() {
         let bounds = |counts: &[(&str, u64)]| {
             counts
                 .iter()
                 .map(|(name, most)| ((*name).to_owned(), *most))
                 .collect::<std::collections::BTreeMap<String, u64>>()
         };
-        let draw = ("commands_replayed.cmd_draw_indexed_indirect", 1);
-        let dispatch = ("commands_replayed.cmd_dispatch_indirect", 1);
-        let other = ("commands_replayed.cmd_copy_buffer", 7);
+        let draw = ("commands_recorded.cmd_draw_indexed_indirect", 1);
+        let dispatch = ("commands_recorded.cmd_dispatch_indirect", 1);
+        let other = ("commands_recorded.cmd_copy_buffer", 7);
         assert_eq!(
             Speculated::of(&bounds(&[draw, other])),
             Speculated::Draws,
@@ -2824,18 +2876,18 @@ mod the_creation_prediction {
         );
         assert_eq!(Speculated::of(&bounds(&[])), Speculated::NoCommand);
         // A count present at zero is a count that did not happen: `bounds` holds the most a count
-        // reached, and a recording that carries the name at 0 replayed no such command.
+        // reached, and a recording that carries the name at 0 recorded no such command.
         assert_eq!(
-            Speculated::of(&bounds(&[("commands_replayed.cmd_draw", 0), dispatch])),
+            Speculated::of(&bounds(&[("commands_recorded.cmd_draw", 0), dispatch])),
             Speculated::Dispatches,
             "a draw count of zero is not a draw"
         );
         // `draw_states_recorded` is not the signal, and must not become one: 22 census rows read
-        // it at 0 while replaying a draw.
+        // it at 0 while recording a draw.
         assert_eq!(
             Speculated::of(&bounds(&[("draw_states_recorded", 4), dispatch])),
             Speculated::Dispatches,
-            "a recorded draw state is not a replayed draw command"
+            "a recorded draw state is not a draw command"
         );
     }
 

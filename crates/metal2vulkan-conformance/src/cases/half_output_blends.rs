@@ -65,70 +65,29 @@
 //! The lane's header dates its fit to macOS 26.7. The live M3 is the oracle, so the 27.0.1 answer
 //! recorded here is what this family states, and nothing in it asserts the older rule.
 //!
-//! **Our side agrees with Metal about the blend colour.** `bc-1mbc` and `1mbc-zero` are
-//! code-identical to Metal in all six formats, which is what says the two divergent blend-colour
-//! rows below are the family's product-rounding gap and not a disagreement about `1 - c`.
+//! **What Metal does, measured over every word.** Into each format Metal rounds the **source**
+//! product to the attachment's precision and carries the **destination** product into the sum
+//! unrounded -- `round(round(Sf * S) + Df * D)`, one fused multiply-add on the destination term --
+//! at all 5,376 compared words of the eight sites the tests' `MEASURED` names, in 16- and 32-bit
+//! float formats alike, which
+//! `metals_recorded_codes_hold_the_rounding_the_divergent_sites_measure` keeps against the
+//! committed recordings: its compiler's fast-math fold of the blend into the fragment function.
+//! The alpha channel of `da-1mda`, whose source factor and destination value are both the
+//! destination alpha, follows no rule measured, so nothing here asserts one for it. The four
+//! blend-colour sites are not modelled by that rule (`bc-1msa` does not fit it at the first word of
+//! `r16f`: Metal stores 0.60498046875 where the rule gives 0.6044921875).
 //!
-//! **Where our side differs from Metal, measured over every word.** On this round's MoltenVK
-//! (Apple M3 Max, API 1.2) all six cases are `divergent`, at eighteen sites between them. Read off
-//! the per-site counts of a replay rather than off a first mismatch, so these are counts over
-//! every word of the site:
-//!
-//! | case | site | differing words of the site | largest raw-code distance |
-//! |---|---|---|---|
-//! | `r16f` | `sc-dc` | 21 of 256 | 1 |
-//! | `r16f` | `bc-1msa` | 96 of 256 | 256 |
-//! | `rg16f` | `sc-dc` | 40 of 512 | 1 |
-//! | `rg16f` | `sas-1msa` | 47 of 512 | 80 |
-//! | `rg16f` | `ba-1mba` | 187 of 512 | 22 |
-//! | `rg16f` | `bc-1msa` | 195 of 512 | 256 |
-//! | `rgba16f` | `sc-dc` | 90 of 1024 | 1 |
-//! | `rgba16f` | `da-1mda` | 256 of 1024 | 432 |
-//! | `rgba16f` | `ba-1mba` | 363 of 1024 | 816 |
-//! | `rgba16f` | `bc-1msa` | 405 of 1024 | 1024 |
-//! | `r32f` | `bc-1msa` | 67 of 256 | 32 |
-//! | `rg32f` | `sc-dc` | 41 of 512 | 1 |
-//! | `rg32f` | `ba-1mba` | 177 of 512 | 60 |
-//! | `rg32f` | `bc-1msa` | 135 of 512 | 128 |
-//! | `rgba32f` | `sc-dc` | 77 of 1024 | 1 |
-//! | `rgba32f` | `da-1mda` | 146 of 1024 | 97 |
-//! | `rgba32f` | `ba-1mba` | 368 of 1024 | 165 |
-//! | `rgba32f` | `bc-1msa` | 297 of 1024 | 192 |
-//!
-//! `r32f` was the one case with no differing word before the blend-colour rows were ported, and
-//! `bc-1msa` is what moved it: a single-channel 32-bit float target now differs too, so no format
-//! of this family is free of the gap. Thirteen of the twenty-one blends still move at no word in
-//! any format — including every one whose factor is `One`, `Zero`, a source factor, `Min` or
-//! `Max`, and both blend-colour rows whose answer turns on the factor alone. `sc-dc` is one code
-//! at its worst. The large distances are colour channels whose result sits near zero, where a
-//! raw-code distance is many steps of a small value.
-//!
-//! **What the difference is**, read off those eight sites rather than off the notice: Metal rounds
-//! the **source** product to the attachment's precision and carries the **destination** product
-//! into the sum unrounded -- `round(round(Sf * S) + Df * D)`, one fused multiply-add on the
-//! destination term -- and our side is the mirror image, `round(Sf * S + round(Df * D))`. Each rule
-//! holds at all 5,376 compared words of the eight sites, and this module's own
-//! `metals_recorded_codes_hold_the_rounding_the_divergent_sites_measure` keeps Metal's
-//! half of that against the committed recordings. So the gap is not half-precision rounding but
-//! which of the two products the arithmetic keeps unrounded, which is why the two 32-bit float
-//! formats differ too and why `sc-dc`, whose source product `S * S` is exact in the attachment,
-//! still moves by a single code. Metal's rule is its compiler's fast-math fold of the blend into
-//! the fragment function; ours is the device's fixed-function blend, which the pipeline leaves the
-//! blend to. The alpha channel of `da-1mda`, whose source factor and
-//! destination value are both the destination alpha, follows neither rule on either side and is
-//! identical on both, so nothing here asserts a rule for it.
-//!
-//! **The four blend-colour sites are not modelled by that rule**, and no rule is asserted for
-//! them: `bc-1msa` does not fit it at the first word of `r16f` (Metal stores 0.60498046875 where
-//! the rule gives 0.6044921875), so the eight sites `MEASURED` names stay the eight the rule was
-//! measured over. What the exact `bc-1mbc` and `1mbc-zero` sites do say is that the blend colour
-//! itself is not the disagreement — both sides compute the same factor from it — so the four
-//! divergent blend-colour sites are the product rounding at a row the rule has not been fitted to.
-//! Fitting it there is open work.
-//!
-//! Every one of the eighteen stays `divergent` rather than being loosened:
-//! `half-output-fast-math-blend`'s own definition says validation derives no tolerance from it.
-//! `known-gaps.tsv` carries all eighteen rows.
+//! **What our side does.** Where the device enables `storageInputOutput16` (MoltenVK, RADV, ANV)
+//! the pipeline hands it the function's `half` as a 16-bit output (`StageIo::half_outputs`), so
+//! the device blends the `half` Metal's attachment receives as its own `half` output. On the M3
+//! Max under MoltenVK 1.4.2 that is Metal's compiler blending Metal's own output type: every word
+//! of every blend stores Metal's code, in the 16- and the 32-bit float formats alike, the
+//! blend-colour rows included (a replay of the six cases against the committed recordings). RADV
+//! and ANV are not measured with it. Where the device lacks the feature (lavapipe, NVIDIA's) the
+//! pipeline hands it the `half` widened to `float`, and the device's blend is the answer (the
+//! native-arithmetic contract): the sites where it differs from Metal's stay `divergent` rather
+//! than being loosened, because `half-output-fast-math-blend`'s own definition says validation
+//! derives no tolerance from it, and `known-gaps.tsv` carries a row for each, per venue.
 //!
 //! Nothing here can fault a GPU: single-sampled 16 by 16 targets, one full-screen triangle a pass,
 //! no loop, and every fetch inside its buffer.
@@ -450,23 +409,16 @@ impl Case for HalfOutputBlends {
         //
         // Nothing loosens a stored code and nothing may: the note's own definition in
         // `pipeline/artifact.rs` ends "Validation derives no tolerance from it", so a tolerance
-        // written from it would be the suite overruling the contract it exists to test. Five of the
-        // six formats are therefore left **divergent** on this round's MoltenVK, with the measured
+        // written from it would be the suite overruling the contract it exists to test. The three
+        // 16-bit float formats are therefore left **divergent** on MoltenVK, with the measured
         // counts in the module docs above.
-        // A half-float attachment also takes the stage's `half` through a 16-bit output on a
-        // device that does not store a 32-bit output's NaN as Metal does, announced as
-        // `shader-half-color-bits` on the three 16-bit formats of this family. It is the case's own
-        // shape again -- a stored `half` output into a half-float attachment -- so its code is
-        // declared, and it loosens no stored code either: the three rows stay divergent on the
-        // texels the module docs above measure, which is the finding and must not be laundered.
         //
-        // Two more of the same shape are declared from the run that shows them: a device whose own
-        // conversion into the attachment is not Metal's (`device-color-conversion`, lavapipe) and
-        // one whose NaN encoding in a half-float target is its own (`device-nan-encoding`). Both
-        // are declarations at the notices site and neither loosens a stored code -- which matters
-        // most for `device-color-conversion`, whose own definition says validation derives no
-        // tolerance and no explanation from it and a difference stays a mismatch for review. The
-        // rows stay divergent on their texels, on both venues.
+        // Two more of the same shape show in the runs: a device whose own conversion into the
+        // attachment is not Metal's (`device-color-conversion`, lavapipe) and one whose NaN
+        // encoding in a half-float target is its own (`device-nan-encoding`). Both are the
+        // device's own answers, which the suite declares for every case
+        // (`crate::replay::NATIVE_NOTES`), and neither loosens a stored code. The rows stay
+        // divergent on their texels, on both venues.
         // Every row reads its answer back through a `Shared` buffer, so on a device without
         // unified memory the runtime announces `shared-in-system-memory`
         // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
@@ -478,18 +430,10 @@ impl Case for HalfOutputBlends {
         // nothing else (replay-nvidia.log). On MoltenVK, where
         // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
         // recording of this suite declares it.
-        std::iter::once(crate::replay::shared_memory_notice())
-            .chain(
-                [
-                    Degradation::HalfOutputFastMathBlend,
-                    Degradation::ShaderHalfColorBits,
-                    Degradation::DeviceColorConversion,
-                    Degradation::DeviceNanEncoding,
-                ]
-                .into_iter()
-                .map(|kind| crate::replay::notice_allowance(kind.code())),
-            )
-            .collect()
+        vec![
+            crate::replay::shared_memory_notice(),
+            crate::replay::notice_allowance(Degradation::HalfOutputFastMathBlend.code()),
+        ]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -764,14 +708,13 @@ mod tests {
     /// restating the lane's whole model.
     #[test]
     fn metals_recorded_codes_hold_the_three_blends_the_rule_pins() {
-        use metal2vulkan_runtime::MetalLevel;
         for case in all() {
             let Ok(recording) = crate::recording::read(case.name()) else {
                 // Recorded in a later commit of this batch.
                 continue;
             };
             let answer = recording
-                .answer(MetalLevel::NEWEST)
+                .answer()
                 .unwrap_or_else(|why| panic!("{}: {why}", case.name));
             let taken = answer
                 .deterministic()
@@ -902,8 +845,8 @@ mod tests {
         grid as f64 / 2f64.powi(GRID as i32)
     }
 
-    /// The eight sites this family's rounding was measured over: every site of it that is
-    /// `divergent` on this round's MoltenVK, which is where Metal's rounding and ours part.
+    /// The eight sites this family's rounding was measured over: the sites where Metal's rounding
+    /// and the runtime's parted on MoltenVK when the rule was measured.
     ///
     /// `sas-1msa` appears only for `RG16Float`, which holds no alpha channel, so
     /// `SourceAlphaSaturated` is the smaller of the source alpha and one less the destination's
@@ -949,7 +892,6 @@ mod tests {
     ///
     #[test]
     fn metals_recorded_codes_round_the_blend_colour_before_its_one_minus() {
-        use metal2vulkan_runtime::MetalLevel;
         let mut separating = 0usize;
         let mut compared = 0usize;
         let mut fits_before = 0usize;
@@ -962,7 +904,7 @@ mod tests {
                 continue;
             };
             let answer = recording
-                .answer(MetalLevel::NEWEST)
+                .answer()
                 .unwrap_or_else(|why| panic!("{}: {why}", case.name));
             let taken = answer
                 .deterministic()
@@ -1057,20 +999,16 @@ mod tests {
     /// term. It holds at all 5,376 compared words of the eight sites of [`MEASURED`], in 16- and
     /// 32-bit float formats alike.
     ///
-    /// That is what makes this family's divergences more than a half-precision story: the two
-    /// 32-bit float formats diverge as well, and `sc-dc`, whose source product `S * S` is exact in
-    /// the attachment, still moves by a single code. The runtime's own answer is the mirror image
-    /// of the rule -- `round(Sf * S + round(Df * D))`, the destination product rounded and the
-    /// source product fused -- which is the gap `known-gaps.tsv` carries for these eight sites.
+    /// The M3 Max's own blend under MoltenVK stores the same codes into the 32-bit float formats
+    /// at every word of the family; into the 16-bit float formats it blends in `float` and
+    /// converts toward zero, which is the gap `known-gaps.tsv` carries there.
     ///
-    /// **Only these eight sites are held, because only they were measured.** Metal's rounding at
-    /// the family's other sites is ours, which is why they are exact, and at two of them
-    /// (`sas-1msa` into the two formats that hold an alpha channel) it is neither of the two rules
-    /// written here: both sides agree there, so no gap turns on it and no rule is asserted for it.
-    /// `one-zero`, `min` and `max` are the test above.
+    /// **Only these eight sites are held, because only they were measured.** At two of the
+    /// family's other sites (`sas-1msa` into the two formats that hold an alpha channel) Metal's
+    /// rounding is not the rule written here, so no rule is asserted for them. `one-zero`, `min`
+    /// and `max` are the test above.
     #[test]
     fn metals_recorded_codes_hold_the_rounding_the_divergent_sites_measure() {
-        use metal2vulkan_runtime::MetalLevel;
         let mut checked = 0usize;
         for case in all() {
             let sites: Vec<&str> = MEASURED
@@ -1085,7 +1023,7 @@ mod tests {
                 continue;
             };
             let answer = recording
-                .answer(MetalLevel::NEWEST)
+                .answer()
                 .unwrap_or_else(|why| panic!("{}: {why}", case.name));
             let taken = answer
                 .deterministic()

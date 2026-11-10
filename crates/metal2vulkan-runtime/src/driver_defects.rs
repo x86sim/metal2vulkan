@@ -1,20 +1,17 @@
 //! The defects of a device's driver in commands the runtime records for itself, keyed on the
-//! driver's identity, release and GPU: `VkPhysicalDeviceDriverProperties`'s `driverID`, and
-//! `VkPhysicalDeviceProperties`'s `driverVersion`, which each driver raises with every release
-//! (Mesa encodes it as `VK_MAKE_API_VERSION`, MoltenVK as `major * 10000 + minor * 100 + patch`),
-//! and `deviceID`. A device's defects are in its properties
-//! ([`DeviceProperties::driver_defects`](super::DeviceProperties::driver_defects)), and what a
-//! defect breaks is taken another way where an exact one exists, else refused there, typed
+//! driver's identity and GPU: `VkPhysicalDeviceDriverProperties`'s `driverID` and
+//! `VkPhysicalDeviceProperties`'s `deviceID`, never its release. A device's defects are in its
+//! properties ([`DeviceProperties::driver_defects`](super::DeviceProperties::driver_defects)), and
+//! what a defect breaks is taken another way where an exact one exists, else refused there, typed
 //! ([`Needs::RuntimeDriverDefect`]), never run wrong unannounced: only where a refusal would
 //! withhold a feature of the families the device claims (a row of the feature table,
 //! `families/features.rs`) does it run, announced as a degradation.
 //!
-//! Each defect lists the drivers that have it and, for each, the measured identities a probe found
-//! clean: a GPU (`deviceID`, the one it was measured under for a GPU that reports several:
-//! `DeviceDescription::canonical_device_id`) at one release, which the device layer measured
-//! (`DeviceDescription::measured_identity`). Every other release and GPU of the driver has it,
-//! measured broken or not measured at all, so a release or GPU nobody probed takes the exact path,
-//! and one probed clean then needs only its identity in the list, not new code.
+//! Each defect lists the drivers that have it and, for each, the GPUs a probe found clean
+//! (`deviceID`, the one it was measured under for a GPU that reports several:
+//! `DeviceDescription::canonical_device_id`). Every other GPU of the driver has it, measured broken
+//! or not measured at all, so a GPU nobody probed takes the exact path, and one probed clean then
+//! needs only its `deviceID` in the list, not new code.
 //!
 //! None is a translation's (`DriverWorkaround` covers those), so none is in the compile profile,
 //! a cache key or a digest.
@@ -30,9 +27,9 @@ use std::collections::BTreeSet;
 pub(super) struct Affected {
     pub(super) defect: RuntimeDriverDefect,
     pub(super) driver: DriverId,
-    /// The measured identities a probe found without the defect, each a GPU (`deviceID`) at one
-    /// release (`driverVersion`); every other GPU and release of the driver has it.
-    pub(super) clean: &'static [(u32, u32)],
+    /// The GPUs (`deviceID`) a probe found without the defect; every other GPU of the driver
+    /// has it.
+    pub(super) clean: &'static [u32],
 }
 
 /// Every known defect, by driver.
@@ -139,17 +136,16 @@ pub(super) struct Affected {
 ///   Metal texture, which Metal keeps losslessly compressed where its usage allows
 ///   (`texture/heap_tiled.rs`'s `metal_compresses`; an image of neither `STORAGE` usage nor
 ///   `MUTABLE_FORMAT`), and Metal's blits of a compressed `RG11B10Float` or `RGB9E5Float`
-///   texture write other bytes than they read (`bind::CompressedBlit`), so a CPU copy of a
-///   `Shared` texture of either format reads back NaNs made quiet and shared exponents
-///   renormalized, where Metal's `replaceRegion` and `getBytes` keep the bytes. Measured on
+///   texture write other bytes than they read (`compressed_blit.rs`: NaNs made quiet, shared
+///   exponents renormalized), so a CPU copy of a `Shared` texture of either format reads them
+///   back so, where Metal's `replaceRegion` and `getBytes` keep the bytes. Measured on
 ///   1.4.1 (driverVersion 10401) on an M4 under macOS 27.0.1
 ///   (`runtime_lane::compressed_blits`): known broken through 1.4.1. The
 ///   compression is Metal's, so no MoltenVK release is expected to fix it, but a probe of a
 ///   later one decides. Nothing is refused: the image of such a texture a CPU copy reaches, and
 ///   of a device's own one without `allowGPUOptimizedContents` (whose GPU blits keep the bytes
 ///   on Metal), is made of `PixelFormatView` usage (`compressed_blit::copy_exact_usage`), which
-///   Metal keeps uncompressed, and the runtime rewrites what its blits write itself
-///   (`compressed_blit.rs`).
+///   Metal keeps uncompressed, so its copies keep the bytes as every other device's do.
 ///
 /// `MultisampledCopiesConvertFloatNans`:
 /// - Mesa's RADV (`MESA_RADV`): `gfx_or_compute_copy_image` in `radv_meta_copy.c` gives the
@@ -158,16 +154,15 @@ pub(super) struct Affected {
 ///   and a multisampled copy is then a draw (`radv_gfx_copy_image`) that fetches each sample in
 ///   that format and exports it: a NaN in a 16-bit float channel lands as `0xfe00`, its sign and
 ///   payload lost, while a single-sampled copy kept them. Read in 26.2's source (2026-10-09), and
-///   measured on 26.2.4 (driverVersion 0x6802004) on the Radeon 780M (`deviceID` 0x15bf;
-///   `runtime_lane::renders::multisampled_nan_clears_store_metal_s_texel`: every NaN sample of a 4x
-///   `R16Float` and `RGBA16Float` NaN clear, copied from its unsigned-integer scratch, held
-///   `0xfe00`: a scratch not mutable to the attachment's format alike): known broken through
-///   26.2.4. The path is every RADV GPU's, so every device has it. Nothing is refused: the NaN
-///   clear of a multisampled attachment is written through a view of its image in the
-///   unsigned-integer format of its texel size (`nan_clear.rs`), which the runtime's multisampled
-///   color render targets of such formats take there where it costs the image nothing
-///   (`nan_clear::view_candidate`), and is the device's copy, announced (`device-nan-encoding`),
-///   where the image takes no such view.
+///   measured on 26.2.4 (driverVersion 0x6802004) on the Radeon 780M (`deviceID` 0x15bf: every
+///   NaN sample of a 4x `R16Float` and `RGBA16Float` texel copied from an unsigned-integer scratch
+///   held `0xfe00`, a scratch not mutable to the attachment's format alike): known broken through
+///   26.2.4. The path is every RADV GPU's, so every device has it. Nothing is refused: a blit copy
+///   between multisampled images of such a format runs through views of them in the
+///   unsigned-integer format of its texel size where both take one (`sample_planes::BitsCopy`),
+///   which the runtime's multisampled color render targets of such formats take where it costs the
+///   image nothing (`nan_clear::view_candidate`), and is the device's copy, announced
+///   (`device-nan-encoding`), elsewhere.
 ///
 /// `ReadsCommandBuffersAfterTheirSignal`:
 /// - MoltenVK (`MOLTENVK`): on a device with `MTLSharedEvent` the GPU signals a timeline
@@ -409,6 +404,85 @@ pub(super) struct Affected {
 ///   refused: such an image takes no host-transfer usage there (`Device::host_placed_image`), so it
 ///   stays in memory of its own class and its CPU copies go through a submission; on every other
 ///   driver a block-compressed texture's CPU copies stay on the host.
+///
+/// `TwoPlaneChromaMisplaced`:
+/// - MoltenVK (`MOLTENVK`): a sampler Y′CbCr conversion of `G8_B8R8_2PLANE_420_UNORM`,
+///   `G8_B8R8_2PLANE_422_UNORM` or their 10-bit formats, whose optimal tiling reports midpoint
+///   and cosited chroma, a linear chroma filter, separate reconstruction and forced explicit
+///   reconstruction, reconstructs the chroma off where Vulkan places it (20.2.8, "Chroma
+///   Reconstruction"). A bare Vulkan probe on an M3 Max under macOS 27.0.1 sampled 40 x 24
+///   images at every luma texel's centre and at 2048 random points, the planes random and, for
+///   the weights, one chroma pair alone set: under a nearest sampler filter, a linear chroma
+///   filter and midpoint chroma, the weights of a chroma sample have the right shape (1/4, 3/4,
+///   3/4, 1/4 across and down) but centred one luma texel up and to the left of the midpoint's
+///   (chroma sample `k` at luma `2k` where Vulkan's lies at `2k + 1`); under a linear sampler
+///   filter the chroma is filtered twice (3/16, 3/16, 10/16, 10/16, 3/16, 3/16 across) and
+///   shifted alike; forced explicit reconstruction changes nothing, and cosited chroma reads
+///   weights of no interpolation. A texel's channels lay up to 1000/2048 from Vulkan's
+///   conversion (4:2:0, the identity model) and 366/2048 (4:2:2), the luma exact. Its 4:2:2
+///   single-plane formats (`G8B8G8R8_422_UNORM`, `B8G8R8G8_422_UNORM`) reconstruct as Vulkan
+///   states. Measured on 1.4.2 (driverVersion 10402): known broken through 1.4.2. Nothing is
+///   refused: a two-plane 4:2:0 or 4:2:2 texture converts through Metal's arithmetic there
+///   (`ycbcr_device.rs`), as on a device without the conversion.
+///
+/// `TenBitCodesReadAsWords`:
+/// - Mesa's lavapipe (`MESA_LLVMPIPE`): a sampler Y′CbCr conversion of
+///   `G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16` and its 4:4:4 format reads each code's 16-bit
+///   word as a 16-bit unsigned normalized value, `word / 65535`, its six unused low bits included,
+///   where Vulkan converts the 10-bit code as `c / (2^10 - 1)` ("Fixed-Point Data Conversions";
+///   the format "has a 10-bit G component in the top 10 bits of each 16-bit word ... with the
+///   bottom 6 bits of each word unused"). A bare Vulkan probe read luma code 1023 (low bits 0) as
+///   0.999039 through the identity model, and the runtime's conversion of random words through it
+///   (`runtime_lane::ycbcr_textures::retyped_views_read_their_luma_codes`) read codes one low
+///   wherever the word's low bits put it below the code's value. Measured on 26.0.8 (LLVM
+///   21.1.8): known broken through 26.0.8. Nothing is refused: a 10-bit two-plane texture converts
+///   through Metal's arithmetic there (`ycbcr_device.rs`).
+/// - Mesa's RADV (`MESA_RADV`): the same read. A bare Vulkan probe of a linear
+///   `G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16` image on a Radeon 780M read luma code 1023 (low
+///   bits 0) as 0.999039 through the identity model. Measured on 26.2.4 (linear tiling; the
+///   optimal tiling's conversion of the format was not measured): known broken through 26.2.4.
+///   Nothing is refused: a 10-bit two-plane texture converts through Metal's arithmetic there, and
+///   its planes read in place through the texel buffer (`ycbcr_device.rs`,
+///   `texture/ycbcr_planes.rs`).
+/// - NVIDIA's (`NVIDIA_PROPRIETARY`): on the RTX 5080 Laptop GPU (`deviceID` 0x2c19) under Linux,
+///   a sampler Y′CbCr conversion of `G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16` and its 4:2:2 and
+///   4:4:4 formats (optimal tiling, the image's own format, the surface's matrix and range) reads
+///   each code's six unused low bits too, where Vulkan has them "unused by format conversion" in
+///   a view of the image's own format ("If the VkImage format and VkImageView format are the same,
+///   these bits will be unused by format conversion and this will have no effect"): measured
+///   through the runtime's conversion of random planes (`tests::ycbcr_device`), every texel lay
+///   within 0.0001/2048 of Vulkan's conversion of the codes where the words' low bits were 0, and
+///   up to 6.43/2048 from it where they were random, within 0.034/2048 there of the word read as
+///   the code with six bits of fraction (`word / 64`) under a video range; its 8-bit formats lay
+///   within 0.034/2048 of Vulkan's. Measured on 615.71.09: known broken through 615.71.09. Every
+///   NVIDIA GPU takes it until a probe finds one clean. Nothing is refused: a 10-bit two-plane
+///   texture converts through Metal's arithmetic there (`ycbcr_device.rs`).
+///
+/// `UnpinnablePagesBreakHostMemory`:
+/// - NVIDIA's (`NVIDIA_PROPRIETARY`): on the RTX 5080 Laptop GPU (`deviceID` 0x2c19) under Linux,
+///   `vkAllocateMemory` importing the pointer of a mapping of a udmabuf of a `memfd`'s pages
+///   (`VM_PFNMAP`, which the kernel's `get_user_pages` refuses) answers
+///   `VK_ERROR_OUT_OF_DEVICE_MEMORY` on both memory types `vkGetMemoryHostPointerPropertiesEXT`
+///   allows (2 and 3), where Vulkan requires `VK_ERROR_INVALID_EXTERNAL_HANDLE` of a pointer
+///   "platform-specific restrictions" keep from being imported ("Host External Memory"), and
+///   later allocations of the process fail as out of device memory too, where Vulkan's
+///   out-of-memory errors "do not modify any currently existing Vulkan objects". After such an
+///   import tried as type 2, then 3: every host-pointer import measured (a `memfd`'s shared pages,
+///   8 KiB to 8 MiB at any offset; 8 MiB of private anonymous pages; 8 MiB 512 MiB away from the
+///   mapping; 40 tries over 3 s; on a second device made after it) and a plain 64 KiB
+///   allocation of host-visible type 2, while a device-local one allocates. After the runtime's
+///   own import of such pages (type 3, then 2): an 8 MiB import 8 times in a row, and a guest
+///   RAM's chunk at each of 7 objects over it, while each object's own one-page import succeeded.
+///   Neither the pointer's properties query alone, a failed import of the udmabuf itself, nor a
+///   mapping of one never imported broke anything. Measured on 615.71.09 with the runtime's
+///   device tests: known broken through 615.71.09; every other NVIDIA GPU, unprobed, takes the
+///   same path. Nothing is refused that the driver would import: on Linux the runtime asks the
+///   kernel whether it pins each mapping over the pages before it hands the driver their pointer
+///   (`host_memory.rs`'s `refuse_unpinnable`), and never hands it pages it cannot pin: a no-copy
+///   buffer, heap or rebind over them takes the caller's dma-buf source, and else, or where its
+///   import fails, a copy of them, as where a pointer import fails (`copied.rs`,
+///   `copied-host-pages`); a RAM's chunk over them is not imported, and its objects take their
+///   own paths to the same end.
 pub(super) const AFFECTED: &[Affected] = &[
     Affected {
         defect: RuntimeDriverDefect::HostTransferImagesCopiedAtBind,
@@ -428,8 +502,8 @@ pub(super) const AFFECTED: &[Affected] = &[
     Affected {
         defect: RuntimeDriverDefect::MultisampledStencilColourCopies,
         driver: DriverId::NVIDIA_PROPRIETARY,
-        // The RTX 5080 Laptop GPU at 615.71.09, measured clean.
-        clean: &[(0x2c19, (615 << 22) | (71 << 14) | (9 << 6))],
+        // The RTX 5080 Laptop GPU, measured clean.
+        clean: &[0x2c19],
     },
     Affected {
         defect: RuntimeDriverDefect::NormalizedDepthPastUnitRange,
@@ -489,8 +563,8 @@ pub(super) const AFFECTED: &[Affected] = &[
     Affected {
         defect: RuntimeDriverDefect::ImplicitPreprocessAfterExecutionSet,
         driver: DriverId::MESA_RADV,
-        // The Radeon 780M at 26.2.4, measured clean.
-        clean: &[(0x15bf, (26 << 22) | (2 << 12) | 4)],
+        // The Radeon 780M, measured clean.
+        clean: &[0x15bf],
     },
     Affected {
         defect: RuntimeDriverDefect::FreedAddressMemoryFailsPendingWork,
@@ -527,32 +601,54 @@ pub(super) const AFFECTED: &[Affected] = &[
         driver: DriverId::MOLTENVK,
         clean: &[],
     },
+    Affected {
+        defect: RuntimeDriverDefect::TwoPlaneChromaMisplaced,
+        driver: DriverId::MOLTENVK,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::TenBitCodesReadAsWords,
+        driver: DriverId::MESA_LLVMPIPE,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::TenBitCodesReadAsWords,
+        driver: DriverId::MESA_RADV,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::TenBitCodesReadAsWords,
+        driver: DriverId::NVIDIA_PROPRIETARY,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::UnpinnablePagesBreakHostMemory,
+        driver: DriverId::NVIDIA_PROPRIETARY,
+        clean: &[],
+    },
 ];
 
 /// The defects of the driver and device `description` names, its GPU read by the `deviceID` it
-/// was measured under (`DeviceDescription::measured_gpu`).
+/// was measured under (`DeviceDescription::canonical_device_id`).
 pub(super) fn of(description: &DeviceDescription) -> BTreeSet<RuntimeDriverDefect> {
     among(
         AFFECTED,
         description.driver_id,
-        description.measured_gpu(),
-        description.driver_version,
+        description.canonical_device_id(),
     )
 }
 
-/// The defects of `table` that the driver `driver` has on the device `device` at release
-/// `version`: each of the driver's but those a probe found clean on that GPU at that release. A
-/// `device` of `None` is a GPU no probe ran (`DeviceDescription::measured_gpu`): it has them all.
+/// The defects of `table` that the driver `driver` has on the GPU `device`: each of the driver's
+/// but those a probe found clean on that GPU.
 pub(super) fn among(
     table: &[Affected],
     driver: Option<DriverId>,
-    device: Option<u32>,
-    version: u32,
+    device: u32,
 ) -> BTreeSet<RuntimeDriverDefect> {
     table
         .iter()
         .filter(|affected| Some(affected.driver) == driver)
-        .filter(|affected| !device.is_some_and(|d| affected.clean.contains(&(d, version))))
+        .filter(|affected| !affected.clean.contains(&device))
         .map(|affected| affected.defect)
         .collect()
 }

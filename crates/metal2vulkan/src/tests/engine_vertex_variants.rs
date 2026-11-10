@@ -5,48 +5,47 @@
 //! descriptor and the device decide (`pipeline::link::vertex`), and the runtime makes one
 //! `VkShaderModule` per distinct SPIR-V. So a sweep that creates one pipeline per
 //! `MTLVertexFormat` pays for as many translations as it has distinct projections and as many
-//! driver shader conversions as it has distinct modules — and the two numbers are not the same
-//! number. This module measures both over the conformance suite's own sweeps, through the owned
-//! fixture they use (`dsx_int_attributes`, whose `int_attribute_to_float4` and
-//! `int_attribute_to_half4` read attribute 0 as a `float4` and as a `half4`), and attributes every
-//! module to the input that makes it:
+//! driver shader conversions as it has distinct modules. This module measures both over the
+//! conformance suite's own sweeps, through the owned fixture they use (`dsx_int_attributes`, whose
+//! `int_attribute_to_float4` and `int_attribute_to_half4` read attribute 0 as a `float4` and as a
+//! `half4`), and attributes every module to the input that makes it:
 //!
-//! - **fixed-function input, one module per `narrow_float`.** The whole format is
-//!   `VertexAttribute` state and no instruction of the module names it, so every format the device
-//!   fetches in fixed function shares one module — except that a narrow-float format (`Half*`,
-//!   `FloatRG11B10`) read as a 32-bit `float` canonicalizes the device's widening to Metal's NaN,
-//!   which is a second module. Necessary: the two differ instruction for instruction.
-//! - **`narrow_float` of an attribute read as `half`: nothing.** The canonicalization is emitted
-//!   only for a 32-bit `float` read, so the bit changes no instruction of a `half`-declared
-//!   attribute's stage. `link::vertex::narrow_float_of_f32_reads` keeps it out of the projection
-//!   there, and `a_half_read_compiles_one_module_for_the_whole_sweep` holds the projections and
-//!   the modules at the same count.
-//! - **one module per pulled format.** A format the fixed-function path cannot fetch, or one the
-//!   profile asks the shader to convert (`VertexNormalizedPolicy::Exact`), is decoded in the
-//!   shader, and each decode is its own code. Necessary, and the count of it is what the exact
-//!   form costs: 2 modules against 21 over the 45-format sweep.
+//! - **fixed-function input, one module, one translation.** The whole format is `VertexAttribute`
+//!   state and no instruction of the module names it, so every format the device fetches in fixed
+//!   function shares one projection and one module. What the device's conversion of a format may
+//!   answer otherwise than Metal's fetch -- a normalized format's quotient, a narrow float's NaN
+//!   read as `float` -- is noted where the render pipeline links, on its vertex stage
+//!   (`PrecisionNote::DeviceVertexConversion`, `PrecisionNote::DeviceNanEncoding`), or, where the
+//!   device is measured to convert a normalized format as Metal does, required of the device in
+//!   its place (`VkProperty::MetalNormalizedVertexFetch`), so neither keys a translation
+//!   (`a_pipeline_notes_what_the_device_converts_from_one_translation`).
+//! - **one module per pulled format.** A format the fixed-function path cannot fetch is decoded in
+//!   the shader, and each decode is its own code. Necessary: no format of the 45-format sweep is
+//!   pulled on the suite's venue.
 //! - **the step function: nothing, where the device fetches it.** Metal's constant step is a
 //!   Vulkan binding of divisor 0 and stride 0 (`metal::vertex::attribute_fetch`,
 //!   `link::vertex::binding_stride`), which is `VertexAttribute` and `VertexBinding` state and
 //!   names no instruction, so a constant-step sweep costs exactly what the per-vertex sweep costs.
 //!   Where that binding is not available -- the portability subset forbids a stride of 0, which is
 //!   what makes the fetch independent of the base instance -- every format is pulled instead and
-//!   the sweep is one module a creation: 45 of 45 on `moltenvk-m3`, 2 on a native driver.
+//!   the sweep is one module a creation: 45 of 45 on `moltenvk-m3`, 1 on a native driver.
 //!
 //! Counts, not times: a count is the same on a loaded host as on a quiet one. No GPU is used, and
 //! `llvm-as` assembles the fixture, so a missing tool skips visibly.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::budget::SPIRV_WORDS;
-use crate::device::{DevicePolicy, DeviceProfile, VertexNormalizedPolicy};
-use crate::library::FunctionConstantValues;
+use crate::device::{DevicePolicy, DeviceProfile};
+use crate::library::{FunctionArtifact, FunctionConstantValues};
 use crate::metal::{VertexFormat, VertexStepFunction};
+use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::compile::{compile_bitcode, EntryRef};
 use crate::pipeline::descriptor::{
     VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
-use crate::pipeline::link::vertex::{narrow_float_of_f32_reads, vertex_fetch_projection};
+use crate::pipeline::link::vertex::vertex_fetch_projection;
 use crate::pipeline::lower_inputs::{LoweringInputs, VertexFetch, VertexFetchProjection};
 use crate::pipeline::stage_io::IoNumeric;
 use crate::pipeline::testing::{engine_dir, llvm_assemble, meter, profile, AssembleError};
@@ -79,16 +78,6 @@ fn fixture() -> Option<Vec<u8>> {
 
 fn prof() -> DeviceProfile {
     profile(PROFILE, DevicePolicy::default()).expect("committed profile")
-}
-
-/// The same profile under Metal's own normalized vertex conversion
-/// (`VertexNormalizedPolicy::Exact`, which `DevicePolicy::exact_answers` selects).
-fn exact_prof() -> DeviceProfile {
-    let policy = DevicePolicy {
-        vertex_normalized: VertexNormalizedPolicy::Exact,
-        ..DevicePolicy::default()
-    };
-    profile(PROFILE, policy).expect("committed profile")
 }
 
 /// Every format of the SDK table a float-class attribute can read, as `cases::vertex_formats`
@@ -135,25 +124,26 @@ fn desc(
     d
 }
 
-/// The projection of attribute 0 for `format` at slot `at` under `step`, narrowed as a compile of
-/// `entry` narrows it (`narrow_float_of_f32_reads`).
+/// The projection of attribute 0 for `format` at slot `at` under `step`.
 fn projection(
     p: &DeviceProfile,
-    entry: &str,
     format: VertexFormat,
     at: usize,
     stride: u32,
     step: VertexStepFunction,
 ) -> VertexFetchProjection {
     let attributes = BTreeMap::from([(0, IoNumeric::Float)]);
-    let mut proj = vertex_fetch_projection(Some(&desc(format, at, stride, step)), &attributes, p)
-        .expect("the sweeps' descriptors are valid");
-    narrow_float_of_f32_reads(&mut proj, |_| entry == TO_FLOAT4);
-    proj
+    vertex_fetch_projection(Some(&desc(format, at, stride, step)), &attributes, p)
+        .expect("the sweeps' descriptors are valid")
 }
 
-/// The final SPIR-V words of `entry` compiled under `proj`.
-fn words(bc: &[u8], p: &DeviceProfile, entry: &str, proj: &VertexFetchProjection) -> Vec<u32> {
+/// The artifact of `entry` compiled under `proj`.
+fn artifact(
+    bc: &[u8],
+    p: &DeviceProfile,
+    entry: &str,
+    proj: &VertexFetchProjection,
+) -> Arc<FunctionArtifact> {
     let mut inputs = LoweringInputs::new();
     inputs.vertex_fetch = Some(proj.clone());
     compile_bitcode(
@@ -166,9 +156,11 @@ fn words(bc: &[u8], p: &DeviceProfile, entry: &str, proj: &VertexFetchProjection
         SPIRV_WORDS,
     )
     .expect("the fixture compiles under every projection of the sweeps")
-    .module
-    .words
-    .to_vec()
+}
+
+/// The final SPIR-V words of `entry` compiled under `proj`.
+fn words(bc: &[u8], p: &DeviceProfile, entry: &str, proj: &VertexFetchProjection) -> Vec<u32> {
+    artifact(bc, p, entry, proj).module.words.to_vec()
 }
 
 /// One sweep's counts: its creations, the distinct projections they compile under (so the
@@ -188,7 +180,7 @@ fn count(bc: &[u8], p: &DeviceProfile, entry: &str, step: VertexStepFunction) ->
     let mut modules = BTreeSet::new();
     let mut pulled = Vec::new();
     for (at, &format) in formats.iter().enumerate() {
-        let proj = projection(p, entry, format, at, stride, step);
+        let proj = projection(p, format, at, stride, step);
         if matches!(proj.attributes[&0], VertexFetch::Pulled { .. }) {
             pulled.push(format.name());
         }
@@ -203,36 +195,10 @@ fn count(bc: &[u8], p: &DeviceProfile, entry: &str, step: VertexStepFunction) ->
     }
 }
 
-/// The normalized formats, whose conversion `VertexNormalizedPolicy::Exact` moves into the
-/// shader and the default leaves to fixed-function vertex input: the 8- and 16-bit `Normalized`
-/// formats of either sign, the BGRA one, and the two packed words.
-const NORMALIZED: [&str; 19] = [
-    "MTLVertexFormatUCharNormalized",
-    "MTLVertexFormatUChar2Normalized",
-    "MTLVertexFormatUChar3Normalized",
-    "MTLVertexFormatUChar4Normalized",
-    "MTLVertexFormatUChar4Normalized_BGRA",
-    "MTLVertexFormatCharNormalized",
-    "MTLVertexFormatChar2Normalized",
-    "MTLVertexFormatChar3Normalized",
-    "MTLVertexFormatChar4Normalized",
-    "MTLVertexFormatUShortNormalized",
-    "MTLVertexFormatUShort2Normalized",
-    "MTLVertexFormatUShort3Normalized",
-    "MTLVertexFormatUShort4Normalized",
-    "MTLVertexFormatShortNormalized",
-    "MTLVertexFormatShort2Normalized",
-    "MTLVertexFormatShort3Normalized",
-    "MTLVertexFormatShort4Normalized",
-    "MTLVertexFormatInt1010102Normalized",
-    "MTLVertexFormatUInt1010102Normalized",
-];
-
 /// `vertex-format-float4`'s own sweep under the default: the device fetches every one of the 45
-/// formats in fixed function, and the whole sweep is **two** modules -- one per `narrow_float`,
-/// which is the only thing of the format the module's instructions name.
+/// formats in fixed function, and the whole sweep is **one** module of one translation.
 #[test]
-fn a_float_read_compiles_two_modules_for_the_whole_sweep() {
+fn a_float_read_compiles_one_module_for_the_whole_sweep() {
     let Some(bc) = fixture() else { return };
     let got = count(&bc, &prof(), TO_FLOAT4, VertexStepFunction::PerVertex);
     assert_eq!(got.creations, 45, "the swept formats");
@@ -243,14 +209,13 @@ fn a_float_read_compiles_two_modules_for_the_whole_sweep() {
     );
     assert_eq!(
         (got.projections, got.modules),
-        (2, 2),
+        (1, 1),
         "projections and modules of {} creations",
         got.creations
     );
 }
 
-/// The same sweep read as a `half4`: the device's widening is not canonicalized for a `half`
-/// read, so the two fixed-function modules are **one**, and the projection does not key a second.
+/// The same sweep read as a `half4`: one module of one translation too.
 #[test]
 fn a_half_read_compiles_one_module_for_the_whole_sweep() {
     let Some(bc) = fixture() else { return };
@@ -264,101 +229,148 @@ fn a_half_read_compiles_one_module_for_the_whole_sweep() {
     );
 }
 
-/// Under `VertexNormalizedPolicy::Exact` every normalized format is pulled and divided in the
-/// shader, one module each: both forms are kept and the switch is what picks between them. The
-/// count is the exact form's cost, and `NORMALIZED` is exactly what moves.
+/// A render pipeline notes what the device's fixed-function vertex input converts, from its own
+/// vertex descriptor, on its vertex stage, while one translation of the function serves every
+/// format the device fetches. Over `vertex-format-float4`'s and `-half4`'s sweeps, a normalized
+/// format's pipeline records `PrecisionNote::DeviceVertexConversion` whatever width the function
+/// reads it at on lavapipe and RADV, which do not take `DriverDeviation::MetalNormalizedVertexFetch`;
+/// on `moltenvk-m3`, which does, it records none and requires
+/// `VkProperty::MetalNormalizedVertexFetch`, but for a 16-bit format read as `half`, whose `float`
+/// rounds to `half` twice and keeps the note. A narrow float's records
+/// `PrecisionNote::DeviceNanEncoding` where the function reads it as a 32-bit `float` (a `half`
+/// read keeps the code's own bits), and every other fixed-function format's records neither and
+/// requires no such property. Every such creation of one entry keys its vertex function alike
+/// (`RenderPipelineKeys::vertex`), so a runtime translates it once, and its vertex stage is one
+/// module. The function compiled alone records neither note and requires no such property: its
+/// module is every format's.
 #[test]
-fn metals_own_normalized_conversion_pulls_every_normalized_format() {
+fn a_pipeline_notes_what_the_device_converts_from_one_translation() {
+    use crate::budget::Budget;
+    use crate::device::requirements::VkProperty;
+    use crate::device::Device;
+    use crate::error::DriverDeviation;
+    use crate::library::Library;
+    use crate::lower::stage_io::fetch::{encoding, Encoding};
+    use crate::pipeline::testing::description;
+    use crate::pipeline::{FunctionDescriptor, RenderPipelineDescriptor, StageSource};
     let Some(bc) = fixture() else { return };
-    let p = exact_prof();
-    let float4 = count(&bc, &p, TO_FLOAT4, VertexStepFunction::PerVertex);
-    let mut pulled = float4.pulled.clone();
-    pulled.sort_unstable();
-    let mut expected = NORMALIZED;
-    expected.sort_unstable();
-    assert_eq!(
-        pulled, expected,
-        "the formats the shader pulls under VertexNormalizedPolicy::Exact"
-    );
-    assert_eq!(
-        (float4.projections, float4.modules),
-        (2 + NORMALIZED.len(), 2 + NORMALIZED.len()),
-        "projections and modules of {} creations",
-        float4.creations
-    );
-    let half4 = count(&bc, &p, TO_HALF4, VertexStepFunction::PerVertex);
-    assert_eq!(
-        (half4.projections, half4.modules),
-        (1 + NORMALIZED.len(), 1 + NORMALIZED.len()),
-        "the `half` read keeps its one fixed-function module beside them"
-    );
-    assert_eq!(
-        count(&bc, &prof(), TO_FLOAT4, VertexStepFunction::PerVertex).pulled,
-        Vec::<&str>::new(),
-        "the default fetches every format of the sweep in fixed function"
-    );
-}
-
-/// `DevicePolicy::exact_answers` selects Metal's normalized vertex conversion, so the exact form
-/// is reached by the one switch the owner's rule names and not field by field alone.
-#[test]
-fn exact_answers_selects_metals_normalized_vertex_conversion() {
-    assert_eq!(
-        DevicePolicy::default().exact_answers().vertex_normalized,
-        VertexNormalizedPolicy::Exact
-    );
-    assert_eq!(
-        DevicePolicy::default().vertex_normalized,
-        VertexNormalizedPolicy::Device,
-        "the fast form is the default"
-    );
-}
-
-/// `narrow_float` is not key data of a `half`-declared attribute: the module compiled with the bit
-/// set is the module compiled without it, word for word, for every narrow-float format the device
-/// fetches in fixed function. The `float4` entry is the control: there the two differ.
-#[test]
-fn narrow_float_changes_no_instruction_of_a_half_read() {
-    let Some(bc) = fixture() else { return };
-    let p = prof();
+    let library = Library::from_air(&bc).expect("library");
     let formats = float_readable();
     let stride = SLOT * formats.len() as u32;
-    let mut narrow = 0;
-    for (at, &format) in formats.iter().enumerate() {
-        let attributes = BTreeMap::from([(0, IoNumeric::Float)]);
-        let d = desc(format, at, stride, VertexStepFunction::PerVertex);
-        let raw = vertex_fetch_projection(Some(&d), &attributes, &p).expect("projection");
-        if raw.attributes[&0] != (VertexFetch::FixedFunction { narrow_float: true }) {
-            continue;
+    let fetch = VkProperty::MetalNormalizedVertexFetch;
+    for stem in [PROFILE, "lavapipe", "amd-780m-radv"] {
+        let dev = Device::new(
+            description(stem).expect("committed description"),
+            DevicePolicy::default(),
+        )
+        .expect("device");
+        // MoltenVK on the M3 Max's identity is measured to convert every normalized code as
+        // Metal does; lavapipe and RADV are not.
+        let metal = dev
+            .profile()
+            .takes_driver_deviation(DriverDeviation::MetalNormalizedVertexFetch);
+        assert_eq!(metal, stem == PROFILE, "{stem}");
+        for entry in [TO_FLOAT4, TO_HALF4] {
+            let function = FunctionDescriptor::new(library.function(entry).expect("entry"));
+            let mut keys = BTreeSet::new();
+            let mut modules = BTreeSet::new();
+            let (mut converted, mut relied, mut nans, mut fixed) = (0, 0, 0, 0);
+            for (at, &format) in formats.iter().enumerate() {
+                let what = format!("{stem} {entry} {}", format.name());
+                let mut d = RenderPipelineDescriptor::new(StageSource::Function(function.clone()));
+                d.rasterization_enabled = false;
+                d.vertex_descriptor = Some(desc(format, at, stride, VertexStepFunction::PerVertex));
+                let pipeline = dev
+                    .compile_render_pipeline(&d, &Budget::standard())
+                    .unwrap_or_else(|e| panic!("{what}: {e}"));
+                let notes = &pipeline.stages[0].precision_notes;
+                let requires = pipeline.requirements.properties.contains(&fetch);
+                if !pipeline.vertex_input.pulled.is_empty() {
+                    // A format the device cannot fetch: the module's decode is its own.
+                    assert!(
+                        !notes.contains(&PrecisionNote::DeviceVertexConversion) && !requires,
+                        "{what}: a pulled attribute's decode is not the device's: {notes:?}"
+                    );
+                    continue;
+                }
+                fixed += 1;
+                let e = encoding(format).expect("encoding");
+                // A 16-bit code's `float` quotient rounded to `half` again is not Metal's `half`
+                // at every code, however the device converts it.
+                let twice = entry == TO_HALF4
+                    && matches!(
+                        e,
+                        Encoding::Int {
+                            bits: 16,
+                            normalized: true,
+                            ..
+                        }
+                    );
+                let measured = e.is_normalized() && metal && !twice;
+                let conversion = e.is_normalized() && !measured;
+                let nan = e.widens_narrow_float() && entry == TO_FLOAT4;
+                assert_eq!(
+                    (
+                        notes.contains(&PrecisionNote::DeviceVertexConversion),
+                        notes.contains(&PrecisionNote::DeviceNanEncoding)
+                    ),
+                    (conversion, nan),
+                    "{what}: {notes:?}"
+                );
+                assert_eq!(
+                    requires, measured,
+                    "{what}: the pipeline requires the measured conversion exactly where it \
+                     records no note for it: {:?}",
+                    pipeline.requirements.properties
+                );
+                converted += usize::from(conversion);
+                relied += usize::from(measured);
+                nans += usize::from(nan);
+                keys.insert(
+                    dev.render_pipeline_key(&d, &Budget::standard())
+                        .unwrap_or_else(|e| panic!("{what}: {e}"))
+                        .vertex,
+                );
+                modules.insert(pipeline.stages[0].spirv.to_vec());
+            }
+            assert_eq!(
+                (keys.len(), modules.len()),
+                (1, 1),
+                "{stem} {entry}: translations and modules of {fixed} fixed-function creations"
+            );
+            // Every normalized format, and every narrow float read as `float`, is fetched in
+            // fixed function on the three devices: on `moltenvk-m3` the 19 normalized formats
+            // rely on the measured conversion but the eight 16-bit ones read as `half`, which
+            // note it, and elsewhere all 19 note it.
+            let noted = match (metal, entry) {
+                (false, _) => 19,
+                (true, TO_FLOAT4) => 0,
+                (true, _) => 8,
+            };
+            assert_eq!(
+                (converted, relied, nans),
+                (noted, 19 - noted, if entry == TO_FLOAT4 { 5 } else { 0 }),
+                "{stem} {entry}: the creations noting each, and relying on the measured conversion"
+            );
+            // The function compiled under the shared projection notes neither.
+            let p = dev.profile();
+            let proj = projection(
+                p,
+                VertexFormat::UChar4Normalized,
+                0,
+                stride,
+                VertexStepFunction::PerVertex,
+            );
+            let a = artifact(&bc, p, entry, &proj);
+            assert!(
+                !a.precision.contains(&PrecisionNote::DeviceVertexConversion)
+                    && !a.precision.contains(&PrecisionNote::DeviceNanEncoding)
+                    && !a.requirements.properties.contains(&fetch),
+                "{stem} {entry}: {:?}",
+                a.precision
+            );
         }
-        narrow += 1;
-        let mut flat = raw.clone();
-        narrow_float_of_f32_reads(&mut flat, |_| false);
-        assert_eq!(
-            flat.attributes[&0],
-            VertexFetch::FixedFunction {
-                narrow_float: false
-            },
-            "{}: the narrowing clears the bit",
-            format.name()
-        );
-        assert_eq!(
-            words(&bc, &p, TO_HALF4, &raw),
-            words(&bc, &p, TO_HALF4, &flat),
-            "{}: a `half` read compiles the same with and without `narrow_float`",
-            format.name()
-        );
-        assert_ne!(
-            words(&bc, &p, TO_FLOAT4, &raw),
-            words(&bc, &p, TO_FLOAT4, &flat),
-            "{}: a 32-bit `float` read does not",
-            format.name()
-        );
     }
-    assert_eq!(
-        narrow, 5,
-        "the narrow-float formats fetched in fixed function"
-    );
 }
 
 /// `integer-vertex-attributes`' own sweep: sixteen unnormalized 8- and 16-bit integer formats,
@@ -397,7 +409,7 @@ fn the_integer_attribute_sweep_compiles_thirty_four_modules_of_two_functions() {
         for step in [VertexStepFunction::PerVertex, VertexStepFunction::Constant] {
             for (at, &format) in FORMATS.iter().enumerate() {
                 creations += 1;
-                let proj = projection(&p, entry, format, at, stride, step);
+                let proj = projection(&p, format, at, stride, step);
                 if step == VertexStepFunction::PerVertex
                     && matches!(proj.attributes[&0], VertexFetch::Pulled { .. })
                 {
@@ -453,15 +465,52 @@ fn the_constant_step_sweep_pulls_every_format_on_a_portability_device() {
     );
 }
 
+/// The same sweep's pulled decodes note the device's product: a normalized format's decode is the
+/// code times its maximum's reciprocal, and the function records
+/// `PrecisionNote::DeviceVertexConversion` wherever that misses Metal's fetch at some code, on
+/// `moltenvk-m3` too, whose fixed-function conversion is measured to be Metal's: read as a
+/// `float4`, 18 of the 19 normalized formats (all but `Int1010102Normalized`, whose 10-bit fields
+/// Metal computes as the product), and read as a `half4`, the eight 16-bit ones. No other format
+/// records it.
+#[test]
+fn a_pulled_normalized_decode_notes_the_device_s_product() {
+    let Some(bc) = fixture() else { return };
+    let p = prof();
+    let formats = float_readable();
+    let stride = SLOT * formats.len() as u32;
+    for (entry, want) in [(TO_FLOAT4, 18), (TO_HALF4, 8)] {
+        let mut noted = Vec::new();
+        for (at, &format) in formats.iter().enumerate() {
+            let proj = projection(&p, format, at, stride, VertexStepFunction::Constant);
+            assert!(
+                matches!(proj.attributes[&0], VertexFetch::Pulled { .. }),
+                "{format:?} is pulled on {PROFILE}"
+            );
+            let a = artifact(&bc, &p, entry, &proj);
+            if a.precision.contains(&PrecisionNote::DeviceVertexConversion) {
+                noted.push(format);
+            }
+        }
+        assert_eq!(noted.len(), want, "{entry}: {noted:?}");
+        let normalized = |f: &VertexFormat| {
+            crate::lower::stage_io::fetch::encoding(*f).is_ok_and(|e| e.is_normalized())
+        };
+        assert!(noted.iter().all(normalized), "{entry}: {noted:?}");
+        assert!(
+            !noted.contains(&VertexFormat::Int1010102Normalized),
+            "{entry}"
+        );
+    }
+}
+
 /// The same sweep where a constant-step binding is available: fixed-function vertex input fetches
 /// the formats the per-vertex sweep fetches, so the constant step costs exactly what the
-/// per-vertex step costs -- **two** modules over the 45 creations, one per `narrow_float`, the
-/// only thing of the format a fixed-function module's instructions name; and one for a `half`
-/// read, which canonicalizes no widening. 45 modules to 2. A format the device does not accept as
-/// a vertex buffer is pulled under either step and is named as such, not as a step the step
-/// function costs (`FloatRGB9E5` on the Intel profiles).
+/// per-vertex step costs -- **one** module of one translation over the 45 creations, for a `float`
+/// read and a `half` one alike. 45 modules to 1. A format the device does not accept as a vertex buffer
+/// is pulled under either step and is named as such, not as a step the step function costs
+/// (`FloatRGB9E5` on the Intel profiles).
 #[test]
-fn a_constant_step_binding_compiles_two_modules_for_the_whole_sweep() {
+fn a_constant_step_binding_compiles_one_module_for_the_whole_sweep() {
     let Some(bc) = fixture() else { return };
     for stem in NATIVE {
         let p = profile(stem, DevicePolicy::default()).expect("committed profile");
@@ -488,7 +537,7 @@ fn a_constant_step_binding_compiles_two_modules_for_the_whole_sweep() {
         if got.pulled.is_empty() {
             assert_eq!(
                 (got.projections, got.modules, half.projections, half.modules),
-                (2, 2, 1, 1),
+                (1, 1, 1, 1),
                 "{stem}: projections and modules of {} creations",
                 got.creations
             );
@@ -500,7 +549,7 @@ fn a_constant_step_binding_compiles_two_modules_for_the_whole_sweep() {
             );
             assert_eq!(
                 (got.projections, got.modules, half.projections, half.modules),
-                (3, 3, 2, 2),
+                (2, 2, 2, 2),
                 "{stem}: projections and modules of {} creations",
                 got.creations
             );
@@ -509,8 +558,7 @@ fn a_constant_step_binding_compiles_two_modules_for_the_whole_sweep() {
 }
 
 /// `integer-vertex-attributes`' sweep where a constant-step binding is available: the step
-/// function is not key data of a fixed-function fetch and an unnormalized integer format is not
-/// narrow-float, so all 64 creations -- 16 formats, 2 entry points, 2 step functions -- share
+/// function is not key data of a fixed-function fetch, so all 64 creations -- 16 formats, 2 entry points, 2 step functions -- share
 /// **two** modules, one an entry point. 34 modules to 2.
 #[test]
 fn the_integer_attribute_sweep_compiles_two_modules_where_the_constant_step_is_fixed_function() {
@@ -544,7 +592,7 @@ fn the_integer_attribute_sweep_compiles_two_modules_where_the_constant_step_is_f
             for step in [VertexStepFunction::PerVertex, VertexStepFunction::Constant] {
                 for (at, &format) in FORMATS.iter().enumerate() {
                     creations += 1;
-                    let proj = projection(&p, entry, format, at, stride, step);
+                    let proj = projection(&p, format, at, stride, step);
                     if matches!(proj.attributes[&0], VertexFetch::Pulled { .. }) {
                         pulled += 1;
                     }

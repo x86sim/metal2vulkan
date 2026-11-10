@@ -19,7 +19,7 @@
 //!   format the trigger names in a code span. A consumer predicts a notice from its device's
 //!   facts and the format it binds, so dropping one of those names leaves a reader unable to tell
 //!   whether the notice reaches them, where dropping a clause of prose does not. Only the
-//!   identifiers are held, never the sentence around them; 43 of the kinds are declared with one
+//!   identifiers are held, never the sentence around them; 42 of the kinds are declared with one
 //!   today.
 //!
 //! No rule holds a declaration's prose. Containment of a trigger's first sentence, even with the
@@ -30,8 +30,7 @@ use crate::Degradation;
 use std::collections::BTreeMap;
 
 /// docs/API.md's catalogue, each code's entry as one line of text: the words after the code and
-/// its category (`- \`<code>\` (<category>). `), with every continuation line, retired codes among
-/// them.
+/// its category (`- \`<code>\` (<category>). `), with every continuation line.
 fn catalogue() -> BTreeMap<String, String> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/API.md");
     let guide = std::fs::read_to_string(path).unwrap();

@@ -1,135 +1,56 @@
-//! Metal's `sign`, `fract`, `saturate`, `median3`, and `pow` at their special operands, on the
-//! interpreter against Metal's recorded answers (Apple M3 Max, ORACLE_ABI v34), bit for bit: every
-//! distinct lane of the A1 cases `fract-saturate-and-median3-at-nan-infinity-and-signed-zero`
-//! (aed3faaa) and `sign-of-zero-and-division-range-{without,under}-fast-math` (87d13612, f9a12252,
-//! whose `sign` answers agree lane for lane), and the lanes of `pow-at-every-c99-special-operand`
-//! (116e052a) with a NaN operand, the exponent one, a denormal exponent, or a negative denormal
-//! base to a non-integral exponent. The operands are signed zeros, `f32` and `half` denormals, the
-//! smallest normals, values beside the integers, the largest finite values, infinities, and NaNs
-//! (quiet and signalling, both signs, with payloads).
+//! Metal's `saturate`, `median3`, and `pow` at their special operands, on the interpreter against
+//! Metal's recorded answers (Apple M3 Max, ORACLE_ABI v34), bit for bit: every distinct lane of the
+//! A1 case `fract-saturate-and-median3-at-nan-infinity-and-signed-zero` (aed3faaa) but those whose
+//! answer is the device's instruction's (`median3`'s ties), and the lanes of
+//! `pow-at-every-c99-special-operand` (116e052a) that one of C99's special cases decides (a NaN
+//! answer as any NaN, its bits the device's). The operands are signed zeros, `f32` and `half`
+//! denormals, the smallest normals, values beside the integers, the largest finite values,
+//! infinities, and NaNs (quiet and signalling, both signs, with payloads).
 
 use super::*;
 
-/// `(x, precise::fract, fast::fract, saturate, hx, half fract, half saturate)`: `float` then
-/// `half` operands and answers (`precise::saturate` and `fast::saturate` agree on every lane).
-const FRACT_SATURATE: [(u32, u32, u32, u32, u16, u16, u16); 39] = [
-    (
-        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x0000, 0x0000, 0x0000,
-    ),
-    (
-        0x80000000, 0x00000000, 0x00000000, 0x00000000, 0x8000, 0x0000, 0x0000,
-    ),
-    (
-        0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x0001, 0x0001, 0x0001,
-    ),
-    (
-        0x80000001, 0x00000000, 0x00000000, 0x00000000, 0x8001, 0x3BFF, 0x0000,
-    ),
-    (
-        0x007FFFFF, 0x00000000, 0x00000000, 0x00000000, 0x03FF, 0x03FF, 0x03FF,
-    ),
-    (
-        0x807FFFFF, 0x00000000, 0x00000000, 0x00000000, 0x83FF, 0x3BFF, 0x0000,
-    ),
-    (
-        0x00800000, 0x00800000, 0x00800000, 0x00800000, 0x0400, 0x0400, 0x0400,
-    ),
-    (
-        0x80800000, 0x3F7FFFFF, 0x3F800000, 0x00000000, 0x8400, 0x3BFF, 0x0000,
-    ),
-    (
-        0xB3000000, 0x3F7FFFFF, 0x3F800000, 0x00000000, 0x8C00, 0x3BFF, 0x0000,
-    ),
-    (
-        0xB3800000, 0x3F7FFFFF, 0x3F7FFFFF, 0x00000000, 0x9000, 0x3BFF, 0x0000,
-    ),
-    (
-        0xAEDBE6FF, 0x3F7FFFFF, 0x3F800000, 0x00000000, 0x868E, 0x3BFF, 0x0000,
-    ),
-    (
-        0x3F000000, 0x3F000000, 0x3F000000, 0x3F000000, 0x3800, 0x3800, 0x3800,
-    ),
-    (
-        0xBF000000, 0x3F000000, 0x3F000000, 0x00000000, 0xB800, 0x3800, 0x0000,
-    ),
-    (
-        0x3FC00000, 0x3F000000, 0x3F000000, 0x3F800000, 0x3E00, 0x3800, 0x3C00,
-    ),
-    (
-        0xBFC00000, 0x3F000000, 0x3F000000, 0x00000000, 0xBE00, 0x3800, 0x0000,
-    ),
-    (
-        0x3F800000, 0x00000000, 0x00000000, 0x3F800000, 0x3C00, 0x0000, 0x3C00,
-    ),
-    (
-        0xBF800000, 0x00000000, 0x00000000, 0x00000000, 0xBC00, 0x0000, 0x0000,
-    ),
-    (
-        0x3F7FFFFF, 0x3F7FFFFF, 0x3F7FFFFF, 0x3F7FFFFF, 0x3BFF, 0x3BFF, 0x3BFF,
-    ),
-    (
-        0xBF7FFFFF, 0x33800000, 0x33800000, 0x00000000, 0xBBFF, 0x1000, 0x0000,
-    ),
-    (
-        0x3F800001, 0x34000000, 0x34000000, 0x3F800000, 0x3C01, 0x1400, 0x3C00,
-    ),
-    (
-        0xBF800001, 0x3F7FFFFE, 0x3F7FFFFE, 0x00000000, 0xBC01, 0x3BFE, 0x0000,
-    ),
-    (
-        0x4A800001, 0x3F000000, 0x3F000000, 0x3F800000, 0x6001, 0x3800, 0x3C00,
-    ),
-    (
-        0xCA800001, 0x3F000000, 0x3F000000, 0x00000000, 0xE001, 0x3800, 0x0000,
-    ),
-    (
-        0x4B800000, 0x00000000, 0x00000000, 0x3F800000, 0x6800, 0x0000, 0x3C00,
-    ),
-    (
-        0xCB800000, 0x00000000, 0x00000000, 0x00000000, 0xE800, 0x0000, 0x0000,
-    ),
-    (
-        0x7F7FFFFF, 0x00000000, 0x00000000, 0x3F800000, 0x7BFF, 0x0000, 0x3C00,
-    ),
-    (
-        0xFF7FFFFF, 0x00000000, 0x00000000, 0x00000000, 0xFBFF, 0x0000, 0x0000,
-    ),
-    (
-        0x7F800000, 0x00000000, 0x00000000, 0x3F800000, 0x7C00, 0x0000, 0x3C00,
-    ),
-    (
-        0xFF800000, 0x00000000, 0x00000000, 0x00000000, 0xFC00, 0x0000, 0x0000,
-    ),
-    (
-        0x7FC00000, 0x7FC00000, 0x7FC00000, 0x00000000, 0x7E00, 0x7E00, 0x0000,
-    ),
-    (
-        0xFFC00000, 0x7FC00000, 0x7FC00000, 0x00000000, 0xFE00, 0xFE00, 0x0000,
-    ),
-    (
-        0x7F800001, 0x7FC00000, 0x7FC00000, 0x00000000, 0x7C01, 0x7C01, 0x0000,
-    ),
-    (
-        0xFF800001, 0x7FC00000, 0x7FC00000, 0x00000000, 0xFC01, 0xFC01, 0x0000,
-    ),
-    (
-        0x7FBFFFFF, 0x7FC00000, 0x7FC00000, 0x00000000, 0x7DFF, 0x7DFF, 0x0000,
-    ),
-    (
-        0x40300000, 0x3F400000, 0x3F400000, 0x3F800000, 0x4180, 0x3A00, 0x3C00,
-    ),
-    (
-        0xC0300000, 0x3E800000, 0x3E800000, 0x00000000, 0xC180, 0x3400, 0x0000,
-    ),
-    (
-        0x3F8CCCCD, 0x3DCCCCD0, 0x3DCCCCD0, 0x3F800000, 0x3C66, 0x2E60, 0x3C00,
-    ),
-    (
-        0x40000000, 0x00000000, 0x00000000, 0x3F800000, 0x4000, 0x0000, 0x3C00,
-    ),
-    (
-        0x3E800000, 0x3E800000, 0x3E800000, 0x3E800000, 0x3400, 0x3400, 0x3400,
-    ),
+/// `(x, saturate, hx, half saturate)`: `float` then `half` operands and answers
+/// (`precise::saturate` and `fast::saturate` agree on every lane).
+const SATURATE: [(u32, u32, u16, u16); 39] = [
+    (0x00000000, 0x00000000, 0x0000, 0x0000),
+    (0x80000000, 0x00000000, 0x8000, 0x0000),
+    (0x00000001, 0x00000000, 0x0001, 0x0001),
+    (0x80000001, 0x00000000, 0x8001, 0x0000),
+    (0x007FFFFF, 0x00000000, 0x03FF, 0x03FF),
+    (0x807FFFFF, 0x00000000, 0x83FF, 0x0000),
+    (0x00800000, 0x00800000, 0x0400, 0x0400),
+    (0x80800000, 0x00000000, 0x8400, 0x0000),
+    (0xB3000000, 0x00000000, 0x8C00, 0x0000),
+    (0xB3800000, 0x00000000, 0x9000, 0x0000),
+    (0xAEDBE6FF, 0x00000000, 0x868E, 0x0000),
+    (0x3F000000, 0x3F000000, 0x3800, 0x3800),
+    (0xBF000000, 0x00000000, 0xB800, 0x0000),
+    (0x3FC00000, 0x3F800000, 0x3E00, 0x3C00),
+    (0xBFC00000, 0x00000000, 0xBE00, 0x0000),
+    (0x3F800000, 0x3F800000, 0x3C00, 0x3C00),
+    (0xBF800000, 0x00000000, 0xBC00, 0x0000),
+    (0x3F7FFFFF, 0x3F7FFFFF, 0x3BFF, 0x3BFF),
+    (0xBF7FFFFF, 0x00000000, 0xBBFF, 0x0000),
+    (0x3F800001, 0x3F800000, 0x3C01, 0x3C00),
+    (0xBF800001, 0x00000000, 0xBC01, 0x0000),
+    (0x4A800001, 0x3F800000, 0x6001, 0x3C00),
+    (0xCA800001, 0x00000000, 0xE001, 0x0000),
+    (0x4B800000, 0x3F800000, 0x6800, 0x3C00),
+    (0xCB800000, 0x00000000, 0xE800, 0x0000),
+    (0x7F7FFFFF, 0x3F800000, 0x7BFF, 0x3C00),
+    (0xFF7FFFFF, 0x00000000, 0xFBFF, 0x0000),
+    (0x7F800000, 0x3F800000, 0x7C00, 0x3C00),
+    (0xFF800000, 0x00000000, 0xFC00, 0x0000),
+    (0x7FC00000, 0x00000000, 0x7E00, 0x0000),
+    (0xFFC00000, 0x00000000, 0xFE00, 0x0000),
+    (0x7F800001, 0x00000000, 0x7C01, 0x0000),
+    (0xFF800001, 0x00000000, 0xFC01, 0x0000),
+    (0x7FBFFFFF, 0x00000000, 0x7DFF, 0x0000),
+    (0x40300000, 0x3F800000, 0x4180, 0x3C00),
+    (0xC0300000, 0x00000000, 0xC180, 0x0000),
+    (0x3F8CCCCD, 0x3F800000, 0x3C66, 0x3C00),
+    (0x40000000, 0x3F800000, 0x4000, 0x3C00),
+    (0x3E800000, 0x3E800000, 0x3400, 0x3400),
 ];
 
 /// `(a, b, c, precise::median3, fast::median3, ha, hb, hc, half median3)`.
@@ -284,48 +205,6 @@ const MEDIAN3: [(u32, u32, u32, u32, u32, u16, u16, u16, u16); 50] = [
     (
         0x3F800000, 0x40000000, 0x40400000, 0x40000000, 0x40000000, 0x3C00, 0x4000, 0x4200, 0x4000,
     ),
-];
-
-/// `(x, sign(x))` of `float`, precise and fast alike.
-const SIGN_F32: [(u32, u32); 17] = [
-    (0x00000000, 0x00000000),
-    (0x80000000, 0x00000000),
-    (0x00000001, 0x00000000),
-    (0x80000001, 0x00000000),
-    (0x3F800000, 0x3F800000),
-    (0xBF800000, 0xBF800000),
-    (0x3F000000, 0x3F800000),
-    (0xBF000000, 0xBF800000),
-    (0x7F800000, 0x3F800000),
-    (0xFF800000, 0xBF800000),
-    (0x7FC00000, 0x00000000),
-    (0xFFC00000, 0x00000000),
-    (0x7F7FFFFF, 0x3F800000),
-    (0xFF7FFFFF, 0xBF800000),
-    (0x00800000, 0x3F800000),
-    (0x80800000, 0xBF800000),
-    (0x40000000, 0x3F800000),
-];
-
-/// `(x, sign(x))` of `half`.
-const SIGN_HALF: [(u16, u16); 17] = [
-    (0x0000, 0x0000),
-    (0x8000, 0x0000),
-    (0x0001, 0x3C00),
-    (0x8001, 0xBC00),
-    (0x3C00, 0x3C00),
-    (0xBC00, 0xBC00),
-    (0x3800, 0x3C00),
-    (0xB800, 0xBC00),
-    (0x7C00, 0x3C00),
-    (0xFC00, 0xBC00),
-    (0x7E00, 0x0000),
-    (0xFE00, 0x0000),
-    (0x7BFF, 0x3C00),
-    (0xFBFF, 0xBC00),
-    (0x0400, 0x3C00),
-    (0x8400, 0xBC00),
-    (0x4000, 0x3C00),
 ];
 
 /// `(x, y, precise::pow, fast::pow, hx, hy, half pow)`.
@@ -605,7 +484,8 @@ const POW: [(u32, u32, u32, u32, u16, u16, u16); 90] = [
 /// One lane: the operands' bits and Metal's answer.
 type Row = (Vec<u64>, u64);
 
-/// Run `op` on form `f` over `rows` and require every answer bit for bit, NaN payloads included.
+/// Run `op` on form `f` over `rows` and require every answer bit for bit, NaN payloads included but
+/// a `half` NaN's, whose bits are the device's widening's (`PrecisionNote::NativeNanEncoding`).
 fn metal_answers(op: FloatFn, f: Form, rows: &[Row]) {
     let cases: Vec<Case> = rows
         .iter()
@@ -615,17 +495,7 @@ fn metal_answers(op: FloatFn, f: Form, rows: &[Row]) {
         &format!("{op:?} {f:?} against Metal"),
         &vec![f; op.arity()],
         f,
-        &|fb, x| {
-            math::float_fn(
-                fb,
-                op,
-                f,
-                Contraction::Forbidden,
-                NanTest::IsNan,
-                x,
-                &Lib::instructions(),
-            )
-        },
+        &|fb, x| math::float_fn(fb, op, f, Contraction::Forbidden, x, &Lib::instructions()),
         &cases,
         &|c| {
             let ops: Vec<u64> = c.iter().map(|l| l[0]).collect();
@@ -633,124 +503,86 @@ fn metal_answers(op: FloatFn, f: Form, rows: &[Row]) {
                 .find(|(o, _)| *o == ops)
                 .map(|(_, want)| vec![*want])
         },
-        &|g, w| g == w,
+        &|g, w| g == w || (f == float(16) && is_nan(f, g) && is_nan(f, w)),
     );
 }
 
 #[test]
-fn fract_and_saturate_answer_as_metal() {
-    let rows = |x: fn(&(u32, u32, u32, u32, u16, u16, u16)) -> [u64; 2]| -> Vec<Row> {
-        FRACT_SATURATE
-            .iter()
-            .map(|r| {
-                let [x, want] = x(r);
-                (vec![x], want)
-            })
-            .collect()
-    };
-    let (f32_, half) = (float(32), float(16));
-    metal_answers(
-        FloatFn::Fract,
-        f32_,
-        &rows(|r| [u64::from(r.0), u64::from(r.1)]),
-    );
-    metal_answers(
-        // A1 case aed3faaa calls `fast::fract` without fast-math flags.
-        FloatFn::FastFract {
-            infinite_nan: false,
-        },
-        f32_,
-        &rows(|r| [u64::from(r.0), u64::from(r.2)]),
-    );
-    metal_answers(
-        FloatFn::Saturate,
-        f32_,
-        &rows(|r| [u64::from(r.0), u64::from(r.3)]),
-    );
-    metal_answers(
-        FloatFn::Fract,
-        half,
-        &rows(|r| [u64::from(r.4), u64::from(r.5)]),
-    );
-    metal_answers(
-        FloatFn::Saturate,
-        half,
-        &rows(|r| [u64::from(r.4), u64::from(r.6)]),
-    );
-}
-
-#[test]
-fn median3_answers_as_metal() {
-    type M = (u32, u32, u32, u32, u32, u16, u16, u16, u16);
-    let rows = |x: fn(&M) -> [u64; 4]| -> Vec<Row> {
-        MEDIAN3
-            .iter()
-            .map(|r| {
-                let [a, b, c, want] = x(r);
-                (vec![a, b, c], want)
-            })
-            .collect()
-    };
-    metal_answers(
-        FloatFn::Median3,
-        float(32),
-        &rows(|r| {
-            [
-                u64::from(r.0),
-                u64::from(r.1),
-                u64::from(r.2),
-                u64::from(r.3),
-            ]
-        }),
-    );
-    metal_answers(
-        FloatFn::FastMedian3,
-        float(32),
-        &rows(|r| {
-            [
-                u64::from(r.0),
-                u64::from(r.1),
-                u64::from(r.2),
-                u64::from(r.4),
-            ]
-        }),
-    );
-    metal_answers(
-        FloatFn::Median3,
-        float(16),
-        &rows(|r| {
-            [
-                u64::from(r.5),
-                u64::from(r.6),
-                u64::from(r.7),
-                u64::from(r.8),
-            ]
-        }),
-    );
-}
-
-#[test]
-fn sign_answers_as_metal() {
-    let f: Vec<Row> = SIGN_F32
+fn saturate_answers_as_metal() {
+    // `saturate` is the device's `NClamp(x, 0, 1)`: an `f32` denormal operand is the device's
+    // (Metal flushes it to `+0`), every other lane Metal's.
+    let normal = |(x, _): &Row| x[0] & 0x7F80_0000 != 0 || x[0] & 0x007F_FFFF == 0;
+    let f32_: Vec<Row> = SATURATE
         .iter()
-        .map(|(x, s)| (vec![u64::from(*x)], u64::from(*s)))
+        .map(|r| (vec![u64::from(r.0)], u64::from(r.1)))
+        .filter(normal)
         .collect();
-    metal_answers(FloatFn::Sign, float(32), &f);
-    let h: Vec<Row> = SIGN_HALF
+    metal_answers(FloatFn::Saturate, float(32), &f32_);
+    let half: Vec<Row> = SATURATE
         .iter()
-        .map(|(x, s)| (vec![u64::from(*x)], u64::from(*s)))
+        .map(|r| (vec![u64::from(r.2)], u64::from(r.3)))
         .collect();
-    metal_answers(FloatFn::Sign, float(16), &h);
+    metal_answers(FloatFn::Saturate, float(16), &half);
 }
 
-/// `pow`'s special cases (`math::pow_special`) at the lanes of [`POW`], each decided by a special
-/// case: the magnitude operand (`GLSL.std.450 Pow(|x|, y)`, which the interpreter does not
-/// model) is a constant no answer equals, so a lane that read it would fail.
+/// `median3` is `min(max(c, min(a, b)), max(a, b))` of the device's `NMin` and `NMax`, which the
+/// interpreter answers as Metal's `fmin` and `fmax`: Metal's own answer at every lane where fewer
+/// than two operands are NaN and, on `float`, none is an `f32` denormal (the device's reading of
+/// one, and its pick of two NaNs, are `PrecisionNote::NativeMinMax`'s; `fast::median3`'s `b` of two
+/// NaN first operands among them).
 #[test]
-fn pow_special_operands_answer_as_metal() {
+fn median3_answers_as_metal_but_at_its_recorded_ties() {
+    let f32_nan = |b: u64| b & 0x7FFF_FFFF > 0x7F80_0000;
+    let f32_denormal = |b: u64| b & 0x7F80_0000 == 0 && b & 0x007F_FFFF != 0;
+    let half_nan = |b: u64| b & 0x7FFF > 0x7C00;
+    let keep = |ops: &[u64], nan: &dyn Fn(u64) -> bool, denormal: &dyn Fn(u64) -> bool| {
+        ops.iter().filter(|b| nan(**b)).count() < 2 && !ops.iter().any(|b| denormal(*b))
+    };
+    let mut precise = Vec::new();
+    let mut fast = Vec::new();
+    let mut half = Vec::new();
+    for r in MEDIAN3 {
+        let ops = vec![u64::from(r.0), u64::from(r.1), u64::from(r.2)];
+        if keep(&ops, &f32_nan, &f32_denormal) {
+            precise.push((ops.clone(), u64::from(r.3)));
+            fast.push((ops, u64::from(r.4)));
+        }
+        let ops = vec![u64::from(r.5), u64::from(r.6), u64::from(r.7)];
+        if keep(&ops, &half_nan, &|_| false) {
+            half.push((ops, u64::from(r.8)));
+        }
+    }
+    assert!(precise.len() > 20, "{} rows", precise.len());
+    metal_answers(FloatFn::Median3, float(32), &precise);
+    metal_answers(FloatFn::FastMedian3, float(32), &fast);
+    metal_answers(FloatFn::Median3, float(16), &half);
+}
+
+/// `pow`'s C99 special cases (`math::pow_special`) at the lanes of [`POW`] one of them decides,
+/// against Metal's answers: the magnitude operand (`GLSL.std.450 Pow(|x|, y)`, which the
+/// interpreter does not model) is a constant no answer equals, so a lane that read it would fail.
+/// Left out are the lanes the device answers: `pow(x, 1)` of a nonzero number `x` other than `±1`
+/// (the device's `Pow`, which Metal answers `x` exactly), and an `f32` denormal operand, which
+/// Metal reads as a zero and the device as it reads it (`PrecisionNote::DeviceDenormals`). A NaN
+/// answer is any NaN: its bits are the device's (`PrecisionNote::NativeNanEncoding`).
+#[test]
+fn pow_special_operands_answer_as_c99() {
     for (bits, precise) in [(32u8, true), (32, false), (16, true)] {
         let f = float(bits);
         let pi = if bits == 32 { 0x4049_0FDB } else { 0x4248 };
+        let (one, nan_from, magnitude) = if bits == 32 {
+            (0x3F80_0000, 0x7F80_0000, 0x7FFF_FFFF)
+        } else {
+            (0x3C00, 0x7C00, 0x7FFF)
+        };
+        // Decided by the device: `pow(x, 1)` of a number that is not a zero or `±1`, and an `f32`
+        // denormal operand.
+        let device = |x: u64, y: u64| {
+            let ax = x & magnitude;
+            let to_one = y == one && ax != 0 && ax != one && ax <= nan_from;
+            let denormal = |v: u64| bits == 32 && v & 0x7F80_0000 == 0 && v & 0x007F_FFFF != 0;
+            to_one || denormal(x) || denormal(y)
+        };
         let rows: Vec<Row> = POW
             .iter()
             .map(|r| match (bits, precise) {
@@ -758,6 +590,7 @@ fn pow_special_operands_answer_as_metal() {
                 (32, false) => (vec![u64::from(r.0), u64::from(r.1), pi], u64::from(r.3)),
                 _ => (vec![u64::from(r.4), u64::from(r.5), pi], u64::from(r.6)),
             })
+            .filter(|(ops, _)| !device(ops[0], ops[1]))
             .collect();
         let cases: Vec<Case> = rows
             .iter()
@@ -768,7 +601,7 @@ fn pow_special_operands_answer_as_metal() {
             &[f, f, f],
             f,
             &|fb, a| {
-                let r = math::pow_special(fb, f, a[0], a[1], a[2], precise)?;
+                let r = math::pow_special(fb, f, a[0], a[1], a[2])?;
                 crate::lower::arith::narrow::round(fb, f, r)
             },
             &cases,
@@ -778,96 +611,37 @@ fn pow_special_operands_answer_as_metal() {
                     .find(|(o, _)| *o == ops)
                     .map(|(_, want)| vec![*want])
             },
-            &|g, w| g == w,
+            &|g, w| g == w || (is_nan(f, g) && is_nan(f, w)),
         );
     }
 }
 
-/// `pow(x, 1)` of an `f32` denormal `x` (`math::pow_special`): Metal's precise `pow` answers `x`
-/// itself and `fast::pow` the zero of its sign, at each denormal base of the denormal probes
-/// (cases 638c7906 and c9b6bacb, the `pow` word at `y = 1`; the M3 Max and the M4 answer the
-/// same). The magnitude operand is a constant no answer equals, so a lane that read it fails.
+/// `pow(x, 1)` (`math::pow_special`) is the device's `Pow(|x|, 1)`, negated for a negative `x`
+/// (one is odd), where Metal answers `x` itself: the magnitude operand is a constant no `x`
+/// equals, so a lane that kept `x` fails. A zero and `±1` are C99's cases, a NaN its NaN.
 #[test]
-fn pow_of_a_denormal_base_to_one_answers_as_metal() {
+fn pow_of_a_number_to_one_is_the_device_pow() {
     let f = float(32);
     let magnitude = 0x4049_0FDBu64;
     let one = 0x3F80_0000u64;
     let bases = [
-        0x0000_0001u32,
-        0x8000_0001,
-        0x0000_0003,
-        0x0040_0000,
-        0x807F_FFFF,
-        0x007F_FFFF,
+        0x3F00_0000u32,
+        0xBF00_0000,
+        0x4040_0000,
+        0xC040_0000,
+        0x7F7F_FFFF,
     ];
-    for precise in [true, false] {
-        let cases: Vec<Case> = bases
-            .iter()
-            .map(|x| vec![vec![u64::from(*x)], vec![one], vec![magnitude]])
-            .collect();
-        check_accept(
-            &format!("pow f32 of a denormal base to 1 (precise {precise}) against Metal"),
-            &[f, f, f],
-            f,
-            &|fb, a| math::pow_special(fb, f, a[0], a[1], a[2], precise),
-            &cases,
-            &|c| {
-                let x = c[0][0] as u32;
-                let want = if precise { x } else { x & 0x8000_0000 };
-                Some(vec![u64::from(want)])
-            },
-            &|g, w| g == w,
-        );
-    }
-}
-
-/// Metal's `fast::sin` and `fast::cos` past the last evaluated quadrant (`math::fast_trig_flush`),
-/// against Metal's answers: `+0` from the float after `float(π/2) · 2^22` on, for the infinities,
-/// and for NaNs, whatever the sign; the device's `Sin`/`Cos` (here an input no answer equals) up to
-/// and at the limit. The arguments are the bisected boundary, the two A1 cases' (`9424775`, `1e7`,
-/// a NaN, 179b6aa6's `6588397.5`), and probe case 08bc6611's lanes.
-#[test]
-fn fast_sine_and_cosine_flush_past_the_last_quadrant_as_metal() {
-    let f = float(32);
-    let device = 0x3F12_3456u64;
-    let limit = math::FAST_TRIG_LIMIT;
-    assert_eq!(limit, std::f32::consts::FRAC_PI_2 * (1u32 << 22) as f32);
-    assert_eq!(limit.to_bits(), 0x4AC9_0FDB);
-    // (x, flushed): Metal answers +0 when flushed and its evaluated function otherwise.
-    let rows: [(u32, bool); 16] = [
-        (limit.to_bits(), false),
-        ((-limit).to_bits(), false),
-        (0x4AC9_0FDC, true),
-        (0xCAC9_0FDC, true),
-        (9_424_775f32.to_bits(), true),
-        (1e7f32.to_bits(), true),
-        ((-1e7f32).to_bits(), true),
-        (f32::MAX.to_bits(), true),
-        (0x7F80_0000, true),
-        (0xFF80_0000, true),
-        (0x7FC0_0000, true),
-        (0xFFC0_0000, true),
-        (0x7F80_0001, true),
-        (0x3F80_0000, false),
-        (0x8000_0000, false),
-        (1e6f32.to_bits(), false),
-    ];
-    let cases: Vec<Case> = rows
+    let cases: Vec<Case> = bases
         .iter()
-        .map(|(x, _)| vec![vec![u64::from(*x)], vec![device]])
+        .map(|x| vec![vec![u64::from(*x)], vec![one], vec![magnitude]])
         .collect();
     check_accept(
-        "fast sin/cos flush f32 against Metal",
-        &[f, f],
+        "pow f32 of a number to 1",
+        &[f, f, f],
         f,
-        &|fb, a| math::fast_trig_flush(fb, f, a[0], a[1]),
+        &|fb, a| math::pow_special(fb, f, a[0], a[1], a[2]),
         &cases,
-        &|c| {
-            let x = arg(c, 0) as u32;
-            rows.iter()
-                .find(|(r, _)| *r == x)
-                .map(|(_, flushed)| vec![if *flushed { 0 } else { device }])
-        },
+        &|c| Some(vec![magnitude | (c[0][0] & 0x8000_0000)]),
         &|g, w| g == w,
     );
 }

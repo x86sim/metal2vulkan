@@ -40,26 +40,27 @@
 //! (one bitcast, one exact narrow-float conversion, one shift placing sub-word lanes), not lane by
 //! lane.
 //!
-//! **Sub-word stores** replace only the leaf's bits of a word through
+//! **Sub-word stores** without a narrow unit replace only the leaf's bits of a word through
 //! [`WordMem::write_bits`]: two relaxed word atomics in shared memory, `and(~mask | v)` then
 //! `or(v)`, so neighbouring bytes written concurrently by other invocations are never lost and
 //! no loop is emitted. Whole words are stored plainly.
 //!
 //! **Narrow units**. A word memory may also load and store 1- and 2-byte units through typed narrow
-//! views ([`WordMem::units`]; a descriptor slot's `u8[]`/`u16[]` views where the profile has the
-//! storage access, `memory::views`). There a [`Path::OneWord`] leaf of 1 or 2 bytes is its one unit
-//! at index `off / bytes` (its alignment makes the offset a multiple of its size), loaded or stored
-//! plainly, and the partial last word of an aligned store is stored as its units (a 2-byte part at
-//! its 4-aligned start, then a 1-byte part), instead of the word's shift and the sub-word store's
-//! two atomics. A unit holds exactly the leaf's bytes, so no byte outside the leaf is read or
-//! written, as on the word path; [`leaf_units`] names the units an access uses. Where another store
-//! to the same word still takes the sub-word path (a profile with one of the two widths, a
-//! [`Path::Bytes`] leaf, a 3-byte tail without both widths), a unit store and that store's atomics
-//! overlap at the unit's bytes: the Vulkan memory model calls such a pair from two invocations a
-//! data race, as it does a whole-word load beside a sub-word store. The atomics change no byte
-//! outside their mask, so either order keeps both stores' bytes where the device performs each
-//! atomic as one read-modify-write; the model does not promise that, and no device run has measured
-//! it.
+//! views ([`WordMem::units`]; a descriptor slot's `u8[]`/`u16[]` views, or a device address's
+//! `u8`/`u16` `PhysicalStorageBuffer` places, where the profile has the storage access,
+//! `memory::views` and `lower::access::psb`). There a [`Path::OneWord`] leaf of 1 or 2 bytes is its
+//! one unit at index `off / bytes` (its alignment makes the offset a multiple of its size), loaded
+//! or stored plainly, and the partial last word of an aligned store is stored as its units (a
+//! 2-byte part at its 4-aligned start, then a 1-byte part), instead of the word's shift and the
+//! sub-word store's two atomics. A unit holds exactly the leaf's bytes, so no byte outside the leaf
+//! is read or written, as on the word path; [`leaf_units`] names the units an access uses. Where
+//! another store to the same word still takes the sub-word path (a profile with one of the two
+//! widths, a [`Path::Bytes`] leaf, a 3-byte tail without both widths), a unit store and that
+//! store's atomics overlap at the unit's bytes: the Vulkan memory model calls such a pair from two
+//! invocations a data race, as it does a whole-word load beside a sub-word store. The atomics
+//! change no byte outside their mask, so either order keeps both stores' bytes where the device
+//! performs each atomic as one read-modify-write; the model does not promise that, and no device
+//! run has measured it.
 //!
 //! **`uvec4` units**. A word memory may also load and store 16-byte units through a typed `uvec4`
 //! view ([`WordMem::read_vec4`]; a descriptor slot's `{ uvec4[] }` view, or its uniform view's own
@@ -739,12 +740,13 @@ pub fn value_of(fb: &mut FunctionBuilder<'_>, leaf: &Leaf, words: &[Value]) -> B
             }
             Held::Wide { .. } => Err(dangling()),
             Held::Float(FloatFmt::Half | FloatFmt::BFloat) => {
-                // A narrow float is held widened: decode its 16 format bits exactly (`from_bits`
-                // reads only the low 16 bits).
+                // A narrow float is held widened: its 16 format bits (`from_bits` reads only the
+                // low 16 bits), a `half` widened from its word where the device widens it.
                 let at = 2 * i;
-                let w = word(words, (at / 4) as usize)?;
-                let h = shr(fb, w, 8 * (at % 4))?;
-                narrow::from_bits(fb, scalar, h)
+                let w = (at / 4) as usize;
+                let h = shr(fb, word(words, w)?, 8 * (at % 4))?;
+                let tail = words.get(w..).ok_or_else(dangling)?;
+                narrow::from_word_halves(fb, scalar, tail, (at % 4) / 2, h)
             }
             Held::Float(FloatFmt::F64) => {
                 let lo = word(words, (2 * i) as usize)?;
@@ -815,11 +817,12 @@ fn vector_of(fb: &mut FunctionBuilder<'_>, form: Form, words: &[Value]) -> BResu
             low_bits(fb, v, &shifts, bits)?
         }
         Held::Float(FloatFmt::Half | FloatFmt::BFloat) => {
-            // A narrow float is held widened: one exact decode of every lane's bits, which reads
-            // only each lane's low 16 bits.
+            // A narrow float is held widened: one decode of every lane's bits, which reads only
+            // each lane's low 16 bits, or a `half` vector widened from its words at once where the
+            // device widens it (its lanes are the words' halves in order).
             let (v, shifts) = gathered(fb)?;
             let h = low_bits(fb, v, &shifts, 32)?;
-            narrow::from_bits(fb, form, h)?
+            narrow::from_word_halves(fb, form, words, 0, h)?
         }
         Held::Float(FloatFmt::F32) => {
             let (v, _) = gathered(fb)?;
@@ -902,7 +905,8 @@ pub fn words_of(fb: &mut FunctionBuilder<'_>, leaf: &Leaf, v: Value) -> BResult<
                 }
             }
             Held::Float(FloatFmt::Half | FloatFmt::BFloat) => {
-                // A narrow float is held widened: encode its 16 format bits exactly.
+                // A narrow float is held widened: its 16 format bits, a `half`'s by the device's
+                // narrowing (`narrow::to_bits`).
                 let w = narrow::to_bits(fb, scalar, x)?;
                 put(fb, &mut out, 2 * i, w)?;
             }
@@ -979,7 +983,8 @@ fn vector_words(
     Ok(Some(match form.held {
         Held::Int { container: 32, .. } => placed(fb, v)?,
         Held::Float(FloatFmt::Half | FloatFmt::BFloat) => {
-            // A narrow float is held widened: one exact encode of every lane.
+            // A narrow float is held widened: one encode of every lane, a `half`'s by the
+            // device's narrowing (`narrow::to_bits`).
             let bits = narrow::to_bits(fb, form, v)?;
             placed(fb, bits)?
         }
@@ -1217,25 +1222,6 @@ pub fn load(
 /// the store merges a partial word into `mem` through [`WordMem::write_bits`] (the sub-word
 /// store). In a buffer slot those are two word atomics, which read the word they modify (the
 /// Vulkan memory model's "reads"), so the slot's reported access includes a read.
-/// Whether [`store`] of `leaf` into a memory whose units are `units` merges a partial word, that
-/// is calls [`WordMem::write_bits`]: the paths below are exactly [`store`]'s, and nothing in them
-/// depends on a value, so a caller can choose its form before emitting (`access::emit::store_one`
-/// takes the branching guard for such a store, whose two atomics need a place that an `OpSelect`
-/// of two pointers is not). Reading it wrong the optimistic way is loud, not silent: the builder
-/// refuses an atomic whose pointer is not a place.
-pub fn merges(leaf: &Leaf, units: Units) -> bool {
-    match leaf.path {
-        Path::Vec4 if units.vec4 => false,
-        Path::Vec4 | Path::Aligned => {
-            let partial = (0..leaf.words()).any(|j| leaf.bytes - 4 * j < 4);
-            partial && units.intersect(leaf_units(leaf, true)) != leaf_units(leaf, true)
-        }
-        Path::OneWord => !units.has(leaf.bytes),
-        // Word 0 always takes the shifted bytes through `write_bits`.
-        Path::Bytes => true,
-    }
-}
-
 pub fn store(
     fb: &mut FunctionBuilder<'_>,
     mem: &mut dyn WordMem,

@@ -16,6 +16,7 @@ use super::pending_dispatch::PendingDispatch;
 use super::pipeline::ComputePipelineState;
 use super::render::DeferredPass;
 use super::resource::ResourceKey;
+use super::shadow::GatedCopyIn;
 use super::sparse::emulated::Scrub;
 use super::tracker::Summary;
 use super::Device;
@@ -34,6 +35,10 @@ pub(super) enum Deferred {
     /// (`sparse/emulated.rs`): neither `commit` nor a host step records it, but its batch's
     /// submission, with the mappings the batch applied.
     SparseScrub(Arc<Scrub>),
+    /// A shadow's copy in over host pages a consumer logs, whose regions the log decides: as with
+    /// a scrub, neither `commit` nor a host step records it, but its batch's submission, once the
+    /// commit's stamp is published (`shadow::GatedCopyIn`, `dirty_pages.rs`).
+    GatedCopyIn(Arc<GatedCopyIn>),
     /// A render pass that executes render commands (`render/executions.rs`).
     RenderPass(Arc<DeferredPass>),
     /// A compute encoder's dispatch whose pipelines were being made (`pending_dispatch.rs`).
@@ -99,6 +104,7 @@ impl Deferred {
             (Deferred::Execute(a), Deferred::Execute(b)) => Arc::ptr_eq(a, b),
             (Deferred::Dispatch(a), Deferred::Dispatch(b)) => Arc::ptr_eq(a, b),
             (Deferred::SparseScrub(a), Deferred::SparseScrub(b)) => Arc::ptr_eq(a, b),
+            (Deferred::GatedCopyIn(a), Deferred::GatedCopyIn(b)) => Arc::ptr_eq(a, b),
             (Deferred::RenderPass(a), Deferred::RenderPass(b)) => Arc::ptr_eq(a, b),
             (Deferred::Pending(a), Deferred::Pending(b)) => Arc::ptr_eq(a, b),
             (Deferred::Loop(a), Deferred::Loop(b)) => Arc::ptr_eq(a, b),
@@ -111,14 +117,15 @@ impl Deferred {
     /// executes render commands is not: its shadowed textures are its encoder's, copied in
     /// before it and back as the encoder ends (`render/shadows.rs`).
     /// Nor is a dispatch whose pipelines were being made: its shadowed textures were copied in
-    /// at the dispatch, and its writes are its encoder's to copy back.
+    /// at the dispatch, and its writes are its encoder's to copy back. Nor is a gated copy in,
+    /// which is one of the encoder's shadow copies.
     pub(super) fn leaves_shadows(&self) -> bool {
         match self {
             Deferred::Execute(_)
             | Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
             | Deferred::Loop(_) => true,
-            Deferred::RenderPass(_) | Deferred::Pending(_) => false,
+            Deferred::RenderPass(_) | Deferred::Pending(_) | Deferred::GatedCopyIn(_) => false,
         }
     }
 
@@ -136,7 +143,7 @@ impl Deferred {
                 execute.icb.gpu_written() || execute.indirect() || execute.predicated()
             }
             Deferred::Dispatch(_) | Deferred::Loop(_) => true,
-            Deferred::SparseScrub(_) | Deferred::Pending(_) => false,
+            Deferred::SparseScrub(_) | Deferred::GatedCopyIn(_) | Deferred::Pending(_) => false,
             Deferred::RenderPass(pass) => pass.gpu_written(),
         }
     }
@@ -221,7 +228,7 @@ impl Deferred {
             Deferred::Dispatch(_) => Err(internal(
                 "an indirect dispatch recorded before the work it waits for completed",
             )),
-            Deferred::SparseScrub(_) => Ok(Prepared {
+            Deferred::SparseScrub(_) | Deferred::GatedCopyIn(_) => Ok(Prepared {
                 recorded: None,
                 for_good: false,
                 inputs: StepInputs::None,
@@ -254,12 +261,12 @@ impl Deferred {
                 })
             }
             // A pass of draws whose pipelines are being made, or one of which failed, is
-            // recorded by a host step once they are made, which fails the command buffer for a
-            // failed one (`render/pending.rs`). One whose executions read the CPU's records as
+            // recorded by a host step once they are made, which drops the draw of a failed one
+            // (`render/pending.rs`). One whose executions read the CPU's records as
             // they stand now waits for them first.
             Deferred::RenderPass(pass) => {
                 if pass.reads_at_commit() {
-                    pass.wait_made();
+                    pass.wait_made(command_buffer.making_deadline());
                 }
                 if pass.making() || pass.failed() {
                     return Ok(Prepared {
@@ -336,6 +343,7 @@ impl Deferred {
                 .map(|recorded| (recorded, StepInputs::RenderPass))),
             Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
+            | Deferred::GatedCopyIn(_)
             | Deferred::Pending(_)
             | Deferred::Loop(_) => Ok(None),
         }
@@ -381,6 +389,7 @@ impl Deferred {
             }
             Deferred::Dispatch(dispatch) => dispatch.record(command_buffer),
             Deferred::SparseScrub(_) => Err(internal("a sparse scrub's host step")),
+            Deferred::GatedCopyIn(_) => Err(internal("a gated copy in's host step")),
             Deferred::RenderPass(pass) => pass.record(command_buffer, true),
             Deferred::Pending(dispatch) => dispatch.record(command_buffer),
             Deferred::Loop(check) => check.step(command_buffer),
@@ -398,6 +407,7 @@ impl Deferred {
             Deferred::Execute(execute) => execute.outgrown(),
             Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
+            | Deferred::GatedCopyIn(_)
             | Deferred::Pending(_)
             | Deferred::Loop(_) => false,
         }
@@ -413,6 +423,7 @@ impl Deferred {
             Deferred::RenderPass(pass) => pass.rewritten(),
             Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
+            | Deferred::GatedCopyIn(_)
             | Deferred::Pending(_)
             | Deferred::Loop(_) => false,
         }
@@ -426,6 +437,7 @@ impl Deferred {
             Deferred::Execute(_)
             | Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
+            | Deferred::GatedCopyIn(_)
             | Deferred::RenderPass(_)
             | Deferred::Pending(_) => false,
         }
@@ -439,7 +451,23 @@ impl Deferred {
             Deferred::Execute(_)
             | Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
+            | Deferred::GatedCopyIn(_)
             | Deferred::Loop(_) => false,
+        }
+    }
+
+    /// Whether its recording may write memory no use its command buffer noted names, so the merge
+    /// back of copied host buffers takes every copy as written by it (`copied.rs`): an indirect
+    /// command buffer's execution and a render pass that executes render commands, whose
+    /// commands its step resolves from records, an indirect dispatch and a scrub, which their
+    /// steps or submissions record. A dispatch whose pipelines were being made records the uses
+    /// its encoding noted, a gated copy in writes the shadow it names, and a loop's check records
+    /// nothing.
+    pub(super) fn reaches_unnamed(&self) -> bool {
+        match self {
+            Deferred::Execute(_) | Deferred::Dispatch(_) | Deferred::SparseScrub(_) => true,
+            Deferred::RenderPass(pass) => pass.executes(),
+            Deferred::GatedCopyIn(_) | Deferred::Pending(_) | Deferred::Loop(_) => false,
         }
     }
 
@@ -460,13 +488,16 @@ impl Deferred {
             Deferred::Execute(_)
             | Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
+            | Deferred::GatedCopyIn(_)
             | Deferred::Loop(_) => false,
         }
     }
 
-    /// Whether the making of a pipeline the work records failed, which its recording makes again,
-    /// on the thread that records it (`DeferredPass::failed`, `PendingDispatch::failed`): where
-    /// that fails too the command buffer completes with `CommandBufferError::PipelineCreation`.
+    /// Whether the making of a pipeline the work records failed (`DeferredPass::failed`,
+    /// `PendingDispatch::failed`): a dispatch's, which its recording makes again, on the thread
+    /// that records it, the command buffer completing with
+    /// `CommandBufferError::PipelineCreation` where that fails too; a draw's, which its
+    /// recording drops (`render/pending.rs`).
     pub(super) fn failed(&self) -> bool {
         match self {
             Deferred::RenderPass(pass) => pass.failed(),
@@ -474,6 +505,7 @@ impl Deferred {
             Deferred::Execute(_)
             | Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
+            | Deferred::GatedCopyIn(_)
             | Deferred::Loop(_) => false,
         }
     }
@@ -490,6 +522,7 @@ impl Deferred {
             Deferred::Execute(_)
             | Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
+            | Deferred::GatedCopyIn(_)
             | Deferred::Loop(_) => None,
         }
     }
@@ -502,6 +535,7 @@ impl Deferred {
             Deferred::Execute(_)
             | Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
+            | Deferred::GatedCopyIn(_)
             | Deferred::Loop(_) => {}
         }
     }
@@ -515,6 +549,7 @@ impl Deferred {
             Deferred::Execute(_)
             | Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
+            | Deferred::GatedCopyIn(_)
             | Deferred::Loop(_) => {}
         }
     }
@@ -524,7 +559,10 @@ impl Deferred {
         match self {
             Deferred::Execute(execute) => indirect_execute::degrade_host_replay(device, execute),
             Deferred::Dispatch(dispatch) => dispatch.degrade(device),
-            Deferred::SparseScrub(_) | Deferred::Pending(_) | Deferred::Loop(_) => {}
+            Deferred::SparseScrub(_)
+            | Deferred::GatedCopyIn(_)
+            | Deferred::Pending(_)
+            | Deferred::Loop(_) => {}
             Deferred::RenderPass(pass) => pass.degrade(device),
         }
     }

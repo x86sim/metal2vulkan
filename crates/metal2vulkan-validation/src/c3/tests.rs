@@ -1369,23 +1369,13 @@ fn a_cube_gradient_footprint_row_is_deferred_and_never_a_reviewed_reading() {
     );
 }
 
-/// A nearest cube sample's texel from a correctly rounded reciprocal (`CubeFaceReciprocal`) is
-/// deferred the same way, with its measured bound.
-#[test]
-fn a_cube_face_reciprocal_row_is_deferred_and_never_a_reviewed_reading() {
-    deferred_and_never_reviewed(
-        PrecisionNote::CubeFaceReciprocal,
-        "CubeFaceReciprocal:a nearest cube texel",
-    );
-}
-
-/// A bicubic sample's unpinned arithmetic (`BicubicFilterArithmetic`) is deferred the same way,
-/// with its measured bound: no model of Apple's 2D rounding fitted.
+/// An emulated filter's arithmetic (`BicubicFilterArithmetic`: the device's multiply and add where
+/// Metal sums fixed-point weights exactly) is deferred the same way, with its bound.
 #[test]
 fn a_bicubic_filter_arithmetic_row_is_deferred_and_never_a_reviewed_reading() {
     deferred_and_never_reviewed(
         PrecisionNote::BicubicFilterArithmetic,
-        "BicubicFilterArithmetic:a 2D bicubic sum",
+        "BicubicFilterArithmetic:a bicubic sum",
     );
 }
 
@@ -1827,10 +1817,11 @@ fn a_signed_off_apple_reading_holds_only_while_every_differing_word_is_within_ap
 /// Where Apple states no accuracy, the device's answer is within Apple's promise, but not the
 /// product's approximation. A row whose modules record the product's lowering as a near-equivalent
 /// of Metal's (`DeviceArithmetic`) keeps the word open, so the report refuses the sign-off,
-/// whatever the unstated-words flag says: fast `fmod` ("Undefined"), and fast `float` `tanh`,
-/// which the product computes as `(t - 1) / (t + 1)` with its own division (its lowering of
-/// `air.fast_tanh.f32` records `DeviceArithmetic`), whose divisor at `tanh(44)` is past the
-/// `2^126` where Table 8.2 bounds the fast division.
+/// whatever the unstated-words flag says: fast `fmod` ("Undefined"). Fast `float` `tanh` at
+/// `tanh(44)`, whose formula's divisor is past the `2^126` where Table 8.2 bounds the fast
+/// division, is unstated too, but the product's fast `tanh` is the device's `Tanh` (its lowering
+/// of `air.fast_tanh.f32` records no `DeviceArithmetic`): the device's own answer, within the
+/// promise, so the sign-off stands even where the row records the note for another operation.
 #[test]
 fn an_unstated_word_the_product_approximates_keeps_its_reading_open() {
     /// A one-word fast-math reading: the case's AIR tag, what the word computes of which bit
@@ -1895,33 +1886,36 @@ fn an_unstated_word_the_product_approximates_keeps_its_reading_open() {
         let check = report.readings[0].bound.as_ref().unwrap();
         assert_eq!(check.count("unstated"), 1, "{}", word.computes);
         assert!(report.refused.is_empty());
-
-        // The product's remainder or division, recorded as a near-equivalent: open, and the
-        // sign-off refused.
-        let report = report_of(
-            word,
-            &[
-                PrecisionNote::DeviceArithmetic,
-                PrecisionNote::DeviceTranscendentals,
-            ],
-        );
-        let check = report.readings[0].bound.as_ref().unwrap();
-        assert_eq!(check.count("near_equivalent"), 1, "{}", word.computes);
-        assert_eq!(report.refused.len(), 1);
-        assert!(
-            report.refused[0].words[0].contains("near_equivalent")
-                && report.refused[0].words[0].contains("DeviceArithmetic"),
-            "{:?}",
-            report.refused
-        );
-        assert!(!report.holds());
     }
-    let report = report_of(&tanh, &[PrecisionNote::DeviceArithmetic]);
+    let recorded = [
+        PrecisionNote::DeviceArithmetic,
+        PrecisionNote::DeviceTranscendentals,
+    ];
+    // The product's remainder, recorded as a near-equivalent: open, and the sign-off refused.
+    let report = report_of(&fmod, &recorded);
+    let check = report.readings[0].bound.as_ref().unwrap();
+    assert_eq!(check.count("near_equivalent"), 1);
+    assert_eq!(report.refused.len(), 1);
     assert!(
-        report.refused[0].words[0].contains("its lowering of air.fast_tanh.f32 (Metal's tanh)"),
+        report.refused[0].words[0].contains("near_equivalent")
+            && report.refused[0].words[0].contains("DeviceArithmetic"),
         "{:?}",
         report.refused
     );
+    assert!(!report.holds());
+    let report = report_of(&fmod, &[PrecisionNote::DeviceArithmetic]);
+    assert!(
+        report.refused[0].words[0].contains("its lowering of air.fast_fmod.f32 (Metal's fmod)"),
+        "{:?}",
+        report.refused
+    );
+    // The device's `Tanh`: no near-equivalent of the product's, so the word stays unstated and
+    // the sign-off stands, whatever arithmetic notes the row records.
+    let report = report_of(&tanh, &recorded);
+    let check = report.readings[0].bound.as_ref().unwrap();
+    assert_eq!(check.count("unstated"), 1);
+    assert_eq!(check.count("near_equivalent"), 0);
+    assert!(report.refused.is_empty(), "{:?}", report.refused);
 }
 
 /// A word within Apple's bound that shows a recorded near-equivalent's difference keeps its reading
@@ -1929,11 +1923,10 @@ fn an_unstated_word_the_product_approximates_keeps_its_reading_open() {
 /// sign-off stands, whatever arithmetic notes the row records. A fast `sinpi` of a subnormal: +0
 /// where the operand is read as zero, as Metal reads it, the subnormal pi times it
 /// where the device keeps it (fast `sinpi`'s lowering records `DeviceDenormals`), and Table 8.2's
-/// absolute 2^-13 admits both. A product whose result is a subnormal keeps Apple's verdict: the
-/// product's multiply flushes it on every profile, so the note is not its. A product one rounding
-/// away (toward zero, which "correctly rounded" admits) touches no subnormal. (Metal's divisions
-/// flush their own subnormals and record no such note, and precise `fmod` answers Metal at
-/// denormals itself.)
+/// absolute 2^-13 admits both. A product whose result is a subnormal is open too: lavapipe's
+/// multiply is the device's, not measured to flush as Metal does, and records the note. A product
+/// one rounding away (toward zero, which "correctly rounded" admits) touches no subnormal. (Precise
+/// `fmod` answers Metal at denormals itself.)
 #[test]
 fn a_word_within_apples_bound_that_shows_a_recorded_near_equivalent_keeps_its_reading_open() {
     let report_of = |computes: &str,
@@ -1999,13 +1992,14 @@ fn a_word_within_apples_bound_that_shows_a_recorded_near_equivalent_keeps_its_re
     }
     assert!(!report.holds());
 
-    // 2^-100 * 2^-30, Metal's +0 against a kept 2^-130: the multiply records no denormal note,
-    // so within, and the sign-off stands with every note recorded.
+    // 2^-100 * 2^-30, Metal's +0 against a kept 2^-130: the multiply records the denormal note,
+    // so open, and the sign-off refused.
     let (a, b) = (f32::from_bits(27 << 23), f32::from_bits((127 - 30) << 23)); // 2^-100, 2^-30
     let report = report_of("mul(a, b)", Math::Precise, &[a, b], 0.0, tiny, &every);
     let check = report.readings[0].bound.as_ref().unwrap();
-    assert_eq!(check.count("within"), 1);
-    assert!(report.refused.is_empty());
+    assert_eq!(check.count("near_equivalent"), 1);
+    assert_eq!(report.refused.len(), 1);
+    assert!(report.refused[0].words[0].contains("(Metal's mul)"));
 
     // (1 / 3)^2 rounded toward zero against Metal's nearest: no subnormal, no NaN, so within,
     // and the sign-off stands with every note recorded.
@@ -3571,8 +3565,8 @@ fn a_deferred_near_equivalent_stays_open_with_its_reason() {
 /// A deferred near-equivalent the run announced as a degradation, which no executed module's notes
 /// record (the runtime makes a rate-mapped pass's map and announces it), keeps the row open with
 /// its reason, as a note its comparison class records does, even where the list holds a reading at
-/// it; a cost, a note C3 judges word by word, a retired code, or a code the vocabulary does not
-/// know leaves an ordinary mismatch, which the list reviews.
+/// it; a cost, a note C3 judges word by word, or a code the vocabulary does not know leaves an
+/// ordinary mismatch, which the list reviews.
 #[test]
 fn an_announced_deferred_near_equivalent_stays_open_with_its_reason() {
     use crate::observation::{EXECUTOR_DEGRADES, RUNTIME_DEGRADES};
@@ -3638,7 +3632,6 @@ fn an_announced_deferred_near_equivalent_stays_open_with_its_reason() {
             &[
                 cost,
                 Degradation::DeviceDenormals.code(),
-                Degradation::RETIRED_CODES[0].0,
                 "metal2vulkan-degrade-no-such-kind",
             ],
         )),
@@ -3850,11 +3843,9 @@ fn a_rekey_list_moves_records_only_to_this_builds_keys() {
 
 /// The Apple M3 Max's MoltenVK runs (`apple-m3-max-moltenvk`) compare with its own Metal rows: a
 /// run compared with another Metal environment allows no device, and a device stating no Metal
-/// environment is allowed under any. The Apple M4's capture derives the venue's translation key
-/// (under macOS 27 the two GPUs share one MoltenVK device ID and differ only in allocation sizes),
-/// yet the list refuses it as a device naming the M3 Max's Metal environment, as a second device of
-/// the venue or in a venue of its own, and a device whose Metal environment is no C3 reference
-/// environment.
+/// environment is allowed under any. The list refuses a second GPU's device (the M3 Max's capture
+/// under another GPU's name, in a venue of its own) naming the M3 Max's Metal environment, and a
+/// device whose Metal environment is no C3 reference environment.
 #[test]
 fn each_moltenvk_device_compares_with_its_own_gpus_metal() {
     let committed = Venues::load(&Venues::committed_path()).unwrap();
@@ -3908,31 +3899,12 @@ fn each_moltenvk_device_compares_with_its_own_gpus_metal() {
         names(&stating_none, "apple-m3-max-macos26.5.2"),
         ["Apple M3 Max"]
     );
-    // The M4's capture as a second device of the venue: translation cannot tell them apart, but
-    // its device names another GPU's Metal environment.
-    let m4 = crate::c3::VenueProfile::committed("moltenvk-m4").unwrap();
     let mut m4_device = m3.devices[0].clone();
-    m4_device.profile = "moltenvk-m4".into();
-    m4_device.identity = m4.identity.clone();
-    let mut shared = committed.clone();
-    shared
-        .venues
-        .iter_mut()
-        .find(|venue| venue.environment_id == "apple-m3-max-moltenvk")
-        .unwrap()
-        .devices
-        .push(m4_device.clone());
-    shared.check_profiles().expect("one translation key");
-    let error = shared.check().unwrap_err();
-    assert!(
-        error.contains("which is another GPU's (Apple M3 Max)"),
-        "{error}"
-    );
+    m4_device.identity.device = "Apple M4".into();
     // A venue of its own whose device names the M3 Max's Metal environment.
     let mut own = committed.clone();
     let mut venue = m3.clone();
     venue.environment_id = "apple-m4-moltenvk".into();
-    venue.profile = "moltenvk-m4".into();
     venue.devices = vec![m4_device];
     own.venues.push(venue);
     let error = own.check().unwrap_err();

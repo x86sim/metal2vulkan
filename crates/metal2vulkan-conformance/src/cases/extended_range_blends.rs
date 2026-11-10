@@ -241,18 +241,21 @@ impl Case for ExtendedRangeBlend {
         // what this M3 Max and lavapipe both show -- and one that does not shows the code. The
         // allowance fails the case if the notice stops firing, so it cannot outlive its reason.
         //
-        // The pass loads and stores an extended-range colour attachment, so our load pass
-        // (`render/unused_bits_load.rs`) rewrites every 32 x 32 tile of the render area where
-        // Metal's rewrites only the tiles a draw's primitives reach, announced as
-        // `unreached-tiles-rewritten`. The difference it names cannot reach this case: the draw is
-        // one full-screen triangle over the whole 128 x 64 target, so every tile is a reached
-        // tile, and every stored code compares exactly on MoltenVK and on lavapipe alike. So this
-        // is a declaration of what our side announced and not a tolerance -- no code is loosened.
+        // The pass loads and stores an extended-range colour attachment, so its draw announces
+        // `extended-range-bits-kept`: the device's store keeps the bits the codes leave unused in
+        // the texels the draw does not write, where Metal's pass makes them canonical. The
+        // difference it names cannot reach this case: the draw is one full-screen triangle over
+        // the whole 128 x 64 target under every channel, so it writes every texel, and every
+        // stored code compares exactly. So this is a declaration of what our side announced and
+        // not a tolerance -- no code is loosened.
         //
-        // The two extended-range blend kinds (`extended-range-blend-source` and
-        // `extended-range-blends-stored-codes`) are deliberately **not** named here: neither fired
-        // on either venue of this round, and an allowance no run justified is a claim without
-        // evidence. A venue that needs one adds it with the run that shows it.
+        // The function blends the `half4` fill into the extended-range target in the shader, in
+        // the device's arithmetic, so every row announces `extended-range-blend-source`, a native
+        // note the suite declares for every case (`crate::replay::NATIVE_NOTES`); the codes still
+        // compare exactly, and a site the device's arithmetic moves is a known gap.
+        // `extended-range-blends-stored-codes` is deliberately **not** named here: it fired on no
+        // venue, and an allowance no run justified is a claim without evidence. A venue that
+        // needs it adds it with the run that shows it.
         // Every row reads its answer back through a `Shared` buffer, so on a device without
         // unified memory the runtime announces `shared-in-system-memory`
         // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
@@ -268,7 +271,7 @@ impl Case for ExtendedRangeBlend {
             .chain(
                 [
                     Degradation::HalfOutputFastMathBlend,
-                    Degradation::UnreachedTilesRewritten,
+                    Degradation::ExtendedRangeBitsKept,
                 ]
                 .into_iter()
                 .map(|kind| crate::replay::notice_allowance(kind.code())),

@@ -925,11 +925,11 @@ impl Device {
     /// A `Memoryless` descriptor, of which plain Metal makes a texture (an Apple M3 Max under
     /// macOS 27.0.1: a 64-texel `RGBA8Unorm` texture buffer of `ShaderRead` usage answers
     /// `storageMode` 3, its other getters its descriptor's), lies over a `Private` buffer: no
-    /// Vulkan buffer takes memory lazily. The texture answers the descriptor's mode, and the
-    /// runtime refuses every use of it ([`Texture::check_not_memoryless`]), as Metal's validation
-    /// stops every use of a memoryless texture but as a render pass's attachment, which no
-    /// texture buffer is. Announced `memoryless-texture-buffer`: the bytes are memory Metal
-    /// spends none of.
+    /// Vulkan buffer takes memory lazily. The texture answers the descriptor's mode, and its uses
+    /// are a memoryless texture's (`texture.rs`): a command that uses it fails its command
+    /// buffer, as plain Metal's (a dispatch that reads it and a blit out of it, measured), its
+    /// views are nil, and its CPU access, at which plain Metal's process faults, is refused.
+    /// Announced `memoryless-texture-buffer`: the bytes are memory Metal spends none of.
     pub(super) fn new_texture_buffer(
         &self,
         descriptor: &TextureDescriptor,
@@ -1363,6 +1363,24 @@ impl Texels {
     /// copied in place (`shadow_copy_back.rs`), and its merges read the texels through `unorm`,
     /// its image's view of its own 8-bit unsigned normalized format, where given so
     /// (`shadow_merge.rs`). Refused as `new_buffer` refuses the staging buffer.
+    /// Whether these texels take a device copy on `device` (`texture.rs`, `dirty_pages.rs`): on
+    /// a discrete GPU, tracked, over host pages whose memory carries a log, where the shadow's
+    /// copy in is one region straight from the texels' place in the buffer's `VkBuffer` (one
+    /// slice, rows that share no bytes, a first texel at a multiple of the texel's size there),
+    /// the copy in a log decides.
+    pub(super) fn device_copy(&self, device: &Device) -> bool {
+        let layout = &self.layout;
+        // The looks at the pages last: each takes their lock (`WorkCounts::no_copy_lies_read`),
+        // which a texture on any other GPU never needs.
+        device.properties().kind == crate::DeviceKind::Discrete
+            && self.tracked()
+            && layout.slices == 1
+            && layout.shared_bytes() == 0
+            && (self.buffer.at_for(layout.offset, ReadApart::Texture).1)
+                .is_multiple_of(self.texel_bytes)
+            && (self.buffer.host_pages()).is_some_and(|pages| pages.dirty().is_some())
+    }
+
     pub(super) fn shadow_copies(
         &self,
         image: vk::Image,
@@ -1508,7 +1526,17 @@ impl Texels {
         storage: bool,
         range: BufferRange,
     ) -> Result<vk::BufferView, Error> {
-        let key = (format, storage, range.offset, range.range);
+        self.view_of(format, storage, (range.offset, range.range))
+    }
+
+    /// [`view`](Self::view) of `range` bytes from `offset` in the viewed `VkBuffer`.
+    pub(super) fn view_of(
+        &self,
+        format: Format,
+        storage: bool,
+        (offset, range): (u64, u64),
+    ) -> Result<vk::BufferView, Error> {
+        let key = (format, storage, offset, range);
         let mut views = lock(&self.views.views);
         if let Some(&view) = views.get(&key) {
             return Ok(view);
@@ -1526,8 +1554,8 @@ impl Texels {
         let mut info = vk::BufferViewCreateInfo::default()
             .buffer(buffer)
             .format(format.into())
-            .offset(range.offset)
-            .range(range.range);
+            .offset(offset)
+            .range(range);
         if let Some(named) = usage.named() {
             only = only.usage(named);
             info = info.push_next(&mut only);
@@ -1604,6 +1632,10 @@ impl Texels {
             // racing the GPU's use of them is the program's, as through `contents`.
             unsafe { std::ptr::copy_nonoverlapping(packed[from..].as_ptr(), target.add(at), n) };
         }
+        // A write of host pages a consumer logs is the runtime's own, which its log does not see:
+        // reported, so the copies of the pages take it (`dirty_pages.rs`).
+        let at = target as u64;
+        self.buffer.wrote_host(at..at + (end - start));
         self.buffer.upload(start..end)
     }
 

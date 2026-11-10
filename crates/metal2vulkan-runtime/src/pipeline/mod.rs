@@ -84,6 +84,9 @@ pub(super) use making::Pending;
 pub(super) use objects::ShaderModules;
 pub(super) use objects::{create_set_layout, set_needs, RawPipeline, VariantObjects};
 pub use options::{PipelineOption, PipelineOptions};
+/// The general form of a key (`render/residual.rs`), for `tests::general_form`.
+#[cfg(test)]
+pub(super) use render::general_form;
 /// The form a driver's facts choose, for the test that holds every committed profile to it
 /// (`tests::pipeline::every_committed_driver_reads_its_uniform_views_at_their_residuals`).
 #[cfg(test)]
@@ -392,7 +395,8 @@ impl Eq for ComputePipelineState {}
 static DIRECT_ARGUMENTS_FROM_AIR: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Count one fall back to the made descriptor's AIR ([`DIRECT_ARGUMENTS_FROM_AIR`]).
+/// Count one fall back to the made descriptor's AIR (`DIRECT_ARGUMENTS_FROM_AIR`, in the device
+/// tests' builds).
 fn note_direct_arguments_from_air() {
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     DIRECT_ARGUMENTS_FROM_AIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -408,7 +412,7 @@ pub(crate) fn direct_arguments_from_air() -> u64 {
 /// ([`ComputePipelineState::set_zero_choice`]): what a device test must read rather than derive
 /// from the device's answer, since a binding the device takes dynamically still stays static where
 /// the layout's dynamic-buffer budget is spent before it
-/// (`objects::dynamic_numbers`, `tests::dynamic_multi_variable`).
+/// (`objects::dynamic_numbers`).
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 pub(crate) struct SetZeroChoice {
     /// Its dispatches push set 0 rather than allocate and write one
@@ -420,10 +424,9 @@ pub(crate) struct SetZeroChoice {
     /// The set-0 bindings its entry point uses through more than one variable
     /// (`DescriptorBinding::variables`): those the device's answer governs.
     pub(crate) several_variables: Vec<u32>,
-    /// Its set-0 write-only store sinks (`SyntheticBinding::StoreSink`): the bindings whose
-    /// descriptor a command of its own region writes, so a dispatch binds its predecessor's set
-    /// again only where they are dynamic.
-    pub(crate) store_sinks: Vec<u32>,
+    /// Its set-0 bindings, by number, ascending: a dispatch whose bind offsets move from its
+    /// predecessor's binds that one's set again only where every binding it moves is dynamic.
+    pub(crate) bindings: Vec<u32>,
     /// The base variant was compiled under stand-ins for storage-texture formats, so dispatches
     /// run another variant and this choice is not theirs.
     pub(crate) stand_in: bool,
@@ -488,27 +491,6 @@ impl Kernel {
             }
         }
         inputs
-    }
-
-    /// `pipeline`, this descriptor's compile with its kernel or tile function compiled under
-    /// `inputs` ([`Kernel::inputs`]), held to the device's compiler word bound
-    /// (`fit_compute_pipeline`, `fit_tile_pipeline`): translated again from the function this
-    /// descriptor holds, with the exact forms dropped, where its module passes the bound.
-    fn fit(
-        &self,
-        compile: &metal2vulkan::device::Device,
-        inputs: &metal2vulkan::pipeline::LoweringInputs,
-        budget: &metal2vulkan::Budget,
-        pipeline: ComputePipeline,
-    ) -> Result<ComputePipeline, metal2vulkan::error::Error> {
-        match self {
-            Kernel::Compute(descriptor) => {
-                compile.fit_compute_pipeline(descriptor, inputs, budget, pipeline)
-            }
-            Kernel::Tile(descriptor) => {
-                compile.fit_tile_pipeline(descriptor, inputs, budget, pipeline)
-            }
-        }
     }
 }
 
@@ -669,16 +651,25 @@ impl ComputePipelineState {
         used: Option<&Used>,
         added_unsupported: usize,
     ) -> Result<ComputePipelineState, Error> {
+        let requested = descriptor;
         let mut descriptor = descriptor.clone();
         descriptor.kernel = crate::dynamic_library::stage_with_dependencies(&descriptor.kernel);
-        ComputePipelineState::of_kernel(
+        let state = ComputePipelineState::of_kernel(
             device,
             Kernel::Compute(descriptor),
             options,
             used,
             "new_compute_pipeline_state",
             added_unsupported,
-        )
+        )?;
+        // The creation's record, as the program asked for it (`warm/record.rs`); a binary
+        // archive's add makes none.
+        if used.is_none() {
+            device.record_pipeline(|| {
+                crate::warm::Pipeline::Compute(requested.clone(), added_unsupported)
+            });
+        }
+        Ok(state)
     }
 
     /// The state of `kernel`, a compute or tile descriptor, made on `device` under `options` in
@@ -761,17 +752,21 @@ impl ComputePipelineState {
         // sampler or texel slot's), made here, where the creation may wait, so that no dispatch's
         // encoding makes one (`neutral.rs`; `RenderPipelineState::make_neutrals`). One that fails
         // is left to the dispatch that binds it. And room kept in the memory the encodings place
-        // their own resources in (`Device::keep_room`).
-        if !crate::exit_guard::in_host_step() {
+        // their own resources in (`Device::keep_room`). A warm pass makes neither: they take
+        // memory and addresses, which the program's creation makes in its own order
+        // (`warm/pass.rs`).
+        if !crate::exit_guard::in_host_step() && !crate::warm::warming() {
             if let Ok(plan) = base.plan(device, &BindShape::default()) {
                 let _ = crate::binding::make_neutrals(device, &plan);
             }
             device.keep_room();
         }
         // Its first dispatch's predicted `VkPipeline`, made where Metal compiles
-        // (`dispatch_making.rs`). A stand-in compile is never dispatched.
+        // (`dispatch_making.rs`), a making the pool runs kept by the state's piece holds. A
+        // stand-in compile is never dispatched.
+        let pieces = piece_holds::PieceHolds::new();
         if let (Kernel::Compute(descriptor), false) = (&kernel, stand_in) {
-            base.make_at_creation(device, descriptor);
+            base.make_at_creation(device, descriptor, &pieces);
         }
         device.degrade_absent_reads(&base.shared_pipeline().dependencies, |_| {
             function.function.info().name.to_string()
@@ -788,21 +783,33 @@ impl ComputePipelineState {
                     .map_or(&[][..], |(_, samplers)| samplers.as_slice()),
             }],
         );
-        let identifier =
-            UniqueIdentifier::state(&device.shared().identifiers, StateKind::Compute, indirect)?;
+        // A warm pass's state takes no identifier and no ID (`warm/pass.rs`): both are numbered
+        // in the program's order, and its samplers took none above (`numbered.rs`).
+        let identifier = match crate::warm::warming() {
+            true => None,
+            false => Some(UniqueIdentifier::state(
+                &device.shared().identifiers,
+                StateKind::Compute,
+                indirect,
+            )?),
+        };
         let at_bind_views = AtBindViews::new(device, &base.shared_pipeline().interface);
         Ok(ComputePipelineState(Arc::new_cyclic(|state| {
             // The state holds its ID's slot, which lists it among the states an indirect
             // command's record can name (`indirect_states`).
-            let id = indirect.then(|| {
-                let id = IdHold::take(&device.shared().resource_ids, IdSpace::Pipeline, placement);
-                id.hold_state(
-                    Holder::Pipeline(Weak::clone(state)),
-                    StateKind::Compute,
-                    identifier.value(),
-                );
-                id
-            });
+            let id = match (&identifier, indirect) {
+                (Some(identifier), true) => {
+                    let ids = &device.shared().resource_ids;
+                    let id = IdHold::take(ids, IdSpace::Pipeline, placement);
+                    id.hold_state(
+                        Holder::Pipeline(Weak::clone(state)),
+                        StateKind::Compute,
+                        identifier.value(),
+                    );
+                    Some(id)
+                }
+                _ => None,
+            };
             let program = Program {
                 device: device.clone(),
                 function: function.clone(),
@@ -816,18 +823,44 @@ impl ComputePipelineState {
                 folded_refused: AtomicBool::new(false),
                 added_unsupported,
                 label: options.label.clone(),
-                pieces: piece_holds::PieceHolds::new(),
+                pieces,
                 at_bind_views,
                 planned: Mutex::new(None),
             };
             StateShared {
                 id,
-                identifier: Some(identifier),
+                identifier,
                 _samplers: samplers,
                 program: Arc::new(program),
             }
         })))
     }
+}
+
+/// Make on `device` what a creation of `pipeline`, a pipeline record's, makes: the same creation,
+/// on a warm pass's thread (`warm/pass.rs`), under the default options, its state let go at once.
+/// So its translations reach the shader cache and its `VkPipeline`s the driver's caches under the
+/// very keys and records the program's creation of the same descriptor asks for; what the program
+/// would see of it (an ID, an identifier, sampler numbers, notices, the kept variants' order, a
+/// neutral's memory) each of those paths leaves out on a warm pass's threads. `false` for a mesh
+/// render pipeline, which it does not make: that creation keeps no translation on disk and makes
+/// no `VkPipeline` (`GraphicsState::create_mesh`), so nothing of it outlives the state.
+pub(crate) fn warm(device: &Device, pipeline: &crate::warm::Pipeline) -> Result<bool, Error> {
+    use crate::warm::Pipeline;
+    let options = PipelineOptions::default();
+    match pipeline {
+        Pipeline::Compute(descriptor, added) => {
+            ComputePipelineState::create_adding(device, descriptor, &options, None, *added)?;
+        }
+        Pipeline::Render(descriptor, added) => {
+            GraphicsState::create_adding(device, descriptor, &options, None, *added)?;
+        }
+        Pipeline::Tile(descriptor, added) => {
+            TileState::create_adding(device, descriptor, &options, None, *added)?;
+        }
+        Pipeline::Mesh(_) => return Ok(false),
+    }
+    Ok(true)
 }
 
 /// The first name `linked` repeats where Metal's pipeline creation fails or was not measured: a
@@ -943,15 +976,7 @@ impl ComputePipelineState {
             pushes: objects.pushes_set_zero(),
             dynamic: objects.dynamic_bindings().to_vec(),
             several_variables: of(|b| b.variables > 1),
-            store_sinks: of(|b| {
-                matches!(
-                    b.source,
-                    metal2vulkan::pipeline::BindingSource::Synthetic {
-                        binding: metal2vulkan::pipeline::SyntheticBinding::StoreSink,
-                        ..
-                    }
-                )
-            }),
+            bindings: of(|_| true),
             stand_in: self.0.stand_in,
         }
     }
@@ -1581,9 +1606,8 @@ impl Variant {
     /// the variant of it the memo knows live, or the pipeline `sources` give, each stage found or
     /// compiled under one budget. The function compiles under the descriptor's stage input
     /// descriptor or color attachment formats ([`Kernel::inputs`]), and the pipeline under its
-    /// other fields, held to the device's compiler word bound from `descriptor`, which holds the
-    /// function ([`Kernel::fit`]); with `descriptor` holding the function as compiled. A refusal is
-    /// the compile layer's.
+    /// other fields; with `descriptor` holding the function as compiled. A refusal is the compile
+    /// layer's.
     ///
     /// The compile reads the kernel's specialized entry from the device's stage entries, as a
     /// render creation's stages do: a sibling pipeline of the same kernel at the same call-stack
@@ -1611,7 +1635,7 @@ impl Variant {
         let compiled =
             sources.function(function, &inputs, (&function_key, Some(entries)), &budget)?;
         let compiled = descriptor.with_stage(StageSource::Compiled(compiled));
-        let found = sources.kernel(&compiled, (descriptor, &inputs), &budget)?;
+        let found = sources.kernel(&compiled, &budget)?;
         Ok((found, compiled))
     }
 
@@ -1649,7 +1673,11 @@ impl Variant {
                 variant.pipelines.seed(region, made);
             }
         }
-        device.shared().shader_cache.memo.live_compute(&variant);
+        // A warm pass's variant is no state's the program holds: the memo does not hand it out
+        // (`warm/pass.rs`).
+        if !crate::warm::warming() {
+            device.shared().shader_cache.memo.live_compute(&variant);
+        }
         Ok(variant)
     }
 

@@ -9,31 +9,35 @@
 //! vertices through a vertex descriptor (`LAYOUT_FUNCTIONS`).
 
 use super::degrade_notices::{counts, on_device};
+use super::pixel_samplers::metal_sampler;
 use super::{
-    dynamic_input_assembly, layer_reported_nothing_at_all, validated_device_with, Messages,
-    ScratchCache, WAIT,
+    dynamic_input_assembly, layer_reported_nothing_at_all, pipelines_settled,
+    validated_device_with, Messages, ScratchCache, WAIT,
 };
 use crate::air_library::AirLibrary;
 use crate::gpu::TEST_DEVICE;
 use metal2vulkan::bind::SamplerDescriptor;
-use metal2vulkan::device::VkProperty;
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage, VertexFormat};
 use metal2vulkan::pipeline::{
-    ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource, VertexAttributeDescriptor,
-    VertexBufferLayoutDescriptor, VertexDescriptor,
+    ColorAttachmentDescriptor, PrecisionNote, RenderPipelineDescriptor, StageSource,
+    VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
+use metal2vulkan::Budget;
 use metal2vulkan_devtools::{llvm_assemble, llvm_assemble_text};
 use metal2vulkan_runtime::{
-    BlitOption, ClearColor, CommandBuffer, CommandBufferStatus, Device, Library, LoadAction,
-    Origin, PipelineOptions, Region, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
-    SamplerState, Size, StoreAction, Texture, TextureDescriptor, WorkCounts,
+    BlitOption, ClearColor, CommandBuffer, CommandBufferStatus, Degradation, Device, Library,
+    LoadAction, Origin, PipelineOptions, Region, RenderPassDescriptor, RenderPipelineState,
+    ResourceOptions, SamplerState, Size, StoreAction, Texture, TextureDescriptor, WorkCounts,
 };
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// The render target's side, and the color `colored_fragment` draws with its `RGBA8Unorm` bytes.
 const SIDE: u64 = 8;
 const DRAWN: [f32; 4] = [1.0, 0.2, 0.0, 1.0];
 const DRAWN_TEXEL: [u8; 4] = [255, 51, 0, 255];
+/// [`DRAWN`] as an `RGBA16Float` texel's bytes.
+const HALF_DRAWN: [u8; 8] = [0x00, 0x3c, 0x66, 0x32, 0x00, 0x00, 0x00, 0x3c];
 
 /// The owned fixture's library on `device`.
 fn library(device: &Device) -> Library {
@@ -49,12 +53,41 @@ fn state(device: &Device, fragment: &str) -> RenderPipelineState {
     state_with(device, fragment, |_| {})
 }
 
+/// The kinds of the precision notes [`state`]'s stages keep under some specialization only
+/// (`StageModule::specialized_notes`), as the device's compile layer compiles its descriptor.
+fn specialized_kinds(device: &Device, fragment: &str) -> BTreeSet<Degradation> {
+    let compiled = device
+        .compile_device()
+        .compile_render_pipeline(&descriptor(device, fragment, |_| {}), &Budget::standard())
+        .unwrap();
+    compiled
+        .stages
+        .iter()
+        .flat_map(|stage| &stage.specialized_notes)
+        .map(|s| Degradation::from_precision_note(s.note))
+        .collect()
+}
+
 /// [`state`], its target's attachment as `adjust` changes it.
 fn state_with(
     device: &Device,
     fragment: &str,
     adjust: impl FnOnce(&mut ColorAttachmentDescriptor),
 ) -> RenderPipelineState {
+    device
+        .new_render_pipeline_state(
+            &descriptor(device, fragment, adjust),
+            &PipelineOptions::default(),
+        )
+        .unwrap()
+}
+
+/// [`state_with`]'s descriptor.
+fn descriptor(
+    device: &Device,
+    fragment: &str,
+    adjust: impl FnOnce(&mut ColorAttachmentDescriptor),
+) -> RenderPipelineDescriptor {
     let library = library(device);
     let vertex = library.new_function_with_name("colored_vertex").unwrap();
     let fragment = library.new_function_with_name(fragment).unwrap();
@@ -64,9 +97,7 @@ fn state_with(
     let mut color = ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm);
     adjust(&mut color);
     descriptor.color_attachments[0] = Some(color);
-    device
-        .new_render_pipeline_state(&descriptor, &PipelineOptions::default())
-        .unwrap()
+    descriptor
 }
 
 /// The pipelines made, and those handed to the pool, since `before`.
@@ -268,44 +299,59 @@ fn a_state_s_first_draw_takes_the_pipeline_made_at_its_creation() {
 /// The specialized notices of a pipeline made at its state's creation wait for its first draw:
 /// the creation announces none of them, the first draw (which makes no pipeline) announces them,
 /// each once, and a second draw announces nothing more. The pipeline is the predicted one: a draw
-/// of `sampled_fragment` binding nothing (its sampler is the function's own), whose slot's unbound
-/// class names no measured family, so that its `half` conversion is noted. On a device that samples
-/// through Metal's own texture unit the slot's `half` conversion is Metal's: the pipeline holds no
-/// specialized notice, and its first draw announces none.
+/// of `sampled_fragment`, whose `half` sample's NaN is the device's decode where the format bound
+/// there may hold one (`PrecisionNote::DeviceNanEncoding`, a test of the bound format, which no
+/// pipeline's key carries). Each draw binds an `RGBA16Float` texture, which takes the pipeline
+/// made at creation (`a_draw_binding_a_texture_takes_the_pipeline_made_at_creation`); every kind
+/// the first draw announces is one the stage specializes ([`specialized_kinds`]). On a device that
+/// samples through Metal's own texture unit the creation makes the predicted key's general form,
+/// and hands the predicted key itself to the pool right after (`pipeline/render/residual.rs`):
+/// both counted once the pool settles, and neither announcing anything before a draw.
 #[test]
 fn a_pipeline_made_at_creation_announces_at_its_first_draw() {
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
     {
         let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |_| {}).unwrap();
-        let metal = device
-            .compile_device()
-            .profile()
-            .enabled()
-            .properties
-            .contains(&VkProperty::MetalSampler);
+        let nans = Degradation::from_precision_note(PrecisionNote::DeviceNanEncoding);
+        let waits = specialized_kinds(&device, "sampled_fragment");
+        assert!(
+            waits.contains(&nans),
+            "the stage's specialized notes: {waits:?}"
+        );
+        let wide = filled(&device, PixelFormat::RGBA16Float, &HALF_DRAWN);
         drop(messages.take_notices());
         let before = device.work_counts();
         let state = state(&device, "sampled_fragment");
+        pipelines_settled(&device);
+        let metal = metal_sampler(&device);
         assert_eq!(
             made_since(&device, &before),
-            (1, 0),
-            "the predicted key's pipeline, made at creation"
+            (1 + u64::from(metal), 0),
+            "the predicted key's pipeline, made at creation, and its general form where the \
+             device samples through Metal's texture unit ({metal})"
         );
         let at_creation = counts(&messages.take_notices());
         let created = device.work_counts();
-        draw(&device, &state, PrimitiveType::Triangle);
+        draw_with(&device, &state, PrimitiveType::Triangle, Some(&wide));
         assert_eq!(
             made_since(&device, &created),
             (0, 0),
             "the first draw found its pipeline made"
         );
         let at_draw = counts(&messages.take_notices());
-        assert_eq!(
-            at_draw.is_empty(),
-            metal,
+        assert!(
+            at_draw.contains_key(&nans),
             "the first draw announced the pipeline's notices: {at_draw:?} (creation: \
              {at_creation:?})"
+        );
+        let unspecialized: Vec<_> = at_draw
+            .keys()
+            .filter(|kind| !waits.contains(kind))
+            .collect();
+        assert!(
+            unspecialized.is_empty(),
+            "the first draw announced what no specialization keeps: {unspecialized:?}"
         );
         let early: Vec<_> = at_draw
             .keys()
@@ -316,7 +362,7 @@ fn a_pipeline_made_at_creation_announces_at_its_first_draw() {
             at_draw.values().all(|&n| n == 1),
             "announced more than once: {at_draw:?}"
         );
-        draw(&device, &state, PrimitiveType::Triangle);
+        draw_with(&device, &state, PrimitiveType::Triangle, Some(&wide));
         assert_eq!(
             counts(&messages.take_notices()),
             Default::default(),
@@ -330,13 +376,23 @@ fn a_pipeline_made_at_creation_announces_at_its_first_draw() {
 /// draw binds. A draw of `sampled_fragment` binding nothing takes the pipeline made at creation,
 /// and so do draws binding an `RGBA8Unorm` or an `RGBA16Float` texture, each sampling its texels:
 /// the class of the format the slot binds reaches the function as a push field, not as the
-/// pipeline's specialization.
+/// pipeline's specialization. On a device that samples through Metal's own texture unit the
+/// creation makes the predicted key's general form too (`pipeline/render/residual.rs`), and the
+/// predicted key, made on the pool right after, is the one these draws take once the pool settles:
+/// each class is plain and measured, as the unbound slot the prediction binds.
 #[test]
 fn a_draw_binding_a_texture_takes_the_pipeline_made_at_creation() {
     on_device(|device, _| {
+        let metal = metal_sampler(device);
         let before = device.work_counts();
         let state = state(device, "sampled_fragment");
-        assert_eq!(made_since(device, &before), (1, 0), "made at creation");
+        pipelines_settled(device);
+        assert_eq!(
+            made_since(device, &before),
+            (1 + u64::from(metal), 0),
+            "made at creation, with the general form where the device samples through Metal's \
+             texture unit ({metal})"
+        );
         let created = device.work_counts();
         draw(device, &state, PrimitiveType::Triangle);
         assert_eq!(
@@ -350,12 +406,7 @@ fn a_draw_binding_a_texture_takes_the_pipeline_made_at_creation() {
             draw_with(device, &state, PrimitiveType::Triangle, Some(&source)),
             DRAWN_TEXEL
         );
-        // 1.0, 0.2, 0.0 and 1.0 as half floats.
-        let half: Vec<u8> = [0x3c00u16, 0x3266, 0x0000, 0x3c00]
-            .iter()
-            .flat_map(|h| h.to_le_bytes())
-            .collect();
-        let wide = filled(device, PixelFormat::RGBA16Float, &half);
+        let wide = filled(device, PixelFormat::RGBA16Float, &HALF_DRAWN);
         assert_eq!(
             draw_with(device, &state, PrimitiveType::Triangle, Some(&wide)),
             DRAWN_TEXEL
@@ -370,6 +421,92 @@ fn a_draw_binding_a_texture_takes_the_pipeline_made_at_creation() {
             after.creation_pipelines_drawn - before.creation_pipelines_drawn,
             1,
             "the pipeline made at creation drew"
+        );
+        assert_eq!(
+            after.residual_form_draws, before.residual_form_draws,
+            "no draw took the general form"
+        );
+    });
+}
+
+/// A `BC4RUnorm` texture of `side` texels square, every block of it `block`'s 8 bytes.
+fn bc4_filled(device: &Device, side: u64, block: [u8; 8]) -> Texture {
+    let mut descriptor = TextureDescriptor::texture_2d(PixelFormat::BC4RUnorm, side, side, false);
+    descriptor.usage = TextureUsage::SHADER_READ;
+    descriptor.resource_options = ResourceOptions::shared();
+    let texture = device.new_texture(&descriptor).unwrap();
+    let blocks = side / 4;
+    let bytes = block.repeat((blocks * blocks) as usize);
+    texture
+        .replace_region(
+            Region::new_2d(0, 0, side, side),
+            0,
+            0,
+            &bytes,
+            8 * blocks,
+            0,
+        )
+        .unwrap();
+    texture
+}
+
+/// A draw binding a texture of a class whose `half` conversion is not measured, a `BC4RUnorm` one,
+/// draws at once with the pipeline its state's creation made. On a device that samples through
+/// Metal's own texture unit the class keys apart from the prediction (`SpecKey::UnmeasuredTexels`
+/// 1, where the unbound slot the prediction binds has 0), so the draw takes its key's general form,
+/// the one the creation made (`pipeline/render/residual.rs`), and hands its own key's making to
+/// the pool, which nothing waits for; once made, a second draw takes it. Elsewhere the class is a
+/// push field alone, and both draws take the predicted key. Each draws the blocks' red, 1.
+#[test]
+fn a_draw_of_an_unmeasured_class_takes_the_general_form_its_creation_made() {
+    on_device(|device, _| {
+        let metal = metal_sampler(device);
+        let before = device.work_counts();
+        let state = state(device, "sampled_fragment");
+        let created = pipelines_settled(device);
+        assert_eq!(
+            made_since(device, &before),
+            (1 + u64::from(metal), 0),
+            "made at creation, with the general form where the device samples through Metal's \
+             texture unit ({metal})"
+        );
+        // Both endpoints 255, every index 0: red 1, and Metal's green 0, blue 0 and alpha 1.
+        let red = bc4_filled(device, SIDE, [0xff, 0xff, 0, 0, 0, 0, 0, 0]);
+        const RED: [u8; 4] = [255, 0, 0, 255];
+        assert_eq!(
+            draw_with(device, &state, PrimitiveType::Triangle, Some(&red)),
+            RED
+        );
+        let drawn = pipelines_settled(device);
+        let metal_count = u64::from(metal);
+        assert_eq!(
+            (
+                drawn.residual_form_draws - created.residual_form_draws,
+                drawn.residual_form_makings - created.residual_form_makings,
+                drawn.creation_pipelines_drawn - created.creation_pipelines_drawn,
+            ),
+            (metal_count, metal_count, 1),
+            "the draw took the general form, made at creation, and began its own key's making \
+             where the device samples through Metal's texture unit ({metal}); elsewhere the \
+             predicted key"
+        );
+        assert_eq!(
+            made_since(device, &created),
+            (metal_count, metal_count),
+            "its own key, made on the pool while the draw went on, where the class keys apart"
+        );
+        assert_eq!(
+            draw_with(device, &state, PrimitiveType::Triangle, Some(&red)),
+            RED
+        );
+        let again = device.work_counts();
+        assert_eq!(
+            (
+                again.residual_form_draws - drawn.residual_form_draws,
+                made_since(device, &drawn),
+            ),
+            (0, (0, 0)),
+            "the second draw took its own key, made"
         );
     });
 }

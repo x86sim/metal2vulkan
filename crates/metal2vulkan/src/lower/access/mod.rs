@@ -112,7 +112,6 @@ pub mod pointer;
 mod psb;
 pub mod pulled;
 pub(crate) mod root_sets;
-pub mod sink;
 pub mod table;
 pub mod tile;
 pub(crate) mod tile_memory;
@@ -141,7 +140,7 @@ use crate::pipeline::facts::{RuntimeFact, UniformViewChoice};
 use crate::pipeline::interface::{
     AccessSet, BufferForm, DescriptorView, PushLoc, PushPlacement, Window,
 };
-use crate::pipeline::sym::{PushField, SlotClass, SlotRef, SpecKey};
+use crate::pipeline::sym::{PushField, SlotRef};
 use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
 use crate::spirv::error::BResult;
 use crate::spirv::ids::{DemoteTy, TypeId, Value as SValue};
@@ -321,20 +320,10 @@ impl Access {
             Some(_) => leaf_words(&self.leaf).saturating_add(96),
             None => 0,
         };
-        // A store's dropped-store guard, per target. Charged for a load too: a memory
-        // intrinsic's endpoint and a stored pointer carry no `value` here, so the access cannot
-        // tell a store from a load, and the estimate must bound what emission writes.
-        let guard = DROPPED_STORE_GUARD_WORDS.saturating_mul(self.targets.len() as u32);
         per.saturating_add(blob)
-            .saturating_add(guard)
             .saturating_add(16u32.saturating_mul(self.targets.len() as u32 + 2))
     }
 }
-
-/// SPIR-V words of one store's dropped-store guard: the stage's `SpecKey::DroppedStoreSlots`
-/// word read from its push field or the argument table, the bit test, and the selection the store
-/// runs in (`emit::store_one`).
-const DROPPED_STORE_GUARD_WORDS: u32 = 64;
 
 fn leaf_words(l: &Leaf) -> u32 {
     l.cost()
@@ -705,6 +694,9 @@ pub struct AccessPlan {
     /// Device-address accesses are contained (robust buffer access does not cover them, so only
     /// `Containment::UnsafeOff` turns this off).
     pub psb_contained: bool,
+    /// The narrow units device-address accesses load and store directly (`psb::narrow_units` of
+    /// the profile): a sub-word store there is one narrow store instead of two word atomics.
+    pub psb_units: Units,
     /// The arenas the function uses.
     pub local: local::LocalPlan,
     /// The function's index extensions ([`index`]): planned before any instruction is selected
@@ -782,13 +774,7 @@ pub struct AccessPlan {
     /// the ids as this states, and the heap's function-table array, or, on a device without the
     /// array's features, the stage's function-table snapshot, one more again.
     pub function_tables: Option<function_table::TableReads>,
-    /// A heap depth comparison the shader makes reads its texture's depth class
-    /// (`lower::sampler::compared`): the handle-table search carries the depth flags
-    /// (`memory::handles::Lookup::Flagged`), so every heap handle carries its entry's depth flags
-    /// beside its element.
-    pub heap_depth: bool,
-    /// A heap texture's linear sample the function emulates reads its texel class
-    /// (`lower::sampler::linear`): the handle-table search carries the class's index
+    /// A heap texture's access reads its texel class: the handle-table search carries the class's index
     /// (`memory::handles::Lookup::Flagged`), so every heap handle carries it beside its element.
     pub heap_class: bool,
     /// A heap texture's float write the function makes tests its texel class's index
@@ -802,14 +788,6 @@ pub struct AccessPlan {
     /// (`SyntheticBinding::ExecutionStatus`), one more storage descriptor, on a device that does
     /// not address buffers, and why ([`absent::StatusBinding`]).
     pub status_binding: Option<absent::StatusBinding>,
-    /// The memory-plan slot indices a guarded store goes through: a guest buffer slot of the
-    /// stage's argument table with a bit of the draw's or dispatch's `SpecKey::DroppedStoreSlots`
-    /// word ([`request_dropped_store_word`]).
-    pub dropped_store_slots: BTreeSet<usize>,
-    /// The stage binds its write-only store sink (`SyntheticBinding::StoreSink`), one more
-    /// storage descriptor, so a dropped store through a descriptor view selects a pointer into it
-    /// rather than branching ([`sink`]).
-    pub store_sink: Option<sink::SinkPlan>,
 }
 
 impl AccessPlan {
@@ -820,10 +798,9 @@ impl AccessPlan {
 
     /// What the function's handle-table search yields.
     pub fn lookup(&self) -> crate::memory::handles::Lookup {
-        if self.heap_alpha || self.heap_depth || self.carries_class() {
+        if self.heap_alpha || self.carries_class() {
             crate::memory::handles::Lookup::Flagged {
                 alpha: self.heap_alpha,
-                depth: self.heap_depth,
                 class: self.carries_class(),
             }
         } else {
@@ -865,8 +842,6 @@ pub struct Declared {
     /// The stage's view of the command buffer's `ExecutionStatus` buffer, where it binds the
     /// buffer ([`absent::declare`]).
     pub status: Option<View>,
-    /// The stage's write-only store sink, where it binds one ([`sink::declare`]).
-    pub store_sink: Option<sink::SinkViews>,
     /// The `RangeAtBindOffset` specialization of each slot read through a uniform view, by
     /// memory-plan slot index: where it holds, an access reads the view at the Metal offset alone
     /// ([`range_at_bind_offset`]).
@@ -1534,6 +1509,7 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
     cx.families.access.pulled = sourced;
     cx.families.access.slots = lowering;
     cx.families.access.psb_contained = p.fields().containment != Containment::UnsafeOff;
+    cx.families.access.psb_units = psb::narrow_units(p);
     Ok(slots)
 }
 
@@ -1764,7 +1740,6 @@ pub fn declare(
         tile: tile::declare(mb, &plan.families.access)?,
         function_tables: function_table::declare(mb, plan)?,
         status: absent::declare(mb, plan.stage, &plan.families.access)?,
-        store_sink: sink::declare(mb, plan.stage, &plan.families.access)?,
         ..Declared::default()
     };
     for (i, s) in plan.slots.iter().enumerate() {
@@ -2011,10 +1986,8 @@ fn blob_roots(
 }
 
 /// Give each of `targets` the profile's containment check and read its slot's `SlotBindOffset`;
-/// a written target is a storage view. A written target also reads the draw's or dispatch's
-/// `SpecKey::DroppedStoreSlots` word, which gates every store through the slot
-/// (`emit::writable`), so only a function that stores through a buffer slot reads it. Every
-/// static-root access places its targets here ([`access_with_leaf`], `copy::endpoint`).
+/// a written target is a storage view. Every static-root access places its targets here
+/// ([`access_with_leaf`], `copy::endpoint`).
 fn place_targets(cx: &mut SelectCx<'_>, targets: &mut [Target], write: bool) -> Result<(), Error> {
     let check = contain::encoding(cx.profile);
     for t in targets {
@@ -2027,36 +2000,9 @@ fn place_targets(cx: &mut SelectCx<'_>, targets: &mut [Target], write: bool) -> 
         if write && view_kind(cx.profile, plan) != ViewKind::Storage {
             return Err(cx.invariant("a write through a uniform view"));
         }
-        let slot = plan.slot;
-        cx.push.insert(PushField::SlotBindOffset(slot));
-        if write {
-            request_dropped_store_word(cx, t.slot, slot);
-        }
+        cx.push.insert(PushField::SlotBindOffset(plan.slot));
     }
     Ok(())
-}
-
-/// Read the stage's `SpecKey::DroppedStoreSlots` word where a store through `slot`, memory-plan
-/// slot `at`, is gated on it: a guest buffer slot of the stage's argument table, the only slot a
-/// caller's memory is bound to (`emit::writable` reads the same predicate, so every selection that
-/// emits a store through a static root asks here). A synthetic binding the runtime owns has no bit
-/// of the word and no guard.
-///
-/// The slot is recorded in [`AccessPlan::dropped_store_slots`], from which [`sink::finish`] reads
-/// which of the gated stores go through a descriptor view and so need the stage's write-only sink
-/// to select a place in, and the sink's descriptor is reserved here so the forms are chosen with
-/// it ([`sink::reserve`]).
-pub(super) fn request_dropped_store_word(cx: &mut SelectCx<'_>, at: usize, slot: SlotRef) {
-    if slot.class == SlotClass::Buffer && slot.index < u32::BITS {
-        cx.push
-            .insert(PushField::Specialized(SpecKey::DroppedStoreSlots(
-                slot.stage,
-            )));
-        // Before the first such slot is recorded: the sink's descriptor is counted once, and
-        // ahead of the per-stage descriptor fallbacks that choose the slots' forms.
-        sink::reserve(cx);
-        cx.families.access.dropped_store_slots.insert(at);
-    }
 }
 
 /// Give each slot of `targets` the unit views that read or write `leaf` (a store when `write`)

@@ -33,14 +33,14 @@ fn shape(ty: TextureType, pf: PixelFormat, samples: u32, usage: TextureUsage) ->
     TextureShape::Texture {
         address_modes: crate::metal::sampler::AddressModeMap::IDENTITY,
         offset_base_axes: 0,
-        own_format_views: false,
+        ycbcr_in_place: false,
+        ycbcr_planes_sampler: None,
         texture_type: ty,
         pixel_format: pf,
         sample_count: samples,
         usage,
         mipmap_level_count: 1,
         sparse: false,
-        depth_twin: false,
         swizzle: crate::metal::TextureSwizzleChannels::DEFAULT,
     }
 }
@@ -55,9 +55,9 @@ const READ: TextureUsage = TextureUsage::SHADER_READ;
 const WRITE: TextureUsage = TextureUsage::SHADER_WRITE;
 
 /// On every committed profile the heap classes are distinct and sorted, every image class has
-/// a neutral of exactly its type (an empty heap element can be written), the eight sampler
-/// classes (one per use: comparison, integer texel, and a cube's explicit gradients) close the
-/// list, and cube arrays and multisampled storage images follow the profile.
+/// a neutral of exactly its type (an empty heap element can be written), the four sampler
+/// classes (one per use: comparison and integer texel) close the list, and cube arrays and
+/// multisampled storage images follow the profile.
 #[test]
 fn heap_classes_are_the_declarable_images_and_every_sampler_use() {
     for (stem, p) in committed_profiles().expect("profiles") {
@@ -65,19 +65,10 @@ fn heap_classes_are_the_declarable_images_and_every_sampler_use() {
         assert!(classes.windows(2).all(|w| w[0] < w[1]), "{stem}");
         for compare in [false, true] {
             for integer in [false, true] {
-                for cube_gradient in [false, true] {
-                    let class = HandleClass::Sampler {
-                        compare,
-                        integer,
-                        cube_gradient,
-                    };
-                    assert!(classes.contains(&class));
-                    assert_eq!(
-                        class.sampler_use(),
-                        Some(SamplerUse::new(compare, integer).with_cube_gradient(cube_gradient))
-                    );
-                    assert_eq!(class.sampler_use().map(HandleClass::sampler), Some(class));
-                }
+                let class = HandleClass::Sampler { compare, integer };
+                assert!(classes.contains(&class));
+                assert_eq!(class.sampler_use(), Some(SamplerUse::new(compare, integer)));
+                assert_eq!(class.sampler_use().map(HandleClass::sampler), Some(class));
             }
         }
         let images = &p.fields().images;
@@ -97,7 +88,7 @@ fn heap_classes_are_the_declarable_images_and_every_sampler_use() {
                 assert!(images.storage_multisample, "{stem}: {i:?}");
             }
         }
-        let n_images = classes.len() - 8;
+        let n_images = classes.len() - 4;
         assert_eq!(n_images, image_classes(&p).len(), "{stem}: duplicates");
     }
 }
@@ -731,7 +722,6 @@ fn a_storage_write_makes_every_write_of_its_slot_general() {
         layout,
         components: vk::ComponentMapping::IDENTITY,
         level: None,
-        twin: false,
         shader_swizzle: false,
     };
     let sampled = HandleClass::Image(class(
@@ -911,7 +901,6 @@ fn sampler_tables_relist_states_of_the_plans_shapes() {
             classes: vec![HandleClass::Sampler {
                 compare: false,
                 integer: false,
-                cube_gradient: false,
             }],
             cubic: true,
             opaque_black: false,
@@ -1014,7 +1003,6 @@ fn a_late_cubic_sampler_is_listed_with_its_cubic_bit_beside_tested_stages() {
             classes: vec![HandleClass::Sampler {
                 compare: false,
                 integer: false,
-                cube_gradient: false,
             }],
             cubic: tested,
             opaque_black: false,
@@ -1094,10 +1082,9 @@ fn sampler_tables_admit_the_shapes_the_plan_s_checks_pass() {
         },
         ..ResourceTemplate::default()
     };
-    let class = |cube_gradient: bool| HandleClass::Sampler {
+    let class = HandleClass::Sampler {
         compare: false,
         integer: false,
-        cube_gradient,
     };
     let held_on =
         |profile: &DeviceProfile, template: &ResourceTemplate, late: SamplerDescriptor| -> bool {
@@ -1138,17 +1125,11 @@ fn sampler_tables_admit_the_shapes_the_plan_s_checks_pass() {
     };
     assert!(anisotropic.shape().anisotropic);
     assert!(black.shape().opaque_black_border);
-    let sampled = template(vec![class(false)], false);
+    let sampled = template(vec![class], false);
     assert!(!held(&sampled, lod), "invalid LOD clamps");
-    assert!(
-        held(&sampled, anisotropic),
-        "anisotropic, no cube gradients"
-    );
+    assert!(held(&sampled, anisotropic), "anisotropic");
     assert!(!held(&sampled, black), "members unchecked for the border");
-    let gradients = template(vec![class(false), class(true)], false);
-    assert!(held(&gradients, anisotropic), "beside a cube's gradients");
-    // Without `samplerAnisotropy` the plan's check refuses an anisotropic state for a use without
-    // a cube's gradients and passes it for one with them, whose sampler it makes isotropic.
+    // Without `samplerAnisotropy` the plan's check refuses an anisotropic state.
     assert!(
         !floor
             .fields()
@@ -1161,16 +1142,7 @@ fn sampler_tables_admit_the_shapes_the_plan_s_checks_pass() {
         !held_on(&floor, &sampled, anisotropic),
         "anisotropic without samplerAnisotropy"
     );
-    assert!(
-        !held_on(&floor, &gradients, anisotropic),
-        "anisotropic beside a use without the gradients, without samplerAnisotropy"
-    );
-    let cube_only = template(vec![class(true)], false);
-    assert!(
-        held_on(&floor, &cube_only, anisotropic),
-        "a cube's gradients alone, without samplerAnisotropy"
-    );
-    let checked = template(vec![class(false)], true);
+    let checked = template(vec![class], true);
     assert!(held(&checked, black), "members checked for the border");
     let naming = template(Vec::new(), false);
     for late in [lod, anisotropic, black] {
@@ -1257,7 +1229,7 @@ fn a_form_a_heap_reads_is_held_raw_in_the_unsigned_class() {
             assert_eq!(fit(&s, &u2d), Fit::Holds, "{pf:?}");
             assert_eq!(fit(&s, &i2d), Fit::NumericType, "{pf:?}");
             let facts = TextureFacts::new(TextureType::Type2D, pf);
-            let mut slot = crate::bind::plan::resources::sampled_view(p, pf, &u2d, false)
+            let mut slot = crate::bind::plan::resources::sampled_view(p, pf, &u2d)
                 .unwrap_or_else(|e| panic!("{stem} {pf:?}: {e}"));
             slot.layout = layout;
             assert_eq!(
@@ -1452,89 +1424,4 @@ fn a_heap_member_a_mode_two_write_would_round_is_refused() {
         }
     }
     assert!(checked > 0, "no profile holds a format the check refuses");
-}
-
-/// On a profile where a heap write stores half-float members' bits through the unsigned integer
-/// twin (`metal::format::heap_half_bits`), the twin class is a heap class and holds exactly the
-/// writable, unswizzled `R16Float`, `RG16Float` and `RGBA16Float` textures whose image takes
-/// views in other formats, each through its unsigned integer alias; one whose image takes no
-/// other view carries its class's own-view index, the neutral in the twin, and is a texture a
-/// heap write converts (`heap_write_nans_converted`), as a packed small float is for a `half`
-/// write. Elsewhere no twin class exists.
-#[test]
-fn a_half_float_member_is_held_through_its_alias_in_the_unsigned_twin() {
-    use crate::metal::texel_format::{heap_class_index, heap_own_view_index, HALF_BITS_FORMATS};
-    use crate::metal::TextureSwizzleChannels as Swizzle;
-    let mut twins = 0;
-    for (stem, p) in &committed_profiles().expect("profiles") {
-        let twin = ImageHandleClass {
-            format: StorageFormatClass::HalfBits,
-            ..class(
-                ImageDim::D2,
-                false,
-                false,
-                SampledType::Uint,
-                ImageAccess::Storage,
-            )
-        };
-        let declared = heap_classes(p).contains(&HandleClass::Image(twin));
-        assert_eq!(declared, crate::metal::format::heap_half_bits(p), "{stem}");
-        if !declared {
-            continue;
-        }
-        twins += 1;
-        let layout = vk::ImageLayout::GENERAL;
-        let element = |facts: &TextureFacts| {
-            heap_element(p, &HandleClass::Image(twin), facts, layout).expect("an element")
-        };
-        let facts = |pf: PixelFormat, usage: TextureUsage, own: bool| {
-            let mut f = TextureFacts::new(TextureType::Type2D, pf);
-            f.usage = usage;
-            f.own_format_views = own;
-            f
-        };
-        let aliases = [
-            vk::Format::R16_UINT,
-            vk::Format::R16G16_UINT,
-            vk::Format::R16G16B16A16_UINT,
-        ];
-        for (&pf, alias) in HALF_BITS_FORMATS.iter().zip(aliases) {
-            let held = facts(pf, WRITE, false);
-            match element(&held) {
-                HeapElement::View(v) => assert_eq!(v.format, alias, "{stem} {pf:?}"),
-                other => panic!("{stem} {pf:?}: {other:?}"),
-            }
-            let flags = handle_entry_flags(&held) >> FLAG_TEXEL_CLASS.trailing_zeros();
-            let own = heap_class_index(pf, Swizzle::DEFAULT);
-            assert_eq!(flags, own, "{stem} {pf:?}");
-            assert!(!heap_write_nans_converted(&held, true), "{stem} {pf:?}");
-            // An image of its own format's views alone: the float class's, announced.
-            let wrapped = facts(pf, WRITE, true);
-            assert_eq!(element(&wrapped), HeapElement::Neutral, "{stem} {pf:?}");
-            let flags = handle_entry_flags(&wrapped) >> FLAG_TEXEL_CLASS.trailing_zeros();
-            assert_eq!(
-                Some(flags),
-                heap_own_view_index(pf, Swizzle::DEFAULT),
-                "{stem} {pf:?}"
-            );
-            assert!(heap_write_nans_converted(&wrapped, false), "{stem} {pf:?}");
-            // Not writable: no storage member, nothing converted.
-            let read = facts(pf, READ, false);
-            assert_eq!(element(&read), HeapElement::Neutral, "{stem} {pf:?}");
-            assert!(!heap_write_nans_converted(&read, true), "{stem} {pf:?}");
-        }
-        for pf in [
-            PixelFormat::RGBX16Float,
-            PixelFormat::RGBA32Float,
-            PixelFormat::RGBA16Uint,
-            PixelFormat::RG11B10Float,
-        ] {
-            let f = facts(pf, WRITE, false);
-            assert_eq!(element(&f), HeapElement::Neutral, "{stem} {pf:?}");
-            let small = pf == PixelFormat::RG11B10Float;
-            assert!(!heap_write_nans_converted(&f, false), "{stem} {pf:?}");
-            assert_eq!(heap_write_nans_converted(&f, true), small, "{stem} {pf:?}");
-        }
-    }
-    assert!(twins > 0, "no committed profile takes the twin");
 }

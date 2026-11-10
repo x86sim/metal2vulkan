@@ -29,8 +29,10 @@ pub(super) mod properties;
 pub(crate) mod relay;
 mod staging;
 pub(super) mod submit;
+pub(crate) mod submit_stalls;
 
 pub use adopt::RawDevice;
+pub(crate) use compiles::holding;
 pub use create::{
     DebugMessage, DeviceOptions, LayerSetting, LayerSettingValue, MessageKind, MessageSeverity,
     MessageSink,
@@ -57,7 +59,7 @@ use super::function_table::TableShared;
 use super::generated_commands::Commands;
 use super::gpu_pools::GpuPools;
 use super::gpu_time::{self, FromHost, Timing};
-use super::heap_sets::{DeviceHeaps, NanResidue};
+use super::heap_sets::DeviceHeaps;
 use super::host_memory::Importer;
 use super::interop::Interop;
 use super::loader_word::LoaderWord;
@@ -67,7 +69,7 @@ use super::mipmap_scratch::MipmapScratch;
 use super::owned_kernel::OwnedKernels;
 use super::recycle::{self, BufferMaking, Recycler};
 use super::released_programs::Keepers;
-use super::render_state::{depth_bias_command, DepthBiasCommand, DepthRanges};
+use super::render_state::DepthRanges;
 use super::render_target::KeptRenderPasses;
 use super::resource_ids::{ResourceIds, SamplerIdReads};
 use super::sample_planes::PlanesObjects;
@@ -81,7 +83,7 @@ use super::stencil_copy::StencilCopyObjects;
 use super::texture::TextureState;
 use super::unique_identifier::UniqueIdentifiers;
 use crate::image_barrier::MemoryReads;
-use crate::recorder::{Command, MeshDraws, Recorder, RecorderShared, Slot};
+use crate::recorder::{Command, MeshDraws, Slot};
 use crate::release;
 use ash::vk::{self, Handle};
 use functions::{Functions, Vk};
@@ -98,6 +100,17 @@ use submit::{Internal, OwnTimeline};
 /// A Metal device (`MTLDevice`) on a Vulkan device. Cheap to clone (a retain); `Send + Sync`.
 #[derive(Clone)]
 pub struct Device(Arc<DeviceShared>);
+
+/// A handle on a device that does not keep it ([`Device::downgrade`]).
+#[derive(Clone)]
+pub(crate) struct WeakDevice(Weak<DeviceShared>);
+
+impl WeakDevice {
+    /// The device, while it lives.
+    pub(crate) fn upgrade(&self) -> Option<Device> {
+        self.0.upgrade().map(Device)
+    }
+}
 
 impl std::fmt::Debug for Device {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -179,8 +192,9 @@ pub(super) struct DeviceShared {
     /// The primary queue family: its first queue's, where internal submissions go.
     pub(super) queue_family: u32,
     /// The `VkQueue`s the runtime submits to, the primary family's first queue first: at least
-    /// one.
-    pub(super) queues: Vec<QueueSlot>,
+    /// one. Shared with the scheduler's thread where it takes the driver's stalls idle
+    /// (`submit_stalls.rs`).
+    pub(super) queues: Arc<[QueueSlot]>,
     /// The families of those queues, the primary first, each once: what the device's buffers and
     /// images are shared among (`sharing.rs`).
     pub(super) queue_families: Vec<u32>,
@@ -250,9 +264,6 @@ pub(super) struct DeviceShared {
     /// The heap sets and the texture table every command buffer shares (`heap_sets.rs`). Its
     /// lock is taken before `resource_ids`', never under it.
     pub(super) heaps: Mutex<DeviceHeaps>,
-    /// The live textures the heap holds whose NaN a heap write of a half-float twin's function
-    /// converts (`heap_sets::NanResidue`), read at draws and dispatches without `heaps`.
-    pub(super) heap_nan_residue: NanResidue,
     /// The live visible-function tables, by resource ID: an argument buffer can name each, for
     /// a dispatch of the state that made it (`function_table.rs`).
     pub(super) function_tables: Mutex<BTreeMap<u64, Weak<TableShared>>>,
@@ -297,6 +308,9 @@ pub(super) struct DeviceShared {
     pub(super) textures: super::texture::TextureState,
     /// The translated-shader cache on disk and the driver's pipeline cache.
     pub(super) shader_cache: ShaderCache,
+    /// Its check of the first move of an image over host pages, per class of pages, and its
+    /// verdicts (`in_place.rs`).
+    pub(crate) in_place: crate::in_place::InPlaceChecks,
     /// How no-copy buffers import host memory, or why they are refused.
     pub(super) host_import: Result<Importer, metal2vulkan::error::Unsupported>,
     /// Whether the device imports a pointer to shared memory, once asked
@@ -308,9 +322,6 @@ pub(super) struct DeviceShared {
     /// The command that binds an index buffer range of a size, where the device enabled
     /// `maintenance5` (`draw_source.rs`).
     pub(super) sized_index_bind: Option<SizedIndexBind>,
-    /// The command that records a depth bias of a pinned unit, where the device enabled
-    /// `VK_EXT_depth_bias_control` (`render_state.rs`).
-    pub(super) depth_bias_command: Option<DepthBiasCommand>,
     /// The mesh draw commands, where the device enabled `meshShader` (`render/mesh.rs`).
     pub(super) mesh_draws: Option<MeshDraws>,
     /// `vkCmdPushDescriptorSet`, from Vulkan 1.4 or `VK_KHR_push_descriptor`
@@ -325,11 +336,9 @@ pub(super) struct DeviceShared {
     /// draw that reads its own pass's texture through a snapshot takes (`render/snapshot.rs`).
     pub(super) color_write_masks: Option<ColorWriteMasks>,
     /// The device's slot among those its commands go through (`recorder`), where it took one:
-    /// let go of after `vkDestroyDevice` (it drops after the teardown, `Drop`). Held, not read.
-    _recording: Option<Slot>,
-    /// The thread that replays its encoders' deferred command buffers, where it has a slot
-    /// (`recorder`).
-    recorder: Option<Recorder>,
+    /// let go of after `vkDestroyDevice` (it drops after the teardown, `Drop`). Its counts are
+    /// `WorkCounts::commands_recorded`.
+    recording: Option<Slot>,
     /// The reasons a draw that reads its pass's texture took the split that the device said
     /// already, where `METAL2VULKAN_LOG_PIPELINES` is set (`render/snapshot.rs`).
     pub(super) snapshot_fallbacks: Mutex<Vec<&'static str>>,
@@ -375,6 +384,8 @@ pub(super) struct DeviceShared {
     /// The crate-owned compute kernels the runtime dispatches for itself, made on first use
     /// (`owned_kernel.rs`).
     pub(super) owned_kernels: Mutex<OwnedKernels>,
+    /// The two-plane YCbCr formats the device converts itself (`ycbcr_device.rs`).
+    pub(super) ycbcr_formats: crate::ycbcr_device::YCbCrFormats,
     /// The spare scratch block of `generate_mipmaps`' filter chains (`mipmap_scratch.rs`).
     pub(super) mipmap_scratch: Mutex<MipmapScratch>,
     /// The sample planes' copy kernels and merge pipelines, made on first use
@@ -421,6 +432,18 @@ pub(super) struct DeviceShared {
     pub(super) rebinds: super::rebind::Rebinds,
     /// The no-copy buffers by the host memory they were made over (`host_aliases.rs`).
     pub(super) aliases: super::host_aliases::HostAliases,
+    /// The guest RAMs it uses, and their chunks it imported (`host_ram.rs`).
+    pub(crate) host_ram: super::host_ram::RamSource,
+    /// Its copied host buffers, compared at each commit and each batch's completion
+    /// (`copied.rs`).
+    pub(crate) copied: Arc<super::copied::CopiedBuffers>,
+    /// How many of the next imports of host pages by their pointer fail as the driver's out of
+    /// device memory: for the tests of `copied.rs` (`Device::fail_next_host_imports`).
+    #[cfg(test)]
+    pub(crate) failing_host_imports: std::sync::atomic::AtomicU64,
+    /// The logs of its shadows over host pages a consumer logs the writes to
+    /// (`dirty_pages.rs`).
+    pub(super) dirty: super::dirty_pages::DirtyShadows,
     /// The new textures that read zero where Metal reads its pattern, until a command observes
     /// or covers that (`fresh_unwritten.rs`).
     pub(super) fresh: super::fresh_unwritten::FreshUnwritten,
@@ -497,6 +520,10 @@ pub(super) struct DeviceShared {
     /// rebind's or a storage form's new `VkImage`, a detach's stand-in, a reattach): a view kept
     /// by what it was made of (`binding::BindMemo`) is current while this holds.
     pub(crate) views_epoch: AtomicU64,
+    /// Its pipeline records: the hook they go to, and the counts (`warm/record.rs`).
+    pub(crate) pipeline_recording: crate::warm::Recording,
+    /// Its warm calls: the records queued, its warm thread, and the counts (`warm/pass.rs`).
+    pub(crate) warmer: crate::warm::Warmer,
 }
 
 impl DeviceShared {
@@ -574,10 +601,12 @@ impl DeviceShared {
         Arc::clone(&self.functions)
     }
 
-    /// What its encoders' deferred command buffers' replays share, where it records them so
-    /// (`recorder`).
-    pub(crate) fn recorder(&self) -> Option<&Arc<RecorderShared>> {
-        self.recorder.as_ref().map(Recorder::shared)
+    /// The commands recorded through its slot so far, by kind (`recorder`); none where it took
+    /// no slot.
+    pub(crate) fn commands_recorded(&self) -> crate::CommandsRecorded {
+        self.recording
+            .as_ref()
+            .map_or_else(Default::default, Slot::counts)
     }
 
     /// `vkAllocateCommandBuffers` of `info`: the loader serves it and reads the device's loader
@@ -708,7 +737,7 @@ impl Drop for DeviceShared {
             exit_guard::called(Call::DeviceWaitIdle);
             // The scheduler's thread, which waited on its nudge, has stopped.
             release::object(self.vk(), self.nudge);
-            for queue in &self.queues {
+            for queue in self.queues.iter() {
                 release::object(self.vk(), queue.timeline);
                 // The marks after the last uses of the queue outside a batch (`relay.rs`).
                 for fence in queue.flights.get().map(|f| f.drain()).unwrap_or_default() {
@@ -725,8 +754,10 @@ impl Drop for DeviceShared {
             // with its state.
             self.timing.release(self.vk());
         }
-        // Nor a kept barrier command buffer: the queues are idle.
+        // Nor a kept barrier command buffer, nor a submission taking a driver's stall idle: the
+        // queues are idle.
         self.scheduler.release_kept(self.vk());
+        self.scheduler.release_idle(self.vk());
         // No command buffer is left to give back a spare, or to hold one.
         self.spares.release(self);
         if let Some(internal) = lock(&self.internal).take() {
@@ -798,9 +829,12 @@ impl Drop for DeviceShared {
 }
 
 /// One of the device's `VkQueue`s.
-pub(super) struct QueueSlot {
-    /// The queue, under its lock: submissions are externally synchronized.
-    raw: Mutex<vk::Queue>,
+pub(crate) struct QueueSlot {
+    /// The queue, under its lock: submissions are externally synchronized. With it, its place in
+    /// its driver's period of stalls (`submit_stalls.rs`), which each use under the lock moves.
+    raw: Mutex<(vk::Queue, submit_stalls::Period)>,
+    /// Its place's `Period::may_be_due`, as of the last use: read without the lock.
+    stall_due: AtomicBool,
     /// The queue's family, which the command pools of what it runs are made for.
     pub(super) family: u32,
     /// The family's queue flags: the commands it runs, and so the accesses a barrier recorded
@@ -827,12 +861,56 @@ pub(super) struct QueueSlot {
 }
 
 impl QueueSlot {
-    /// `f` with the queue, under its lock, its loader word put back first.
+    /// `f` with the queue, under its lock, its loader word put back first: a use whose
+    /// signalling calls are not counted, so its place in its driver's period is forgotten
+    /// (`submit_stalls.rs`).
     pub(super) fn with<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
-        let queue = lock(&self.raw);
+        let mut held = lock(&self.raw);
+        held.1.forget();
+        self.stall_due.store(false, Ordering::Relaxed);
         // SAFETY: the queue lives while its slot does.
         unsafe { self.word.restore() };
-        f(*queue)
+        f(held.0)
+    }
+
+    /// `f` with the queue and its place in its driver's period, under its lock, its loader word
+    /// put back first: `f` counts each signalling call it makes (`Period::called`). For a use of
+    /// `caller`'s, also the wait for the lock where it waited behind a stall taken idle
+    /// (`Period::entered`).
+    pub(crate) fn with_counted<R>(
+        &self,
+        caller: submit_stalls::Caller,
+        f: impl FnOnce(vk::Queue, &mut submit_stalls::Period) -> R,
+    ) -> (R, Option<u64>) {
+        let asked = gpu_time::host_nanos();
+        let mut held = lock(&self.raw);
+        let behind = match caller {
+            submit_stalls::Caller::Work => {
+                let waited = gpu_time::host_nanos().saturating_sub(asked);
+                held.1.entered(waited)
+            }
+            submit_stalls::Caller::Empty => None,
+        };
+        // SAFETY: the queue lives while its slot does.
+        unsafe { self.word.restore() };
+        let (queue, period) = &mut *held;
+        let used = f(*queue, period);
+        self.stall_due.store(period.may_be_due(), Ordering::Relaxed);
+        (used, behind)
+    }
+
+    /// `f` with the queue's place in its driver's period alone, under the queue's lock.
+    pub(crate) fn with_period<R>(&self, f: impl FnOnce(&mut submit_stalls::Period) -> R) -> R {
+        let mut held = lock(&self.raw);
+        let answer = f(&mut held.1);
+        self.stall_due.store(held.1.may_be_due(), Ordering::Relaxed);
+        answer
+    }
+
+    /// Whether its driver's next stall may be due within `submit_stalls::MOST_EMPTY` calls, as of
+    /// its last use (`Period::may_be_due`), read without its lock.
+    pub(crate) fn stall_may_be_due(&self) -> bool {
+        self.stall_due.load(Ordering::Relaxed)
     }
 
     /// The host saw the timeline reach `value`.
@@ -879,6 +957,16 @@ pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+impl Device {
+    /// Fail the next `count` imports of host pages by their pointer as the driver's out of device
+    /// memory: the tests' stand-in for an import the device and the gate admitted that then fails
+    /// (`copied.rs`).
+    pub(crate) fn fail_next_host_imports(&self, count: u64) {
+        (self.shared().failing_host_imports).store(count, Ordering::Relaxed);
+    }
+}
+
 impl Device {
     /// `registryID`: an identifier of the physical device, from its `deviceUUID`.
     pub fn registry_id(&self) -> u64 {
@@ -894,6 +982,11 @@ impl Device {
     /// consumer computes Apple's private ones from.
     pub fn properties(&self) -> &DeviceProperties {
         &self.0.properties
+    }
+
+    /// A handle on the device that does not keep it.
+    pub(crate) fn downgrade(&self) -> WeakDevice {
+        WeakDevice(Arc::downgrade(&self.0))
     }
 
     /// The compile-and-plan device this device compiles and plans for. No Metal counterpart.
@@ -962,7 +1055,7 @@ impl Device {
         let (pools, descriptors) = self.0.spares.trim(&self.0, idle);
         // x86Sim RAM 10: and the recorder's kept logs past a few (`recorder/handles.rs`, `trim`),
         // counted with the command pools
-        (pools + crate::recorder::handles::trim(idle), descriptors)
+        (pools, descriptors)
     }
 
     /// Keep room in the memory pools the runtime's encodings and commits place their own
@@ -1113,6 +1206,11 @@ pub(super) struct Parts {
     pub(super) lowering_refuses: BTreeSet<Degradation>,
     /// Its command buffers keep execution records (`DeviceOptions::record_executions`).
     pub(super) record_executions: bool,
+    /// Where its pipeline records go (`DeviceOptions::pipeline_records`, `warm/record.rs`).
+    pub(super) pipeline_records: Option<crate::warm::RecordHook>,
+    /// Its check of the first move over host pages fails whatever the moves did
+    /// (`DeviceOptions::fail_in_place_check`).
+    pub(super) fail_in_place_check: bool,
     /// Its views may reinterpret an image's components ([`DeviceShared`]'s field), outside
     /// `enabled`'s vocabulary.
     pub(super) view_reinterpretation: bool,
@@ -1131,6 +1229,14 @@ pub(super) struct Parts {
     /// `adopt.rs`, where the consumer lists it), outside `enabled`'s vocabulary: its render
     /// pipelines are linked from libraries (`pipeline/libraries.rs`).
     pub(super) graphics_pipeline_library: bool,
+    /// It enables `samplerYcbcrConversion` (`create.rs`), outside `enabled`'s vocabulary: a
+    /// two-plane YCbCr texture's planes convert through the device's own conversion where it
+    /// converts their format (`ycbcr_device.rs`). An adopted device's consumer does not say, so
+    /// it is false there.
+    pub(super) ycbcr_conversion: bool,
+    /// It takes the two-plane 4:4:4 formats with that conversion: Vulkan 1.3, or
+    /// `VK_EXT_ycbcr_2plane_444_formats` enabled with its feature (`create.rs`).
+    pub(super) ycbcr_444: bool,
     /// It enables `VK_EXT_pipeline_creation_feedback` (`create.rs`), outside `enabled`'s
     /// vocabulary, wherever listed: each making of a program's pipeline reads whether its cache
     /// held the pipeline (`shader_cache/mod.rs`).
@@ -1149,8 +1255,6 @@ pub(super) struct Parts {
     pub(super) owned: bool,
     /// The shader cache, its directory opened before any Vulkan object was made.
     pub(super) cache: CacheSetup,
-    /// The Metal level it answers at, and how it was chosen (`metal_level.rs`).
-    pub(super) metal_level: crate::metal_level::Chosen,
 }
 
 impl Device {
@@ -1181,11 +1285,15 @@ impl Device {
             announce_each,
             lowering_refuses,
             record_executions,
+            pipeline_records,
+            fail_in_place_check,
             view_reinterpretation,
             generated_commands,
             host_image_copy,
             linear_color_attachment,
             graphics_pipeline_library,
+            ycbcr_conversion,
+            ycbcr_444,
             creation_feedback,
             dma_buf,
             dma_buf_images,
@@ -1193,7 +1301,6 @@ impl Device {
             memory_reads,
             owned,
             cache,
-            metal_level,
         } = parts;
         // Every pipeline made on the device from here on is made at the user-initiated class.
         // SAFETY: the device is live (the caller's contract), and its functions are its own.
@@ -1282,7 +1389,8 @@ impl Device {
                     raw.get_device_queue(family, index)
                 };
                 QueueSlot {
-                    raw: Mutex::new(queue),
+                    raw: Mutex::new((queue, submit_stalls::Period::default())),
+                    stall_due: AtomicBool::new(false),
                     family,
                     flags: flags_of(family),
                     // SAFETY: the queue was just returned, its word the loader's.
@@ -1418,15 +1526,6 @@ impl Device {
             }
         });
         // SAFETY: as above; the loader serves `vkGetDeviceProcAddr` once the word is put back.
-        let depth_bias_command = unsafe {
-            loader_word.restore();
-            depth_bias_command(&instance.raw, &raw, &enabled)
-        }
-        .map(|bias| {
-            // SAFETY: the device's own command of that name.
-            unsafe { crate::recorder::through(recording.as_ref(), Command::CmdSetDepthBias2, bias) }
-        });
-        // SAFETY: as above; the loader serves `vkGetDeviceProcAddr` once the word is put back.
         let color_write_masks = unsafe {
             loader_word.restore();
             ColorWriteMasks::load(&instance.raw, &raw, &enabled)
@@ -1437,10 +1536,18 @@ impl Device {
                 crate::recorder::through(recording.as_ref(), Command::CmdSetColorWriteMask, masks)
             })
         });
+        // The YCbCr formats the device converts itself, where it enables the conversion.
+        let ycbcr_formats = match ycbcr_conversion {
+            // SAFETY: `physical` belongs to `instance`, created at Vulkan 1.2 or later, and the
+            // device enables `samplerYcbcrConversion`.
+            true => unsafe {
+                crate::ycbcr_device::YCbCrFormats::of(&instance.raw, physical, ycbcr_444)
+            },
+            false => crate::ycbcr_device::YCbCrFormats::default(),
+        };
         let drawn = prime::PrimedDraws {
             dynamic: extended_dynamic_state,
             color_write_masks,
-            depth_bias: depth_bias_command,
             sized_index_bind,
         };
         // Before the exit hook is registered for this device (below): the first call of each
@@ -1476,13 +1583,14 @@ impl Device {
                     extended_dynamic_state: false,
                     primitive_restart: false,
                     color_write_masks: false,
-                    depth_bias: false,
                     sized_index_bind: false,
+                    ycbcr_conversion: ycbcr_formats.primer().is_some(),
                 }),
                 generated_commands.as_ref(),
                 push_descriptor,
                 calibrated,
                 drawn,
+                ycbcr_formats.primer(),
             )
         } {
             scheduler.stop();
@@ -1495,8 +1603,7 @@ impl Device {
         // device exists, so the description's version passed the floor).
         let (identity, max_allocation) =
             unsafe { properties::query(&instance.raw, physical, instance.api_version) };
-        let properties =
-            DeviceProperties::new(identity, description, &compile, metal_level.level());
+        let properties = DeviceProperties::new(identity, description, &compile);
         // SAFETY: as above.
         let memory_properties =
             unsafe { instance.raw.get_physical_device_memory_properties(physical) };
@@ -1535,8 +1642,6 @@ impl Device {
             &properties.description,
             limits.buffer_image_granularity,
             linear_color_attachment,
-            compile.policy().multisample_depth_twin
-                == metal2vulkan::device::MultisampleDepthTwinPolicy::Exact,
         );
         // SAFETY: as above; the device is live, made with `enabled` enabled, and `loader_word`
         // is its loader word.
@@ -1653,13 +1758,6 @@ impl Device {
                 recording.as_ref(),
             )
         };
-        // Its encoders' commands replay on a thread of its own where it has a slot (`recorder`).
-        // SAFETY: the device's handle, live, its word the loader's (put back just now).
-        let recorder = recording.as_ref().and_then(|slot| {
-            Recorder::start(slot, &functions, unsafe {
-                LoaderWord::of_device(raw.handle())
-            })
-        });
         let shader_cache = match ShaderCache::start(
             cache,
             &physical_properties,
@@ -1721,7 +1819,7 @@ impl Device {
             functions: Arc::new(functions),
             queue_family,
             round_robin: queues.len() - present_queues,
-            queues,
+            queues: queues.into(),
             queue_families,
             round_robin_made: AtomicU64::new(0),
             presenting_made: AtomicU64::new(0),
@@ -1735,6 +1833,8 @@ impl Device {
             deferred: crate::render::DeferredEncoders::default(),
             record_executions,
             views_epoch: AtomicU64::new(0),
+            pipeline_recording: crate::warm::Recording::new(pipeline_records),
+            warmer: crate::warm::Warmer::default(),
             device_address,
             upload_alignment,
             dynamic_buffers: [
@@ -1752,7 +1852,6 @@ impl Device {
             sampler_count: SamplerCount::new(limits.max_sampler_allocation_count),
             sampler_sets: Mutex::default(),
             heaps: Mutex::default(),
-            heap_nan_residue: NanResidue::default(),
             function_tables: Mutex::default(),
             internal: Mutex::new(None),
             internal_done: OwnTimeline::default(),
@@ -1771,17 +1870,16 @@ impl Device {
             lost,
             textures,
             shader_cache,
+            in_place: crate::in_place::InPlaceChecks::new(fail_in_place_check),
             host_import,
             shared_pointer_imports: OnceLock::new(),
             extended_dynamic_state,
             sized_index_bind,
-            depth_bias_command,
             mesh_draws,
             push_descriptor,
             pushes_after_pipeline_binds,
             color_write_masks,
-            _recording: recording,
-            recorder,
+            recording,
             snapshot_fallbacks: Mutex::new(Vec::new()),
             reader_sizes: Mutex::new(Default::default()),
             gpu_pools,
@@ -1801,6 +1899,7 @@ impl Device {
             gpu_work: AtomicU64::new(0),
             dynamic_multi_variable: OnceLock::new(),
             owned_kernels: Mutex::new(OwnedKernels::default()),
+            ycbcr_formats,
             mipmap_scratch: Mutex::default(),
             planes: Mutex::new(PlanesObjects::default()),
             interleave: Mutex::default(),
@@ -1818,6 +1917,11 @@ impl Device {
             heap_keys: Default::default(),
             rebinds: Default::default(),
             aliases: Default::default(),
+            host_ram: Default::default(),
+            copied: Default::default(),
+            #[cfg(test)]
+            failing_host_imports: Default::default(),
+            dirty: Default::default(),
             fresh: Default::default(),
             owners: Default::default(),
             live_buffers: Default::default(),
@@ -1855,19 +1959,24 @@ impl Device {
         if waits_on_gpu {
             (shared.scheduler).wait_on_gpu(Functions::clone(&shared.functions), shared.nudge);
         }
-        let device = Device(shared);
-        // The pages its replays held last go on its handler threads (`recorder`).
-        if let Some(recorder) = device.shared().recorder() {
-            recorder.set_elsewhere(device.elsewhere());
-            // Woken by the scheduler's thread for what a commit queued (`recorder`).
-            (device.shared().scheduler).wake_recorder(Arc::clone(recorder));
+        // Where the driver stalls in one signalling submission of every 1024 to a `VkQueue`
+        // (`DriverFact::SignallingSubmitsStallEvery1024`), the scheduler's thread takes the
+        // stalls while idle, each queue's empty submissions signalling a semaphore of its own
+        // (`submit_stalls.rs`); a device that cannot make the semaphores takes none.
+        let stalls = metal2vulkan::device::DriverFact::SignallingSubmitsStallEvery1024;
+        if shared.properties.driver_facts.contains(&stalls) {
+            if let Some(semaphores) = submit_stalls::semaphores(shared.vk(), shared.queues.len()) {
+                let functions = Functions::clone(&shared.functions);
+                let queues = Arc::clone(&shared.queues);
+                let idle = submit_stalls::IdleStalls::new(functions, queues, semaphores);
+                shared.scheduler.take_stalls_idle(idle);
+            }
         }
-        device.say_unmeasured_driver();
+        let device = Device(shared);
+        // The verdicts of its check of textures over host pages, where a record holds them.
+        device.recall_in_place_checks();
         device.degrade_argument_buffers_unread();
         device.degrade_float_tininess();
-        if let Some((kind, notice)) = metal_level.announcement() {
-            device.degrade(kind, || notice);
-        }
         Ok(device)
     }
 }

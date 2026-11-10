@@ -91,14 +91,14 @@ fn compatibility_is_type_samples_numeric_type_and_depth() {
     let tex = |texture_type, pixel_format, sample_count| TextureShape::Texture {
         address_modes: crate::metal::sampler::AddressModeMap::IDENTITY,
         offset_base_axes: 0,
-        own_format_views: false,
+        ycbcr_in_place: false,
+        ycbcr_planes_sampler: None,
         texture_type,
         pixel_format,
         sample_count,
         usage: crate::metal::TextureUsage::SHADER_READ,
         mipmap_level_count: 1,
         sparse: false,
-        depth_twin: false,
         swizzle: crate::metal::TextureSwizzleChannels::DEFAULT,
     };
     assert!(compatible(
@@ -162,14 +162,14 @@ fn a_ulong_slot_binds_only_rg32uint_textures() {
     let tex = |pixel_format| TextureShape::Texture {
         address_modes: crate::metal::sampler::AddressModeMap::IDENTITY,
         offset_base_axes: 0,
-        own_format_views: false,
+        ycbcr_in_place: false,
+        ycbcr_planes_sampler: None,
         texture_type: TextureType::Type2D,
         pixel_format,
         sample_count: 1,
         usage: crate::metal::TextureUsage::SHADER_READ,
         mipmap_level_count: 1,
         sparse: false,
-        depth_twin: false,
         swizzle: crate::metal::TextureSwizzleChannels::DEFAULT,
     };
     let t = slot_iface(TextureType::Type2D, SampledType::Uint64);
@@ -256,14 +256,14 @@ fn a_numeric_slot_binds_either_integer_type() {
             TextureShape::Texture {
                 address_modes: crate::metal::sampler::AddressModeMap::IDENTITY,
                 offset_base_axes: 0,
-                own_format_views: false,
+                ycbcr_in_place: false,
+                ycbcr_planes_sampler: None,
                 texture_type: TextureType::Type2D,
                 pixel_format,
                 sample_count: 1,
                 usage: crate::metal::TextureUsage::SHADER_WRITE,
                 mipmap_level_count: 1,
                 sparse: false,
-                depth_twin: false,
                 swizzle: crate::metal::TextureSwizzleChannels::DEFAULT,
             },
         );
@@ -281,7 +281,7 @@ fn a_numeric_slot_binds_either_integer_type() {
             alpha_red_texels: Default::default(),
         };
         let (write, _) = planner
-            .plain_texture(0, 1, vk::DescriptorType::STORAGE_IMAGE, texture, false)
+            .plain_texture(0, 1, vk::DescriptorType::STORAGE_IMAGE, texture)
             .expect("plan");
         let bound = matches!(write, WriteSource::Texture { .. });
         (bound, planner.variant.storage_images.get(&texture).copied())
@@ -428,7 +428,7 @@ fn a_depth_read_as_colour_replicates_its_depth_as_metal_does() {
     let mut seen = 0;
     for (stem, p) in crate::spirv::testing::committed_profiles().expect("profiles") {
         for pf in depths {
-            let Ok(read) = sampled_view(&p, pf, &class(false), false) else {
+            let Ok(read) = sampled_view(&p, pf, &class(false)) else {
                 continue;
             };
             seen += 1;
@@ -437,7 +437,7 @@ fn a_depth_read_as_colour_replicates_its_depth_as_metal_does() {
                 (vk::ImageAspectFlags::DEPTH, DEPTH_AS_COLOR),
                 "{stem} {pf:?}"
             );
-            let compare = sampled_view(&p, pf, &class(true), false).unwrap();
+            let compare = sampled_view(&p, pf, &class(true)).unwrap();
             assert_eq!(
                 compare.components,
                 vk::ComponentMapping::IDENTITY,
@@ -445,7 +445,7 @@ fn a_depth_read_as_colour_replicates_its_depth_as_metal_does() {
             );
         }
         for pf in stencils {
-            let Ok(read) = sampled_view(&p, pf, &uint, false) else {
+            let Ok(read) = sampled_view(&p, pf, &uint) else {
                 continue;
             };
             assert_eq!(
@@ -459,72 +459,6 @@ fn a_depth_read_as_colour_replicates_its_depth_as_metal_does() {
         }
     }
     assert!(seen > 0, "no profile samples a depth format");
-}
-
-/// A `Depth32Float` texture held with a depth twin is read through an `R32_SFLOAT` colour view of
-/// its image and compared through a `D32_SFLOAT` depth view of its twin, on every committed
-/// profile; a texture without one keeps its depth view of its own image, and only a `Depth32Float`
-/// texture takes a twin.
-#[test]
-fn a_depth_twin_is_read_through_its_colour_image_and_compared_through_its_twin() {
-    let t = TextureSlot {
-        depth_compare: true,
-        ..slot_iface(TextureType::Type2D, SampledType::Float)
-    };
-    let class = |compare| {
-        declared(
-            &t,
-            vk::DescriptorType::SAMPLED_IMAGE,
-            false,
-            compare,
-            StorageFormatClass::NotStorage,
-        )
-        .unwrap()
-    };
-    for (stem, p) in crate::spirv::testing::committed_profiles().expect("profiles") {
-        let d32 = PixelFormat::Depth32Float;
-        let read = sampled_view(&p, d32, &class(false), true).unwrap();
-        assert_eq!(
-            (read.format, read.aspect, read.twin, read.components),
-            (
-                vk::Format::R32_SFLOAT,
-                vk::ImageAspectFlags::COLOR,
-                false,
-                DEPTH_AS_COLOR
-            ),
-            "{stem}"
-        );
-        let compare = sampled_view(&p, d32, &class(true), true).unwrap();
-        assert_eq!(
-            (
-                compare.format,
-                compare.aspect,
-                compare.twin,
-                compare.components
-            ),
-            (
-                vk::Format::D32_SFLOAT,
-                vk::ImageAspectFlags::DEPTH,
-                true,
-                vk::ComponentMapping::IDENTITY
-            ),
-            "{stem}"
-        );
-        for compare in [false, true] {
-            let Ok(own) = sampled_view(&p, d32, &class(compare), false) else {
-                continue;
-            };
-            assert_eq!(
-                (own.aspect, own.twin),
-                (vk::ImageAspectFlags::DEPTH, false),
-                "{stem}"
-            );
-        }
-        assert!(matches!(
-            sampled_view(&p, PixelFormat::Depth16Unorm, &class(false), true),
-            Err(BindError::Internal(_))
-        ));
-    }
 }
 
 /// A bound runtime sampler's values are checked at plan time from its shape, with exactly the
@@ -606,7 +540,6 @@ fn runtime_sampler_values_are_checked_at_plan_time() {
                                 slot,
                                 compare,
                                 integer: false,
-                                cube_gradient: false,
                                 opaque_black: crate::metal::sampler::OpaqueBlackBorder::Stated,
                             }),
                             "{stem} {name} compare={compare}"
@@ -690,14 +623,14 @@ fn an_immutable_linear_sampler_needs_a_filterable_view() {
                 TextureShape::Texture {
                     address_modes: crate::metal::sampler::AddressModeMap::IDENTITY,
                     offset_base_axes: 0,
-                    own_format_views: false,
+                    ycbcr_in_place: false,
+                    ycbcr_planes_sampler: None,
                     texture_type: TextureType::Type2D,
                     pixel_format: pf,
                     sample_count: 1,
                     usage: crate::metal::TextureUsage::SHADER_READ,
                     mipmap_level_count: 1,
                     sparse: false,
-                    depth_twin: false,
                     swizzle: crate::metal::TextureSwizzleChannels::DEFAULT,
                 },
             );
@@ -725,7 +658,7 @@ fn an_immutable_linear_sampler_needs_a_filterable_view() {
                 StorageFormatClass::NotStorage,
             )
             .expect("declared");
-            let format = sampled_view(&p, pf, &class, false).expect("view").format;
+            let format = sampled_view(&p, pf, &class).expect("view").format;
             let filterable = p.supports_format(format, FormatUsage::SampledImageFilterLinear);
             if integer || filterable {
                 assert!(
@@ -791,14 +724,14 @@ fn a_linear_compare_sampler_needs_no_filterable_view() {
                     TextureShape::Texture {
                         address_modes: crate::metal::sampler::AddressModeMap::IDENTITY,
                         offset_base_axes: 0,
-                        own_format_views: false,
+                        ycbcr_in_place: false,
+                        ycbcr_planes_sampler: None,
                         texture_type: TextureType::Type2D,
                         pixel_format: pf,
                         sample_count: 1,
                         usage: crate::metal::TextureUsage::SHADER_READ,
                         mipmap_level_count: 1,
                         sparse: false,
-                        depth_twin: false,
                         swizzle: crate::metal::TextureSwizzleChannels::DEFAULT,
                     },
                 );
@@ -828,7 +761,7 @@ fn a_linear_compare_sampler_needs_no_filterable_view() {
                     StorageFormatClass::NotStorage,
                 )
                 .expect("declared");
-                let format = sampled_view(&p, pf, &class, false).expect("view").format;
+                let format = sampled_view(&p, pf, &class).expect("view").format;
                 let filterable = p.supports_format(format, FormatUsage::SampledImageFilterLinear);
                 if compare || filterable {
                     assert!(
@@ -886,14 +819,14 @@ fn bicubic_texels_follow_the_bound_format() {
                 TextureShape::Texture {
                     address_modes: crate::metal::sampler::AddressModeMap::IDENTITY,
                     offset_base_axes: 0,
-                    own_format_views: false,
+                    ycbcr_in_place: false,
+                    ycbcr_planes_sampler: None,
                     texture_type: TextureType::Type2D,
                     pixel_format: pf,
                     sample_count: 1,
                     usage: crate::metal::TextureUsage::SHADER_READ,
                     mipmap_level_count: 1,
                     sparse: false,
-                    depth_twin: false,
                     swizzle: crate::metal::TextureSwizzleChannels::DEFAULT,
                 },
             );
@@ -934,148 +867,9 @@ fn bicubic_texels_follow_the_bound_format() {
     );
 }
 
-/// A combined binding with the cube-gradient bit (a cube's explicit gradients in Metal's isotropic
-/// footprint, which a function takes through a runtime sampler where the device's cube-gradient
-/// route is not measured) takes an anisotropic runtime sampler on every committed profile, without
-/// `samplerAnisotropy` too: its Vulkan sampler is isotropic (no anisotropy handed), and Metal's
-/// anisotropic filter is the function's emulation, whose taps read explicit levels, under the
-/// variant naming the slot (`anisotropic_variant`) wherever the function states
-/// `RuntimeFact::AnisotropicSampler` for it. An isotropic sampler is accepted for it, and the same
-/// anisotropic sampler for a binding without the bit (every other cube-gradient binding, whose
-/// footprint the sampler's word chooses) gets the ordinary verdict (`samplerAnisotropy`).
-#[test]
-fn an_explicit_cube_gradient_binding_takes_an_anisotropic_sampler_isotropically() {
-    use crate::bind::state::SamplerDescriptor;
-    use crate::metal::sampler::{vk_sampler, SamplerUse};
-    let texture = SlotRef {
-        stage: Stage::Kernel,
-        class: SlotClass::Texture,
-        index: 0,
-    };
-    let sampler_slot = SlotRef {
-        stage: Stage::Kernel,
-        class: SlotClass::Sampler,
-        index: 2,
-    };
-    let isotropic = SamplerDescriptor::new();
-    let mut anisotropic = isotropic;
-    anisotropic.max_anisotropy = 4;
-    let (mut isotropic_taken, mut compiled) = (0, 0);
-    for (stem, p) in crate::spirv::testing::committed_profiles().expect("profiles") {
-        let t = slot_iface(TextureType::Cube, SampledType::Float);
-        let slots = BTreeMap::from([
-            (texture, SlotInterface::Texture(t)),
-            (
-                sampler_slot,
-                SlotInterface::Sampler(SamplerSlot {
-                    compare: false,
-                    coordinate_sensitive: false,
-                }),
-            ),
-        ]);
-        for (name, desc) in [("isotropic", isotropic), ("anisotropic", anisotropic)] {
-            for cube_gradient in [false, true] {
-                let mut stage = StageShape::default();
-                stage.textures.insert(
-                    texture.index,
-                    TextureShape::Texture {
-                        address_modes: crate::metal::sampler::AddressModeMap::IDENTITY,
-                        offset_base_axes: 0,
-                        own_format_views: false,
-                        texture_type: TextureType::Cube,
-                        pixel_format: PixelFormat::RGBA8Unorm,
-                        sample_count: 1,
-                        usage: crate::metal::TextureUsage::SHADER_READ,
-                        mipmap_level_count: 1,
-                        sparse: false,
-                        depth_twin: false,
-                        swizzle: crate::metal::TextureSwizzleChannels::DEFAULT,
-                    },
-                );
-                stage
-                    .samplers
-                    .insert(sampler_slot.index, BoundSampler::new(desc).shape());
-                let shape = BTreeMap::from([(Stage::Kernel, stage.clone())]);
-                let mut planner = ResourcePlanner {
-                    profile: &p,
-                    shape: &shape,
-                    slots: &slots,
-                    dependencies: &[],
-                    stage_flags: |_| vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    variant: VariantKey::new(),
-                    diagnostics: Vec::new(),
-                    uses: Vec::new(),
-                    template: Default::default(),
-                    alpha_red_texels: Default::default(),
-                };
-                let sampler =
-                    CombinedSampler::new(SamplerRef::Slot(sampler_slot.index), false, false)
-                        .with_cube_gradient(cube_gradient);
-                let planned = planner.combined(texture, sampler, None);
-                let verdict = vk_sampler(
-                    &desc,
-                    SamplerUse::new(false, false).with_cube_gradient(cube_gradient),
-                    &p,
-                );
-                if name == "anisotropic" && cube_gradient {
-                    let made = verdict.unwrap_or_else(|e| panic!("{stem}: {e:?}"));
-                    assert_eq!(made.max_anisotropy, None, "{stem}: {made:?}");
-                    // The write carries the use, so the binder's `VkSampler` (`sampler_desc`)
-                    // is the isotropic one too.
-                    let Ok(WriteSource::CombinedImageSampler {
-                        sampler:
-                            SamplerSource::Slot {
-                                compare,
-                                integer,
-                                cube_gradient: true,
-                                ..
-                            },
-                        ..
-                    }) = planned
-                    else {
-                        panic!("{stem}: {planned:?}");
-                    };
-                    let use_ = SamplerUse::new(compare, integer).with_cube_gradient(true);
-                    assert_eq!(vk_sampler(&desc, use_, &p), Ok(made), "{stem}");
-                    let mut bind = crate::bind::state::BindShape::default();
-                    bind.stages.insert(Stage::Kernel, stage);
-                    let stated = [crate::pipeline::RuntimeDependency::new(
-                        crate::pipeline::facts::RuntimeFact::AnisotropicSampler {
-                            slot: sampler_slot,
-                        },
-                        crate::pipeline::facts::Mechanism::Variant,
-                    )];
-                    assert_eq!(
-                        crate::bind::plan::slots::anisotropic_variant(&stated, &bind),
-                        BTreeSet::from([sampler_slot]),
-                        "{stem}"
-                    );
-                    isotropic_taken += 1;
-                } else {
-                    match verdict {
-                        Ok(_) => {
-                            assert!(
-                                matches!(planned, Ok(WriteSource::CombinedImageSampler { .. })),
-                                "{stem} {name} {cube_gradient}: {planned:?}"
-                            );
-                            compiled += 1;
-                        }
-                        Err(e) => assert_eq!(planned, Err(bind_error(e)), "{stem} {name}"),
-                    }
-                }
-            }
-        }
-    }
-    assert!(
-        isotropic_taken > 0 && compiled > 0,
-        "{isotropic_taken} taken isotropically, {compiled} accepted"
-    );
-}
-
 /// A runtime sampler slot specializes `SamplerState` to the bound sampler's word masked by the
-/// fields the function reads, and an unbound slot to 0. So the pixel predicates hold as they did of
-/// `SamplerCoords` and `SamplerPixelNearest`: pixel coordinates wherever the sampler uses them, a
-/// nearest pixel sampler exactly where it also filters nearest.
+/// fields the function reads, and an unbound slot to 0. So the pixel predicate holds as it did of
+/// `SamplerCoords`: pixel coordinates wherever the sampler uses them, whatever its filters.
 #[test]
 fn sampler_state_follows_the_bound_sampler() {
     use crate::bind::state::SamplerDescriptor;
@@ -1116,7 +910,7 @@ fn sampler_state_follows_the_bound_sampler() {
             template: Default::default(),
             alpha_red_texels: Default::default(),
         };
-        [W::PIXEL_COORDINATES, W::PIXEL_NEAREST, W::FIELDS]
+        [W::PIXEL_COORDINATES, W::LINEAR, W::FIELDS]
             .map(|fields| planner.sampler_state(slot, fields) as u32)
     };
     let with = |normalized: bool, filter: F| {
@@ -1133,21 +927,17 @@ fn sampler_state_follows_the_bound_sampler() {
     assert_eq!(plan(None), [0, 0, 0]);
     assert_eq!(plan(with(true, F::Nearest)), [0, 0, repeat_t]);
     assert_eq!(plan(with(true, F::Linear)), [0, linear, linear | repeat_t]);
-    assert_eq!(
-        plan(with(false, F::Nearest)),
-        [pixel, pixel, pixel | repeat_t]
-    );
+    assert_eq!(plan(with(false, F::Nearest)), [pixel, 0, pixel | repeat_t]);
     assert_eq!(
         plan(with(false, F::Linear)),
-        [pixel, pixel | linear, pixel | linear | repeat_t]
+        [pixel, linear, pixel | linear | repeat_t]
     );
-    // The pixel predicates: the word masked by them is exactly the pixel-coordinates bit.
-    let states = |desc, mask| plan(desc)[if mask == W::PIXEL_COORDINATES { 0 } else { 1 }] == pixel;
-    assert!(!states(with(true, F::Nearest), W::PIXEL_COORDINATES));
-    assert!(states(with(false, F::Linear), W::PIXEL_COORDINATES));
-    assert!(states(with(false, F::Nearest), W::PIXEL_NEAREST));
-    assert!(!states(with(false, F::Linear), W::PIXEL_NEAREST));
-    assert!(!states(None, W::PIXEL_NEAREST));
+    // The pixel predicate: the word masked by it is exactly the pixel-coordinates bit.
+    let states = |desc| plan(desc)[0] == pixel;
+    assert!(!states(with(true, F::Nearest)));
+    assert!(states(with(false, F::Linear)));
+    assert!(states(with(false, F::Nearest)));
+    assert!(!states(None));
 }
 
 /// A texture slot read or sampled with a `half` result specializes `TexelFormat` from the bound
@@ -1190,14 +980,14 @@ fn texel_format_follows_the_bound_format() {
         Some(TextureShape::Texture {
             address_modes: crate::metal::sampler::AddressModeMap::IDENTITY,
             offset_base_axes: 0,
-            own_format_views: false,
+            ycbcr_in_place: false,
+            ycbcr_planes_sampler: None,
             texture_type: TextureType::Type2D,
             pixel_format,
             sample_count: 1,
             usage: crate::metal::TextureUsage::SHADER_READ,
             mipmap_level_count: 1,
             sparse: false,
-            depth_twin: false,
             swizzle: crate::metal::TextureSwizzleChannels::DEFAULT,
         })
     };
@@ -1340,7 +1130,7 @@ fn a_separate_pair_takes_the_combined_pairs_checks() {
                 StorageFormatClass::NotStorage,
             )
             .expect("declared");
-            let view = sampled_view(&p, pf, &class, false).expect("view");
+            let view = sampled_view(&p, pf, &class).expect("view");
             let filterable = p.supports_format(view.format, FormatUsage::SampledImageFilterLinear);
             let refusal = Err(BindError::Unsupported(Unsupported::needs(
                 Feature::Format,
@@ -1374,14 +1164,14 @@ fn a_separate_pair_takes_the_combined_pairs_checks() {
                     TextureShape::Texture {
                         address_modes: crate::metal::sampler::AddressModeMap::IDENTITY,
                         offset_base_axes: 0,
-                        own_format_views: false,
+                        ycbcr_in_place: false,
+                        ycbcr_planes_sampler: None,
                         texture_type: TextureType::Type2D,
                         pixel_format: pf,
                         sample_count: 1,
                         usage: crate::metal::TextureUsage::SHADER_READ,
                         mipmap_level_count: 1,
                         sparse: false,
-                        depth_twin: false,
                         swizzle: crate::metal::TextureSwizzleChannels::DEFAULT,
                     },
                 );
@@ -1423,7 +1213,6 @@ fn a_separate_pair_takes_the_combined_pairs_checks() {
                         slot: sampler_slot,
                         compare: false,
                         integer: false,
-                        cube_gradient: false,
                         opaque_black: crate::metal::sampler::OpaqueBlackBorder::Stated,
                     },
                     None => WriteSource::Neutral(NeutralResource::Sampler { compare: false }),
@@ -1535,12 +1324,12 @@ fn an_a8_texture_buffer_without_a8_unorm_views_its_bytes_in_red() {
             true => vk::Format::R8_UNORM,
             false => vk::Format::A8_UNORM,
         };
-        let planned = planner.plain_texture(0, 0, uniform_ty, uniform, false);
+        let planned = planner.plain_texture(0, 0, uniform_ty, uniform);
         let Ok((WriteSource::TexelBuffer { format, .. }, _)) = planned else {
             panic!("{profile}: {planned:?}");
         };
         assert_eq!(format, own, "{profile}: the uniform view");
-        let planned = planner.plain_texture(0, 1, storage_ty, storage, false);
+        let planned = planner.plain_texture(0, 1, storage_ty, storage);
         let Ok((WriteSource::TexelBuffer { format, .. }, _)) = planned else {
             panic!("{profile}: {planned:?}");
         };
@@ -1575,7 +1364,7 @@ fn an_a8_texture_buffer_without_a8_unorm_views_its_bytes_in_red() {
         // A read that does not apply the swizzle.
         let plain = shape(TextureSwizzleChannels::DEFAULT);
         let mut planner = make(&p, &plain, &slots, &[]);
-        let planned = planner.plain_texture(0, 0, uniform_ty, uniform, false);
+        let planned = planner.plain_texture(0, 0, uniform_ty, uniform);
         match held {
             true => assert_eq!(
                 planned.map(|(w, _)| w),

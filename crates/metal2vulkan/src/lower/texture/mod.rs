@@ -42,7 +42,8 @@
 //! decoded NaN kept (`narrow::round_texel`; the NaN is the device's decode,
 //! `PrecisionNote::DeviceNanEncoding`), 16-bit integers are held zero-extended and written
 //! sign-extended, and a storage image of class `SwizzleBgra` or `SrgbEncode` converts in the
-//! shader, the latter through Metal's twelve-bit sRGB tables.
+//! shader, the latter by the device's sRGB transfer (`PrecisionNote::SrgbTexelDecode` for a read,
+//! `PrecisionNote::DevicePackConversion` for a write).
 //!
 //! **Containment**. A write is discarded out of bounds (Metal's semantics) by a builder-closed
 //! bounds check unless the profile's robustness discards it already (`robustImageAccess`;
@@ -123,10 +124,8 @@ mod alpha;
 mod atomic;
 mod cooperative;
 mod emit;
-pub mod float_texel;
 pub mod half;
 pub(crate) mod heap_raw;
-pub mod norm_write;
 mod slice;
 mod slot;
 mod status;
@@ -135,12 +134,10 @@ pub(crate) use absent::absent_arm;
 pub use absent::ABSENT_ARM;
 pub use atomic::TexAtomic;
 pub(crate) use emit::{
-    constant_lanes, constant_lanes_by, dispatch, extended_table, float_class, half_bits_class,
-    half_by_class, half_class, heap_element, heap_float_class, heap_half_class, heap_raw_form,
-    heap_raw_image, live_or_zero, metal_texel_nans, reinterpret, resident_access, rgb9e5_word,
-    slot_image, sparse_spec, srgb_filtered_texel, srgb_raw_gather, srgb_raw_tap, srgb_raw_texel,
-    swizzled_float, swizzled_gather, swizzled_held, texel_format_const, tile_map, tiled_word,
-    with_word, HalfClass, NullLeaf, TileLevel, RGB9E5_WORDS, SRGB_FILTERED_WORDS, SRGB_RAW_WORDS,
+    constant_lanes, dispatch, half_class, heap_element, heap_half_class, heap_raw_form,
+    heap_raw_image, live_or_zero, reinterpret, resident_access, rgb9e5_word, slot_image,
+    sparse_spec, srgb_raw_tap, srgb_texel, swizzled_float, swizzled_gather, swizzled_held,
+    tile_map, tiled_word, with_word, NullLeaf, TileLevel, RGB9E5_WORDS, SRGB_DECODE_WORDS,
     SRGB_TAP_WORDS, SRGB_TEXEL,
 };
 pub use emit::{emit, held_texel, to_image};
@@ -151,8 +148,6 @@ use crate::lower::access::handle::HandleTarget;
 use crate::memory::handles::{Candidate, HeapGroups};
 use crate::pipeline::lower_inputs::StorageImageClass;
 use crate::pipeline::sym::{ImageAccess, ImageHandleClass};
-#[cfg(test)]
-pub(crate) use emit::alias_halves;
 pub(crate) use slot::image_class;
 #[cfg(test)]
 pub use slot::max_levels;
@@ -174,7 +169,7 @@ use crate::error::{DriverDeviation, Error, Feature, LowerFamily, Unsupported};
 use crate::lower::arith::{FloatFmt, Form, Held};
 use crate::lower::emit::EmitCx;
 use crate::lower::sampler::Sampling;
-use crate::lower::select::{both, FamilyPlans, NoteClause, NoteOn, NoteTest, Plan, SelectCx};
+use crate::lower::select::{FamilyPlans, NoteClause, NoteOn, NoteTest, Plan, SelectCx};
 use crate::lower::strategy::FamilyStrategy;
 use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::sym::{SampledType, SlotClass, SlotRef};
@@ -291,18 +286,13 @@ pub struct Read {
     pub alpha: bool,
     /// A Metal 4.1 read through a clamp-to-edge sampler ([`Edge`]).
     pub edge: Option<Edge>,
-    /// The read takes an 8-bit sRGB texel's raw code from its slot's raw view, decoded as Metal
-    /// decodes it (`emit::srgb_raw_texel`, `RuntimeFact::SrgbTexture`).
+    /// The read takes an 8-bit sRGB texel's codes from its slot's image, which holds the format's
+    /// UNORM twin (`LoweringInputs::srgb_textures`), and decodes them by the device's transfer
+    /// (`emit::srgb_texel`, `RuntimeFact::SrgbTexture`).
     pub raw: bool,
-    /// The read takes a 16-bit float texel's own 16 bits from its slot's unsigned integer alias
-    /// view where the bound format's class names such channels, and widens them exactly
-    /// (`HalfTexelBitsPolicy::Exact`, `RuntimeFact::HalfBitsTexture`); elsewhere it keeps the
-    /// device's decode of the texel, as under the default. A plain fetch alone
-    /// ([`half_bits_read`]).
-    pub half_bits_alias: bool,
     /// The read, of a storage slot whose class is `SrgbEncode`, takes the codes of an 8-bit sRGB
-    /// format from its UNORM alias and decodes them as Metal does, through the module's table
-    /// (`emit::srgb_raw_texel`).
+    /// format from its UNORM alias and decodes them by the device's transfer
+    /// (`emit::srgb_texel`).
     pub srgb_codes: bool,
     /// The read, of a texture buffer slot, applies the bound texture buffer's swizzle to its
     /// texel, an out-of-bounds texel included, under the slot's `TextureSwizzle` specialization
@@ -326,12 +316,6 @@ pub struct Read {
     /// where the handle's class index is `A8Unorm`'s, on a device that holds such a texture's alpha
     /// in red ([`heap_alpha_in_red`]).
     pub heap_alpha_red: bool,
-    /// A `float` texel of the slot converts by the bound format's class (`float_texel`): its
-    /// code recovered from the device's value and divided exactly.
-    pub float_texel: bool,
-    /// Where the NaN switch asks for Metal's NaN, how the read's `half` texel answers a NaN
-    /// texel ([`texel_nans_class`]): by the class of the bound texture it names.
-    pub half_nans: Option<NanClass>,
     /// The read, of a slot's color texture on a profile whose sparse textures are sparse images
     /// (it enables `shaderResourceResidency`), sets the lanes Metal reads as constants (a channel
     /// the format lacks, through the swizzle) after it, from the slot's `ConstantLanes`
@@ -388,23 +372,17 @@ fn read_words(r: &Read) -> u32 {
         }
         + if r.edge.is_some() { 64 } else { 0 }
         + if r.raw || r.srgb_codes {
-            SRGB_RAW_WORDS
+            SRGB_DECODE_WORDS
         } else if r.extended.is_some() {
             crate::lower::arith::extended_range::DECODE_WORDS + r.texel.read_words()
         } else if r.texel.conv == TexelConv::F16 {
             half::CALL_WORDS.max(r.texel.read_words())
-        } else if r.float_texel {
-            // A heap texture's call reads the class its handle carries first.
-            float_texel::CALL_WORDS
-                + r.texel.read_words()
-                + if r.image.heap() { HEAP_CLASS_WORDS } else { 0 }
         } else {
             r.texel.read_words()
         };
     let declared = if r.declared.is_some() { 16 } else { 0 };
-    let nans = r.half_nans.map_or(0, NanClass::words);
     let siblings: u32 = r.heap_cross.iter().map(|x| read_words(x) + 24).sum();
-    own + declared + nans + siblings
+    own + declared + siblings
 }
 
 /// A Metal 4.1 `read(sampler s, ...)` through a constexpr clamp-to-edge sampler (MSL 4.1
@@ -438,19 +416,9 @@ pub struct Write {
     /// The slot's variant binds a texture of this extended-range format: the write encodes the
     /// raw texel ([`extended_range::encode`](crate::lower::arith::extended_range::encode)).
     pub extended: Option<crate::metal::format::ExtendedRange>,
-    /// The slot's storage class ([`storage_class`]): a converting one rounds the write to Metal's
-    /// code of each channel (`RotateArgb`'s `ARGB8Unorm` codes; `HalfTowardZero`'s halves and
-    /// `HalfQuietNan`'s NaN).
+    /// The slot's storage class ([`storage_class`]): a converting one moves or encodes the
+    /// written channels (`RotateArgb`'s rotation, `SrgbEncode`'s codes).
     pub class: StorageImageClass,
-    /// A `float` written through a heap handle on a device not measured to store it in a
-    /// half-float texture as Metal does ([`heap_write_class`]): the class (`HalfTowardZero` or
-    /// `HalfQuietNan`) the write takes where the handle's texel class is a half-float format's
-    /// (`emit::heap_halves`).
-    pub heap_half: Option<StorageImageClass>,
-    /// A `float` written through a heap handle: its NaN lanes are quieted where the handle's
-    /// texel class is a small float's (`StorageImageClass::SmallFloatQuietNan`,
-    /// `emit::heap_small_float_format`).
-    pub heap_small_floats: bool,
     /// A `float` or `half` texel written through a heap handle stores its alpha in the image's
     /// red where the handle's class index is `A8Unorm`'s, on a device that holds such a texture's
     /// alpha in red ([`heap_alpha_in_red`]).
@@ -459,11 +427,6 @@ pub struct Write {
     /// texture's swizzle on its held value, before converting it, under the slot's
     /// `TextureSwizzle` specialization (`emit::unswizzled`).
     pub swizzle: bool,
-    /// How a `half` texel's NaN is written ([`half_nans`]).
-    pub half_nans: HalfNans,
-    /// How a `float` or `half` texel's channels are rounded to a normalized format's codes
-    /// ([`norm_storage`]).
-    pub norm: NormWrite,
     /// The slot's variant binds a texture of another numeric class
     /// (`LoweringInputs::cross_class`): `texel` is that class's own form
     /// ([`native_write_form`]), into which the write first turns the declared lanes
@@ -471,10 +434,6 @@ pub struct Write {
     pub cross: Option<CrossWrite>,
     /// How an integer texel's lanes are saturated to the bound format's channels ([`int_range`]).
     pub saturate: IntRange,
-    /// A `half` or `float` written through a heap handle stores a half-float member's bits
-    /// through the group's unsigned integer twin where the handle's class names one
-    /// ([`heap_bits`], `emit::heap_bits`).
-    pub heap_bits: bool,
 }
 
 /// A write's declared texel and the bound format of a texture of another numeric class
@@ -510,66 +469,6 @@ impl IntRange {
             IntRange::Full => 0,
             IntRange::Widths(_) => 24,
             IntRange::SlotWord(_) => 24 + 48,
-        }
-    }
-}
-
-/// How a `float` texel's write rounds its channels to the codes Metal stores in a normalized
-/// format ([`norm_storage`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum NormWrite {
-    /// As computed: no normalized format, or a device measured to store Metal's codes, or a
-    /// conversion the storage class makes (`StorageImageClass::OneBitAlpha`).
-    Device,
-    /// By the bound format's class (the slot's `TexelFormat` specialization, a heap handle's
-    /// class): the module's routine ([`norm_write`]).
-    Class,
-    /// Through a heap handle on a device measured to store Metal's codes but a 1-bit channel's:
-    /// alpha 1 only above one half where the handle's class is a 1-bit-alpha format's
-    /// (`metal::texel_format::heap_one_bit_indices`), as `StorageImageClass::OneBitAlpha` writes
-    /// it.
-    HeapOneBit,
-}
-
-impl NormWrite {
-    /// The words of the write's rounding: the routine's call, or the class index test, alpha's rule
-    /// and the select, and a heap handle's class read.
-    pub(crate) fn words(self, heap: bool) -> u32 {
-        match self {
-            NormWrite::Device => 0,
-            NormWrite::Class => norm_write::CALL_WORDS + if heap { HEAP_CLASS_WORDS } else { 0 },
-            NormWrite::HeapOneBit => emit::heap_one_bit_words() + emit::ONE_BIT_ALPHA_WORDS + 8,
-        }
-    }
-}
-
-/// How a `half` texel's write stores a NaN as Metal does ([`half_nans`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum HalfNans {
-    /// Not a `half` texel's write, or one to channels that hold no NaN: the value as held.
-    Held,
-    /// The texture's channels are 16-bit floats: the half widened, its NaN the device's
-    /// conversion of the widening (the half's bits under `DriverDeviation::MetalHalfTexelWrites`).
-    Kept,
-    /// The texture's channels are other floats: every NaN lane `0x7fc00000`.
-    Canonical,
-    /// A heap element: [`HalfNans::Kept`] where its handle's texel class is a half-float
-    /// format's, else [`HalfNans::Canonical`].
-    HeapClass,
-    /// A texture slot whose storage choice declares no format: [`HalfNans::Kept`] where its
-    /// `PushField::TextureHalfChannels` is 1, else [`HalfNans::Canonical`].
-    SlotWord(SlotRef),
-}
-
-impl HalfNans {
-    /// The words of the write's NaN handling: the test and select of `emit::quiet_nans`, and for a
-    /// runtime choice its class test or word load and select.
-    pub(crate) fn words(self) -> u32 {
-        match self {
-            HalfNans::Held | HalfNans::Kept => 0,
-            HalfNans::Canonical => 24,
-            HalfNans::HeapClass => 24 + 16 + emit::heap_half_words(),
-            HalfNans::SlotWord(_) => 24 + 32,
         }
     }
 }
@@ -643,6 +542,9 @@ pub enum TextureStrategy {
     /// A sample of a texture slot bound in an extended-range format, emulated by fetches of its
     /// raw texels (`sampler::extended`).
     ExtendedSample(Box<crate::lower::sampler::extended::Sample>),
+    /// A sample of a two-plane YCbCr texture slot whose variant reads its planes in place,
+    /// computed from their codes (`sampler::in_place`).
+    InPlaceSample(Box<crate::lower::sampler::in_place::Sample>),
     /// An operation on the absent handle: a texture or sampler a function constant removed
     /// (`memory::handles::Candidate::Absent`).
     AbsentArgument(AbsentArgument),
@@ -792,9 +694,9 @@ impl Switch {
         };
         // The shared form (SEMANTICS 1012): the emulation once, and per arm its image's reads.
         if let Some(arms) = self.shared() {
-            let (once, per_arm) = arms.first().map_or((0, 0), |(_, s)| {
-                (s.words() + s.routed_words(), s.shared_arm_words())
-            });
+            let (once, per_arm) = arms
+                .first()
+                .map_or((0, 0), |(_, s)| (s.words(), s.shared_arm_words()));
             return once
                 .saturating_add(per_arm.saturating_mul(arms.len() as u32))
                 .saturating_add(crate::lower::sampler::SHARED_WORDS)
@@ -828,29 +730,17 @@ impl FamilyStrategy for TextureStrategy {
 impl TextureStrategy {
     /// The sampled images of combined bindings this strategy makes: its own sampling's, or its
     /// switch's arms' (each the static sampling of one binding). Under the separate form each is
-    /// made from the separate texture and sampler. A sampling makes one in its open block, and
-    /// Metal's emulated linear filter one more in each block that reads the binding: the
-    /// emulation's and the device's sample's, or the raw emulation's alone; an emulated cube
-    /// gather's device arm one more, where it has one; a plain fetch one in each arm of its branch,
-    /// the fetch's and the device's access's. A switch that emulates once ([`Switch::shared`],
-    /// SEMANTICS 1012) makes them only for its arms' device accesses
-    /// ([`Sampling::shared_sampled_images`]).
+    /// made from the separate texture and sampler. A sampling makes one in its open block. A switch
+    /// that emulates once ([`Switch::shared`], SEMANTICS 1012) makes none: its bicubic taps read
+    /// each arm's image alone.
     pub fn combined_samplings(&self) -> u32 {
         match self {
             TextureStrategy::Sampling(s) => match s.source {
-                crate::lower::sampler::Source::Combined(_) => {
-                    1 + s.linear.as_ref().map_or(0, |l| if l.raw { 1 } else { 2 })
-                        + s.cube_gather
-                            .as_ref()
-                            .map_or(0, |g| u32::from(!g.raw && !g.integer))
-                        + 2 * u32::from(s.fetched.is_some())
-                }
+                crate::lower::sampler::Source::Combined(_) => 1,
                 _ => 0,
             },
             TextureStrategy::Switch(w) => match w.shared() {
-                Some(arms) => arms
-                    .iter()
-                    .fold(0, |n, (_, s)| n.saturating_add(s.shared_sampled_images())),
+                Some(_) => 0,
                 None => w
                     .arms
                     .iter()
@@ -900,6 +790,7 @@ impl TextureStrategy {
             TextureStrategy::ImageblockSlice(s) if s.guard => "texture.imageblock_slice_guarded",
             TextureStrategy::ImageblockSlice(_) => "texture.imageblock_slice",
             TextureStrategy::ExtendedSample(e) => e.name(),
+            TextureStrategy::InPlaceSample(e) => e.name(),
             TextureStrategy::AbsentArgument(_) => AbsentArgument::NAME,
         })
     }
@@ -927,25 +818,13 @@ impl TextureStrategy {
                         0
                     }
                     + emit::class_write_words(w.class)
-                    + w.heap_half.map_or(0, heap_half_write_words)
-                    + match w.heap_small_floats {
-                        true => heap_half_write_words(StorageImageClass::SmallFloatQuietNan),
-                        false => 0,
-                    }
                     + if w.heap_alpha_red {
                         emit::HEAP_ALPHA_IN_RED_WORDS
                     } else {
                         0
                     }
-                    + w.half_nans.words()
-                    + w.norm.words(w.image.heap())
                     + if w.cross.is_some() { 48 } else { 0 }
                     + w.saturate.words()
-                    + if w.heap_bits {
-                        heap_bits_write_words()
-                    } else {
-                        0
-                    }
             }
             TextureStrategy::Atomic(a) => a.words(),
             TextureStrategy::Query(q) => {
@@ -967,6 +846,7 @@ impl TextureStrategy {
             TextureStrategy::Switch(s) => s.words(),
             TextureStrategy::ImageblockSlice(s) => s.words(),
             TextureStrategy::ExtendedSample(e) => e.words(),
+            TextureStrategy::InPlaceSample(e) => e.words(),
             // `access::absent::AbsentRead`'s status write, and the zero, a constant.
             TextureStrategy::AbsentArgument(a) => {
                 if a.marks {
@@ -1002,13 +882,6 @@ pub struct TexturePlan {
     /// Some heap color texture's sample or gather has a `half` result, which converts by the
     /// class its handle carries (`emit::heap_half_class`): the module defines the `half` routine.
     pub heap_half: bool,
-    /// Some heap color texture's read, gather or sample with a `float` result may read one
-    /// texel, which converts by the class its handle carries (`emit::heap_float_class`): the module
-    /// defines the `float` routine.
-    pub heap_float: bool,
-    /// Some heap texture's `float` write rounds to a normalized format's codes by the class its
-    /// handle carries ([`NormWrite::Class`]): the module defines the rounding routine.
-    pub heap_norm_write: bool,
     /// The results of the heap reads that decode a member of a form a heap reads
     /// (`ExtendedRange::HEAP_READ`): `false` a `float` one, `true` a `half` one. The module
     /// defines that decode's routine for each ([`heap_raw::define`]).
@@ -1016,10 +889,6 @@ pub struct TexturePlan {
     /// The guard conditions of the slice writes every invocation shares (`cooperative`): each
     /// one's branch is taken by every invocation, so its condition is emitted as `true`.
     pub cooperative: BTreeSet<ValueId>,
-    /// Which families the module's `half` routine tells apart ([`half_families`]): every
-    /// measured one, or on a device that samples through Metal's own texture unit only those
-    /// whose `half` is not Metal's `float` texel rounded to nearest even.
-    pub half_families: half::HalfFamilies,
     /// The heap operations the function selects (texture and sampling): each masks its handle
     /// where the handle-table search carries flags in it (`AccessPlan::lookup`).
     pub heap_uses: u32,
@@ -1027,11 +896,12 @@ pub struct TexturePlan {
     /// nil texture's arm), sorted (`absent_arm`), whose words the census counts under
     /// [`ABSENT_ARM`]: computed after the body's selection.
     pub absent_arm: Vec<ValueId>,
-    /// The measured driver deviations, as their properties, the function's `float` writes to a
-    /// half-float storage image rely on (`select_write`): a write left to the device's
-    /// conversion because it stores Metal's half (`MetalHalfStorageWrites`), or a NaN rounded to
-    /// `0x7fc00000` because the device stores that as Metal's (`MetalFloatStorageNans`). The
-    /// module requires them.
+    /// The measured driver deviations, as their properties, the function's storage writes rely
+    /// on (`select_write`): a `float` write to a half-float storage image, left to the device's
+    /// conversion because it stores Metal's half (`MetalHalfStorageWrites`) and its NaN
+    /// (`MetalHalfStorageNans`), a write that may reach a normalized format, because it stores
+    /// Metal's codes (`MetalNormStorageWrites`), and a `half` texel's NaN to a 16-bit float format
+    /// (`MetalHalfTexelWrites`). The module requires them.
     pub storage_properties: BTreeSet<crate::device::requirements::VkProperty>,
     /// The function's depth comparisons the device makes read depth images that keep values
     /// outside `[0, 1]` without `VK_EXT_depth_range_unrestricted` because the driver's do
@@ -1094,29 +964,15 @@ pub struct Declared {
     /// The tile map of each slot with a tile-map arm: a word view of its `ResourceKind::TileMap`
     /// binding.
     pub tile_maps: BTreeMap<u32, crate::memory::views::View>,
-    /// The raw view of each slot a read of which takes an 8-bit sRGB texel's raw code
-    /// (`ResourceKind::RawTexture`): its variable.
-    pub raw: BTreeMap<u32, GlobalId>,
-    /// The declaration of the raw view of each slot a read of which takes a 16-bit float texel's
-    /// own bits (`SlotPlan::half_bits`): the unsigned integer image of the slot's shape, whose
-    /// class widens the bits (`StorageImageClass::HalfBits`). Its variable is the slot's in
-    /// [`raw`](Self::raw).
-    pub half_bits: BTreeMap<u32, ImageDecl>,
     /// The `TexelFormat` specialization constant of each slot whose texels a read, gather, or
     /// sample converts to a `half` result by the bound format's class.
     pub half_format: BTreeMap<u32, ConstId>,
     /// The module's routine of that conversion ([`half::define`]), defined once where a slot
     /// takes it.
     pub half_routine: Option<FuncId>,
-    /// The `PlainHalfTexels` specialization constant of each slot of those on a device whose
-    /// routine tells apart Metal's sampler's families alone (`half::HalfFamilies::MetalSampler`).
+    /// The `PlainHalfTexels` specialization constant of each of those slots: whether the bound
+    /// class converts by the plain arm (`half` module docs).
     pub plain_half: BTreeMap<u32, SValue>,
-    /// The module's routine converting one texel to a `float` result by the class
-    /// ([`float_texel::define`]), defined once where a slot takes it.
-    pub float_routine: Option<FuncId>,
-    /// The module's routine rounding a written `float` texel to a normalized format's codes by
-    /// the class ([`norm_write::define`]), defined once where a write takes it.
-    pub norm_routine: Option<FuncId>,
     /// The `TextureSwizzle` specialization constant of each texture buffer slot whose reads
     /// apply the bound texture buffer's swizzle, and of each storage slot of
     /// `LoweringInputs::swizzled_storage` whose reads and writes apply the bound texture's, or
@@ -1265,44 +1121,24 @@ pub fn declare(
                 }
                 None => image,
             };
-            let g = mb.resource(
-                crate::pipeline::sym::ResourceSlot::metal(s.slot),
-                crate::spirv::ir::StorageClass::UniformConstant,
-                ty,
-            )?;
+            // A planes image's slot is the combined image sampler of the device's conversion
+            // (`ResourceKind::YCbCrPlanes`).
+            let (ty, symbol) = match decl.planes_sampler {
+                Some(sampler) => (
+                    mb.ty(SType::SampledImage { image: ty })?,
+                    crate::pipeline::sym::ResourceSlot {
+                        stage: s.slot.stage,
+                        kind: crate::pipeline::sym::ResourceKind::YCbCrPlanes(sampler),
+                        index: s.slot.index,
+                    },
+                ),
+                None => (ty, crate::pipeline::sym::ResourceSlot::metal(s.slot)),
+            };
+            let g = mb.resource(symbol, crate::spirv::ir::StorageClass::UniformConstant, ty)?;
             if s.volatile && volatile_decorated(plan) {
                 mb.volatile(g)?;
             }
             d.images.insert(*index, (g, image));
-            // The raw view, a sampled slot's, never level views: an 8-bit sRGB texture's codes
-            // through an image of the same type, and a 16-bit float texture's own bits through an
-            // unsigned integer image of the same shape (`HalfTexelBitsPolicy::Exact`).
-            if s.raw || s.half_bits {
-                let (ty, alias) = match s.half_bits {
-                    true => {
-                        let alias = ImageDecl {
-                            texel: slot::TexelClass::Uint,
-                            class: StorageImageClass::HalfBits,
-                            ..*decl
-                        };
-                        (alias.declare(mb)?, Some(alias))
-                    }
-                    false => (image, None),
-                };
-                let r = mb.resource(
-                    crate::pipeline::sym::ResourceSlot {
-                        stage: s.slot.stage,
-                        kind: crate::pipeline::sym::ResourceKind::RawTexture,
-                        index: s.slot.index,
-                    },
-                    crate::spirv::ir::StorageClass::UniformConstant,
-                    ty,
-                )?;
-                d.raw.insert(*index, r);
-                if let Some(alias) = alias {
-                    d.half_bits.insert(*index, alias);
-                }
-            }
         }
         if s.presence {
             let b = mb.ty(SType::Bool)?;
@@ -1362,9 +1198,9 @@ pub fn declare(
             )?;
         }
         if s.half_format && d.half_routine.is_none() {
-            d.half_routine = Some(half::define(mb, plan.families.texture.half_families)?);
+            d.half_routine = Some(half::define(mb)?);
         }
-        if s.half_format && half::takes_plain_arm(mb, plan.families.texture.half_families) {
+        if s.half_format {
             let b = mb.ty(SType::Bool)?;
             let c = mb.spec(
                 crate::pipeline::sym::SpecKey::PlainHalfTexels(s.slot),
@@ -1372,12 +1208,6 @@ pub fn declare(
                 ConstBits(1),
             )?;
             d.plain_half.insert(*index, mb.const_value(c)?);
-        }
-        if s.float_format && d.float_routine.is_none() {
-            d.float_routine = Some(float_texel::define(mb)?);
-        }
-        if s.norm_write && d.norm_routine.is_none() {
-            d.norm_routine = Some(norm_write::define(mb)?);
         }
         if s.swizzle {
             let u32_ = mb.ty(SType::Int {
@@ -1433,21 +1263,6 @@ pub fn declare(
         let g = heap_array(mb, plan.stage, class, decl)?;
         d.heap.insert(class, g);
     }
-    // The unsigned integer twins the writes of half-float members store their bits through,
-    // each declared once; a group of the float class decorates it as the float class.
-    for h in plan.families.texture.heap.values() {
-        let Some((class, decl)) = h.bits else {
-            continue;
-        };
-        if d.heap.contains_key(&class) {
-            continue;
-        }
-        let g = heap_array(mb, plan.stage, class, decl)?;
-        if h.volatile && volatile_decorated(plan) {
-            mb.volatile(g)?;
-        }
-        d.heap.insert(class, g);
-    }
     // The classes of other numeric types the reads and queries of a member of another class
     // read it through, each declared once.
     for (class, decl) in plan
@@ -1470,13 +1285,7 @@ pub fn declare(
         d.heap_classes = Some(declare_heap_classes(mb)?);
     }
     if plan.families.texture.heap_half && d.half_routine.is_none() {
-        d.half_routine = Some(half::define(mb, plan.families.texture.half_families)?);
-    }
-    if plan.families.texture.heap_float && d.float_routine.is_none() {
-        d.float_routine = Some(float_texel::define(mb)?);
-    }
-    if plan.families.texture.heap_norm_write && d.norm_routine.is_none() {
-        d.norm_routine = Some(norm_write::define(mb)?);
+        d.half_routine = Some(half::define(mb)?);
     }
     Ok(d)
 }
@@ -1510,20 +1319,6 @@ fn declare_heap_classes(mb: &mut ModuleBuilder) -> BResult<GlobalId> {
         parts: parts.into(),
     })?;
     mb.plain_global(crate::spirv::ir::StorageClass::Private, arr, Some(init))
-}
-
-/// The words a heap texture's `float` write adds where its handle's class may be a half-float
-/// format's, written by class `class`, at most: the test of the class index, the class's write, and
-/// the choice between it and the texel as computed.
-pub(crate) fn heap_half_write_words(class: StorageImageClass) -> u32 {
-    emit::heap_half_words() + emit::class_write_words(class) + 32
-}
-
-/// The words a heap texture's `half` or `float` write adds where it stores a half-float member's
-/// bits through the unsigned integer twin, at most: the test of the class index, the bits, the
-/// twin's access chain and load, and the branch between the two writes.
-pub(crate) fn heap_bits_write_words() -> u32 {
-    emit::heap_bits_words() + emit::class_write_words(StorageImageClass::HalfBits) + 96
 }
 
 /// The words [`heap_texel_class`] emits, at most: the field's shift and mask, the clamp into the
@@ -1698,128 +1493,33 @@ pub enum OneTexel {
     Heap(ValueId),
 }
 
-/// A read, gather, or sample of `image`, of shape `shape`, with a `half` result, which reads one
-/// texel where `one` says. On a slot of a color texture, a texture buffer's included (Metal reads a
-/// texture buffer's texels as a texture's, measured on the P2a probe), it converts the texels by
-/// the bound format's class (`half`), which the slot's `TexelFormat` specialization gives
-/// (`RuntimeFact::TexelFormat`); a heap color texture's sample or gather by the class its handle
-/// carries (its caller asks the routine), whose `OTHER` arm no specialization rules out; a heap
-/// element's read and a depth texture's are rounded exactly (`narrow::round_texel`). The module
-/// notes each heap and depth access as `PrecisionNote::HalfTexelConversion`: a format whose
-/// conversion is not measured takes that rounding of the device's `f32` texel, which Metal's
-/// conversion may not be. A slot's access notes it where its class names no measured family
-/// ([`unmeasured_class`]), the conversion's `OTHER` arm, and, where the access reads one texel, no
-/// packed field either: through a runtime sampler slot, where its word filters. Where the access
-/// converts the device's texel only under `arm`'s clauses (a runtime sampler's emulation of an
-/// 8-bit sRGB slot's raw codes, whose device arm alone converts one), the note holds there alone.
-/// On a device that samples through Metal's own texture unit, an 8-bit sRGB format's class is
-/// Metal's too ([`unconverted_class`]); where that device also rounds to `half` as Metal does
-/// ([`half_families`]), every measured class's is, so the access notes it where the bound format's
-/// class is unmeasured there, as the slot's `UnmeasuredTexels` specialization states, whatever the
-/// access and its sampler.
+/// A read, gather, or sample of `image`, of shape `shape`, with a `half` result, a sample where
+/// `sample` (a sample's and a pixel fetch's form: not a read's or a gather's). Its `half` is the
+/// device's `f32` texel rounded to nearest even (`narrow::round_texel`) on every device, recorded
+/// as `PrecisionNote::HalfTexelConversion` where Metal's `half` result may differ from it.
 ///
-/// Where the access's texel is the device's (`device`, [`device_texels`]), it is rounded exactly as
-/// a heap element's, and noted alike.
-/// Whether a read of `image`, of shape `shape`, with a `half` or `float` result takes a 16-bit
-/// float texel's own bits from the slot's unsigned integer alias view, widened exactly
-/// ([`HalfTexelBitsPolicy::Exact`](crate::device::HalfTexelBitsPolicy::Exact)): Metal's
-/// `texture2d<half>` never widens, so such a texel's NaN is its own code, which a device whose
-/// decode into `f32` canonicalizes has destroyed before the shader sees it (MoltenVK on an Apple
-/// GPU, measured over every NaN code of the three formats; ANV on Intel's GPUs, from the
-/// conformance suite's replay).
-///
-/// Of a colour texture slot the function declares `access::read`, which Metal lets it only read,
-/// so the one declaration the slot has can be the alias's: a slot it may sample, gather, compare,
-/// write or update atomically keeps the device's decode. Not of a texture buffer, a depth texture,
-/// a heap element, or a device that does not sample the alias
-/// (`metal::format::half_bits_read_view` of every 16-bit float format). The slot takes a second
-/// binding of the alias view (`ResourceKind::RawTexture`, `RuntimeFact::HalfBitsTexture`), and
-/// states its `TexelFormat` class, on which the read branches: the device's texel stays the arm of
-/// every other class, whose NaN Metal answers `0x7e00` already.
-///
-/// A read through a snapshot takes that arm from the snapshot's codes, where the copy fetched the
-/// alias on the same branch ([`half_bits_snapshot`]).
-pub(crate) fn half_bits_read(
-    cx: &mut SelectCx<'_>,
-    image: ImageRef,
-    shape: ImageShape,
-) -> Result<bool, Error> {
-    use crate::air::abi::Access as AbiAccess;
-    if cx.profile.fields().half_texel_bits != crate::device::HalfTexelBitsPolicy::Exact {
-        return Ok(false);
-    }
-    let ImageRef::Slot(index) = image else {
-        return Ok(false);
-    };
-    if shape.depth || shape.dim == ImageDim::Buffer {
-        return Ok(false);
-    }
-    let s = slot_of(cx, index)?;
-    if s.access != AbiAccess::Read {
-        return Ok(false);
-    }
-    let slot = s.slot;
-    if !crate::metal::texel_format::HALF_BITS_FORMATS
-        .iter()
-        .all(|&pf| crate::metal::format::half_bits_read_view(pf, cx.profile).is_some())
-    {
-        return Ok(false);
-    }
-    // A slot of the sRGB variant is bound in an 8-bit sRGB format, never a 16-bit float one, and
-    // its second binding is that variant's raw view: the two aliases share the slot's one
-    // `ResourceKind::RawTexture` binding, so no slot takes both.
-    if cx.inputs.srgb_textures.contains(&slot) {
-        return Ok(false);
-    }
-    texel_format_spec(cx, image)?;
-    if let Some(s) = cx.families.texture.slots.get_mut(&index) {
-        s.half_bits = true;
-    }
-    cx.facts
-        .insert(crate::pipeline::facts::RuntimeFact::HalfBitsTexture { slot });
-    Ok(true)
-}
-
-/// Whether the snapshot of `image`'s slot holds the texel's own 16 bits rather than the copy's
-/// fetch of the slot's image ([`half_bits_read`], `lower::fragment`'s `snapshot`): the slot is one
-/// the draw reads through a snapshot, its snapshot's form holds a 16-bit code, and the read is the
-/// plain fetch the copy makes.
-///
-/// The copy of such a slot fetches the slot's unsigned integer alias where the bound format's
-/// class names 16-bit float channels, on the same branch the read takes, and stores its codes; so
-/// one snapshot holds whichever arm the class selects, and no second image is needed. A read the
-/// shader checks is not that fetch -- the alias arm selects no out-of-bounds texel -- and keeps the
-/// device's decode, as it does without a snapshot.
-///
-/// A 16-bit float texture's snapshot takes one of two forms, whichever the slot's declared type
-/// names: `SnapshotForm::Half`, or `SnapshotForm::Bits` where the variant reads the slot in
-/// another class (`tests::engine_snapshot_exact`'s
-/// `every_half_channel_format_names_a_snapshot_form_of_16_bit_codes`). Both hold a 16-bit code,
-/// and every other form belongs to a texture whose class names no 16-bit float channels, so the
-/// copy of such a slot fetches the slot's image alone, as it did.
-fn half_bits_snapshot(cx: &SelectCx<'_>, image: ImageRef, check: ReadCheck) -> Result<bool, Error> {
-    use crate::pipeline::sym::SnapshotForm;
-    let ImageRef::Slot(index) = image else {
-        return Ok(false);
-    };
-    if check == ReadCheck::Shader {
-        return Ok(false);
-    }
-    let slot = slot_of(cx, index)?.slot;
-    Ok(matches!(
-        cx.inputs.snapshot_textures.get(&slot),
-        Some(SnapshotForm::Half | SnapshotForm::Bits)
-    ))
-}
-
+/// Where the device's texel is its own (`device`, [`device_texels`]: off Metal's own texture unit)
+/// the access records the note outright, a heap element's and a depth texture's too. On a device
+/// that samples through Metal's own texture unit (MoltenVK on Apple's GPU, whose `f32` texel is
+/// Metal's `float` result), a slot's color texture converts through the module's routine (`half`),
+/// which keeps a YCbCr field's ties away from zero on the grid `8192`, by the bound format's class
+/// (its `TexelFormat` specialization, `RuntimeFact::TexelFormat`); a heap color texture's sample or
+/// gather by the class its handle carries (its caller asks the routine). The note holds there
+/// where the bound class's `half` is not that `float` rounded to nearest even: a class measured in
+/// none of the families (the slot's `UnmeasuredTexels` specialization), a 16-bit normalized grid
+/// (`BicubicTexels::WIDE16`: three steps of each round twice), and a sample of a 32-bit float
+/// texel (`BicubicTexels::LINEAR`: Metal rounds toward zero, saturating), tests of the bound
+/// format the runtime announces at a draw or dispatch binding such a texture. A heap color
+/// texture's and a depth texture's access records it outright.
 pub(crate) fn half_texels(
     cx: &mut SelectCx<'_>,
     image: ImageRef,
     shape: ImageShape,
-    (one, arm): (OneTexel, Option<&[NoteClause]>),
+    sample: bool,
     device: bool,
     m: &mut Meter,
 ) -> Result<(), Error> {
+    use crate::metal::bicubic::BicubicTexels as B;
     let index = match image {
         ImageRef::Slot(index) if !shape.depth && !device => index,
         _ => {
@@ -1827,47 +1527,22 @@ pub(crate) fn half_texels(
             return Ok(());
         }
     };
-    let families = half_families(cx);
-    cx.families.texture.half_families = families;
-    let when = match families {
-        half::HalfFamilies::MetalSampler => {
-            // The routine's `OTHER` arm is Metal's `half` of every measured class's texel: the
-            // note holds where the bound format's class is unmeasured there. The module requires
-            // the device's sampler to be Metal's.
-            cx.families.sampler.metal_sampler = true;
-            if let Some(s) = cx.families.texture.slots.get_mut(&index) {
-                s.unmeasured = true;
-            }
-            vec![[NoteTest::equal(NoteOn::Unmeasured(index), 1, 1)].into()]
-        }
-        half::HalfFamilies::Every => {
-            let unmeasured = [unconverted_class(cx, index)?];
-            let unpacked: NoteClause = [NoteTest::equal(
-                NoteOn::Texel(index),
-                crate::metal::texel_format::TexelFormat::PACKED_MASK,
-                0,
-            )]
-            .into();
-            match one {
-                OneTexel::Always => both(&unmeasured, &[unpacked]),
-                OneTexel::Word(n) => {
-                    let mut either = vec![unpacked];
-                    either.extend(crate::lower::sampler::linear::word_filters(n));
-                    both(&unmeasured, &either)
-                }
-                OneTexel::Never | OneTexel::Heap(_) => unmeasured.to_vec(),
-            }
-        }
-    };
-    let when = match arm {
-        Some(arm) => both(&when, arm),
-        None => when,
-    };
+    // The module requires the device's sampler to be Metal's.
+    cx.families.sampler.metal_sampler = true;
+    if let Some(s) = cx.families.texture.slots.get_mut(&index) {
+        s.unmeasured = true;
+    }
+    let mut when = vec![
+        [NoteTest::equal(NoteOn::Unmeasured(index), 1, 1)].into(),
+        [NoteTest::differ(NoteOn::Bound(index), B::WIDE16, 0)].into(),
+    ];
+    if sample {
+        when.push([NoteTest::differ(NoteOn::Bound(index), B::LINEAR, 0)].into());
+    }
     cx.note_when(PrecisionNote::HalfTexelConversion, when, m)?;
     let slot = slot_of(cx, index)?.slot;
     if let Some(s) = cx.families.texture.slots.get_mut(&index) {
         s.half_format = true;
-        s.half_filtered |= one != OneTexel::Always;
     }
     cx.facts
         .insert(crate::pipeline::facts::RuntimeFact::TexelFormat { slot });
@@ -1900,281 +1575,37 @@ pub(crate) fn half_texel_nans(
     }
 }
 
-/// How a `half` read, sample or gather of `image` (shape `shape`), which reads one texel where
-/// `one` says, answers a NaN texel where the NaN switch asks for Metal's NaN
-/// (`NanMinMaxPolicy::Exact`, the profile's `TexelNanRoute::Metal`, on every device: whatever
-/// NaN the device's arithmetic answers, the texel's is the image's decode): by Metal's rule, a NaN
-/// texel read, sampled or gathered one texel at a time from a texture of
-/// 16-bit float channels is its own (the device's decode, which a device that widens a half
-/// texel exactly decodes to its bits), and every other NaN `0x7e00`. The class of the texture
-/// bound says which: a slot's `TexelFormat` class, which the binder pushes as data
-/// ([`texel_format_spec`]); a heap element's, its handle's class index; a depth texture's never; an
-/// access that never reads one texel needs none ([`NanClass::Never`]). `None` where the switch is
-/// off, or where nothing tells the class (a heap's texture buffer, whose handle carries none: its
-/// NaN stays the device's decode, noted by [`half_texel_nans`]).
-pub(crate) fn texel_nans_class(
+/// Record what a read, gather, or sample of `image`, of shape `shape`, with a `float` result that
+/// may read one texel (`one` not [`OneTexel::Never`]) answers on a profile without Metal's own
+/// sampler (`VkProperty::MetalSampler`, whose device value is Metal's): the device's conversion of
+/// the texel's codes, `PrecisionNote::DeviceTexelConversion`; of a heap's texture buffer, which no
+/// class reaches, a half-float texel's NaN the device's decode, `PrecisionNote::DeviceNanEncoding`.
+pub(crate) fn float_texel_notes(
     cx: &mut SelectCx<'_>,
     image: ImageRef,
     shape: ImageShape,
     one: OneTexel,
-) -> Result<Option<NanClass>, Error> {
-    use crate::device::profile::TexelNanRoute;
-    if cx.profile.fields().texel_nans != TexelNanRoute::Metal {
-        return Ok(None);
+) {
+    if one == OneTexel::Never || !device_texels(cx) {
+        return;
     }
-    Ok(Some(match image {
-        _ if shape.depth || one == OneTexel::Never => NanClass::Never,
-        ImageRef::Slot(_) => {
-            texel_format_spec(cx, image)?;
-            let ImageRef::Slot(index) = image else {
-                return Err(cx.invariant("a slot's class of a heap element"));
-            };
-            NanClass::Slot(index)
-        }
-        ImageRef::Heap { .. } if shape.dim == ImageDim::Buffer => return Ok(None),
-        ImageRef::Heap { handle, .. } => {
-            cx.families.access.heap_class_index = true;
-            NanClass::Heap(handle)
-        }
-    }))
-}
-
-/// How a `half` texel access tells whether the texture bound holds 16-bit float channels, whose
-/// NaN texel Metal hands back as its own bits where the access reads one texel
-/// ([`texel_nans_class`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum NanClass {
-    /// Slot `index`'s `TexelFormat` class (`RuntimeFact::TexelFormat`, read as data): the
-    /// half-float family's without a packed field (`metal::texel_format::half_channels`), or
-    /// `TexelFormat::OTHER`, whose conversion is not measured: the device's decode, as before.
-    Slot(u32),
-    /// The class index heap handle `handle` carries (`emit::heap_half_format`).
-    Heap(ValueId),
-    /// A depth texture: never 16-bit float channels, so every NaN is `0x7e00`.
-    Never,
-}
-
-impl NanClass {
-    /// The estimated words of an access's answer of Metal's NaN: the texel's NaN test (the bitcast,
-    /// the mask, the compare and their constants), the canonical NaN, the class test (a slot's mask
-    /// and compare, a heap handle's [`emit::heap_half_words`]), a runtime sampler's filter test,
-    /// and the two selects.
-    pub(crate) fn words(self) -> u32 {
-        let class = match self {
-            NanClass::Slot(_) => 40,
-            NanClass::Heap(_) => emit::heap_half_words(),
-            NanClass::Never => 0,
-        };
-        64 + class + 48
-    }
-}
-
-/// A read, gather, or sample of `image`, of shape `shape`, with a `float` result that may read
-/// one texel (`one` not [`OneTexel::Never`]): on a color texture slot, a texture buffer's included,
-/// on a profile without Metal's own sampler (`VkProperty::MetalSampler`, whose device value is
-/// Metal's), its texel converts by the bound format's class (`float_texel`), which the slot's
-/// `TexelFormat` specialization gives (`RuntimeFact::TexelFormat`); a heap color texture's (not a
-/// texture buffer's) by the class its handle carries, which the module reads from the handle
-/// (`AccessPlan::heap_class`). Whether it does. Nothing is noted: the conversion is exact where the
-/// class names a normalized family, a packed one or a half-float one, and the device's value
-/// elsewhere, as before. A heap's texture buffer carries no class, so it is not converted, and a
-/// half-float texel's NaN there stays the device's: `PrecisionNote::DeviceNanEncoding`.
-///
-/// A depth texture's too, a comparison's never (its caller's test): Metal reads and samples one
-/// texel of `Depth16Unorm` as `c / 65535` correctly rounded (every code), its
-/// class `R16Unorm`'s, where a device may multiply by the reciprocal (lavapipe: 512 codes one ulp
-/// off); a 32-bit float depth's class keeps the device's value. A heap's depth texture's handle
-/// carries that class as a colour one's does (`metal::texel_format::heap_class` of its format), so
-/// it converts by it alike.
-pub(crate) fn float_texels(
-    cx: &mut SelectCx<'_>,
-    image: ImageRef,
-    shape: ImageShape,
-    one: OneTexel,
-    device: bool,
-) -> Result<bool, Error> {
-    if one == OneTexel::Never {
-        return Ok(false);
-    }
-    let metal_sampler = cx
-        .profile
-        .fields()
-        .enabled
-        .properties
-        .contains(&crate::device::requirements::VkProperty::MetalSampler);
-    if metal_sampler {
-        return Ok(false);
-    }
-    // Native device sampling: the device's value, but where a heap's texture buffer notes its
-    // NaN below (it carries no class to convert by under either policy).
-    let heap_buffer = image.heap() && shape.dim == ImageDim::Buffer;
-    if device && !heap_buffer {
-        cx.precision.insert(PrecisionNote::DeviceTexelConversion);
-        return Ok(false);
-    }
-    let index = match image {
-        ImageRef::Slot(index) => index,
-        ImageRef::Heap { .. } if shape.dim != ImageDim::Buffer => {
-            cx.families.texture.heap_float = true;
-            cx.families.access.heap_class = true;
-            return Ok(true);
-        }
-        // A heap's texture buffer carries no class: a half-float texel's NaN stays the device's.
-        ImageRef::Heap { .. } => {
-            cx.precision.insert(PrecisionNote::DeviceNanEncoding);
-            return Ok(false);
-        }
+    let note = match image.heap() && shape.dim == ImageDim::Buffer {
+        true => PrecisionNote::DeviceNanEncoding,
+        false => PrecisionNote::DeviceTexelConversion,
     };
-    let slot = slot_of(cx, index)?.slot;
-    if let Some(s) = cx.families.texture.slots.get_mut(&index) {
-        s.float_format = true;
-    }
-    cx.facts
-        .insert(crate::pipeline::facts::RuntimeFact::TexelFormat { slot });
-    Ok(true)
+    cx.precision.insert(note);
 }
 
 /// Whether an access's `float` or `half` texel is the device's conversion: on a profile whose
 /// device does not sample through Metal's own texture unit (`VkProperty::MetalSampler`, whose value
-/// is Metal's and keeps the conversion), where the policy says so (`TexelConversionPolicy::Device`,
-/// the default), and for a sample or gather (`sampled`) also where the device's sampler answers it
-/// (`DeviceProfile::device_samples`, `SamplingPolicy::NativeDevice`), whose conversion of a
-/// sample's one texel would read the runtime sampler's filter and split the pipeline by it. A
-/// read's texel under `TexelConversionPolicy::Exact` is Metal's conversion on every sampling
-/// policy. Every access of a kind agrees: the selection states a sample's `half` conversion on the
-/// access (`Sampling::half_texel`), which the emission follows.
-pub(crate) fn device_texels(cx: &SelectCx<'_>, sampled: bool) -> bool {
-    let fields = cx.profile.fields();
-    let metal = fields
-        .enabled
-        .properties
-        .contains(&crate::device::requirements::VkProperty::MetalSampler);
-    let policy = fields.texel_conversion == crate::device::TexelConversionPolicy::Device;
-    !metal && (policy || (sampled && cx.profile.device_samples()))
-}
-
-/// The families the module's `half` routine tells apart (`half::HalfFamilies`): on a device whose
-/// texel is Metal's `float` result of the access (`VkProperty::MetalSampler`) and whose rounding to
-/// nearest even is Metal's (`QuantizeForm::Device`, `Converted` and `Controlled`), only those whose
-/// `half` is not that texel rounded to nearest even ([`half::HalfFamilies::MetalSampler`]);
-/// elsewhere every measured one. A function of the profile alone, so every access of a function
-/// agrees.
-pub(crate) fn half_families(cx: &SelectCx<'_>) -> half::HalfFamilies {
-    use crate::spirv::builder::QuantizeForm;
-    let metal = cx
-        .profile
+/// is Metal's and keeps the conversion). Every access of a kind agrees: the selection states a
+/// sample's `half` conversion on the access (`Sampling::half_texel`), which the emission follows.
+pub(crate) fn device_texels(cx: &SelectCx<'_>) -> bool {
+    !cx.profile
         .fields()
         .enabled
         .properties
-        .contains(&crate::device::requirements::VkProperty::MetalSampler);
-    let rounds = matches!(
-        crate::lower::arith::narrow::quantize_form(cx.profile),
-        QuantizeForm::Device | QuantizeForm::Converted | QuantizeForm::Controlled
-    );
-    match metal && rounds {
-        true => half::HalfFamilies::MetalSampler,
-        false => half::HalfFamilies::Every,
-    }
-}
-
-/// The clause of texture slot `index` bound in a format whose class names no measured family: its
-/// `TexelFormat` specialization holds none of `LINEAR`, `HALF`, and `EXACT`, the value on which the
-/// conversion routine and the emulated filters take the device's arm.
-pub(crate) fn unmeasured_class(index: u32) -> NoteClause {
-    use crate::metal::bicubic::BicubicTexels as B;
-    [NoteTest::equal(
-        NoteOn::Texel(index),
-        B::LINEAR | B::HALF | B::EXACT,
-        0,
-    )]
-    .into()
-}
-
-/// The clause of texture slot `index` where its `half` conversion may not be Metal's
-/// ([`half_texels`]): [`unmeasured_class`], and where the slot may be bound in an 8-bit sRGB
-/// format (its variant, `LoweringInputs::srgb_textures`) on a device that samples through
-/// Metal's own texture unit (`VkProperty::MetalSampler`: MoltenVK on Apple's GPU), also no `SRGB`
-/// bit, the module requiring the property there. That device's `f32` texel of such a format is
-/// Metal's `float` value: a step on `1/4095` (a color channel's table step, or a linear sum
-/// rounded onto its grid), `1/4080` (alpha's linear sum), or `1/255` (alpha's code), rounded to
-/// nearest even (`metal::texel_format`). The conversion's `OTHER` arm rounds that to `half` to
-/// nearest even, which is the step's own rounding to `half`, Metal's `half` value: on those grids
-/// no step lies near enough a tie between halves for the `f32` rounding to move it across
-/// (`metals_srgb_float_steps_round_to_their_half_steps`).
-fn unconverted_class(cx: &mut SelectCx<'_>, index: u32) -> Result<NoteClause, Error> {
-    use crate::metal::bicubic::BicubicTexels as B;
-    let srgb = cx.inputs.srgb_textures.contains(&slot_of(cx, index)?.slot);
-    let metal = cx
-        .profile
-        .fields()
-        .enabled
-        .properties
-        .contains(&crate::device::requirements::VkProperty::MetalSampler);
-    if !(srgb && metal) {
-        return Ok(unmeasured_class(index));
-    }
-    cx.families.sampler.metal_sampler = true;
-    Ok([NoteTest::equal(
-        NoteOn::Texel(index),
-        B::LINEAR | B::HALF | B::EXACT | B::SRGB,
-        0,
-    )]
-    .into())
-}
-
-/// An emulated linear sample of `image` that converts no texel to `half` by the class: a raw
-/// sample, whose emulation reads the `UNORM`, `SRGB`, and channel bits, or a sample with a `float`
-/// result, whose emulation reads the format's treatment; or an emulated cube gather, a depth cube's
-/// included, whose corner rule the class states. The slot's `TexelFormat` specialization
-/// (`RuntimeFact::TexelFormat`), without the conversion routine. Nothing is noted here: a raw
-/// sample's decode is exact, and the sample's selection records its filter's note.
-pub(crate) fn texel_format_spec(cx: &mut SelectCx<'_>, image: ImageRef) -> Result<(), Error> {
-    let ImageRef::Slot(index) = image else {
-        return Err(cx.invariant("an emulated linear sample of a heap element"));
-    };
-    let slot = slot_of(cx, index)?.slot;
-    if let Some(s) = cx.families.texture.slots.get_mut(&index) {
-        s.texel_format = true;
-    }
-    cx.facts
-        .insert(crate::pipeline::facts::RuntimeFact::TexelFormat { slot });
-    Ok(())
-}
-
-/// Whether a linear sample of `image` (shape `shape`) on a device whose sampler answers it
-/// (`DeviceProfile::device_samples`) takes the emulation of Metal's filter: at a sampled color
-/// texture slot under its YCbCr variant (`LoweringInputs::ycbcr_textures`), whose bound format's
-/// view holds converted texels Metal filters on its own grid. Such a slot of any such sample
-/// records `RuntimeFact::YCbCrTexture`, which puts it in the variant where the binder binds a
-/// YCbCr format there, on a profile that takes the variant (`ProfileFields::ycbcr_variant`: under
-/// `YCbCrFilterPolicy::Exact`, and on a device that samples through Metal's own sampler also under
-/// `SamplingPolicy::Exact`). On any other profile the slot records nothing and the device filters
-/// such a texture as any other (`YCbCrFilterPolicy::Device`), which the module's
-/// `PrecisionNote::DeviceSampling` states, or, through Metal's own sampler, its filter note under
-/// the bound format (`lower::sampler::linear::metal_filtered_ycbcr`).
-pub(crate) fn ycbcr_texture(
-    cx: &mut SelectCx<'_>,
-    image: ImageRef,
-    shape: ImageShape,
-) -> Result<bool, Error> {
-    let ImageRef::Slot(index) = image else {
-        return Ok(false);
-    };
-    if shape.dim == ImageDim::Buffer
-        || shape.depth
-        || shape.ms
-        || !cx.profile.fields().ycbcr_variant
-    {
-        return Ok(false);
-    }
-    let s = slot_of(cx, index)?;
-    if s.storage() {
-        return Ok(false);
-    }
-    let slot = s.slot;
-    cx.facts
-        .insert(crate::pipeline::facts::RuntimeFact::YCbCrTexture { slot });
-    Ok(cx.inputs.ycbcr_textures.contains(&slot))
+        .contains(&crate::device::requirements::VkProperty::MetalSampler)
 }
 
 /// The address-mode map constexpr sampler `words` samples texture slot `index` under: the map
@@ -2194,60 +1625,35 @@ pub(crate) fn constexpr_address_map(
     Ok(cx.inputs.address_maps.get(&slot).copied())
 }
 
-/// Whether `image` is a slot under its YCbCr variant ([`ycbcr_texture`]), on a profile that takes
-/// the variant.
-pub(crate) fn ycbcr_slot(cx: &SelectCx<'_>, image: ImageRef) -> Result<bool, Error> {
-    match image {
-        ImageRef::Slot(_) if !cx.profile.fields().ycbcr_variant => Ok(false),
-        ImageRef::Slot(index) => Ok(cx.inputs.ycbcr_textures.contains(&slot_of(cx, index)?.slot)),
-        ImageRef::Heap { .. } => Ok(false),
-    }
-}
-
-/// How an access of a texture an 8-bit sRGB format may be bound to reads its texels under the
-/// slot's variant ([`srgb_texels`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SrgbReach {
-    /// Through the device's decode alone: no form the raw codes serve.
-    Device,
-    /// From the raw codes alone, decoded or summed exactly as Metal does.
-    Raw,
-    /// From the raw codes where a runtime sampler's word states a sampler its emulation reaches,
-    /// through the device's decode elsewhere (a runtime sampler's linear emulation): the caller
-    /// notes the device's decode where the word does not reach it.
-    Word,
-}
-
-/// A read, sample, or gather of `image` (shape `shape`) with a `half` or `float` result, which
-/// an 8-bit sRGB format bound to it would decode (`metal::texel_format`). `reach` says where the
-/// module can answer as Metal does from the raw codes: a read, a nearest sample, a pixel-coordinate
-/// fetch, and a gather with a `half` result decode the code through Metal's twelve-bit table, and a
-/// bicubic sample and an emulated linear sample sum the table steps exactly (the exact routines'
-/// `BicubicTexels::SRGB` grids), a runtime sampler's where its word reaches the emulation
-/// ([`SrgbReach::Word`]); the caller decides. On a sampled color texture slot (not a texture
-/// buffer, a depth texture, or a storage slot) the module records `RuntimeFact::SrgbTexture`, and
-/// where the slot is one of `LoweringInputs::srgb_textures` (its variant: bound in such a format)
-/// an access the raw codes serve reads them, returning `true` and declaring Metal's table
-/// (`arith::srgb`, shared with `air.unpack`'s `unorm4x8_srgb`, whose census name it is charged to),
-/// and any other access keeps the device's decode, recording `PrecisionNote::SrgbTexelDecode` and
-/// `RuntimeFact::SrgbDeviceDecode` (a device that cannot sample the bound format has no view to
-/// decode it through, so the planner refuses the texture there). An access served by the raw codes
-/// where a word reaches it records the fact too, for its device arm, and leaves the note to the
-/// caller. A heap element's format is not known, so a heap element's access records the note. On a
-/// device that decodes through Metal's own texture unit (`VkProperty::MetalSampler`: MoltenVK on
-/// Apple's GPU) the device's decode is Metal's, so the module requires the property there instead
-/// of the note.
+/// A read, sample, or gather of `image` (shape `shape`) with a `half` or `float` result, which an
+/// 8-bit sRGB format bound to it would decode (`metal::texel_format`). On a sampled color texture
+/// slot (not a texture buffer, a depth texture, or a storage slot) the module records
+/// `RuntimeFact::SrgbTexture`.
+///
+/// Where the slot is one of `LoweringInputs::srgb_textures` (its variant: bound to a format the
+/// device cannot sample, held as its UNORM twin, whose view reads the codes) the access decodes
+/// what the view reads (one texel's codes, or the device's filter of them) by the MSL transfer
+/// through the device's `Pow` (`emit::srgb_texel`), returning `true` and recording
+/// `PrecisionNote::SrgbTexelDecode`.
+///
+/// Elsewhere the access reads the device's own decode through the slot's view, an sRGB format's
+/// sRGB view: the module records `PrecisionNote::SrgbTexelDecode` where the bound format's class
+/// is an sRGB one (`BicubicTexels::SRGB`, a test of the bound format that the runtime announces at
+/// a draw or dispatch binding such a texture), and outright for a heap element, whose format is
+/// never known. On a device that decodes through Metal's own texture unit
+/// (`VkProperty::MetalSampler`: MoltenVK on Apple's GPU) the device's decode is Metal's, so the
+/// module requires the property there instead of the note.
 pub(crate) fn srgb_texels(
     cx: &mut SelectCx<'_>,
     image: ImageRef,
     shape: ImageShape,
-    reach: SrgbReach,
+    m: &mut Meter,
 ) -> Result<bool, Error> {
     if shape.dim == ImageDim::Buffer || shape.depth {
         return Ok(false);
     }
     let ImageRef::Slot(index) = image else {
-        device_decode(cx);
+        device_decode(cx, None, m)?;
         return Ok(false);
     };
     let s = slot_of(cx, index)?;
@@ -2258,57 +1664,36 @@ pub(crate) fn srgb_texels(
     cx.facts
         .insert(crate::pipeline::facts::RuntimeFact::SrgbTexture { slot });
     if !cx.inputs.srgb_textures.contains(&slot) {
+        device_decode(cx, Some(index), m)?;
         return Ok(false);
     }
-    // A form the raw codes do not serve everywhere decodes through the device's view, which a
-    // device that cannot sample the bound format does not have: under the slot's twin variant it
-    // decodes the device's filtered codes instead, through Metal's table.
-    if reach != SrgbReach::Raw {
-        cx.facts
-            .insert(crate::pipeline::facts::RuntimeFact::SrgbDeviceDecode { slot });
-    }
-    let twin = reach != SrgbReach::Raw && cx.inputs.srgb_twins.contains(&slot);
-    if reach == SrgbReach::Device && !twin {
-        device_decode(cx);
-        return Ok(false);
-    }
-    if reach == SrgbReach::Device {
-        cx.precision.insert(PrecisionNote::SrgbTexelDecode);
-    }
-    cx.families
-        .arith
-        .srgb
-        .get_or_insert(crate::air::intrinsics::PackDir::Unpack);
-    Ok(reach != SrgbReach::Device)
+    cx.precision.insert(PrecisionNote::SrgbTexelDecode);
+    Ok(true)
 }
 
-/// Whether an access of `image` that keeps the device's decode of an 8-bit sRGB texture
-/// ([`srgb_texels`] with a reach other than [`SrgbReach::Raw`]) samples the bound format's UNORM
-/// twin instead (`LoweringInputs::srgb_twins`: a format the device cannot sample), whose view reads
-/// the codes, so the access decodes the device's filtered codes through Metal's table
-/// (`texture::srgb_filtered_texel`), Metal's value exactly where the filter reads one texel.
-pub(crate) fn srgb_twin(cx: &SelectCx<'_>, image: ImageRef) -> Result<bool, Error> {
-    match image {
-        ImageRef::Slot(index) => Ok(cx.inputs.srgb_twins.contains(&slot_of(cx, index)?.slot)),
-        ImageRef::Heap { .. } => Ok(false),
-    }
-}
-
-/// An access that keeps the device's decode of a texture that may be bound in an 8-bit sRGB
-/// format ([`srgb_texels`]): `PrecisionNote::SrgbTexelDecode`, or on a device that decodes
-/// through Metal's own texture unit the requirement of `VkProperty::MetalSampler`.
-fn device_decode(cx: &mut SelectCx<'_>) {
+/// An access that reads the device's decode of a texture that may be bound in an 8-bit sRGB
+/// format ([`srgb_texels`]): `PrecisionNote::SrgbTexelDecode` where texture slot `index` is bound
+/// in such a format, or outright for a heap element (`None`); on a device that decodes through
+/// Metal's own texture unit, the requirement of `VkProperty::MetalSampler` instead.
+fn device_decode(cx: &mut SelectCx<'_>, index: Option<u32>, m: &mut Meter) -> Result<(), Error> {
+    use crate::metal::bicubic::BicubicTexels as B;
     let metal = cx
         .profile
         .fields()
         .enabled
         .properties
         .contains(&crate::device::requirements::VkProperty::MetalSampler);
-    if metal {
-        cx.families.sampler.metal_sampler = true;
-    } else {
-        cx.precision.insert(PrecisionNote::SrgbTexelDecode);
+    match (metal, index) {
+        (true, _) => cx.families.sampler.metal_sampler = true,
+        (false, Some(index)) => {
+            let srgb = NoteTest::equal(NoteOn::Bound(index), B::SRGB, B::SRGB);
+            cx.note_when(PrecisionNote::SrgbTexelDecode, vec![[srgb].into()], m)?;
+        }
+        (false, None) => {
+            cx.precision.insert(PrecisionNote::SrgbTexelDecode);
+        }
     }
+    Ok(())
 }
 
 /// The value id of an operand (constants included: emission materializes them).
@@ -2483,6 +1868,7 @@ pub fn select(
             _ => Vec::new(),
         };
         for index in slots {
+            not_in_place(cx, index);
             if extended_range(cx, ImageRef::Slot(index))?.is_some() {
                 return Err(Unsupported::not_implemented(Feature::Format).into());
             }
@@ -2524,7 +1910,9 @@ pub fn select(
             let mut arms = Vec::with_capacity(cands.len());
             for c in cands {
                 let arm = match c {
+                    // A switch-at-use's arm reads its slot's image.
                     Candidate::Texture(index) => {
+                        not_in_place(cx, index);
                         select_image(cx, (at, inst), t, &ops, ImageRef::Slot(index), m)?
                     }
                     Candidate::Absent => AbsentArgument::select(cx, at, inst, t)?,
@@ -2577,39 +1965,31 @@ fn heap_group(cx: &mut SelectCx<'_>, tex: Value, m: &mut Meter) -> Result<u32, E
 /// heap operation masks its handle to its element (an `OpBitwiseAnd`), and a read that selects the
 /// out-of-bounds alpha also tests that flag (an `OpBitwiseAnd` and an `OpINotEqual`), with their
 /// constants once; the census's for the strategy that asks for them, `texture.read_clamped.heap`
-/// where the alpha is carried, else
-/// [`DEPTH_CLASS_CENSUS`](crate::lower::sampler::compared::DEPTH_CLASS_CENSUS) where the depth
-/// class is, else [`HEAP_CLASS_CENSUS`]; with the module's table of heap texel classes
+/// where the alpha is carried, else [`HEAP_CLASS_CENSUS`]; with the module's table of heap texel classes
 /// ([`heap_classes_words`]) under [`HEAP_CLASS_CENSUS`] where a sample reads it. And the words of
 /// the `half` conversion routine (`half`), the census's for [`half::CENSUS_NAME`], where a slot
-/// takes it, and the `float` one's (`float_texel`).
+/// takes it.
 pub fn routine_words(
     texture: &TexturePlan,
     access: &crate::lower::access::AccessPlan,
 ) -> impl Iterator<Item = (&'static str, u64)> {
-    let flags = (access.heap_alpha || access.heap_depth || access.carries_class()).then(|| {
+    let flags = (access.heap_alpha || access.carries_class()).then(|| {
         let words = 16 + 16 * u64::from(texture.heap_uses);
-        let name = match (access.heap_alpha, access.heap_depth) {
-            (true, _) => "texture.read_clamped.heap",
-            (false, true) => crate::lower::sampler::compared::DEPTH_CLASS_CENSUS,
-            (false, false) => HEAP_CLASS_CENSUS,
+        let name = match access.heap_alpha {
+            true => "texture.read_clamped.heap",
+            false => HEAP_CLASS_CENSUS,
         };
         (name, words)
     });
     let classes = access
         .heap_class
         .then(|| (HEAP_CLASS_CENSUS, heap_classes_words()));
-    // The `half` conversion routine, once per module that defines it, and the `float` one.
+    // The `half` conversion routine, once per module that defines it.
     let half = texture
         .slots
         .values()
         .any(|s| s.half_format)
         .then_some((half::CENSUS_NAME, half::ROUTINE_WORDS));
-    let float = (texture.heap_float || texture.slots.values().any(|s| s.float_format))
-        .then_some((float_texel::CENSUS_NAME, float_texel::ROUTINE_WORDS));
-    // The normalized write's rounding, once.
-    let norm = (texture.heap_norm_write || texture.slots.values().any(|s| s.norm_write))
-        .then_some((norm_write::CENSUS_NAME, norm_write::ROUTINE_WORDS));
     // The heap's raw decode, once per result type.
     let raw = (!texture.heap_raw.is_empty()).then(|| {
         (
@@ -2617,207 +1997,180 @@ pub fn routine_words(
             heap_raw::ROUTINE_WORDS * texture.heap_raw.len() as u64,
         )
     });
-    flags
-        .into_iter()
-        .chain(classes)
-        .chain(half)
-        .chain(float)
-        .chain(norm)
-        .chain(raw)
+    flags.into_iter().chain(classes).chain(half).chain(raw)
 }
 
 /// The census name of the words a heap texel class costs: the module's table of classes and, where
 /// no other flag is carried, the masks of the heap handles.
 pub const HEAP_CLASS_CENSUS: &str = "sampler.heap.texel_class";
 
-/// The class a `float` written through a heap handle takes where the handle's texel class is a
-/// half-float format's (`emit::heap_halves`): the class a slot bound in such a format takes
-/// (`metal::format::half_write_class`), `None` where that is `Identity` (the device stores the
-/// write as Metal does).
-pub(crate) fn heap_write_class(cx: &SelectCx<'_>) -> Option<StorageImageClass> {
-    match crate::metal::format::half_write_class(cx.profile) {
-        StorageImageClass::Identity => None,
-        class => Some(class),
-    }
-}
-
-/// What a `float` write to texture `image` (a slot's storage class `class`; a heap write's class
-/// where its handle's is a half-float format's, `heap_half`) relies on or records where it may
-/// reach a half-float image: a write the shader rounds or quiets stores the NaN `0x7fc00000`,
-/// Metal's `0x7e00` where the profile takes `DriverDeviation::MetalFloatStorageNans` (the module
-/// requires its property), else the device's encoding of it (`PrecisionNote::DeviceNanEncoding`); a
-/// quieted write, unrounded, requires `VkProperty::MetalHalfStorageWrites`; and one left to the
-/// device's conversion, a heap write's or a slot's whose choice declares a half-float format,
-/// requires that and `VkProperty::MetalHalfStorageNans`.
+/// What a `float` write to texture `image` (of storage class `class`) relies on or records where it
+/// may reach a half-float image ([`may_store_half`]), which the device converts whole. Its rounding
+/// of each channel to `half` (Metal rounds toward zero, a finite value past 65504 to 65504) is
+/// Metal's where the profile takes `DriverDeviation::MetalHalfStorageWrites` (the module requires
+/// its property), else the device's (`PrecisionNote::DeviceColorConversion`). A write of an
+/// integer texel into a texture of the float class (`cross`, `emit::cross_write`), which Metal
+/// stores rounded to nearest even onto a half-float or small-float channel, records the note
+/// wherever it may reach one, the device's conversion rounding as it rounds a `float` write
+/// (toward zero on every measured driver: within one unit in the last place of the channel's
+/// Metal value, a finite value past 65504 stored as 65504 where Metal's `half` is the infinity).
+/// Its NaN is Metal's
+/// `0x7e00` where the profile takes `DriverDeviation::MetalHalfStorageNans` (the module requires its
+/// property), else the device's encoding of it (`PrecisionNote::DeviceNanEncoding`). A write that
+/// may reach a packed small float image ([`small_float_storage`]) stores its NaN as the device
+/// converts it too: Metal stores every NaN there as its canonical one, and RADV and NVIDIA keep
+/// another NaN's payload bits. A slot declared without a format records each note under the format
+/// bound there (`m` charged for the clauses), which the runtime announces at a draw or dispatch
+/// that binds such a texture.
 pub(super) fn half_storage_facts(
     cx: &mut SelectCx<'_>,
     image: ImageRef,
-    class: StorageImageClass,
-    (heap_half, heap_bits): (Option<StorageImageClass>, bool),
+    (class, cross): (StorageImageClass, bool),
+    m: &mut Meter,
 ) -> Result<(), Error> {
     use crate::device::requirements::VkProperty;
-    let applied = match image {
-        ImageRef::Heap { .. } => heap_half.unwrap_or(StorageImageClass::Identity),
-        ImageRef::Slot(_) => class,
+    let half = match class {
+        StorageImageClass::Identity => may_store_half(cx, image)?,
+        _ => Vec::new(),
     };
-    let mut relied = Vec::new();
-    match applied {
-        StorageImageClass::HalfTowardZero | StorageImageClass::HalfQuietNan => {
-            if applied == StorageImageClass::HalfQuietNan {
-                relied.push(VkProperty::MetalHalfStorageWrites);
-            }
-            if cx
+    if !half.is_empty() {
+        if !cross
+            && cx
                 .profile
-                .takes_driver_deviation(DriverDeviation::MetalFloatStorageNans)
-            {
-                relied.push(VkProperty::MetalFloatStorageNans);
-            } else if heap_bits {
-                // A member the twin holds stores Metal's `0x7e00`; the runtime announces the
-                // note where the heap holds a half-float texture the twin does not.
-                heap_half_texel_writes(cx, false);
-            } else {
-                cx.precision.insert(PrecisionNote::DeviceNanEncoding);
-            }
+                .takes_driver_deviation(DriverDeviation::MetalHalfStorageWrites)
+        {
+            cx.families
+                .texture
+                .storage_properties
+                .insert(VkProperty::MetalHalfStorageWrites);
+        } else {
+            cx.note_when(PrecisionNote::DeviceColorConversion, half.clone(), m)?;
         }
-        StorageImageClass::Identity if declared_half(cx, image)? => {
-            relied.push(VkProperty::MetalHalfStorageWrites);
-            relied.push(VkProperty::MetalHalfStorageNans);
+        if cx
+            .profile
+            .takes_driver_deviation(DriverDeviation::MetalHalfStorageNans)
+        {
+            cx.families
+                .texture
+                .storage_properties
+                .insert(VkProperty::MetalHalfStorageNans);
+        } else {
+            cx.note_when(PrecisionNote::DeviceNanEncoding, half, m)?;
         }
-        _ => {}
     }
-    cx.families.texture.storage_properties.extend(relied);
-    Ok(())
+    let small = small_float_storage(cx, image)?;
+    if cross {
+        cx.note_when(PrecisionNote::DeviceColorConversion, small.clone(), m)?;
+    }
+    cx.note_when(PrecisionNote::DeviceNanEncoding, small, m)
 }
 
-/// How a `half` texel's write to texture `image` stores a NaN as Metal does, and what it records.
-/// Metal stores a written half's NaN as the half's own bits in a 16-bit float channel and as its
-/// conversion of the canonical `0x7fc00000` in any other (the M3 Max under macOS 26.7, measured by
-/// the consumer; the M4 under macOS 27.0.1: every NaN class, both signs, `write`
-/// and `read_write`, `Shared` and `Private`): a 16-bit float channel takes the half widened
-/// ([`HalfNans::Kept`]), which a device of `DriverDeviation::MetalHalfTexelWrites` stores as its
-/// bits, and any other float channel every NaN as `0x7fc00000` ([`HalfNans::Canonical`]), which a
-/// 32-bit float channel stores as it is. The texture's format decides: a slot's declared format, or
-/// the class it rounds by (`HalfTowardZero`, `HalfQuietNan`: a 16-bit float format's); a heap
-/// element's handle class ([`HalfNans::HeapClass`]); a texture slot's word where its choice
-/// declares none ([`HalfNans::SlotWord`]). A normalized format's channel stores no NaN
-/// ([`HalfNans::Held`]).
+/// Where a write to texture `image` may store into a packed small float format (`RG11B10Float`;
+/// `RGB9E5Float` is written through its word alias, whose word is Metal's), as the clauses of
+/// [`stored_where`]: a heap element's, whose handle may name one, a slot's whose storage choice
+/// declares one, and a slot's declared without a format where the texture bound there is of the
+/// small floats' class (`metal::texel_format::PackedTexels::SmallFloat`).
+fn small_float_storage(cx: &SelectCx<'_>, image: ImageRef) -> Result<Vec<NoteClause>, Error> {
+    use crate::metal::texel_format::{PackedTexels, TexelFormat};
+    let small = PackedTexels::SmallFloat.class().0;
+    stored_where(
+        cx,
+        image,
+        |f| f == crate::vk::Format::B10G11R11_UFLOAT_PACK32,
+        |index| NoteTest::equal(NoteOn::Bound(index), TexelFormat::PACKED_MASK, small),
+    )
+}
+
+/// Where a write to texture `image` left to the device's conversion stores into a format
+/// `declared` accepts, as clauses for [`SelectCx::note_when`]: always (one clause of no test) for
+/// a heap element, whose handle may name any format; for a slot whose storage choice declares a
+/// format, always where `declared` accepts it, else never (no clause); and for a slot declared
+/// without a format (a formatless choice, or a variant that states no choice, which
+/// `slot::storage_format` declares formatless), where the format bound there passes `bound`'s
+/// test of its class (`NoteOn::Bound`), which the runtime reads at each draw or dispatch.
+fn stored_where(
+    cx: &SelectCx<'_>,
+    image: ImageRef,
+    declared: impl Fn(crate::vk::Format) -> bool,
+    bound: impl Fn(u32) -> NoteTest,
+) -> Result<Vec<NoteClause>, Error> {
+    let ImageRef::Slot(index) = image else {
+        return Ok(vec![NoteClause::new()]);
+    };
+    let slot = slot_of(cx, index)?.slot;
+    Ok(
+        match cx.inputs.storage_images.get(&slot).map(|c| c.vk_format) {
+            None | Some(crate::vk::Format::UNDEFINED) => vec![[bound(index)].into()],
+            Some(f) if declared(f) => vec![NoteClause::new()],
+            Some(_) => Vec::new(),
+        },
+    )
+}
+
+/// What a `half` texel's write to texture `image` records of its NaN. Metal stores a written
+/// half's NaN as the half's own bits in a 16-bit float channel and as its conversion of the
+/// canonical `0x7fc00000` in any other (the M3 Max under macOS 26.7, measured by the consumer; the
+/// M4 under macOS 27.0.1: every NaN class, both signs, `write` and `read_write`, `Shared` and
+/// `Private`). The write stores the half widened, its NaN's payload in the significand's top bits,
+/// which the device converts: a 16-bit float channel's NaN is Metal's on a device of
+/// `DriverDeviation::MetalHalfTexelWrites` (the module requires its property), and every other
+/// float channel's, a 32-bit one's among them, is the device's.
 ///
 /// The write records `PrecisionNote::DeviceNanEncoding` where the stored NaN stays the device's:
-/// a 16-bit float channel's, and a packed small float's (the device converting
-/// `0x7fc00000`), on a profile without `DriverDeviation::MetalHalfTexelWrites`, which states
-/// both; a heap element's likewise; a texel buffer declaring no format always (it has no word,
-/// so it keeps the half). A slot's word records nothing: the runtime announces the note at the
-/// bind of a 16-bit or packed small float texture there on such a profile
-/// (`RuntimeFact::StorageTextureHalfChannels`). A 32-bit float channel's `0x7fc00000` is
-/// stored as it is: no note. Nor is a slot's whose choice writes the half's bits through the
-/// texture's unsigned integer alias (`StorageImageClass::HalfBits`), which every device stores
-/// exactly; the binder chooses it for a half-float texture a slot only writes on such a profile, so
-/// that slot's word is not read.
-pub(super) fn half_nans(
-    cx: &mut SelectCx<'_>,
-    image: ImageRef,
-    (buffer, heap_bits): (bool, bool),
-) -> Result<HalfNans, Error> {
+/// a 16-bit float channel's on a profile without `DriverDeviation::MetalHalfTexelWrites`, a 32-bit
+/// or packed small float channel's, a slot's whose choice declares no format, a texel buffer's
+/// declaring none, and a heap element's, which may be any of them. A normalized or integer channel
+/// stores no NaN.
+pub(super) fn half_write_nans(cx: &mut SelectCx<'_>, image: ImageRef) -> Result<(), Error> {
     use crate::device::requirements::VkProperty;
     use crate::vk::NumericFormat as N;
-    // Each form, and whether the device's conversion decides the NaN stored (`Device`), and where
-    // a runtime choice lets the runtime narrow the note to the bind (`Bound`).
+    // Whether the stored NaN is exact (`Exact`), a 16-bit float channel's (`Sixteen`, Metal's on
+    // the measured deviation), or the device's (`Device`).
     #[derive(PartialEq)]
     enum Stored {
         Exact,
+        Sixteen,
         Device,
-        Bound,
     }
-    let declared = |f: crate::vk::Format| -> (HalfNans, Stored) {
+    let declared = |f: crate::vk::Format| -> Stored {
         let Some(b) = f.block() else {
-            return (HalfNans::Held, Stored::Exact);
+            return Stored::Device;
         };
         match (b.color, b.component_bits, b.packed_bits) {
-            (Some(N::Sfloat), Some(16), None) => (HalfNans::Kept, Stored::Device),
-            (Some(N::Sfloat), Some(32), None) => (HalfNans::Canonical, Stored::Exact),
-            (Some(N::Sfloat | N::Ufloat), _, _) => (HalfNans::Canonical, Stored::Device),
-            _ => (HalfNans::Held, Stored::Exact),
+            (Some(N::Sfloat), Some(16), None) => Stored::Sixteen,
+            (Some(N::Sfloat | N::Ufloat), _, _) => Stored::Device,
+            _ => Stored::Exact,
         }
     };
-    let (nans, stored) = match image {
-        // A half-float member the group's unsigned integer twin holds stores the half's bits;
-        // the runtime announces the note where the heap holds a texture it does not.
-        ImageRef::Heap { .. } if heap_bits => (HalfNans::HeapClass, Stored::Bound),
-        ImageRef::Heap { .. } => (HalfNans::HeapClass, Stored::Device),
+    let stored = match image {
+        ImageRef::Heap { .. } => Stored::Device,
         ImageRef::Slot(index) => {
             let slot = slot_of(cx, index)?.slot;
             match cx.inputs.storage_images.get(&slot) {
                 Some(c) => match c.class {
-                    StorageImageClass::HalfTowardZero | StorageImageClass::HalfQuietNan => {
-                        (HalfNans::Kept, Stored::Device)
-                    }
-                    StorageImageClass::SmallFloatQuietNan => (HalfNans::Canonical, Stored::Device),
-                    // The half's own bits, written through the unsigned integer alias.
-                    StorageImageClass::HalfBits => (HalfNans::Kept, Stored::Exact),
-                    StorageImageClass::Identity if c.vk_format != crate::vk::Format::UNDEFINED => {
-                        declared(c.vk_format)
-                    }
-                    StorageImageClass::Identity if buffer => (HalfNans::Kept, Stored::Device),
-                    StorageImageClass::Identity => (HalfNans::SlotWord(slot), Stored::Bound),
-                    _ => (HalfNans::Held, Stored::Exact),
+                    StorageImageClass::Identity => declared(c.vk_format),
+                    _ => Stored::Exact,
                 },
-                None if buffer => (HalfNans::Kept, Stored::Device),
-                None => (HalfNans::SlotWord(slot), Stored::Bound),
+                None => Stored::Device,
             }
         }
     };
     let measured = cx
         .profile
         .takes_driver_deviation(DriverDeviation::MetalHalfTexelWrites);
-    if stored != Stored::Exact && measured {
-        cx.families
-            .texture
-            .storage_properties
-            .insert(VkProperty::MetalHalfTexelWrites);
-    } else if stored == Stored::Device {
-        cx.precision.insert(PrecisionNote::DeviceNanEncoding);
-    }
-    match nans {
-        HalfNans::HeapClass => cx.families.access.heap_class_index = true,
-        HalfNans::SlotWord(_) => mark(cx, image, |u| u.half_channels = true),
-        _ => {}
-    }
-    if heap_bits && !measured {
-        heap_half_texel_writes(cx, true);
-    }
-    Ok(nans)
-}
-
-/// Whether a `half` or `float` write (`texel`) to texture `image` of shape `shape` stores a
-/// half-float member's bits through its heap group's unsigned integer twin (`HeapPlan::bits`,
-/// `emit::heap_bits`): a heap write of one sample, not to a cube or texture buffer, neither an
-/// extended-range encode nor another class's (`encoded`), on a device where every half-float
-/// format has the unsigned integer alias the twin holds it through
-/// (`metal::format::heap_half_bits`: a device not measured to store a written `half`'s NaN as its
-/// bits, `DriverDeviation::MetalHalfTexelWrites`). Marks the group's writes, and the handle
-/// carries its class index, which names a member the twin holds
-/// (`metal::texel_format::heap_half_bits_indices`).
-pub(super) fn heap_bits(
-    cx: &mut SelectCx<'_>,
-    image: ImageRef,
-    shape: ImageShape,
-    (texel, encoded): (TexelConv, bool),
-) -> bool {
-    let ImageRef::Heap { group, .. } = image else {
-        return false;
-    };
-    let applies = matches!(texel, TexelConv::F32 | TexelConv::F16)
-        && !encoded
-        && !shape.ms
-        && !matches!(shape.dim, ImageDim::Buffer | ImageDim::Cube)
-        && crate::metal::format::heap_half_bits(cx.profile);
-    if applies {
-        if let Some(h) = cx.families.texture.heap.get_mut(&group) {
-            h.writes_bits = true;
+    match stored {
+        Stored::Sixteen if measured => {
+            cx.families
+                .texture
+                .storage_properties
+                .insert(VkProperty::MetalHalfTexelWrites);
         }
-        cx.families.access.heap_class_index = true;
+        Stored::Sixteen | Stored::Device => {
+            cx.precision.insert(PrecisionNote::DeviceNanEncoding);
+        }
+        Stored::Exact => {}
     }
-    applies
+    Ok(())
 }
 
 /// Whether a storage read or write of a `float` or `half` texel (`texel`) through heap handle
@@ -2844,114 +2197,75 @@ pub(super) fn heap_alpha_in_red(
     applies
 }
 
-/// Record that the stage's `half` (`packed`) or `float` writes through heap handles store
-/// half-float members' bits through the unsigned integer twin, and leave the device's conversion
-/// of a NaN to the members it does not hold (`RuntimeFact::HeapHalfTexelWrites`), which the
-/// runtime announces where the heap holds one.
-fn heap_half_texel_writes(cx: &mut SelectCx<'_>, packed: bool) {
-    cx.facts
-        .insert(crate::pipeline::facts::RuntimeFact::HeapHalfTexelWrites {
-            stage: cx.stage,
-            packed,
-        });
-}
-
-/// How a `float` (or `half`, held widened) texel's write in form `texel` to texture `image` of
-/// shape `shape` rounds its channels where the texture's format may be a normalized one
-/// (`norm_write`'s module docs: Metal stores each channel's code from its exact product). A device
-/// measured to store those codes (`DriverDeviation::MetalNormStorageWrites`, whose property the
-/// module then requires) takes the write as computed but for a 1-bit channel, which it rounds
-/// otherwise: a slot of such a format takes `StorageImageClass::OneBitAlpha`, and a heap write
-/// tests its handle's class where the device stores such a texture ([`NormWrite::HeapOneBit`]).
-/// Elsewhere the write rounds by the bound format's class ([`NormWrite::Class`]): a slot's
-/// `TexelFormat` specialization, a heap handle's class. A heap texture buffer carries no class, so
-/// its write keeps the device's conversion (`PrecisionNote::DeviceColorConversion`) where such a
-/// buffer may hold a format the device converts otherwise. A slot whose storage choice declares a
-/// format that is not normalized, or converts by its class (sRGB, `ARGB8Unorm`, the half and small
-/// floats, a YCbCr write, a 1-bit alpha), takes none.
-pub(super) fn norm_storage(
+/// What a `float` (or `half`, held widened) texel's write in form `texel` to texture `image` of
+/// shape `shape` relies on or records where the texture's format may be a normalized one, whose
+/// conversion the device makes: Metal stores each channel's value clamped to its range (a NaN 0)
+/// times its maximum code exactly, rounded to nearest with a tie away from zero, a 1-bit channel 1
+/// only above one half. A device measured to store those codes
+/// (`DriverDeviation::MetalNormStorageWrites`, whose property the module then requires) stores
+/// them, but for a 1-bit channel, which it rounds otherwise (RADV rounds its half up): a write of
+/// four lanes that may reach a texture of a 1-bit alpha (a heap element, or a slot whose storage
+/// choice declares no format, where the device stores such a texture) records
+/// `PrecisionNote::DeviceColorConversion`. Elsewhere every such write records it (ANV and
+/// lavapipe round the `f32` product with ties to even). A slot whose storage choice declares a
+/// format that is not normalized, or encodes it by its class (sRGB, a YCbCr write, the half and
+/// small floats), records nothing.
+pub(super) fn norm_storage_facts(
     cx: &mut SelectCx<'_>,
     image: ImageRef,
     shape: ImageShape,
     texel: TexelForm,
-) -> Result<NormWrite, Error> {
+) -> Result<(), Error> {
     use crate::device::requirements::VkProperty;
     use crate::metal::format::{one_bit_storage, StorageUse};
     use crate::vk::NumericFormat as N;
-    let buffer = shape.dim == ImageDim::Buffer;
-    let reached = match image {
-        ImageRef::Heap { .. } => true,
+    // Whether the write may reach a normalized format, and whether the bound texture decides it.
+    let (reached, bound) = match image {
+        ImageRef::Heap { .. } => (true, true),
         ImageRef::Slot(index) => {
             let slot = slot_of(cx, index)?.slot;
             match cx.inputs.storage_images.get(&slot) {
-                None => true,
+                None => (true, true),
                 Some(c) => {
-                    let normalized = c.vk_format == crate::vk::Format::UNDEFINED
+                    let formatless = c.vk_format == crate::vk::Format::UNDEFINED;
+                    let normalized = formatless
                         || c.vk_format
                             .block()
                             .is_some_and(|b| matches!(b.color, Some(N::Unorm | N::Snorm)));
-                    // `AlphaInRed` stores the rounded alpha in red: the routine rounds the
-                    // texel in Metal's channels, before the class moves them.
-                    normalized
-                        && matches!(
-                            c.class,
-                            StorageImageClass::Identity
-                                | StorageImageClass::SwizzleBgra
-                                | StorageImageClass::AlphaInRed
-                        )
+                    let converted = matches!(
+                        c.class,
+                        StorageImageClass::Identity
+                            | StorageImageClass::SwizzleBgra
+                            | StorageImageClass::AlphaInRed
+                            | StorageImageClass::RotateArgb
+                    );
+                    (normalized && converted, formatless)
                 }
             }
         }
     };
     if !reached {
-        return Ok(NormWrite::Device);
+        return Ok(());
     }
-    let measured = cx
+    if !cx
         .profile
-        .takes_driver_deviation(DriverDeviation::MetalNormStorageWrites);
-    if measured {
-        cx.families
-            .texture
-            .storage_properties
-            .insert(VkProperty::MetalNormStorageWrites);
-        let use_ = match buffer {
-            true => StorageUse::texel_buffer(false, true),
-            false => StorageUse::texture(false, true),
-        };
-        // A heap write's alpha, where the device stores a texture of a 1-bit alpha there.
-        let one_bit = image.heap() && texel.lanes == 4 && one_bit_storage(use_, cx.profile);
-        return Ok(match (one_bit, buffer) {
-            (false, _) => NormWrite::Device,
-            (true, true) => {
-                cx.precision.insert(PrecisionNote::DeviceColorConversion);
-                NormWrite::Device
-            }
-            (true, false) => {
-                cx.families.access.heap_class_index = true;
-                NormWrite::HeapOneBit
-            }
-        });
+        .takes_driver_deviation(DriverDeviation::MetalNormStorageWrites)
+    {
+        cx.precision.insert(PrecisionNote::DeviceColorConversion);
+        return Ok(());
     }
-    match image {
-        ImageRef::Heap { .. } if buffer => {
-            cx.precision.insert(PrecisionNote::DeviceColorConversion);
-            Ok(NormWrite::Device)
-        }
-        ImageRef::Heap { .. } => {
-            cx.families.texture.heap_norm_write = true;
-            cx.families.access.heap_class = true;
-            Ok(NormWrite::Class)
-        }
-        ImageRef::Slot(index) => {
-            let slot = slot_of(cx, index)?.slot;
-            if let Some(s) = cx.families.texture.slots.get_mut(&index) {
-                s.norm_write = true;
-            }
-            cx.facts
-                .insert(crate::pipeline::facts::RuntimeFact::TexelFormat { slot });
-            Ok(NormWrite::Class)
-        }
+    cx.families
+        .texture
+        .storage_properties
+        .insert(VkProperty::MetalNormStorageWrites);
+    let use_ = match shape.dim == ImageDim::Buffer {
+        true => StorageUse::texel_buffer(false, true),
+        false => StorageUse::texture(false, true),
+    };
+    if bound && texel.lanes == 4 && one_bit_storage(use_, cx.profile) {
+        cx.precision.insert(PrecisionNote::DeviceColorConversion);
     }
+    Ok(())
 }
 
 /// A fragment function's write of a texel of form `texel` to texture `image` (`extended`: an
@@ -2964,8 +2278,7 @@ pub(super) fn norm_storage(
 /// small-float one (unmeasured). Kernel, vertex, object, mesh and tile functions write alike at
 /// every mode. The write is built under the default's rule alone, so: a write that may be such
 /// records the mode in `StageIo::texture_write_rounding`, for link to match against the pipeline's;
-/// under `NearestEven` one whose slot's storage choice declares such a format (or rounds as a
-/// half-float one: `HalfTowardZero`, `HalfQuietNan`) is refused
+/// under `NearestEven` one whose slot's storage choice declares such a format is refused
 /// `NotImplemented(PrivateRenderState(TextureWriteRounding))`, and one whose bound texture
 /// decides (a slot or texture buffer whose choice declares no format; a heap handle) states
 /// `RuntimeFact::StorageTextureWriteRounding` or `RuntimeFact::HeapWriteRounding`, which the
@@ -3001,16 +2314,6 @@ fn mode_rounded_write(
             match cx.inputs.storage_images.get(&slot) {
                 None => Target::Slot(slot),
                 Some(c) => match c.class {
-                    StorageImageClass::HalfTowardZero | StorageImageClass::HalfQuietNan => {
-                        Target::Declared {
-                            half: true,
-                            small: false,
-                        }
-                    }
-                    StorageImageClass::SmallFloatQuietNan => Target::Declared {
-                        half: false,
-                        small: true,
-                    },
                     StorageImageClass::Identity if c.vk_format == F::UNDEFINED => {
                         Target::Slot(slot)
                     }
@@ -3063,26 +2366,27 @@ fn mode_rounded_write(
     Ok(())
 }
 
-/// Whether a write to `image` left to the device's conversion may store a half-float texel: a
-/// heap element's may, and a slot's whose storage choice declares a half-float format does.
-fn declared_half(cx: &SelectCx<'_>, image: ImageRef) -> Result<bool, Error> {
+/// Where a write to `image` left to the device's conversion may store a half-float texel, as the
+/// clauses of [`stored_where`]: a heap element's may, a slot's whose storage choice declares a
+/// half-float format does, and a slot's declared without a format does where the texture bound
+/// there is of a half-float class (`BicubicTexels::HALF` without a packed field, which the small
+/// floats' class carries).
+fn may_store_half(cx: &SelectCx<'_>, image: ImageRef) -> Result<Vec<NoteClause>, Error> {
+    use crate::metal::bicubic::BicubicTexels;
+    use crate::metal::texel_format::TexelFormat;
     use crate::vk::Format as F;
-    let ImageRef::Slot(index) = image else {
-        return Ok(true);
-    };
-    let slot = slot_of(cx, index)?.slot;
-    Ok(cx.inputs.storage_images.get(&slot).is_some_and(|c| {
-        matches!(
-            c.vk_format,
-            F::R16_SFLOAT | F::R16G16_SFLOAT | F::R16G16B16A16_SFLOAT
-        )
-    }))
+    let mask = BicubicTexels::HALF | TexelFormat::PACKED_MASK;
+    stored_where(
+        cx,
+        image,
+        |f| matches!(f, F::R16_SFLOAT | F::R16G16_SFLOAT | F::R16G16B16A16_SFLOAT),
+        |index| NoteTest::equal(NoteOn::Bound(index), mask, BicubicTexels::HALF),
+    )
 }
 
 /// The class of texture slot `image`'s storage choice, where its variant states one, else
-/// `Identity`: a write through a converting class stores Metal's code of each channel
-/// (`RotateArgb`'s `ARGB8Unorm` codes; `HalfTowardZero`'s halves and `HalfQuietNan`'s NaN). A heap
-/// element's is `Identity`.
+/// `Identity`: a write through a converting class moves or encodes the written channels
+/// (`RotateArgb`'s rotation, `SrgbEncode`'s codes). A heap element's is `Identity`.
 pub(crate) fn storage_class(
     cx: &SelectCx<'_>,
     image: ImageRef,
@@ -3110,6 +2414,26 @@ pub(crate) fn extended_range(
     };
     let slot = slot_of(cx, index)?.slot;
     Ok(cx.inputs.extended_range.get(&slot).copied())
+}
+
+/// Whether texture slot `index`'s variant reads a two-plane YCbCr texture's planes in place
+/// (`LoweringInputs::ycbcr_in_place`, `sampler::in_place`).
+pub(crate) fn ycbcr_in_place(cx: &SelectCx<'_>, index: u32) -> Result<bool, Error> {
+    let slot = slot_of(cx, index)?.slot;
+    Ok(cx.inputs.ycbcr_in_place.contains(&slot))
+}
+
+/// Record an access of texture slot `index` that its in-place form does not read
+/// (`slot::InPlaceReads::blocked`): no texture is read in place there.
+pub(crate) fn not_in_place(cx: &mut SelectCx<'_>, index: u32) {
+    if let Some(s) = cx.families.texture.slots.get_mut(&index) {
+        s.in_place.blocked = true;
+    }
+}
+
+/// Whether the function observes any of texture call `at`'s status word.
+pub(crate) fn observes_status(cx: &mut SelectCx<'_>, at: InstId) -> bool {
+    status_use(cx, at).is_some()
 }
 
 /// The numeric class of the texture texture slot `image`'s variant binds where it is not the
@@ -3282,6 +2606,15 @@ fn select_image(
     m: &mut Meter,
 ) -> Result<TextureStrategy, Error> {
     let shape = t.image;
+    // The in-place form reads a slot's width, height and level count, and nothing else here.
+    if let ImageRef::Slot(index) = image {
+        if !matches!(
+            t.op,
+            TexOp::Query(Query::Width | Query::Height | Query::NumMipLevels)
+        ) {
+            not_in_place(cx, index);
+        }
+    }
     let texel = match t.texel {
         Some(x) if matches!(t.op, TexOp::Read | TexOp::Write | TexOp::Atomic(_)) => Some(
             image_texel_conv(x.ty.elem, x.sign, cx.profile).map(|(c, class)| {
@@ -3333,7 +2666,7 @@ fn select_image(
         }
         TexOp::Write => {
             let (form, _) = texel.ok_or_else(refuse)?;
-            select_write(cx, ops, image, shape, form)
+            select_write(cx, ops, (image, shape, form), m)
         }
         TexOp::Atomic(op) => {
             let texel = texel.ok_or_else(refuse)?;
@@ -3560,73 +2893,38 @@ fn select_read_as(
         }
         _ => false,
     };
-    // An 8-bit sRGB texel's raw code, under the slot's variant, decoded exactly; another `half`
-    // texel converts by the bound format's class, and its NaN is the device's decode.
-    let raw = matches!(texel.conv, TexelConv::F16 | TexelConv::F32)
-        && srgb_texels(cx, image, shape, SrgbReach::Raw)?;
-    if let (true, ImageRef::Slot(index)) = (raw, image) {
-        if let Some(s) = cx.families.texture.slots.get_mut(&index) {
-            s.raw = true;
-        }
-    }
-    // A storage slot's 8-bit sRGB codes, through its UNORM alias, decoded through Metal's table
-    // (the slot's planning declares it), as a raw view's are.
+    // An 8-bit sRGB texel's codes, under the slot's twin variant, decoded by the device's
+    // transfer; another `half` texel converts by the bound format's class, and its NaN is the
+    // device's decode.
+    let raw =
+        matches!(texel.conv, TexelConv::F16 | TexelConv::F32) && srgb_texels(cx, image, shape, m)?;
+    // A storage slot's 8-bit sRGB codes, through its UNORM alias, decoded by the device's
+    // transfer, as a UNORM twin's are.
     let srgb_codes = storage
         && matches!(texel.conv, TexelConv::F16 | TexelConv::F32)
         && matches!(
             storage_class(cx, image)?,
             StorageImageClass::SrgbEncode | StorageImageClass::SrgbEncodeBgra
         );
-    // A storage slot's half-float texels, through its unsigned integer alias, widened exactly
-    // (the slot's planning declares it): Metal's read, a NaN's included. So is an `RGB9E5Float`
-    // slot's word through its `R32_UINT` alias, decoded exactly.
-    let half_bits = storage
-        && matches!(texel.conv, TexelConv::F16 | TexelConv::F32)
-        && matches!(
-            storage_class(cx, image)?,
-            StorageImageClass::HalfBits | StorageImageClass::SharedExponentBits
-        );
-    // A sampled slot's 16-bit float texels, through the texture's unsigned integer alias at the
-    // slot's second binding, widened exactly where the bound class names such channels
-    // ([`half_bits_read`]). The device's texel stays the arm of every other class, so the read
-    // keeps its conversion and its note below.
-    let half_bits_alias = !storage
-        && matches!(texel.conv, TexelConv::F16 | TexelConv::F32)
-        && !raw
-        && extended.is_none()
-        && half_bits_read(cx, image, shape)?;
-    // A slot read through a snapshot takes that same arm, from the snapshot's codes: the copy
-    // fetches the alias where the class names 16-bit float channels, so the read widens the
-    // texel's own 16 bits there too, instead of the device's decode the copy would have stored
-    // ([`half_bits_snapshot`]).
-    if half_bits_alias && half_bits_snapshot(cx, image, check)? {
-        if let ImageRef::Slot(index) = image {
-            if let Some(s) = cx.families.texture.slots.get_mut(&index) {
-                s.half_bits_snapshot = true;
-            }
-        }
+    if srgb_codes {
+        cx.precision.insert(PrecisionNote::SrgbTexelDecode);
     }
-    let exact = raw || srgb_codes || half_bits;
-    // An extended-range texel is decoded exactly to `f32`, which a `half` result rounds to
-    // nearest even, as Metal answers. A read is one texel.
-    let half_nans = if texel.conv == TexelConv::F16 && !exact && extended.is_none() {
-        half_texels(
-            cx,
-            image,
-            shape,
-            (OneTexel::Always, None),
-            device_texels(cx, false),
-            m,
-        )?;
+    // An `RGB9E5Float` slot's word through its `R32_UINT` alias, decoded exactly (the slot's
+    // planning declares it).
+    let words = storage
+        && matches!(texel.conv, TexelConv::F16 | TexelConv::F32)
+        && storage_class(cx, image)? == StorageImageClass::SharedExponentBits;
+    // The shader decodes these texels itself, recording its own notes. An extended-range texel is
+    // decoded exactly to `f32`, which a `half` result rounds to nearest even, as Metal answers. A
+    // read is one texel.
+    let decoded = raw || srgb_codes || words;
+    if texel.conv == TexelConv::F16 && !decoded && extended.is_none() {
+        half_texels(cx, image, shape, false, device_texels(cx), m)?;
         half_texel_nans(cx, image, shape, m)?;
-        texel_nans_class(cx, image, shape, OneTexel::Always)?
-    } else {
-        None
-    };
-    let float_texel = texel.conv == TexelConv::F32
-        && !exact
-        && extended.is_none()
-        && float_texels(cx, image, shape, OneTexel::Always, device_texels(cx, false))?;
+    }
+    if texel.conv == TexelConv::F32 && !decoded && extended.is_none() {
+        float_texel_notes(cx, image, shape, OneTexel::Always);
+    }
     // A float read of a sampled heap group of one sample decodes a member of a form a heap reads
     // where its handle names one, from the group's unsigned integer class.
     let heap_raw = match image {
@@ -3695,15 +2993,12 @@ fn select_read_as(
         alpha,
         edge,
         raw,
-        half_bits_alias,
         srgb_codes,
         swizzle,
         storage_swizzle,
         extended,
         heap_raw,
         heap_alpha_red,
-        float_texel,
-        half_nans,
         constant_lanes,
         declared,
         heap_class: as_class,
@@ -3810,9 +3105,8 @@ fn slot_of<'a>(cx: &'a SelectCx<'_>, index: u32) -> Result<&'a SlotPlan, Error> 
 fn select_write(
     cx: &mut SelectCx<'_>,
     ops: &Operands<'_>,
-    image: ImageRef,
-    shape: ImageShape,
-    texel: TexelForm,
+    (image, shape, texel): (ImageRef, ImageShape, TexelForm),
+    m: &mut Meter,
 ) -> Result<TextureStrategy, Error> {
     if !image_access(cx, image)?.0 {
         return Err(refuse());
@@ -3838,8 +3132,8 @@ fn select_write(
             let format = match image {
                 ImageRef::Slot(index) => {
                     let slot = slot_of(cx, index)?.slot;
-                    // The bound image's own format: an alias view's image (a half-float
-                    // texture written through its integer alias), else the declared one.
+                    // The bound image's own format: an alias view's image (an `RGB9E5Float`
+                    // texture written through its `R32_UINT` view), else the declared one.
                     cx.inputs
                         .storage_images
                         .get(&slot)
@@ -3868,35 +3162,18 @@ fn select_write(
     let extended = extended_range(cx, image)?;
     let class = storage_class(cx, image)?;
     mode_rounded_write(cx, image, texel, extended.is_some())?;
-    // A `float` written through a heap handle may reach a half-float texture, whose format only
-    // the handle's texel class tells: it rounds where the class is one.
-    let heap_half = match image.heap() && texel.conv == TexelConv::F32 {
-        true => heap_write_class(cx),
-        false => None,
-    };
-    // Its NaNs quieted where the class is a small float's.
-    let heap_small_floats = image.heap() && texel.conv == TexelConv::F32;
-    cx.families.access.heap_class_index |= heap_half.is_some() || heap_small_floats;
     // Its alpha in red where the class is `A8Unorm`'s and the device holds such a texture so.
     let heap_alpha_red = heap_alpha_in_red(cx, image, shape, texel.conv);
-    // A half-float member's bits through the group's unsigned integer twin, where the handle's
-    // class names one.
-    let encoded = extended.is_some() || cross.is_some();
-    let heap_bits = heap_bits(cx, image, shape, (texel.conv, encoded));
     if texel.conv == TexelConv::F32 {
-        half_storage_facts(cx, image, class, (heap_half, heap_bits))?;
+        half_storage_facts(cx, image, (class, cross.is_some()), m)?;
     }
-    let half_nans = match texel.conv == TexelConv::F16 && extended.is_none() {
-        true => half_nans(cx, image, (shape.dim == ImageDim::Buffer, heap_bits))?,
-        false => HalfNans::Held,
-    };
+    if texel.conv == TexelConv::F16 && extended.is_none() {
+        half_write_nans(cx, image)?;
+    }
     // A `half` texel's too, held widened: Metal stores its value by the same rule.
-    let norm = match texel.conv {
-        TexelConv::F32 | TexelConv::F16 if extended.is_none() => {
-            norm_storage(cx, image, shape, texel)?
-        }
-        _ => NormWrite::Device,
-    };
+    if matches!(texel.conv, TexelConv::F32 | TexelConv::F16) && extended.is_none() {
+        norm_storage_facts(cx, image, shape, texel)?;
+    }
     // A storage slot bound to a swizzled texture stores each channel from the lane the swizzle
     // takes it to, under its variant, as plain Metal writes it. A `ulong` texel's is not measured.
     let swizzle = shape.dim != ImageDim::Buffer && swizzled_storage(cx, image)?;
@@ -3920,15 +3197,10 @@ fn select_write(
         guard,
         extended,
         class,
-        heap_half,
-        heap_small_floats,
         heap_alpha_red,
         swizzle,
-        half_nans,
-        norm,
         cross,
         saturate,
-        heap_bits,
     }))
 }
 

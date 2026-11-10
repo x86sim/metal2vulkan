@@ -1,24 +1,24 @@
 //! Device tests of the blit encoder's texture commands on the device the cfg selects, under the
 //! validation layer: copies between buffers and textures (on the layouts Vulkan states and on the
 //! ones that go through a scratch buffer) and between textures, Metal's refusals, 32-bit float
-//! depth outside `[0, 1]` uploaded as Metal holds it with the form each device stores it in printed
-//! (a texture with a depth twin keeping it), what each driver's depth images keep of the `float`s
-//! Metal's hold, against its driver facts, and `generate_mipmaps` with each format's verdict
-//! printed.
+//! depth outside `[0, 1]` uploaded as Metal holds it with the form each device stores it in
+//! printed, what each driver's depth images keep of the `float`s Metal's hold, against its driver
+//! facts, and `generate_mipmaps` with each format's way printed.
 
+use super::degrade_notices::signs_depth_tests;
+use super::degrade_notices::twins_carried;
 use super::degrade_notices::{assert_made_once, assert_once, forced, loses_depth_denormals};
 use super::degrade_notices::{decodes_blocks_its_way, shared_in_system_memory};
-use super::degrade_notices::{twins_blocks, twins_carried, twins_depth};
 use super::{layer_reported_nothing_at_all, validated_device, Messages, ScratchCache};
 use crate::gpu::TEST_DEVICE;
-use metal2vulkan::bind::{MipmapFilterChain, MipmapRule};
+use metal2vulkan::bind::MipmapFilterChain;
 use metal2vulkan::device::VkExtension;
 use metal2vulkan::error::Feature;
 use metal2vulkan::metal::format::{is_depth_stencil, x_channel};
 use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
 use metal2vulkan_runtime::{
     BlitCommandEncoder, BlitOption, Buffer, CommandBuffer, CopyProblem, CpuCacheMode, Degradation,
-    Device, DriverFact, Error, HazardTrackingMode, Invalid, MipmapVerdict, Origin, Problem, Region,
+    Device, DriverFact, Error, HazardTrackingMode, Invalid, Origin, Problem, Region,
     ResourceOptions, Size, StorageMode, Texture, TextureDescriptor,
 };
 use std::collections::BTreeSet;
@@ -1143,60 +1143,14 @@ fn mipmaps_leave_single_levels_and_depth_as_they_are() {
     layer_reported_nothing_at_all(&messages);
 }
 
-/// The kind [`depth_outside_the_unit_range_uploads_as_metal_holds_it`] takes when it makes a
-/// texture with a depth twin, on a device whose depth images its driver is not measured to keep
-/// every `float` in ([`depth_images`]), and expects absent elsewhere.
-pub(super) const TWINS: [Degradation; 1] = [Degradation::DepthTwin];
-
-/// The kind [`mipmaps_of_every_format_run_or_are_refused_typed`] takes where a device's blit
-/// chain of some format ran, and expects absent where none did.
-pub(super) const MIPMAPS: [Degradation; 1] = [Degradation::MipmapsWithinSpread];
-
-/// Whether the runtime computes the mipmaps of a `pf` texture of `extent` and `levels` as
-/// Metal's filter, never by the device's blits (`runtime::mipmap_filter`): a format the filter
-/// computes, on a device with `shaderInt64` (every venue's), the chain far within any device's
-/// limits at these sizes.
-fn filtered(
-    pf: PixelFormat,
-    extent: [u64; 3],
-    levels: u64,
-    volume: bool,
-    rule: MipmapRule,
-) -> bool {
-    filter_chain(pf, extent, levels, volume, rule).is_some()
-}
-
-/// The chain [`filtered`] plans: where it may differ from an Apple M3 Max's answer
-/// (`mipmaps-as-apple-m4`) or a level may be one unit from Metal's near a tie
-/// (`mipmap-tie-rounding`), which its run announces.
-fn filter_chain(
-    pf: PixelFormat,
-    extent: [u64; 3],
-    levels: u64,
-    volume: bool,
-    rule: MipmapRule,
-) -> Option<MipmapFilterChain> {
-    let groups = [65535, 65535];
-    let extent = extent.map(|e| e as u32);
-    // Whether Metal compresses the texture changes no chain's making.
-    MipmapFilterChain::plan(
-        pf,
-        extent,
-        1,
-        levels as u32,
-        volume,
-        false,
-        rule,
-        256,
-        1 << 27,
-        groups,
-        None,
-    )
-}
+/// The kind `generate_mipmaps` takes where a filtered format's chain ran, the device's blits or
+/// the compute filter: in [`mipmaps_of_every_format_run_or_are_refused_typed`] and
+/// `mipmap_chains`.
+pub(super) const MIPMAPS: [Degradation; 1] = [Degradation::DeviceFilteredMipmaps];
 
 /// Whether plain Metal mipmaps `pf` by picking texels, which the runtime copies exactly on every
 /// device: a color format a shader reads as integers, which an extended-range format is not
-/// (`mipmaps_exact::integer_mipmaps_pick_the_texels_plain_metal_picks`).
+/// (`mipmap_chains::integer_mipmaps_pick_the_texels_plain_metal_picks`).
 fn picked(pf: PixelFormat) -> bool {
     use metal2vulkan::pipeline::SampledType;
     !is_depth_stencil(pf)
@@ -1207,26 +1161,22 @@ fn picked(pf: PixelFormat) -> bool {
 }
 
 /// The kind [`depth_outside_the_unit_range_uploads_as_metal_holds_it`] takes when it uploads into
-/// a render target's depth image, which has no twin, on a device whose depth image may clamp
-/// ([`depth_images`]).
+/// a depth image on a device whose depth image may clamp ([`depth_images`]).
 pub(super) const UPLOADS: [Degradation; 1] = [Degradation::RestrictedDepthUpload];
 
-/// 32-bit float depth outside `[0, 1]` uploads as Metal holds it, through `replace_region` and
+/// 32-bit float depth outside `[0, 1]` uploads into a depth image, through `replace_region` and
 /// through a blit from a buffer, on every device.
 ///
-/// A texture the program only reads or samples keeps each value on every venue here: where the
-/// device's depth images keep every `float` ([`depth_images`]), in its depth image; elsewhere in
-/// the `R32_SFLOAT` image of a depth twin, announced once ([`TWINS`]), as every venue here samples
-/// and copies both formats. A render target's depth image keeps each value where the device
-/// enabled `VK_EXT_depth_range_unrestricted` or its driver is measured to keep one without it;
-/// elsewhere Vulkan leaves such a value undefined (`VUID-vkCmdCopyBufferToImage-pRegions-07931`)
-/// and a device keeps it or stores it clamped to `[0, 1]`, which its upload announces once
-/// ([`UPLOADS`]): each value reads back as one of the two, and the form the device took is
-/// printed; where it keeps them, the upload of a negative value into a render target, and a copy
-/// out of a twin into one, switch its depth on to render a pass that loads it over its magnitude
-/// stand-in (`texture/signed_depth.rs`), unannounced.
-/// Copies between two textures with twins, and from a render target into one, land in both its
-/// images.
+/// A depth image, a read-only texture's and a render target's alike, keeps each value where the
+/// device enabled `VK_EXT_depth_range_unrestricted` or its driver is measured to keep one without
+/// it; elsewhere Vulkan leaves such a value undefined
+/// (`VUID-vkCmdCopyBufferToImage-pRegions-07931`) and a device keeps it or stores it clamped to
+/// `[0, 1]`, which its first upload announces once ([`UPLOADS`]): each value reads back as one of
+/// the two, and the form the device took is printed; where it keeps them, the upload of a negative
+/// value into a render target, whose depth a test reads, announces `signed-depth-test` where the
+/// device's depth test compares the value as it is (`degrade_notices::signs_depth_tests`). A copy
+/// between two depth images moves the source's words, and a copy into a render target announces the
+/// same.
 #[test]
 fn depth_outside_the_unit_range_uploads_as_metal_holds_it() {
     const VALUES: [f32; 4] = [-0.5, 2.0, 1000.0, 0.25];
@@ -1236,9 +1186,7 @@ fn depth_outside_the_unit_range_uploads_as_metal_holds_it() {
     {
         let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
         let name = device.name();
-        let (unrestricted, clamps, keeps_floats) = depth_images(&device);
-        // Whether a read-only texture takes a twin.
-        let twinned = !keeps_floats;
+        let (unrestricted, clamps, _) = depth_images(&device);
         let queue = device.new_command_queue().unwrap();
         let made = |usage: TextureUsage| {
             let mut d = TextureDescriptor::texture_2d(PixelFormat::Depth32Float, 2, 2, false);
@@ -1276,27 +1224,11 @@ fn depth_outside_the_unit_range_uploads_as_metal_holds_it() {
         // What the device announced before its first texture.
         messages.take_notices();
         let replaced = made(read_only);
-        let twin = forced(&[(Degradation::DepthTwin, twinned)]);
-        let announced = assert_made_once(&messages, &[], &twin);
-        for kind in TWINS {
-            assert_eq!(
-                announced.contains_key(&kind),
-                twinned,
-                "{kind:?} on {name} exactly where the device's depth image may not hold a \
-                 texel: {announced:?}"
-            );
-        }
-        replaced
-            .replace_region(Region::new_2d(0, 0, 2, 2), 0, 0, &words, 8, 0)
-            .unwrap();
         let blitted = made(read_only);
         let held = made(target);
-        let quiet = assert_once(&messages.take_notices(), &[]);
-        assert!(
-            !quiet.contains_key(&Degradation::RestrictedDepthUpload),
-            "an upload into a depth twin's texture announced on {name}: {quiet:?}"
-        );
-        held.replace_region(Region::new_2d(0, 0, 2, 2), 0, 0, &words, 8, 0)
+        assert_once(&messages.take_notices(), &[]);
+        replaced
+            .replace_region(Region::new_2d(0, 0, 2, 2), 0, 0, &words, 8, 0)
             .unwrap();
         let clamped = forced(&[(Degradation::RestrictedDepthUpload, clamps)]);
         let uploaded = assert_made_once(&messages, &[], &clamped);
@@ -1307,6 +1239,10 @@ fn depth_outside_the_unit_range_uploads_as_metal_holds_it() {
                 "{kind:?} on {name} exactly where the device may clamp: {uploaded:?}"
             );
         }
+        held.replace_region(Region::new_2d(0, 0, 2, 2), 0, 0, &words, 8, 0)
+            .unwrap();
+        let signed = forced(&[(Degradation::SignedDepthTest, signs_depth_tests(&device))]);
+        assert_made_once(&messages, &[], &signed);
         let source = device.new_buffer(16, ResourceOptions::shared()).unwrap();
         with_bytes(&source, |bytes| bytes.copy_from_slice(&words));
         let command_buffer = queue.command_buffer().unwrap();
@@ -1326,38 +1262,42 @@ fn depth_outside_the_unit_range_uploads_as_metal_holds_it() {
         .unwrap();
         blit.end_encoding().unwrap();
         run(&command_buffer);
-        for (how, texture) in [("replace_region", &replaced), ("a blit", &blitted)] {
-            assert_eq!(floats(texture), VALUES, "{how} on {name}");
-        }
+        form("replace_region", &floats(&replaced));
+        form("a blit", &floats(&blitted));
         form("replace_region into a render target", &floats(&held));
 
-        // A copy of a texture with a twin into another (both images), into a render target (its
-        // twin), and of a render target into a texture with a twin (its image through a scratch
-        // buffer, its twin directly), whose twin a last copy reads back.
-        let (copied, out_of_twin, into_twin, back) =
-            (made(read_only), made(target), made(read_only), made(target));
+        // A copy between two read-only textures, out of one into a render target, and back.
+        let (copied, into_target, back) = (made(read_only), made(target), made(read_only));
         let command_buffer = queue.command_buffer().unwrap();
         let mut blit = command_buffer.blit_command_encoder().unwrap();
         blit.copy_texture(&replaced, &copied).unwrap();
-        blit.copy_texture(&replaced, &out_of_twin).unwrap();
-        blit.copy_texture(&held, &into_twin).unwrap();
-        blit.copy_texture(&into_twin, &back).unwrap();
+        blit.copy_texture(&replaced, &into_target).unwrap();
+        blit.copy_texture(&held, &back).unwrap();
         blit.end_encoding().unwrap();
         run(&command_buffer);
-        assert_eq!(floats(&copied), VALUES, "a copy between twins on {name}");
-        form("a copy out of a twin", &floats(&out_of_twin));
-        let held = floats(&held);
-        assert_eq!(floats(&into_twin), held, "a copy into a twin on {name}");
-        // The last copy writes a render target's depth image on the GPU, which may clamp where
-        // the device's depth images may (ANV: the twin's copy into it stores the clamp).
-        form("a copy into a twin, read back", &floats(&back));
-        // The blit from the `Shared` buffer writes a depth image on the GPU where the texture
-        // takes no twin, which announces what a float depth's may store; every other copy into
-        // a depth image copies one depth image's bits into another.
+        let replaced = floats(&replaced);
+        assert_eq!(
+            floats(&copied),
+            replaced,
+            "a copy between depth images on {name}"
+        );
+        assert_eq!(
+            floats(&into_target),
+            replaced,
+            "a copy into a render target on {name}"
+        );
+        assert_eq!(
+            floats(&back),
+            floats(&held),
+            "a copy out of a render target on {name}"
+        );
+        // The blit from the `Shared` buffer writes a depth image on the GPU, which announces what
+        // a float depth's may store; every other copy into a depth image copies one depth
+        // image's bits into another.
         let first = forced(&[
             (
                 Degradation::DepthDenormals,
-                !twinned && loses_depth_denormals(&device, false),
+                loses_depth_denormals(&device, false),
             ),
             (
                 Degradation::SharedInSystemMemory,
@@ -1365,7 +1305,7 @@ fn depth_outside_the_unit_range_uploads_as_metal_holds_it() {
             ),
         ]);
         let later = assert_made_once(&messages, &[], &first);
-        for kind in TWINS.iter().chain(&UPLOADS) {
+        for kind in &UPLOADS {
             assert!(
                 !later.contains_key(kind),
                 "{kind:?} announced again on {name}: {later:?}"
@@ -1421,9 +1361,7 @@ const OUTSIDE: [f32; 5] = [-0.5, 2.0, 1000.0, -1000.0, 1.5];
 /// `get_bytes`. Each count kept is printed with the driver's `driverID` and `driverVersion`. A
 /// driver with a fact keeps every value of its kind, and every device keeps the values outside
 /// `[0, 1]` where it enabled `VK_EXT_depth_range_unrestricted`. The shader's reads and
-/// comparisons of such a texture are `depth_compares`' (Metal's answers there). A device whose
-/// identity is not measured announces nothing for it (its paths are exact; it sends the
-/// informational `metal2vulkan-unmeasured-driver`, no degrade notice).
+/// comparisons of such a texture are `depth_compares`' (Metal's answers there).
 #[test]
 fn depth_images_keep_what_their_drivers_claim() {
     let cache = ScratchCache::new().unwrap();
@@ -1484,34 +1422,25 @@ fn depth_images_keep_what_their_drivers_claim() {
     layer_reported_nothing_at_all(&messages);
 }
 
-fn verdict(v: MipmapVerdict) -> &'static str {
-    match v {
-        MipmapVerdict::NotChecked => "not checked",
-        MipmapVerdict::AcceptedWithinSpread => "accepted within Metal's spread (near-equivalent)",
-        MipmapVerdict::Refused => "refused",
-        _ => "unknown",
-    }
-}
-
 /// `generate_mipmaps` of every pixel format in 2D (levels that halve exactly and levels that do
-/// not) and 3D: refused as Metal refuses it, refused typed where the device's chain is not within
-/// Metal's measured spread, else run, a near-equivalent announced once ([`MIPMAPS`]) and printed
-/// as one, never as Metal's answer; each format's verdict printed. Every format Metal's filter is
-/// computed for runs exactly instead, on every device (`mipmaps_exact`; its blit chain is never
-/// checked), and so do the integer formats' picks: never refused, and no near-equivalent.
+/// not) and 3D: refused as Metal refuses it, left as it is for a depth or stencil texture, an
+/// integer format's texels picked, and every other format's levels made by the device's blit
+/// chain or, where its blits cannot filter the format, by the compute filter, as the work counts
+/// say; each format's way printed. A filtered chain announces `device-filtered-mipmaps` once
+/// ([`MIPMAPS`]). Refused `NotImplemented(MipmapGeneration)` only for a format the compute filter
+/// does not compute (the RGBX formats among them), never for one it does.
 #[test]
 fn mipmaps_of_every_format_run_or_are_refused_typed() {
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
     {
         let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
-        let rule = device.properties().metal_level.mipmap_rule();
         // What the device announced before its first mipmaps.
         messages.take_notices();
         let queue = device.new_command_queue().unwrap();
-        let (mut ran, mut exact, mut metal, mut gaps) = (0, 0, 0, 0);
+        let (mut blitted, mut filtered, mut picks, mut metal, mut gaps) = (0, 0, 0, 0, 0);
         let mut lines = Vec::new();
-        // The kinds the textures' makings and the computed chains announce.
+        // The kinds the textures' makings announce.
         let mut first = BTreeSet::new();
         for &pf in PixelFormat::ALL {
             let mut outcome = Vec::new();
@@ -1526,14 +1455,8 @@ fn mipmaps_of_every_format_run_or_are_refused_typed() {
                     outcome.push("no texture");
                     continue;
                 };
-                // A read-only `Depth32Float` texture's depth twin, a BC texture's decoded twin,
-                // and a BC6H or BC7 texture's device decode.
+                // A carried texture's decoded twin, and a BC texture's device decode.
                 first.extend(forced(&[
-                    (
-                        Degradation::DepthTwin,
-                        pf == PixelFormat::Depth32Float && twins_depth(&device),
-                    ),
-                    (Degradation::DecodedBlockTwin, twins_blocks(&device, pf)),
                     (
                         Degradation::CarriedDecodedTwin,
                         twins_carried(&device, pf)[0],
@@ -1549,29 +1472,29 @@ fn mipmaps_of_every_format_run_or_are_refused_typed() {
                 ]));
                 let command_buffer = queue.command_buffer().unwrap();
                 let mut blit = command_buffer.blit_command_encoder().unwrap();
-                let volume = ty == TextureType::Type3D;
-                // An RGBX format's chain is not yet held (Metal stores X = green in its levels,
-                // zeros for `RGBX8Snorm`'s): refused `NotImplemented(MipmapGeneration)`, below.
-                let computed =
-                    !x_channel(pf) && (filtered(pf, extent, levels, volume, rule) || picked(pf));
-                match blit.generate_mipmaps(&t) {
+                let before = device.work_counts();
+                let result = blit.generate_mipmaps(&t);
+                let after = device.work_counts();
+                let blits = after.image_blits_recorded - before.image_blits_recorded;
+                let filter = after.mipmaps_filtered - before.mipmaps_filtered;
+                match result {
                     // Plain Metal leaves a depth or stencil texture as it is.
                     Ok(()) if is_depth_stencil(pf) => outcome.push("left as it is"),
-                    Ok(()) if computed => {
-                        exact += 1;
-                        if let Some(chain) = filter_chain(pf, extent, levels, volume, rule) {
-                            first.extend(forced(&[
-                                (Degradation::MipmapsAsAppleM4, chain.unlike_an_m3),
-                                (Degradation::MipmapTieRounding, chain.near_ties),
-                            ]));
-                        }
-                        outcome.push("exact");
+                    Ok(()) if picked(pf) => {
+                        assert_eq!((blits, filter), (0, 0), "{pf:?} {ty:?}: picks");
+                        picks += 1;
+                        outcome.push("picked");
+                    }
+                    Ok(()) if filter == 1 => {
+                        assert_eq!(blits, 0, "{pf:?} {ty:?}: the filter alone");
+                        filtered += 1;
+                        outcome.push("compute filter");
                     }
                     Ok(()) => {
-                        ran += 1;
-                        outcome.push("ran");
+                        assert_eq!(blits, levels - 1, "{pf:?} {ty:?}: a blit a level");
+                        blitted += 1;
+                        outcome.push("blits");
                     }
-                    Err(e) if computed => panic!("{pf:?} {ty:?}: an exact chain refused: {e}"),
                     Err(Error::Invalid(Invalid {
                         problem: Problem::Mipmap(_),
                         ..
@@ -1581,6 +1504,10 @@ fn mipmaps_of_every_format_run_or_are_refused_typed() {
                     }
                     Err(Error::Unsupported(u)) => {
                         assert_eq!(u.feature, Feature::MipmapGeneration, "{pf:?}: {u:?}");
+                        assert!(
+                            x_channel(pf) || MipmapFilterChain::texel_bytes(pf).is_none(),
+                            "{pf:?} {ty:?}: refused where the compute filter computes it: {u:?}"
+                        );
                         gaps += 1;
                         outcome.push("refused");
                     }
@@ -1589,43 +1516,38 @@ fn mipmaps_of_every_format_run_or_are_refused_typed() {
                 blit.end_encoding().unwrap();
                 run(&command_buffer);
             }
-            let v = device.mipmap_generation(pf);
-            // A refusal may come before the check (a format without linear filtering).
-            match (outcome.contains(&"ran"), outcome.contains(&"refused")) {
-                (true, false) => assert_eq!(v, MipmapVerdict::AcceptedWithinSpread, "{pf:?}"),
-                (true, true) => assert_ne!(v, MipmapVerdict::NotChecked, "{pf:?}"),
-                _ => {}
-            }
             if outcome
                 .iter()
                 .any(|o| !matches!(*o, "Metal refuses" | "no texture" | "left as it is"))
             {
                 lines.push(format!(
-                    "  {}: 2D 8x8 {}, 2D 7x5 {}, 3D 4x4x4 {}, verdict {}",
+                    "  {}: 2D 8x8 {}, 2D 7x5 {}, 3D 4x4x4 {}",
                     pf.name(),
                     outcome[0],
                     outcome[1],
                     outcome[2],
-                    verdict(v)
                 ));
             }
         }
         eprintln!(
-            "mipmaps on {}: {exact} exact (Metal's, its filter computed or its texels picked), \
-             {ran} ran (near-equivalent, within Metal's spread, not Metal's), {metal} refused as \
-             Metal refuses them, {gaps} refused by the device's check or features",
+            "mipmaps on {}: {blitted} by the device's blits, {filtered} by the compute filter \
+             (both the device's filter, not Apple's: a near-equivalent), {picks} picked (plain \
+             Metal's texels), {metal} refused as Metal refuses them, {gaps} refused (not \
+             implemented)",
             device.name()
         );
         for line in lines {
             eprintln!("{line}");
         }
         assert!(metal > 0);
-        first.extend(forced(&[(Degradation::MipmapsWithinSpread, ran > 0)]));
+        assert!(blitted > 0);
+        let ran = blitted + filtered > 0;
+        first.extend(forced(&[(Degradation::DeviceFilteredMipmaps, ran)]));
         let announced = assert_made_once(&messages, &[], &first);
         for kind in MIPMAPS {
             assert_eq!(
                 announced.contains_key(&kind),
-                ran > 0,
+                ran,
                 "{kind:?} exactly where a chain ran: {announced:?}"
             );
         }

@@ -299,16 +299,7 @@ fn a_compute_pipeline_compiles_from_a_function() {
         assert_eq!(pipe.stage.entry_point, "main");
         assert_eq!(pipe.stage.stage, crate::vk::ShaderStage::COMPUTE);
         assert_eq!(pipe.layout.sets.len(), 1);
-        // Buffer 0's storage view, and on a profile that can select between two descriptors'
-        // pointers (`variablePointers` with `variablePointersStorageBuffer`) the kernel's
-        // write-only store sink, which its dropped store selects into instead of branching
-        // (`lower::access::sink`). `vk12-floor` has neither feature and keeps the branch.
-        let expected_bindings = 1 + usize::from(stem != "vk12-floor");
-        assert_eq!(
-            pipe.layout.sets[0].bindings.len(),
-            expected_bindings,
-            "{stem}"
-        );
+        assert_eq!(pipe.layout.sets[0].bindings.len(), 1, "{stem}");
         assert_eq!(pipe.metal_info.max_total_threads_per_threadgroup, 64);
         assert_eq!(pipe.metal_info.thread_execution_width, 32);
         assert_eq!(pipe.metal_info.static_threadgroup_memory_length, 0);
@@ -629,25 +620,6 @@ fn function_keys_cover_their_inputs() {
     assert_ne!(with_true, maps(&[(0, edges)]));
     assert_ne!(maps(&[(0, edges)]), maps(&[(1, edges)]));
     assert_ne!(maps(&[(0, edges)]), maps(&[(0, mirrored)]));
-    // So is the vertex function's capture form.
-    let captured = |form| {
-        let mut i = LoweringInputs::new();
-        i.captured_positions = Some(form);
-        a.function_compile_key(&fd, &i)
-    };
-    let vertices = captured(crate::pipeline::CaptureForm::Vertices);
-    let short = captured(crate::pipeline::CaptureForm::Indexed(
-        crate::metal::IndexType::UInt16,
-    ));
-    let long = captured(crate::pipeline::CaptureForm::Indexed(
-        crate::metal::IndexType::UInt32,
-    ));
-    assert_ne!(with_true, vertices);
-    assert_ne!(dropped, vertices);
-    assert_ne!(layer, vertices);
-    assert_ne!(vertices, short);
-    assert_ne!(vertices, long);
-    assert_ne!(short, long);
     // So are the extended-range colors whose `half` shadow the draw's instance holds.
     let shadowed = |colors: &[u32]| {
         let mut i = LoweringInputs::new();
@@ -675,12 +647,7 @@ fn the_inputs_encoding_is_the_earlier_derived_debug() {
     };
     let mut full = LoweringInputs::new();
     let mut projection = VertexFetchProjection::new();
-    projection.attributes.insert(
-        2,
-        VertexFetch::FixedFunction {
-            narrow_float: false,
-        },
-    );
+    projection.attributes.insert(2, VertexFetch::FixedFunction);
     full.vertex_fetch = Some(projection);
     full.storage_images.insert(
         slot(SlotClass::Texture, 1),
@@ -706,9 +673,9 @@ fn the_inputs_encoding_is_the_earlier_derived_debug() {
                 .replace(", merged_draws: false", "")
                 .replace(", framebuffer_fetch: None", "")
                 .replace(", srgb_textures: {}", "")
-                .replace(", srgb_twins: {}", "")
                 .replace(", snapshot_textures: {}", "")
-                .replace(", ycbcr_textures: {}", "")
+                .replace(", ycbcr_in_place: {}", "")
+                .replace(", ycbcr_planes_sampled: {}", "")
                 .replace(", viewport_index_varying: false", "")
                 .replace(", max_call_stack_depth: None", "")
                 .replace(", flat_grid: false", "")
@@ -726,7 +693,6 @@ fn the_inputs_encoding_is_the_earlier_derived_debug() {
                 .replace(", extended_range: {}", "")
                 .replace(", extended_range_colors: {}", "")
                 .replace(", word_colors: {}", "")
-                .replace(", srgb_fetches: {}", "")
                 .replace(", zeroed_colors: {}", "")
                 .replace(", dropped_colors: {}", "")
                 .replace(", kept_imageblock_bytes: None", "")
@@ -749,16 +715,12 @@ fn the_inputs_encoding_is_the_earlier_derived_debug() {
                 .replace(", address_maps: {}", "")
                 .replace(", cubic_samplers: {}", "")
                 .replace(", rotated_blends: {}", "")
-                .replace(", captured_positions: None", "")
-                .replace(", half_output_lanes: {}", "")
                 .replace(", extended_shadows: {}", "")
                 .replace(", cross_class: {}", "")
                 .replace(", texture_write_rounding: TowardZero", "")
                 .replace(", anisotropic_samplers: {}", "")
                 .replace(", uniform_varyings: {}", "")
                 .replace(", instanced_attributes: {}", "")
-                .replace(", depth16_codes: false", "")
-                .replace(", depth16_bias_raises: None", "")
                 .replace(", color_group: None", "")
                 .replace(", object_payload: None", "")
                 .replace(", tessellation: None", ""),
@@ -1990,8 +1952,8 @@ fn a_multisampled_framebuffer_fetch_reads_each_samples_own_color() {
 /// color attachments 0 and 2, not 1: on `lavapipe` attachment 1 is masked and the feature required
 /// (and enabled); on `vk12-floor`, without the feature, every element is identical, an absent
 /// attachment 1's included, and a written attachment that blends differently is refused typed. A
-/// blend of one and zero, added, of an attachment the function rounds to Metal's codes takes no
-/// Vulkan blend, so it differs from no other element.
+/// blend of one and zero, added, of an attachment whose channels convert by a rule other than the
+/// device's (`StageIo::color_writes`) takes no Vulkan blend, so it differs from no other element.
 #[test]
 fn a_render_pipeline_requires_the_blend_features_its_attachments_need() {
     use crate::device::requirements::VkFeature;
@@ -2160,7 +2122,7 @@ fn a_vertex_key_projects_the_attributes_it_reads() {
     let keys = dev
         .render_pipeline_key(&d, &Budget::standard())
         .expect("keys");
-    let mut expected = crate::pipeline::link::vertex::vertex_fetch_projection(
+    let expected = crate::pipeline::link::vertex::vertex_fetch_projection(
         d.vertex_descriptor.as_ref(),
         &{
             use crate::pipeline::stage_io::IoNumeric::{Float, Uint};
@@ -2169,9 +2131,6 @@ fn a_vertex_key_projects_the_attributes_it_reads() {
         dev.profile(),
     )
     .expect("projection");
-    // The key narrows `narrow_float` to the attributes read as a 32-bit `float`; attribute 1's
-    // `Half2` is read as a `half2`, so its bit is not key data of this entry.
-    crate::pipeline::link::vertex::narrow_float_of_f32_reads(&mut expected, |a| a == 0);
     let mut inp = LoweringInputs::new();
     inp.vertex_fetch = Some(expected);
     assert_eq!(keys.vertex, dev.function_compile_key(&fd, &inp));
@@ -2605,10 +2564,7 @@ fn the_interface_states_the_textures_read_at_the_fragments_own_pixel() {
 /// writes no memory of the function's. A profile without the interlock refuses it, naming the
 /// feature. A variant asked for `tob_sample`'s slot, which the fact does not list, would sample the
 /// texture beside the copy: refused, never compiled so. All of it holds under the exact answers
-/// too, and there each snapshot variant names Metal's conversion routine
-/// (`lower::texture::float_texel`) exactly where the direct read does: the read decodes the
-/// snapshot's codes and converts the value by the bound format's class, so what a program reads
-/// back through a snapshot is what it reads without one.
+/// too.
 #[test]
 fn a_snapshot_variant_reads_its_texture_in_the_copy_alone() {
     use crate::device::requirements::VkFeature;
@@ -2629,12 +2585,11 @@ fn a_snapshot_variant_reads_its_texture_in_the_copy_alone() {
         inputs
     };
     let mut interlocked = 0;
-    let mut converted = 0;
     let policies = [
-        DevicePolicy::default(),
-        DevicePolicy::default().exact_answers(),
+        ("default", DevicePolicy::default()),
+        ("exact", DevicePolicy::default().exact_answers()),
     ];
-    for (stem, policy) in [
+    for (stem, name, policy) in [
         "intel-irisxe-anv",
         "nvidia-rtx5080-laptop",
         "amd-780m-radv",
@@ -2643,23 +2598,13 @@ fn a_snapshot_variant_reads_its_texture_in_the_copy_alone() {
         "vk12-floor",
     ]
     .into_iter()
-    .flat_map(|stem| policies.map(|policy| (stem, policy)))
+    .flat_map(|stem| policies.map(|(name, policy)| (stem, name, policy)))
     {
         let p = crate::pipeline::testing::profile(stem, policy).expect("profile");
-        let stem = format!("{stem} {:?}", policy.texel_conversion);
+        let stem = format!("{stem} {name}");
         let base = crate::pipeline::testing::compile(&bc, "tob_read", &p)
             .unwrap_or_else(|e| panic!("{stem}: {e}"));
         assert_eq!(base.interface.snapshot_textures, [0u32], "{stem}");
-        let routine = crate::lower::texture::float_texel::CENSUS_NAME;
-        let converts = base.strategies.entries.contains_key(routine);
-        if converts {
-            assert_eq!(
-                policy.texel_conversion,
-                crate::device::TexelConversionPolicy::Exact,
-                "{stem}"
-            );
-            converted += 1;
-        }
         let sampled = crate::pipeline::testing::compile(&bc, "tob_sample", &p)
             .unwrap_or_else(|e| panic!("{stem}: {e}"));
         assert!(sampled.interface.snapshot_textures.is_empty(), "{stem}");
@@ -2696,22 +2641,9 @@ fn a_snapshot_variant_reads_its_texture_in_the_copy_alone() {
                 [0u32],
                 "{stem} {form:?}"
             );
-            // The snapshot's codes reach the output through the same conversion the direct read
-            // takes: the read decodes them and converts the value by the bound format's class,
-            // so the value a program reads back is the one it reads without a snapshot.
-            assert_eq!(
-                narrow.strategies.entries.contains_key(routine),
-                converts,
-                "{stem} {form:?}: the conversion routine"
-            );
         }
         let a = variant.unwrap_or_else(|e| panic!("{stem}: {e}"));
         assert_eq!(a.interface.snapshot_textures, [0u32], "{stem}");
-        assert_eq!(
-            a.strategies.entries.contains_key(routine),
-            converts,
-            "{stem}: the conversion routine"
-        );
         assert_eq!(a.interface.own_pixel_textures, [0u32], "{stem}");
         assert!(!a.interface.writes_memory, "{stem}");
         assert!(
@@ -2749,7 +2681,6 @@ fn a_snapshot_variant_reads_its_texture_in_the_copy_alone() {
         interlocked >= 8,
         "the interlocked profiles, under both policies"
     );
-    assert!(converted >= 4, "the exact conversion's calls");
 }
 
 /// The interface states whether the function writes memory another invocation or a later command

@@ -14,12 +14,19 @@
 //!   that convert the same stages, named by what a stage's conversion reads (`driver.rs`); and
 //!   what render creations work out from their descriptors before their compiles, under the
 //!   descriptor's key (`creation.rs`).
-//! - **A new build never reads an older build's entries.** They live under `v1/<build>/`, where
-//!   `<build>` is the SHA-256 of the crate's version, both artifact versions, and the digest of
-//!   the crate's sources that `build.rs` computes (the product files).
+//! - **A build never reads the entries of another translator.** They live under `v1/<build>/`,
+//!   where `<build>` is the SHA-256 of the crate's version, both artifact versions, and the
+//!   translator's source digest (`metal2vulkan::cache::SOURCE_DIGEST`, its product files), so a
+//!   translator edit starts afresh even where no version moved. The runtime's own sources are not
+//!   in it: a translated artifact is the translator's answer for the inputs its key and profile
+//!   fingerprint hash, so a build that changed only the runtime reads every artifact an earlier
+//!   one wrote. What the runtime derives itself from a render descriptor (its linked-use answers,
+//!   reflection and variant keys, `creation.rs`) is named by `RUNTIME_VERSION` too, so a runtime
+//!   change that bumps it reads none of an earlier runtime's records; a record's format is also
+//!   versioned by its own tag and magic.
 //! - **Records of content, every build's**. Beside the builds', one directory holds records named
 //!   by the content they describe, which hold no translation: the driver's data of each family of
-//!   makings (above).
+//!   makings (above), and the libraries pipeline records name (`libraries.rs`).
 //! - **A wrong entry is never used.** An entry's name is the SHA-256 of its build, kind, key and
 //!   profile fingerprint, and a read is a hit only if the envelope's versions, kind, key and
 //!   profile equal the request's and its checksum holds (`from_bytes_for_key`). Anything else is
@@ -52,10 +59,15 @@
 //!   so a sweep of pipeline states over one function pair asks it once rather than once a state.
 
 mod creation;
+mod libraries;
+/// The name of a creation's record under a runtime version, which `tests::shader_cache` reads.
+#[cfg(test)]
+pub(crate) use creation::record_name;
 /// The variant records this process gave the directory, which `tests::render_stage_digests`'
 /// count reads (`creation.rs`).
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 pub(crate) use creation::variant_records_written;
+pub(crate) use creation::VariantStages;
 pub(crate) mod driver;
 mod held;
 pub(super) mod store;
@@ -288,10 +300,16 @@ pub(crate) enum EntryKind {
     RenderReflection = 9,
     /// The pipeline key of a render descriptor under a variant key (`creation.rs`).
     VariantPipeline = 10,
+    /// A library a pipeline record names, in the content directory (`libraries.rs`).
+    Library = 11,
 }
 
-/// The build this crate is: the SHA-256 of its version, both artifact versions, the translator's
-/// source digest, and its own sources' digest (`build.rs`).
+/// The translations this build reads and writes: the SHA-256 of the crate's version, both artifact
+/// versions and the translator's source digest. Not the runtime's own sources: every entry under
+/// it is the translator's answer for its key (an artifact, a frame of linked-use answers or a
+/// reflection) or a record of the translator's keys, under a name the runtime's own format tags
+/// version, so a build whose translator and versions did not move reads its entries
+/// (the module docs).
 pub(crate) fn this_build() -> Hash256 {
     let mut hash = Sha256::new();
     hash.update(b"metal2vulkan shader cache build\0");
@@ -300,7 +318,6 @@ pub(crate) fn this_build() -> Hash256 {
     hash.update(metal2vulkan::cache::ARTIFACT_FORMAT_VERSION.to_le_bytes());
     hash.update(metal2vulkan::cache::SEMANTICS_VERSION.to_le_bytes());
     hash.update(metal2vulkan::cache::SOURCE_DIGEST.as_bytes());
-    hash.update(env!("M2V_RUNTIME_SOURCE_ID").as_bytes());
     hash.finalize().into()
 }
 
@@ -379,6 +396,9 @@ pub(super) struct ShaderCache {
     held: held::HeldFunctions,
     store: Arc<Store>,
     worker: Worker,
+    /// The libraries pipeline records name that this device knows the directory holds
+    /// (`libraries.rs`).
+    libraries: libraries::KeptLibraries,
     /// What names the makings' records (`driver.rs`).
     records: Records,
     /// The `VkPipelineCache` the device keeps for each record name, one per family of makings
@@ -417,6 +437,7 @@ impl ShaderCache {
             held: held::HeldFunctions::new(),
             store,
             worker,
+            libraries: libraries::KeptLibraries::new(),
             records: Records {
                 identity: driver::Identity::of(properties),
                 settings,
@@ -425,6 +446,12 @@ impl ShaderCache {
             live: LiveCaches::default(),
             driver_reports: feedback,
         })
+    }
+
+    /// The device's view of the directory: what reads and writes its content records (the
+    /// device's check of textures over host pages keeps its verdicts there, `in_place.rs`).
+    pub(crate) fn content_store(&self) -> &Store {
+        &self.store
     }
 
     /// Destroy the `VkPipelineCache` of every record the device holds, then stop the cache

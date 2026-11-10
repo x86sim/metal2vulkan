@@ -25,10 +25,7 @@
 //!
 //! The copy is one counted loop over the block's cells in the writing invocation (a builder
 //! loop), each iteration a contained arena leaf load
-//! (`access::imageblock::load`) and a texture write. A `half` element written to a slot that
-//! stores each channel's half bits (`StorageImageClass::HalfBits`) loads the cells' bits as 16-bit
-//! integers and writes them as they are: the texel the widening and `narrow::to_bits` would give,
-//! since the two are inverse on every bit pattern (a NaN's sign and payload included). A block
+//! (`access::imageblock::load`) and a texture write. A block
 //! past the imageblock's extent in either axis is clipped to it (the cells past it are not the
 //! imageblock's; Metal leaves them undefined).
 //!
@@ -87,28 +84,12 @@ pub struct Slice {
     pub guard: bool,
     /// The cell loads are contained.
     pub contained: bool,
-    /// The slot's storage class (`super::storage_class`): a converting one (`RotateArgb`,
-    /// `HalfTowardZero`) rounds each texel to Metal's code of each channel.
+    /// The slot's storage class (`super::storage_class`): a converting one moves or encodes each
+    /// texel's channels (`RotateArgb`'s rotation, `SrgbEncode`'s codes).
     pub class: StorageImageClass,
-    /// A `float` slice through a heap handle on a device not measured to store it in a
-    /// half-float texture as Metal does: the class each texel takes where the handle's texel
-    /// class is a half-float format's (`super::Write::heap_half`).
-    pub heap_half: Option<StorageImageClass>,
-    /// A `float` slice through a heap handle: each texel's NaN lanes quieted where the handle's
-    /// texel class is a small float's (`super::Write::heap_small_floats`).
-    pub heap_small_floats: bool,
-    /// How a `half` element's NaN is written (`super::half_nans`).
-    pub half_nans: super::HalfNans,
-    /// Each texel of a half-float member stores its bits through the heap group's unsigned
-    /// integer twin where the handle's class names one (`super::Write::heap_bits`).
-    pub heap_bits: bool,
     /// Every invocation of the workgroup writes a strided share of the cells, then a workgroup
     /// barrier (`super::cooperative`); else the writing invocation writes them all.
     pub cooperative: bool,
-    /// A `half` element written to a slot that stores each channel's half bits
-    /// (`StorageImageClass::HalfBits`): the cells loaded as this leaf of 16-bit integers, each
-    /// lane the channel's bits as they are.
-    pub bits: Option<Leaf>,
 }
 
 impl Slice {
@@ -117,19 +98,6 @@ impl Slice {
             + if self.contained { 64 } else { 0 }
             + if self.guard { 48 } else { 0 }
             + super::emit::class_write_words(self.class)
-            + self.heap_half.map_or(0, |c| {
-                super::HEAP_CLASS_WORDS + super::emit::class_write_words(c) + 32
-            })
-            + match self.heap_small_floats {
-                true => super::heap_half_write_words(StorageImageClass::SmallFloatQuietNan),
-                false => 0,
-            }
-            + self.half_nans.words()
-            + if self.heap_bits {
-                super::heap_bits_write_words()
-            } else {
-                0
-            }
             + if self.cooperative { 24 } else { 0 }
             + 320
     }
@@ -330,44 +298,15 @@ pub(super) fn select(
     };
     let guard = slot::write_guard(cx, false);
     let class = super::storage_class(cx, image)?;
-    let heap_half = match image.heap() && conv == TexelConv::F32 {
-        true => super::heap_write_class(cx),
-        false => None,
-    };
-    let heap_small_floats = image.heap() && conv == TexelConv::F32;
-    cx.families.access.heap_class_index |= heap_half.is_some() || heap_small_floats;
-    // A half-float member's bits through the group's unsigned integer twin, where the handle's
-    // class names one.
-    let heap_bits = super::heap_bits(cx, image, t.image, (conv, false));
     if conv == TexelConv::F32 {
-        super::half_storage_facts(cx, image, class, (heap_half, heap_bits))?;
+        super::half_storage_facts(cx, image, (class, false), m)?;
     }
-    let half_nans = match conv == TexelConv::F16 {
-        true => super::half_nans(cx, image, (false, heap_bits))?,
-        false => super::HalfNans::Held,
-    };
-    // A `half` element to a slot of half bits, its NaNs as held: the cells' bits as they are.
-    let bits = match conv == TexelConv::F16
-        && class == StorageImageClass::HalfBits
-        && !image.heap()
-        && matches!(half_nans, super::HalfNans::Held | super::HalfNans::Kept)
-    {
-        true => Some(Leaf {
-            form: Form {
-                held: held_on(
-                    cx.profile,
-                    Held::Int {
-                        bits: 16,
-                        container: 32,
-                    },
-                )?,
-                lanes,
-            },
-            bytes,
-            path,
-        }),
-        false => None,
-    };
+    if matches!(conv, TexelConv::F32 | TexelConv::F16) {
+        super::norm_storage_facts(cx, image, t.image, TexelForm { conv, lanes })?;
+    }
+    if conv == TexelConv::F16 {
+        super::half_write_nans(cx, image)?;
+    }
     mark(cx, image, |u| u.write = true);
     // Every invocation shares the write where its guard selects local id 0 at a uniform point.
     let cooperative = match super::cooperative::guard(cx, call, m)? {
@@ -393,11 +332,6 @@ pub(super) fn select(
         guard,
         contained: imageblock::contained(cx),
         class,
-        heap_half,
-        heap_small_floats,
-        half_nans,
-        heap_bits,
         cooperative,
-        bits,
     })))
 }

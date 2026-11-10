@@ -588,6 +588,7 @@ fn pulled_read(
     if encoding.is_float() != form.is_float() || form.is_bool() {
         return Err(not_lowered());
     }
+    fetch::decode_notes(cx, encoding, form);
     let element = match (kind, step_function) {
         (Kind::ControlPoint, VertexStepFunction::PerPatchControlPoint) => Element::ControlPoint,
         (Kind::Patch, VertexStepFunction::PerPatch) => Element::Patch,
@@ -631,7 +632,6 @@ fn pulled_read(
             },
             components: form.lanes,
             source_bits: form.bits(),
-            bits: 32,
         };
         sp.interface
             .pulled

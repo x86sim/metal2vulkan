@@ -91,14 +91,12 @@ pub struct BindState {
     #[cfg_attr(feature = "serde", serde(default))]
     pub depth_stencil: metal::state::DepthStencilDescriptor,
     /// The draw's primitive type (`drawPrimitives:`'s or `drawIndexedPrimitives:`'s
-    /// `primitiveType`), which two draws read: one of an indexed capture variant
-    /// (`CaptureForm::Indexed`), as Metal restarts a line or triangle strip at the index type's
-    /// all-ones index and shades no vertex there, and draws every index of a list or of points;
-    /// and one of a pipeline whose vertex function writes the primitive ID
-    /// (`LoweringInputs::primitive_id_varying`), whose `PushField::VerticesPerPrimitive` holds
-    /// the type's vertices per primitive. `None` where the consumer does not say; such a draw is
-    /// `BindError::MissingPrimitiveType`. Only a draw's bytes depend on it, so it is not part of
-    /// the shape.
+    /// `primitiveType`), which a draw of a pipeline whose vertex function writes the primitive ID
+    /// reads (`LoweringInputs::primitive_id_varying`): its `PushField::VerticesPerPrimitive` holds
+    /// the type's vertices per primitive, and an indexed strip, which Metal restarts at the index
+    /// type's all-ones index, does not run de-indexed. `None` where the consumer does not say;
+    /// such a draw is `BindError::MissingPrimitiveType`. Only a draw's bytes depend on it, so it
+    /// is not part of the shape.
     #[cfg_attr(feature = "serde", serde(default))]
     pub primitive_type: Option<metal::PrimitiveType>,
     /// The index type of a direct indexed draw of a pipeline whose vertex function writes the
@@ -213,30 +211,6 @@ pub struct BindState {
     /// for every other draw.
     #[cfg_attr(feature = "serde", serde(default))]
     pub mesh_last_first: bool,
-    /// Whether the depth the draw renders against is `Depth16Unorm`: its render pass's depth
-    /// attachment's format, or `false` for the hidden `float` depth a pass without one tests;
-    /// `None` where the draw has no depth. Plain Metal stores into that depth whatever format the
-    /// draw's pipeline names, so a draw whose pipeline names otherwise runs the variant whose
-    /// fragment stage takes Metal's 16-bit codes by it (`BindShape::depth16_pass`,
-    /// `VariantKey::depth16_pass`). Part of the shape; `None` for every other encoder.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub depth16_pass: Option<bool>,
-    /// Whether the draw biases its triangles' depths by Metal's factors: a constant or slope factor
-    /// other than 0 (`setDepthBias:slopeScale:clamp:`), for a draw of triangles whose viewports
-    /// take no bias. Where the depth is `Depth16Unorm` and the device stores unbiased depths as
-    /// Metal's codes but not biased ones, the draw runs the variant whose fragment stage adds the
-    /// bias itself (`BindShape::depth16_biased`, `VariantKey::depth16_biased`). Part of the shape;
-    /// `false` for every other draw.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub depth16_biased: bool,
-    /// The side of the draw's depth bias, where the consumer proved it: `Some(true)` where Metal's
-    /// biased depth is never below the fragment's own, `Some(false)` where it is never above
-    /// (`metal::state::depth16_bias_side`). Where the depth is `Depth16Unorm` and the draw's
-    /// fragment stage adds the bias itself, the draw runs the variant whose stage declares that
-    /// side (`BindShape::depth16_bias_raises`, `VariantKey::depth16_bias_raises`), so the device
-    /// may test the depth before the stage runs. Part of the shape; `None` for every other draw.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub depth16_bias_raises: Option<bool>,
     /// Allocations a pointer may reach that the consumer lists apart from `used_resources`, at
     /// their own lengths: the resident set holds them beside the bound buffers and the used
     /// resources, and a replay's extents count them (the runtime's live buffers of their own,
@@ -281,9 +255,9 @@ pub struct BindState {
     #[cfg_attr(feature = "serde", serde(default))]
     pub fragment_tests: FragmentTests,
     /// The render encoder's blend color (`setBlendColorRed:green:blue:alpha:`; Metal's default
-    /// `[0, 0, 0, 0]` where the encoder never set it), red first: a fragment function that blends
-    /// an extended-range attachment in the shader under a blend that reads it takes it as push
-    /// data (`PushField::BlendColor`). Only a draw's bytes depend on it, so it is not part of the
+    /// `[0, 0, 0, 0]` where the encoder never set it), red first: a fragment function that
+    /// computes a blend in the shader under a blend that reads it takes it as push data
+    /// (`PushField::HalfBlendColor`). Only a draw's bytes depend on it, so it is not part of the
     /// shape.
     #[cfg_attr(feature = "serde", serde(default))]
     pub blend_color: [f32; 4],
@@ -316,15 +290,6 @@ pub struct BindState {
     /// depend on it, so it is not part of the shape.
     #[cfg_attr(feature = "serde", serde(default))]
     pub stencil_references: [u32; 2],
-    /// The draw's depth bias as a fragment stage that stores Metal's `Depth16Unorm` codes itself
-    /// adds it (`PushField::DepthBias`, `RuntimeFact::Depth16Codes`): Metal's constant as a
-    /// depth (`metal::state::depth16_bias`), then its slope and clamp factors, all 0 where the
-    /// draw's bias touches no depth (Metal's default, a draw of points or lines, a bias the draw's
-    /// viewports take). Read only by a draw of such a pipeline, whose consumer records the draw's
-    /// Vulkan depth bias as zero; only the draw's bytes depend on it, so it is not part of the
-    /// shape.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub depth_bias: [f32; 3],
 }
 
 /// What a draw's depth and stencil tests can do to its fragments (`BindState::fragment_tests`).
@@ -733,9 +698,6 @@ impl BindState {
             fragment_tests: self.fragment_tests,
             extended_shadows: self.extended_shadows.clone(),
             snapshot_textures: self.snapshot_textures.clone(),
-            depth16_pass: self.depth16_pass,
-            depth16_biased: self.depth16_biased,
-            depth16_bias_raises: self.depth16_bias_raises,
             primitive_id_indices: self.primitive_id_indices,
             quad_primitive_ids: self.quad_primitive_ids,
             private_list: self.private_list,
@@ -790,9 +752,6 @@ impl BindState {
             fragment_tests,
             extended_shadows,
             snapshot_textures,
-            depth16_pass,
-            depth16_biased,
-            depth16_bias_raises,
             primitive_id_indices,
             quad_primitive_ids,
             private_list,
@@ -823,9 +782,6 @@ impl BindState {
             && self.fragment_tests == *fragment_tests
             && self.extended_shadows == *extended_shadows
             && self.snapshot_textures == *snapshot_textures
-            && self.depth16_pass == *depth16_pass
-            && self.depth16_biased == *depth16_biased
-            && self.depth16_bias_raises == *depth16_bias_raises
             && self.primitive_id_indices == *primitive_id_indices
             && self.quad_primitive_ids == *quad_primitive_ids
             && self.private_list == *private_list
@@ -1044,20 +1000,7 @@ impl StageTable {
             textures: self.textures.iter().map(|(i, t)| (*i, t.shape())).collect(),
             samplers: self.samplers.iter().map(|(i, s)| (*i, s.shape())).collect(),
             threadgroup_lengths: self.threadgroup_lengths.clone(),
-            dropped_store_buffers: self.dropped_stores(),
         }
-    }
-
-    /// [`StageTable::dropped_store_buffers`] over the slots this table binds a buffer at, the
-    /// shape's word: a bit of an unbound slot names nothing a store can reach, so leaving it out
-    /// keeps one shape for the draws of one set of bindings.
-    fn dropped_stores(&self) -> u32 {
-        let bound = self
-            .buffers
-            .keys()
-            .filter(|i| **i < u32::BITS)
-            .fold(0u32, |m, i| m | 1 << i);
-        self.dropped_store_buffers & bound
     }
 
     /// Whether its shape is the empty one, which [`BindState::shape`] leaves out.
@@ -1076,7 +1019,6 @@ impl StageTable {
             textures,
             samplers,
             threadgroup_lengths,
-            dropped_store_buffers,
         } = shape;
         let buffer_shapes = (self.buffers.iter())
             .map(|(i, b)| (*i, b.shape(self.class_alignment(*i, view_base_alignment))));
@@ -1086,7 +1028,6 @@ impl StageTable {
             && texture_shapes.eq(textures.iter().map(|(i, t)| (*i, *t)))
             && sampler_shapes.eq(samplers.iter().map(|(i, s)| (*i, *s)))
             && self.threadgroup_lengths == *threadgroup_lengths
-            && self.dropped_stores() == *dropped_store_buffers
     }
 
     /// The alignment above the vertex fetch's that the bind offset class of a buffer at index
@@ -1168,9 +1109,11 @@ impl BoundTexture {
 impl TextureFacts {
     /// The facts of an image texture that can change a plan (its view facts): the type, the pixel
     /// format, the sample count, the usage, whether it is sparse, its level count, which decides a
-    /// storage slot's level views and pushed level count, whether it is held with a depth twin, its
-    /// swizzle, its address-mode map, and its [`offset_base_axes`](Self::offset_base_axes). Its
-    /// array length only changes the view's subresource range, which is every layer.
+    /// storage slot's level views and pushed level count, its swizzle, its address-mode map, its
+    /// [`offset_base_axes`](Self::offset_base_axes), and whether its planes are read in place
+    /// ([`ycbcr_in_place`](Self::ycbcr_in_place), whose words the slot's push field carries, not
+    /// the shape) and through which device conversion where they are held as an image. Its array length only changes the view's subresource range, which is every
+    /// layer.
     ///
     /// The level count is stated whatever the usage: plain Metal writes a texture made without
     /// `ShaderWrite` at every level, through every write form, as one made with it.
@@ -1185,11 +1128,11 @@ impl TextureFacts {
             usage: self.usage,
             mipmap_level_count: self.mipmap_level_count,
             sparse: self.sparse,
-            depth_twin: self.depth_twin,
             swizzle: self.swizzle,
             address_modes: self.address_modes,
             offset_base_axes: self.offset_base_axes(),
-            own_format_views: self.own_format_views,
+            ycbcr_in_place: self.ycbcr_in_place.is_some(),
+            ycbcr_planes_sampler: self.ycbcr_in_place.and_then(|p| p.planes_sampler()),
         }
     }
 }
@@ -1271,14 +1214,6 @@ pub struct StageTable {
     /// runtime leaves out a slot it finds bound at moving offsets, so that its draws keep one shape.
     #[cfg_attr(feature = "serde", serde(default))]
     pub at_bind_views: u64,
-    /// The buffer slots (bit `i` for index `i`) bound to memory whose GPU writes Metal drops,
-    /// which the runtime sets: no-copy memory of Metal's private option bit 24, or pages a
-    /// consumer replaced read-only (`metal2vulkan-runtime`'s `read_only_view.rs`). A function's
-    /// stores through such a slot are dropped and nothing else of the draw or dispatch changes
-    /// (`SpecKey::DroppedStoreSlots`, `lower::access::emit::store_one`), as Metal drops a shader's
-    /// stores to such memory and completes. A slot left out (none, the default) keeps its stores.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub dropped_store_buffers: u32,
 }
 
 /// What the consumer knows of a Metal acceleration structure bound at a buffer slot.
@@ -1379,18 +1314,6 @@ pub struct TextureFacts {
     /// (`shaderResourceResidency`); the plan refuses it elsewhere.
     #[cfg_attr(feature = "serde", serde(default))]
     pub sparse: bool,
-    /// The texture's texels are held in an `R32_SFLOAT` image, and a `D32_SFLOAT` twin holds them
-    /// for comparisons: a `Depth32Float` texture the program only reads or samples, made by a
-    /// consumer on a device without `VK_EXT_depth_range_unrestricted`, so that a texel outside [0,
-    /// 1] keeps its value, or on one whose driver is not measured to keep a denormal in a depth
-    /// image (the runtime's driver facts), so that a denormal does. A sampled view of it reads the
-    /// `R32_SFLOAT` image, and a view a comparison reads is of the twin
-    /// ([`ImageViewDesc::twin`](crate::bind::ImageViewDesc)).
-    /// Only a `Depth32Float` texture holds its texels there. A multisampled one does under
-    /// `MultisampleDepthTwinPolicy::Exact` and has no `D32_SFLOAT` twin beside it: Metal reads a
-    /// `depth2d_ms` and compares nothing, so no view of a twin is asked for.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub depth_twin: bool,
     /// `MTLTexture.swizzle`: the source of each channel the texture's reads and samples return,
     /// border texels included. A sample emulated by fetches reads its border taps through it, and
     /// an opaque-black border the device replaces is checked against it.
@@ -1414,13 +1337,16 @@ pub struct TextureFacts {
     /// (`SpecKey::OffsetBaseAxes`, [`TextureFacts::offset_base_axes`]).
     #[cfg_attr(feature = "serde", serde(default))]
     pub parent_base_size: [u32; 3],
-    /// The texture's image is viewed in its own format alone: a wrapped image made without
-    /// `MUTABLE_FORMAT` (`false` for every texture the runtime makes). A storage slot that only
-    /// writes such a half-float texture is bound through the format's own view, with the class
-    /// it took previously (its `half` NaNs the device's, announced), not the unsigned integer alias
-    /// (`StorageImageClass::HalfBits`) the image cannot take.
+    /// The texture's two planes, where a function reads them in place
+    /// ([`YCbCrInPlace`](crate::bind::YCbCrInPlace), the runtime's extension): a two-plane YCbCr
+    /// texture of a converted 4:2:0 format whose planes the consumer views as one texel buffer.
+    /// A slot whose function reads it only as the in-place form reads
+    /// (`RuntimeFact::YCbCrInPlace`) takes its in-place variant (`VariantKey::ycbcr_in_place`),
+    /// which binds that texel buffer ([`WriteSource::YCbCrInPlace`](crate::bind::WriteSource))
+    /// and pushes these words (`PushField::YCbCrInPlace`); any other slot binds the texture's
+    /// image. `None` for every other texture.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub own_format_views: bool,
+    pub ycbcr_in_place: Option<crate::bind::YCbCrInPlace>,
 }
 
 impl TextureFacts {
@@ -1434,12 +1360,11 @@ impl TextureFacts {
             array_length: 1,
             mipmap_level_count: 1,
             sparse: false,
-            depth_twin: false,
             swizzle: metal::TextureSwizzleChannels::DEFAULT,
             address_modes: metal::sampler::AddressModeMap::IDENTITY,
             parent_relative_level: 0,
             parent_base_size: [0; 3],
-            own_format_views: false,
+            ycbcr_in_place: None,
         }
     }
 
@@ -1700,21 +1625,6 @@ pub struct BindShape {
     /// the pipeline can read through a snapshot so (`VariantKey::snapshot_textures`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub snapshot_textures: BTreeSet<u32>,
-    /// `BindState.depth16_pass`: where it differs from the pipeline's depth format, the variant
-    /// whose fragment stage takes Metal's 16-bit depth codes by the pass's depth
-    /// (`VariantKey::depth16_pass`).
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub depth16_pass: Option<bool>,
-    /// `BindState.depth16_biased`: against a `Depth16Unorm` depth, on a profile whose device
-    /// stores unbiased depths as Metal's codes but not biased ones, the variant whose fragment
-    /// stage adds the draw's bias and writes Metal's code (`VariantKey::depth16_biased`).
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub depth16_biased: bool,
-    /// `BindState.depth16_bias_raises`: where the draw's fragment stage adds a `Depth16Unorm`
-    /// depth's bias itself, the variant whose stage declares the bias's side
-    /// (`VariantKey::depth16_bias_raises`).
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub depth16_bias_raises: Option<bool>,
     /// `BindState.primitive_id_indices`: the primitive ID's de-indexed variant of an indexed
     /// draw's index type (`VariantKey::primitive_id_indices`), where the pipeline writes the ID.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -1968,11 +1878,6 @@ pub struct StageShape {
     pub textures: BTreeMap<u32, TextureShape>,
     pub samplers: BTreeMap<u32, BoundSamplerShape>,
     pub threadgroup_lengths: BTreeMap<u32, u32>,
-    /// The bound buffer slots whose GPU writes are dropped
-    /// ([`StageTable::dropped_store_buffers`] over the slots this shape binds a buffer at), which
-    /// a function that stores through a buffer slot reads (`SpecKey::DroppedStoreSlots`).
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub dropped_store_buffers: u32,
 }
 
 /// The shape of a bound buffer.
@@ -2031,10 +1936,6 @@ pub enum TextureShape {
         /// where the module has none.
         #[cfg_attr(feature = "serde", serde(default))]
         sparse: bool,
-        /// The texture is held in an `R32_SFLOAT` image with a `D32_SFLOAT` twin
-        /// ([`TextureFacts::depth_twin`]): a sampled view reads the image, a compared one the twin.
-        #[cfg_attr(feature = "serde", serde(default))]
-        depth_twin: bool,
         /// The texture's swizzle ([`TextureFacts::swizzle`]): the border taps of a sample emulated
         /// by fetches read through it, and an opaque-black border the device replaces is checked
         /// against it.
@@ -2051,11 +1952,17 @@ pub enum TextureShape {
         /// rule specializes on them (`SpecKey::OffsetBaseAxes`).
         #[cfg_attr(feature = "serde", serde(default))]
         offset_base_axes: u8,
-        /// The texture's image is viewed in its own format alone
-        /// ([`TextureFacts::own_format_views`]): a storage slot takes no alias view of it that
-        /// another choice serves.
+        /// The texture's planes are read in place where a slot's function reads them so
+        /// ([`TextureFacts::ycbcr_in_place`]): such a slot takes its in-place variant
+        /// (`VariantKey::ycbcr_in_place`).
         #[cfg_attr(feature = "serde", serde(default))]
-        own_format_views: bool,
+        ycbcr_in_place: bool,
+        /// The device's conversion of the texture's planes, where the consumer holds them as an
+        /// image it samples ([`YCbCrInPlace::planes_sampler`](crate::bind::YCbCrInPlace)): a slot
+        /// whose every sample the device's sampler takes samples that image
+        /// (`VariantKey::ycbcr_planes_sampled`).
+        #[cfg_attr(feature = "serde", serde(default))]
+        ycbcr_planes_sampler: Option<crate::bind::YCbCrPlanesSampler>,
     },
     Buffer {
         pixel_format: metal::PixelFormat,

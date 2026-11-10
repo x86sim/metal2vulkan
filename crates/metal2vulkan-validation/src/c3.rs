@@ -718,21 +718,15 @@ pub struct SlotRow {
 ///   Euclidean length of the gradient's two counted components where Apple combines them by its own
 ///   rule, so near a level or filter boundary a sample selects another level or filter than
 ///   Metal's, and the sampled value is ordinary data later words use.
-/// - A nearest cube sample's texel (`CubeFaceReciprocal`): the product computes Metal's position
-///   with the correctly rounded reciprocal of the major magnitude where Apple's texture unit uses
-///   an approximate one, so near a texel edge a sample reads the next texel, and the sampled value
-///   is ordinary data later words use.
 /// - A non-quad simdgroup operation before a discard (`QuadsCountedBeforeDiscard`), in a shape
 ///   whose placement by Metal's compiler is not known: its lanes include the quads the discard
 ///   drops, which Metal's may leave out, and the count, ballot, or reduction is ordinary data later
 ///   words use. Where Metal's placement was measured, the module makes it (a sum moved past the
 ///   discard, or counted ahead of it) and records no note.
-/// - A depth comparison the device makes (`DeviceDepthComparison`): a tap passes or fails where
-///   Metal's does not, and the comparison's value is ordinary data later words use. Open until the
-///   shader makes those comparisons on texels it fetches.
-/// - A bicubic sample's unpinned arithmetic (`BicubicFilterArithmetic`): a 2D normalized sum near a
-///   rounding tie lands one grid step from Metal's, whose 2D rounding no model fitted, and the
-///   sampled value is ordinary data later words use.
+/// - An emulated filter's arithmetic (`BicubicFilterArithmetic`): a bicubic sum (and an
+///   extended-range linear, 3D or level blend) in the device's multiply and add under weights
+///   computed from the fraction, where Metal sums its fixed-point weights exactly onto the
+///   format's grid, and the sampled value is ordinary data later words use.
 /// - A vertex function's simdgroup operation on a device that groups vertices otherwise than
 ///   Apple's GPUs and cannot pin the vertex stage's subgroup size (`VertexSimdgroupGrouping`): the
 ///   operation combines the device's group of vertices, a simdgroup Metal allows, and its value is
@@ -749,7 +743,8 @@ pub struct SlotRow {
 ///   attachment 0's alpha (`CoverageReadsRoundedAlpha`): the coverage reads the rounded alpha
 ///   where Metal's reads it before rounding, so a fragment near a coverage threshold may cover
 ///   another sample, and the stored samples are ordinary data later words use. Open until Metal's
-///   coverage pattern is computed in the function.
+///   coverage pattern is computed in the function, on a device whose coverage is Metal's
+///   (elsewhere the device's coverage is its native answer, `DeviceAlphaCoverage`).
 /// - An `ARGB8Unorm` attachment blended in none of the measured forms
 ///   (`RotatedBlendRounding`): Apple's blend computes a factor pair apart in its color and alpha
 ///   arithmetic, which the rotation swaps for Metal's alpha and blue, and the stored code is
@@ -763,19 +758,19 @@ pub struct SlotRow {
 /// A varying the device interpolates (`DeviceInterpolation`) is not deferred: every fragment
 /// function that reads one records it on every device but MoltenVK's, so a row-level deferral
 /// would hold any mismatch of such a function open as the interpolation's, a coverage or a
-/// rate-map difference among them. Its differences stay mismatches for review.
+/// rate-map difference among them. Its differences stay mismatches for review. Nor is the
+/// device's alpha-to-coverage (`DeviceAlphaCoverage`): the device's native answer, which no exact
+/// path replaces, recorded by every pipeline that covers by alpha off MoltenVK.
 ///
 /// Row-level only. A note whose difference can be attributed word by word (a NaN encoding, a
 /// denormal, a `half` rounding) belongs in a per-word judgement of a reading's differing words,
 /// beside the check of each against Apple's bound, never in this list: a row-level match would
 /// reopen every signed-off reading whose row merely records the note.
-pub const DEFERRED_NEAR_EQUIVALENTS: [PrecisionNote; 13] = [
+pub const DEFERRED_NEAR_EQUIVALENTS: [PrecisionNote; 11] = [
     PrecisionNote::RasterizationRateMap,
     PrecisionNote::SparseResidency,
     PrecisionNote::CubeGradientFootprint,
-    PrecisionNote::CubeFaceReciprocal,
     PrecisionNote::QuadsCountedBeforeDiscard,
-    PrecisionNote::DeviceDepthComparison,
     PrecisionNote::BicubicFilterArithmetic,
     PrecisionNote::VertexSimdgroupGrouping,
     PrecisionNote::FragmentSimdgroupGrouping,
@@ -842,19 +837,6 @@ fn near_equivalent_bound(note: PrecisionNote) -> &'static str {
              1 + 3/2048: a sample near a level or filter boundary can take another level or \
              filter"
         }
-        PrecisionNote::CubeFaceReciprocal => {
-            "a nearest cube texel from Metal's position floor(RN(RN(1 + sc * r) / 2 * n)) with r \
-             the correctly rounded reciprocal of the major magnitude, where Apple M3 Max's and \
-             M4's texture unit's is one or two ulps off on 208 of 2,001 majors measured (204 up, 4 \
-             down, each within about 0.2 ulp of a rounding midpoint): on such a major a position \
-             within about n * 2^-23 of a texel edge reads the next texel; no exact form of Apple's \
-             reciprocal is known"
-        }
-        PrecisionNote::DeviceDepthComparison => {
-            "a depth comparison the device makes differs from Apple M4's on up to 584 of 9,024 \
-             Depth16Unorm comparisons (ANV; RADV 71, the RTX 3090 474, lavapipe 1,203); every \
-             comparison the shader makes is Metal's, on texels it fetches or the device reads"
-        }
         PrecisionNote::QuadsCountedBeforeDiscard => {
             "a non-quad simdgroup operation before a discard, in a shape whose placement by \
              Metal's compiler is not known (another operation than a sum, a use of its result \
@@ -866,12 +848,12 @@ fn near_equivalent_bound(note: PrecisionNote) -> &'static str {
              discarded); after the discard every venue measured counts Metal's lanes"
         }
         PrecisionNote::BicubicFilterArithmetic => {
-            "a 2D bicubic sum of an 8- or 16-bit normalized or sRGB format near a rounding tie \
-             one step of the format's grid from Apple M3 Max's (1/65535 or 1/32767 of a 16-bit \
-             format, 1/4080 or 1/2032 of an 8-bit one, an sRGB table step), on 824 words of the \
-             five cases measured; a 2D float or half sum's accumulator, a 1D half sum near a tie \
-             and its non-finite results, the packed formats and Depth16Unorm unpinned; exact \
-             path: Apple's 2D rounding, which no model fitted"
+            "a bicubic sum (and an extended-range linear, 3D or level blend) in the device's \
+             f32 multiply and add under the Catmull-Rom weights computed from the fraction, a \
+             half result the device's narrowing, where Apple M3 Max's sums its fixed-point \
+             weights (each axis within 4.83e-4 of the polynomial) exactly onto the format's \
+             grid: a few grid steps apart (1/4080 of an 8-bit format), up to 2.1e-3 on an \
+             extended-range sRGB texture; no exact path: the device's arithmetic is the form"
         }
         PrecisionNote::VertexSimdgroupGrouping => {
             "a vertex function's simdgroup holds the device's group of vertices: 8 a subgroup, \
@@ -898,7 +880,8 @@ fn near_equivalent_bound(note: PrecisionNote) -> &'static str {
              nearest-even half alpha, and its coverage reads that rounded alpha where Metal's \
              reads the alpha before rounding: a fragment whose alpha lies within half a half step \
              of a coverage threshold may cover one sample more or fewer (2 of 16,384 alphas on an \
-             Apple M3 Max); exact path: Metal's coverage pattern computed in the function"
+             Apple M3 Max); exact path: Metal's coverage pattern computed in the function, \
+             where the device covers as Metal does"
         }
         PrecisionNote::RotatedBlendRounding => {
             "an ARGB8Unorm attachment blended in none of the measured forms may store a channel \

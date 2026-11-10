@@ -10,7 +10,7 @@
 //! `absent_reads`, in
 //! `indirect_host_steps`, in `indirect_dispatches`, in `index_fetches`, in `texture_blits`, in
 //! `sparse_textures`, in `buffer_texture_blits`, in `amplified_draws`, in `color_writes`, in
-//! `binary_archives`, in `view_reinterpretation`, in `mipmaps_exact`, in `clear_reach`, in
+//! `binary_archives`, in `view_reinterpretation`, in `clear_reach`, in
 //! `resolves`, in `mesh_draws`, in `provoking`, in `provoking_mesh`, in `visibility`, in
 //! `pass_start_reads`, in `unorm_depth_bias`, in `pvrtc_textures`, in `heaps`, in `rate_maps`, in
 //! `rebind_reach`, in `predication` or in `blits` takes, each test checking that
@@ -28,11 +28,9 @@
 //! resource IDs ([`UNLISTED`]),
 //! indirect command buffers' commands naming a released state ([`RELEASED_STATES`]) and their host
 //! steps ([`HOST_STEPS`]), indirect dispatches' host reads ([`INDIRECT_DISPATCHES`]), indexed draws
-//! past their index buffer ([`INDEX_FETCHES`]), depth twins ([`TWINS`]) and uploads into depth
-//! images ([`UPLOADS`]), a MoltenVK whose
-//! argument-buffer state is unread ([`ARGUMENT_BUFFERS`]), a device answering at a Metal level
-//! below its host's macOS release here ([`METAL_LEVELS`]), mipmaps within Metal's
-//! spread ([`MIPMAPS`]), a heap's depth or stencil texture laid apart from the heap ([`APART`]),
+//! past their index buffer ([`INDEX_FETCHES`]), uploads into depth images ([`UPLOADS`]), a
+//! MoltenVK whose argument-buffer state is unread ([`ARGUMENT_BUFFERS`]), mipmaps of the device's
+//! filter ([`MIPMAPS`]), a heap's depth or stencil texture laid apart from the heap ([`APART`]),
 //! a multisample depth or stencil texture without GPU-optimized contents that stays optimized
 //! ([`OPTIMIZED`]),
 //! a heap's colour texture on a driver whose compressed images hide aliased writes ([`ALIASES`]),
@@ -44,9 +42,7 @@
 //! whose fragment rounds its color writes in `color_writes` ([`COLOR_WRITES`]), render pipeline
 //! states whose stages an archive holds from two adds in `binary_archives` ([`ARCHIVES`]),
 //! texture views of another component layout shadowed in `view_reinterpretation`
-//! ([`VIEW_SHADOWS`]), mipmaps computed as an Apple M4's where an Apple M3 Max's differ in
-//! `mipmaps_exact` ([`M3_MIPMAPS`]) and mipmaps at a rounding the chain does not fit there
-//! ([`TIE_MIPMAPS`]), executions of an indirect command buffer from one command
+//! ([`VIEW_SHADOWS`]), executions of an indirect command buffer from one command
 //! with two lengths in `visibility` ([`REPEATED_STARTS`]), resources made with Metal's private
 //! option bit here ([`PRIVATE_OPTION`]), indexed indirect draws of bytes a draw wrote with no
 //! barrier in `indirect_draws` ([`UNORDERED_DRAWS`]), pipeline states whose functions read an
@@ -66,16 +62,13 @@
 //! `provoking_mesh` ([`PROVOKING`]),
 //! render pipeline states whose draws run a synthesized geometry stage in `barycentric_weights`
 //! ([`SYNTHESIZED_GEOMETRY`]), tessellated draws emulated on a device without
-//! `tessellationShader` in `patches` ([`EMULATED_TESSELLATION`]), render and compute pipeline
-//! states whose exact forms a stage past the device's compiler word bound dropped here
-//! ([`EXACT_FORMS_OVER_LIMIT`]),
+//! `tessellationShader` in `patches` ([`EMULATED_TESSELLATION`]),
 //! vertex-stage reads in place of bytes a fragment stage of the pass wrote in `pass_start_reads`
 //! ([`IN_PLACE_VERTEX_READS`]) and a vertex stage's write of bytes one wrote there
 //! ([`FRAGMENTS_BEFORE_GEOMETRY`]), constant biases of 16-bit unorm depths the device converts
-//! past a fragment stage that tests first, where the profile is not measured to store Metal's
-//! biased codes, in `unorm_depth_bias` ([`UNORM_DEPTH_BIAS`]), 16-bit unorm depths the device converts without the profile's
-//! deviation ([`UNORM_DEPTH_ROUNDING`]) and those the fragment stage writes Metal's codes of
-//! ([`SHADER_UNORM_DEPTH`]),
+//! where the profile is not measured to store Metal's biased codes, in `unorm_depth_bias`
+//! ([`UNORM_DEPTH_BIAS`]), 16-bit unorm depths the device converts without the profile's
+//! deviation ([`UNORM_DEPTH_ROUNDING`]),
 //! draws of points in a rate-mapped pass, which keep Vulkan's clipping of points, in
 //! `wide_points` ([`POINT_GUARD_BAND`]), draws whose fragment function writes a depth in depth
 //! clamp mode through a range above 0 that keep the device's clamp, in `viewport_ranges`
@@ -110,9 +103,9 @@
 //! heap textures whose layout in Metal's heaps the runtime does not model in `heap_metal_sizes`
 //! ([`UNMODELLED_SIZES`]) and those whose images take more of a heap than Metal's answer there
 //! ([`PAST_METAL_SIZES`]), BC1 to BC5 textures on a driver not measured to decode them as Metal
-//! does in `compressed_decode` ([`BLOCK_DECODES`]) and writes into their decoded twins behind
-//! work in flight there ([`BEHIND_WRITES`]), ASTC textures on a device without their format in
-//! `astc_textures` ([`ASTC_TWINS`]; PVRTC ones take the first in `pvrtc_textures`), passes rendering a linear image apart in
+//! does in `compressed_decode` ([`BLOCK_DECODES`]), ASTC textures on a device without their format
+//! in `astc_textures` ([`ASTC_TWINS`]; PVRTC ones take the first in `pvrtc_textures`) and CPU
+//! writes into their decoded twins there ([`CPU_DECODES`]), passes rendering a linear image apart in
 //! `linear_attachments` ([`LINEAR_COPIES`]) and those rendering one through copies as they clear
 //! it and no command of them may read it, there too ([`CHOSEN_COPIES`]), passes rendering a texture
 //! over a buffer they do not store through the image its texture keeps in `kept_buffer_bytes`
@@ -142,20 +135,19 @@
 //! where the compile layer runs the dispatch on no emulated variant, a one-aspect resolve where the
 //! device resolves the aspects independently, both properties no device option withholds,
 //! uncalibrated GPU times where the device calibrates its timestamps, an unlisted sampler state
-//! where the device's and the pipeline's sampler arrays hold its ID, a depth twin where the
-//! device's depth images keep every `float`, an upload into a depth image where the device enabled
-//! `VK_EXT_depth_range_unrestricted` or its driver keeps a value outside `[0, 1]` without it, and a
-//! `Shared` buffer in system memory where the device has unified memory, a heap's depth or stencil
-//! texture where the driver lays no such image apart, and a depth or stencil texture without
-//! GPU-optimized contents where the driver drops the layout, emulated mesh draws where the
-//! device has `VK_EXT_mesh_shader`, a capped anisotropy where the device's samplers take 32
-//! or none, and a vertex simdgroup grouping where the driver groups vertices as Apple's GPUs do or
-//! the vertex stage has no subgroups) is expected absent there, as the
-//! compile layer, the device's description or its driver facts settle it.
+//! where the device's and the pipeline's sampler arrays hold its ID, an upload into a depth image
+//! where the device enabled `VK_EXT_depth_range_unrestricted` or its driver keeps a value outside
+//! `[0, 1]` without it, and a `Shared` buffer in system memory where the device has unified memory,
+//! a heap's depth or stencil texture where the driver lays no such image apart, and a depth or
+//! stencil texture without GPU-optimized contents where the driver drops the layout, emulated mesh
+//! draws where the device has `VK_EXT_mesh_shader`, a capped anisotropy where the device's samplers
+//! take 32 or none, and a vertex simdgroup grouping where the driver groups vertices as Apple's
+//! GPUs do or the vertex stage has no subgroups) is expected absent there, as the compile layer,
+//! the device's description or its driver facts settle it.
 
 use super::absent_reads::ABSENT_READS;
 use super::amplified_draws::AMPLIFICATION;
-use super::astc_textures::{decodes_astc, ASTC_TWINS};
+use super::astc_textures::{decodes_astc, ASTC_TWINS, CPU_DECODES};
 use super::attachment_reads::IN_PLACE;
 use super::barycentric_weights::SYNTHESIZED_GEOMETRY;
 use super::binary_archives::ARCHIVES;
@@ -169,11 +161,11 @@ use super::color_groups::PER_COLOR_COUNTS;
 use super::color_reformat::KEPT_COLORS;
 use super::color_writes::COLOR_WRITES;
 use super::command_queues::SHARED_PRESENT_QUEUES;
-use super::compressed_decode::{BEHIND_WRITES, BLOCK_DECODES};
+use super::compressed_decode::BLOCK_DECODES;
 use super::cross_class_reads::CROSS_CLASS;
 use super::depth_denormals::{DEPTH_DENORMALS, SIGNED_DEPTH_TESTS};
 use super::detach_textures::DETACHED_REACHES;
-use super::extended_range_blends::{EXTENDED_RANGE_BITS, STORED_CODES, UNREACHED_TILES};
+use super::extended_range_blends::{EXTENDED_RANGE_BITS, STORED_CODES};
 use super::extended_range_resolve::XR_RESOLVE;
 use super::extended_range_two_planes::HEAP_PLANES;
 use super::first_use::FIRST_SPARSE;
@@ -195,7 +187,6 @@ use super::kept_buffer_bytes::KEPT_BYTES;
 use super::linear_attachments::{CHOSEN_COPIES, LINEAR_COPIES};
 use super::memoryless::MEMORYLESS_TEXEL_BUFFERS;
 use super::mesh_draws::EMULATED_MESH;
-use super::mipmaps_exact::{M3_MIPMAPS, TIE_MIPMAPS};
 use super::no_copy_heaps::HEAP;
 use super::pass_start_reads::{FRAGMENTS_BEFORE_GEOMETRY, IN_PLACE_VERTEX_READS};
 use super::patches::EMULATED_TESSELLATION;
@@ -214,11 +205,11 @@ use super::sample_copies::DRAWN_DEPTH;
 use super::shader_stencil::SHADOW;
 use super::snorm_tile_store::{SHARED_EXPONENT, SNORM_MINIMUM};
 use super::sparse_textures::SPARSE;
-use super::texture_blits::{MIPMAPS, TWINS, UPLOADS};
+use super::texture_blits::{MIPMAPS, UPLOADS};
 use super::tile_dispatches::TILE_DISPATCHES;
 use super::topology_classes::UNSIZED_POINTS;
 use super::two_plane_copies::TWO_PLANE_COPIES;
-use super::unorm_depth_bias::{SHADER_UNORM_DEPTH, UNORM_DEPTH_BIAS, UNORM_DEPTH_ROUNDING};
+use super::unorm_depth_bias::{UNORM_DEPTH_BIAS, UNORM_DEPTH_ROUNDING};
 use super::view_reinterpretation::VIEW_SHADOWS;
 use super::viewport_ranges::{NAN_DEPTH, UNCLAMPED_BIAS, VERTEX_CLAMPS};
 use super::visibility::REPEATED_STARTS;
@@ -238,7 +229,6 @@ use crate::gpu::TEST_DEVICE;
 use metal2vulkan::bind::{AstcDecode, SamplerDescriptor};
 use metal2vulkan::cache::VariantKey;
 use metal2vulkan::device::VkExtension;
-use metal2vulkan::device::{DecodedTexelsPolicy, ResolvePolicy};
 use metal2vulkan::device::{DriverFact, DriverWorkaround, OpBits, VkFeature, VkProperty};
 use metal2vulkan::device::{SimdClass, Tier};
 use metal2vulkan::error::{DriverDeviation, Feature};
@@ -250,11 +240,10 @@ use metal2vulkan::metal::{
 use metal2vulkan::pipeline::MeshPipelineDescriptor;
 use metal2vulkan::pipeline::PipelineLayout;
 use metal2vulkan::pipeline::StageModule;
-use metal2vulkan::pipeline::{
-    ColorAttachmentDescriptor, RenderPipelineDescriptor, Stage, StageSource,
-};
+use metal2vulkan::pipeline::TileRenderPipelineDescriptor;
 use metal2vulkan::pipeline::{ComputePipelineDescriptor, FunctionDescriptor, Reconvergence};
 use metal2vulkan::pipeline::{PrecisionNote, SlotRef, SpecKey};
+use metal2vulkan::pipeline::{RenderPipelineDescriptor, Stage, StageSource};
 use metal2vulkan::vk::DriverId;
 use metal2vulkan::vk::ResolveModeFlags as Mode;
 use metal2vulkan::Budget;
@@ -262,12 +251,11 @@ use metal2vulkan_devtools::{engine_dir, llvm_assemble};
 use metal2vulkan_runtime::{
     BlitOption, Buffer, CpuCacheMode, DebugMessage, Degradation, DegradationCategory, Device,
     DeviceOptions, DriverSetting, Error, HazardTrackingMode, HeapDescriptor, HeapType, HostMemory,
-    LayerSetting, LayerSettingValue, LoadAction, MessageSeverity, MetalLevel,
-    MultisampleStencilResolveFilter, Origin, PipelineOptions, Problem, RenderPassDescriptor,
-    ResourceOptions, RuntimeGap, Size, StorageMode, StoreAction, TextureDescriptor,
+    LayerSetting, LayerSettingValue, LoadAction, MessageSeverity, MultisampleStencilResolveFilter,
+    Origin, PipelineOptions, Problem, RenderPassDescriptor, ResourceOptions, RuntimeGap, Size,
+    StorageMode, StoreAction, TextureDescriptor,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 use std::time::Duration;
 
 /// The longest a command buffer here may take.
@@ -293,16 +281,15 @@ const BLITS: [Degradation; 3] = [
 const DISPATCHES: [Degradation; 2] = [Degradation::SplitDispatch, Degradation::EmulatedSimdgroups];
 
 /// The kinds [`passes_degrade_once_per_kind`] takes (the second where the device resolves a
-/// combined format's aspects one at a time; the exact resolve and the device's rounded one where
-/// the driver's average of `RGBA8Unorm` at 4 samples is not measured as Metal's, or where the
-/// device makes a texture of 8 samples; the unmeasured resolve where it makes one).
-const PASSES: [Degradation; 7] = [
+/// combined format's aspects one at a time; the device's rounded resolve where the driver's
+/// average of `RGBA8Unorm` at 4 samples is not measured as Metal's, or where the device makes a
+/// texture of 8 samples; the unmeasured resolve where it makes one).
+const PASSES: [Degradation; 6] = [
     Degradation::SeparateDepthStencil,
     Degradation::OneAspectResolve,
     Degradation::ResolveScratch,
     Degradation::DeviceRoundedResolve,
     Degradation::DontCareStore,
-    Degradation::ShaderResolve,
     Degradation::UnmeasuredResolve,
 ];
 
@@ -315,11 +302,9 @@ pub(super) const WRAPPED: [Degradation; 1] = [Degradation::WrappedImageLayoutTra
 pub(super) const POSITIONED: [Degradation; 1] = [Degradation::PositionsThroughScratch];
 
 /// The kinds a device announces as it is made, which the lane's constructor takes and checks
-/// exactly (`runtime_lane::creation_kinds`); `metal-level-below-host` is [`METAL_LEVELS`].
-/// `float-tininess-after-rounding` is announced by the devices `native_maths` makes with native
-/// device maths, on every venue but MoltenVK, and by none made with the lane's exact policy.
-pub(super) const CREATED: [Degradation; 3] = [
-    Degradation::MetalLevelNotMacOS,
+/// exactly (`runtime_lane::creation_kinds`).
+/// `float-tininess-after-rounding` is announced by every device on every venue but MoltenVK.
+pub(super) const CREATED: [Degradation; 2] = [
     Degradation::DriverPipelineCacheKept,
     Degradation::FloatTininessAfterRounding,
 ];
@@ -353,7 +338,7 @@ const RAGGED: &str = "a-ragged-thread-grid-observes-each-threadgroups-size-and-p
 /// Shuffles in threadgroups of 8 threads: partial simdgroups.
 const PARTIAL_SIMDGROUPS: &str = "dsm2-shuffle-past-the-thread-count-eight";
 /// Kernels of float functions and arithmetic, and one of a nearest cube sample, whose stages
-/// record precision notes (the cube's `CubeFaceReciprocal` on a device without
+/// record precision notes (the cube's `DeviceSampling` on a device without
 /// `VkProperty::MetalSampler`).
 const NOTED: [&str; 3] = [
     "anchor-three-transcendentals-where-rounding-cannot-reach",
@@ -461,7 +446,8 @@ pub(super) fn on_device_with(
 
 /// Every kind is taken by a lane test's site: listed above, or a stage's precision note or
 /// reconvergence; no kind is in two lists, and no list names a kind twice. `misplaced-notice`
-/// ([`MISPLACED`]) is taken by the runtime's own tests instead, as no lane can meet it.
+/// ([`MISPLACED`]) and `copied-host-pages` ([`COPIED_PAGES`]) are taken by the runtime's own tests
+/// instead, as no lane can meet them.
 ///
 /// This module compiles only under the device cfgs, so a kind that lands with no site leaves this
 /// test red where the ordinary gate cannot read it. The runtime crate's
@@ -499,7 +485,6 @@ fn every_kind_has_a_site_a_lane_test_takes() {
         &HOST_STEPS,
         &INDIRECT_DISPATCHES,
         &INDEX_FETCHES,
-        &TWINS,
         &UPLOADS,
         &MIPMAPS,
         &APART,
@@ -514,14 +499,12 @@ fn every_kind_has_a_site_a_lane_test_takes() {
         &COLOR_WRITES,
         &ARCHIVES,
         &VIEW_SHADOWS,
-        &M3_MIPMAPS,
         &REPEATED_STARTS,
         &PRIVATE_OPTION,
         &IN_PLACE_VERTEX_READS,
         &FRAGMENTS_BEFORE_GEOMETRY,
         &UNORM_DEPTH_BIAS,
         &UNORM_DEPTH_ROUNDING,
-        &SHADER_UNORM_DEPTH,
         &POINT_GUARD_BAND,
         &NAN_DEPTH,
         &UNCLAMPED_BIAS,
@@ -539,7 +522,6 @@ fn every_kind_has_a_site_a_lane_test_takes() {
         &NOT_MIPMAPPED_ANISOTROPY,
         &IN_PLACE,
         &ARGUMENT_BUFFERS,
-        &METAL_LEVELS,
         &UNREADABLE,
         &UNVIEWABLE,
         &UNNAMED_SHADOWS,
@@ -553,7 +535,6 @@ fn every_kind_has_a_site_a_lane_test_takes() {
         &HEAP_PLANES,
         &TWO_PLANE_COPIES,
         &EXTENDED_RANGE_BITS,
-        &UNREACHED_TILES,
         &SNORM_MINIMUM,
         &SHARED_EXPONENT,
         &STORED_CODES,
@@ -565,7 +546,6 @@ fn every_kind_has_a_site_a_lane_test_takes() {
         &RESET_UNENCODED,
         &HEAP_LAYOUTS,
         &SHADER_DEPTH,
-        &TIE_MIPMAPS,
         &MEMMOVES,
         &FRESH_PATTERNS,
         &UNMODELLED_SIZES,
@@ -573,8 +553,8 @@ fn every_kind_has_a_site_a_lane_test_takes() {
         &CROSS_CLASS,
         &NIL_OFFSETS,
         &BLOCK_DECODES,
-        &BEHIND_WRITES,
         &ASTC_TWINS,
+        &CPU_DECODES,
         &SHARED_PRESENT_QUEUES,
         &PAST_METAL_SIZES,
         &LINEAR_COPIES,
@@ -583,6 +563,8 @@ fn every_kind_has_a_site_a_lane_test_takes() {
         &DELAYED_DEALLOCATORS,
         &READ_ONLY_PAGES,
         &MISPLACED,
+        &STILL_MAKING,
+        &COPIED_PAGES,
         &DEPTH_DENORMALS,
         &SIGNED_DEPTH_TESTS,
         &FIRST_SPARSE,
@@ -591,7 +573,6 @@ fn every_kind_has_a_site_a_lane_test_takes() {
         &UNSIZED_POINTS,
         &SYNTHESIZED_GEOMETRY,
         &EMULATED_TESSELLATION,
-        &EXACT_FORMS_OVER_LIMIT,
         &GROUPED,
         &WORD_PAST_BUFFER,
         &XR_RESOLVE,
@@ -635,7 +616,7 @@ fn moltenvk_argument_buffers_are_announced_where_unread_and_refused_off() {
                 || (description.vendor_id == 0x106b
                     && uab == limits.max_per_stage_descriptor_sampled_images));
         // The constructor checked the creation notices against `creation_kinds`.
-        let made = super::creation_kinds(&device, false);
+        let made = super::creation_kinds(&device);
         assert!(
             messages.take_notices().is_empty(),
             "announced past the creation"
@@ -675,166 +656,6 @@ fn moltenvk_argument_buffers_are_announced_where_unread_and_refused_off() {
         Ok(_) => panic!("argument buffers off: the device opened"),
     }
     assert_eq!(off.take(), Vec::new(), "the validation layer reported");
-}
-
-/// The kind a pipeline state takes where a stage of its translation, with the device's exact
-/// forms, is longer than the device's compiler word bound, and the translation dropped exact
-/// forms to fit it ([`exact_forms_past_the_compiler_bound_are_announced_exactly_there`]).
-const EXACT_FORMS_OVER_LIMIT: [Degradation; 1] = [Degradation::ExactFormsOverCompilerLimit];
-
-/// A render pipeline state, and a compute pipeline state, announces [`EXACT_FORMS_OVER_LIMIT`]
-/// exactly where a stage of its translation with the lane's exact forms
-/// (`runtime_lane::validated_options`) is longer than the device's compiler word bound
-/// (`DeviceProfile::module_word_bound`: ANV's, `None` elsewhere). No owned fixture's stage reaches
-/// ANV's bound, so no venue announces it today; each checks the rule on its own device, with the
-/// owned `runtime_examples` render pipeline and kernel. The runtime's own tests
-/// (`fitted_variant_notice`) take the announcement of a fitted variant of every kind of state,
-/// and the translator's (`pipeline::compile::fit`) the fit of every kind of pipeline.
-#[test]
-fn exact_forms_past_the_compiler_bound_are_announced_exactly_there() {
-    on_device(|device, messages| {
-        let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/public/examples/runtime_examples.ll");
-        let library = device
-            .new_library_with_air(&llvm_assemble(&ll).unwrap())
-            .unwrap();
-        let function = |name| {
-            library
-                .new_function_with_name(name)
-                .unwrap()
-                .function_descriptor()
-        };
-        let mut descriptor =
-            RenderPipelineDescriptor::new(StageSource::Function(function("colored_vertex")));
-        descriptor.fragment = Some(StageSource::Function(function("colored_fragment")));
-        descriptor.color_attachments[0] =
-            Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm));
-        let compile = device.compile_device();
-        let bound = compile.profile().module_word_bound();
-        // The notices a state's creation made, against whether its longest stage passes the bound.
-        let check = |what: &str, longest: usize| {
-            let past = bound.is_some_and(|bound| longest > bound as usize);
-            let announced = counts(&messages.take_notices())
-                .get(&Degradation::ExactFormsOverCompilerLimit)
-                .copied()
-                .unwrap_or(0);
-            eprintln!(
-                "{}: {what}: longest stage {longest} words, compiler word bound {bound:?}",
-                device.name()
-            );
-            assert_eq!(
-                announced,
-                usize::from(past),
-                "{what}: {:?} exactly past the bound",
-                EXACT_FORMS_OVER_LIMIT
-            );
-        };
-        let compiled = compile
-            .compile_render_pipeline(&descriptor, &Budget::standard())
-            .unwrap();
-        let longest = compiled
-            .stages
-            .iter()
-            .map(|stage| stage.spirv.len())
-            .max()
-            .unwrap_or(0);
-        let _state = device
-            .new_render_pipeline_state(&descriptor, &PipelineOptions::default())
-            .unwrap();
-        check("render", longest);
-        let kernel =
-            ComputePipelineDescriptor::new(StageSource::Function(function("scale_and_offset")));
-        let longest = compile
-            .compile_compute_pipeline(&kernel, &Budget::standard())
-            .unwrap()
-            .stage
-            .spirv
-            .len();
-        let _state = device
-            .new_compute_pipeline_state(&kernel, &PipelineOptions::default())
-            .unwrap();
-        check("compute", longest);
-    });
-}
-
-/// The kind a device answering at a Metal level below its host's macOS release takes
-/// ([`a_metal_level_below_the_host_release_is_announced_once`]).
-const METAL_LEVELS: [Degradation; 1] = [Degradation::MetalLevelBelowHost];
-
-/// A device opens at its host's Metal level, the device's site of
-/// [`METAL_LEVELS`]: on macOS, the measured level of the host's release, or else the newest
-/// measured below it, announcing [`METAL_LEVELS`] once, exactly where the release is not a
-/// measured one; off macOS, the newest level, announcing `metal-level-not-macos`. Every lane
-/// venue's macOS release is a measured level (26.7 on the M3, 27.0.1 on the M4) or none, so no
-/// venue announces [`METAL_LEVELS`] today; each checks the rule on its own host. A device made at a
-/// named level (`DeviceOptions::metal_level`) answers at it and announces neither. The lane's
-/// constructor checks each device's creation notices exactly (`creation_kinds`), so the test checks
-/// the level, that the constructor expects the notice exactly where the host's release is not a
-/// measured one, and that nothing more is announced.
-#[test]
-fn a_metal_level_below_the_host_release_is_announced_once() {
-    let cache = ScratchCache::new().unwrap();
-    let messages = Messages::default();
-    let host = super::host_release();
-    let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |_| {}).unwrap();
-    let level = device.properties().metal_level;
-    let made = assert_once(&messages.take_notices(), &[]);
-    let created = super::creation_kinds(&device, false);
-    let measured =
-        |level: MetalLevel| super::macos_release(level.macos()).expect("a level's release reads");
-    let (expected, below) = match host {
-        Some(version) => {
-            let at = MetalLevel::ALL
-                .into_iter()
-                .rev()
-                .find(|&level| measured(level) <= version)
-                .expect("the host's release is at or above a measured level");
-            (at, measured(at) != version)
-        }
-        None => (MetalLevel::NEWEST, false),
-    };
-    eprintln!(
-        "{}: host macOS {host:?}, Metal level {level}; made announcing {created:?}",
-        device.name()
-    );
-    assert_eq!(
-        level, expected,
-        "the device's Metal level on macOS {host:?}"
-    );
-    for kind in METAL_LEVELS {
-        assert_eq!(
-            created.contains(&kind),
-            below,
-            "{kind:?} exactly where macOS {host:?} is not a measured release: {created:?}"
-        );
-    }
-    assert_eq!(
-        created.contains(&Degradation::MetalLevelNotMacOS),
-        host.is_none(),
-        "metal-level-not-macos exactly off macOS: {created:?}"
-    );
-    assert!(made.is_empty(), "announced past the creation: {made:?}");
-    drop(device);
-    for named in MetalLevel::ALL {
-        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |options| {
-            options.metal_level = Some(named);
-        })
-        .unwrap();
-        assert_eq!(device.properties().metal_level, named, "the level named");
-        let made = assert_once(&messages.take_notices(), &[]);
-        let created = super::creation_kinds(&device, true);
-        for kind in METAL_LEVELS
-            .into_iter()
-            .chain([Degradation::MetalLevelNotMacOS])
-        {
-            assert!(
-                !created.contains(&kind),
-                "{kind:?} at the named level {named}: {created:?}"
-            );
-        }
-        assert!(made.is_empty(), "announced past the creation: {made:?}");
-    }
-    layer_reported_nothing_at_all(&messages);
 }
 
 /// The kind an anisotropy past the device's largest takes
@@ -942,6 +763,32 @@ fn an_anisotropic_state_without_mips_is_announced_through_metals_sampler() {
 /// test `a_misplaced_notice_reaches_the_sink_unchanged_from_the_notice_thread_and_is_recorded_once`
 /// takes its site, as a build without debug assertions does.
 const MISPLACED: [Degradation; 1] = [Degradation::MisplacedNotice];
+
+/// The kinds a draw and a dispatch take whose pipeline was still being made once their command
+/// buffer's bound passed (`PipelineWaitPolicy::Bounded`, `pipeline_commit_wait` after its
+/// commit), and a draw whose pipeline the driver failed to make. No lane meets them: a lane holds
+/// none of the runtime's pipeline makings, a driver's compile outlasting the bound is a timing no
+/// lane may count on, and no lane's pipeline fails. The runtime's own tests
+/// `a_draw_whose_pipeline_is_still_being_made_at_its_bound_runs_nothing`,
+/// `a_dispatch_whose_pipeline_is_still_being_made_at_its_bound_runs_nothing` and
+/// `a_draw_whose_pipeline_was_not_made_runs_nothing_and_its_command_buffer_runs_on` take their
+/// sites, the makings held in the device's pool by the runtime's test hold, the last one's
+/// failure injected.
+const STILL_MAKING: [Degradation; 3] = [
+    Degradation::DrawDroppedStillMaking,
+    Degradation::DispatchDroppedStillMaking,
+    Degradation::DrawDroppedUnmade,
+];
+
+/// The kind a no-copy buffer takes whose import of the caller's pages the caller's gate
+/// (`HostMemory::with_import_gate`) refused, or whose import the gate and the device admitted and
+/// that then failed, so the pages are copied. No lane meets it: no lane gives a gate, and no
+/// venue's driver fails an admitted import on demand (NVIDIA's runs out of the host kernel's
+/// mappings only past `vm.max_map_count`). The runtime's own tests
+/// `copied_buffer_is_made_where_the_caller_s_gate_refuses_the_import` and
+/// `copied_buffer_is_made_where_an_admitted_import_fails_announced` take its site, the import
+/// failed by the runtime's test hook.
+const COPIED_PAGES: [Degradation; 1] = [Degradation::CopiedHostPages];
 
 /// The kind Metal's private option bit takes where the GPU's writes reach the memory here
 /// ([`the_private_option_bit_is_announced_on_a_heap_of_the_runtime_s_memory`],
@@ -1141,6 +988,185 @@ fn the_private_option_bit_drops_the_gpu_s_writes_to_no_copy_memory() {
             false => &PRIVATE_OPTION,
         };
         assert_made_once(messages, kinds, &shared_kinds(device));
+    });
+}
+
+/// What a kernel's stores into no-copy memory made with Metal's private option bit 24 reach, read
+/// over a window of `WINDOW` bytes from the memory's start: the bytes a copy in the same command
+/// buffer as the dispatch read, a copy in a later command buffer read, and the CPU read; and the
+/// kinds the kernel's pipeline state's making announces ([`made_compute_kinds`]).
+struct KernelStoreReads {
+    same: Vec<u8>,
+    later: Vec<u8>,
+    cpu: Vec<u8>,
+    made: BTreeSet<Degradation>,
+}
+
+/// The bytes [`kernel_store_reads`] reads of the memory, from its start.
+const WINDOW: usize = 1024;
+
+/// Where in the memory the kernel's stores land: past bytes no store names, so a stray write shows.
+const STORED_AT: u64 = 512;
+
+/// The words the kernel stores, one a thread.
+const STORED_WORDS: u32 = 64;
+
+/// The byte the memory holds before the dispatch; never zero, so a dropped store and a store of
+/// zeros read apart.
+const PAD: u8 = 0xab;
+
+/// The byte each copy's destination holds before the copy, so a copy that moved nothing reads as
+/// itself.
+const UNREAD: u8 = 0x5c;
+
+/// `a4_index_word` (`out[t] = in[3t + 1]`) dispatched over `STORED_WORDS` threads into `memory`,
+/// bound at `STORED_AT`, then read back three ways ([`KernelStoreReads`]). `in[i]` is
+/// `0xc0de_0000 + i`, so each stored word names the thread that stored it.
+fn kernel_store_reads(device: &Device, memory: &Buffer) -> KernelStoreReads {
+    let ll = engine_dir().join("a4_index_word.ll");
+    let library = device
+        .new_library_with_air(&llvm_assemble(&ll).unwrap())
+        .unwrap();
+    let function = library.new_function_with_name("a4_index_word").unwrap();
+    let state = device
+        .new_compute_pipeline_state_with_function(&function, &PipelineOptions::default())
+        .unwrap();
+    let words = 3 * STORED_WORDS + 1;
+    let input: Vec<u8> = (0..words)
+        .flat_map(|i| (0xc0de_0000u32 + i).to_le_bytes())
+        .collect();
+    let input = device
+        .new_buffer_with_bytes(&input, ResourceOptions::shared())
+        .unwrap();
+    let destination = || {
+        device
+            .new_buffer_with_bytes(&[UNREAD; WINDOW], ResourceOptions::shared())
+            .unwrap()
+    };
+    let (same, later) = (destination(), destination());
+    let queue = device.new_command_queue().unwrap();
+    let copy = |command_buffer: &metal2vulkan_runtime::CommandBuffer, to: &Buffer| {
+        let mut blit = command_buffer.blit_command_encoder().unwrap();
+        blit.copy_from_buffer_to_buffer(memory, 0, to, 0, WINDOW as u64)
+            .unwrap();
+        blit.end_encoding().unwrap();
+    };
+    let finish = |command_buffer: &metal2vulkan_runtime::CommandBuffer| {
+        command_buffer.commit().unwrap();
+        command_buffer.wait_until_completed_for(WAIT).unwrap();
+        assert_eq!(command_buffer.error(), None);
+    };
+    // The dispatch and the first copy in one command buffer; the second copy in a later one.
+    let command_buffer = queue.command_buffer().unwrap();
+    let mut encoder = command_buffer.compute_command_encoder().unwrap();
+    encoder.set_compute_pipeline_state(&state).unwrap();
+    encoder.set_buffer(Some(&input), 0, 0).unwrap();
+    encoder.set_buffer(Some(memory), STORED_AT, 1).unwrap();
+    encoder
+        .dispatch_threads(
+            Size::new(u64::from(STORED_WORDS), 1, 1),
+            Size::new(32, 1, 1),
+        )
+        .unwrap();
+    encoder.end_encoding().unwrap();
+    copy(&command_buffer, &same);
+    finish(&command_buffer);
+    let command_buffer = queue.command_buffer().unwrap();
+    copy(&command_buffer, &later);
+    finish(&command_buffer);
+    let read = |buffer: &Buffer| {
+        let contents = buffer.contents().unwrap();
+        // SAFETY: the buffer holds at least `WINDOW` bytes of host memory, and no command uses
+        // them now.
+        unsafe { std::slice::from_raw_parts(contents.as_ptr(), WINDOW) }.to_vec()
+    };
+    KernelStoreReads {
+        same: read(&same),
+        later: read(&later),
+        cpu: read(memory),
+        made: made_compute_kinds(device, function.function_descriptor()),
+    }
+}
+
+/// A kernel's stores into a no-copy buffer made with Metal's private option bit 24, which Metal
+/// drops: measured on the M3 Max under macOS 27.0.1 (`probes/readonly_gpu_writes.m`, and the
+/// conformance suite's `host-page-writes-kernel-store-read-only`), a later command of the same
+/// command buffer reads the stored words back from the GPU's caches, every run, while a later
+/// command buffer and the CPU read the pages' own bytes. On macOS the runtime imports the pages
+/// through a read-only view of them, which answers as Metal does at all three sites and announces
+/// nothing; elsewhere the stores reach the pages and are read at all three, announced once. Every byte of
+/// the window the stores do not name keeps the pages' own byte at every site.
+#[test]
+fn a_kernel_s_stores_into_private_bit_memory_reach_only_its_own_command_buffer() {
+    on_device(|device, messages| {
+        let memory = Mapping::anonymous(GUEST_PAGE);
+        // SAFETY: the mapping's `GUEST_PAGE` bytes are this process's and nothing else uses them.
+        unsafe { std::ptr::write_bytes(memory.pointer().as_ptr(), PAD, GUEST_PAGE) };
+        let shared = with_private_bit(ResourceOptions::shared());
+        // SAFETY: the mapping outlives the buffer, which is dropped first.
+        let no_copy = unsafe {
+            device.new_buffer_with_bytes_no_copy(
+                HostMemory::new(memory.pointer()),
+                GUEST_PAGE as u64,
+                shared,
+                None,
+            )
+        };
+        let no_copy = match no_copy {
+            Err(error) if not_importable(&error) => {
+                eprintln!("PRIVATEBIT-KERNEL: the device imports no host memory: {error:?}");
+                return;
+            }
+            no_copy => no_copy.unwrap(),
+        };
+        let reads = kernel_store_reads(device, &no_copy);
+        let mut stored = vec![PAD; WINDOW];
+        for t in 0..STORED_WORDS {
+            let at = STORED_AT as usize + 4 * t as usize;
+            let word = 0xc0de_0000u32 + 3 * t + 1;
+            stored[at..at + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let kept = vec![PAD; WINDOW];
+        let past = match DROPS_WRITES {
+            true => &kept,
+            false => &stored,
+        };
+        eprintln!(
+            "PRIVATEBIT-KERNEL: drops writes {DROPS_WRITES}; same command buffer stored {}, later \
+             command buffer stored {}, CPU stored {}",
+            reads.same == stored,
+            reads.later == stored,
+            reads.cpu == stored
+        );
+        assert!(
+            reads.same == stored,
+            "a later command of the dispatch's command buffer reads the stored words, as Metal's \
+             does"
+        );
+        assert!(
+            reads.later == *past,
+            "a later command buffer reads {}",
+            match DROPS_WRITES {
+                true => "the pages' own bytes: the stores were dropped",
+                false => "the stores, which reached the pages",
+            }
+        );
+        assert!(
+            reads.cpu == *past,
+            "the CPU reads {}",
+            match DROPS_WRITES {
+                true => "the pages' own bytes: the stores were dropped",
+                false => "the stores, which reached the pages",
+            }
+        );
+        drop(no_copy);
+        let mut first = shared_kinds(device);
+        first.extend(reads.made);
+        let kinds: &[Degradation] = match DROPS_WRITES {
+            true => &[],
+            false => &PRIVATE_OPTION,
+        };
+        assert_made_once(messages, kinds, &first);
     });
 }
 
@@ -1368,9 +1394,12 @@ fn run_kinds(device: &Device, case: &PublicCase) -> (BTreeSet<Degradation>, BTre
 
 /// Runs of kernels whose texture notes their bound formats decide ([`SPECIALIZED`]), each run
 /// twice, announce once each exactly the precision kinds their stages keep under the
-/// specialization their runs bind, and no other precision kind: the `half` conversion their stages
-/// specialize (`HalfTexelConversion`, kept for a format of no measured family) is exact under an
-/// 8-bit unorm texture and under the packed formats, so neither run announces it.
+/// specialization their runs bind, and no other precision kind; each stage specializes a note.
+/// Where the device samples through Metal's own sampler (`VkProperty::MetalSampler`), the `half`
+/// conversion their stages specialize (`HalfTexelConversion`, kept for a format of no measured
+/// family) is exact under an 8-bit unorm texture and under the packed formats, so neither run
+/// announces it. Elsewhere every slot's `half` texel is the device's rounding of its own `float`
+/// texel, which the stage records whatever is bound.
 #[test]
 fn runs_announce_the_notes_their_specialization_keeps_once() {
     on_device(|device, messages| {
@@ -1398,9 +1427,11 @@ fn runs_announce_the_notes_their_specialization_keeps_once() {
         assert_eq!(announced, expected, "{counts:?}");
         assert!(counts.values().all(|&n| n == 1), "{counts:?}");
         let conversion = Degradation::from_precision_note(PrecisionNote::HalfTexelConversion);
+        let metal = super::pixel_samplers::metal_sampler(device);
         for (kinds, specialized) in &held {
-            assert!(specialized.contains(&conversion), "{specialized:?}");
-            assert!(!kinds.contains(&conversion), "{kinds:?}");
+            assert!(!specialized.is_empty(), "no specialized note: {kinds:?}");
+            assert_eq!(specialized.contains(&conversion), metal, "{specialized:?}");
+            assert_eq!(kinds.contains(&conversion), !metal, "{kinds:?}");
         }
     });
 }
@@ -1693,7 +1724,8 @@ fn resolves_stencil_alone(device: &Device) -> Option<bool> {
 /// 4x `Depth32Float_Stencil8` target whose stencil alone resolves. Each kind is announced once and
 /// nothing else, the one-aspect resolve exactly where the device's description resolves that
 /// stencil one aspect at a time (lavapipe, which resolves no aspects independently), and
-/// `device-rounded-resolve` exactly where the 8x half-float target, which no rule covers, is made.
+/// `device-rounded-resolve` exactly where the device's average is not measured to be Metal's at 4
+/// samples or an 8x target is made.
 #[test]
 fn passes_degrade_once_per_kind() {
     let (messages, _cache, lane) = lane();
@@ -1709,13 +1741,14 @@ fn passes_degrade_once_per_kind() {
     let eight_samples = lane.device.new_texture(&eight).ok();
     eight.pixel_format = PixelFormat::RGBA16Float;
     let half_eight = lane.device.new_texture(&eight).ok();
-    let exact = !lane
+    let rounded = !lane
         .device
         .properties()
         .driver_facts
         .contains(&DriverFact::ColorResolveAverageIsMetals);
     eprintln!(
-        "8 samples made: {} (RGBA16Float: {}); exact resolve at 4 samples: {exact}",
+        "8 samples made: {} (RGBA16Float: {}); the device's rounded resolve at 4 samples: \
+         {rounded}",
         eight_samples.is_some(),
         half_eight.is_some()
     );
@@ -1741,8 +1774,8 @@ fn passes_degrade_once_per_kind() {
             );
             lane.run(&descriptor, |_, _, _| {}).unwrap();
         }
-        // A half-float resolve at 4 samples, Metal's closed rule (the exact resolve), and at 8
-        // where the device makes such a texture, which no rule covers: the device's average.
+        // A half-float resolve at 4 samples, and at 8 where the device makes such a texture: the
+        // device's average.
         let half = PixelFormat::RGBA16Float;
         let descriptor = color_pass(
             &lane.msaa(half),
@@ -1798,10 +1831,9 @@ fn passes_degrade_once_per_kind() {
             // Where the device's average is Metal's (MoltenVK's is Metal's own resolve) and it
             // makes no texture of 8 samples (an Apple GPU: Metal makes none past 4), every resolve
             // here is Metal's own and none rounds by the device.
-            Degradation::ShaderResolve => exact || eight_samples.is_some(),
-            // Only a format without a rule at its count rounds by the device: the half-float
-            // resolve of 8 samples.
-            Degradation::DeviceRoundedResolve => half_eight.is_some(),
+            Degradation::DeviceRoundedResolve => {
+                rounded || eight_samples.is_some() || half_eight.is_some()
+            }
             Degradation::UnmeasuredResolve => eight_samples.is_some() || half_eight.is_some(),
             _ => true,
         })
@@ -1873,14 +1905,14 @@ fn a_creation_s_notices_and_messages_reach_the_sink_on_the_asking_thread() {
     let made = made_lane_device(TEST_DEVICE, &lane, cache.path(), |options| {
         options.messages = Some(sink);
     });
-    let (device, level_named) = made.unwrap();
+    let device = made.unwrap();
     {
         let device = &device;
         let take = || -> Vec<(std::thread::ThreadId, u32, DebugMessage)> {
             heard.lock().unwrap().drain(..).collect()
         };
         let created: Vec<DebugMessage> = take().into_iter().map(|(_, _, m)| m).collect();
-        creation_heard_checked(device, level_named, &created, &lane).unwrap();
+        creation_heard_checked(device, &created, &lane).unwrap();
         // Notes announced as each state is made.
         let cases: Vec<PublicCase> = NOTED.map(|name| public_case(name).unwrap()).into();
         let (asker, ()) = on_a_utility_thread(|| {
@@ -1960,8 +1992,7 @@ fn a_creation_s_notices_and_messages_reach_the_sink_on_the_asking_thread() {
 /// every precision note a stage records that no specialization removes (a specialized one is
 /// announced where a draw or dispatch binds a variant keeping it), but
 /// `ArgumentPixelSamplerScaling`, which a draw or dispatch listing the state announces;
-/// `shader-half-color-bits` where a stage writes a `half`'s bits to a color attachment,
-/// `shader-color-conversion` where one rounds a color write to Metal's code; and reconvergence
+/// `shader-color-conversion` where a stage rounds a color write to Metal's code; and reconvergence
 /// that is not Metal's.
 fn making_kinds<'a>(stages: impl IntoIterator<Item = &'a StageModule>) -> BTreeSet<Degradation> {
     let mut kinds = BTreeSet::new();
@@ -1971,9 +2002,6 @@ fn making_kinds<'a>(stages: impl IntoIterator<Item = &'a StageModule>) -> BTreeS
             if !specialized && note != PrecisionNote::ArgumentPixelSamplerScaling {
                 kinds.insert(Degradation::from_precision_note(note));
             }
-        }
-        if !stage.half_bit_colors.is_empty() {
-            kinds.insert(Degradation::ShaderHalfColorBits);
         }
         if !stage.rounded_colors.is_empty() {
             kinds.insert(Degradation::ShaderColorConversion);
@@ -2027,6 +2055,21 @@ pub(super) fn made_compute_kinds(
     let compiled = device
         .compile_device()
         .compile_compute_pipeline(&descriptor, &Budget::standard())
+        .unwrap();
+    let mut kinds = making_kinds([&compiled.stage]);
+    kinds.extend(layout_kinds(device, &compiled.layout));
+    kinds
+}
+
+/// [`making_kinds`] of a tile render pipeline state of `descriptor` on `device`, as its compile
+/// layer compiles it (`compile_tile_pipeline`), and its layout's ([`layout_kinds`]).
+pub(super) fn made_tile_kinds(
+    device: &Device,
+    descriptor: &TileRenderPipelineDescriptor,
+) -> BTreeSet<Degradation> {
+    let compiled = device
+        .compile_device()
+        .compile_tile_pipeline(descriptor, &Budget::standard())
         .unwrap();
     let mut kinds = making_kinds([&compiled.stage]);
     kinds.extend(layout_kinds(device, &compiled.layout));
@@ -2156,6 +2199,21 @@ pub(super) fn expected_once(
     expected
 }
 
+/// The note a device announces at its first clear of a color attachment to a value at a rounding
+/// question, which the device converts its own way (`device-color-conversion`): such as 0.5 in an
+/// 8-bit unorm channel, 127.5 codes, a tie, or any value strictly between 0 and 1 in an sRGB
+/// one, whose encode Vulkan leaves to the device. A lane whose pipelines record the note has it
+/// already (`made_render_kinds`); MoltenVK's record none. Not where every such clear is by the load
+/// operation of an attachment its pass's render area covers (`covered`) on a driver whose load
+/// operation clears as Metal's does (`DriverFact::ColorClearIsMetals`).
+pub(super) fn tie_cleared(device: &Device, covered: bool) -> BTreeSet<Degradation> {
+    let metals = device
+        .properties()
+        .driver_facts
+        .contains(&DriverFact::ColorClearIsMetals);
+    forced(&[(Degradation::DeviceColorConversion, !(metals && covered))])
+}
+
 /// The kinds of `kinds` whose condition holds: each paired with the device fact, or the test's
 /// own step, that forces the runtime to announce it.
 pub(super) fn forced(kinds: &[(Degradation, bool)]) -> BTreeSet<Degradation> {
@@ -2194,10 +2252,9 @@ pub(super) fn clamps_depth_uploads(device: &Device) -> bool {
 
 /// Whether `device` keeps a negative or NaN 32-bit float depth a write stores in a render
 /// target's depth image (not [`clamps_depth_uploads`]) and its depth test compares it as it is,
-/// where Metal's compares its magnitude (no `DriverFact::DepthTestComparesMagnitudes`): a
-/// single-sample `Depth32Float` target then renders a pass that loads it over its magnitude
-/// stand-in (`texture/signed_depth.rs`), and a write into a multisampled or combined
-/// depth/stencil one announces `signed-depth-test`.
+/// where Metal's compares its magnitude (no `DriverFact::DepthTestComparesMagnitudes`): a write
+/// that may store such a value in a render target's `Depth32Float` or `Depth32Float_Stencil8`
+/// depth then announces `signed-depth-test`.
 pub(super) fn signs_depth_tests(device: &Device) -> bool {
     let magnitudes = device
         .properties()
@@ -2212,53 +2269,18 @@ pub(super) fn shared_in_system_memory(device: &Device) -> bool {
     !device.properties().has_unified_memory
 }
 
-/// Whether `device` gives a single-sample `Depth32Float` texture of shader-read usage without
-/// render target usage a depth twin (`depth-twin`): its depth images may store a value otherwise
-/// than Metal's ([`clamps_depth_uploads`], or a driver not measured to keep a denormal there,
-/// `DriverFact::DepthImageKeepsDenormals`).
-pub(super) fn twins_depth(device: &Device) -> bool {
-    let keeps = device
-        .properties()
-        .driver_facts
-        .contains(&DriverFact::DepthImageKeepsDenormals);
-    clamps_depth_uploads(device) || !keeps
-}
-
-/// The kind `device` announces for a resolve of a color attachment of `format` at `samples`, a
-/// texture the runtime made: `shader-resolve` under `ResolvePolicy::Exact` where the format has
-/// Metal's rules at that count (`ColorResolveFormat::of` and `resolves`) and the device's
-/// `AVERAGE` is not measured to be Metal's there (`DriverFact::ColorResolveAverageIsMetals`, at
-/// most 4 samples): the runtime gives such a target the input attachment usage the exact resolve
-/// reads it through where that costs the image nothing, which every driver measured answers so
-/// (lavapipe, RADV, ANV and NVIDIA); `device-rounded-resolve` where the device's
-/// `AVERAGE` resolves it (one with rules under `ResolvePolicy::Device`, the default, and one
-/// without rules there under either) and is not measured to resolve as Metal's; none where it is
-/// (the fact holds for every format).
-pub(super) fn resolve_kind(
-    device: &Device,
-    format: PixelFormat,
-    samples: u32,
-) -> Option<Degradation> {
-    // Rules that hold at that count: the float formats' at 2 and 4 samples only.
-    let rules = metal2vulkan::metal::format::direct_format(format)
-        .and_then(metal2vulkan::bind::ColorResolveFormat::of)
-        .is_some_and(|rules| rules.resolves(samples));
+/// The kind `device` announces for a resolve of a color attachment of a format that is not
+/// extended-range, into a texture of its own format, at `samples`, a texture the runtime made:
+/// the device's `AVERAGE` resolves it in the pass, `device-rounded-resolve` where that is not
+/// measured to resolve as Metal's (`DriverFact::ColorResolveAverageIsMetals`, at most 4 samples);
+/// none where it is (the fact holds for every format).
+pub(super) fn resolve_kind(device: &Device, samples: u32) -> Option<Degradation> {
     let metals = samples <= 4
         && device
             .properties()
             .driver_facts
             .contains(&DriverFact::ColorResolveAverageIsMetals);
-    let policy = device.compile_device().policy().resolve;
-    // A format without rules, or any under the device's resolve, resolves by the device's
-    // average, Metal's own where the fact holds.
-    match (
-        metals,
-        rules && samples > 1 && policy == ResolvePolicy::Exact,
-    ) {
-        (true, _) => None,
-        (false, true) => Some(Degradation::ShaderResolve),
-        (false, false) => Some(Degradation::DeviceRoundedResolve),
-    }
+    (!metals).then_some(Degradation::DeviceRoundedResolve)
 }
 
 /// Whether `device` copies bytes into a multisampled 32-bit float depth (from a buffer, or from a
@@ -2281,8 +2303,8 @@ pub(super) fn draws_depth_copies(device: &Device) -> bool {
 /// (`carried-decoded-twin`), and whether the twin's codes announce `decoded-texel-precision`: an
 /// ASTC format the device has no block for (`astc_textures::decodes_astc`), a PVRTC, ETC2 or
 /// EAC format it has no format for, or a 4:2:2 format (every device); the notice for an ASTC LDR
-/// format's 8-bit codes and an EAC 11-bit format's 16-bit ones under
-/// `DecodedTexelsPolicy::Compact`, and for no other twin, whose codes are exact (an ASTC sRGB
+/// format's 8-bit codes and an EAC 11-bit format's 16-bit ones, and for no other twin, whose codes
+/// are exact (an ASTC sRGB
 /// format's, a PVRTC format's, an 8-bit ETC2 or EAC format's, a 4:2:2 format's).
 pub(super) fn twins_carried(device: &Device, pf: PixelFormat) -> [bool; 2] {
     let astc = AstcDecode::of(pf).filter(|_| !decodes_astc(device, pf));
@@ -2294,35 +2316,27 @@ pub(super) fn twins_carried(device: &Device, pf: PixelFormat) -> [bool; 2] {
     let etc = metal2vulkan::bind::EtcDecode::of(pf).filter(|_| decoded);
     let chroma = metal2vulkan::bind::ChromaDecode::of(pf).is_some() && decoded;
     let eleven = etc.is_some_and(metal2vulkan::bind::EtcDecode::eleven_bit);
-    let compact = device.compile_device().policy().decoded_texels == DecodedTexelsPolicy::Compact;
     let ldr = astc.is_some_and(|decode| !decode.srgb);
     [
         astc.is_some() || pvrtc || etc.is_some() || chroma,
-        (ldr || eleven) && compact,
+        ldr || eleven,
     ]
 }
 
-/// Whether `device` gives a single-sample texture of `pf` a decoded twin (`decoded-block-twin`): a
-/// BC1 to BC5 format whose decode its driver is not measured to make as Metal's (BC1 to BC3
-/// `DriverFact::ColorBlockDecodeIsMetals`, BC4 and BC5 `DriverFact::ChannelBlockDecodeIsMetals`).
-/// Every venue's twin formats take sampling, linear filtering and copies, which the twin needs.
-pub(super) fn twins_blocks(device: &Device, pf: PixelFormat) -> bool {
-    use metal2vulkan::bind::BlockDecode as B;
-    let fact = match B::of(pf) {
-        Some(B::Bc1 | B::Bc2 | B::Bc3) => DriverFact::ColorBlockDecodeIsMetals,
-        Some(_) => DriverFact::ChannelBlockDecodeIsMetals,
-        None => return false,
-    };
-    !device.properties().driver_facts.contains(&fact)
-}
-
-/// Whether `device` announces `compressed-texel-decode` for a texture of `pf` it makes in memory
-/// of its own: a BC6H or BC7 texture, which takes no decoded twin, on a driver not measured to
-/// decode it as Metal does (`DriverFact::Bc6hBlockDecodeIsMetals`, `Bc7BlockDecodeIsMetals`). A BC1
-/// to BC5 texture takes a twin instead ([`twins_blocks`]).
+/// Whether `device` announces `compressed-texel-decode` for a texture of `pf`: a BC texture, which
+/// the device samples through its own decode, on a driver not measured to decode it as Metal does
+/// (BC1 to BC3 `DriverFact::ColorBlockDecodeIsMetals`, BC4 and BC5
+/// `DriverFact::ChannelBlockDecodeIsMetals`, `DriverFact::Bc6hBlockDecodeIsMetals`,
+/// `Bc7BlockDecodeIsMetals`).
 pub(super) fn decodes_blocks_its_way(device: &Device, pf: PixelFormat) -> bool {
     use PixelFormat as P;
     let fact = match pf {
+        P::BC1RGBA | P::BC1RGBASRGB | P::BC2RGBA | P::BC2RGBASRGB | P::BC3RGBA | P::BC3RGBASRGB => {
+            DriverFact::ColorBlockDecodeIsMetals
+        }
+        P::BC4RUnorm | P::BC4RSnorm | P::BC5RGUnorm | P::BC5RGSnorm => {
+            DriverFact::ChannelBlockDecodeIsMetals
+        }
         P::BC6HRGBFloat | P::BC6HRGBUfloat => DriverFact::Bc6hBlockDecodeIsMetals,
         P::BC7RGBAUnorm | P::BC7RGBAUnormSRGB => DriverFact::Bc7BlockDecodeIsMetals,
         _ => return false,

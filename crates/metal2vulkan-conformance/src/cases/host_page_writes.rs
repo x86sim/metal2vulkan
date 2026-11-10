@@ -437,12 +437,9 @@ impl Case for HostPageWrite {
         // notices site; a code this list names that no run announces is an unfired allowance,
         // which is noise the tally exists to show. So this is a measured set and not a guess.
         //
-        // Measured on this M3 Max through MoltenVK: the two **drawing** rows announce
-        // `fast-math-rewrites` and nothing else -- the translator rewrites the arithmetic of
-        // `rt6_render_state`'s vertex function, which is the fixture, not this family's subject --
-        // and the two **kernel** rows announce nothing at all, so they declare nothing. The first
-        // replay of this family declared neither and reported both drawing rows divergent at
-        // three sites of `case/notices` with no byte of any read-back moving.
+        // The two **drawing** rows' `fast-math-rewrites` (the arithmetic of `rt6_render_state`'s
+        // vertex function, which is the fixture, not this family's subject) is the suite's
+        // (`crate::replay::NATIVE_NOTES`), declared by no row.
         //
         // `private-resource-option` **has** its venue now, which is what the earlier reading of
         // this comment was waiting for. On macOS a no-copy buffer with bit 24 announces nothing:
@@ -454,10 +451,6 @@ impl Case for HostPageWrite {
         // and for neither writable row (replay-nvidia.log, replay-llvmpipe.log). So it is declared
         // from `Row::read_only`, which is the bit it is about.
         //
-        // `shader-color-conversion` is the two **drawing** rows': they store into a normalized
-        // colour attachment, which our side may round in the shader. Announced by both on both
-        // drivers; neither kernel row stores a colour.
-        //
         // `shared-in-system-memory` is every row's and belongs to the venue, not to this family:
         // each row reads its pages back through a `Shared` buffer
         // (`crate::replay::shared_memory_notice`). Announced by all four on the 5080.
@@ -467,14 +460,6 @@ impl Case for HostPageWrite {
         // against ours 16), which is this family's whole subject. Those bytes stay compared
         // exactly and those rows stay divergent on them.
         let mut named = vec![crate::replay::shared_memory_notice()];
-        if matches!(self.row.shape, Shape::Visibility) {
-            named.push(crate::replay::notice_allowance(
-                metal2vulkan_runtime::Degradation::FastMathRewrites.code(),
-            ));
-            named.push(crate::replay::notice_allowance(
-                metal2vulkan_runtime::Degradation::ShaderColorConversion.code(),
-            ));
-        }
         if self.row.read_only {
             named.push(crate::replay::notice_allowance(
                 metal2vulkan_runtime::Degradation::PrivateResourceOption.code(),

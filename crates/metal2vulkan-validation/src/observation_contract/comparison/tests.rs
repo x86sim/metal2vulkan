@@ -63,11 +63,7 @@ fn every_precision_note_has_its_table_row() {
         (N::HalfSampleFilter, Allowance::Unbounded),
         (N::SrgbTexelDecode, Allowance::Unbounded),
         (N::FloatSampleFilter, Allowance::Unbounded),
-        (N::DeviceGatherFootprint, Allowance::Unbounded),
-        (N::CubeFaceReciprocal, Allowance::Unbounded),
         (N::FunctionStorageAssumed, Allowance::Recorded),
-        (N::DeviceTexelDenormals, Allowance::Recorded),
-        (N::BeyondMeasuredDeviation, Allowance::Recorded),
         (N::ViewBaseTexelOffset, Allowance::Recorded),
         (N::DeviceColorConversion, Allowance::Recorded),
         (N::DeviceInterpolation, Allowance::Unbounded),
@@ -76,6 +72,7 @@ fn every_precision_note_has_its_table_row() {
         (N::FragmentSimdgroupGrouping, Allowance::Unbounded),
         (N::BlendedWriteRounding, Allowance::Unbounded),
         (N::CoverageReadsRoundedAlpha, Allowance::Unbounded),
+        (N::DeviceAlphaCoverage, Allowance::Unbounded),
         (N::RotatedBlendRounding, Allowance::Unbounded),
         (N::ComputedSampleDepth, Allowance::Unbounded),
     ];
@@ -114,8 +111,6 @@ fn only_the_environment_notes_are_told_value_by_value() {
         N::RasterizationRateMap,
         N::BicubicFilterArithmetic,
         N::SparseResidency,
-        N::DeviceTexelDenormals,
-        N::BeyondMeasuredDeviation,
         N::ViewBaseTexelOffset,
         N::DeviceColorConversion,
     ] {

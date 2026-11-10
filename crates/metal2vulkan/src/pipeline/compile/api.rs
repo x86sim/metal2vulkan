@@ -279,8 +279,6 @@ impl Device {
     /// call stack was sized for another depth (`RuntimeFact::CallStackDepth`) is
     /// `InvalidDescriptor(MaxCallStackDepth)`. A stage-input attribute whose buffer has no layout,
     /// read or not, is `InvalidDescriptor(StageInputLayout)`, where Metal stops at an assertion.
-    /// A `Function` kernel's pipeline is held to the device's compiler word bound
-    /// ([`Device::fit_compute_pipeline`]).
     pub fn compile_compute_pipeline(
         &self,
         d: &ComputePipelineDescriptor,
@@ -288,9 +286,7 @@ impl Device {
     ) -> Result<ComputePipeline, Error> {
         guarded(|| {
             let inputs = kernel_inputs(d);
-            let first = self.compute_pipeline(d, &inputs, &mut Meter::new(b))?;
-            let bound = self.profile().module_word_bound();
-            self.fit_compute_within(d, &inputs, b, first, bound)
+            self.compute_pipeline(d, &inputs, &mut Meter::new(b))
         })
     }
 
@@ -321,8 +317,7 @@ impl Device {
     /// `InvalidDescriptor(ColorAttachment)`. A multisampled pass (`raster_sample_count` above 1) is
     /// `Unsupported{TileShading, NotImplemented}`: what its imageblock's samples are is not read.
     /// The tile function's recursion is sized for `d`'s `maxCallStackDepth` as a compute kernel's
-    /// is. A `Function` tile function's pipeline is held to the device's compiler word bound
-    /// ([`Device::fit_tile_pipeline`]).
+    /// is.
     pub fn compile_tile_pipeline(
         &self,
         d: &TileRenderPipelineDescriptor,
@@ -330,9 +325,7 @@ impl Device {
     ) -> Result<ComputePipeline, Error> {
         guarded(|| {
             let inputs = tile_inputs(d);
-            let first = self.tile_pipeline(d, &inputs, &mut Meter::new(b))?;
-            let bound = self.profile().module_word_bound();
-            self.fit_tile_within(d, &inputs, b, first, bound)
+            self.tile_pipeline(d, &inputs, &mut Meter::new(b))
         })
     }
 
@@ -490,18 +483,14 @@ impl Device {
     /// compiled under the same inputs; link refuses a vertex stage compiled under another
     /// projection. Each stage's recursion is sized for `d`'s `maxVertexCallStackDepth` or
     /// `maxFragmentCallStackDepth`, as a compute kernel's is for its pipeline's; a `Compiled` stage
-    /// sized for another depth is `InvalidDescriptor(MaxCallStackDepth)`. A pipeline of `Function`
-    /// stages is held to the device's compiler word bound ([`Device::fit_render_variant`]).
+    /// sized for another depth is `InvalidDescriptor(MaxCallStackDepth)`.
     pub fn compile_render_variant(
         &self,
         d: &RenderPipelineDescriptor,
         v: &VariantKey,
         b: &Budget,
     ) -> Result<RenderPipeline, Error> {
-        guarded(|| {
-            let first = self.render_pipeline(d, v, &mut Meter::new(b))?;
-            self.fit_render_within(d, v, b, first, self.profile().module_word_bound())
-        })
+        guarded(|| self.render_pipeline(d, v, &mut Meter::new(b)))
     }
 
     /// Compile the mesh render pipeline `d` under budget `b`: its object function (when it has one)
@@ -528,21 +517,17 @@ impl Device {
     /// Compile the mesh render pipeline `d` under the variant `v` a plan of it asked for
     /// (`BindingPlan::variant`) and budget `b`, as [`Device::compile_mesh_pipeline`] does: each
     /// `Function` stage under [`VariantKey::lowering_inputs`] of its stage, the fragment function's
-    /// for the mesh function's outputs. A pipeline of `Function` stages is held to the device's
-    /// compiler word bound ([`Device::fit_mesh_variant`]).
+    /// for the mesh function's outputs.
     pub fn compile_mesh_variant(
         &self,
         d: &MeshPipelineDescriptor,
         v: &VariantKey,
         b: &Budget,
     ) -> Result<RenderPipeline, Error> {
-        guarded(|| {
-            let first = self.mesh_pipeline(d, v, &mut Meter::new(b))?;
-            self.fit_mesh_within(d, v, b, first, self.profile().module_word_bound())
-        })
+        guarded(|| self.mesh_pipeline(d, v, &mut Meter::new(b)))
     }
 
-    /// [`Device::compile_mesh_variant`] with the caller's meter, unfitted.
+    /// [`Device::compile_mesh_variant`] with the caller's meter.
     pub(crate) fn mesh_pipeline(
         &self,
         d: &MeshPipelineDescriptor,
@@ -602,7 +587,7 @@ impl Device {
             check_call_stack(c.artifact(), 1)?;
         }
         let artifacts: Vec<&FunctionArtifact> = compiled.iter().map(|c| c.artifact()).collect();
-        let mut linked = link(&artifacts, &LinkInputs::mesh(d), p)?;
+        let linked = link(&artifacts, &LinkInputs::mesh(d), p)?;
         let mut stages = Vec::with_capacity(compiled.len());
         for (i, c) in compiled.iter().enumerate() {
             stages.push(stage_module(c, &linked, i)?);
@@ -642,10 +627,6 @@ impl Device {
         }
         let mut dependencies = dependencies(&artifacts, self);
         dependencies.extend(mesh_facts);
-        let depth = (&mut linked, &mut stages, &mut dependencies);
-        if let Some(r) = depth16_stage((d.into(), v, d.fragment.is_none()), depth, p, m)? {
-            requirements = p.union_requirements(&requirements, &r);
-        }
         let (graphics, requirements) = graphics_requirements(requirements, &linked, &artifacts, p)?;
         let profile = self.profile_fingerprint();
         Ok(RenderPipeline {
@@ -714,8 +695,7 @@ impl Device {
     }
 
     /// [`Device::compile_compute_pipeline`] with the caller's meter (tests count its work),
-    /// unfitted, a `Function` kernel compiled under `inputs` (`d`'s own, `kernel_inputs`, or a
-    /// fit's).
+    /// a `Function` kernel compiled under `inputs` (`d`'s own, `kernel_inputs`).
     pub(crate) fn compute_pipeline(
         &self,
         d: &ComputePipelineDescriptor,
@@ -753,8 +733,8 @@ impl Device {
         })
     }
 
-    /// [`Device::compile_tile_pipeline`] with the caller's meter, unfitted, a `Function` tile
-    /// function compiled under `inputs` (`d`'s own, `tile_inputs`, or a fit's).
+    /// [`Device::compile_tile_pipeline`] with the caller's meter, a `Function` tile function
+    /// compiled under `inputs` (`d`'s own, `tile_inputs`).
     pub(crate) fn tile_pipeline(
         &self,
         d: &TileRenderPipelineDescriptor,
@@ -802,7 +782,7 @@ impl Device {
         })
     }
 
-    /// [`Device::compile_render_variant`] with the caller's meter, unfitted. A variant of one of
+    /// [`Device::compile_render_variant`] with the caller's meter. A variant of one of
     /// the pipeline's color groups (`VariantKey::color_group`) compiles and links as the pipeline
     /// of its group's attachments (`color_group`), its key's choices of colors naming the group's.
     pub(crate) fn render_pipeline(
@@ -903,7 +883,7 @@ impl Device {
         }
         let compiled: Vec<&CompiledFunction> = std::iter::once(&vertex).chain(&fragment).collect();
         let artifacts: Vec<&FunctionArtifact> = compiled.iter().map(|c| c.artifact()).collect();
-        let mut linked = link(
+        let linked = link(
             &artifacts,
             &LinkInputs::render_variant(d, v, group.clone()),
             p,
@@ -956,10 +936,6 @@ impl Device {
                 fact,
                 mechanism: mechanism(&fact, self.profile()),
             });
-        }
-        let depth = (&mut linked, &mut stages, &mut dependencies);
-        if let Some(r) = depth16_stage((pass(), v, d.fragment.is_none()), depth, p, m)? {
-            requirements = p.union_requirements(&requirements, &r);
         }
         let (mut graphics, requirements) =
             graphics_requirements(requirements, &linked, &artifacts, p)?;
@@ -1072,83 +1048,6 @@ impl Device {
     }
 }
 
-/// State among a render pipeline's `dependencies` the depth variant `v` compiled it for
-/// (`RuntimeFact::Depth16Pass` of `VariantKey::depth16_pass`, `RuntimeFact::Depth16Biased` of
-/// `VariantKey::depth16_biased`, `RuntimeFact::Depth16BiasSide` of
-/// `VariantKey::depth16_bias_raises`), and give one without a fragment
-/// function (`fragmentless`) whose pass `pass` takes Metal's `Depth16Unorm` codes from its fragment
-/// stage (`compile::depth16_codes`) the synthesized fragment stage
-/// (`lower::stage_io::depth16::fragment_module`), as a fragment function would take them under
-/// `LoweringInputs::depth16_codes`: its module after the `stages`, its push range and placement in
-/// the `linked` layout and interface, and `RuntimeFact::Depth16Codes` among the `dependencies`.
-/// It writes no color, so the pipeline's color state stays a fragment-less pipeline's. The module's
-/// requirements, or `None` where the pipeline takes no such stage.
-fn depth16_stage(
-    (pass, v, fragmentless): (FragmentPass<'_>, &VariantKey, bool),
-    (linked, stages, dependencies): (
-        &mut Linked,
-        &mut Vec<StageModule>,
-        &mut Vec<RuntimeDependency>,
-    ),
-    p: &DeviceProfile,
-    m: &mut Meter,
-) -> Result<Option<Requirements>, Error> {
-    use crate::lower::stage_io::depth16;
-    if let Some(depth16) = v.depth16_pass {
-        let fact = RuntimeFact::Depth16Pass { depth16 };
-        dependencies.push(RuntimeDependency::new(fact, mechanism(&fact, p)));
-    }
-    if v.depth16_biased {
-        let fact = RuntimeFact::Depth16Biased;
-        dependencies.push(RuntimeDependency::new(fact, mechanism(&fact, p)));
-    }
-    if let Some(raises) = v.depth16_bias_raises {
-        let fact = RuntimeFact::Depth16BiasSide { raises };
-        dependencies.push(RuntimeDependency::new(fact, mechanism(&fact, p)));
-    }
-    if !fragmentless || !crate::pipeline::compile::depth16_codes(pass, v, p) {
-        return Ok(None);
-    }
-    let module = depth16::fragment_module(v.depth16_bias_raises)?;
-    let stats = crate::spirv::verify::verify(&module, p, m)?;
-    let module = crate::spirv::serialize::serialize_for(module, p)?;
-    let words = crate::spirv::serialize::relocate(&module, &*linked)?;
-    stages.push(StageModule {
-        stage: vk::ShaderStage::FRAGMENT,
-        entry_point: ENTRY_NAME.to_owned(),
-        spirv: words.into(),
-        specialization: crate::pipeline::artifact::SpecializationLayout::default(),
-        required_subgroup_size: None,
-        stage_flags: vk::PipelineShaderStageCreateFlags::empty(),
-        reconvergence: crate::pipeline::artifact::Reconvergence::Guaranteed,
-        precision_notes: Vec::new(),
-        strategies: crate::pipeline::artifact::StrategyCensus::default(),
-        constant_blob: None,
-        rounded_colors: Vec::new(),
-        specialized_notes: Vec::new(),
-        half_bit_colors: Vec::new(),
-        own_pixel_textures: Vec::new(),
-        snapshot_textures: Vec::new(),
-        private_bytes: 0,
-        stats,
-    });
-    let placement = depth16::fragment_placement();
-    if let Some((offset, size)) = placement.push_range {
-        linked
-            .layout
-            .push_constants
-            .push(crate::pipeline::layout::PushConstantRange {
-                stages: vk::ShaderStageFlags::FRAGMENT,
-                offset,
-                size,
-            });
-    }
-    linked.interface.push.push(placement);
-    let fact = RuntimeFact::Depth16Codes { biased: true };
-    dependencies.push(RuntimeDependency::new(fact, mechanism(&fact, p)));
-    Ok(Some(module.requirements))
-}
-
 /// A render or mesh render pipeline's graphics state, and its stages' `requirements` with what
 /// that state adds.
 fn graphics_requirements(
@@ -1184,6 +1083,14 @@ fn graphics_requirements(
     requirements
         .properties
         .extend(graphics.sample_count_properties(&p.fields().enabled.properties)?);
+    // The measured conversions its fixed-function vertex input relies on in place of a note.
+    requirements
+        .properties
+        .extend(linked.vertex_properties.iter().copied());
+    // The measured coverage its fixed-function alpha to coverage relies on in place of a note.
+    requirements
+        .properties
+        .extend(linked.fragment_properties.iter().copied());
     // The portability subset's features it relies on, named only where the device has them: where
     // the subset withholds one, link refused or pulled what it would allow (and the binder pulls a
     // per-bind stride that does not cover its attributes), and a device without the subset
@@ -1513,24 +1420,12 @@ fn compute_fields(d: &ComputePipelineDescriptor) -> String {
     }
 }
 
-/// The pipeline key's fields of variant `v` past its stages' keys: the depth it was compiled for
-/// (`VariantKey::depth16_pass`, `VariantKey::depth16_biased`, `VariantKey::depth16_bias_raises`),
-/// which a pipeline without a fragment function keeps in no stage's key, and which every pipeline
-/// states (`RuntimeFact::Depth16Pass`, `RuntimeFact::Depth16Biased`,
-/// `RuntimeFact::Depth16BiasSide`), and its color group past the first (`VariantKey::color_group`),
-/// whose variant of a pipeline without a fragment function has no stage of its own. Empty for
-/// every other variant, so a pipeline keeps its key.
+/// The pipeline key's fields of variant `v` past its stages' keys: its color group past the first
+/// (`VariantKey::color_group`), whose variant of a pipeline without a fragment function has no
+/// stage of its own, and its emulated mesh function's synthesized vertex stage. Empty for every
+/// other variant, so a pipeline keeps its key.
 fn variant_fields(v: &VariantKey) -> String {
-    let mut fields = match v.depth16_pass {
-        Some(depth16) => format!(" depth16_pass {depth16}"),
-        None => String::new(),
-    };
-    if v.depth16_biased {
-        fields.push_str(" depth16_biased");
-    }
-    if let Some(raises) = v.depth16_bias_raises {
-        fields.push_str(&format!(" depth16_bias_raises {raises}"));
-    }
+    let mut fields = String::new();
     // The group a pipeline without a fragment function keeps in no stage's key.
     if v.color_group != 0 {
         fields.push_str(&format!(" color_group {}", v.color_group));
@@ -1578,12 +1473,6 @@ fn stage_module(c: &CompiledFunction, linked: &Linked, i: usize) -> Result<Stage
     if a.subgroup.full_subgroups {
         stage_flags |= vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS;
     }
-    // A fragment function that selects an attachment's rules rounds it, and keeps the notes of
-    // the rules, as the pipeline's attachment selects them.
-    let rules = linked
-        .graphics
-        .as_ref()
-        .map_or(&[][..], |g| &g.color_write_rules[..]);
     // A `half` output of a module without fast math keeps its note where its attachment blends.
     let colors = linked
         .graphics
@@ -1594,13 +1483,22 @@ fn stage_module(c: &CompiledFunction, linked: &Linked, i: usize) -> Result<Stage
         .graphics
         .as_ref()
         .is_some_and(|g| g.alpha_to_coverage);
-    let Some((precision_notes, rounded_colors)) =
-        crate::pipeline::color_writes::pipeline_writes(a, rules, colors, coverage)
-    else {
-        return Err(invariant(
-            "link gave no rule word to a selected color attachment",
-        ));
-    };
+    let (mut precision_notes, rounded_colors) =
+        crate::pipeline::color_writes::pipeline_writes(a, colors, coverage);
+    // The vertex stage's notes of what the device's fixed-function input converts for this
+    // pipeline's vertex descriptor, which no module of it records.
+    if a.interface.stage == Stage::Vertex && !linked.vertex_notes.is_empty() {
+        precision_notes.extend(&linked.vertex_notes);
+        precision_notes.sort_unstable();
+        precision_notes.dedup();
+    }
+    // The fragment stage's notes of what the device's fixed-function fragment operations answer
+    // for this pipeline's graphics state (its alpha to coverage), which no module of it records.
+    if a.interface.stage == Stage::Fragment && !linked.fragment_notes.is_empty() {
+        precision_notes.extend(&linked.fragment_notes);
+        precision_notes.sort_unstable();
+        precision_notes.dedup();
+    }
     Ok(StageModule {
         stage: a.interface.vk_stage(),
         entry_point: ENTRY_NAME.to_owned(),
@@ -1615,7 +1513,6 @@ fn stage_module(c: &CompiledFunction, linked: &Linked, i: usize) -> Result<Stage
         constant_blob: a.blob.clone(),
         rounded_colors,
         specialized_notes: a.specialized.clone(),
-        half_bit_colors: a.interface.io.half_bit_colors.clone(),
         own_pixel_textures: a.interface.own_pixel_textures.clone(),
         snapshot_textures: a.interface.snapshot_textures.clone(),
         private_bytes: a.interface.private_bytes,

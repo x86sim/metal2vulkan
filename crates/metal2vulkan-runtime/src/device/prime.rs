@@ -82,7 +82,6 @@ use crate::gpu_time::Calibration;
 use crate::loader_word::LoaderWord;
 use crate::memory;
 use crate::release::{self, Generated, Released};
-use crate::render_state::DepthBiasCommand;
 use crate::sharing::Sharing;
 use crate::tracker::Barrier;
 use ash::vk;
@@ -92,11 +91,13 @@ use super::functions::Vk;
 use super::QueueSlot;
 
 /// The table's entry points priming cannot make before the hook is registered for the device it
-/// primes: the release of a device, an instance and a messenger, and the commands of a mesh draw
-/// and of an execution of commands the GPU generates, which take pipelines of their own kinds.
-/// The first release of each in the process, and the first replay of each command
-/// (`recorder`), registers the hook again as its section ends (`exit_guard::called`).
-pub(crate) const UNPRIMED: [Call; 8] = [
+/// primes: the release of a device, an instance and a messenger, the commands of a mesh draw
+/// and of an execution of commands the GPU generates, which take pipelines of their own kinds, and
+/// the layout of a linear image, of which a device need make none of any format. The first
+/// release of each in the process, the first call of each command in a section, and the first
+/// layout read in a section, registers the hook again as its section ends
+/// (`exit_guard::called`).
+pub(crate) const UNPRIMED: [Call; 9] = [
     Call::DestroyDevice,
     Call::DestroyDebugUtilsMessenger,
     Call::DestroyInstance,
@@ -105,6 +106,7 @@ pub(crate) const UNPRIMED: [Call; 8] = [
     Call::CmdDrawMeshTasksIndirectCount,
     Call::CmdExecuteGeneratedCommands,
     Call::CmdPreprocessGeneratedCommands,
+    Call::GetImageSubresourceLayout,
 ];
 
 /// The table's entry points a queue family that writes no timestamps (`timestampValidBits` 0)
@@ -171,13 +173,13 @@ pub(crate) const PRIMITIVE_RESTART_CALLS: [Call; 1] = [Call::CmdSetPrimitiveRest
 /// primes: a snapshot draw's masks (`dynamic_state.rs`, `render/snapshot.rs`).
 pub(crate) const COLOR_WRITE_MASK_CALLS: [Call; 1] = [Call::CmdSetColorWriteMask];
 
-/// The table's entry points a device without `VK_EXT_depth_bias_control` never calls, nor
-/// primes: a depth bias in a unit of its own (`render_state.rs`).
-pub(crate) const DEPTH_BIAS_CALLS: [Call; 1] = [Call::CmdSetDepthBias2];
-
 /// The table's entry points a device without `maintenance5` never calls, nor primes: an index
 /// buffer bound with its size (`draw_source.rs`).
 pub(crate) const SIZED_INDEX_BIND_CALLS: [Call; 1] = [Call::CmdBindIndexBuffer2];
+
+/// The table's entry points a device that converts no YCbCr format itself never calls, nor
+/// primes: the release of a YCbCr sample kernel's conversion (`ycbcr_device.rs`).
+pub(crate) const YCBCR_CONVERSION_CALLS: [Call; 1] = [Call::DestroySamplerYcbcrConversion];
 
 /// The debug name of a render host step's pipeline that priming makes, where the instance reports
 /// messages ([`NAMING_CALLS`]).
@@ -372,18 +374,17 @@ pub(crate) struct Has {
     pub(crate) extended_dynamic_state: bool,
     pub(crate) primitive_restart: bool,
     pub(crate) color_write_masks: bool,
-    pub(crate) depth_bias: bool,
     pub(crate) sized_index_bind: bool,
+    pub(crate) ycbcr_conversion: bool,
 }
 
 /// The commands a render encoder records that the device has where it has their feature or
-/// extension, which the priming's render host step makes (a deferred command buffer's replay
-/// records them inside a section, `recorder`).
+/// extension, which the priming's render host step makes (a host step records them inside a
+/// section).
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PrimedDraws {
     pub(crate) dynamic: Option<ExtendedDynamicState>,
     pub(crate) color_write_masks: Option<ColorWriteMasks>,
-    pub(crate) depth_bias: Option<DepthBiasCommand>,
     pub(crate) sized_index_bind: Option<SizedIndexBind>,
 }
 
@@ -396,7 +397,6 @@ impl PrimedDraws {
                 .dynamic
                 .is_some_and(|dynamic| dynamic.primitive_restart_enable.is_some()),
             color_write_masks: self.color_write_masks.is_some(),
-            depth_bias: self.depth_bias.is_some(),
             sized_index_bind: self.sized_index_bind.is_some(),
             ..has
         }
@@ -406,15 +406,16 @@ impl PrimedDraws {
 /// Prime `device` of `physical`, made from `instance`, whose queues are `queues`, the first of
 /// its primary family `queue_family`, its buffers and images shared as `sharing` says, on this
 /// thread; `has` says what the device has, `generated` holds the commands of
-/// `VK_EXT_device_generated_commands` where it has them, and `drawn` the render encoder's
-/// commands it has.
+/// `VK_EXT_device_generated_commands` where it has them, `drawn` the render encoder's commands
+/// it has, and `ycbcr` a Y′CbCr conversion of a format it converts, where it converts one.
 ///
 /// # Safety
 ///
 /// The device is live and enables timeline semaphores, and `bufferDeviceAddress` where `has`
 /// says it has device addresses; `queues` holds at least one of its queues, which nothing else
 /// uses yet; `generated` is the device's, which enables the extension and `maintenance5`;
-/// `loader_word` is the device's loader word.
+/// `loader_word` is the device's loader word; the device enables `samplerYcbcrConversion` and
+/// converts `ycbcr`'s format with its chroma location where `ycbcr` is given.
 pub(super) unsafe fn prime(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
@@ -428,6 +429,7 @@ pub(super) unsafe fn prime(
     push: Option<vk::PFN_vkCmdPushDescriptorSetKHR>,
     calibration: Option<Calibration>,
     drawn: PrimedDraws,
+    ycbcr: Option<vk::SamplerYcbcrConversionCreateInfo<'static>>,
 ) -> Result<(), Error> {
     let mut primer = Primer {
         device,
@@ -451,6 +453,7 @@ pub(super) unsafe fn prime(
                 None => Ok(()),
             })
             .and_then(|()| primer.sparse(queues, has.sparse_binding))
+            .and_then(|()| primer.ycbcr(ycbcr))
     };
     // SAFETY: the submission completed, or was never made, or the device is lost; nothing else
     // uses the objects held.
@@ -480,8 +483,9 @@ pub(super) unsafe fn prime(
 /// has no push command, those of [`CALIBRATION_CALLS`] where it calibrates no timestamps, those
 /// of [`NAMING_CALLS`] where its instance reports no messages, and those of
 /// [`EXTENDED_DYNAMIC_STATE_CALLS`], [`PRIMITIVE_RESTART_CALLS`],
-/// [`COLOR_WRITE_MASK_CALLS`], [`DEPTH_BIAS_CALLS`] and [`SIZED_INDEX_BIND_CALLS`] where it has
-/// not their commands, that `calls` (one bit each) does not hold.
+/// [`COLOR_WRITE_MASK_CALLS`] and [`SIZED_INDEX_BIND_CALLS`] where it has
+/// not their commands, and those of [`YCBCR_CONVERSION_CALLS`] where it converts no YCbCr format,
+/// that `calls` (one bit each) does not hold.
 pub(crate) fn missing(calls: u128, has: Has) -> Vec<Call> {
     Call::ALL
         .iter()
@@ -501,8 +505,8 @@ pub(crate) fn missing(calls: u128, has: Has) -> Vec<Call> {
                 && (has.extended_dynamic_state || !EXTENDED_DYNAMIC_STATE_CALLS.contains(&call))
                 && (has.primitive_restart || !PRIMITIVE_RESTART_CALLS.contains(&call))
                 && (has.color_write_masks || !COLOR_WRITE_MASK_CALLS.contains(&call))
-                && (has.depth_bias || !DEPTH_BIAS_CALLS.contains(&call))
                 && (has.sized_index_bind || !SIZED_INDEX_BIND_CALLS.contains(&call))
+                && (has.ycbcr_conversion || !YCBCR_CONVERSION_CALLS.contains(&call))
         })
         .collect()
 }
@@ -865,6 +869,27 @@ impl Primer<'_> {
         Ok(())
     }
 
+    /// A Y′CbCr conversion of `info`, a format the device converts, where it converts one
+    /// ([`YCBCR_CONVERSION_CALLS`]).
+    ///
+    /// # Safety
+    ///
+    /// As [`prime`]'s; the device enables `samplerYcbcrConversion` where `info` is given, and
+    /// converts its format with its chroma location.
+    unsafe fn ycbcr(
+        &mut self,
+        info: Option<vk::SamplerYcbcrConversionCreateInfo<'static>>,
+    ) -> Result<(), Error> {
+        let Some(info) = info else {
+            return Ok(());
+        };
+        // SAFETY: the caller's.
+        let conversion =
+            unsafe { self.device.create_sampler_ycbcr_conversion(&info, None) }.map_err(vulkan)?;
+        self.hold(conversion);
+        Ok(())
+    }
+
     /// An object of every other kind the runtime releases, the read of a pipeline cache's data,
     /// and a command buffer of a pool of `queue_family` recorded as a host step records one;
     /// `device_addresses` where the device has them.
@@ -968,6 +993,10 @@ impl Primer<'_> {
             self.made(Call::CreateImage);
             let requirements = device.get_image_memory_requirements(image);
             self.made(Call::GetImageMemoryRequirements);
+            let mut requirements2 = vk::MemoryRequirements2::default();
+            let query = vk::ImageMemoryRequirementsInfo2::default().image(image);
+            device.get_image_memory_requirements2(&query, &mut requirements2);
+            self.made(Call::GetImageMemoryRequirements2);
             let memory = match self.allocate(requirements, vk::MemoryPropertyFlags::empty(), false)
             {
                 Ok(memory) => memory,
@@ -1305,8 +1334,8 @@ impl Primer<'_> {
             let zero = vk::ClearDepthStencilValue::default();
             device.cmd_clear_depth_stencil_image(recorded, depth, general, &zero, &[depth_whole]);
             self.made(Call::CmdClearDepthStencilImage);
-            // What an encoder records that no host step does, which a deferred command buffer's
-            // replay records (`recorder`): a buffer's fill and its inline update, each at bytes
+            // What an encoder records that no host step does: a buffer's fill and its inline
+            // update, each at bytes
             // of its own, a copy of the query's result, and a blit of the image's first texel to
             // its second after the clear.
             device.cmd_fill_buffer(recorded, buffer, 192, 4, 0);
@@ -1467,7 +1496,7 @@ impl Primer<'_> {
             device.cmd_set_stencil_reference(draws, faces, 0);
             self.made(Call::CmdSetStencilReference);
             // The extended dynamic states and the extension states the device has, set before
-            // the bind too (a deferred command buffer's replay records them, `recorder`).
+            // the bind too.
             let drawn = self.drawn;
             if let Some(dynamic) = drawn.dynamic {
                 (dynamic.cull_mode)(draws, vk::CullModeFlags::NONE);
@@ -1496,10 +1525,6 @@ impl Primer<'_> {
                 let all = [vk::ColorComponentFlags::RGBA];
                 masks(draws, 0, all.len() as u32, all.as_ptr());
                 self.made(Call::CmdSetColorWriteMask);
-            }
-            if let Some(bias) = drawn.depth_bias {
-                bias(draws, &vk::DepthBiasInfoEXT::default());
-                self.made(Call::CmdSetDepthBias2);
             }
             // A clear of the attachment inside the pass, as a render encoder's clear of a stand-in
             // records it.

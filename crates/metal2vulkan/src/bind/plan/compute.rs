@@ -62,8 +62,8 @@ use super::resources::{separate_samplers, ResourcePlanner};
 use super::slots::{
     address_map_variant, anisotropic_variant, bindings, bound_value, buffer_use, check_slots,
     check_sparse_textures, cross_variant, cubic_variant, mark_disjoint, plan_buffer, psb_variant,
-    record_specialized, srgb_twin_variant, srgb_variant, storage_view_variant, used_uses,
-    ycbcr_variant,
+    record_specialized, srgb_variant, storage_view_variant, used_uses, ycbcr_in_place_variant,
+    ycbcr_planes_sampled_variant,
 };
 use super::{
     BindingPlan, BoundKind, ComputeTemplate, DescriptorWrite, FieldLocation, LocalRules,
@@ -430,15 +430,16 @@ fn plan(p: &ComputePipeline, device: &Device, shape: &BindShape) -> Result<Bindi
                 class: SlotClass::Texture,
                 ..
             }) => return Err(not_implemented(Feature::TexelBuffer)),
-            // A storage texture's level count, and whether its channels are 16-bit floats, which
-            // the resource plan records; and a value the bound resources decide, which the plan
-            // records too (`slots::record_specialized`).
+            // A storage texture's level count and integer channel widths, which the resource plan
+            // records; and a value the bound resources decide, which the plan records too
+            // (`slots::record_specialized`).
             PushField::TextureLevels(_)
-            | PushField::TextureHalfChannels(_)
             | PushField::TextureIntegerChannels(_)
             | PushField::Specialized(_) => {}
             // A structure's instance count, which instantiation reads from the state.
             PushField::InstanceCount(_) => {}
+            // An in-place YCbCr texture's words, which instantiation reads from the state.
+            PushField::YCbCrInPlace(_) => {}
             // A stage-in buffer's bound stride, which instantiation reads from the state.
             PushField::StageInStride(_) => {}
             other => return Err(internal(format!("a compute push field {other:?}"))),
@@ -613,11 +614,6 @@ fn plan(p: &ComputePipeline, device: &Device, shape: &BindShape) -> Result<Bindi
                     SyntheticBinding::Imageblock => WriteSource::Imageblock,
                     // The command buffer's status, on a device that does not address buffers.
                     SyntheticBinding::ExecutionStatus => WriteSource::ExecutionStatus,
-                    // The stage's write-only store sink, which a dropped store through a
-                    // descriptor view lands in (`lower::access::sink`). No shader reads it.
-                    SyntheticBinding::StoreSink => WriteSource::Neutral(NeutralResource::Sink {
-                        min_bytes: NeutralResource::SINK_BYTES,
-                    }),
                     other => return Err(internal(format!("a compute binding {other:?}"))),
                 },
                 BindingSource::Texture(slot) => {
@@ -628,8 +624,7 @@ fn plan(p: &ComputePipeline, device: &Device, shape: &BindShape) -> Result<Bindi
                     resources.combined(texture, sampler, b.immutable_sampler.as_ref())?
                 }
                 BindingSource::SeparateTexture { texture, sampler } => {
-                    let use_ = sampler.sampler_binding_use();
-                    let immutable = separate.get(&(texture.stage, use_)).ok_or_else(|| {
+                    let immutable = separate.get(&(texture.stage, sampler)).ok_or_else(|| {
                         internal(format!(
                             "separate texture {texture:?} without its sampler {sampler:?}"
                         ))
@@ -642,10 +637,8 @@ fn plan(p: &ComputePipeline, device: &Device, shape: &BindShape) -> Result<Bindi
                 }
                 // A sparse texture's tile map.
                 BindingSource::TileMap(slot) => resources.tile_map(slot),
-                // An 8-bit sRGB texture's raw view.
-                BindingSource::RawTexture(slot) => {
-                    resources.raw_texture(set.set, b.binding, b.ty, slot)?
-                }
+                // A two-plane YCbCr texture's planes image, through the device's conversion.
+                BindingSource::YCbCrPlanes(slot) => resources.planes_image_write(slot)?,
                 // A tile function's attachment.
                 BindingSource::TileAttachment(color_index) => WriteSource::TileAttachment {
                     color_index,
@@ -822,8 +815,9 @@ fn plan(p: &ComputePipeline, device: &Device, shape: &BindShape) -> Result<Bindi
         shape,
         &variant.cross_class,
     );
-    variant.srgb_twins = srgb_twin_variant(device.profile(), &variant.srgb_textures, shape);
-    variant.ycbcr_textures = ycbcr_variant(&p.dependencies, shape);
+    variant.ycbcr_in_place = ycbcr_in_place_variant(&p.dependencies, shape);
+    variant.ycbcr_planes_sampled =
+        ycbcr_planes_sampled_variant(&p.dependencies, shape, &variant.ycbcr_in_place);
     variant.address_maps = address_map_variant(&p.dependencies, shape);
     variant.cubic_samplers = cubic_variant(&p.dependencies, shape)?;
     variant.anisotropic_samplers = anisotropic_variant(&p.dependencies, shape);

@@ -40,7 +40,7 @@ use crate::pipeline::testing::{
     AssembleError,
 };
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources, TrapKind};
-use crate::spirv::ir::{Inst, StorageClass, Type, TypedModule};
+use crate::spirv::ir::{AtomicOp, Inst, StorageClass, Type, TypedModule};
 
 const HEADER: &str = "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32\"\ntarget triple = \"air64_v28-apple-macosx26.0.0\"\n\n";
 
@@ -301,8 +301,6 @@ fn resources_bound(plan: &Plan, mem: &Memory, threads: u32, binds: &[Bind]) -> (
                 };
                 push[at..at + 8].copy_from_slice(&guest.to_le_bytes())
             }
-            // No slot's writes dropped: the word stays 0.
-            PushField::Specialized(crate::pipeline::sym::SpecKey::DroppedStoreSlots(_)) => {}
             other => panic!("unexpected push field {other:?}"),
         }
     }
@@ -745,6 +743,176 @@ fn narrow_atomics_through_a_loaded_pointer_are_exact_and_contained() {
             );
         }
     }
+}
+
+/// Every thread stores the byte `t ^ 0xA5` at byte `t` and the half `(257t) ^ 0xA5A5` at byte
+/// `64 + 2t` of the loaded pointer `b0[0]`'s allocation, loads the byte at `192 + t` and the half
+/// at `256 + 2t` into `b1[t]` and `b1[64 + t]`, and stores both 4096·(t + 1) bytes past the
+/// pointer (out of bounds), loading the half there back into `b1[128 + t]`.
+const NARROW_STORE_BODY: &str = "  %p = load ptr addrspace(1), ptr addrspace(1) %b0, align 8
+  %tz = zext i32 %t to i64
+  %t8 = trunc i32 %t to i8
+  %x8 = xor i8 %t8, -91
+  %pb = getelementptr inbounds i8, ptr addrspace(1) %p, i64 %tz
+  store i8 %x8, ptr addrspace(1) %pb, align 1
+  %t16 = trunc i32 %t to i16
+  %m16 = mul i16 %t16, 257
+  %x16 = xor i16 %m16, -23131
+  %ih = add i64 %tz, 32
+  %ph = getelementptr inbounds i16, ptr addrspace(1) %p, i64 %ih
+  store i16 %x16, ptr addrspace(1) %ph, align 2
+  %ilb = add i64 %tz, 192
+  %plb = getelementptr inbounds i8, ptr addrspace(1) %p, i64 %ilb
+  %lb = load i8, ptr addrspace(1) %plb, align 1
+  %ilh = add i64 %tz, 128
+  %plh = getelementptr inbounds i16, ptr addrspace(1) %p, i64 %ilh
+  %lh = load i16, ptr addrspace(1) %plh, align 2
+  %tz1 = add i64 %tz, 1
+  %far = mul i64 %tz1, 4096
+  %pf = getelementptr inbounds i8, ptr addrspace(1) %p, i64 %far
+  store i8 %x8, ptr addrspace(1) %pf, align 1
+  %pf2 = getelementptr inbounds i8, ptr addrspace(1) %pf, i64 2
+  store i16 %x16, ptr addrspace(1) %pf2, align 2
+  %lf = load i16, ptr addrspace(1) %pf2, align 2
+  %q0 = getelementptr inbounds i32, ptr addrspace(1) %b1, i32 %t
+  %lb32 = zext i8 %lb to i32
+  store i32 %lb32, ptr addrspace(1) %q0, align 4
+  %i1 = add i32 %t, 64
+  %q1 = getelementptr inbounds i32, ptr addrspace(1) %b1, i32 %i1
+  %lh32 = zext i16 %lh to i32
+  store i32 %lh32, ptr addrspace(1) %q1, align 4
+  %i2 = add i32 %t, 128
+  %q2 = getelementptr inbounds i32, ptr addrspace(1) %b1, i32 %i2
+  %lf32 = zext i16 %lf to i32
+  store i32 %lf32, ptr addrspace(1) %q2, align 4
+";
+
+/// The loads and stores of `m` through `PhysicalStorageBuffer` pointers to 8- and 16-bit
+/// integers, as `[8-bit loads, 8-bit stores, 16-bit loads, 16-bit stores]`, and its word `and`
+/// atomics: the first of a sub-word store's pair (the `or`s also count resident misses).
+fn narrow_psb_accesses(m: &TypedModule) -> ([u32; 4], u32) {
+    let width = |ptr| match m.value(ptr).and_then(|d| m.types().get(d.ty)) {
+        Ok(Type::Pointer {
+            class: StorageClass::PhysicalStorageBuffer,
+            pointee,
+        }) => match m.types().get(*pointee) {
+            Ok(Type::Int { width, .. }) if *width < 32 => Some(*width),
+            _ => None,
+        },
+        _ => None,
+    };
+    let (mut counts, mut pair) = ([0u32; 4], 0);
+    for n in m.blocks().iter().flat_map(|b| &b.insts) {
+        match &n.inst {
+            Inst::Load { ptr, .. } => match width(*ptr) {
+                Some(8) => counts[0] += 1,
+                Some(16) => counts[2] += 1,
+                _ => {}
+            },
+            Inst::Store { ptr, .. } => match width(*ptr) {
+                Some(8) => counts[1] += 1,
+                Some(16) => counts[3] += 1,
+                _ => {}
+            },
+            Inst::Atomic {
+                op: AtomicOp::And, ..
+            } => pair += 1,
+            _ => {}
+        }
+    }
+    (counts, pair)
+}
+
+/// An 8- and a 16-bit store through a loaded (device-address) pointer is one narrow `OpStore`
+/// where the profile has the width's storage access (`storageBuffer8BitAccess`,
+/// `storageBuffer16BitAccess`), without the sub-word store's `and`/`or` word atomics, and its
+/// narrow loads are one narrow `OpLoad`; without the access both stay word accesses, the stores
+/// the atomic pair. Either way the stores and loads are exact, the neighbouring bytes kept, and the
+/// out-of-bounds ones contained (the allocation untouched, the load 0).
+#[test]
+fn narrow_stores_through_a_loaded_pointer_are_native_where_the_profile_has_the_access() {
+    const N: u32 = 64;
+    let Some(bc) = assemble(
+        "wide_narrow_store",
+        &kernel("wide_narrow_store", 2, NARROW_STORE_BODY, ""),
+    ) else {
+        return;
+    };
+    let both = [
+        VkFeature::StorageBuffer8BitAccess,
+        VkFeature::StorageBuffer16BitAccess,
+    ];
+    let mut cases: Vec<(String, DeviceProfile)> = profiles();
+    for stem in ["moltenvk-m3", "lavapipe"] {
+        for removed in [&both[..1], &both[1..], &both[..]] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../metal2vulkan-validation/profiles")
+                .join(format!("{stem}.json"));
+            let text = std::fs::read_to_string(path).expect("profile");
+            let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
+            for f in removed {
+                desc.features.remove(f);
+            }
+            let p = Device::new(desc, DevicePolicy::default())
+                .expect("device")
+                .profile()
+                .clone();
+            cases.push((format!("{stem} -{removed:?}"), p));
+        }
+    }
+    let (mut native, mut paired) = (0, 0);
+    for (what, p) in cases {
+        let (plan, m) = checked(&bc, "wide_narrow_store", &p, &LowerInputs::new(), &what);
+        let has = crate::memory::leaf::Units::storage_on(&p);
+        let (counts, pair) = narrow_psb_accesses(&m);
+        let (b, h) = (u32::from(has.u8), u32::from(has.u16));
+        // One byte load and two byte stores; two half loads and two half stores.
+        assert_eq!(
+            counts,
+            [b, 2 * b, 2 * h, 2 * h],
+            "{what}: narrow device-address loads and stores"
+        );
+        // Each of the two stores of a width without the access is the atomic pair.
+        assert_eq!(
+            pair,
+            2 * (1 - b) + 2 * (1 - h),
+            "{what}: the sub-word store's atomics"
+        );
+        if has.u8 && has.u16 {
+            native += 1;
+        }
+        if !has.u8 && !has.u16 {
+            paired += 1;
+        }
+        let pattern: Vec<u8> = (0..384u32).map(|i| (i * 7 + 3) as u8).collect();
+        let mut ptrs = vec![0u8; 16];
+        ptrs[..8].copy_from_slice(&alloc_guest(0).to_le_bytes());
+        let mem = Memory {
+            slots: vec![ptrs, vec![0; 4 * 3 * N as usize]],
+            allocs: vec![pattern.clone()],
+        };
+        let (res, at) = resources(&plan, &mem, N);
+        let mut want = pattern.clone();
+        for t in 0..N as usize {
+            want[t] = t as u8 ^ 0xA5;
+            let h = ((257 * t) as u16 ^ 0xA5A5).to_le_bytes();
+            want[64 + 2 * t..66 + 2 * t].copy_from_slice(&h);
+        }
+        for out in run_orders(&m, &res, &what) {
+            assert_eq!(out[at.alloc(0)], want, "{what}: the allocation");
+            let o = words(&out[at.slot(1)]);
+            for t in 0..N as usize {
+                assert_eq!(o[t], u32::from(pattern[192 + t]), "{what}: byte load {t}");
+                let h = u16::from_le_bytes([pattern[256 + 2 * t], pattern[257 + 2 * t]]);
+                assert_eq!(o[64 + t], u32::from(h), "{what}: half load {t}");
+            }
+            assert!(
+                o[128..192].iter().all(|x| *x == 0),
+                "{what}: contained load"
+            );
+        }
+    }
+    assert!(native > 0 && paired > 0, "both forms ran");
 }
 
 /// Every thread stores `3t` coherently to word `t` of the loaded pointer `b0[0]`'s allocation,
@@ -2023,5 +2191,127 @@ fn a_wide_pointers_bits_through_a_cell_are_its_guest_address() {
                 Ok(_) => panic!("{shape} {stem}: a loaded pointer on Profile F"),
             }
         }
+    }
+}
+
+/// A loop that loads through a pointer read from a buffer, stores through it, and stores to a
+/// static slot each iteration (the store that may alias anything, as far as a driver knows).
+const LOOP_ACCESS: &str = "define void @loop_access(ptr addrspace(1) noundef \"air-buffer-no-alias\" %b0, ptr addrspace(1) noundef \"air-buffer-no-alias\" %b1, i32 %t) {
+entry:
+  %d = load ptr addrspace(1), ptr addrspace(1) %b0, align 8
+  %tz = zext i32 %t to i64
+  %q = getelementptr inbounds i32, ptr addrspace(1) %b1, i64 %tz
+  br label %loop
+
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
+  %acc = phi i32 [ 0, %entry ], [ %acc1, %loop ]
+  %k = mul i64 %i, 64
+  %k2 = add i64 %k, %tz
+  %p = getelementptr inbounds i32, ptr addrspace(1) %d, i64 %k2
+  %v = load i32, ptr addrspace(1) %p, align 4
+  %acc1 = xor i32 %acc, %v
+  store i32 %acc1, ptr addrspace(1) %q, align 4
+  %w = getelementptr inbounds i32, ptr addrspace(1) %p, i64 1
+  store i32 %acc1, ptr addrspace(1) %w, align 4
+  %i1 = add i64 %i, 1
+  %done = icmp eq i64 %i1, 16
+  br i1 %done, label %exit, label %loop
+
+exit:
+  ret void
+}
+
+!air.kernel = !{!0}
+!air.version = !{!90}
+!air.language_version = !{!91}
+!0 = !{ptr @loop_access, !1, !2}
+!1 = !{}
+!2 = !{!10, !11, !12}
+!10 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read_write\", !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 8, !\"air.arg_type_align_size\", i32 8, !\"air.arg_type_name\", !\"ulong\", !\"air.arg_name\", !\"b0\"}
+!11 = !{i32 1, !\"air.buffer\", !\"air.location_index\", i32 1, i32 1, !\"air.read_write\", !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4, !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"b1\"}
+!12 = !{i32 2, !\"air.thread_index_in_threadgroup\", !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"t\"}
+!90 = !{i32 2, i32 8, i32 0}
+!91 = !{!\"Metal\", i32 4, i32 0, i32 0}
+";
+
+/// An access through a wide pointer reads no root entry: the pointer carries its entry's `host`
+/// and `size` from where it was formed (the resident-set search, before the loop), and the sink's
+/// address is read once at entry. So a loop that stores each iteration, which a driver cannot
+/// prove leaves the root table alone, has no `u64` device-address load in its blocks at all
+/// (the old form read `host`, `bind_offset`, `size` and the sink's `host` per access: 8 here).
+#[test]
+fn accesses_through_a_loaded_pointer_read_no_root_entry_in_a_loop() {
+    let Some(bc) = assemble("loop_access", LOOP_ACCESS) else {
+        return;
+    };
+    for (what, p) in profiles() {
+        let (plan, m) = checked(&bc, "loop_access", &p, &LowerInputs::new(), &what);
+        assert_eq!(uses(&plan, "access.dynamic.load"), 1, "{what}");
+        assert_eq!(uses(&plan, "access.dynamic.store"), 1, "{what}");
+        let headers: Vec<(usize, usize)> = m
+            .blocks()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| match b.merge {
+                Some(crate::spirv::ir::Merge::Loop { merge, .. }) => Some((i, merge.index())),
+                _ => None,
+            })
+            .collect();
+        assert!(!headers.is_empty(), "{what}: no loop");
+        let is_entry_load = |ptr| match m.value(ptr).and_then(|d| m.types().get(d.ty)) {
+            Ok(Type::Pointer {
+                class: StorageClass::PhysicalStorageBuffer,
+                pointee,
+            }) => matches!(m.types().get(*pointee), Ok(Type::Int { width: 64, .. })),
+            _ => false,
+        };
+        let is_memory = |ptr| {
+            matches!(
+                m.value(ptr).and_then(|d| m.types().get(d.ty)),
+                Ok(Type::Pointer {
+                    class: StorageClass::PhysicalStorageBuffer | StorageClass::StorageBuffer,
+                    ..
+                })
+            )
+        };
+        let mut kernel_loops = 0;
+        for (header, merge) in headers {
+            // The loop's blocks: those reached from its header short of its merge block.
+            let mut seen = vec![header];
+            let mut work = vec![header];
+            while let Some(b) = work.pop() {
+                let succ: Vec<usize> = match &m.blocks()[b].term {
+                    crate::spirv::ir::Terminator::Branch(t) => vec![t.index()],
+                    crate::spirv::ir::Terminator::CondBranch { t, f, .. } => {
+                        vec![t.index(), f.index()]
+                    }
+                    crate::spirv::ir::Terminator::Switch { default, cases, .. } => {
+                        let mut v = vec![default.index()];
+                        v.extend(cases.iter().map(|(_, c)| c.index()));
+                        v
+                    }
+                    _ => Vec::new(),
+                };
+                for s in succ {
+                    if s != merge && !seen.contains(&s) {
+                        seen.push(s);
+                        work.push(s);
+                    }
+                }
+            }
+            let insts = || seen.iter().flat_map(|&b| &m.blocks()[b].insts);
+            // The kernel's loop, which stores to memory (the resident-set search's own loop over
+            // the table, which stores only its variables, is not one).
+            if !insts().any(|n| matches!(&n.inst, Inst::Store { ptr, .. } if is_memory(*ptr))) {
+                continue;
+            }
+            kernel_loops += 1;
+            let loads = insts()
+                .filter(|n| matches!(&n.inst, Inst::Load { ptr, .. } if is_entry_load(*ptr)))
+                .count();
+            assert_eq!(loads, 0, "{what}: root-entry loads in the loop");
+        }
+        assert_eq!(kernel_loops, 1, "{what}: the kernel's loop");
     }
 }

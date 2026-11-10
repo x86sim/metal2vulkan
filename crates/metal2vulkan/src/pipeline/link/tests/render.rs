@@ -27,51 +27,29 @@ fn link(
     crate::pipeline::link::link(&all, inputs, p)
 }
 
-/// `fragment` with the color writes a render pipeline of `inputs` on `p` compiles it under, an
-/// attachment whose rules it selects (`ChannelWrite::Selected`) recorded as a four-lane output's
-/// (`StageIo::selected_colors`), which rounds an 8-bit unorm or a half-float channel where
-/// `fragment` lists the attachment as rounded and nothing otherwise.
+/// `fragment` with the color writes a render pipeline of `inputs` on `p` compiles it under.
 fn compiled_for(
     fragment: &FunctionArtifact,
     inputs: &LinkInputs,
     p: &DeviceProfile,
 ) -> FunctionArtifact {
-    use crate::pipeline::color_writes::{HALF_CODE, UNORM8_CODE};
-    use crate::pipeline::lower_inputs::ChannelWrite;
     let mut out = fragment.clone();
     if let (LinkInputs::Render(r), Stage::Fragment) = (inputs, fragment.interface.stage) {
-        let io = &mut out.interface.io;
-        io.color_writes = crate::pipeline::color_writes::wanted(
+        out.interface.io.color_writes = crate::pipeline::color_writes::wanted(
             fragment,
             &r.color_attachments,
             (r.alpha_to_coverage, r.texture_write_rounding_mode),
             p,
         );
-        io.selected_colors = io
-            .color_writes
-            .iter()
-            .filter(|(_, rules)| rules.contains(&Some(ChannelWrite::Selected)))
-            .map(|(&a, _)| {
-                let rounds = fragment.interface.io.rounded_colors.contains(&a);
-                let write = crate::pipeline::stage_io::SelectedWrite {
-                    lanes: 4,
-                    rounds: match rounds {
-                        true => 1 << UNORM8_CODE | 1 << HALF_CODE,
-                        false => 0,
-                    },
-                    nans: 0,
-                };
-                (a, write)
-            })
-            .collect();
     }
     out
 }
 
-/// A blend of one and zero, added, of an attachment the fragment function rounds takes no Vulkan
-/// blend, since the function writes what Metal's blend stores, nor the format's blend support
-/// (lavapipe blends no snorm format); another blend keeps the device's, and so does a (one, zero)
-/// blend of an attachment the function does not round.
+/// A blend of one and zero, added, of an attachment whose format converts the fragment function's
+/// output (its color writes name a rule), or that the function rounds, takes no Vulkan blend, since
+/// Metal's blend stores the output as written, nor the format's blend support (lavapipe blends no
+/// snorm format); another blend keeps the device's, and so does a (one, zero) blend of an
+/// attachment whose format converts nothing (`RGBA32Float`) and the function does not round.
 #[test]
 fn a_rounded_one_zero_blend_takes_no_vulkan_blend() {
     use crate::device::requirements::FormatUsage;
@@ -100,7 +78,10 @@ fn a_rounded_one_zero_blend_takes_no_vulkan_blend() {
     };
     assert_eq!(blend_of(&rounding, replace), None);
     assert!(blend_of(&rounding, over).is_some());
-    assert!(blend_of(&fa, replace).is_some());
+    assert_eq!(blend_of(&fa, replace), None);
+    let mut float = ColorAttachmentDescriptor::new(PixelFormat::RGBA32Float);
+    float.blending_enabled = true;
+    assert!(blend_of(&fa, float).is_some());
     let snorm = vk::Format::R8G8B8A8_SNORM;
     assert!(!p.supports_format(snorm, FormatUsage::ColorAttachmentBlend));
     let mut replace_snorm = ColorAttachmentDescriptor::new(PixelFormat::RGBA8Snorm);
@@ -149,13 +130,7 @@ fn a_safe_one_zero_blend_of_a_sixteen_bit_float_attachment_blends() {
             .expect("links")
             .graphics
             .expect("graphics");
-        let (notes, _) = pipeline_writes(
-            &fragment,
-            &g.color_write_rules,
-            &g.color_attachments,
-            g.alpha_to_coverage,
-        )
-        .expect("the rule words");
+        let (notes, _) = pipeline_writes(&fragment, &g.color_attachments, g.alpha_to_coverage);
         let noted = notes.contains(&crate::pipeline::PrecisionNote::HalfOutputPrecision);
         (
             g.color_attachments[0]
@@ -179,18 +154,16 @@ fn a_safe_one_zero_blend_of_a_sixteen_bit_float_attachment_blends() {
 }
 
 /// A fragment function links only under the color writes its pipeline gives the attachments it
-/// writes. On lavapipe and RADV a `float4` output to an `RGBA8Unorm` attachment rounds by the unorm
-/// rule, blended with (one, zero) too; under another blend, and for alpha-to-coverage's alpha, the
-/// channel is the device's; an `RGBA32Float` attachment takes no entry. Where a channel so rounds,
-/// the attachment selects its rules at the draw (`ChannelWrite::Selected`), by the rule word link
-/// gives it: `0x2222` for the four unorm channels, `0x1222` with alpha-to-coverage's alpha,
-/// `0x3333` for an `RGBA16Float` one's half-float channels, so a fragment compiled for one such
-/// attachment links into a pipeline of another; one all of whose channels are the device's selects
-/// nothing. A fragment compiled under the channels' own rules (`color_writes::exact_writes`) links
-/// too, into a pipeline of those rules. A fragment compiled without the map, or for a format whose
-/// rules it does not select (`RGBA16Unorm`), is `NeedsInput(ColorWrites)`. On MoltenVK, which
-/// converts as Metal does, the map names only the half-float channels, blended or not, and selects
-/// nothing.
+/// writes. On lavapipe and RADV a `float4` output to an `RGBA8Unorm` attachment takes the unorm
+/// rule, blended with (one, zero) too (`color_writes::takes_metal_rule`); under another blend, and
+/// for alpha-to-coverage's alpha, the channel is the device's. The map names the unorm rule the
+/// device's all the same, since the lowering stores and notes the two alike, so the four
+/// pipelines give one map and a fragment compiled for one links into the others. An
+/// `RGBA16Float` attachment takes the half-float rule, and an `RGBA32Float` one no entry; an
+/// `RGBA16Unorm` one Metal's 16-bit rule where the profile stores those codes as Metal does, else
+/// the device's. A fragment compiled for one map links into a pipeline of that map alone:
+/// compiled for another, or without the map, it is `NeedsInput(ColorWrites)`. On MoltenVK, which
+/// converts as Metal does, the map names only the half-float channels, blended or not.
 #[test]
 fn color_writes_are_the_pipelines() {
     use crate::error::RuntimeInput;
@@ -206,7 +179,6 @@ fn color_writes_are_the_pipelines() {
         r.alpha_to_coverage = coverage;
         LinkInputs::Render(Box::new(r))
     };
-    let unorm8 = Some(C::Unorm { bits: 8 });
     let plain = render(
         ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm),
         false,
@@ -229,80 +201,80 @@ fn color_writes_are_the_pipelines() {
     );
     for stem in ["lavapipe", "amd-rdna3-radv"] {
         let p = profile(stem);
-        let writes = |inputs: &LinkInputs, exact: bool| match inputs {
+        let writes = |inputs: &LinkInputs| match inputs {
             LinkInputs::Render(r) => {
                 let colors = &r.color_attachments;
                 let rounding = (r.alpha_to_coverage, r.texture_write_rounding_mode);
-                match exact {
-                    true => crate::pipeline::color_writes::exact_writes([0], colors, rounding, &p),
-                    false => crate::pipeline::color_writes::wanted(&fa, colors, rounding, &p),
-                }
+                crate::pipeline::color_writes::wanted(&fa, colors, rounding, &p)
             }
             _ => unreachable!(),
         };
         let device = Some(C::Device);
         let half = Some(crate::pipeline::color_writes::HALF);
-        let selected = Some([Some(C::Selected); 4]);
         let coverage = render(
             ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm),
             true,
         );
-        for (inputs, exact, want, word) in [
-            (&plain, Some([unorm8; 4]), selected, Some(0x2222)),
-            (
-                &render(replace, false),
-                Some([unorm8; 4]),
-                selected,
-                Some(0x2222),
+        let replaced = render(replace, false);
+        let blended = render(blend, false);
+        let takes = |inputs: &LinkInputs| match inputs {
+            LinkInputs::Render(r) => crate::pipeline::color_writes::takes_metal_rule(
+                0,
+                &r.color_attachments,
+                (r.alpha_to_coverage, r.texture_write_rounding_mode),
+                &p,
             ),
-            (&render(blend, false), Some([device; 4]), None, None),
-            (
-                &coverage,
-                Some([unorm8, unorm8, unorm8, device]),
-                selected,
-                Some(0x1222),
-            ),
-            (&half_float, Some([half; 4]), selected, Some(0x3333)),
-            (&float, None, None, None),
+            _ => unreachable!(),
+        };
+        for (inputs, want, metal) in [
+            (&plain, Some([device; 4]), true),
+            (&replaced, Some([device; 4]), true),
+            (&blended, Some([device; 4]), false),
+            (&coverage, Some([device; 4]), true),
+            (&half_float, Some([half; 4]), true),
+            (&float, None, false),
         ] {
-            assert_eq!(writes(inputs, true).get(&0).copied(), exact, "{stem}");
-            let want = want.or(exact);
-            assert_eq!(writes(inputs, false).get(&0).copied(), want, "{stem}");
-            let l = link(&[&va, &fa], inputs, &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
-            let words = &l.graphics.as_ref().expect("graphics").color_write_rules;
-            assert_eq!(
-                words.clone(),
-                Vec::from_iter(word.map(|w| (0, w))),
-                "{stem}"
-            );
+            assert_eq!(writes(inputs).get(&0).copied(), want, "{stem}");
+            assert_eq!(takes(inputs), metal, "{stem}");
+            link(&[&va, &fa], inputs, &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
         }
-        // Compiled for one attachment whose rules it selects, linked into another's pipeline.
+        let needs = Err(Error::NeedsInput(RuntimeInput::ColorWrites));
+        // Compiled for one attachment's map, linked into the pipelines of that map and of
+        // another's.
         let for_plain = compiled_for(&fa, &plain, &p);
-        for inputs in [&half_float, &coverage] {
+        for inputs in [&plain, &replaced, &blended, &coverage] {
             crate::pipeline::link::link(&[&va, &for_plain], inputs, &p)
                 .unwrap_or_else(|e| panic!("{stem}: {e}"));
         }
-        // Compiled under the channels' own rules, it links into the pipeline of those rules alone.
-        let mut own = fa.clone();
-        own.interface.io.color_writes = writes(&plain, true);
-        crate::pipeline::link::link(&[&va, &own], &plain, &p)
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
         assert_eq!(
-            crate::pipeline::link::link(&[&va, &own], &half_float, &p).map(|_| ()),
-            Err(Error::NeedsInput(RuntimeInput::ColorWrites)),
+            crate::pipeline::link::link(&[&va, &for_plain], &half_float, &p).map(|_| ()),
+            needs,
             "{stem}"
         );
-        let needs = Err(Error::NeedsInput(RuntimeInput::ColorWrites));
         // Compiled without the map, and for another format.
         assert_eq!(
             crate::pipeline::link::link(&[&va, &fa], &plain, &p).map(|_| ()),
             needs,
             "{stem}"
         );
+        let norm16 =
+            p.takes_driver_deviation(crate::error::DriverDeviation::MetalNorm16ColorWrites);
+        let wide_rule = match norm16 {
+            true => Some(C::Unorm { bits: 16 }),
+            false => device,
+        };
+        assert_eq!(
+            writes(&wide).get(&0).copied(),
+            Some([wide_rule; 4]),
+            "{stem}"
+        );
         let for_wide = compiled_for(&fa, &wide, &p);
         assert_eq!(
             crate::pipeline::link::link(&[&va, &for_wide], &plain, &p).map(|_| ()),
-            needs,
+            match norm16 {
+                true => needs.clone(),
+                false => Ok(()),
+            },
             "{stem}"
         );
         assert_eq!(
@@ -416,7 +388,7 @@ fn half_colors_round_to_nearest_even_under_mode_two() {
             _ => unreachable!(),
         };
         // The default mode's own rule of the alpha the coverage reads: the output as written.
-        let unstored = crate::pipeline::color_writes::exact_writes(
+        let unstored = crate::pipeline::color_writes::color_writes(
             [0],
             &[Some(rgb)],
             (true, Mode::TowardZero),
@@ -442,13 +414,7 @@ fn half_colors_round_to_nearest_even_under_mode_two() {
                 .graphics
                 .expect("graphics");
             assert_eq!(g.alpha_to_coverage, coverage, "{stem} {c:?}");
-            let (notes, _) = pipeline_writes(
-                &fragment,
-                &g.color_write_rules,
-                &g.color_attachments,
-                g.alpha_to_coverage,
-            )
-            .expect("the rule words");
+            let (notes, _) = pipeline_writes(&fragment, &g.color_attachments, g.alpha_to_coverage);
             assert_eq!(
                 notes.contains(&PrecisionNote::CoverageReadsRoundedAlpha),
                 coverage && want[3] == nearest,
@@ -509,9 +475,7 @@ fn vertex_stage(p: &DeviceProfile, d: &VertexDescriptor, attrs: &[u32]) -> Stage
     let f4 = io_ty(IoNumeric::Float, 4);
     for (a, f) in &proj.attributes {
         match f {
-            VertexFetch::FixedFunction { narrow_float } => {
-                vs.io.inputs.push(super::attr_of(*a, f4, *narrow_float))
-            }
+            VertexFetch::FixedFunction => vs.io.inputs.push(attr(*a, f4)),
             _ => vs.io.pulled.push(PulledInput::new(*a, f4, *f)),
         }
     }
@@ -624,22 +588,12 @@ fn limits_pull_attributes_and_a_foreign_projection_is_refused() {
     p.edit(|x| x.limits.max_vertex_input_attributes = 2);
     let proj = vertex::vertex_fetch_projection(Some(&d), &used, &p).expect("projection");
     assert!(matches!(proj.attributes[&4], VertexFetch::Pulled { .. }));
-    assert!(matches!(
-        proj.attributes[&1],
-        VertexFetch::FixedFunction {
-            narrow_float: false
-        }
-    ));
+    assert!(matches!(proj.attributes[&1], VertexFetch::FixedFunction));
     let mut p = profile("moltenvk-m3");
     p.edit(|x| x.limits.max_vertex_input_bindings = 1);
     let proj = vertex::vertex_fetch_projection(Some(&d), &used, &p).expect("projection");
     assert!(matches!(proj.attributes[&4], VertexFetch::Pulled { .. }));
-    assert!(matches!(
-        proj.attributes[&0],
-        VertexFetch::FixedFunction {
-            narrow_float: false
-        }
-    ));
+    assert!(matches!(proj.attributes[&0], VertexFetch::FixedFunction));
     // Linking the pulled attribute lists it as pulled with its layout's step.
     let vs = vertex_stage(&p, &d, &[0, 4]);
     let va = artifact(vs, None);
@@ -686,12 +640,7 @@ fn a_constant_step_links_to_a_zero_divisor_binding_of_zero_stride() {
     d.layouts.get_mut(&3).expect("layout 3").step_function = VertexStepFunction::Constant;
     let proj =
         vertex::vertex_fetch_projection(Some(&d), &floats(&[0, 1, 4]), &p).expect("projection");
-    assert_eq!(
-        proj.attributes[&4],
-        VertexFetch::FixedFunction {
-            narrow_float: false
-        }
-    );
+    assert_eq!(proj.attributes[&4], VertexFetch::FixedFunction);
     let vs = vertex_stage(&p, &d, &[0, 1, 4]);
     let va = artifact(vs, None);
     let l = link(&[&va], &render_with(d), &p).expect("link");
@@ -768,13 +717,9 @@ fn the_format_class_must_match_the_declared_type() {
         let got = vertex::vertex_fetch_projection(Some(&d), &BTreeMap::from([(i, numeric)]), &p);
         match (want, got) {
             (Want::Fixed, Ok(proj)) => {
-                // `Half2` is the one narrow-float format of the list, whose widening a `float`
-                // attribute canonicalizes.
                 assert_eq!(
                     proj.attributes[&i],
-                    VertexFetch::FixedFunction {
-                        narrow_float: format == VertexFormat::Half2
-                    },
+                    VertexFetch::FixedFunction,
                     "{format:?}"
                 )
             }
@@ -846,20 +791,8 @@ fn unaligned_attributes_are_pulled() {
         }
         let proj = vertex::vertex_fetch_projection(Some(&d), &BTreeMap::from([(0, numeric)]), &p)
             .expect("projection");
-        // A `half` format and `FloatRG11B10` carry the narrow-float bit, whose widening the
-        // function canonicalizes; the others do not.
-        let fixed = VertexFetch::FixedFunction {
-            narrow_float: matches!(
-                format,
-                VertexFormat::Half
-                    | VertexFormat::Half2
-                    | VertexFormat::Half3
-                    | VertexFormat::Half4
-                    | VertexFormat::FloatRG11B10
-            ),
-        };
         assert_eq!(
-            proj.attributes[&0] == fixed,
+            proj.attributes[&0] == VertexFetch::FixedFunction,
             aligned && base,
             "{format:?} at {offset} stride {stride:?}: {:?}",
             proj.attributes[&0]
@@ -886,9 +819,7 @@ fn portability_stride_alignment_pulls_static_strides() {
             .expect("projection")
             .attributes[&0]
     };
-    let fixed = VertexFetch::FixedFunction {
-        narrow_float: false,
-    };
+    let fixed = VertexFetch::FixedFunction;
     let mvk = profile("moltenvk-m3");
     assert_eq!(
         mvk.fields()
@@ -929,9 +860,7 @@ fn the_portability_subset_can_pull_attributes_past_their_stride() {
             .expect("projection")
             .attributes[&0]
     };
-    let fixed = VertexFetch::FixedFunction {
-        narrow_float: false,
-    };
+    let fixed = VertexFetch::FixedFunction;
     let beyond = VkFeature::VertexAttributeAccessBeyondStride;
     let mvk = profile("moltenvk-m3");
     assert!(mvk.fields().enabled.features.contains(&beyond));
@@ -1094,7 +1023,7 @@ fn static_strides_under_dynamic_strides_cover_their_attributes() {
     let fixed = |proj: &crate::pipeline::lower_inputs::VertexFetchProjection| {
         proj.attributes
             .iter()
-            .filter(|(_, f)| matches!(f, VertexFetch::FixedFunction { .. }))
+            .filter(|(_, f)| matches!(f, VertexFetch::FixedFunction))
             .map(|(a, _)| *a)
             .collect::<Vec<u32>>()
     };
@@ -2593,12 +2522,12 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
     // A device whose `InterpolateAtOffset` reads from the center: a driver other than
     // MoltenVK's.
     let centered_mvk = mvk_as(&|d| d.driver_id = None);
-    // MoltenVK 1.4.0, whose `InterpolateAtOffset` reads off the center and which is not measured to
-    // read center varyings at the pixel center itself: it refuses a per-sample function's center
-    // varying naming the property it lacks; every other case links or is refused as on the same
-    // device without the deviation.
-    let unmeasured_mvk =
-        mvk_as(&|d| d.driver_version = crate::device::driver_facts::moltenvk(1, 4, 0));
+    // MoltenVK on the Apple8 family under macOS 27 (`deviceID` 0x1B00_0208), whose
+    // `InterpolateAtOffset` reads off the center and which is not measured to read center
+    // varyings at the pixel center itself: it refuses a per-sample function's center varying
+    // naming the property it lacks; every other case links or is refused as on the same device
+    // without the deviation.
+    let unmeasured_mvk = mvk_as(&|d| d.device_id = 0x1B00_0208);
     let needs_centered = Error::Unsupported(Unsupported::needs(
         Feature::SampleRateShading,
         Capability::Property(VkProperty::InterpolateAtOffsetCentered),
@@ -2611,7 +2540,7 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
         .contains(&VkProperty::MetalCenterVaryings));
     for (stem, p, biased) in [
         ("moltenvk-m3", committed, false),
-        ("moltenvk-m3 at 1.4.0", unmeasured_mvk, true),
+        ("moltenvk-m3 as Apple8", unmeasured_mvk, true),
         ("moltenvk-m3 centered", centered_mvk, false),
         ("lavapipe", profile("lavapipe"), false),
     ] {

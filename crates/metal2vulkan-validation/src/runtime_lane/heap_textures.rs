@@ -29,7 +29,7 @@
 
 use super::degrade_notices::counts;
 use super::heap_layouts::HEAP_LAYOUTS;
-use super::heap_metal_sizes::stacked_nil_alignment;
+use super::heap_metal_sizes::STACKED_NIL_ALIGNMENT;
 use super::host_memory::{gpu_fill, gpu_read, on_device, run};
 use super::presenting::Adopted;
 use super::textures::{no_texture_alone, pattern, texel_bytes};
@@ -1281,8 +1281,8 @@ fn tiling_refusal(error: &Error) -> Option<LinearNeed> {
 /// of transfers alone, `device/staging.rs` in the runtime). No colour texture is refused
 /// `NotImplemented(HeapTextureMemory)`: one whose image needs extended usage, such as a written
 /// sRGB texture, is checked format by format. `Unspecialized` takes Metal's answers: 0 bytes from
-/// the query, at 128 for a 2D texture and the device's level's alignment for a cube, a 3D texture
-/// or an array (`stacked_nil_alignment`), and no texture from the call
+/// the query, at 128 for a 2D texture, a cube, a 3D texture or an array (`STACKED_NIL_ALIGNMENT`),
+/// and no texture from the call
 /// (`TextureProblem::Unspecialized`, Metal's nil; an M4 under macOS 27.0.1, every
 /// usage). A format Metal makes no texture of from a descriptor alone, such as a two-plane YCbCr
 /// one, takes Metal's answers too: 0 bytes from the query, at 16 for a two-plane YCbCr 2D texture
@@ -1297,7 +1297,10 @@ fn tiling_refusal(error: &Error) -> Option<LinearNeed> {
 /// the footprint **and** makes the texture, so the refusal is this crate's open gap and the
 /// `HEAPTEX shared no image` lines name every format and descriptor it covers. Every such format
 /// answers in all four swept usages, counted from that table, so one that stops answering fails
-/// rather than passing as a query and a call that both refuse.
+/// rather than passing as a query and a call that both refuse. An ASTC texture on a device that
+/// holds it in a carrier with a decoded twin (lavapipe) answers Metal's model of its blocks and is
+/// refused its making, `NotImplemented(DecodedHeapTexture)`: the twin would decode what the heap's
+/// bytes held. `HEAPTEX shared decoded` lines name each.
 #[test]
 fn shared_heap_textures_are_made_or_refused_for_linear_tiling() {
     on_device(|device| {
@@ -1326,6 +1329,7 @@ fn shared_heap_textures_are_made_or_refused_for_linear_tiling() {
         let mut changed_again = Vec::new();
         let mut gaps = Vec::new();
         let mut no_image = Vec::new();
+        let mut decoded = Vec::new();
         let mut check = |what: String, mut descriptor: TextureDescriptor| {
             descriptor.resource_options = options;
             let query = device.heap_texture_size_and_align(&descriptor);
@@ -1368,7 +1372,7 @@ fn shared_heap_textures_are_made_or_refused_for_linear_tiling() {
                     let align = match descriptor.texture_type {
                         TextureType::Type1D | TextureType::Type2D => 128,
                         TextureType::TextureBuffer => 16,
-                        _ => stacked_nil_alignment(device),
+                        _ => STACKED_NIL_ALIGNMENT,
                     };
                     assert_eq!(
                         (answer.size, answer.align, descriptor.pixel_format),
@@ -1426,6 +1430,19 @@ fn shared_heap_textures_are_made_or_refused_for_linear_tiling() {
                     }
                     no_image.push(format!("{what}: {answer:?}"));
                 }
+                // An ASTC texture on a device that holds it in a carrier with a decoded twin, which
+                // would decode what the heap's bytes held: the query answers Metal's model of its
+                // blocks and the making is refused, the runtime's gap.
+                (Ok(answer), Err(Error::NotImplemented(RuntimeGap::DecodedHeapTexture))) => {
+                    let pf = descriptor.pixel_format;
+                    assert!(
+                        !super::astc_textures::decodes_astc(device, pf),
+                        "{what}: refused as a decoded heap texture on a device that decodes it"
+                    );
+                    let metal = device.metal_heap_texture_size_and_align(&descriptor);
+                    assert_eq!(metal, Ok(Some(answer)), "{what}: Metal's model");
+                    decoded.push(format!("{what}: {answer:?}"));
+                }
                 (Ok(answer), Err(error)) => panic!("{what}: answered {answer:?}, made {error:?}"),
                 (Err(error), Ok(_)) => panic!("{what}: refused {error:?} by the query alone"),
                 (Err(query), Err(call)) => {
@@ -1478,6 +1495,9 @@ fn shared_heap_textures_are_made_or_refused_for_linear_tiling() {
         for line in &no_image {
             eprintln!("HEAPTEX shared no image {line}");
         }
+        for line in &decoded {
+            eprintln!("HEAPTEX shared decoded {line}");
+        }
         eprintln!(
             "HEAPTEX shared on {}: {made} made ({round_trips} round trips, {} second reads \
              differ, {} staging queue submissions), {} refused for linear tiling, {} answered a \
@@ -1501,13 +1521,14 @@ fn shared_heap_textures_are_made_or_refused_for_linear_tiling() {
             gaps.is_empty(),
             "colour textures refused as gaps: {gaps:#?}"
         );
-        // Every format whose footprint its own structure decides, Metal's `NoTexture` shape
-        // aside, answered that footprint in all four swept usages. The count comes from the
-        // product's own table rather than a number here, so a footprint that stops answering
-        // fails this instead of passing quietly as a query and a call that both refuse.
+        // Every format whose footprint its own structure decides answered that footprint in all
+        // four swept usages, the packed 10-bit pair's `NoTexture` 0 bytes at 16 among them (the
+        // arm above). The count comes from the product's own table rather than a number here, so
+        // a footprint that stops answering fails this instead of passing quietly as a query and a
+        // call that both refuse.
         let answering = PixelFormat::ALL
             .iter()
-            .filter(|&&pf| footprint(pf).is_some_and(|shape| shape != Footprint::NoTexture))
+            .filter(|&&pf| footprint(pf).is_some())
             .count();
         assert_eq!(
             no_image.len(),
@@ -1746,12 +1767,11 @@ fn a_heap_texture_buffer_is_the_heap_s_bytes() {
 
 /// Two `Depth32Float` textures a shader reads, side by side in a placement heap, keep their texels
 /// (a Metal heap probe, an M3 Max and an M4 alike: each read back as uploaded, then a buffer filled
-/// over the first one's answered bytes changed every texel of it and none of the second's). Where
-/// the device holds such a texture with a depth twin (RADV, ANV and unmeasured drivers) the
-/// answered size takes the twin's bytes too, so the second texture, uploaded before the first,
-/// keeps its texels when the first's upload writes its twin; the comparisons of both compare as a
-/// texture's outside a heap does; in a `Shared` and a `Private` heap. `HEAPTEX depth` lines print
-/// the answer and the device's twin notices.
+/// over the first one's answered bytes changed every texel of it and none of the second's). Each
+/// reads back what a texture outside a heap of the same upload reads (the device's depth image may
+/// store a value outside `[0, 1]` clamped or a denormal as zero, announced), and the comparisons
+/// of both compare as a texture's outside a heap does; in a `Shared` and a `Private` heap.
+/// `HEAPTEX depth` lines print the answer and the device's notices.
 ///
 /// Where the device's driver lays depth and stencil images apart from their memory
 /// (`DriverFact::DepthStencilImagesLieApart`: MoltenVK, which makes such an image's Metal texture
@@ -1763,7 +1783,7 @@ fn a_heap_texture_buffer_is_the_heap_s_bytes() {
 /// shadow of the heap's bytes too: the fill changes every texel of the first, announced
 /// `shadowed-texture` once. Elsewhere neither is announced.
 #[test]
-fn heap_depth_textures_keep_their_bytes_with_their_twins() {
+fn heap_depth_textures_keep_their_bytes() {
     use super::depth_compares::{pipeline, run as compare, SIDE, VALUES};
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
@@ -1797,9 +1817,11 @@ fn heap_depth_textures_keep_their_bytes_with_their_twins() {
             descriptor.resource_options = ResourceOptions::private();
             let texture = device.new_texture(&descriptor).unwrap();
             upload(&queue, &[(&texture, bytes)], side);
-            compare(device, (&texture, None), &state, &jobs, 1)
+            let compares = compare(device, (&texture, None), &state, &jobs, 1);
+            (texels(&queue, &texture, side), compares)
         };
-        let (first_compares, second_compares) = (plain(&first), plain(&second));
+        let ((first_kept, first_compares), (second_kept, second_compares)) =
+            (plain(&first), plain(&second));
         for storage in [StorageMode::Shared, StorageMode::Private] {
             let options = tracked(storage);
             let mut descriptor =
@@ -1821,10 +1843,10 @@ fn heap_depth_textures_keep_their_bytes_with_their_twins() {
             let a = placement.new_texture_at_offset(&descriptor, 0).unwrap();
             let b = placement.new_texture_at_offset(&descriptor, next).unwrap();
             made = true;
-            // The second first: the first's upload writes its twin, if it has one, after.
+            // The second first: the first's upload lands after it.
             upload(&queue, &[(&b, &second), (&a, &first)], side);
-            assert_eq!(texels(&queue, &a, side), first, "{what}: the first");
-            assert_eq!(texels(&queue, &b, side), second, "{what}: the second");
+            assert_eq!(texels(&queue, &a, side), first_kept, "{what}: the first");
+            assert_eq!(texels(&queue, &b, side), second_kept, "{what}: the second");
             let compared = compare(device, (&a, None), &state, &jobs, 1);
             assert_eq!(bits(&compared), bits(&first_compares), "{what}: the first");
             let compared = compare(device, (&b, None), &state, &jobs, 1);
@@ -1836,7 +1858,11 @@ fn heap_depth_textures_keep_their_bytes_with_their_twins() {
             // A buffer over the first's bytes, filled: the second keeps its texels.
             let over = placement.new_buffer_at_offset(size, options, 0).unwrap();
             gpu_fill(&queue, &over, 0..size, 0x3e);
-            assert_eq!(texels(&queue, &b, side), second, "{what}: after the fill");
+            assert_eq!(
+                texels(&queue, &b, side),
+                second_kept,
+                "{what}: after the fill"
+            );
             let compared = compare(device, (&b, None), &state, &jobs, 1);
             assert_eq!(
                 bits(&compared),
@@ -1847,7 +1873,7 @@ fn heap_depth_textures_keep_their_bytes_with_their_twins() {
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .zip(first.as_chunks::<4>().0.iter())
+                .zip(first_kept.as_chunks::<4>().0.iter())
                 .filter(|(after, before)| after != before)
                 .count();
             eprintln!(
@@ -1873,13 +1899,9 @@ fn heap_depth_textures_keep_their_bytes_with_their_twins() {
     };
     let notices = counts(&messages.take_notices());
     let count = |kind| notices.get(&kind).copied().unwrap_or(0);
-    let twins = count(Degradation::DepthTwin);
     let aparts = count(APART[0]);
     let shadowed = count(Degradation::ShadowedTexture);
-    eprintln!(
-        "HEAPTEX depth: {twins} depth-twin notices, {aparts} heap-depth-stencil-apart, \
-         {shadowed} shadowed-texture"
-    );
+    eprintln!("HEAPTEX depth: {aparts} heap-depth-stencil-apart, {shadowed} shadowed-texture");
     assert_eq!(aparts, 0);
     // A shadow of a `Shared` heap's bytes where its memory takes no optimal depth image: every
     // texel the fill covered changed, as in a shadow where the driver lays the image apart.

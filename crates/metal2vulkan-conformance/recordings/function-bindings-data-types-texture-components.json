@@ -2313,7 +2313,7 @@
         "stage_entries_specialized": 1
       },
       "composed": {
-        "device_memory_allocated": 201328512
+        "device_memory_allocated": 201328256
       },
       "ceilings": {
         "pooled_memory_blocks_made": 3

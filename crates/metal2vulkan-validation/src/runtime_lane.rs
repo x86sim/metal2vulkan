@@ -42,7 +42,7 @@ use metal2vulkan::pipeline::LinkedFunctions;
 use metal2vulkan_devtools::{llvm_assemble, AssembleError};
 use metal2vulkan_runtime::{
     CommandBufferStatus, ComputePipelineState, DebugMessage, Degradation, Device, DeviceOptions,
-    Execution, Function, LayerSetting, LayerSettingValue, MetalLevel, PipelineOptions,
+    Execution, Function, LayerSetting, LayerSettingValue, PipelineOptions,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -56,8 +56,9 @@ pub const METAL_ENVIRONMENT: &str = "apple-m3-max-macos27.0.1";
 const WAIT: Duration = Duration::from_secs(60);
 
 /// `device`'s work counts once its pipeline pool holds no piece (`WorkCounts::pipeline_pool_busy`),
-/// waiting at most [`WAIT`]: a draw that took its key's residual form does not wait for its own
-/// key's making, which may outlast the draw's command buffer.
+/// waiting at most [`WAIT`]: a draw that took its key's general form does not wait for its own
+/// key's making, which may outlast the draw's command buffer, and a state's creation hands its
+/// predicted key's making to the pool after its general form's, not waiting for it.
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 fn pipelines_settled(device: &Device) -> metal2vulkan_runtime::WorkCounts {
     let until = std::time::Instant::now() + WAIT;
@@ -235,6 +236,8 @@ mod absent_reads;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod address_maps;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod alpha_coverage;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod alpha_in_red;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod alpha_tests;
@@ -279,10 +282,6 @@ mod cache;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod capabilities;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod capture_costs;
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod capture_reach;
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod chosen_pointers;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod chroma_pairs;
@@ -301,7 +300,7 @@ mod command_queues;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod command_render_states;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod commands_replayed;
+mod commands_recorded;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod commit_costs;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -361,6 +360,8 @@ mod detach_textures;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod device_commands;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod device_copies;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod device_lockstep;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod discard_counts;
@@ -402,8 +403,6 @@ mod executions;
 mod exits;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod extended_range_bicubic;
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod extended_range_blend_table;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod extended_range_blends;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -514,6 +513,8 @@ mod host_copied_textures;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod host_memory;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod in_place_textures;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod index_fetches;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod index_pools;
@@ -539,6 +540,8 @@ mod int_attributes;
 mod interlocked_draw_order;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod keep_alives;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod kept_apart;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod kept_buffer_bytes;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -572,6 +575,8 @@ mod math_routines;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod memoryless;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod memoryless_uses;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod mesh_barriers;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod mesh_commands;
@@ -580,9 +585,9 @@ mod mesh_draws;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod mip_levels;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod mipmap_costs;
+mod mipmap_chains;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod mipmaps_exact;
+mod mipmap_costs;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod mirror_clamp;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -603,6 +608,8 @@ mod no_copy_heaps;
 mod no_copy_textures;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod norm_storage_writes;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod normalized_vertex_fetch;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod numbered_samplers;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -738,8 +745,6 @@ mod separate_samples;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod seq_cst_fences;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod settled_sums;
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod shader_stencil;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod shared_exponent_storage;
@@ -751,6 +756,8 @@ mod snapshot_reads;
 mod snorm_tile_store;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod sparse_textures;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod srgb_decode;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod srgb_storage;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -768,8 +775,6 @@ mod submit_costs;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
 mod submit_per_import;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod sum_regroup;
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod surface_aliases;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod surface_fills;
@@ -778,7 +783,7 @@ mod surface_texture_costs;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod swizzled_storage;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod sync_coverage;
+pub(crate) mod sync_coverage;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod teardown_holders;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -811,8 +816,6 @@ mod tile_memory;
 mod tile_normalized;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod tile_path_costs;
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod tile_reach_kernel;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod tile_shadows;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -858,6 +861,10 @@ mod word_samples;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod wrapped_buffers;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod ycbcr_device_reads;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+mod ycbcr_in_place;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod ycbcr_minify;
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 mod ycbcr_passes;
@@ -894,20 +901,19 @@ pub fn validated_device_with(
     let made = messages.take_notices();
     messages.restore_notices(pending);
     messages.device_made(&made);
-    let (device, level_named) = device?;
-    creation_checked(&device, level_named, &made)?;
+    let device = device?;
+    creation_checked(&device, &made)?;
     Ok(device)
 }
 
-/// The device [`validated_device_with`] makes, and whether its options name a Metal level; the
-/// notices it announced as it was made are left in its sink, `messages` or the one `adjust` set,
-/// for [`creation_checked`].
+/// The device [`validated_device_with`] makes; the notices it announced as it was made are left in
+/// its sink, `messages` or the one `adjust` set, for [`creation_checked`].
 pub(crate) fn made_lane_device(
     device_type: DeviceType,
     messages: &Messages,
     cache: &Path,
     adjust: impl FnOnce(&mut DeviceOptions),
-) -> Result<(Device, bool), String> {
+) -> Result<Device, String> {
     fatal_signals::install();
     let mut options = validated_options(messages, cache);
     adjust(&mut options);
@@ -915,29 +921,23 @@ pub(crate) fn made_lane_device(
     // The layers the device finally asks for, after `adjust`: what a layer-dependent claim of this
     // list holds is what the instance enables of them (`layer_reported_nothing`).
     messages.device_asked_layers(&options.layers);
-    let level_named = options.metal_level.is_some();
-    let device = open_device(device_type, options).map_err(|error| {
+    open_device(device_type, options).map_err(|error| {
         format!(
             "the runtime made no {} device: {error}",
             device_type.as_str()
         )
-    })?;
-    Ok((device, level_named))
+    })
 }
 
 /// Whether `made`, the messages `device`'s making delivered, are exactly its [`creation_kinds`],
 /// one notice each; else what it announced.
-pub(crate) fn creation_checked(
-    device: &Device,
-    level_named: bool,
-    made: &[DebugMessage],
-) -> Result<(), String> {
+pub(crate) fn creation_checked(device: &Device, made: &[DebugMessage]) -> Result<(), String> {
     let announced: BTreeSet<Degradation> = made
         .iter()
         .filter_map(|message| message.degradation.as_ref())
         .map(|notice| notice.degradation)
         .collect();
-    let expected = creation_kinds(device, level_named);
+    let expected = creation_kinds(device);
     match announced == expected && made.len() == expected.len() {
         true => Ok(()),
         false => Err(format!(
@@ -957,10 +957,7 @@ const METAL_CACHE_KEPT: &str = "metal2vulkan-driver-pipeline-cache-kept";
 /// [`creation_checked`] of `heard`, every message `device`'s making delivered to a sink that hears
 /// every message (not the lane's, which keeps notices and failures alone): its notices exactly
 /// its [`creation_kinds`], one each, and its other messages exactly the informational ones the
-/// device sends as it is made, each once and in this order: `metal2vulkan-unmeasured-driver`
-/// exactly where its identity is not measured, as the runtime reads it
-/// (`unmeasured_driver_message`, the fact the device's own message reads); then [`LAYERS_DROPPED`]
-/// where the loader could not provide the instance layers the device asked for, which the device
+/// device sends as it is made, each once and in this order: [`LAYERS_DROPPED`] where the loader could not provide the instance layers the device asked for, which the device
 /// alone can say (the instance's answer, not the loader's listing: a layer the loader lists and
 /// cannot load answers the same); then [`METAL_CACHE_KEPT`] exactly where its driver keeps its
 /// internal pipeline cache and that cache is Metal's own ([`metal_cache_kept`], read from the
@@ -973,7 +970,6 @@ const METAL_CACHE_KEPT: &str = "metal2vulkan-driver-pipeline-cache-kept";
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 pub(crate) fn creation_heard_checked(
     device: &Device,
-    level_named: bool,
     heard: &[DebugMessage],
     messages: &Messages,
 ) -> Result<(), String> {
@@ -981,11 +977,10 @@ pub(crate) fn creation_heard_checked(
         .iter()
         .cloned()
         .partition(|message| message.degradation.is_some());
-    creation_checked(device, level_named, &notices)?;
+    creation_checked(device, &notices)?;
     for message in &informed {
         messages.heard_informational(&message.id_name, &message.text);
     }
-    let unmeasured = metal2vulkan_runtime::unmeasured_driver_message(device.properties());
     let dropped = messages.layers_dropped_message();
     let cache_kept = metal_cache_kept(device);
     let mut expected: Vec<String> = Vec::new();
@@ -999,18 +994,6 @@ pub(crate) fn creation_heard_checked(
             }
             expected.push(first.text.clone());
             rest = after;
-        }
-    }
-    if let Some(message) = &unmeasured {
-        expected.push(message.text.clone());
-        match rest.split_first() {
-            Some((first, after))
-                if (first.severity, &first.id_name, &first.text)
-                    == (message.severity, &message.id_name, &message.text) =>
-            {
-                rest = after;
-            }
-            _ => rest = &[],
         }
     }
     if let Some(text) = &dropped {
@@ -1059,7 +1042,8 @@ pub(crate) fn creation_heard_checked(
 }
 
 /// A macOS release as `[major, minor, patch]` (`26.7` is `[26, 7, 0]`), if it reads.
-pub(crate) fn macos_release(text: &str) -> Option<[u32; 3]> {
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+fn macos_release(text: &str) -> Option<[u32; 3]> {
     let mut parts = text.trim().split('.').map(str::parse::<u32>);
     let major = parts.next()?.ok()?;
     let minor = parts.next().unwrap_or(Ok(0)).ok()?;
@@ -1068,6 +1052,7 @@ pub(crate) fn macos_release(text: &str) -> Option<[u32; 3]> {
 }
 
 /// The macOS release this host runs (`sw_vers -productVersion`); `None` off macOS.
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 pub(crate) fn host_release() -> Option<[u32; 3]> {
     if !cfg!(target_os = "macos") {
         return None;
@@ -1158,20 +1143,18 @@ fn driver_keeps_pipeline_cache(device: &Device) -> bool {
 pub(crate) const MOLTENVK_ARGUMENT_BUFFERS_READ: [u32; 2] = [10401, 10402];
 
 /// The kinds a device the lane makes announces as it is made, each from what the lane reads of
-/// the device and its host apart from the runtime, and nothing else: `metal-level-not-macos` off
-/// macOS and `metal-level-below-host` on a macOS release that is no measured level, where the
-/// options name no Metal level; `driver-pipeline-cache-kept` where the driver lets no device turn
-/// its internal pipeline cache off and that cache is not Metal's own (MoltenVK's);
+/// the device apart from the runtime, and nothing else: `driver-pipeline-cache-kept` where the
+/// driver lets no device turn its internal pipeline cache off and that cache is not Metal's own
+/// (MoltenVK's);
 /// `moltenvk-argument-buffers-unread` on a MoltenVK whose argument-buffer state the runtime does
-/// not read; and `float-tininess-after-rounding` where the device's policy takes native device
-/// maths and its profile's float functions are not Metal's own (MoltenVK's).
-pub fn creation_kinds(device: &Device, level_named: bool) -> BTreeSet<Degradation> {
+/// not read; and `float-tininess-after-rounding` where its profile's float functions are not
+/// Metal's own (MoltenVK's).
+pub fn creation_kinds(device: &Device) -> BTreeSet<Degradation> {
     let mut kinds = BTreeSet::new();
     let compile = device.compile_device();
-    if compile.policy().float_maths == metal2vulkan::device::FloatMathsPolicy::Native
-        && !compile
-            .profile()
-            .takes_driver_deviation(metal2vulkan::error::DriverDeviation::MetalFloatFunctions)
+    if !compile
+        .profile()
+        .takes_driver_deviation(metal2vulkan::error::DriverDeviation::MetalFloatFunctions)
     {
         kinds.insert(Degradation::FloatTininessAfterRounding);
     }
@@ -1187,21 +1170,6 @@ pub fn creation_kinds(device: &Device, level_named: bool) -> BTreeSet<Degradatio
                 && uab == limits.max_per_stage_descriptor_sampled_images));
     if description.driver_id == Some(metal2vulkan::vk::DriverId::MOLTENVK) && !read {
         kinds.insert(Degradation::MoltenVkArgumentBuffersUnread);
-    }
-    if !level_named {
-        match host_release() {
-            None => {
-                kinds.insert(Degradation::MetalLevelNotMacOS);
-            }
-            Some(version) => {
-                let measured = MetalLevel::ALL
-                    .into_iter()
-                    .any(|level| macos_release(level.macos()) == Some(version));
-                if !measured {
-                    kinds.insert(Degradation::MetalLevelBelowHost);
-                }
-            }
-        }
     }
     // MoltenVK's kept cache is Metal's own, said in an informational message, no notice
     // (`creation_heard_checked`).
@@ -1278,7 +1246,8 @@ fn dynamic_input_assembly(device: &Device) -> bool {
 ///   of no patches), and it does not model a fragment shader interlock's critical sections; layer
 ///   1.4.341 also drops every write-after-write of a bound descriptor it finds while recording.
 ///   A clean run is evidence for the other accesses alone (`runtime_lane/sync_coverage.rs` holds
-///   the controls).
+///   the controls, and asks the layer whether it sees a kernel's write:
+///   `sync_coverage::layer_sees_kernel_writes`).
 /// - `load-store`: a render pass's load operations checked against an earlier pass's stores
 ///   (`syncval_load_op_after_store_op_validation`, off by default), which a layer release that
 ///   does not know the setting reports as unrecognized (Ubuntu 26.04's 1.4.341 does not; the
@@ -1679,6 +1648,74 @@ fn case_bound_value_kinds(device: &Device, case: &PublicCase) -> BTreeSet<Degrad
 fn shared_kinds(device: &Device) -> BTreeSet<Degradation> {
     let shared = degrade_notices::shared_in_system_memory(device);
     degrade_notices::forced(&[(Degradation::SharedInSystemMemory, shared)])
+}
+
+/// Whether `got`, a `float` channel a module converted from a texel's codes, holds as Metal's
+/// `want`: bit for bit where `exact` (the device samples through Metal's own texture unit,
+/// `pixel_samplers::metal_sampler`), else within one `f32` unit in the last place, the bound
+/// `PrecisionNote::DeviceTexelConversion` records of an 8- or 16-bit normalized code (lavapipe
+/// multiplies by the reciprocal); there a NaN holds any NaN (the note's half-float and
+/// small-float NaN, the device's encoding).
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+fn converted_holds(got: f32, want: f32, exact: bool) -> bool {
+    if got.to_bits() == want.to_bits() {
+        return true;
+    }
+    if exact {
+        return false;
+    }
+    let same_sign = got.is_sign_negative() == want.is_sign_negative();
+    (got.is_nan() && want.is_nan())
+        || (same_sign
+            && got.is_finite()
+            && want.is_finite()
+            && got.to_bits().abs_diff(want.to_bits()) <= 1)
+}
+
+/// Whether `got`, a `float` channel a module read from a texel's 8-bit sRGB color code, holds as
+/// Metal's `want` (the code's step of Metal's twelve-bit table over 4095, [`srgb_step`]): bit for
+/// bit where `exact` (the device samples through Metal's own texture unit,
+/// `pixel_samplers::metal_sampler`), else as the device's decode of the same code
+/// (`PrecisionNote::SrgbTexelDecode`, whose precision Vulkan does not set): nearer `want` than
+/// Metal's value of either neighbouring code.
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+fn srgb_decode_holds(got: f32, want: f32, exact: bool) -> bool {
+    if got.to_bits() == want.to_bits() {
+        return true;
+    }
+    if exact || !got.is_finite() {
+        return false;
+    }
+    let value = |c: u32| (f64::from(srgb_step(c)) / 4095.0) as f32;
+    let Some(code) = (0..=255).find(|&c| value(c).to_bits() == want.to_bits()) else {
+        return false;
+    };
+    let off = |v: f32| (f64::from(got) - f64::from(v)).abs();
+    [code.checked_sub(1), (code < 255).then_some(code + 1)]
+        .into_iter()
+        .flatten()
+        .all(|n| off(want) < off(value(n)))
+}
+
+/// Whether `got` holds as Metal's `half` result `want` (a value on the `half` grid, widened) under
+/// `PrecisionNote::NativeHalfConversion`'s recorded bound: within one unit in the last place of
+/// the `half`, the device rounding otherwise or not at all, so that a value Metal takes to an
+/// infinity may stay finite from 65504 up; a NaN holds any NaN.
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+fn half_within(got: f32, want: f32) -> bool {
+    if got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()) {
+        return true;
+    }
+    if want.is_infinite() {
+        let same_sign = got.is_sign_negative() == want.is_sign_negative();
+        return same_sign && got.abs() >= 65504.0;
+    }
+    // A half's unit in the last place at `want`: 2^-24 among the denormals.
+    let exponent = match want.abs() {
+        w if w < 2f32.powi(-14) => -24,
+        w => w.log2().floor() as i32 - 10,
+    };
+    want.is_finite() && (got - want).abs() <= 2f32.powi(exponent)
 }
 
 /// The function of `case`'s entry, made with its constant values, from a library of its AIR.

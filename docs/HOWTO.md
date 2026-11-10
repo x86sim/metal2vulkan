@@ -43,9 +43,17 @@ driver's subgroup width instead.
 
 A `half` computed in `float` rounds through the device's conversion to 16 bits and back, Metal's
 `half(float)` under the float controls the entry declares, where the driver keeps that pair (ANV,
-RADV). NVIDIA's driver (615.71.09) folds it (`DriverWorkaround::HalfConversionPairFolded`), so
-there a `half` rounds natively by default and in integer arithmetic under
-`HalfRoundingPolicy::Exact`.
+RADV). Elsewhere it rounds through the device's own conversion, or its `OpQuantizeToF16` alone
+without `shaderFloat16` (which may flush a value below the smallest normal `half`), and the
+pipeline records `NativeHalfConversion` or `NativeHalfQuantize`. NVIDIA's driver (615.71.09)
+folds the pair (`DriverWorkaround::HalfConversionPairFolded`), so it takes the native conversion.
+A `half` read from memory or from its bits is the device's widening on every device (an
+`OpFConvert` of the bits read as a 16-bit float with `shaderFloat16`, `GLSL.std.450
+UnpackHalf2x16` without it), and a `half` stored or reinterpreted as bits, unless they are the
+bits it was loaded from, the device's narrowing (an `OpFConvert` to 16 bits, `GLSL.std.450
+PackHalf2x16` without `shaderFloat16`); the pipeline records `NativeNanEncoding` (a NaN's bits)
+and, where that conversion is neither under the float controls nor measured to be Metal's,
+`NativeHalfConversion` (a denormal the device may flush).
 
 To read AIR without translating it (list a metallib's functions, decode a module into typed IR,
 read its entry points' bindings, canonicalize an entry under function-constant values), depend on
@@ -73,7 +81,9 @@ second process does not translate it again. It cannot be turned off.
 - **Where.** By default `~/Library/Caches/metal2vulkan` on macOS, `$XDG_CACHE_HOME/metal2vulkan`
   elsewhere, or `~/.cache/metal2vulkan` when `XDG_CACHE_HOME` is unset. `ShaderCacheOptions`
   (in `DeviceOptions`, or `RawDevice` for an adopted device) names another directory. Several
-  processes and builds may share it; each build reads only its own translations.
+  processes and builds may share it; a build reads only the translations of its own translator
+  (its version, `SEMANTICS_VERSION`, `ARTIFACT_FORMAT_VERSION` and translator sources), so an
+  update that changed only the runtime keeps every translation.
 - **How much.** At most `capacity` bytes on disk (25 GiB by default), least recently used first;
   another build's entries go after 30 days unused. In memory, at most `memory_capacity` bytes
   (256 MiB by default): a pipeline state made again takes its translation from there without
@@ -98,6 +108,24 @@ second process does not translate it again. It cannot be turned off.
   is still queued, which costs the next process those translations and nothing else.
   `Device::shader_cache_statistics` counts the entries queued, those a creation wrote itself past
   the queue's bound, and the bytes written.
+- **Pipeline records and warming.** A device with `DeviceOptions::pipeline_records` set hands
+  that hook a `PipelineRecord` at each pipeline state creation, and keeps each library a record
+  names in the directory once, named by its content hash, beside the driver's data: a record holds
+  the descriptor and the libraries' hashes, not their bytes, so its size is the descriptor's. The
+  libraries count against `capacity` with everything else; a record whose library was evicted
+  names one the directory no longer holds. Keep a VM's records in the order they came
+  (`to_bytes`), and at its next boot hand them to `Device::warm(records, byte_budget)` on a device
+  over the same directory: one background thread makes their translations and predicted
+  `VkPipeline`s before the guest asks, below every other making, until the driver data it added
+  reaches the budget, and the guest sees nothing of it. What it makes is what the guest's own
+  creation of each descriptor makes on this build: a record holds a descriptor, never a
+  translation, so records kept across an update are warmed by the new translator, and the pass
+  reads no translation of another translator and no creation record of another
+  `RUNTIME_VERSION`. A record it cannot read is counted and dropped, the device's first said once
+  as the `Warning` `metal2vulkan-warm-record-unread`; nothing it meets fails or ends the run.
+  `Device::warm_statistics` counts the records made, those that could not be (a stage the compile
+  layer compiled already), the libraries written, each warmed record's outcome and the driver
+  bytes added.
 - **When it fills or a write fails.** Each device says so once, through its `MessageSink` (or on
   stderr) as a `Warning`: `id_name` `metal2vulkan-shader-cache-evicted` when the directory reaches
   its cap, and the degrade notice
@@ -164,6 +192,15 @@ Linux) imports a pointer through amdgpu's userptr, which takes anonymous pages o
 `MAP_SHARED` mappings of a `memfd`, a shared memory object or any file (QEMU's
 `memory-backend-memfd,share=on` guest RAM among them) with `Unsupported`, `HostMemory`. NVIDIA and
 lavapipe import the same memory.
+
+No driver that pins imported pages imports a mapping the kernel cannot pin (`VM_IO` or `VM_PFNMAP`:
+a mapping of a dma-buf). NVIDIA's driver fails such an import as out of device memory and then fails
+the process's later host-visible allocations too
+(`RuntimeDriverDefect::UnpinnablePagesBreakHostMemory`), so on Linux the runtime asks the kernel
+first on that driver (one `PROCMAP_QUERY` and one one-byte `process_vm_readv` per mapping) and
+never hands it such pages (`WorkCounts::host_imports_unpinnable`): the source is called, and with
+none, or where its import fails, the object is a copy of the pages, as where an import fails
+([Copied host buffers](#copied-host-buffers)). Pages not mapped readable are refused.
 
 A consumer whose memory is such a mapping passes `HostMemory::with_dma_buf(pointer, source)` instead
 of `HostMemory::new(pointer)`. The runtime still imports the pointer first, exactly as without a
@@ -241,15 +278,31 @@ used (no command reaches them unnamed yet), `host_rebind_imports_made` those reb
 `host_rebind_imports_covered` those whose pages lay within bytes a buffer over host pages lay over
 already.
 
-A texture over a no-copy buffer's host pages, imported by their pointer or as dma-bufs, is a
-shadow (`shadowed-texture`) on every device, whatever its usage and row pitch: an optimal image of
-the runtime's own memory, its texels copied in from the pages before a use and merged back after a
-write. An image bound to imported memory starts in `VK_IMAGE_LAYOUT_UNDEFINED`
-(`VUID-VkImageCreateInfo-pNext-01443`), and its layout transitions "may perform read and write
-accesses on all memory bound to the image subresource range"; every image takes one, its first move
-from the layout it is made in, before any use, and the host could keep the bytes across it only by
-reading them before it and writing them back after, which would undo a CPU write made meanwhile,
-where Metal keeps every write to bytes a command buffer does not write.
+A texture over a no-copy buffer's host pages, imported by their pointer or as dma-bufs (or over a
+buffer the runtime placed in fresh host pages), meets a rule Metal does not have. An image bound to
+imported memory starts in `VK_IMAGE_LAYOUT_UNDEFINED` (`VUID-VkImageCreateInfo-pNext-01443`), and
+its layout transitions "may perform read and write accesses on all memory bound to the image
+subresource range"; every image takes one, its first move from the layout it is made in, before any
+use, and the host could keep the bytes across it only by reading them before it and writing them
+back after, which would undo a CPU write made meanwhile, where Metal keeps every write to bytes a
+command buffer does not write.
+
+By default (`HostPageTexturePolicy::InPlace`) the runtime relies on the driver there, checked. A
+texture whose declared usage only samples or reads it is a linear image aliasing the pages wherever
+the device's own check passed for that kind of pages (pointer imports, dma-buf imports, fresh
+pages): the check makes such images while a CPU thread writes beside their texels and passes a kind
+only where every first move kept every byte. It runs on a thread of its own, started by the first
+such texture, once per driver, driver version and runtime release; with a shader-cache directory
+its verdict is kept there and recalled as the next device is made, else it runs once per process.
+Until it answers, a texture is a shadow (`WorkCounts::host_texture_shadows_check_pending`), so the
+first frames of a first session pay the shadow's copies. A texture that renders or writes
+(`RenderTarget`, `ShaderWrite`, `ShaderAtomic`), one the check failed or could not cover, and one
+no image in place serves (a pitch the device's linear images do not take --
+`host_texture_shadows_refused_pitch`; over dma-buf pages, a source that makes no one dma-buf of
+the texture's own pages, as a chunked `udmabuf` import does -- `host_texture_shadows_refused_source`)
+is a shadow (`shadowed-texture`, naming why): an optimal image of the runtime's own memory, its
+texels copied in from the pages before a use and merged back after a write. `HostPageTexturePolicy::Shadow` (in `DevicePolicy::exact_answers`) keeps every such
+texture a shadow and runs no check.
 
 A texture over another buffer's bytes (the runtime's own memory) is a linear image over them where
 its rows lie one after another (`bytes_per_row` is its texels' bytes, or it has one row; an array's
@@ -286,6 +339,118 @@ its bytes up to the last whole multiple of 4 KiB and the rest, whichever part of
 records it (`WorkCounts::copy_regions_split`): among them a two-plane YCbCr texture's planes copied
 into its staging buffer where it converts whole (`WorkCounts::ycbcr_whole_conversions`), and a
 staged texture's bytes and rows.
+
+### Copied host buffers
+
+A no-copy buffer whose import the runtime does not make is made over a copy of its bytes instead,
+announced (`copied-host-pages`): no import maps the pages, so they take no kernel mapping. That
+happens where:
+
+- the caller's gate refuses the import: `HostMemory::with_import_gate(gate)` asks the `ImportGate`
+  once, on the thread making the buffer, heap or rebind and holding no lock of the runtime's, just
+  before the import and before the runtime asks whether the process may write the pages, with the
+  pages it would map (`ImportRequest`, the host pages from the first
+  byte's through the last's). `false` makes the copy (`WorkCounts::host_imports_refused_by_host`,
+  `copied_host_buffers_refused`). A consumer with a budget of mappings (Linux's
+  `vm.max_map_count`) refuses there, paying in copies instead of a failed call. It is not asked
+  for a buffer or rebind that lies in a live import of the same bytes, memory whose GPU writes
+  Metal's private option bit 24 drops, a rebind whose bytes moved in their page under a texture
+  (below), or where the device refused the pointer before it;
+- an import the device and the gate admitted fails, of the pointer or of the dma-bufs of the
+  caller's source (out of memory, another Vulkan error: `copied_host_buffers_degraded`);
+- on NVIDIA's driver, the pages are a mapping the kernel cannot pin (a dma-buf's), which the
+  runtime never hands that driver (`RuntimeDriverDefect::UnpinnablePagesBreakHostMemory`,
+  `WorkCounts::host_imports_unpinnable`), and no dma-buf of the caller's source served them
+  (`copied_host_buffers_degraded`).
+
+`Buffer::host_backing` answers, per buffer, whether it got the copy: `HostBacking::Copied`, else
+how its pages are imported (`ImportedByPointer`, `ImportedAsDmaBuf`, `InHostRam`), or `Detached`;
+`None` for a buffer over no host memory of the caller's. A buffer placed in a no-copy
+heap answers its heap's. The answer changes only at the buffer's (or heap's) rebind, which may move
+it between an import and a copy, and at a detach. Unlike a `WorkCounts` delta, it does not race
+with buffers another thread makes on the same device.
+
+The copy is host-visible memory of the device's own; the buffer's `contents` is still the pointer.
+Each commit writes into the copy every byte the CPU changed in the pages since the copy and the
+pages last agreed, and each batch's completion writes back every byte the GPU changed, before its
+handlers run or a waiter returns, keeping a byte the CPU changed since (`copied_copy_in_bytes`,
+`copied_merge_back_bytes`). An event signal submitted while a copy is live is seen at its batch's
+completion, after that write-back: no read of the event's value shows it earlier, and a wait for it
+on another queue (a plain `Event`'s too) is held until then rather than chained on the GPU
+(`event_signals_behind_merge`). Each completion compares every byte of each copy its command
+buffers may have written (`copied_merges_compared`, `copied_merges_skipped`): those their uses
+wrote, and every copy where a function reads addresses or an indirect command buffer runs, so keep
+copies few. Where the pages' memory carries a log of the writes to them
+(`HostMemory::with_dirty_pages`, `HostRam::with_dirty_pages`), each commit compares only the pages
+the log reports written since the copy's last commit, and the bytes no log keeps
+(`copied_copy_in_bytes_skipped`): it asks one stamp of each log for every copy and waits for its
+publication (bounded) on the committing thread, and every copy compares every byte at its first
+commit and where a log answers `false`. The runtime reports to the log what the log cannot see: a
+copy's merge back, as the copy's own write, the GPU's writes into the pages through imports in
+place, and its own CPU writes into them. A texture over a copied buffer is a shadow of its bytes. The copy reads the pages through the kernel
+first, and where the kernel cannot read them, with plain loads where the process maps every page
+with read permission: on Linux the kernel's read pins each page, which a mapping of a dma-buf
+(`VM_PFNMAP`) does not allow. Pages not mapped, or mapped
+without read permission, are never copied: the buffer is refused, as their import is.
+
+Pages the process maps read-only (a VMM's alias of `replaceBackingWithRanges:readOnly:`, its
+maximum protection lowered to read) are copied the same way, and the copy drops the GPU's writes,
+as Metal drops them: each batch's completion takes the bytes the GPU changed back out of the copy
+and writes nothing to the pages (`copied_dropped_bytes`), so later commands of the same command
+buffer read the writes back and a later command buffer reads the pages' bytes. The runtime asks
+the system whether the process can write the pages as it makes the copy. The announcement's detail
+says so.
+
+A no-copy heap's own buffer is copied the same way (`copied_heaps_made`): its buffers lie in the
+copy, and its textures are shadows of its bytes. `Buffer::rebind_bytes_no_copy` and
+`Heap::rebind_bytes_no_copy` give the buffer or heap a copy of their new pages the same way
+(`copied_rebind_pages_made`). The heap's placed buffers lie in the copy at their offsets; its
+textures bound to its bytes, and a texture's image in place over the buffer, are made again over
+the copy (`copied_rebind_images_made`): where an image in place rides on it, the copy is fresh
+pages the runtime maps and imports by pointer, and the image is made as over the caller's pages,
+under the device's in-place check for fresh pages; else the copy is memory the device allocates,
+and each image a linear image of it that starts `PREINITIALIZED`, so its first move keeps the
+copy's bytes. Textures held as shadows read the copy. A buffer's
+rebind to bytes at another offset in their page than the old, under a texture planned at the old
+offset, is a copy laid out at the old offset too, the gate unasked (`copied_rebind_pages_moved`).
+A rebind is refused (`NotImplemented(RebindTextures)`) only where the device makes no such image
+over the copy (its driver lays the linear image out at other pitches, or in memory of another type
+or alignment), or where the buffer's GPU writes are dropped and its bytes moved in their page.
+
+### Guest RAM imported whole
+
+A VMM whose device refuses views of guest pages made through dma-bufs (each import of scattered
+pages then takes a kernel mapping per page) can give the device the guest's RAM once instead:
+
+- `unsafe HostRam::new(ranges, keep_alive)` takes the RAM's ranges of host memory (whole host pages,
+  mapped readable and writable until the keep-alive goes) and `Device::use_host_ram(&ram)` uses it
+  on a device, until the returned `HostRamUse` is dropped. A device may use several RAMs whose
+  ranges are apart, and a new one over the same ranges once the earlier use ended; ranges that
+  meet a used RAM's are misuse (`Invalid`, `Problem::HostRam`).
+- `HostMemory::with_runs(resolver)` gives each no-copy object a `RunResolver`: asked once, at the
+  object's making and at each `rebind_bytes_no_copy` to new memory, on the calling thread with no lock of the runtime's held and before the import
+  gate, with the object's import window (whole host pages), it answers the host addresses of the
+  same bytes in the RAM's ranges, as runs of whole pages in the object's byte order, or `None`.
+  It is asked only on a device that uses a RAM, only where the object would import its pages
+  itself, never for memory whose GPU writes Metal's private option bit 24 drops. An answer that
+  does not cover the window in whole pages of one RAM the device uses is refused (`Invalid`,
+  `Problem::HostRam`).
+- One run inside one chunk: the device imports the RAM by host pointer in chunks of 64 MiB, never
+  across a range's end, each the first time an object over it is made, on that thread, once
+  (`WorkCounts::host_ram_chunks_imported`, `host_ram_chunk_bytes`, `host_ram_chunks_live`). The
+  object's `VkBuffer` is made as an import of its own pages would make it and bound in the chunk
+  at its run (`chunk_bound_buffers_made`): no import of its own, no gate asked, its `contents`
+  still the pointer, and its size reaching no page past its own, so neither its Metal range, a
+  robust descriptor range nor a root entry reaches the rest of the chunk. A no-copy heap's own
+  buffer, and a buffer's or heap's rebind, take the same path; a buffer's rebind to bytes at
+  another offset in their page under a texture takes the copy laid out at the old offset instead.
+- Any other answer (several runs, one run crossing a chunk's end, `None`) takes the paths above:
+  the gate, then the import or the copy. The runs are kept with the object.
+- The chunks are never released while idle. Once the use is dropped, each is freed when nothing
+  holds it (no buffer bound in it, no command buffer that used one), and the RAM's keep-alive is
+  dropped after the last.
+- `HostRam::with_dirty_pages` takes one `DirtyPages` log for the whole RAM, its offsets host
+  addresses.
 
 ## 7. Check the integration
 

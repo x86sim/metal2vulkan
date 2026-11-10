@@ -67,17 +67,17 @@
 //! - MoltenVK on this M3 Max: the two `tgp_composite` rows announce
 //!   `half-output-fast-math-blend`, for the `half` colour output reaching a storing attachment.
 //!   The exact row announces nothing and reads exact.
-//! - lavapipe: every row announces `shader-color-conversion`, for the normalized store our side
-//!   rounds in the shader where the device's own conversion is not Metal's. Beside it, the
-//!   `tgp_composite` rows announce `half-output-fast-math-blend` and `device-interpolation`, the
+//! - lavapipe: every row's normalized store is the device's own conversion, whose note the suite
+//!   declares for every case ([`crate::replay::NATIVE_NOTES`]). Beside it, the `tgp_composite` rows
+//!   announce `half-output-fast-math-blend` and `device-interpolation`, the
 //!   second for the texture coordinate `tgp_rect` hands across the rectangle on a device not
 //!   measured to interpolate as Metal does, and the exact row announces `device-arithmetic` for
-//!   the division `tob_sample` does.
+//!   the division `tob_sample` does, another note of the device's own the suite declares.
 //!
 //! Each row **declares every code it can announce**, one declaration a code, because the
 //! comparison reads a declaration per code: a code a row announces and declares nowhere is a
-//! divergence for an undeclared notice, so two rows declare three codes between the venues and the
-//! exact row declares two. A declaration loosens no value; what it says is that the row's shape
+//! divergence for an undeclared notice, so a row declares exactly the codes its shape can announce
+//! outside the native set. A declaration loosens no value; what it says is that the row's shape
 //! can reach that note, which this table is the measurement of. The interpolation note is worth
 //! reading twice over: lavapipe interpolates a varying otherwise than Metal, and these rows'
 //! sampled texels still came back exactly Metal's, so what the row declares is the note and not a
@@ -157,7 +157,6 @@ const FILL: Functions = Functions {
     fixture: TOB,
     vertex: "tob_rect",
     fragment: "tob_solid",
-    divides_a_float: false,
     interpolates_a_varying: false,
     half_output: false,
 };
@@ -168,11 +167,6 @@ struct Functions {
     fixture: &'static str,
     vertex: &'static str,
     fragment: &'static str,
-    /// Whether the fragment function divides a `float`: `tob_sample` divides the pixel's position
-    /// by the sampled texture's extent, and nothing else here does.
-    ///
-    /// This is the shape that decides the row's `device-arithmetic` declaration, and nothing else.
-    divides_a_float: bool,
     /// Whether the fragment function reads a varying the device interpolates: `tgp_layer` reads
     /// the texture coordinate `tgp_rect` hands across the rectangle, while `tob_sample` derives
     /// its coordinate from the pixel's own position and reads no interpolated varying.
@@ -214,7 +208,6 @@ const SUBJECTS: &[Subject] = &[
             fixture: TOB,
             vertex: "tob_rect",
             fragment: "tob_sample",
-            divides_a_float: true,
             interpolates_a_varying: false,
             half_output: false,
         },
@@ -228,7 +221,6 @@ const SUBJECTS: &[Subject] = &[
             fixture: TGP,
             vertex: "tgp_rect",
             fragment: "tgp_layer",
-            divides_a_float: false,
             interpolates_a_varying: true,
             half_output: true,
         },
@@ -242,7 +234,6 @@ const SUBJECTS: &[Subject] = &[
             fixture: TGP,
             vertex: "tgp_rect",
             fragment: "tgp_layer",
-            divides_a_float: false,
             interpolates_a_varying: true,
             half_output: true,
         },
@@ -396,19 +387,10 @@ impl Case for RenderChain {
         // describes it, so a row that can announce two codes names both. Which codes those are
         // follows the row's shape, and each is one a run was measured announcing for this very row:
         //
-        // - `shader-color-conversion`, for every row, because every row's fragment stage stores a
-        //   normalized channel, which our side rounds in the shader on a device whose own
-        //   conversion is not Metal's. Measured announced by all three rows on lavapipe, and by
-        //   none of them on MoltenVK on this M3 Max, where Metal's own conversion runs.
         // - `half-output-fast-math-blend`, for the two rows whose fragment stage returns a `half`
         //   colour output ([`Functions::half_output`]). Our side records it where such an output
         //   reaches an attachment that stores a channel out of a module naming no math mode, which
         //   `tgp_composite` does. Measured announced by those two rows on both venues.
-        // - `device-arithmetic`, for the row whose fragment stage divides a `float`
-        //   ([`Functions::divides_a_float`]): `tob_sample` divides the pixel's position by the
-        //   sampled texture's extent, and our side records the note where such arithmetic takes
-        //   Vulkan's precision bounds rather than correct rounding. Measured announced by that row
-        //   on lavapipe.
         // - `device-interpolation`, for the two rows whose fragment stage reads a varying the
         //   device interpolates ([`Functions::interpolates_a_varying`]): `tgp_rect` hands the
         //   texture coordinate across the rectangle, and our side records the note on a device not
@@ -422,18 +404,10 @@ impl Case for RenderChain {
         //   target back through is `Shared`, which a device with no unified memory keeps in
         //   system memory because that is the only memory both sides can reach. It belongs to
         //   the venue's memory model rather than to a chain's shape.
-        let mut named = vec![
-            crate::replay::notice_allowance(Degradation::ShaderColorConversion.code()),
-            crate::replay::shared_memory_notice(),
-        ];
+        let mut named = vec![crate::replay::shared_memory_notice()];
         if self.subject.sample.half_output {
             named.push(crate::replay::notice_allowance(
                 Degradation::HalfOutputFastMathBlend.code(),
-            ));
-        }
-        if self.subject.sample.divides_a_float {
-            named.push(crate::replay::notice_allowance(
-                Degradation::DeviceArithmetic.code(),
             ));
         }
         if self.subject.sample.interpolates_a_varying {
@@ -811,15 +785,9 @@ mod tests {
             // The whole set, one declaration a code the row can announce: a code the row
             // announces and declares nowhere is a divergence, and a code it declares but cannot
             // announce is an allowance standing behind nothing, so the set is stated exactly.
-            let mut wanted = vec![
-                Degradation::ShaderColorConversion.code().to_owned(),
-                Degradation::SharedInSystemMemory.code().to_owned(),
-            ];
+            let mut wanted = vec![Degradation::SharedInSystemMemory.code().to_owned()];
             if case.subject.sample.half_output {
                 wanted.push(Degradation::HalfOutputFastMathBlend.code().to_owned());
-            }
-            if case.subject.sample.divides_a_float {
-                wanted.push(Degradation::DeviceArithmetic.code().to_owned());
             }
             if case.subject.sample.interpolates_a_varying {
                 wanted.push(Degradation::DeviceInterpolation.code().to_owned());

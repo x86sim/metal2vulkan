@@ -1649,7 +1649,7 @@ fn the_device_s_functions_are_reached_through_checked_accessors() {
 /// tuple field, a type argument or a by-value parameter) fails
 /// `only_the_listed_modules_keep_the_device_s_functions`; so does a listed module that keeps none
 /// any more.
-const KEEPERS: [(&str, &str); 24] = [
+const KEEPERS: [(&str, &str); 23] = [
     (
         "binding.rs",
         "the push command (vkCmdPushDescriptorSet), a call's parameter (`push_set`) and the \
@@ -1677,6 +1677,12 @@ const KEEPERS: [(&str, &str); 24] = [
     (
         "device/relay.rs",
         "the queues' flights, taken back from the instance's relay first in the teardown",
+    ),
+    (
+        "device/submit_stalls.rs",
+        "the empty submissions that take a driver's stalls idle, made by the scheduler's thread \
+         inside a section; the teardown waits for the device to idle, the thread having stopped, \
+         before it releases their semaphores",
     ),
     (
         "draw_source.rs",
@@ -1714,11 +1720,6 @@ const KEEPERS: [(&str, &str); 24] = [
         "MoltenVK's statistics call, inside a call that borrows the device",
     ),
     (
-        "recorder/log.rs",
-        "the generated-command entry points' types, a replay's call through its slot's entry \
-         points",
-    ),
-    (
         "recorder/mod.rs",
         "the device's mesh draw commands, routed through its slot (DeviceShared)",
     ),
@@ -1737,10 +1738,6 @@ const KEEPERS: [(&str, &str); 24] = [
     (
         "render/pending.rs",
         "a pending draw's recording, held by its command buffer",
-    ),
-    (
-        "render_state.rs",
-        "a draw's recording (vkCmd*), held by what holds its command buffer",
     ),
     (
         "scheduler/mod.rs",
@@ -2084,10 +2081,10 @@ fn the_table_names_each_entry_point_once() {
 #[test]
 fn the_priming_check_names_what_was_not_made() {
     use crate::device::prime::{
-        missing, Has, CALIBRATION_CALLS, COLOR_WRITE_MASK_CALLS, DEPTH_BIAS_CALLS,
-        DEVICE_ADDRESS_CALLS, EXTENDED_DYNAMIC_STATE_CALLS, GENERATED_COMMANDS_CALLS,
-        HOST_QUERY_RESET_CALLS, NAMING_CALLS, PRIMITIVE_RESTART_CALLS, PUSH_DESCRIPTOR_CALLS,
-        SIZED_INDEX_BIND_CALLS, SPARSE_CALLS, TIMESTAMP_CALLS, UNPRIMED,
+        missing, Has, CALIBRATION_CALLS, COLOR_WRITE_MASK_CALLS, DEVICE_ADDRESS_CALLS,
+        EXTENDED_DYNAMIC_STATE_CALLS, GENERATED_COMMANDS_CALLS, HOST_QUERY_RESET_CALLS,
+        NAMING_CALLS, PRIMITIVE_RESTART_CALLS, PUSH_DESCRIPTOR_CALLS, SIZED_INDEX_BIND_CALLS,
+        SPARSE_CALLS, TIMESTAMP_CALLS, UNPRIMED, YCBCR_CONVERSION_CALLS,
     };
     let has = |timestamps, device_addresses| Has {
         timestamps,
@@ -2101,8 +2098,8 @@ fn the_priming_check_names_what_was_not_made() {
         extended_dynamic_state: true,
         primitive_restart: true,
         color_write_masks: true,
-        depth_bias: true,
         sized_index_bind: true,
+        ycbcr_conversion: true,
     };
     let all = Call::ALL.iter().fold(0, |bits, call| bits | call.bit());
     assert!(missing(all, has(true, true)).is_empty());
@@ -2212,12 +2209,13 @@ fn the_priming_check_names_what_was_not_made() {
             color_write_masks: false,
             ..has
         }),
-        (&DEPTH_BIAS_CALLS, |has| Has {
-            depth_bias: false,
-            ..has
-        }),
         (&SIZED_INDEX_BIND_CALLS, |has| Has {
             sized_index_bind: false,
+            ..has
+        }),
+        // Without a YCbCr format the device converts, nor is a conversion's release.
+        (&YCBCR_CONVERSION_CALLS, |has| Has {
+            ycbcr_conversion: false,
             ..has
         }),
     ];

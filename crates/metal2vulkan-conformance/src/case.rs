@@ -622,8 +622,6 @@ pub struct Venue {
     pub driver: String,
     /// The API version the device runs.
     pub api: String,
-    /// The Metal level the side answers as ([`metal2vulkan_runtime::MetalLevel::macos`]).
-    pub metal_level: String,
 }
 
 impl Venue {
@@ -635,11 +633,7 @@ impl Venue {
 
 impl std::fmt::Display for Venue {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            out,
-            "{} ({}, API {}, Metal level {})",
-            self.device, self.driver, self.api, self.metal_level
-        )
+        write!(out, "{} ({}, API {})", self.device, self.driver, self.api)
     }
 }
 
@@ -2043,7 +2037,7 @@ pub trait Side {
     /// [`Value`]: `Ok` where the wait returned, the typed error where it did not.
     ///
     /// **Metal has no side here, deliberately.** Metal does not come back from this call — the
-    /// probe that measured it ended with it — so [`crate::metal_side::MetalSide`] leaves this
+    /// probe that measured it ended with it — so `metal_side::MetalSide` leaves this
     /// default in place and must go on leaving it. A case over it says
     /// [`MetalSource::did_not_return`] and record mode refuses the row before anything is encoded.
     ///

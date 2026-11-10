@@ -44,7 +44,6 @@ fn stage_module_bytes_are_little_endian_words() {
         strategies: StrategyCensus::default(),
         constant_blob: None,
         rounded_colors: Vec::new(),
-        half_bit_colors: Vec::new(),
         own_pixel_textures: Vec::new(),
         snapshot_textures: Vec::new(),
         private_bytes: 0,
@@ -95,7 +94,6 @@ fn a_stage_s_notes_under_a_specialization_are_its_held_clauses() {
         strategies: StrategyCensus::default(),
         constant_blob: None,
         rounded_colors: Vec::new(),
-        half_bit_colors: Vec::new(),
         own_pixel_textures: Vec::new(),
         snapshot_textures: Vec::new(),
         private_bytes: 0,
@@ -168,6 +166,22 @@ mod serde_round_trips {
         assert_eq!(&back, value, "{json}");
     }
 
+    /// A planes image's conversion: an 8-bit 4:2:0 surface's, full range, BT.709.
+    fn planes_sampler() -> crate::bind::YCbCrPlanesSampler {
+        use crate::bind::{YCbCrCodes, YCbCrInPlace, YCbCrMatrix, YCbCrPlanes, YCbCrRange};
+        let codes = metal::format::ycbcr_format(metal::PixelFormat::YCBCR84202P)
+            .and_then(YCbCrCodes::of)
+            .expect("codes");
+        let planes = YCbCrPlanes::new(
+            [8, 4],
+            [0, 16],
+            [64, 16],
+            (YCbCrRange::Full, YCbCrMatrix::Bt709),
+            codes,
+        );
+        YCbCrInPlace::of(&planes).expect("in place").sampler()
+    }
+
     fn buffer(index: u32) -> SlotRef {
         slot(Stage::Fragment, SlotClass::Buffer, index)
     }
@@ -198,8 +212,11 @@ mod serde_round_trips {
             dropped_vertex_layer: true,
             storage_view_slots: BTreeSet::from([buffer(3)]),
             srgb_textures: BTreeSet::from([slot(Stage::Kernel, SlotClass::Texture, 4)]),
-            srgb_twins: BTreeSet::from([slot(Stage::Kernel, SlotClass::Texture, 4)]),
-            ycbcr_textures: BTreeSet::from([slot(Stage::Kernel, SlotClass::Texture, 6)]),
+            ycbcr_in_place: BTreeSet::from([slot(Stage::Kernel, SlotClass::Texture, 7)]),
+            ycbcr_planes_sampled: BTreeMap::from([(
+                slot(Stage::Kernel, SlotClass::Texture, 7),
+                planes_sampler(),
+            )]),
             flat_grid: true,
             replay_bindings: true,
             merged_draws: true,
@@ -231,7 +248,6 @@ mod serde_round_trips {
                 ),
             )]),
             cubic_samplers: BTreeMap::from([(slot(Stage::Fragment, SlotClass::Sampler, 0), 0x2d0)]),
-            captured_positions: Some(crate::pipeline::CaptureForm::Vertices),
             primitive_id_indices: Some(metal::IndexType::UInt16),
             quad_primitive_ids: true,
             private_list: true,
@@ -245,9 +261,6 @@ mod serde_round_trips {
                 SampledType::Uint,
             )]),
             anisotropic_samplers: BTreeSet::from([slot(Stage::Fragment, SlotClass::Sampler, 1)]),
-            depth16_pass: Some(false),
-            depth16_biased: true,
-            depth16_bias_raises: Some(true),
             color_group: 1,
         });
         round_trip(&SpecializationKey {
@@ -264,7 +277,7 @@ mod serde_round_trips {
     #[test]
     fn lower_inputs() {
         let mut attributes = BTreeMap::new();
-        attributes.insert(0, VertexFetch::FixedFunction { narrow_float: true });
+        attributes.insert(0, VertexFetch::FixedFunction);
         attributes.insert(
             1,
             VertexFetch::Pulled {
@@ -327,15 +340,17 @@ mod serde_round_trips {
                 depth_or_stencil: true,
                 alpha_to_coverage: false,
                 amplified: true,
-                half_blends: BTreeSet::from([0]),
             }),
             srgb_textures: BTreeSet::from([slot(Stage::Fragment, SlotClass::Texture, 7)]),
-            srgb_twins: BTreeSet::from([slot(Stage::Fragment, SlotClass::Texture, 7)]),
             snapshot_textures: BTreeMap::from([(
                 slot(Stage::Fragment, SlotClass::Texture, 3),
                 crate::pipeline::SnapshotForm::Half,
             )]),
-            ycbcr_textures: BTreeSet::from([slot(Stage::Fragment, SlotClass::Texture, 8)]),
+            ycbcr_in_place: BTreeSet::from([slot(Stage::Fragment, SlotClass::Texture, 9)]),
+            ycbcr_planes_sampled: BTreeMap::from([(
+                slot(Stage::Fragment, SlotClass::Texture, 9),
+                planes_sampler(),
+            )]),
             viewport_index_varying: true,
             // An emulated post-tessellation vertex function's state.
             tessellation: Some(crate::pipeline::TessellationDescriptor {
@@ -404,7 +419,6 @@ mod serde_round_trips {
                 crate::metal::format::WordAttachment::layout(metal::PixelFormat::ABGR4Unorm)
                     .expect("a word layout"),
             )]),
-            srgb_fetches: BTreeSet::from([0, 2]),
             zeroed_colors: BTreeMap::from([(2, metal::PixelFormat::RGBA32Sint)]),
             dropped_colors: BTreeSet::from([3]),
             kept_imageblock_bytes: Some(12),
@@ -444,18 +458,6 @@ mod serde_round_trips {
                 (4, crate::pipeline::RotatedBlendForm::Premultiplied),
                 (6, crate::pipeline::RotatedBlendForm::Unmeasured),
             ]),
-            captured_positions: Some(crate::pipeline::CaptureForm::Indexed(
-                metal::IndexType::UInt16,
-            )),
-            half_output_lanes: BTreeMap::from([(
-                1,
-                [
-                    Some(crate::pipeline::HalfOutputLane::Float32),
-                    Some(crate::pipeline::HalfOutputLane::Float32Added),
-                    None,
-                    None,
-                ],
-            )]),
             extended_shadows: BTreeSet::from([0]),
             cross_class: BTreeMap::from([(
                 slot(Stage::Fragment, SlotClass::Texture, 10),
@@ -465,8 +467,6 @@ mod serde_round_trips {
             anisotropic_samplers: BTreeSet::from([slot(Stage::Fragment, SlotClass::Sampler, 3)]),
             uniform_varyings: BTreeSet::from([VaryingKey::user(b"user(tint)")]),
             instanced_attributes: BTreeSet::from([1]),
-            depth16_codes: true,
-            depth16_bias_raises: Some(false),
             color_group: Some(crate::pipeline::ColorGroup {
                 present: vec![0, 1, 2, 3, 5, 7],
                 width: 4,
@@ -674,7 +674,6 @@ mod serde_round_trips {
                     view: crate::pipeline::graphics::StandInView::Image,
                 }),
             }),
-            color_write_rules: vec![(0, 0x3322), (2, 0x0001)],
             snapshot_reads: true,
             color_group: Some(crate::pipeline::ColorGroup {
                 present: vec![0, 5],
@@ -750,7 +749,7 @@ mod serde_round_trips {
                 id: 0,
                 key: SpecKey::SamplerState {
                     slot: slot(Stage::Fragment, SlotClass::Sampler, 1),
-                    fields: crate::metal::sampler::SamplerWord::PIXEL_NEAREST,
+                    fields: crate::metal::sampler::SamplerWord::PIXEL_COORDINATES,
                 },
                 size: 4,
                 default: 0,
@@ -1021,10 +1020,6 @@ mod bind_serde_round_trips {
             blend_color: [0.25, -0.5, 1.5, 0.75],
             alpha_test_reference: Some(0.375),
             primitive_type: Some(metal::PrimitiveType::TriangleStrip),
-            depth_bias: [1.5 / 65535.0, -2.0, 0.125],
-            depth16_pass: Some(true),
-            depth16_biased: true,
-            depth16_bias_raises: Some(true),
             primitive_id_indices: Some(metal::IndexType::UInt16),
             quad_primitive_ids: true,
             private_list: true,
@@ -1086,9 +1081,6 @@ mod bind_serde_round_trips {
             fragment_tests: crate::bind::FragmentTests::Pass,
             extended_shadows: BTreeSet::from([0]),
             snapshot_textures: BTreeSet::from([2]),
-            depth16_pass: Some(true),
-            depth16_biased: true,
-            depth16_bias_raises: Some(true),
             primitive_id_indices: Some(metal::IndexType::UInt32),
             quad_primitive_ids: true,
             private_list: true,
@@ -1144,7 +1136,6 @@ mod bind_serde_round_trips {
                         class: crate::pipeline::sym::HandleClass::Sampler {
                             compare: false,
                             integer: false,
-                            cube_gradient: false,
                         },
                         element: 5,
                         source: HeapSource::Used(3),
@@ -1155,7 +1146,6 @@ mod bind_serde_round_trips {
                             layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                             components: vk::ComponentMapping::IDENTITY,
                             level: None,
-                            twin: false,
                             shader_swizzle: false,
                         },
                     },

@@ -169,9 +169,7 @@ fn the_stage_takes_its_combined_bindings_apart_past_the_sampler_limit() {
                 runtime,
                 "{what}: {separate:?}"
             );
-            // One sampled image per pair: its sample's, or where Metal's linear filter is
-            // emulated, or a plain sample's texels are fetched, the device sample's in the shared
-            // emulation's dispatch, whose facts and taps read the texture alone (SEMANTICS 1012).
+            // One sampled image per pair: its sample's.
             let made = count(&a, OP_SAMPLED_IMAGE);
             assert_eq!(made, 32, "{what}");
             assert_eq!(uses(&a, "sampler.separate_binding"), made as u32, "{what}");
@@ -291,7 +289,6 @@ fn the_binder_writes_a_runtime_separate_sampler_and_its_textures() {
                 slot: s0,
                 compare: false,
                 integer: false,
-                cube_gradient: false,
                 opaque_black: crate::metal::sampler::OpaqueBlackBorder::Stated,
             },
         ),

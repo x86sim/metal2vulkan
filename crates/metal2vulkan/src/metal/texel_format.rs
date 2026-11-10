@@ -102,33 +102,31 @@
 //! `R8Unorm`, `R16Float`, and `R32Float`, in 1D and 2D: the P2a probe).
 //!
 //! **sRGB.** Metal decodes an 8-bit sRGB color channel through its twelve-bit table (the code `c`
-//! to the step `k`, the value `k / 4095`, `lower::arith::srgb`), which the device's decode does
-//! not reproduce, and reads alpha as `c / 255`: a read or a nearest sample with a `half` result
-//! rounds that value to nearest even, a gather's likewise, and a read or a nearest sample with a
-//! `float` result rounds it to `f32` to nearest even (`RGBA8Unorm_sRGB`, every code: `f8f81b81`,
-//! the probe cases). A linear sample sums the taps' steps exactly with the linear filter's weights,
-//! rounds the sum half up onto `1/4095` (alpha's codes onto `1/(16 · 255)`), and that value to
-//! nearest even, to `half` or `f32` (the probe cases and P2a), as the bicubic filter sums them.
-//! Only the raw code gives these values, so a texture bound in such a format is read through a
-//! UNORM view of the same image ([`srgb_raw_view`]): the `RuntimeFact::SrgbTexture` variant of a
-//! function. Its [`texel_format`] is [`UNORM`](BicubicTexels::UNORM) and
-//! [`SRGB`](BicubicTexels::SRGB) with its channels, never [`EXACT`](BicubicTexels::EXACT): a
-//! conversion of the device's value keeps its rounding, and the emulated linear filter reads the
-//! raw codes under the variant alone, adding `EXACT` there. A gather's `float` value is not
-//! measured, so it keeps the device's decode (`PrecisionNote::SrgbTexelDecode`). `RGBA8Unorm_sRGB`
-//! was read, and so were `BGRA8Unorm_sRGB`, `R8Unorm_sRGB`, and `RG8Unorm_sRGB` (the probe): they
-//! take its rule ([`srgb_raw`]). So do the sRGB forms of BC1 to BC3 and BC7 (an Apple M4: every
-//! color channel of their random blocks' reads is the step of the unorm form's
-//! 8-bit code, alpha `c / 255`), read through their unorm views: exact where the device decodes the
-//! unorm form's codes as Metal does (BC7's on every venue measured, as Direct3D specifies its
-//! decode bit for bit; BC1 to BC3's where the driver has `DriverFact::ColorBlockDecodeIsMetals`,
-//! and elsewhere announced as `compressed-texel-decode`). So do the ASTC sRGB formats, whose
-//! colour Metal reads as the table's step of the top byte of each channel's decode (`bind::AstcDecode`,
-//! an Apple M3 Max): read through the unorm view of their decoded twin's codes on a device without
-//! the format, exact; a device with it decodes them itself, as its unorm view would decode the
-//! blocks the LDR way, so they take the rule only where the device holds the codes
-//! ([`srgb_raw_on`]). The other compressed and the wide sRGB formats are not measured and keep the
-//! device's decode.
+//! to the step `k`, the value `k / 4095` correctly rounded to the result, `lower::arith::srgb`)
+//! and reads alpha as `c / 255`; its linear and bicubic filters sum the decoded steps
+//! (`RGBA8Unorm_sRGB`, every code: `f8f81b81`, the probe cases). The device decodes such a texel
+//! itself, through a view of the image in the sRGB format (Vulkan's texel decode applies the sRGB
+//! EOTF to the codes before filtering, within the device's precision), and that is the only form
+//! wherever the device samples the format: a texture slot's reads, samples, gathers and bicubic
+//! taps take it, recording `PrecisionNote::SrgbTexelDecode` where the bound format's class has
+//! [`SRGB`](BicubicTexels::SRGB) on a device that does not decode through Metal's own texture
+//! unit (`VkProperty::MetalSampler`, whose decode is Metal's). The class is
+//! [`UNORM`](BicubicTexels::UNORM) and [`SRGB`](BicubicTexels::SRGB) with its channels, never
+//! [`EXACT`](BicubicTexels::EXACT): a `half` result rounds the device's `float` value, and a
+//! bicubic sample sums the device's decoded taps. The formats ([`srgb_coded`]) are
+//! `RGBA8Unorm_sRGB`, `BGRA8Unorm_sRGB`, `R8Unorm_sRGB` and `RG8Unorm_sRGB` (the probe), their
+//! `RGBX8Unorm_sRGB` kin, and the sRGB forms of BC1 to BC3, BC7, PVRTC, ETC2, EAC and ASTC, whose
+//! decoded 8-bit codes Metal decodes alike (an Apple M4, an Apple M3 Max): a device without such
+//! a compressed format samples its decoded twin through an `R8G8B8A8_SRGB` view of the twin's
+//! codes (`bind::AstcDecode`, `bind::PvrtcDecode`, `bind::EtcDecode`), its own decode again.
+//!
+//! A device that cannot sample an 8-bit sRGB format holds a sampled texture of it as the format's
+//! UNORM twin (`metal::format::srgb_raw_twin`, [`srgb_twin_on`]: `R8Unorm_sRGB` and
+//! `RG8Unorm_sRGB` on lavapipe, `RG8Unorm_sRGB` on ANV and NVIDIA among the committed profiles),
+//! whose views read the codes as `c / 255`. Having no sRGB decode there, the slot's
+//! `RuntimeFact::SrgbTexture` variant decodes what the view reads (one texel's codes, or the
+//! device's filter of them) by the MSL transfer through the device's `Pow`
+//! (`PrecisionNote::SrgbTexelDecode`).
 //!
 //! **Depth formats**. A depth texture has no `half` result, and no linear filter is emulated on
 //! one, so its class is read by a read, plain gather or sample of one texel with a `float` result
@@ -156,7 +154,6 @@
 
 use crate::metal::bicubic::{texels, BicubicTexels};
 use crate::metal::{PixelFormat, TextureSwizzleChannels};
-use crate::vk;
 
 /// The treatment of a bound format's texels with a `half` result: the value of the
 /// `SpecKey::TexelFormat` specialization constant, the bits of [`BicubicTexels`] for a measured
@@ -169,15 +166,6 @@ impl TexelFormat {
     /// decode rounded to `half` (`narrow::round_texel`) and filtered by the device. A slot bound to nothing reads zero, which
     /// every treatment converts alike.
     pub const OTHER: TexelFormat = TexelFormat(0);
-
-    /// The 8-bit unsigned normalized grid, `16 · 255`.
-    pub const GRID8: u32 = 16 * 255;
-    /// The 8-bit signed normalized grid, `16 · 127`.
-    pub const GRID8S: u32 = 16 * 127;
-    /// The 16-bit unsigned normalized grid, `65535`.
-    pub const GRID16: u32 = 65535;
-    /// The 16-bit signed normalized grid, `32767`.
-    pub const GRID16S: u32 = 32767;
 
     /// Bits `CORNER` to `CORNER + 3`: the [`CubeCorner`] of a format outside the measured
     /// families whose cube gather's tap past both edges of a face is measured (module docs), else
@@ -225,13 +213,11 @@ impl TexelFormat {
 
     /// Whether, on a device that samples through Metal's own texture unit, every access's `half`
     /// result of the class is the device's `float` texel rounded to nearest even
-    /// (`SpecKey::PlainHalfTexels`): the class has no 32-bit float channels
-    /// ([`BicubicTexels::LINEAR`], whose samples round toward zero), no 16-bit normalized grid
-    /// ([`BicubicTexels::WIDE16`]) and no YCbCr field on the grid `8192`
-    /// ([`TexelFormat::YCBCR_8192`], ties away): the arms of the routine's Metal-sampler body
-    /// other than its rounding to nearest even (`lower::texture::half`).
+    /// (`SpecKey::PlainHalfTexels`): the class has no YCbCr field on the grid `8192`
+    /// ([`TexelFormat::YCBCR_8192`], ties away), the routine's one arm other than its rounding to
+    /// nearest even (`lower::texture::half`).
     pub fn plain_on_metal_sampler(self) -> bool {
-        self.0 & (BicubicTexels::LINEAR | BicubicTexels::WIDE16 | TexelFormat::YCBCR_8192) == 0
+        self.0 & TexelFormat::YCBCR_8192 == 0
     }
 
     /// The families whose texels decode to no NaN: normalized channels, signed or not
@@ -303,18 +289,6 @@ pub enum CubeCorner {
 }
 
 impl CubeCorner {
-    /// Every corner, in field order.
-    pub const ALL: [CubeCorner; 8] = [
-        CubeCorner::XFace,
-        CubeCorner::Grid255,
-        CubeCorner::Grid1023,
-        CubeCorner::Grid565,
-        CubeCorner::Grid2047,
-        CubeCorner::Signed1023,
-        CubeCorner::Grid16320,
-        CubeCorner::Signed8128,
-    ];
-
     /// The corner of `pf`'s cube gather, where it is measured outside the families (the
     /// probes, Apple M4 on macOS 27.0.1). ASTC's HDR formats were read
     /// through `ASTC_4x4_HDR`'s void-extent blocks; the other block sizes and blocks take its
@@ -358,21 +332,6 @@ impl CubeCorner {
             P::BC4RUnorm | P::BC5RGUnorm => CubeCorner::Grid16320,
             P::BC4RSnorm | P::BC5RGSnorm => CubeCorner::Signed8128,
             _ => return None,
-        })
-    }
-
-    /// The made-up texel's grid `D` per channel (red to alpha), or `None` for the `x` face's
-    /// texel. A signed grid's codes read from `-D`.
-    pub fn grids(self) -> Option<[u32; 4]> {
-        Some(match self {
-            CubeCorner::XFace => return None,
-            CubeCorner::Grid255 => [255; 4],
-            CubeCorner::Grid1023 => [1023, 1023, 1023, 255],
-            CubeCorner::Grid565 => [1023, 4095, 1023, 255],
-            CubeCorner::Grid2047 => [2047; 4],
-            CubeCorner::Signed1023 => [1023; 4],
-            CubeCorner::Grid16320 => [16320; 4],
-            CubeCorner::Signed8128 => [8128; 4],
         })
     }
 
@@ -580,17 +539,6 @@ impl PackedTexels {
         )
     }
 
-    /// Whether every texture of the field's formats has one level: the two-plane YCbCr fields'
-    /// ([`ycbcr`](Self::ycbcr)), whose formats Metal makes a texture of only over an IOSurface
-    /// plane, which takes one level, as do its views. Metal's linear sample of such a texture
-    /// through a mip filter is its sample through none, bit for bit, whatever the level, bias or
-    /// gradient (an Apple M4 on macOS 27.0.1 and an Apple M3 Max on macOS
-    /// 26.7): the emulation of a runtime sampler's linear sample reaches its mip filter on such a
-    /// class (`lower::sampler::linear`).
-    pub fn one_level(self) -> bool {
-        self.ycbcr()
-    }
-
     /// Whether the filter's codes and steps are signed and reach `±2D`
     /// ([`YCbCrExtended8192`](Self::YCbCrExtended8192)): each step divided by `2D` and doubled,
     /// exactly.
@@ -642,8 +590,8 @@ pub fn texel_format(pf: PixelFormat) -> TexelFormat {
     }
     match texels(pf) {
         Some(t) if measured => TexelFormat(t.0),
-        // Measured through the raw view only: the device's view gives no code (module docs).
-        Some(t) if srgb_raw(pf) => TexelFormat(t.0 | BicubicTexels::SRGB),
+        // An sRGB format's family, its channels sRGB codes (module docs).
+        Some(t) if srgb_coded(pf) => TexelFormat(t.0 | BicubicTexels::SRGB),
         // A cube gather's corner, measured alone, and a packed format's codes, with its family
         // where Metal's linear filter of it is measured: a packed normalized format's `EXACT`
         // sum on its field's grids, a small float's half-float one (module docs).
@@ -735,13 +683,6 @@ pub fn reads_unswizzled(pf: PixelFormat, swizzle: TextureSwizzleChannels) -> boo
 /// class looks up in its own copy of this table. The binder and the function come from one build,
 /// whose `SEMANTICS_VERSION` changes with any class.
 ///
-/// After them, from the own-view base, the classes of `R16Float`, `RG16Float` and `RGBA16Float`
-/// again ([`HALF_BITS_FORMATS`]' order): the index of an unswizzled writable texture of one of them
-/// whose image takes no view in another format (`TextureFacts::own_format_views`), so a write
-/// through a heap handle reaches it through the float class, not the unsigned integer twin that
-/// holds its `half` bits elsewhere ([`heap_half_bits_indices`]). Every routine that reads the class
-/// takes it as the class of the same value, and a read of another numeric class as an own class's.
-///
 /// After them, from [`heap_extended_base`], one [`TexelFormat::OTHER`] per form of
 /// `ExtendedRange::HEAP_READ` in its order: the index of a heap texture of that form, whose texels
 /// a function decodes from its raw codes where the index names it, and which every routine that
@@ -762,8 +703,6 @@ pub fn heap_classes() -> &'static [u32] {
 /// markers, and the classes of the formats no read of another class takes.
 struct HeapLayout {
     classes: Vec<u32>,
-    /// Where the own-view half-float classes start, past the sorted own ones.
-    own_view: u32,
     extended: u32,
     numeric: u32,
     own_only: u32,
@@ -784,8 +723,6 @@ fn heap_layout() -> &'static HeapLayout {
         let of = |pf: PixelFormat| heap_class(pf, TextureSwizzleChannels::DEFAULT).0;
         let mut classes = sorted(PixelFormat::ALL.iter().map(|&pf| of(pf)).collect());
         let index = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-        let own_view = index(classes.len());
-        classes.extend(HALF_BITS_FORMATS.iter().map(|&pf| of(pf)));
         let extended = index(classes.len());
         classes.extend(
             crate::metal::format::ExtendedRange::HEAP_READ
@@ -804,7 +741,6 @@ fn heap_layout() -> &'static HeapLayout {
         ));
         HeapLayout {
             classes,
-            own_view,
             extended,
             numeric,
             own_only,
@@ -851,84 +787,6 @@ pub fn heap_numeric(pf: PixelFormat) -> Option<crate::pipeline::sym::SampledType
     }
 }
 
-/// The indices in [`heap_classes`] of the half-float family without a packed field (`R16Float`,
-/// `RG16Float`, `RGBA16Float`, each its own channels, and `RGBX16Float`, `RGBA16Float`'s with
-/// three): the classes whose float write through a heap handle takes the half-float storage class,
-/// which a write tests by its handle's index alone.
-pub fn heap_half_indices() -> Vec<u32> {
-    use crate::metal::bicubic::BicubicTexels;
-    heap_classes()
-        .iter()
-        .enumerate()
-        .filter(|(_, &c)| {
-            c & (BicubicTexels::HALF | TexelFormat::PACKED_MASK) == BicubicTexels::HALF
-        })
-        .filter_map(|(i, _)| u32::try_from(i).ok())
-        .collect()
-}
-
-/// The half-float formats whose texture a heap's unsigned integer twin
-/// (`StorageFormatClass::HalfBits`) holds through its unsigned integer alias, in the own-view
-/// classes' order ([`heap_classes`]). `RGBX16Float` is not among them: no heap storage class
-/// holds an RGBX texture (`bind::heap`'s storage elements), whose conversion a formatless
-/// declaration cannot make per element.
-pub const HALF_BITS_FORMATS: [PixelFormat; 3] = [
-    PixelFormat::R16Float,
-    PixelFormat::RG16Float,
-    PixelFormat::RGBA16Float,
-];
-
-/// The indices in [`heap_classes`] of [`HALF_BITS_FORMATS`]' own classes: a write through a heap
-/// handle carrying one stores the `half` bits through the unsigned integer twin, where the module
-/// declares one (`HeapPlan::bits`). A texture of such a format whose image takes no view in
-/// another format carries the class's own-view index instead ([`heap_own_view_index`]).
-pub fn heap_half_bits_indices() -> Vec<u32> {
-    HALF_BITS_FORMATS
-        .iter()
-        .map(|&pf| heap_class_index(pf, TextureSwizzleChannels::DEFAULT))
-        .collect()
-}
-
-/// The own-view index in [`heap_classes`] of a texture of `pf` made with `swizzle` whose image
-/// takes no view in another format: for an unswizzled one of [`HALF_BITS_FORMATS`], its class's
-/// own-view entry, which holds the same class as [`heap_class_index`]'s but is none of
-/// [`heap_half_bits_indices`] (a swizzle that reads as none keeps it, [`reads_unswizzled`]);
-/// `None` for every other texture, whose index is its own.
-pub fn heap_own_view_index(pf: PixelFormat, swizzle: TextureSwizzleChannels) -> Option<u32> {
-    let k = HALF_BITS_FORMATS.iter().position(|&f| f == pf)?;
-    let k = u32::try_from(k).ok()?;
-    reads_unswizzled(pf, swizzle).then_some(heap_layout().own_view + k)
-}
-
-/// The indices in [`heap_classes`] of the small floats' class (`RG11B10Float`'s, which
-/// `RGB9E5Float` shares; a swizzled texture's is `OTHER`): the classes whose `float` write
-/// through a heap handle quiets its NaNs (`StorageImageClass::SmallFloatQuietNan`), which a write
-/// tests by its handle's index alone.
-pub fn heap_small_float_indices() -> Vec<u32> {
-    let small = (PackedTexels::SmallFloat as u32) << TexelFormat::PACKED;
-    heap_classes()
-        .iter()
-        .enumerate()
-        .filter(|(_, &c)| c & TexelFormat::PACKED_MASK == small)
-        .filter_map(|(i, _)| u32::try_from(i).ok())
-        .collect()
-}
-
-/// The indices in [`heap_classes`] of the classes of a 1-bit alpha ([`PackedTexels::Rgb5A1`]'s
-/// field: `A1BGR5Unorm`, `BGR5A1Unorm`; a swizzled texture's is `OTHER`): the classes whose
-/// `float` write through a heap handle writes alpha 1 only above one half on a device measured to
-/// store every other normalized channel as Metal does (`StorageImageClass::OneBitAlpha`), which a
-/// write tests by its handle's index alone.
-pub fn heap_one_bit_indices() -> Vec<u32> {
-    let one_bit = (PackedTexels::Rgb5A1 as u32) << TexelFormat::PACKED;
-    heap_classes()
-        .iter()
-        .enumerate()
-        .filter(|(_, &c)| c & TexelFormat::PACKED_MASK == one_bit)
-        .filter_map(|(i, _)| u32::try_from(i).ok())
-        .collect()
-}
-
 /// The index in [`heap_classes`] of `A8Unorm`'s class, which no other format's texture carries:
 /// a storage read or write through a heap handle carrying it converts the member's texels where
 /// the device holds such a texture's alpha in red (`metal::format::alpha_in_red`), which a heap's
@@ -940,9 +798,7 @@ pub fn heap_alpha_in_red_index() -> u32 {
 }
 
 /// Whether a texture of pixel format `pf` holds 16-bit float channels of its own: its class is
-/// the half-float family's without a packed field ([`heap_half_indices`]' classes), so a written
-/// `half` stores its NaN there as the half's own bits, and elsewhere as the conversion of
-/// `0x7fc00000` (`PushField::TextureHalfChannels`).
+/// the half-float family's without a packed field.
 pub fn half_channels(pf: PixelFormat) -> bool {
     use crate::metal::bicubic::BicubicTexels;
     texel_format(pf).0 & (BicubicTexels::HALF | TexelFormat::PACKED_MASK) == BicubicTexels::HALF
@@ -976,7 +832,7 @@ pub fn heap_class_index(pf: PixelFormat, swizzle: TextureSwizzleChannels) -> u32
         return base + k;
     }
     let (from, own) = match crosses_classes(pf) {
-        true => (0, &layout.classes[..layout.own_view as usize]),
+        true => (0, &layout.classes[..layout.extended as usize]),
         false => (layout.own_only, &layout.classes[layout.own_only as usize..]),
     };
     let class = heap_class(pf, swizzle).0;
@@ -984,14 +840,10 @@ pub fn heap_class_index(pf: PixelFormat, swizzle: TextureSwizzleChannels) -> u32
         .map_or(from, |i| from + u32::try_from(i).unwrap_or(0))
 }
 
-/// Whether Metal decodes `pf`'s texels from their raw 8-bit codes through its twelve-bit table
-/// (module docs): the 8-bit sRGB formats whose raw code a UNORM view of the same image reads,
-/// the sRGB forms of BC1 to BC3 and BC7, whose codes their unorm views decode, the PVRTC,
-/// ETC2 and EAC sRGB formats, whose codes their linear forms decode (`bind::PvrtcDecode`,
-/// `bind::EtcDecode`; a decoded twin's codes on a device without them), and the ASTC sRGB
-/// formats, whose codes their decoded twin holds (`bind::AstcDecode`), which a device takes only
-/// where it holds the twin ([`srgb_raw_on`]).
-pub fn srgb_raw(pf: PixelFormat) -> bool {
+/// Whether `pf`'s color channels are 8-bit sRGB codes, which Metal decodes through its twelve-bit
+/// table (module docs): the 8-bit sRGB formats, and the sRGB forms of BC1 to BC3, BC7, PVRTC, ETC2,
+/// EAC and ASTC, whose blocks decode to such codes.
+pub fn srgb_coded(pf: PixelFormat) -> bool {
     use PixelFormat as P;
     matches!(
         pf,
@@ -1028,44 +880,15 @@ pub fn srgb_raw(pf: PixelFormat) -> bool {
     )
 }
 
-/// Whether `profile`'s device reads a texture of `pf` from its raw codes as Metal decodes them
-/// ([`srgb_raw`]): where the format it samples `pf` in has a raw view ([`srgb_raw_view`]), or where
-/// it samples no format of `pf`'s, which the binder holds as its UNORM twin
-/// (`metal::format::srgb_raw_twin`) or refuses. An ASTC sRGB format a device samples itself has
-/// none: its unorm form widens the blocks' endpoints the LDR way (`bind::AstcDecode`), so no view
-/// of its image reads Metal's codes, and the device's own sRGB decode answers.
-pub fn srgb_raw_on(pf: PixelFormat, profile: &crate::device::profile::DeviceProfile) -> bool {
+/// Whether `profile`'s device holds a sampled texture of `pf` as its 8-bit sRGB format's UNORM twin
+/// (`metal::format::srgb_raw_twin`): it samples no format of `pf`'s and samples the twin's, whose
+/// views read the codes, so a function decodes them itself (module docs). The runtime's image plan
+/// holds the twin by the same format features.
+pub fn srgb_twin_on(pf: PixelFormat, profile: &crate::device::profile::DeviceProfile) -> bool {
     use crate::device::requirements::FormatUsage;
     let usages = [FormatUsage::SampledImage].into();
-    srgb_raw(pf)
-        && match crate::metal::format::vk_format(pf, &usages, profile) {
-            Ok(m) => srgb_raw_view(m.format).is_some(),
-            Err(_) => true,
-        }
-}
-
-/// The raw view's format of an image of Vulkan format `format`, the sampled view of an
-/// [`srgb_raw`] format: the UNORM format of the same channels and bits (a BC, PVRTC, ETC2 or EAC
-/// format's of the same blocks), which views the image's texels as their codes (`c / 255`). `None` for any
-/// other format.
-pub fn srgb_raw_view(format: vk::Format) -> Option<vk::Format> {
-    use vk::Format as F;
-    Some(match format {
-        F::R8_SRGB => F::R8_UNORM,
-        F::R8G8_SRGB => F::R8G8_UNORM,
-        F::R8G8B8A8_SRGB => F::R8G8B8A8_UNORM,
-        F::B8G8R8A8_SRGB => F::B8G8R8A8_UNORM,
-        F::BC1_RGBA_SRGB_BLOCK => F::BC1_RGBA_UNORM_BLOCK,
-        F::BC2_SRGB_BLOCK => F::BC2_UNORM_BLOCK,
-        F::BC3_SRGB_BLOCK => F::BC3_UNORM_BLOCK,
-        F::BC7_SRGB_BLOCK => F::BC7_UNORM_BLOCK,
-        F::PVRTC1_2BPP_SRGB_BLOCK_IMG => F::PVRTC1_2BPP_UNORM_BLOCK_IMG,
-        F::PVRTC1_4BPP_SRGB_BLOCK_IMG => F::PVRTC1_4BPP_UNORM_BLOCK_IMG,
-        F::ETC2_R8G8B8_SRGB_BLOCK => F::ETC2_R8G8B8_UNORM_BLOCK,
-        F::ETC2_R8G8B8A1_SRGB_BLOCK => F::ETC2_R8G8B8A1_UNORM_BLOCK,
-        F::ETC2_R8G8B8A8_SRGB_BLOCK => F::ETC2_R8G8B8A8_UNORM_BLOCK,
-        _ => return None,
-    })
+    let samples = |pf| crate::metal::format::vk_format(pf, &usages, profile).is_ok();
+    !samples(pf) && crate::metal::format::srgb_raw_twin(pf).is_some_and(samples)
 }
 
 #[cfg(test)]
@@ -1073,43 +896,34 @@ mod tests {
     use super::*;
     use BicubicTexels as T;
 
-    /// The raw view is the UNORM twin of each candidate image format of an [`srgb_raw`] format (a
-    /// PVRTC, ETC2, EAC or ASTC sRGB format's decoded twin's among them), but an ASTC sRGB
-    /// format's own block, whose unorm form decodes the blocks the LDR way; nothing else has one.
+    /// An sRGB-coded format's twin (`metal::format::srgb_raw_twin`) is a format whose direct image
+    /// format is the UNORM format of the sRGB format's own class: the same channels and bits, read
+    /// as their codes; nothing else has one, nor an ASTC sRGB format, whose unorm form decodes the
+    /// blocks otherwise.
     #[test]
-    fn an_srgb_format_has_a_raw_view_of_its_own_channels() {
-        for &pf in PixelFormat::ALL {
-            let astc = crate::bind::AstcDecode::of(pf).is_some();
-            for format in crate::metal::format::candidate_formats(pf) {
-                let own_block = astc && crate::metal::format::direct_format(pf) == Some(format);
-                assert_eq!(
-                    srgb_raw_view(format).is_some(),
-                    srgb_raw(pf) && !own_block,
-                    "{pf:?}: {format:?}"
-                );
-            }
-        }
-        assert_eq!(
-            srgb_raw_view(vk::Format::B8G8R8A8_SRGB),
-            Some(vk::Format::B8G8R8A8_UNORM)
-        );
-    }
-
-    /// An [`srgb_raw`] format's twin (`metal::format::srgb_raw_twin`) is a format whose direct
-    /// image format is the raw view of the sRGB format's: the same channels and bits, read as
-    /// their codes; nothing else has one, nor an ASTC sRGB format.
-    #[test]
-    fn an_srgb_format_s_twin_holds_its_raw_view() {
+    fn an_srgb_format_s_twin_holds_its_codes() {
         for &pf in PixelFormat::ALL {
             match crate::metal::format::srgb_raw_twin(pf) {
                 Some(twin) => {
-                    assert!(srgb_raw(pf), "{pf:?}");
-                    let own = crate::metal::format::direct_format(pf).and_then(srgb_raw_view);
-                    assert_eq!(own, crate::metal::format::direct_format(twin), "{pf:?}");
+                    assert!(srgb_coded(pf), "{pf:?}");
+                    let own = crate::metal::format::direct_format(pf).and_then(|f| f.block());
+                    let codes = crate::metal::format::direct_format(twin).and_then(|f| f.block());
+                    // A PVRTC RGB format and its twin are held only through decoded twins.
+                    let (own, codes) = match (own, codes) {
+                        (Some(own), Some(codes)) => (own, codes),
+                        (None, None) => continue,
+                        _ => panic!("{pf:?}: one of the pair without a direct format"),
+                    };
+                    assert_eq!(own.color, Some(crate::vk::NumericFormat::Srgb), "{pf:?}");
+                    assert_eq!(codes.color, Some(crate::vk::NumericFormat::Unorm), "{pf:?}");
+                    assert_eq!(
+                        (own.class, own.size, own.component_bits),
+                        (codes.class, codes.size, codes.component_bits),
+                        "{pf:?}"
+                    );
                 }
-                // An ASTC sRGB format has none: its unorm form decodes the blocks otherwise.
                 None => assert!(
-                    !srgb_raw(pf) || crate::bind::AstcDecode::of(pf).is_some(),
+                    !srgb_coded(pf) || crate::bind::AstcDecode::of(pf).is_some(),
                     "{pf:?}"
                 ),
             }
@@ -1132,7 +946,7 @@ mod tests {
 
     /// An RGBX format converts as its RGBA twin with red, green and blue (every
     /// read, sample, gather and bicubic sample equals the twin's but for alpha 1): its family,
-    /// an `_sRGB` one's raw codes through the twin's raw view.
+    /// an `_sRGB` one's sRGB codes.
     #[test]
     fn rgbx_formats_convert_as_their_twins_with_three_channels() {
         use PixelFormat as P;
@@ -1151,7 +965,7 @@ mod tests {
                 [true, true, true, false],
                 "{pf:?}"
             );
-            assert_eq!(srgb_raw(pf), srgb_raw(twin), "{pf:?}");
+            assert_eq!(srgb_coded(pf), srgb_coded(twin), "{pf:?}");
         }
         // The integer formats, as their twins, convert by no family.
         for pf in [P::RGBX8Uint, P::RGBX16Sint, P::RGBX32Uint] {
@@ -1244,18 +1058,21 @@ mod tests {
             assert!(!alone.has_channels(), "{pf:?}");
             seen.insert(corner as u32);
         }
-        for (k, corner) in CubeCorner::ALL.into_iter().enumerate() {
+        let every = [
+            CubeCorner::XFace,
+            CubeCorner::Grid255,
+            CubeCorner::Grid1023,
+            CubeCorner::Grid565,
+            CubeCorner::Grid2047,
+            CubeCorner::Signed1023,
+            CubeCorner::Grid16320,
+            CubeCorner::Signed8128,
+        ];
+        for (k, corner) in every.into_iter().enumerate() {
             assert_eq!(corner as u32, k as u32 + 1);
             assert_eq!(corner.class().0 >> TexelFormat::CORNER, corner as u32);
             assert!(corner.class().0 & TexelFormat::CORNER_MASK == corner.class().0);
-            for d in corner.grids().into_iter().flatten() {
-                assert!((1..1 << 16).contains(&d), "{corner:?}");
-            }
             assert!(seen.contains(&(corner as u32)), "{corner:?} has no format");
-        }
-        // The emission takes every field after `XFace` for a corner with grids.
-        for corner in CubeCorner::ALL {
-            assert_eq!(corner.grids().is_none(), corner == CubeCorner::XFace);
         }
         // The measured families keep no corner field.
         for pf in [
@@ -1455,16 +1272,7 @@ mod tests {
         let classes = heap_classes();
         let base = heap_extended_base() as usize;
         assert_eq!(classes.first(), Some(&TexelFormat::OTHER.0));
-        let own_view = heap_layout().own_view as usize;
-        assert_eq!(own_view + HALF_BITS_FORMATS.len(), base);
-        assert!(classes[..own_view].windows(2).all(|w| w[0] < w[1]));
-        for (k, &pf) in HALF_BITS_FORMATS.iter().enumerate() {
-            let own = heap_class_index(pf, TextureSwizzleChannels::DEFAULT) as usize;
-            assert!(own < own_view, "{pf:?}");
-            let viewed = heap_own_view_index(pf, TextureSwizzleChannels::DEFAULT);
-            assert_eq!(viewed, Some((own_view + k) as u32), "{pf:?}");
-            assert_eq!(classes[own_view + k], classes[own], "{pf:?}");
-        }
+        assert!(classes[..base].windows(2).all(|w| w[0] < w[1]));
         let numeric = heap_numeric_base() as usize;
         assert_eq!(numeric, base + ExtendedRange::HEAP_READ.len());
         let own_only = heap_layout().own_only as usize;
@@ -1567,44 +1375,30 @@ mod tests {
         assert_ne!(heap_class_index(PixelFormat::A8Unorm, moved), a8);
     }
 
-    /// The half-float heap classes a float write tests by index are the unswizzled half-float
-    /// formats' and no other format's: `RGBX16Float`'s too, `RGBA16Float`'s texels with three
-    /// channels, whose writes take the half class as its twin's.
-    ///
-    /// The own-view entries of `R16Float`, `RG16Float` and `RGBA16Float` are half classes too, and
-    /// the twin's indices are exactly those formats' own: no other format's texture, swizzled or
-    /// not, carries one, and none carries an own-view index.
+    /// The heap classes of the half-float family without a packed field are the unswizzled
+    /// half-float formats' and no other format's: `RGBX16Float`'s too, `RGBA16Float`'s texels with
+    /// three channels.
     #[test]
     fn a_heap_write_finds_the_half_formats_by_index() {
-        let half = heap_half_indices();
+        use crate::metal::bicubic::BicubicTexels;
+        let half: Vec<u32> = heap_classes()
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| {
+                c & (BicubicTexels::HALF | TexelFormat::PACKED_MASK) == BicubicTexels::HALF
+            })
+            .filter_map(|(i, _)| u32::try_from(i).ok())
+            .collect();
         let wanted = [
             PixelFormat::R16Float,
             PixelFormat::RG16Float,
             PixelFormat::RGBA16Float,
             PixelFormat::RGBX16Float,
         ];
-        assert_eq!(
-            half.len(),
-            wanted.len() + HALF_BITS_FORMATS.len(),
-            "{half:?}"
-        );
-        let bits = heap_half_bits_indices();
-        let swizzle = TextureSwizzleChannels::new(
-            crate::metal::TextureSwizzle::Blue,
-            crate::metal::TextureSwizzle::Green,
-            crate::metal::TextureSwizzle::Red,
-            crate::metal::TextureSwizzle::Alpha,
-        );
+        assert_eq!(half.len(), wanted.len(), "{half:?}");
         for &pf in PixelFormat::ALL {
             let i = heap_class_index(pf, TextureSwizzleChannels::DEFAULT);
             assert_eq!(half.contains(&i), wanted.contains(&pf), "{pf:?}");
-            assert_eq!(bits.contains(&i), HALF_BITS_FORMATS.contains(&pf), "{pf:?}");
-            assert!(!bits.contains(&heap_class_index(pf, swizzle)), "{pf:?}");
-            let viewed = heap_own_view_index(pf, TextureSwizzleChannels::DEFAULT);
-            assert_eq!(viewed.is_some(), HALF_BITS_FORMATS.contains(&pf), "{pf:?}");
-            if let Some(v) = viewed {
-                assert!(half.contains(&v) && !bits.contains(&v), "{pf:?}");
-            }
         }
     }
 

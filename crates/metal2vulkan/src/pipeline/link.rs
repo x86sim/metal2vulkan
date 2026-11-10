@@ -37,7 +37,10 @@
 //!   descriptors; otherwise the same layout is used as a pooled set.
 //! - **Render state** ([`vertex`], [`graphics`]): `VertexInputState` and `GraphicsState` from the
 //!   descriptor, checked against the vertex stage's compiled fetch projection, with the fragment
-//!   stage's imageblock ([`imageblock`]) and interlocked framebuffer fetch ([`fetch`]). A mesh
+//!   stage's imageblock ([`imageblock`]) and interlocked framebuffer fetch ([`fetch`]), and the
+//!   precision notes of the formats fixed-function vertex input converts for the vertex stage
+//!   (`vertex::fixed_function_notes`), which the module, shared by every such format, cannot
+//!   record, with the measured properties a conversion relies on in place of a note. A mesh
 //!   render pipeline has an object stage when it has an object function, its mesh stage, and a
 //!   fragment stage exactly when it rasterizes; its `GraphicsState` is a render pipeline's with the
 //!   mesh stage in the vertex stage's place, and it has no vertex input. An emulated mesh
@@ -64,18 +67,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::cache::VariantKey;
 use crate::device::requirements::VkFeature;
 use crate::device::requirements::VkLimit;
+use crate::device::requirements::VkProperty;
 use crate::device::DeviceProfile;
 use crate::error::{
     Capability, DescriptorError, Error, Feature, InternalError, InternalKind, Unsupported,
 };
 use crate::library::FunctionArtifact;
 use crate::metal;
-use crate::pipeline::artifact::{SpecConstant, SpecializationLayout};
+use crate::pipeline::artifact::{PrecisionNote, SpecConstant, SpecializationLayout};
 use crate::pipeline::descriptor::{
     ColorAttachmentDescriptor, MeshPipelineDescriptor, RenderPipelineDescriptor,
     TessellationDescriptor, VertexDescriptor,
 };
-use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::graphics::GraphicsState;
 use crate::pipeline::interface::{PipelineInterface, StageDescriptor, StageInterface};
 use crate::pipeline::layout::{
@@ -265,6 +268,27 @@ pub struct Linked {
     pub layout: PipelineLayout,
     /// Empty except for a render pipeline.
     pub vertex_input: VertexInputState,
+    /// The precision notes of the vertex stage's fixed-function attributes under this pipeline's
+    /// vertex descriptor (`vertex::fixed_function_notes`), sorted: the compile API adds them to the
+    /// vertex stage's notes. Empty but for a render pipeline whose vertex input converts a
+    /// format otherwise than Metal's fetch may.
+    pub vertex_notes: Vec<PrecisionNote>,
+    /// The measured properties the vertex stage's fixed-function attributes rely on in place of a
+    /// note under this pipeline's vertex descriptor (`vertex::fixed_function_notes`): the compile
+    /// API adds them to the pipeline's requirements. Empty but for a render pipeline whose vertex
+    /// input converts a normalized format on a profile measured to convert it as Metal does
+    /// (`VkProperty::MetalNormalizedVertexFetch`).
+    pub vertex_properties: BTreeSet<VkProperty>,
+    /// The precision notes of the pipeline's fixed-function fragment operations under its graphics
+    /// state (`graphics::coverage_notes`), sorted: the compile API adds them to the fragment
+    /// stage's notes. Empty but for a render pipeline that covers by alpha on a profile not
+    /// measured to cover as Metal does (`PrecisionNote::DeviceAlphaCoverage`).
+    pub fragment_notes: Vec<PrecisionNote>,
+    /// The measured properties the pipeline's fixed-function fragment operations rely on in place
+    /// of a note (`graphics::coverage_notes`): the compile API adds them to the pipeline's
+    /// requirements. Empty but for a render pipeline that covers by alpha on a profile measured to
+    /// cover as Metal does (`VkProperty::MetalAlphaCoverage`).
+    pub fragment_properties: BTreeSet<VkProperty>,
     pub interface: PipelineInterface,
     /// `Some` exactly for a render pipeline.
     pub graphics: Option<GraphicsState>,
@@ -378,6 +402,7 @@ pub fn link(
         g.check_limits(&table.locations, p)?;
     }
     let interface = pipeline_interface(&ifaces);
+    let mut vertex_notes = vertex::FixedFunctionNotes::default();
     let (vertex_input, graphics) = match inputs {
         LinkInputs::Render(r) => {
             let vs = ifaces.first().ok_or_else(|| missing_stage(Stage::Vertex))?;
@@ -385,21 +410,18 @@ pub fn link(
                 (Some(_), _) | (_, Some(_)) => {
                     tessellation::vertex_input_state(vs, r.vertex_descriptor.as_ref())?
                 }
-                // A vertex function compiled in the indexed capture form pulled every attribute:
-                // its fact says so.
-                (None, None) => vertex::vertex_input_state(
-                    vs,
-                    r.vertex_descriptor.as_ref(),
-                    &r.pulled_vertex_buffers,
-                    stages.first().is_some_and(|a| {
-                        a.facts.iter().any(|f| {
-                            matches!(f, RuntimeFact::CapturedPositions { form }
-                                if form.index_type().is_some())
-                        })
-                    }),
-                    &table.locations,
-                    p,
-                )?,
+                (None, None) => {
+                    let vi = vertex::vertex_input_state(
+                        vs,
+                        r.vertex_descriptor.as_ref(),
+                        &r.pulled_vertex_buffers,
+                        &table.locations,
+                        p,
+                    )?;
+                    vertex_notes =
+                        vertex::fixed_function_notes(vs, r.vertex_descriptor.as_ref(), p)?;
+                    vi
+                }
             };
             let ts = control.map(|(plan, offset)| plan.state(offset));
             let mut gs = render_state(r, vs, stages.get(1).copied(), &vi, ts, p)?;
@@ -435,6 +457,10 @@ pub fn link(
         }
         LinkInputs::Standalone | LinkInputs::Compute => (VertexInputState::default(), None),
     };
+    let fragment_notes = graphics
+        .as_ref()
+        .map(|g| graphics::coverage_notes(g, p))
+        .unwrap_or_default();
     // Totality: every relocation of every stage resolves. A miss is a link bug.
     for a in stages {
         if let Some((sym, _)) = a
@@ -453,6 +479,10 @@ pub fn link(
         table,
         layout,
         vertex_input,
+        vertex_notes: vertex_notes.notes,
+        vertex_properties: vertex_notes.properties,
+        fragment_notes: fragment_notes.notes,
+        fragment_properties: fragment_notes.properties,
         interface,
         graphics,
         specialization,
@@ -656,19 +686,21 @@ fn binding_source(slot: ResourceSlot) -> BindingSource {
             stage: slot.stage,
             sampler: CombinedSampler::from_heap_index(sampler, slot.index),
         },
-        ResourceKind::RawTexture => BindingSource::RawTexture(metal(SlotClass::Texture)),
         ResourceKind::ExtendedShadow(color) => BindingSource::ExtendedShadow(color),
         ResourceKind::SnapshotTexels(texture) => BindingSource::SnapshotTexels(texture),
+        ResourceKind::YCbCrPlanes(_) => BindingSource::YCbCrPlanes(metal(SlotClass::Texture)),
     }
 }
 
 /// The immutable sampler of binding `slot`: a combined image sampler's, heap sampler's, or
-/// separate sampler's constexpr sampler, made for its use.
+/// separate sampler's constexpr sampler, made for its use; a planes image's device conversion
+/// (`ResourceKind::YCbCrPlanes`).
 fn immutable_sampler(
     slot: ResourceSlot,
     p: &DeviceProfile,
 ) -> Result<Option<vk::SamplerDesc>, Error> {
     let c = match slot.kind {
+        ResourceKind::YCbCrPlanes(sampler) => return Ok(Some(vk::SamplerDesc::ycbcr(sampler))),
         ResourceKind::CombinedTextureSampler(c) => c,
         ResourceKind::HeapSampler(sampler) | ResourceKind::SeparateSampler(sampler) => {
             CombinedSampler::from_heap_index(sampler, slot.index)
@@ -789,8 +821,12 @@ fn layout(
                 )));
             }
             // A combined image sampler is exactly a `CombinedTextureSampler` symbol, which names
-            // its texture slot and its sampler.
-            let combined = matches!(d.slot.kind, ResourceKind::CombinedTextureSampler(_));
+            // its texture slot and its sampler, or a planes image's (`YCbCrPlanes`), which names
+            // its texture slot and the conversion its immutable sampler bakes.
+            let combined = matches!(
+                d.slot.kind,
+                ResourceKind::CombinedTextureSampler(_) | ResourceKind::YCbCrPlanes(_)
+            );
             if combined != (d.ty == vk::DescriptorType::COMBINED_IMAGE_SAMPLER) {
                 return Err(Error::Internal(InternalError::new(
                     InternalKind::Invariant,

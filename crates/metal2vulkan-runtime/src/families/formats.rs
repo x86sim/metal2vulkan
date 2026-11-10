@@ -14,7 +14,7 @@
 //!   integers: Metal filters none, a stencil view's included, nor a bfloat format's (a linear
 //!   sample reads the nearest texel). A texture held as its sRGB format's UNORM twin
 //!   (`image_plan::holds_srgb_twin`) is filtered by the device through the twin's view and the
-//!   filtered codes decoded through Metal's table (`PrecisionNote::SrgbTexelDecode`): its Filter
+//!   filtered codes decoded by the device's transfer (`PrecisionNote::SrgbTexelDecode`): its Filter
 //!   is the twin's linear filter. An extended-range texture
 //!   (`ExtendedRange`) is filtered by the shader from fetches of its raw texels on every device:
 //!   its Filter is its `ShaderRead` texture's.
@@ -1580,9 +1580,9 @@ impl FormatRow {
 impl Device {
     /// The answers of `pf` on this device (the module docs), worked out once per format.
     pub(crate) fn format_answers(&self, pf: PixelFormat) -> FormatAnswers {
-        // A format the device's Metal level describes none of answers nothing: Metal stops every
-        // texture of one (the 24-bit depth formats among them, whatever the Vulkan driver has).
-        if !self.properties().metal_level.describes(pf) {
+        // A format Metal describes none of answers nothing: Metal stops every texture of one (the
+        // 24-bit depth formats among them, whatever the Vulkan driver has).
+        if !crate::pixel_format_info::describes(pf) {
             return FormatAnswers::none();
         }
         let textures = &self.shared().textures;

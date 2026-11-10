@@ -124,7 +124,6 @@ fn every_fact() -> Vec<RuntimeFact> {
         RuntimeFact::PredicationVote,
         RuntimeFact::TexelFormat { slot },
         RuntimeFact::SrgbTexture { slot },
-        RuntimeFact::HalfBitsTexture { slot },
         RuntimeFact::UlongAtomicView { slot },
         RuntimeFact::ViewportCount,
         RuntimeFact::AliasedImageblock { data_size: 24 },
@@ -157,11 +156,15 @@ fn every_fact() -> Vec<RuntimeFact> {
         RuntimeFact::QuadPrimitiveIds,
         RuntimeFact::RotatedWeights,
         RuntimeFact::PrivateList,
+        RuntimeFact::YCbCrInPlace {
+            slot,
+            samplers: 1,
+            device: true,
+        },
         RuntimeFact::MeshLastFirst,
         RuntimeFact::AbsentArgumentRead {
             stage: Stage::Fragment,
         },
-        RuntimeFact::SrgbDeviceDecode { slot },
         RuntimeFact::ZeroedColor {
             color: 1,
             format: crate::metal::PixelFormat::RGBA8Unorm,
@@ -174,7 +177,6 @@ fn every_fact() -> Vec<RuntimeFact> {
             early_tests: false,
             early_variant: true,
         },
-        RuntimeFact::YCbCrTexture { slot },
         RuntimeFact::TileThreadgroup { tile_sized: true },
         RuntimeFact::ConstexprSampled {
             slot,
@@ -189,11 +191,7 @@ fn every_fact() -> Vec<RuntimeFact> {
             multisampled: true,
             planes: true,
         },
-        RuntimeFact::StorageTextureHalfChannels { slot },
         RuntimeFact::StorageTextureIntegerChannels { slot },
-        RuntimeFact::CapturedPositions {
-            form: crate::pipeline::CaptureForm::Indexed(crate::metal::IndexType::UInt16),
-        },
         RuntimeFact::HeapRawSamples {
             stage: Stage::Fragment,
             sampler: Some(1),
@@ -240,19 +238,9 @@ fn every_fact() -> Vec<RuntimeFact> {
                 index: 0,
             },
         },
-        RuntimeFact::HeapHalfTexelWrites {
-            stage: Stage::Kernel,
-            packed: true,
-        },
         RuntimeFact::MovableStorageWrites {
             early_variant: true,
         },
-        RuntimeFact::Depth16Codes { biased: true },
-        RuntimeFact::Depth16Codes { biased: false },
-        RuntimeFact::Depth16Pass { depth16: true },
-        RuntimeFact::Depth16Biased,
-        RuntimeFact::Depth16BiasSide { raises: true },
-        RuntimeFact::Depth16BiasSide { raises: false },
         RuntimeFact::SynthesizedGeometry {
             weights: true,
             layer: false,
@@ -270,16 +258,6 @@ fn every_fact() -> Vec<RuntimeFact> {
         RuntimeFact::ObjectThreadgroupArena {
             static_bytes: 0,
             payload: None,
-        },
-        RuntimeFact::ExactFormsOverCompilerLimit {
-            sampling: true,
-            float_maths: true,
-            texel_conversion: false,
-            half_rounding: false,
-            nan_and_min_max: true,
-            rounding_order: false,
-            half_blend: false,
-            half_texel_bits: true,
         },
     ]
 }
@@ -333,7 +311,6 @@ fn variant(f: &RuntimeFact) -> usize {
         RuntimeFact::PredicationVote => 42,
         RuntimeFact::TexelFormat { .. } => 43,
         RuntimeFact::SrgbTexture { .. } => 44,
-        RuntimeFact::HalfBitsTexture { .. } => 98,
         RuntimeFact::UlongAtomicView { .. } => 45,
         RuntimeFact::ViewportCount => 46,
         RuntimeFact::AliasedImageblock { .. } => 47,
@@ -347,21 +324,17 @@ fn variant(f: &RuntimeFact) -> usize {
         RuntimeFact::ViewportCompensation { .. } => 55,
         RuntimeFact::FoldedGroups => 56,
         RuntimeFact::AbsentArgumentRead { .. } => 57,
-        RuntimeFact::SrgbDeviceDecode { .. } => 58,
         RuntimeFact::ZeroedColor { .. } => 59,
         RuntimeFact::DroppedColor { .. } => 60,
         RuntimeFact::DepthClampRange => 61,
         RuntimeFact::ConstantLanes { .. } => 62,
         RuntimeFact::FunctionTableRange { .. } => 63,
         RuntimeFact::TestedStorageWrites { .. } => 64,
-        RuntimeFact::YCbCrTexture { .. } => 65,
         RuntimeFact::TileThreadgroup { .. } => 66,
         RuntimeFact::ConstexprSampled { .. } => 67,
         RuntimeFact::CubicSampler { .. } => 68,
         RuntimeFact::CubicArgumentSampler { .. } => 69,
         RuntimeFact::ShaderTests { .. } => 70,
-        RuntimeFact::StorageTextureHalfChannels { .. } => 71,
-        RuntimeFact::CapturedPositions { .. } => 72,
         RuntimeFact::HeapRawSamples { .. } => 73,
         RuntimeFact::ShaderStencilTest { .. } => 74,
         RuntimeFact::ExtendedRangeInputBlend { .. } => 75,
@@ -371,22 +344,17 @@ fn variant(f: &RuntimeFact) -> usize {
         RuntimeFact::HeapCrossClassNeutral { .. } => 79,
         RuntimeFact::AnisotropicSampler { .. } => 80,
         RuntimeFact::StorageTextureIntegerChannels { .. } => 81,
-        RuntimeFact::HeapHalfTexelWrites { .. } => 82,
         RuntimeFact::MovableStorageWrites { .. } => 83,
-        RuntimeFact::Depth16Codes { .. } => 84,
-        RuntimeFact::Depth16Pass { .. } => 85,
-        RuntimeFact::Depth16Biased => 86,
-        RuntimeFact::Depth16BiasSide { .. } => 87,
-        RuntimeFact::SynthesizedGeometry { .. } => 88,
-        RuntimeFact::ObjectThreadgroupArena { .. } => 89,
-        RuntimeFact::ExactFormsOverCompilerLimit { .. } => 90,
-        RuntimeFact::WordInputMerge { .. } => 91,
-        RuntimeFact::ReplayBindings => 92,
-        RuntimeFact::MergedDraws => 93,
-        RuntimeFact::QuadPrimitiveIds => 94,
-        RuntimeFact::RotatedWeights => 95,
-        RuntimeFact::PrivateList => 96,
-        RuntimeFact::MeshLastFirst => 97,
+        RuntimeFact::SynthesizedGeometry { .. } => 84,
+        RuntimeFact::ObjectThreadgroupArena { .. } => 85,
+        RuntimeFact::WordInputMerge { .. } => 87,
+        RuntimeFact::ReplayBindings => 88,
+        RuntimeFact::MergedDraws => 72,
+        RuntimeFact::QuadPrimitiveIds => 58,
+        RuntimeFact::RotatedWeights => 82,
+        RuntimeFact::PrivateList => 86,
+        RuntimeFact::MeshLastFirst => 71,
+        RuntimeFact::YCbCrInPlace { .. } => 65,
     }
 }
 
@@ -394,7 +362,7 @@ fn variant(f: &RuntimeFact) -> usize {
 fn mechanism_is_total_over_every_fact_and_profile() {
     let facts = every_fact();
     let covered: std::collections::BTreeSet<usize> = facts.iter().map(variant).collect();
-    assert_eq!(covered, (0..99).collect(), "every_fact misses a variant");
+    assert_eq!(covered, (0..89).collect(), "every_fact misses a variant");
     for (stem, _) in super::committed_profiles() {
         let dev = device(&stem);
         let p = dev.profile();
@@ -436,7 +404,6 @@ fn mechanism_is_total_over_every_fact_and_profile() {
                     ..
                 }
                 | RuntimeFact::SparseTextureWrites { atomic: true, .. }
-                | RuntimeFact::SrgbDeviceDecode { .. }
                 | RuntimeFact::CubicArgumentSampler { .. }
                 | RuntimeFact::HeapRawSamples { .. }
                 | RuntimeFact::StorageTextureWriteRounding { .. }
@@ -468,24 +435,19 @@ fn mechanism_is_total_over_every_fact_and_profile() {
                 | RuntimeFact::MergedDraws
                 | RuntimeFact::QuadPrimitiveIds
                 | RuntimeFact::PrivateList
+                | RuntimeFact::YCbCrInPlace { .. }
                 | RuntimeFact::ZeroedColor { .. }
                 | RuntimeFact::DroppedColor { .. }
                 | RuntimeFact::DepthClampRange
                 | RuntimeFact::RotatedWeights
                 | RuntimeFact::MeshLastFirst
-                | RuntimeFact::Depth16Pass { .. }
-                | RuntimeFact::Depth16Biased
-                | RuntimeFact::Depth16BiasSide { .. }
                 | RuntimeFact::TestedStorageWrites { .. }
                 | RuntimeFact::MovableStorageWrites { .. }
-                | RuntimeFact::YCbCrTexture { .. }
                 | RuntimeFact::ConstexprSampled { .. }
                 | RuntimeFact::CubicSampler { .. }
-                | RuntimeFact::AnisotropicSampler { .. }
-                | RuntimeFact::CapturedPositions { .. } => Mechanism::Variant,
+                | RuntimeFact::AnisotropicSampler { .. } => Mechanism::Variant,
                 RuntimeFact::ImageViewShape { .. }
                 | RuntimeFact::StorageTextureLevelViews { .. }
-                | RuntimeFact::HalfBitsTexture { .. }
                 | RuntimeFact::UlongAtomicView { .. } => Mechanism::BinderView,
                 RuntimeFact::VertexFetch { .. } | RuntimeFact::TileAttachmentFormat { .. } => {
                     Mechanism::KeyProjection
@@ -523,24 +485,19 @@ fn mechanism_is_total_over_every_fact_and_profile() {
                     crate::device::profile::BufferAccess::Addressed => Mechanism::PushConstant,
                     _ => Mechanism::SyntheticBinding,
                 },
-                RuntimeFact::HeapNumericType { .. }
-                | RuntimeFact::HeapHalfTexelWrites { .. } => Mechanism::BinderView,
+                RuntimeFact::HeapNumericType { .. } => Mechanism::BinderView,
                 RuntimeFact::StageInRegion
                 | RuntimeFact::StageInStride { .. }
                 | RuntimeFact::StorageTextureLevels { .. }
-                | RuntimeFact::StorageTextureHalfChannels { .. }
                 | RuntimeFact::StorageTextureIntegerChannels { .. }
                 | RuntimeFact::AccelerationStructureInstanceCount { .. }
                 | RuntimeFact::ViewportCount
-                | RuntimeFact::Depth16Codes { biased: true }
                 // The bound texture's format class, which the binder pushes.
                 | RuntimeFact::TexelFormat { .. } => Mechanism::PushConstant,
                 RuntimeFact::AliasedImageblock { .. } => Mechanism::None,
                 RuntimeFact::CallStackDepth { .. }
                 | RuntimeFact::AbsentArgumentRead { .. }
-                | RuntimeFact::SynthesizedGeometry { .. }
-                | RuntimeFact::ExactFormsOverCompilerLimit { .. }
-                | RuntimeFact::Depth16Codes { biased: false } => Mechanism::None,
+                | RuntimeFact::SynthesizedGeometry { .. } => Mechanism::None,
             };
             assert_eq!(m, expected, "{stem}: {fact:?}");
         }

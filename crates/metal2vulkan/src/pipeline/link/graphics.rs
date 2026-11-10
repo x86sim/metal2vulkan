@@ -8,10 +8,11 @@
 //! - **Color attachments**: the format mapping for `ColorAttachment` (plus
 //!   `ColorAttachmentBlend` when blending), the write mask, and the blend state; at most
 //!   `maxColorAttachments` of them. A blend of factors one and zero, added, for color and alpha,
-//!   of an attachment the fragment function rounds to Metal's codes (`StageIo::rounded_colors`), or
-//!   writes as a half's bits (`StageIo::half_bit_colors`), takes no Vulkan blend: the function
-//!   writes what Metal's blend stores, which a device's blend could still change (x86 lavapipe adds
-//!   the clear's `+0` to a `-0` source of an `R16Float` attachment, Metal keeps `-0`). An
+//!   of an attachment whose format converts the fragment function's output
+//!   (`StageIo::color_writes`), or that the function rounds (`StageIo::rounded_colors`), takes no
+//!   Vulkan blend: Metal's blend stores the output as written, as no blend does, which a device's
+//!   blend could still change (x86 lavapipe adds the clear's `+0` to a `-0` source of an
+//!   `R16Float` attachment, Metal keeps `-0`). An
 //!   attachment that no first (index 0) output of the fragment function names (every attachment of
 //!   a pipeline without a fragment function) gets an empty write mask, so the draw leaves it
 //!   unmodified. That is what Metal does where measured: an unblended attachment the function reads
@@ -149,7 +150,13 @@
 //!   values in this section refer only to the alpha component of the fragment shader output that
 //!   has a `Location` and `Index` decoration of zero"), reads Metal's alpha;
 //!   over an `ARGB8Unorm` one, whose image's alpha is Metal's blue, it is
-//!   `NotImplemented(Format)`.
+//!   `NotImplemented(Format)`. Which samples the alpha covers is the device's own answer: Metal's
+//!   coverage of an alpha depends on the pixel's place in a 2x2 ordered dither at two and four
+//!   samples (`PrecisionNote::DeviceAlphaCoverage` states it), and Vulkan specifies no algorithm
+//!   for converting the alpha to a coverage mask, so a pipeline that keeps alpha to coverage records
+//!   `PrecisionNote::DeviceAlphaCoverage` on its fragment stage, or, on a profile measured to cover
+//!   as Metal does (`DriverDeviation::MetalAlphaCoverage`), requires
+//!   `VkProperty::MetalAlphaCoverage` in its place ([`coverage_notes`]).
 //! - **Alpha to one** is `VkPipelineMultisampleStateCreateInfo::alphaToOneEnable`
 //!   (`GraphicsState::alpha_to_one`), the exact counterpart of Metal's `alphaToOneEnabled`: both
 //!   replace the fragment's alpha with one before the blend reads it and before the write mask
@@ -175,7 +182,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::device::requirements::{FormatUsage, VkFeature, VkLimit, VkProperty};
 use crate::device::{DeviceProfile, DriverWorkaround};
 use crate::error::{
-    Attachment, Capability, DescriptorError, Error, Feature, RuntimeInput, Unsupported,
+    Attachment, Capability, DescriptorError, DriverDeviation, Error, Feature, RuntimeInput,
+    Unsupported,
 };
 use crate::metal;
 use crate::metal::format::{
@@ -185,11 +193,13 @@ use crate::metal::state::{
     blend_factors, check_constant_alpha, color_write_mask, constant_alpha_withheld,
 };
 use crate::metal::PrimitiveTopologyClass;
+use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::color_writes;
 use crate::pipeline::graphics::{
     ColorAttachmentState, GraphicsState, InputAttachmentUse, TessellationState,
 };
 use crate::pipeline::interface::StageInterface;
+use crate::pipeline::link::vertex::FixedFunctionNotes;
 use crate::pipeline::link::RenderLinkInputs;
 use crate::pipeline::rotated_blend::{alpha_in_red_blend, rotated_blend, RotatedBlend};
 use crate::pipeline::stage_io::{
@@ -347,22 +357,6 @@ pub fn graphics_state(
             _ => None,
         })
         .collect();
-    // The rule word of each attachment whose rules the fragment function selects at the draw.
-    let color_write_rules = match fs {
-        Some(f) => color_writes::rule_words(
-            &f.io,
-            &r.color_attachments,
-            (r.alpha_to_coverage, r.texture_write_rounding_mode),
-            p,
-        )?,
-        None => Vec::new(),
-    };
-    let selected_rounds = |index: u32| {
-        let word = color_write_rules.iter().find(|(a, _)| *a == index);
-        fs.and_then(|f| f.io.selected_colors.get(&index))
-            .zip(word)
-            .is_some_and(|(sel, (_, word))| color_writes::selected_rounds(sel, *word))
-    };
     let mut color_attachments = Vec::with_capacity(used as usize);
     for (index, a) in r.color_attachments.iter().take(used as usize).enumerate() {
         color_attachments.push(match a {
@@ -400,19 +394,29 @@ pub fn graphics_state(
                             blend: None,
                         });
                     }
-                    // The fragment function writes what Metal's blend of one and zero stores,
-                    // so the attachment takes no Vulkan blend, nor the format's blend support:
-                    // one it rounds, and one it writes as a half's bits. But not a 16-bit float
+                    // Metal's blend of one and zero stores the output as written, as no blend
+                    // does, so an attachment the function writes whose format converts the
+                    // output (its channels take a rule of Metal's in this pipeline,
+                    // `color_writes::takes_metal_rule`, whatever the function's map holds of it
+                    // once its lowering read it), or one the function rounds, takes no Vulkan
+                    // blend there, nor the format's blend support. But not a 16-bit float
                     // attachment's from a module without fast math, whose blend Metal computes
                     // keeping the destination's product by zero: that one blends, announced
                     // (`color_writes::keeps_zero`).
-                    let rounded = fs.is_some_and(|f| {
-                        f.io.rounded_colors.contains(&(index as u32))
-                            || f.io.half_bit_colors.contains(&(index as u32))
-                    }) || selected_rounds(index as u32);
+                    let stored = fs.is_some_and(|f| {
+                        let color = index as u32;
+                        f.io.rounded_colors.contains(&color)
+                            || (written.contains(&color)
+                                && color_writes::takes_metal_rule(
+                                    color,
+                                    &r.color_attachments,
+                                    (r.alpha_to_coverage, r.texture_write_rounding_mode),
+                                    p,
+                                ))
+                    });
                     let keeps_zero =
                         fs.is_some_and(|f| color_writes::keeps_zero(&f.io, index as u32, a));
-                    let replaced = rounded && color_writes::replaces(a) && !keeps_zero;
+                    let replaced = stored && color_writes::replaces(a) && !keeps_zero;
                     // An extended-range attachment whose blend the function computes over its
                     // input attachment takes no Vulkan blend, and the function's write stores
                     // every raw component (none where it keeps every channel).
@@ -703,7 +707,6 @@ pub fn graphics_state(
         sample_mask: None,
         // The fragment stage's facts decide it (`link::shader_tests`).
         shader_tests: None,
-        color_write_rules,
         snapshot_reads,
         color_group: r.color_group.clone(),
         // The pipeline's private logic operation, once compile decided it
@@ -943,6 +946,25 @@ fn sample_invocations(
     Ok(sample_shading)
 }
 
+/// What the device's alpha to coverage gives a render pipeline whose graphics state is `g` on `p`
+/// (see the module docs): where it covers by alpha (`GraphicsState::alpha_to_coverage`), the
+/// device converts the alpha to a coverage mask by its own algorithm, which Vulkan does not
+/// specify, so the fragment stage records `PrecisionNote::DeviceAlphaCoverage`; but where `p`
+/// takes `DriverDeviation::MetalAlphaCoverage`, the device covers Metal's samples, and the
+/// pipeline requires `VkProperty::MetalAlphaCoverage` in place of the note. Nothing where the
+/// pipeline does not cover by alpha.
+pub(crate) fn coverage_notes(g: &GraphicsState, p: &DeviceProfile) -> FixedFunctionNotes {
+    let mut out = FixedFunctionNotes::default();
+    if g.alpha_to_coverage {
+        if p.takes_driver_deviation(DriverDeviation::MetalAlphaCoverage) {
+            out.properties.insert(VkProperty::MetalAlphaCoverage);
+        } else {
+            out.notes.push(PrecisionNote::DeviceAlphaCoverage);
+        }
+    }
+    out
+}
+
 /// Whether the pipeline's alpha to coverage stays enabled (see the module docs): only over a
 /// fragment output whose alpha it reads, a four-component float first output at attachment 0.
 /// Without one, Metal's coverage is the rasterizer's, as with alpha to coverage off. A
@@ -1071,13 +1093,12 @@ fn uniform_blend(
 /// `NotImplemented(Format)`: Metal keeps a masked channel's code but rewrites the texel's other
 /// bits (`BGRA10_XR`'s alpha clamped even where masked, its low bits and `BGR10_XR`'s top bits
 /// made canonical), which a mask of the raw components cannot express. A padded form's channels are
-/// its raw words, one each, and the mask is theirs: a loading pass that draws keeps a masked
-/// channel's code and zeroes its word's low six bits, every word of each tile it stores alike (an
-/// Apple M3 Max and an M4, byte-identical), which a consumer's load pass does before the pass (the
-/// runtime's `render/unused_bits_load.rs`, `bind::unused_bits_module`), so a channel the mask
-/// leaves out keeps the word Metal's pass leaves. A bfloat form's channels are its own (red; red
-/// and green; all four), each a raw component; a mask of some of them is unmeasured and refused as
-/// above.
+/// its raw words, one each, and the mask is theirs: a channel the mask leaves out keeps its word
+/// as the device's pass stores it, where Metal's loading pass that draws keeps the channel's code
+/// and zeroes its word's low six bits, every word of each tile it stores alike (an Apple M3 Max
+/// and an M4, byte-identical; the runtime's `extended-range-bits-kept`). A bfloat form's channels
+/// are its own (red; red and green; all four), each a raw component; a mask of some of them is
+/// unmeasured and refused as above.
 fn extended_write_mask(
     form: ExtendedRange,
     mask: vk::ColorComponentFlags,

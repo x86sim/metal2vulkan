@@ -59,6 +59,7 @@ mod command_buffer;
 mod compressed_blit;
 mod compute;
 mod contexts;
+mod copied;
 mod copy_plan;
 mod creation;
 mod deferred;
@@ -72,14 +73,14 @@ mod derived;
 mod descriptor_arena;
 mod detach;
 mod device;
-mod dispatch_execute;
 #[cfg(unix)]
+mod dirty_pages;
+mod dispatch_execute;
 mod dma_buf;
 mod draw_source;
 mod driver_defects;
 mod driver_facts;
 #[doc(hidden)]
-pub use driver_facts::unmeasured_driver_message;
 mod dynamic_library;
 mod dynamic_state;
 mod enables;
@@ -116,14 +117,18 @@ mod gpu_time;
 mod heap;
 mod heap_sets;
 mod host_aliases;
+mod host_backing;
 mod host_bytes;
 mod host_memory;
+mod host_ram;
 #[cfg(unix)]
 mod host_residency;
 #[cfg(unix)]
 mod host_shared_pointers;
 mod image_barrier;
 mod image_plan;
+mod in_place;
+mod in_place_check;
 mod index_bounds;
 mod index_rewrite;
 mod indirect_command_buffer;
@@ -143,7 +148,7 @@ mod loader_word;
 mod managed;
 mod memory;
 mod memory_log;
-mod metal_level;
+mod metal_release;
 mod mipmap;
 mod mipmap_filter;
 mod mipmap_pick;
@@ -217,10 +222,12 @@ mod values;
 mod versioned;
 mod view_plan;
 mod visibility;
+mod warm;
 mod word_fill;
 mod work_counts;
 mod wrapped_buffer;
 mod ycbcr;
+mod ycbcr_device;
 
 #[cfg(test)]
 mod tests;
@@ -252,6 +259,7 @@ pub use device::{
     LayerSettingValue, MessageKind, MessageSeverity, MessageSink, PhysicalDeviceIdentity,
     RawDevice,
 };
+pub use dirty_pages::{DirtyPages, DirtyStamp};
 #[cfg(unix)]
 pub use dma_buf::{DmaBufChunk, DmaBufRequest, DmaBufSource};
 pub use dynamic_library::DynamicLibrary;
@@ -286,8 +294,10 @@ pub use function_table::{
 };
 pub use gpu_time::host_time;
 pub use heap::{Heap, HeapDescriptor, HeapProblem, HeapType, SizeAndAlign};
+pub use host_backing::HostBacking;
 pub use host_bytes::HostBytes;
-pub use host_memory::{Deallocator, HostMemory, KeepAlive};
+pub use host_memory::{Deallocator, HostMemory, ImportGate, ImportRequest, KeepAlive, RunResolver};
+pub use host_ram::{HostRam, HostRamUse};
 pub use indirect_command_buffer::{
     EncodedComputeCommand, EncodedRenderCommand, IndirectBufferBinding, IndirectCommand,
     IndirectCommandBuffer, IndirectCommandBufferDescriptor, IndirectCommandBufferProblem,
@@ -298,8 +308,7 @@ pub use interop::SemaphoreProblem;
 pub use library::{Function, FunctionDescriptor, Library};
 pub use linear_plan::BufferTextureProblem;
 pub use metal2vulkan::device::DriverFact;
-pub use metal_level::MetalLevel;
-pub use mipmap::MipmapVerdict;
+pub use metal_release::MACOS_RELEASE;
 pub use mipmap_plan::MipmapProblem;
 #[doc(hidden)]
 pub use pipeline::budget::{set_making_budget_for_measurement, MakingBudgetStarted};
@@ -317,7 +326,7 @@ pub use rate_map::{RasterizationRateMap, RateMapProblem};
 pub use rate_mapped_pass::RegionRefusal;
 pub use rebind::RebindProblem;
 #[doc(hidden)]
-pub use recorder::CommandsReplayed;
+pub use recorder::CommandsRecorded;
 pub use render::{DrawProblem, RenderCommandEncoder, ResolveTarget};
 pub use render_pass::{
     Attachment, RenderPassColorAttachmentDescriptor, RenderPassDepthAttachmentDescriptor,
@@ -348,6 +357,7 @@ pub use values::{
 };
 pub use view_plan::ViewProblem;
 pub use visibility::{VisibilityProblem, VisibilityResultMode};
+pub use warm::{PipelineRecord, WarmStatistics};
 pub use work_counts::{CopySite, MemoryFrees, WorkCounts};
 pub use wrapped_buffer::{VkBufferMemory, WrappedBufferProblem};
 pub use ycbcr::{IoSurfaceYCbCr, SurfaceYCbCrMatrix};

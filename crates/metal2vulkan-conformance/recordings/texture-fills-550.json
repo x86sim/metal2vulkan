@@ -139,13 +139,11 @@
         "command_buffers_begun": 100,
         "command_buffers_begun_batch_work": 25,
         "command_buffers_begun_encoders": 75,
-        "command_buffers_deferred": 75,
-        "command_buffers_replayed_inline": 75,
         "command_buffers_submitted": 100,
-        "commands_replayed.begin_command_buffer": 75,
-        "commands_replayed.cmd_copy_buffer": 75,
-        "commands_replayed.cmd_pipeline_barrier": 75,
-        "commands_replayed.end_command_buffer": 75,
+        "commands_recorded.begin_command_buffer": 100,
+        "commands_recorded.cmd_copy_buffer": 150,
+        "commands_recorded.cmd_pipeline_barrier": 150,
+        "commands_recorded.end_command_buffer": 100,
         "commits_handed_off": 75,
         "completed_waits": 78,
         "completed_where_seen": 75,
@@ -188,7 +186,7 @@
         "scheduler_sleeps": 75,
         "scheduler_wakes_commit": 75,
         "slot_returns": 75,
-        "spare_command_pools_taken": 150,
+        "spare_command_pools_taken": 75,
         "submit_infos": 75,
         "trail_waits": 75,
         "wakes_completion_waiters": 75,
@@ -196,16 +194,17 @@
       },
       "moving": {
         "batches_submitted_by_waiters": 41,
-        "commands_replayed.begin_command_buffer": 73,
-        "gate_waits_slept": 73
+        "gate_waits_slept": 67
       },
       "composed": {
         "addressable_buffers_made": 2,
         "arena_pools_made": 1,
+        "batches_submitted_by_waiters": 68,
         "device_memory_allocated": 201326592,
         "owned_kernel_spirv_bytes": 3596,
         "owned_kernels_made": 1,
         "pooled_memory_blocks_made": 3,
+        "queues_sharing_a_vk_queue": 0,
         "requirement_images_made": 4,
         "requirement_limits_asked": 4
       }

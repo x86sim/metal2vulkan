@@ -152,6 +152,15 @@ filename (which the loader looks for on the system library search path) provides
 and a lane run there is evidence for everything but the layer's checks. The executor's own Vulkan
 context refuses to open without the layer instead (`candidate::platform::device`).
 
+Whether the layer's synchronization checks see a kernel's write of a buffer it binds is asked of
+the layer, never of its version: the positive control
+(`runtime_lane::sync_coverage::layer_sees_kernel_writes`, one dispatch writing an untracked
+buffer through the runtime's recording, then a copy of it with nothing between) runs first.
+Where the control finds the layer blind, each `sync_coverage` test whose hazard needs a kernel's
+write, and `parity::sequences::lane`'s hazard control, prints
+`LAYER-BLIND-KERNEL-WRITES <test>: ...` naming what it did not check, and requires the layer to
+have reported nothing of the rest of its run.
+
 **Seeded differential sequences** (`parity::sequences`): 64 seeded, race-free Metal programs of
 render passes, blits, dispatches, indirect commands, fences and events over buffers, heaps and
 textures, run on the runtime and compared with committed Metal results
@@ -301,10 +310,8 @@ cargo run -p metal2vulkan-validation --bin corpus-status
 ## Contract 1: emitter stability
 
 `crates/metal2vulkan/src/tests/golden_hashes.rs` pins a hash of the final SPIR-V (or the refusal
-class) of every public fixture entry point on every committed profile, and, in a second table, of
-every fixture that samples under every exact form (Metal's sampler emulated and
-`DevicePolicy::exact_answers`). A behavior-preserving change keeps every cell; a change that moves
-one bumps `SEMANTICS_VERSION` and re-blesses
+class) of every public fixture entry point on every committed profile. A behavior-preserving
+change keeps every cell; a change that moves one bumps `SEMANTICS_VERSION` and re-blesses
 ([CONTRIBUTING.md](../CONTRIBUTING.md#golden-output-hashes-and-semantics_version)). The fixture
 inventory (`crates/metal2vulkan/tests/public_fixture_expectations_engine.tsv`) pins which
 fixtures compile or refuse on which profile. Over the private corpus, the translation audit records

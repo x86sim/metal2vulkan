@@ -84,9 +84,6 @@ pub struct Uses {
     /// A cube's texels are fetched by face (an emulated linear cube sample): the slot is declared
     /// as the binder's 2D-array view of its faces.
     pub faces: bool,
-    /// A `half` texel's write reads whether the bound texture's channels are 16-bit floats
-    /// (`HalfNans::SlotWord`): the slot's storage choice declares no format.
-    pub half_channels: bool,
     /// An integer texel's write reads the widths of the bound texture's channels
     /// (`IntRange::SlotWord`): the slot's storage choice declares no format.
     pub int_channels: bool,
@@ -94,6 +91,21 @@ pub struct Uses {
     /// class is not measured (a `short`, `ushort` or `ulong` one): the slot states no
     /// `RuntimeFact::CrossClassReads`.
     pub narrow_result: bool,
+}
+
+/// How a slot's accesses read a two-plane YCbCr texture bound there, for its planes read in
+/// place (`sampler::in_place`, `RuntimeFact::YCbCrInPlace`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct InPlaceReads {
+    /// An access the form does not read: anything but a sample it builds (`sampler::select`'s
+    /// `in_place_sample`) and a query of the width, the height or the level count.
+    pub blocked: bool,
+    /// The runtime sampler slots the slot's samples read, bit `n` `[[sampler(n)]]`.
+    pub samplers: u32,
+    /// A sample the device's own sampler Y′CbCr conversion does not take
+    /// (`LoweringInputs::ycbcr_planes_sampled`): one through a constexpr sampler that addresses a
+    /// border, or one that places a texel offset by a parent's size.
+    pub device_blocked: bool,
 }
 
 /// The `OpTypeImage` a slot is declared as, and the conversion a storage image's class needs.
@@ -121,6 +133,15 @@ pub struct ImageDecl {
     /// after the class's conversion, its reads take alpha 1 and its writes store green in the
     /// fourth channel.
     pub x_channel: bool,
+    /// The slot's variant reads a two-plane YCbCr texture's planes in place
+    /// (`LoweringInputs::ycbcr_in_place`): the image is the planes' uniform texel buffer of
+    /// unsigned codes (`sampler::in_place`), the texture's size its push field's.
+    pub in_place: bool,
+    /// The slot's variant samples those planes as an image through the device's own sampler
+    /// Y′CbCr conversion (`LoweringInputs::ycbcr_planes_sampled`): the slot is a combined image
+    /// sampler of a sampled 2D `float` image (`ResourceKind::YCbCrPlanes`), whose immutable
+    /// sampler bakes the conversion; `in_place` holds, so its size is still the push field's.
+    pub planes_sampler: Option<crate::bind::YCbCrPlanesSampler>,
 }
 
 impl ImageDecl {
@@ -204,39 +225,11 @@ pub struct SlotPlan {
     /// linear sample reads the bound format's channels from it (`RuntimeFact::TexelFormat`).
     /// Implied by `half_format`.
     pub texel_format: bool,
-    /// An access with a `half` result converts a value of the slot that may be filtered
-    /// (`half::TexelLanes::Filtered`), whose packed class takes the routine's `OTHER` arm: where
-    /// none does, the arm runs only for an unmeasured class without a packed field.
-    pub half_filtered: bool,
     /// A `half` conversion of the slot on a device that samples through Metal's own texture unit
     /// notes the bound format where its class is unmeasured there
     /// (`TexelFormat::unmeasured_on_metal_sampler`): the slot declares its `UnmeasuredTexels`
     /// specialization, which the note's clause tests.
     pub unmeasured: bool,
-    /// A read, gather, or sample reading one texel of the slot with a `float` result converts its
-    /// texel by the bound format's class (`float_texel`): the slot declares its `TexelFormat`
-    /// specialization and the module the `float` routine.
-    pub float_format: bool,
-    /// A `float` write to the slot rounds its channels by the bound format's class
-    /// (`norm_write`): the slot declares its `TexelFormat` specialization and the module the
-    /// rounding routine.
-    pub norm_write: bool,
-    /// A read of the slot, or an emulated linear sample of its cube's faces, takes an 8-bit sRGB
-    /// texel's raw code from the slot's raw view (`ResourceKind::RawTexture`), the slot being one
-    /// of `LoweringInputs::srgb_textures` (`RuntimeFact::SrgbTexture`).
-    pub raw: bool,
-    /// A read of the slot takes a 16-bit float texel's own 16 bits from the slot's unsigned
-    /// integer alias view (`ResourceKind::RawTexture` of an unsigned integer image type,
-    /// `RuntimeFact::HalfBitsTexture`) where the bound format's class names such channels, and
-    /// widens them exactly (`HalfTexelBitsPolicy::Exact`). Never together with
-    /// [`raw`](Self::raw): a slot read through one alias view is read through the one view.
-    pub half_bits: bool,
-    /// The slot is read through a snapshot (`LoweringInputs::snapshot_textures`) and its
-    /// snapshot holds the alias's codes, not the copy's fetch of the slot's image: the copy
-    /// fetches the alias where the class names 16-bit float channels, and the read widens those
-    /// codes instead of the device's decode (`lower::fragment`'s `snapshot`,
-    /// `HalfTexelBitsPolicy::Exact`). Implies [`half_bits`](Self::half_bits).
-    pub half_bits_snapshot: bool,
     /// A read of the slot, a texture buffer, applies the bound texture buffer's swizzle, which
     /// the slot's `TextureSwizzle` specialization gives (`RuntimeFact::TextureSwizzle`); or the
     /// slot, a storage slot of `LoweringInputs::swizzled_storage`, applies the bound texture's to
@@ -253,6 +246,8 @@ pub struct SlotPlan {
     /// specialization, which states the axes on which the base-level size the rule reads, a
     /// view's parent's, is not a power of two where the bound view's is.
     pub offset_base: bool,
+    /// How its accesses read a two-plane YCbCr texture's planes in place.
+    pub in_place: InPlaceReads,
     /// The declaration, set by [`finish`] for a slot that is read, written, or queried, or
     /// whose faces are fetched.
     pub decl: Option<ImageDecl>,
@@ -275,24 +270,19 @@ impl SlotPlan {
             sparse_writes: false,
             half_format: false,
             texel_format: false,
-            half_filtered: false,
             unmeasured: false,
-            float_format: false,
-            norm_write: false,
-            raw: false,
-            half_bits: false,
-            half_bits_snapshot: false,
             swizzle: false,
             constant_lanes: false,
             offset_base: false,
+            in_place: InPlaceReads::default(),
             decl: None,
         }
     }
 
-    /// Whether the slot declares its `TexelFormat` specialization: a conversion or a rounding by
-    /// the bound format's class takes it.
+    /// Whether the slot declares its `TexelFormat` specialization: a conversion by the bound
+    /// format's class takes it.
     pub fn declares_texel_format(&self) -> bool {
-        self.half_format || self.texel_format || self.float_format || self.norm_write
+        self.half_format || self.texel_format
     }
 
     /// Whether the slot is a storage image or storage texel buffer.
@@ -368,10 +358,9 @@ pub struct HeapPlan {
     pub compares_plain: bool,
     /// The float class of its shape and its declaration, for a compared group whose comparisons
     /// the shader makes ([`HeapPlan::compares_plain`]); set by [`finish`]. Its samples without
-    /// comparison read the members there: the binder holds a `Depth32Float` member with a depth
-    /// twin through its colour image in that class, and through the twin in the depth-comparison
-    /// class, whose depth view ANV clamps into `[0, 1]` and RADV holds a denormal in as zero
-    /// (runtime lane `depth_compares` through argument buffers).
+    /// comparison read the members there, and its comparisons the depth-comparison class, whose
+    /// depth view ANV clamps into `[0, 1]` and RADV holds a denormal in as zero (runtime lane
+    /// `depth_compares` through argument buffers).
     pub plain: Option<(ImageHandleClass, ImageDecl)>,
     /// Its float reads decode a member of a form a heap reads (`ExtendedRange::HEAP_READ`) where
     /// the handle's class index names one; set by `select_read`.
@@ -396,14 +385,6 @@ pub struct HeapPlan {
     /// set by [`finish`] for a sampled color group of one sample. The binder holds each member in
     /// the class of its own numeric type, and the neutral in the others.
     pub cross: std::collections::BTreeMap<TexelClass, (ImageHandleClass, ImageDecl)>,
-    /// Its `half` or `float` writes store a half-float member's bits through the unsigned integer
-    /// twin where the handle's class index names one (`Write::heap_bits`); set by `select_write`.
-    pub writes_bits: bool,
-    /// The twin of a written float storage group ([`HeapPlan::writes_bits`]): the formatless
-    /// unsigned integer storage class of its shape that holds half-float members through their
-    /// unsigned integer aliases (`StorageFormatClass::HalfBits`), and its declaration; set by
-    /// [`finish`]. The binder holds each such member there too, at the same element.
-    pub bits: Option<(ImageHandleClass, ImageDecl)>,
 }
 
 impl HeapPlan {
@@ -425,8 +406,6 @@ impl HeapPlan {
             cross_queries: false,
             uncrossed: false,
             cross: Default::default(),
-            writes_bits: false,
-            bits: None,
         }
     }
 
@@ -584,6 +563,8 @@ fn declare_heap(
         level_views: None,
         extended: None,
         x_channel: false,
+        in_place: false,
+        planes_sampler: None,
     };
     Ok((class, decl))
 }
@@ -792,13 +773,12 @@ fn storage_format(
     }
     // The converting classes exist for 8-bit UNORM color formats, half and small float ones and
     // 1-bit alpha ones only. A YCbCr write slot's `float` texels are stored as their bits in an
-    // unsigned integer image, whose class `declare_slot` gives it., as a half-float slot only
-    // written stores its half bits in its unsigned integer alias.
+    // unsigned integer image, whose class `declare_slot` gives it, as an `RGB9E5Float` slot
+    // stores its words in its `R32_UINT` alias.
     let converting = !matches!(
         choice.class,
         StorageImageClass::Identity
             | StorageImageClass::YCbCrWrite
-            | StorageImageClass::HalfBits
             | StorageImageClass::SharedExponentBits
     );
     if converting && texel != TexelClass::Float {
@@ -1031,6 +1011,55 @@ fn declare_slot(
 ) -> Result<ImageDecl, Error> {
     let images = &cx.profile.fields().images;
     let storage = s.storage();
+    // A slot that samples its texture's planes as an image through the device's own sampler
+    // Y′CbCr conversion is a combined image sampler of a 2D `float` image, with the field of the
+    // planes' words for its size (`sampler::in_place`).
+    if let Some(&sampler) = cx.inputs.ycbcr_planes_sampled.get(&s.slot) {
+        if !cx.inputs.ycbcr_in_place.contains(&s.slot) {
+            return Err(cx.invariant("a planes image's slot outside its in-place variant"));
+        }
+        push.push(PushField::YCbCrInPlace(s.slot));
+        counts.sampled_images = counts.sampled_images.saturating_add(1);
+        counts.samplers = counts.samplers.saturating_add(1);
+        return Ok(ImageDecl {
+            dim: Dim::D2,
+            arrayed: false,
+            multisampled: false,
+            depth: false,
+            usage: ImageUsage::Sampled,
+            format: crate::spv::ImageFormat::Unknown,
+            texel: TexelClass::Float,
+            cube_as_array: false,
+            class: StorageImageClass::Identity,
+            level_views: None,
+            extended: None,
+            x_channel: false,
+            in_place: true,
+            planes_sampler: Some(sampler),
+        });
+    }
+    // A slot under its in-place variant is the uniform texel buffer of its texture's planes, of
+    // unsigned codes, with the field of their words (`sampler::in_place`).
+    if cx.inputs.ycbcr_in_place.contains(&s.slot) {
+        push.push(PushField::YCbCrInPlace(s.slot));
+        counts.sampled_images = counts.sampled_images.saturating_add(1);
+        return Ok(ImageDecl {
+            dim: Dim::Buffer,
+            arrayed: false,
+            multisampled: false,
+            depth: false,
+            usage: ImageUsage::Sampled,
+            format: crate::spv::ImageFormat::Unknown,
+            texel: TexelClass::Uint,
+            cube_as_array: false,
+            class: StorageImageClass::Identity,
+            level_views: None,
+            extended: None,
+            x_channel: false,
+            in_place: true,
+            planes_sampler: None,
+        });
+    }
     // A slot bound in an extended-range format holds its raw texels in an unsigned integer
     // image.
     let extended = cx.inputs.extended_range.get(&s.slot).copied();
@@ -1048,17 +1077,16 @@ fn declare_slot(
     if ycbcr_write && (s.uses.read || s.uses.atomic || !float) {
         return Err(Unsupported::not_implemented(Feature::Format).into());
     }
-    // A slot that reads and writes a half-float texture through its unsigned integer alias
-    // holds each texel's half bits there (`StorageImageClass::HalfBits`): a `float` slot's reads
+    // A slot that reads and writes an `RGB9E5Float` texture through its `R32_UINT` alias holds
+    // each texel's word there (`StorageImageClass::SharedExponentBits`): a `float` slot's reads
     // and writes, as the binder chooses it (`metal::format::storage_choice`); no atomic.
-    let half_bits = storage
-        && cx.inputs.storage_images.get(&s.slot).is_some_and(|c| {
-            matches!(
-                c.class,
-                StorageImageClass::HalfBits | StorageImageClass::SharedExponentBits
-            )
-        });
-    if half_bits && (s.uses.atomic || !float) {
+    let words = storage
+        && cx
+            .inputs
+            .storage_images
+            .get(&s.slot)
+            .is_some_and(|c| c.class == StorageImageClass::SharedExponentBits);
+    if words && (s.uses.atomic || !float) {
         return Err(Unsupported::not_representable(Feature::Format).into());
     }
     // A texture of another class, read in its own (`LoweringInputs::cross_class`), only where
@@ -1069,7 +1097,7 @@ fn declare_slot(
     }
     let texel = match extended {
         Some(_) => TexelClass::Uint,
-        None if ycbcr_write || half_bits => TexelClass::Uint,
+        None if ycbcr_write || words => TexelClass::Uint,
         None => image_class(cx.inputs, s),
     };
     if shape.depth && storage {
@@ -1105,10 +1133,6 @@ fn declare_slot(
     };
     let (format, class) = if storage {
         facts.push(RuntimeFact::StorageTextureFormat { slot: s.slot });
-        if s.uses.half_channels {
-            facts.push(RuntimeFact::StorageTextureHalfChannels { slot: s.slot });
-            push.push(PushField::TextureHalfChannels(s.slot));
-        }
         if s.uses.int_channels {
             facts.push(RuntimeFact::StorageTextureIntegerChannels { slot: s.slot });
             push.push(PushField::TextureIntegerChannels(s.slot));
@@ -1143,11 +1167,7 @@ fn declare_slot(
         let n = views.unwrap_or(1);
         counts.storage_images = counts.storage_images.saturating_add(n);
     } else {
-        // The raw view's binding beside the texture's own: an 8-bit sRGB texture's codes, or a
-        // 16-bit float texture's own bits.
-        counts.sampled_images = counts
-            .sampled_images
-            .saturating_add(if s.raw || s.half_bits { 2 } else { 1 });
+        counts.sampled_images = counts.sampled_images.saturating_add(1);
     }
     Ok(ImageDecl {
         dim,
@@ -1166,7 +1186,24 @@ fn declare_slot(
         level_views: views,
         extended,
         x_channel,
+        in_place: false,
+        planes_sampler: None,
     })
+}
+
+/// Whether every access of slot `s` is one its texture's planes read in place answer
+/// (`sampler::in_place`), on a profile that takes the form (`ProfileFields::ycbcr_in_place`): a
+/// sampled 2D texture's (not an array, multisampled or depth one), of a `float` class or only
+/// queried, used, and no access blocked ([`InPlaceReads::blocked`]).
+fn in_place_reads(cx: &SelectCx<'_>, s: &SlotPlan) -> bool {
+    let used = s.uses.read || s.uses.query || s.uses.sample;
+    cx.profile.fields().ycbcr_in_place
+        && used
+        && !s.in_place.blocked
+        && !s.storage()
+        && s.shape
+            .is_some_and(|x| x.dim == ImageDim::D2 && !x.array && !x.ms && !x.depth)
+        && matches!(s.texel, None | Some(TexelClass::Float))
 }
 
 /// Whether a slot of `shape` can have a tile map: a single-sample 2D, 2D array, or 3D color texture
@@ -1181,18 +1218,15 @@ fn tiled_shape(shape: ImageShape) -> bool {
         }
 }
 
-/// The device compares a depth texture's texels (a sample or gather with comparison the shader
-/// does not make itself). Metal's `Depth32Float` texels hold any `float`, which a depth image keeps
-/// outside `[0, 1]` where the consumer enabled `VK_EXT_depth_range_unrestricted`, or where its
-/// driver is measured to keep them without it
-/// (`VkProperty::DepthImageKeepsValuesOutsideUnitRange`, MoltenVK's), which the module then
-/// requires; the device's comparison reads a depth image (the texture's own, or its depth twin):
-/// on a device with neither the function records `PrecisionNote::RestrictedDepthRange`. Its reads,
-/// samples and gathers, and the comparisons the shader makes of them, read the texels the consumer
-/// holds them in, which a colour image keeps, so they record nothing: the interface's
-/// `TextureSlot::access` states them, and the consumer announces an upload its own depth image may
-/// clamp (`restricted-depth-upload`). No module requires the extension, since every value within
-/// `[0, 1]` is exact without it.
+/// The device compares a depth texture's texels (a sample or gather with comparison). Metal's
+/// `Depth32Float` texels hold any `float`, which a depth image keeps outside `[0, 1]` where the
+/// consumer enabled `VK_EXT_depth_range_unrestricted`, or where its driver is measured to keep them
+/// without it (`VkProperty::DepthImageKeepsValuesOutsideUnitRange`, MoltenVK's), which the module
+/// then requires; the device's comparison reads the texture's depth image: on a device with neither
+/// the function records `PrecisionNote::RestrictedDepthRange`. Its reads, samples and gathers
+/// record nothing: the interface's `TextureSlot::access` states them, and the consumer announces an
+/// upload its depth image may clamp (`restricted-depth-upload`), which every read of it then reads.
+/// No module requires the extension, since every value within `[0, 1]` is exact without it.
 pub(crate) fn depth_comparison(cx: &mut SelectCx<'_>) {
     let enabled = &cx.profile.fields().enabled;
     if enabled
@@ -1244,6 +1278,28 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     for s in cx.families.texture.slots.values() {
         if s.shape.is_some_and(|shape| cross_reads(s, shape)) {
             facts.push(RuntimeFact::CrossClassReads { slot: s.slot });
+        }
+    }
+    // The slots whose every access the in-place form reads, on a profile that takes it: their
+    // compile under the form states the same, which its plan holds to.
+    for s in cx.families.texture.slots.values() {
+        let reads = in_place_reads(cx, s);
+        if !reads && cx.inputs.ycbcr_in_place.contains(&s.slot) {
+            return Err(
+                cx.invariant("an in-place texture slot whose accesses the form does not read")
+            );
+        }
+        if s.in_place.device_blocked && cx.inputs.ycbcr_planes_sampled.contains_key(&s.slot) {
+            return Err(cx.invariant(
+                "a planes image's texture slot with a sample the device's sampler does not take",
+            ));
+        }
+        if reads {
+            facts.push(RuntimeFact::YCbCrInPlace {
+                slot: s.slot,
+                samplers: s.in_place.samplers,
+                device: !s.in_place.device_blocked,
+            });
         }
     }
     let mut heap = Vec::new();
@@ -1299,21 +1355,6 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             let sampled_float = class.access == ImageAccess::Sampled
                 && class.sampled_type == SampledType::Float
                 && !class.depth_compare;
-            // The unsigned integer twin of a float storage group whose writes store half bits.
-            let storage_float = class.access == ImageAccess::Storage
-                && class.sampled_type == SampledType::Float
-                && !class.multisampled;
-            h.bits = (h.writes_bits && storage_float).then_some((
-                ImageHandleClass {
-                    sampled_type: SampledType::Uint,
-                    format: StorageFormatClass::HalfBits,
-                    ..class
-                },
-                ImageDecl {
-                    texel: TexelClass::Uint,
-                    ..decl
-                },
-            ));
             h.raw = (h.reads_raw && sampled_float).then_some((
                 ImageHandleClass {
                     sampled_type: SampledType::Uint,
@@ -1430,23 +1471,21 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         }
     }
     for (index, d, volatile) in decls {
-        // An 8-bit sRGB format's codes convert through Metal's twelve-bit tables (`emit::
-        // srgb_codes`, `emit::srgb_raw_texel`), which the module declares once.
-        if matches!(
+        // A write of an 8-bit sRGB format's codes encodes by the device's conversion
+        // (`emit::srgb_codes`, `pack::pack`'s `unorm4x8_srgb`), where Metal encodes through its
+        // twelve-bit table; a read's decode records its own note.
+        let srgb = matches!(
             d.class,
             StorageImageClass::SrgbEncode | StorageImageClass::SrgbEncodeBgra
-        ) {
-            let written = cx
-                .families
-                .texture
-                .slots
-                .get(&index)
-                .is_some_and(|s| s.uses.write);
-            let dir = match written {
-                true => crate::air::intrinsics::PackDir::Pack,
-                false => crate::air::intrinsics::PackDir::Unpack,
-            };
-            cx.families.arith.srgb.get_or_insert(dir);
+        );
+        let written = cx
+            .families
+            .texture
+            .slots
+            .get(&index)
+            .is_some_and(|s| s.uses.write);
+        if srgb && written {
+            cx.precision.insert(PrecisionNote::DevicePackConversion);
         }
         if let Some(s) = cx.families.texture.slots.get_mut(&index) {
             s.decl = Some(d);

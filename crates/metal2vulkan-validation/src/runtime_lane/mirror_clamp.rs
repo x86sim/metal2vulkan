@@ -23,6 +23,7 @@
 //! sixteenth plus a half.
 
 use super::degrade_notices::on_device;
+use super::pixel_samplers::{own_sampler, shifted, REACH};
 use super::{buffer_with, read_buffer};
 use crate::air_library::AirLibrary;
 use metal2vulkan::bind::SamplerDescriptor;
@@ -287,11 +288,16 @@ fn the_lanes_reach_past_the_level_both_ways() {
     );
 }
 
-/// Every lane reads Metal's answer, on each op, pixel and normalized, 6 and 8 texels wide.
-/// Prints, per case, the lanes checked and those that differ, and each lane that differs.
+/// Every lane reads Metal's answer, on each op, pixel and normalized, 6 and 8 texels wide, where
+/// the device samples through Metal's own sampler; but a pixel coordinate reaches the device
+/// divided by the size (`pixel-sampler-scaling`), so a pixel lane may read instead Metal's
+/// normalized answer at a coordinate within [`REACH`] ulps of the quotient (counted apart).
+/// Elsewhere the device samples by its own sampler (announced `device-sampling`: its addressing,
+/// offsets and filter), whose differences are printed. Prints, per case, the lanes checked and
+/// those that differ, and each lane that differs.
 #[test]
 fn mirror_clamped_samples_read_metal_s_texels() {
-    on_device(|device, _| {
+    on_device(|device, messages| {
         let mut wrong = Vec::new();
         for n in [6u32, 8] {
             let float = texture(device, PixelFormat::R32Float, n, |j| j as f32 + 1.0);
@@ -313,13 +319,23 @@ fn mirror_clamped_samples_read_metal_s_texels() {
                 for op in Op::ALL {
                     let texture = if op.compares() { &depth } else { &float };
                     let got = sampled(device, texture, op, pixel, &us);
-                    let mut differ = 0usize;
+                    let (mut differ, mut scaled) = (0usize, 0usize);
                     for (lane, &u) in us.iter().enumerate() {
                         let want = metal(op, u, n, pixel, lane);
                         for (k, want) in want.iter().enumerate() {
                             let have = got[lane * 5 + k];
-                            let same = (0..4).all(|c| have[c].to_bits() == want[c].to_bits());
-                            if !same {
+                            let same = |want: &[f32; 4]| {
+                                (0..4).all(|c| have[c].to_bits() == want[c].to_bits())
+                            };
+                            let near = || {
+                                (-REACH..=REACH).any(|ulps| {
+                                    let v = shifted(u / n as f32, ulps);
+                                    same(&metal(op, v, n, false, lane)[k])
+                                })
+                            };
+                            if !same(want) && pixel && near() {
+                                scaled += 1;
+                            } else if !same(want) {
                                 differ += 1;
                                 wrong.push(format!(
                                     "{n} pixel {pixel} {op:?} u {u:e} offset {}: read {have:?}, \
@@ -331,7 +347,7 @@ fn mirror_clamped_samples_read_metal_s_texels() {
                     }
                     println!(
                         "MIRROR-CLAMP {} {n} pixel {pixel} {op:?}: {} results, {differ} differ \
-                         from Metal",
+                         from Metal, {scaled} Metal's at the scaled coordinate's neighbour",
                         device.name(),
                         us.len() * 5
                     );
@@ -340,6 +356,14 @@ fn mirror_clamped_samples_read_metal_s_texels() {
         }
         for line in wrong.iter().take(80) {
             println!("MIRROR-CLAMP-DIFFERS {}: {line}", device.name());
+        }
+        if own_sampler(device, messages) {
+            println!(
+                "MIRROR-CLAMP {}: the device's own sampler, {} results differ from Metal",
+                device.name(),
+                wrong.len()
+            );
+            return;
         }
         assert!(
             wrong.is_empty(),

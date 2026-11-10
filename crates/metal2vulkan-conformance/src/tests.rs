@@ -13,7 +13,7 @@ use crate::compare::compare;
 use crate::diff::DivergenceKind;
 use crate::record::{record, RecordError};
 use crate::recording::{
-    Answer as RecordedAnswer, Lookup, Outcome, Provenance, Recording, Validated, ORACLE_OS_VERSION,
+    Answer as RecordedAnswer, Lookup, Outcome, Provenance, Recording, Validated,
 };
 use crate::replay::{replay_against, NOTICES_SITE};
 use crate::report::Report;
@@ -21,7 +21,7 @@ use crate::transcript::{
     ByteLayout, Digest, Element, Gaps, Negative, Node, Observed, Region, Sites, Transcript, Value,
 };
 use crate::verdict::Verdict;
-use metal2vulkan_runtime::{Degradation, MetalLevel};
+use metal2vulkan_runtime::{Degradation, MACOS_RELEASE};
 
 /// A side that answers from a script rather than from a device, so the suite's own machinery is
 /// testable with no GPU.
@@ -947,7 +947,7 @@ fn recording_of(case: &dyn Case, transcript: Transcript, runs: u32) -> Recording
         case.name(),
         Vec::new(),
         vec![RecordedAnswer {
-            key: crate::recording::OracleKey::current(MetalLevel::NEWEST),
+            key: crate::recording::OracleKey::current(),
             provenance: Provenance::MetalRun,
             device: "the oracle".to_owned(),
             runs,
@@ -1048,10 +1048,9 @@ fn a_notice_we_announce_and_metal_does_not_is_divergent_until_it_is_named() {
 #[test]
 fn a_declared_notice_does_not_excuse_an_undeclared_one() {
     let declared = Degradation::CarriedDecodedTwin;
-    let undeclared = [
-        Degradation::DeviceTexelConversion,
-        Degradation::NativeDivision,
-    ];
+    // Neither is one of the device's native answers, which the suite declares for every case
+    // ([`crate::replay::NATIVE_NOTES`]).
+    let undeclared = [Degradation::CpuBlockDecode, Degradation::ShaderResolve];
     let bytes = words(&[1, 2]);
     let case = WordsCase {
         allowances: vec![crate::replay::notice_allowance(declared.code())],
@@ -1101,6 +1100,145 @@ fn a_declared_notice_does_not_excuse_an_undeclared_one() {
         "{}",
         replayed.verdict
     );
+}
+
+/// The device's own native answers are declared by the suite for every case: a run that announces
+/// one, with every value Metal's, is announced and not divergent, though the case names nothing,
+/// and the standing declaration is not counted as the case's own, so the native notes the run did
+/// not announce are not reported as allowances that never fired.
+#[test]
+fn a_native_note_is_declared_for_every_case() {
+    let native = Degradation::NativeFma;
+    let bytes = words(&[1, 2]);
+    let case = WordsCase::new("words", 2);
+    let recording = recording_of(&case, case.transcript(bytes.clone(), "Completed", &[]), 3);
+    let mut side = StubSide::new(bytes).announcing(&[native]);
+    let replayed = replay_against(&case, &mut side, &recording).unwrap();
+    assert!(
+        matches!(replayed.verdict, Verdict::Announced { .. }),
+        "{}",
+        replayed.verdict
+    );
+    assert_eq!(replayed.allowances.named, 0);
+    assert_eq!(replayed.allowances.unfired, Vec::new());
+}
+
+/// The standing declaration is of the notice and of nothing else. A value the device's answer
+/// moved is still a divergence, at its own site, where the case names no tolerance; and a notice
+/// outside the native set is still the case's to declare, whatever native notes fired beside it.
+#[test]
+fn a_native_note_declares_no_value_and_excuses_no_other_notice() {
+    let native = Degradation::NativeNanEncoding;
+    let other = Degradation::CarriedDecodedTwin;
+    let case = WordsCase::new("words", 2);
+    let recording = recording_of(&case, case.transcript(words(&[1, 2]), "Completed", &[]), 3);
+    let mut side = StubSide::new(words(&[1, 7])).announcing(&[native, other]);
+    let replayed = replay_against(&case, &mut side, &recording).unwrap();
+    let Verdict::Divergent { found, .. } = &replayed.verdict else {
+        panic!("not divergent: {}", replayed.verdict);
+    };
+    let undeclared: Vec<&str> = found
+        .iter()
+        .filter_map(|divergence| match &divergence.kind {
+            DivergenceKind::UndeclaredNotice { code } => Some(code.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(undeclared, vec![other.code()], "{found:?}");
+    assert!(
+        found
+            .iter()
+            .any(|divergence| divergence.path.starts_with("case/output")),
+        "the moved word is a divergence of its own: {found:?}"
+    );
+    // The notices site itself passes on the native note's declaration: the one notice row is the
+    // undeclared code's, with no second row for the set or the counts.
+    assert!(
+        !found
+            .iter()
+            .any(|divergence| divergence.path.starts_with("case/notices/")),
+        "{found:?}"
+    );
+}
+
+/// A native note the run did not announce is no loosening the case names: a case that names
+/// nothing and announces one other notice reads that notice as undeclared and its notices site as
+/// differing, and is not told that it loosens the site with a declaration nothing justified.
+#[test]
+fn an_unannounced_native_note_is_no_unjustified_loosening() {
+    let other = Degradation::CarriedDecodedTwin;
+    let case = WordsCase::new("words", 2);
+    let recording = recording_of(&case, case.transcript(words(&[1, 2]), "Completed", &[]), 3);
+    let mut side = StubSide::new(words(&[1, 2])).announcing(&[other]);
+    let replayed = replay_against(&case, &mut side, &recording).unwrap();
+    let Verdict::Divergent { found, .. } = &replayed.verdict else {
+        panic!("not divergent: {}", replayed.verdict);
+    };
+    assert!(
+        found
+            .iter()
+            .any(|divergence| matches!(divergence.kind, DivergenceKind::UndeclaredNotice { .. })),
+        "{found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|divergence| divergence.path.starts_with("case/notices/")),
+        "the notices site differs as if nothing declared it: {found:?}"
+    );
+    assert!(
+        !found
+            .iter()
+            .any(|divergence| matches!(divergence.kind, DivergenceKind::Unjustified { .. })),
+        "{found:?}"
+    );
+}
+
+/// The standing set is closed over the native-maths class by construction: every kind whose code
+/// says it is the device's native form is in it, so a native note a later change adds cannot be
+/// left for every case to declare. Each member is a precision kind, held once.
+#[test]
+fn the_native_notes_hold_every_native_kind_once() {
+    use crate::replay::NATIVE_NOTES;
+    for kind in Degradation::ALL {
+        if kind.code().starts_with("metal2vulkan-degrade-native-") {
+            assert!(NATIVE_NOTES.contains(kind), "{kind:?} is missing");
+        }
+    }
+    for (at, kind) in NATIVE_NOTES.iter().enumerate() {
+        assert_eq!(
+            kind.category(),
+            metal2vulkan_runtime::DegradationCategory::Precision,
+            "{kind:?}"
+        );
+        assert!(!NATIVE_NOTES[..at].contains(kind), "{kind:?} twice");
+    }
+}
+
+/// No case names a native note, at the notices site or at a value. The suite declares each one
+/// for every case, so a case's own declaration states the suite's rule a second time; and a value
+/// loosened by one is a tolerance the note's own documentation says validation derives from none.
+/// A value the device's native answer moves is a `known-gaps.tsv` row instead, scoped to the
+/// venue whose device answers so.
+#[test]
+fn no_case_names_a_native_note() {
+    use crate::replay::NATIVE_NOTES;
+    let mut named = Vec::new();
+    for case in crate::cases::all() {
+        for allowance in case.allowances() {
+            let Justification::Degradation(code) = &allowance.justified_by else {
+                continue;
+            };
+            if NATIVE_NOTES.iter().any(|kind| kind.code() == code) {
+                named.push(format!(
+                    "{} names {code} at {}",
+                    case.name(),
+                    allowance.path
+                ));
+            }
+        }
+    }
+    assert!(named.is_empty(), "{}:\n{}", named.len(), named.join("\n"));
 }
 
 /// A case that names two notices separately must see **both** fire. Before the subset check the
@@ -1728,7 +1866,7 @@ fn a_recording_of_another_oracle_is_stale_and_fails() {
     let case = WordsCase::new("words", 2);
     let mut recording = recording_of(&case, case.transcript(words(&[1, 2]), "Completed", &[]), 3);
     recording.answers[0].key.os_build = "00A000".to_owned();
-    let Err(Lookup::Stale(stale)) = recording.answer(MetalLevel::NEWEST) else {
+    let Err(Lookup::Stale(stale)) = recording.answer() else {
         panic!("a recording of another build is not stale");
     };
     let printed = stale.to_string();
@@ -1740,15 +1878,17 @@ fn a_recording_of_another_oracle_is_stale_and_fails() {
     assert!(format!("{error}").contains("stale"), "{error}");
 }
 
+/// An answer of the oracle whose key names the Metal of another release than the runtime's leaves
+/// the case unrecorded at the runtime's release, not stale.
 #[test]
-fn a_level_with_no_answer_is_unrecorded_rather_than_stale() {
+fn another_release_s_answer_is_unrecorded_rather_than_stale() {
     let case = WordsCase::new("words", 2);
     let mut recording = recording_of(&case, case.transcript(words(&[1, 2]), "Completed", &[]), 3);
-    recording.answers[0].key.metal_level = "26.7".to_owned();
+    recording.answers[0].key.metal_level = "26.0".to_owned();
     assert_eq!(
-        recording.answer(MetalLevel::NEWEST),
+        recording.answer(),
         Err(Lookup::Unrecorded {
-            level: MetalLevel::NEWEST.macos().to_owned()
+            release: MACOS_RELEASE.to_owned()
         })
     );
 }
@@ -1795,7 +1935,7 @@ fn record_mode_refuses_a_case_that_must_not_be_re_recorded() {
         ..WordsCase::new("words", 2)
     };
     let mut side = StubSide::new(words(&[1, 2]));
-    let error = record(&case, &mut side, 1, MetalLevel::NEWEST, Validated::NotRun).unwrap_err();
+    let error = record(&case, &mut side, 1, Validated::NotRun).unwrap_err();
     assert_eq!(
         error,
         RecordError::Forbidden {
@@ -1830,7 +1970,7 @@ fn record_mode_refuses_a_case_whose_metal_run_stopped() {
     {
         let mut stops = StubSide::new(words(&[7])).refusing("library", refusal.clone());
         assert_eq!(
-            record(&case, &mut stops, 1, MetalLevel::NEWEST, Validated::Ran).unwrap_err(),
+            record(&case, &mut stops, 1, Validated::Ran).unwrap_err(),
             RecordError::NoMetal
         );
     }
@@ -1839,7 +1979,7 @@ fn record_mode_refuses_a_case_whose_metal_run_stopped() {
         // A refusal at the site the case makes with `made`: the run stops, and no recording is
         // written. The site is named, and the refusal in the words a ledger row uses.
         let mut stops = StubSide::new(words(&[7])).refusing("library", refusal.clone());
-        let error = record(&case, &mut stops, 1, MetalLevel::NEWEST, Validated::Ran).unwrap_err();
+        let error = record(&case, &mut stops, 1, Validated::Ran).unwrap_err();
         let RecordError::Refused {
             case: named,
             at,
@@ -1860,7 +2000,7 @@ fn record_mode_refuses_a_case_whose_metal_run_stopped() {
         // same case, the same refusal, at the site it carries past. The transcript is the whole
         // case with one query Metal answered nil for, which is Metal's answer, so it records.
         let mut carries = StubSide::new(words(&[7])).refusing("texture", refusal);
-        let answer = record(&case, &mut carries, 1, MetalLevel::NEWEST, Validated::Ran)
+        let answer = record(&case, &mut carries, 1, Validated::Ran)
             .expect("a refusal a sweep carries past is Metal's answer, not a truncated run");
         assert_eq!(answer.provenance, Provenance::MetalRun);
         let printed = format!("{:?}", answer.outcomes[0].transcript);
@@ -1884,7 +2024,7 @@ fn record_mode_counts_the_outcomes_it_saw_with_their_runs() {
         let case = WordsCase::new("words", 2);
         let mut side = StubSide::new(words(&[1, 2]));
         assert_eq!(
-            record(&case, &mut side, 2, MetalLevel::NEWEST, Validated::Ran).unwrap_err(),
+            record(&case, &mut side, 2, Validated::Ran).unwrap_err(),
             RecordError::NoMetal
         );
     }
@@ -1892,7 +2032,7 @@ fn record_mode_counts_the_outcomes_it_saw_with_their_runs() {
     {
         let case = WordsCase::new("words", 2);
         let mut side = StubSide::new(words(&[1, 2]));
-        let answer = record(&case, &mut side, 3, MetalLevel::NEWEST, Validated::Ran).unwrap();
+        let answer = record(&case, &mut side, 3, Validated::Ran).unwrap();
         assert_eq!(answer.runs, 3);
         assert_eq!(
             answer.outcomes.len(),
@@ -2347,7 +2487,7 @@ fn a_carried_answer_taken_on_another_chip_names_it() {
         };
         let recorded = crate::recording::read(case.name())
             .unwrap_or_else(|why| panic!("{}: {why}", case.name()))
-            .answer(MetalLevel::NEWEST)
+            .answer()
             .unwrap_or_else(|why| panic!("{}: {why}", case.name()))
             .provenance
             .clone();
@@ -2773,7 +2913,7 @@ fn the_committed_recordings_carry_all_three_validated_answers() {
     let validated = |case: &str| {
         crate::recording::read(case)
             .unwrap_or_else(|why| panic!("{case}: {why}"))
-            .answer(MetalLevel::NEWEST)
+            .answer()
             .unwrap_or_else(|why| panic!("{case}: {why}"))
             .validated
             .clone()
@@ -3006,7 +3146,6 @@ fn the_known_gaps_ledger_parses_and_names_real_cases() {
         device: device.to_owned(),
         driver: "vendor 0x10005 device 0x0000".to_owned(),
         api: "1.2".to_owned(),
-        metal_level: "27.0.1".to_owned(),
     };
     let measured = lavapipe("llvmpipe (LLVM 21.1.8, 128 bits)");
     let other = lavapipe("llvmpipe (LLVM 23.1.1, 256 bits)");
@@ -3145,7 +3284,6 @@ fn venue_named(device: &str) -> Venue {
         device: device.to_owned(),
         driver: "stub".to_owned(),
         api: "none".to_owned(),
-        metal_level: ORACLE_OS_VERSION.to_owned(),
     }
 }
 
@@ -3236,7 +3374,7 @@ fn the_ledger_fails_on_a_new_refusal_and_on_one_that_is_gone() {
         case: "words".to_owned(),
         venue: venue_named("stub"),
         verdict: Verdict::Unrecorded {
-            why: "no Metal answer at Metal level 99".to_owned(),
+            why: "no Metal answer at macOS 99".to_owned(),
         },
         allowances: Default::default(),
         measured_on: None,
@@ -3667,7 +3805,7 @@ fn metal_on_this_chip_answers_the_two_plane_blits_exactly_as_the_probes_printed_
         let recorded = crate::recording::read(case.name())
             .unwrap_or_else(|why| panic!("{}: {why}", case.name()));
         let answer = recorded
-            .answer(MetalLevel::NEWEST)
+            .answer()
             .unwrap_or_else(|why| panic!("{}: {why}", case.name()));
         assert_eq!(
             answer.provenance,
@@ -3789,7 +3927,6 @@ fn a_call_metal_did_not_return_from_is_its_own_verdict() {
         case.name(),
         Vec::new(),
         vec![crate::record::never_returned(
-            MetalLevel::NEWEST,
             "the suite's own tests",
             DIED_AT,
             "the probe's device",
@@ -3853,7 +3990,6 @@ fn answering_where_metal_did_not_return_is_divergent() {
         case.name(),
         Vec::new(),
         vec![crate::record::never_returned(
-            MetalLevel::NEWEST,
             "the suite's own tests",
             DIED_AT,
             "the probe's device",
@@ -3884,7 +4020,7 @@ fn record_mode_refuses_a_row_metal_does_not_return_from() {
     let case = DiedOnMetal { answers: false };
     assert_eq!(case.metal_source().forbidden(), Some(DIED_SAYS));
     let mut side = StubSide::new(Vec::new());
-    let refused = record(&case, &mut side, 1, MetalLevel::NEWEST, Validated::NotRun);
+    let refused = record(&case, &mut side, 1, Validated::NotRun);
     assert_eq!(
         refused,
         Err(RecordError::Forbidden {
@@ -3896,7 +4032,6 @@ fn record_mode_refuses_a_row_metal_does_not_return_from() {
     // And the answer that is written instead says so in the file: the provenance names the call,
     // and Metal's API validation was never asked either.
     let answer = crate::record::never_returned(
-        MetalLevel::NEWEST,
         "the suite's own tests",
         DIED_AT,
         "the probe's device",
@@ -3923,7 +4058,7 @@ fn the_report_says_how_many_answers_came_from_another_chip() {
             case.name(),
             Vec::new(),
             vec![RecordedAnswer {
-                key: crate::recording::OracleKey::current(MetalLevel::NEWEST),
+                key: crate::recording::OracleKey::current(),
                 provenance: Provenance::Carried {
                     from: "a probe this tree holds".to_owned(),
                     measured_on: chip.to_owned(),
@@ -3999,7 +4134,7 @@ fn the_cost_half_reads_every_count_the_runtime_keeps() {
     for name in [
         "queue_submissions",
         "variant_pipelines_made",
-        "commands_replayed.cmd_draw",
+        "commands_recorded.cmd_draw",
         "object_churn.images_parked",
         "shadow_keeps.render_cut",
     ] {
@@ -4042,7 +4177,7 @@ fn the_reading_follows_the_nesting_and_skips_the_site_tables() {
     let shape = "\
 WorkCounts {
     queue_submissions: 2,
-    commands_replayed: CommandsReplayed {
+    commands_recorded: CommandsRecorded {
         cmd_draw: 7,
     },
     copy_sites: [
@@ -4063,7 +4198,7 @@ WorkCounts {
 }";
     let read = crate::cost::Counts::read(shape).expect("the shape reads");
     assert_eq!(read.get("queue_submissions"), 2);
-    assert_eq!(read.get("commands_replayed.cmd_draw"), 7);
+    assert_eq!(read.get("commands_recorded.cmd_draw"), 7);
     assert_eq!(read.get("render_passes_made"), 1);
     assert_eq!(read.len(), 3, "{:?}", read);
 }
@@ -4131,7 +4266,7 @@ fn the_work_is_attributed_to_the_three_regions() {
         assert_eq!(region_of(name), Region::Translation, "{name}");
     }
     for name in [
-        "commands_replayed.cmd_draw",
+        "commands_recorded.cmd_draw",
         "queue_submissions",
         "command_buffers_submitted",
         "scheduler_passes",
@@ -4369,12 +4504,64 @@ fn a_run_with_no_bound_that_stands_is_unmeasured_and_says_why() {
     );
 }
 
+/// The degraded-set rule counts no native note ([`crate::replay::degrading`]). The device's native
+/// form is the only one the runtime builds, so a run that announced one did the same work as one
+/// that did not: a record that holds one (as a record taken before the rule may) compares with a
+/// run that announced none, and the other way about. A notice that is not native still keeps the
+/// two apart.
+#[test]
+fn the_degraded_set_rule_counts_no_native_note() {
+    let native = crate::replay::NATIVE_NOTES[0].code().to_owned();
+    let record = |degraded: Vec<String>| crate::cost::CostRecord {
+        venue: "the measured venue".to_owned(),
+        runs: 2,
+        measured: "two runs".to_owned(),
+        contrasted: None,
+        degraded,
+        bounds: [("queue_submissions".to_owned(), 1)].into_iter().collect(),
+        moving: Default::default(),
+        composed: Default::default(),
+        ceilings: Default::default(),
+        per_state: None,
+        unmeasurable: None,
+    };
+    let found = crate::cost::Counts::read("WorkCounts {\n    queue_submissions: 1,\n}").unwrap();
+    let judged = |record: &crate::cost::CostRecord, degraded: &[String]| {
+        crate::cost::judge(
+            std::slice::from_ref(record),
+            "the measured venue",
+            true,
+            &found,
+            0,
+            None,
+            degraded,
+        )
+        .word()
+    };
+    assert_eq!(judged(&record(vec![native.clone()]), &[]), "within");
+    assert_eq!(
+        judged(&record(Vec::new()), std::slice::from_ref(&native)),
+        "within"
+    );
+    assert_eq!(
+        judged(
+            &record(vec![native.clone()]),
+            &["half-nan-quieted".to_owned()]
+        ),
+        "unmeasured"
+    );
+    assert_eq!(
+        crate::replay::degrading([native, "b".to_owned(), "a".to_owned(), "b".to_owned()]),
+        ["a", "b"]
+    );
+}
+
 /// The cost record rides in the recording, and a recording written before the cost half existed
 /// still reads.
 #[test]
 fn the_cost_record_rides_in_the_recording() {
     let answer = RecordedAnswer {
-        key: crate::recording::OracleKey::current(MetalLevel::NEWEST),
+        key: crate::recording::OracleKey::current(),
         provenance: Provenance::MetalRun,
         device: "a device".to_owned(),
         runs: 1,
@@ -4521,8 +4708,6 @@ fn re_recording_a_metal_answer_keeps_the_cost_record() {
 fn a_count_that_says_which_thread_arrived_first_is_never_gated() {
     use crate::cost::racy;
     for count in [
-        "command_buffers_replayed",
-        "command_buffers_replayed_inline",
         "object_churn.images_evicted",
         "object_churn.vk_images_destroyed",
         "object_churn.vk_images_made",
@@ -4558,10 +4743,9 @@ fn a_count_that_says_which_thread_arrived_first_is_never_gated() {
     // selection is a question only the contrast run answers, and
     // `a_count_the_selection_decides_is_reported_and_not_gated` holds that half.
     for count in [
-        "command_buffers_deferred",
         "command_buffers_submitted",
         "queue_submissions",
-        "commands_replayed.cmd_draw",
+        "commands_recorded.cmd_draw",
         "render_passes_made",
         "slot_returns",
         // The `_made` partner of a `_shared` or `_reused` count stays gated: finding one already
@@ -4653,8 +4837,8 @@ fn a_count_that_says_which_thread_arrived_first_is_never_gated() {
         contrasted: None,
         degraded: Vec::new(),
         bounds: [
-            ("command_buffers_replayed_inline".to_owned(), 1),
-            ("command_buffers_deferred".to_owned(), 1),
+            ("wakes_spared".to_owned(), 1),
+            ("command_buffers_submitted".to_owned(), 1),
         ]
         .into_iter()
         .collect(),
@@ -4679,20 +4863,20 @@ fn a_count_that_says_which_thread_arrived_first_is_never_gated() {
     // The race going over its bound is not a failure.
     assert_eq!(
         judge(
-            "WorkCounts {\n    command_buffers_deferred: 1,\n    \
-             command_buffers_replayed_inline: 9,\n}"
+            "WorkCounts {\n    command_buffers_submitted: 1,\n    \
+             wakes_spared: 9,\n}"
         )
         .word(),
         "within"
     );
     // The total going over it is.
     let over = judge(
-        "WorkCounts {\n    command_buffers_deferred: 2,\n    \
-         command_buffers_replayed_inline: 1,\n}",
+        "WorkCounts {\n    command_buffers_submitted: 2,\n    \
+         wakes_spared: 1,\n}",
     );
     assert_eq!(over.word(), "over");
     assert!(
-        over.to_string().contains("command_buffers_deferred"),
+        over.to_string().contains("command_buffers_submitted"),
         "{over}"
     );
     // And a racy count the record never bounded at all is still not gated, which is the case that
@@ -4884,7 +5068,7 @@ fn a_count_only_one_shape_moved_is_reported_as_well() {
         measured: "eight runs of the whole selection".to_owned(),
         contrasted: None,
         degraded: Vec::new(),
-        bounds: [("commands_replayed.cmd_dispatch".to_owned(), 4)]
+        bounds: [("commands_recorded.cmd_dispatch".to_owned(), 4)]
             .into_iter()
             .collect(),
         moving: Default::default(),
@@ -4908,7 +5092,7 @@ fn a_count_only_one_shape_moved_is_reported_as_well() {
     assert_eq!(
         apart.apart_from(&held),
         vec![
-            ("commands_replayed.cmd_dispatch", 4, 0),
+            ("commands_recorded.cmd_dispatch", 4, 0),
             ("inline_passes", 0, 1)
         ]
     );
@@ -4918,7 +5102,7 @@ fn a_count_only_one_shape_moved_is_reported_as_well() {
     // first to run would be held to zero.
     assert_eq!(record.bounds.get("inline_passes"), Some(&1));
     assert_eq!(
-        record.bounds.get("commands_replayed.cmd_dispatch"),
+        record.bounds.get("commands_recorded.cmd_dispatch"),
         Some(&4)
     );
 }
@@ -5175,9 +5359,9 @@ fn the_runtime_side_forwards_every_field_of_a_pipeline_spec() {
 /// would record a difference without saying what it was waiting on. The notices site used to print
 /// "Metal recorded AnnouncedNothing, we observed a value", which names nothing a reader can act on.
 ///
-/// It is a divergence and not a tolerance on purpose: where the product's own degrade note says
-/// validation derives no explanation from it, loosening the site here would be this suite
-/// overruling the product's stated contract.
+/// It is a divergence and not a tolerance on purpose: a notice the case does not declare, outside
+/// the device's native answers the suite declares for every case ([`crate::replay::NATIVE_NOTES`]),
+/// is a difference nobody is accounting for.
 #[test]
 fn a_divergence_that_is_a_notice_names_the_notice_each_side_announced() {
     use crate::known_gaps::{against, Expectation, Expects, KnownGap};

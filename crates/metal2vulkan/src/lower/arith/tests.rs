@@ -7,8 +7,13 @@
 //! CPU interpreter over every case whose reference result is defined (LLVM poison and undefined
 //! behavior are skipped, so an interpreter trap is a real failure). References are written from
 //! the LLVM and Metal definitions in plain Rust.
+//!
+//! A kernel rounds to `half` in `QuantizeForm::Controlled` unless its body sets another form: the
+//! device's conversion under the 16-bit float controls, Metal's `half(float)` by the Vulkan spec,
+//! which the interpreter rounds to nearest even with half denormals kept. A `half` operand is the
+//! device's widening of its bits (`narrow::from_bits`), exact but for a NaN, which the
+//! interpreter widens to its canonical NaN (`PrecisionNote::NativeNanEncoding`).
 
-use super::divide::Reciprocal;
 use super::legal::{f16_to_f64, f64_to_f16, FloatFmt, Form, Held};
 use super::libm::Lib;
 use super::math::{self, ConvertKind, FloatFn, IntFn, Sign};
@@ -326,6 +331,7 @@ fn kernel_defs(
     lanes: bool,
 ) -> BResult<TypedModule> {
     let mut b = ModuleBuilder::new();
+    b.set_quantize_form(QuantizeForm::Controlled);
     let outb = buffer(&mut b, 0)?;
     let inb = buffer(&mut b, 1)?;
     let funcs = defs(&mut b)?;
@@ -364,7 +370,7 @@ fn kernel_defs(
     if dce {
         let budget = crate::budget::Budget::default();
         let mut meter = crate::budget::Meter::new(&budget);
-        if let Err(e) = crate::spirv::dead::remove_dead_keeping(&mut m, &offers, &[], &mut meter) {
+        if let Err(e) = crate::spirv::dead::remove_dead_keeping(&mut m, &offers, &mut meter) {
             panic!("remove_dead_keeping: {e:?}");
         }
     }
@@ -384,9 +390,9 @@ fn wide_profile() -> DeviceProfile {
 }
 
 /// The `half` roundings the blends' checks run under (`extended_range::blend::half_of`): the
-/// integer sequence every device answers alike, and the device's conversion under the 16-bit float
-/// controls, each checked against Metal's arithmetic.
-const HALF_FORMS: [QuantizeForm; 2] = [QuantizeForm::Integer, QuantizeForm::Controlled];
+/// integer sequence, which every form but the controlled one takes, and the device's conversion
+/// under the 16-bit float controls, each checked against Metal's arithmetic.
+const HALF_FORMS: [QuantizeForm; 2] = [QuantizeForm::Device, QuantizeForm::Controlled];
 
 /// One case: per operand, per lane, the held bits.
 type Case = Vec<Vec<u64>>;
@@ -427,6 +433,15 @@ fn is_nan(f: Form, b: u64) -> bool {
         Held::Float(FloatFmt::F64) => f64::from_bits(b).is_nan(),
         _ => false,
     }
+}
+
+/// Whether `f32` bits `got` are the device's quantize's answer for the `half` value `want` (`f32`
+/// bits) below the smallest normal half: its signed zero. SPIR-V lets `OpQuantizeToF16` answer a
+/// zero there, and the interpreter's does (as NIR's `fquantize2f16`), so a module rounding by
+/// [`QuantizeForm::Device`] may answer it (`PrecisionNote::NativeHalfQuantize`).
+fn quantize_flush_of(got: u64, want: u64) -> bool {
+    let w = f32::from_bits(want as u32);
+    w != 0.0 && w.abs() < 2f32.powi(-14) && got == want & 0x8000_0000
 }
 
 fn is_zero(f: Form, b: u64) -> bool {
@@ -558,13 +573,6 @@ fn dispatch_module(
                 slot: Some(slot(1)),
                 address: None,
                 bytes: input.iter().flat_map(|w| w.to_le_bytes()).collect(),
-            },
-            // The color table a kernel that rounds an sRGB channel declares, bound as the binder
-            // binds it.
-            Buffer {
-                slot: Some(super::srgb::color_table_symbol(Stage::Kernel)),
-                address: None,
-                bytes: super::srgb::color_write_table().to_vec(),
             },
         ],
         push: Vec::new(),
@@ -1770,22 +1778,17 @@ fn a_narrow_mask_after_a_signed_clamp_is_an_extract_under_the_workaround() {
     }
 }
 
-/// Metal's `round`: halves away from zero, and on `float` and `half` (`positive_zero`) a zero
-/// result is `+0` (`round(-0.3)` and `round(-0)` are `+0`).
-fn metal_round(positive_zero: bool, x: f64) -> f64 {
-    let r = x.round();
-    if positive_zero && r == 0.0 {
-        0.0
-    } else {
-        r
-    }
+/// `round`'s composition: halves away from zero, a zero result the operand's sign (C99's
+/// `round(-0.3)` is `-0`, where Metal answers `+0`: `PrecisionNote::NativeTranscendentals`).
+fn c99_round(x: f64) -> f64 {
+    x.round()
 }
 
-/// Metal's `median3` of operand bits `b` (A1 case aed3faaa): `min(max(c, min(a, b)), max(a, b))`,
-/// where `min(p, q)` is `p` for a NaN `q`, else `p < q ? p : q` (and `max` with `>`), comparing the
-/// operands' values `val` (an `f32` denormal as zero) but returning their bits; `fast` answers `b`
-/// for two NaN first operands.
-fn median3_ref(b: [u64; 3], val: &dyn Fn(u64) -> f64, fast: bool) -> u64 {
+/// `median3(a, b, c)` of operand bits `b` as `min(max(c, min(a, b)), max(a, b))` of the device's
+/// `NMin` and `NMax` as the interpreter answers them (Metal's `fmin` and `fmax`: a NaN `q` loses,
+/// a tie answers the second operand), comparing the operands' values `val` but returning their
+/// bits.
+fn median3_ref(b: [u64; 3], val: &dyn Fn(u64) -> f64) -> u64 {
     let pick = |p: u64, q: u64, less: bool| {
         let (vp, vq) = (val(p), val(q));
         if vq.is_nan() || (less && vp < vq) || (!less && vp > vq) {
@@ -1795,52 +1798,17 @@ fn median3_ref(b: [u64; 3], val: &dyn Fn(u64) -> f64, fast: bool) -> u64 {
         }
     };
     let [a, b, c] = b;
-    if fast && val(a).is_nan() && val(b).is_nan() {
-        return b;
-    }
     let lo = pick(a, b, true);
     let hi = pick(a, b, false);
     pick(pick(c, lo, false), hi, true)
 }
 
-/// Metal's `fmin`, `fmax`, `min3`, `max3`, or `clamp` (`op`) of operand bits `b`: `fmin(p, q)` is
-/// `q` for a NaN `p`, else `p` for a NaN `q` or `p < q`, else `q` (and `fmax` with `>`), comparing
-/// the operands' values `val` (an `f32` denormal as zero) but returning their bits; `min3` and
-/// `max3` nest it, and `clamp(x, lo, hi)` is `fmin(fmax(x, lo), hi)`.
-fn metal_min_max_ref(op: FloatFn, b: &[u64], val: &dyn Fn(u64) -> f64) -> u64 {
-    let pick = |p: u64, q: u64, less: bool| {
-        let (vp, vq) = (val(p), val(q));
-        if vp.is_nan() {
-            q
-        } else if vq.is_nan() || (less && vp < vq) || (!less && vp > vq) {
-            p
-        } else {
-            q
-        }
-    };
-    match op {
-        FloatFn::Min => pick(b[0], b[1], true),
-        FloatFn::Max => pick(b[0], b[1], false),
-        FloatFn::Min3 => pick(pick(b[0], b[1], true), b[2], true),
-        FloatFn::Max3 => pick(pick(b[0], b[1], false), b[2], false),
-        FloatFn::Clamp => pick(pick(b[0], b[1], false), b[2], true),
-        _ => panic!("{op:?} is not a minimum or maximum"),
-    }
-}
-
-/// An `f32` operand's value as Metal's `float` comparisons read it: a denormal as zero.
-fn f32_compared(b: u64) -> f64 {
-    if b & 0x7F80_0000 == 0 {
-        0.0
-    } else {
-        f64::from(f32::from_bits(b as u32))
-    }
-}
-
+/// The answer of float function `op` on `bits`-bit operands `a` as its lowering's instructions
+/// give it on the interpreter (one answer Vulkan allows): `fabs`, `sign`, `fract` and `median3`
+/// the device's `FAbs`, `FSign`, `Fract`, `NMin` and `NMax`, `round` its composition. `None` where
+/// the instruction's answer is undefined (`FSign` of a NaN).
 fn float_ref(op: FloatFn, bits: u8, a: &[u64]) -> Option<u64> {
     let x = |i: usize| fval(bits, a[i]);
-    // An `f32` zero or denormal, which Metal's `float` functions read as zero.
-    let flushed = |i: usize| bits == 32 && a[i] & 0x7F80_0000 == 0;
     // Compute in the operand width.
     let r = |v: f64| Some(fbits(bits, v));
     let min = |p: f64, q: f64| p.min(q);
@@ -1850,74 +1818,49 @@ fn float_ref(op: FloatFn, bits: u8, a: &[u64]) -> Option<u64> {
         FloatFn::Floor => r(x(0).floor()),
         FloatFn::Ceil => r(x(0).ceil()),
         FloatFn::Trunc => r(x(0).trunc()),
-        FloatFn::Round => r(metal_round(bits == 32, x(0))),
+        FloatFn::Round => r(c99_round(x(0))),
         FloatFn::Rint => r(x(0).round_ties_even()),
-        FloatFn::Fract | FloatFn::FastFract { .. } => {
-            if x(0).is_nan() {
-                return Some(fbits(bits, f64::NAN));
-            }
-            // `fast::fract`'s `x - floor(x)` is NaN at an infinity under every fast-math flag.
-            if x(0).is_infinite() && op == (FloatFn::FastFract { infinite_nan: true }) {
-                return Some(fbits(bits, f64::NAN));
-            }
-            if x(0).is_infinite() || flushed(0) {
-                return r(0.0);
-            }
-            let below = if bits == 32 {
-                f64::from(f32::from_bits(0x3F7F_FFFF))
-            } else {
-                f64::from_bits(0x3FEF_FFFF_FFFF_FFFF)
-            };
+        FloatFn::Fract | FloatFn::FastFract => {
+            // `Fract`'s `x - floor(x)`, rounded once: a NaN at a NaN or an infinity.
             let d = if bits == 32 {
                 f64::from(f32v(a[0]) - f32v(a[0]).floor())
             } else {
                 x(0) - x(0).floor()
             };
-            r(if op == FloatFn::Fract {
-                d.min(below)
+            let below = if bits == 32 {
+                f64::from(f32::from_bits(0x3F7F_FFFF))
+            } else {
+                f64::from_bits(0x3FEF_FFFF_FFFF_FFFF)
+            };
+            r(if op == FloatFn::Fract && d >= 1.0 {
+                below
             } else {
                 d
             })
         }
         FloatFn::Sign => {
             let v = x(0);
-            r(if flushed(0) || v.is_nan() || v == 0.0 {
-                0.0
-            } else if v > 0.0 {
+            if v.is_nan() {
+                return None;
+            }
+            r(if v > 0.0 {
                 1.0
-            } else {
+            } else if v < 0.0 {
                 -1.0
-            })
-        }
-        FloatFn::Saturate => {
-            let v = x(0);
-            r(if flushed(0) || v.is_nan() || v <= 0.0 {
-                0.0
             } else {
-                v.min(1.0)
+                v
             })
         }
-        FloatFn::Min | FloatFn::Max | FloatFn::Clamp | FloatFn::Min3 | FloatFn::Max3
-            if bits == 32 =>
-        {
-            Some(metal_min_max_ref(op, a, &f32_compared))
-        }
+        // The device's `NClamp(x, 0, 1)`: a NaN answers 0, a denormal is the device's.
+        FloatFn::Saturate => r(min(max(x(0), 0.0), 1.0)),
         FloatFn::Min | FloatFn::MinNum => r(min(x(0), x(1))),
         FloatFn::Max | FloatFn::MaxNum => r(max(x(0), x(1))),
         FloatFn::Clamp => r(min(max(x(0), x(1)), x(2))),
         FloatFn::Min3 => r(min(min(x(0), x(1)), x(2))),
         FloatFn::Max3 => r(max(max(x(0), x(1)), x(2))),
-        FloatFn::Median3 | FloatFn::FastMedian3 => Some(median3_ref(
-            [a[0], a[1], a[2]],
-            &|b| {
-                if bits == 32 && b & 0x7F80_0000 == 0 {
-                    0.0
-                } else {
-                    fval(bits, b)
-                }
-            },
-            op == FloatFn::FastMedian3,
-        )),
+        FloatFn::Median3 | FloatFn::FastMedian3 => {
+            Some(median3_ref([a[0], a[1], a[2]], &|b| fval(bits, b)))
+        }
         FloatFn::Mix | FloatFn::MulAdd => {
             // Rounded per operation in the operand width.
             if bits == 32 {
@@ -1959,7 +1902,9 @@ fn float_ref(op: FloatFn, bits: u8, a: &[u64]) -> Option<u64> {
 
 /// `llvm.copysign` is the first operand's bits with the second's sign bit, exactly: NaN payloads,
 /// infinities, zeros, and denormals keep every other bit, on `float` and on the narrow formats held
-/// widened (whose container's sign bit is the format's).
+/// widened (whose container's sign bit is the format's). A `half` NaN's bits, its sign among them,
+/// are the device's widening's (`PrecisionNote::NativeNanEncoding`): a `half` NaN's sign moves as
+/// that NaN's, and a NaN first operand is a NaN.
 #[test]
 fn copysign_moves_exactly_the_sign_bit() {
     let mut f32s = f32_values();
@@ -1973,9 +1918,14 @@ fn copysign_moves_exactly_the_sign_bit() {
     let mut halves: Vec<u64> = vec![0, 0x8000, 0x0001, 0x8001, 0x3C00, 0xBC00, 0x7BFF];
     halves.extend([0x7C00, 0xFC00, 0x7E00, 0x7C01, 0xFE01, 0x03FF]);
     let bfloats: Vec<u64> = vec![0, 0x8000, 0x0001, 0x3F80, 0xBF80, 0x7F80, 0xFF80, 0x7FC1];
+    let numbers: Vec<u64> = halves
+        .iter()
+        .copied()
+        .filter(|&h| !is_nan(float(16), h))
+        .collect();
     for (what, f, vals, sign) in [
         ("f32", float(32), f32s, 0x8000_0000u64),
-        ("half", float(16), halves, 0x8000),
+        ("half", float(16), numbers, 0x8000),
         ("bfloat", bfloat(), bfloats, 0x8000),
     ] {
         check_accept(
@@ -1988,7 +1938,6 @@ fn copysign_moves_exactly_the_sign_bit() {
                     FloatFn::CopySign,
                     f,
                     Contraction::Forbidden,
-                    NanTest::IsNan,
                     x,
                     &Lib::instructions(),
                 )
@@ -1998,10 +1947,40 @@ fn copysign_moves_exactly_the_sign_bit() {
             &|g, w| g == w,
         );
     }
+    // A `half` NaN operand, its bits the device's widening's.
+    let half = float(16);
+    let nans: Vec<u64> = halves
+        .iter()
+        .copied()
+        .filter(|&h| is_nan(half, h))
+        .collect();
+    let mut cases = pairs(&nans, &halves);
+    cases.extend(pairs(&halves, &nans));
+    check_accept(
+        "copysign half NaN operands",
+        &[half, half],
+        half,
+        &|fb, x| {
+            math::float_fn(
+                fb,
+                FloatFn::CopySign,
+                half,
+                Contraction::Forbidden,
+                x,
+                &Lib::instructions(),
+            )
+        },
+        &cases,
+        &|c| Some(vec![(arg(c, 0) & !0x8000) | (arg(c, 1) & 0x8000)]),
+        &|g, w| (is_nan(half, g) && is_nan(half, w)) || g & 0x7FFF == w & 0x7FFF,
+    );
 }
 
+/// The exactly specified float functions answer their instructions' answers: the device's own
+/// for `fabs`, `sign`, `fract`, `median3` and `mix` (`FAbs`, `FSign`, `Fract`, `NMin`/`NMax`,
+/// `FMix`), and C99's `round` of the device's `Trunc`.
 #[test]
-fn exact_float_functions_match_metal() {
+fn exact_float_functions_answer_their_instructions() {
     let fns = [
         FloatFn::Abs,
         FloatFn::Floor,
@@ -2010,10 +1989,7 @@ fn exact_float_functions_match_metal() {
         FloatFn::Round,
         FloatFn::Rint,
         FloatFn::Fract,
-        FloatFn::FastFract {
-            infinite_nan: false,
-        },
-        FloatFn::FastFract { infinite_nan: true },
+        FloatFn::FastFract,
         FloatFn::Sign,
         FloatFn::Saturate,
         FloatFn::Min,
@@ -2034,10 +2010,6 @@ fn exact_float_functions_match_metal() {
         let f = float(bits);
         let few: Vec<u64> = vals.iter().copied().step_by(4).collect();
         for op in fns {
-            // A `float` `mix` is its own strategy, Metal's fused form (`tests::fused`).
-            if op == FloatFn::Mix && bits == 32 {
-                continue;
-            }
             let arity = op.arity();
             let cases: Vec<Case> = if arity == 1 {
                 vals.iter().map(|v| vec![vec![*v]]).collect()
@@ -2056,30 +2028,23 @@ fn exact_float_functions_match_metal() {
                 }
                 c
             };
-            // The device's `NMin` and `NMax` may give either zero; Metal's (`float`) gives the
-            // second operand.
-            let loose = match op {
-                FloatFn::MinNum | FloatFn::MaxNum => true,
-                FloatFn::Min | FloatFn::Max | FloatFn::Clamp | FloatFn::Min3 | FloatFn::Max3 => {
-                    bits == 64
-                }
-                _ => false,
-            };
+            // The device's `NMin`, `NMax` and `NClamp` may give either zero.
+            let loose = matches!(
+                op,
+                FloatFn::MinNum
+                    | FloatFn::MaxNum
+                    | FloatFn::Min
+                    | FloatFn::Max
+                    | FloatFn::Clamp
+                    | FloatFn::Min3
+                    | FloatFn::Max3
+                    | FloatFn::Saturate
+            );
             check(
                 &format!("{op:?} f{bits}"),
                 &vec![f; arity],
                 f,
-                &|fb, x| {
-                    math::float_fn(
-                        fb,
-                        op,
-                        f,
-                        Contraction::Forbidden,
-                        NanTest::IsNan,
-                        x,
-                        &Lib::instructions(),
-                    )
-                },
+                &|fb, x| math::float_fn(fb, op, f, Contraction::Forbidden, x, &Lib::instructions()),
                 &cases,
                 &|c| {
                     let a: Vec<u64> = c.iter().map(|l| l[0]).collect();
@@ -2087,6 +2052,140 @@ fn exact_float_functions_match_metal() {
                 },
                 loose,
             );
+        }
+    }
+}
+
+/// The functions the device has an instruction for are that instruction, on `float` and on a
+/// `half` held in `float`: `exp`, `log`, `pow` and `powr`'s magnitude, `sinh`, `cosh`, `tanh`
+/// (`Exp`, `Log`, `Pow`, `Sinh`, `Cosh`, `Tanh`, with no `Exp2` or `Log2` composition of Metal's),
+/// the fast `sin`, `cos`, `tan`, `sinh`, `cosh`, `tanh` and `atanh` (the instruction alone, with no
+/// flush past Metal's last evaluated quadrant and no MSL Table 8.2 formula), `fabs`, `sign`,
+/// `fract` and `fast::fract` (`FAbs`, `FSign`, `Fract`, with no bit operation), `median3` (`NMin`
+/// and `NMax` alone), `mix` (`FMix`) and `fast::sqrt` (`Sqrt`). `round` is C99's from the device's
+/// `Trunc`.
+#[test]
+fn functions_with_an_instruction_are_that_instruction() {
+    use crate::spv::GlslStd450Op as G;
+    const OP_EXT_INST: u32 = 12;
+    const OP_BITCAST: u32 = 124;
+    let read = |op: FloatFn, f: Form, lib: Lib| {
+        let m = kernel(&vec![f; op.arity()], f, &|fb, a| {
+            math::float_fn(fb, op, f, Contraction::Forbidden, a, &lib)
+        })
+        .expect("kernel");
+        let words = crate::spirv::serialize::serialize(m).expect("words").words;
+        let (mut ext, mut bitcasts) = (Vec::new(), 0);
+        let mut i = 5;
+        while i < words.len() {
+            let (n, code) = ((words[i] >> 16) as usize, words[i] & 0xFFFF);
+            if code == OP_EXT_INST {
+                ext.extend(words.get(i + 4).copied());
+            }
+            bitcasts += usize::from(code == OP_BITCAST);
+            i += n.max(1);
+        }
+        (ext, bitcasts)
+    };
+    let cases: [(FloatFn, &[G]); 22] = [
+        (FloatFn::FastSin, &[G::Sin]),
+        (FloatFn::FastCos, &[G::Cos]),
+        (FloatFn::FastTan, &[G::Tan]),
+        (FloatFn::FastSinh, &[G::Sinh]),
+        (FloatFn::FastCosh, &[G::Cosh]),
+        (FloatFn::FastTanh, &[G::Tanh]),
+        (FloatFn::FastAtanh, &[G::Atanh]),
+        (FloatFn::Exp, &[G::Exp]),
+        (FloatFn::Log, &[G::Log]),
+        (FloatFn::Sinh, &[G::Sinh]),
+        (FloatFn::Cosh, &[G::Cosh]),
+        (FloatFn::Tanh, &[G::Tanh]),
+        (FloatFn::Pow, &[G::Pow]),
+        (FloatFn::Powr, &[G::Pow]),
+        (FloatFn::Abs, &[G::FAbs]),
+        (FloatFn::Sign, &[G::FSign]),
+        (FloatFn::Fract, &[G::Fract]),
+        (FloatFn::FastFract, &[G::Fract]),
+        (FloatFn::Median3, &[G::NMin, G::NMax]),
+        (FloatFn::Mix, &[G::FMix]),
+        (FloatFn::FastSqrt, &[G::Sqrt]),
+        (FloatFn::Round, &[G::Trunc]),
+    ];
+    {
+        let lib = Lib::instructions();
+        for lane in [float(32), float(16)] {
+            for lanes in [1u8, 3] {
+                let f = vec(lane, lanes);
+                for (op, want) in cases {
+                    // `refine_float` gives a narrow call no fast function.
+                    let fast = matches!(
+                        op,
+                        FloatFn::FastSqrt
+                            | FloatFn::FastSin
+                            | FloatFn::FastCos
+                            | FloatFn::FastTan
+                            | FloatFn::FastSinh
+                            | FloatFn::FastCosh
+                            | FloatFn::FastTanh
+                            | FloatFn::FastAtanh
+                    );
+                    if fast && lane.float_fmt() == Some(FloatFmt::Half) {
+                        continue;
+                    }
+                    let what = format!("{op:?} on {f:?} ({lib:?})");
+                    let (ext, bitcasts) = read(op, f, lib);
+                    for g in want {
+                        assert!(ext.contains(&(*g as u32)), "{what}: {ext:?}");
+                    }
+                    for g in [G::Exp2, G::Log2, G::InverseSqrt] {
+                        assert!(!ext.contains(&(g as u32)), "{what}: {g:?} in {ext:?}");
+                    }
+                    let one_instruction = matches!(
+                        op,
+                        FloatFn::Exp
+                            | FloatFn::Log
+                            | FloatFn::Sinh
+                            | FloatFn::Cosh
+                            | FloatFn::Tanh
+                            | FloatFn::FastSin
+                            | FloatFn::FastCos
+                            | FloatFn::FastTan
+                            | FloatFn::FastSinh
+                            | FloatFn::FastCosh
+                            | FloatFn::FastTanh
+                            | FloatFn::FastAtanh
+                            | FloatFn::Abs
+                            | FloatFn::Sign
+                            | FloatFn::FastFract
+                            | FloatFn::Mix
+                            | FloatFn::FastSqrt
+                    );
+                    if one_instruction && lane.float_fmt() == Some(FloatFmt::F32) {
+                        assert_eq!(ext, vec![want[0] as u32], "{what}");
+                    }
+                    if matches!(
+                        op,
+                        FloatFn::Abs
+                            | FloatFn::Sign
+                            | FloatFn::Fract
+                            | FloatFn::FastFract
+                            | FloatFn::Median3
+                    ) && lane.float_fmt() == Some(FloatFmt::F32)
+                    {
+                        // No bitcast beyond the kernel's own loads and stores.
+                        let m = kernel(&vec![f; op.arity()], f, &|_, a| Ok(a[0])).expect("kernel");
+                        let words = crate::spirv::serialize::serialize(m).expect("words").words;
+                        let mut own = 0;
+                        let mut i = 5;
+                        while i < words.len() {
+                            let (n, code) = ((words[i] >> 16) as usize, words[i] & 0xFFFF);
+                            own += usize::from(code == OP_BITCAST);
+                            i += n.max(1);
+                        }
+                        assert_eq!(bitcasts, own, "{what}: on the bits");
+                    }
+                }
+            }
         }
     }
 }
@@ -2116,185 +2215,15 @@ fn nan_operands() -> Vec<u64> {
     ]
 }
 
-/// [`nan::select`] answers Metal's NaN bit for bit, by either test, on scalars and vectors: the
-/// canonical NaN for every NaN result (`Canonical`, `CanonicalExact`); with a NaN operand's sign or `+` for a domain error
-/// (`OperandSign`); `+` for a NaN operand and the operand's sign for a domain error
-/// (`DomainSign`); the NaN operand itself, else the canonical NaN (`Operand`); and every other
-/// result untouched. The kernel's first input is the operand, its second the result.
+/// Class H: a `half` `fmod` is its `float` remainder rounded, C's, with the dividend's sign, which
+/// the interpreter's `OpFRem` answers: a zero remainder of a nonzero dividend is the zero of the
+/// dividend's sign (`fmod(-2, 0.5)` and `fmod(-65504, 65504)` are `-0`), where Metal answers `+0`
+/// (`nan_fmod_zero`, `nan_fmod_zero_fast`, every lane; `PrecisionNote::NativeTranscendentals`),
+/// and a zero dividend's is the dividend itself (`fmod(-0, 1)` is `-0`), as Metal's is. Scalars
+/// and vectors, bit for bit but for a NaN's payload, and within the word estimate. A `float`
+/// remainder keeps the dividend's sign (`fmod(-2, 0.5)` is `-0`), as Metal's does.
 #[test]
-fn nan_select_answers_metals_nan_exactly() {
-    use super::nan::{self, NanAnswer};
-    let f32_nan = |b: u64| f32::from_bits(b as u32).is_nan();
-    let vals = nan_operands();
-    let cases = pairs(&vals, &vals);
-    for answer in [
-        NanAnswer::Canonical,
-        NanAnswer::CanonicalExact,
-        NanAnswer::OperandSign,
-        NanAnswer::DomainSign,
-        NanAnswer::Operand,
-    ] {
-        for test in [NanTest::IsNan, NanTest::Bits] {
-            for lanes in [1, 3] {
-                let f = vec(float(32), lanes);
-                let lane_cases: Vec<Case> = cases
-                    .iter()
-                    .map(|c| c.iter().map(|o| vec![o[0]; usize::from(lanes)]).collect())
-                    .collect();
-                check_accept(
-                    &format!("{answer:?} {test:?} x{lanes}"),
-                    &[f, f],
-                    f,
-                    &|fb, x| nan::select(fb, f, answer, test, x[1], Some(x[0])),
-                    &lane_cases,
-                    &|c| {
-                        let (a, r) = (arg(c, 0), arg(c, 1));
-                        let sign = a & 0x8000_0000;
-                        let want = match answer {
-                            NanAnswer::Operand if f32_nan(a) => a,
-                            _ if !f32_nan(r) => r,
-                            NanAnswer::Canonical
-                            | NanAnswer::CanonicalExact
-                            | NanAnswer::Operand => nan::CANONICAL,
-                            NanAnswer::OperandSign if f32_nan(a) => sign | nan::CANONICAL,
-                            NanAnswer::OperandSign => nan::CANONICAL,
-                            NanAnswer::DomainSign if f32_nan(a) => nan::CANONICAL,
-                            NanAnswer::DomainSign => sign | nan::CANONICAL,
-                        };
-                        Some(vec![want; usize::from(lanes)])
-                    },
-                    &|g, w| g == w,
-                );
-            }
-        }
-    }
-}
-
-/// Class B: on a `half` result, held widened, [`nan::select`] of the canonical answer gives Metal's
-/// `half` NaN `0x7E00` for every NaN lane, quiet or signaling, of either sign and any payload, by
-/// either test, and keeps every other lane, infinities and zeros included.
-#[test]
-fn nan_select_answers_metals_half_nan() {
-    use super::nan::{self, NanAnswer};
-    let halves: [u64; 16] = [
-        0x7E00, 0xFE00, 0x7C01, 0xFC01, 0x7DFF, 0xFFFF, 0x7FFF, 0x7E55, 0x7C00, 0xFC00, 0, 0x8000,
-        0x3C00, 0xBC00, 0x0001, 0x7BFF,
-    ];
-    for test in [NanTest::IsNan, NanTest::Bits] {
-        for lanes in [1u8, 3] {
-            let f = vec(float(16), lanes);
-            let cases: Vec<Case> = halves
-                .iter()
-                .map(|&h| vec![vec![h; usize::from(lanes)]])
-                .collect();
-            check_accept(
-                &format!("half {test:?} x{lanes}"),
-                &[f],
-                f,
-                &|fb, x| nan::select(fb, f, NanAnswer::Canonical, test, x[0], None),
-                &cases,
-                &|c| {
-                    let h = arg(c, 0);
-                    let want = if is_nan(float(16), h) { 0x7E00 } else { h };
-                    Some(vec![want; usize::from(lanes)])
-                },
-                &|g, w| g == w,
-            );
-        }
-    }
-}
-
-/// Class F: Metal's `fmin`, `fmax`, `min3`, `max3`, and `clamp` on `float` and `half`
-/// ([`math::metal_min_max`]) answer an operand bit for bit, by either NaN test, on scalars and
-/// vectors: a NaN loses, two NaNs and a tie of zeros answer the second operand, and a `float`
-/// denormal compares as zero but is returned itself (`fmin(2^-149, +0)` is `+0`, `fmin(+0,
-/// 2^-149)` is `2^-149`), as `nan_minmax`, `nan_minmax_fast`, their zeros-and-denormals cases,
-/// `nan_half`, and `nan_half_fast` read on every lane.
-#[test]
-fn min_max_answer_metals_operand_bit_for_bit() {
-    let mut floats = nan_operands();
-    floats.extend([
-        0x8000_0001,
-        0x007F_FFFF,
-        0x0080_0000,
-        0x8080_0000,
-        0x4000_0000,
-    ]);
-    let halves: Vec<u64> = vec![
-        0x7E00, 0xFE00, 0x7C01, 0xFC01, 0x7E55, 0x7C00, 0xFC00, 0, 0x8000, 0x3C00, 0xBC00, 0x0001,
-        0x8001, 0x03FF, 0x0400,
-    ];
-    let half_compared = |b: u64| f16_to_f64(b as u16);
-    let formats: [(u8, Vec<u64>, &dyn Fn(u64) -> f64); 2] =
-        [(32, floats, &f32_compared), (16, halves, &half_compared)];
-    for (bits, vals, val) in formats {
-        let few: Vec<u64> = vals.iter().copied().step_by(2).collect();
-        let triples: Vec<Case> = few
-            .iter()
-            .flat_map(|&a| {
-                let few = &few;
-                few.iter()
-                    .flat_map(move |&b| few.iter().map(move |&c| vec![vec![a], vec![b], vec![c]]))
-            })
-            .collect();
-        for op in [
-            FloatFn::Min,
-            FloatFn::Max,
-            FloatFn::Min3,
-            FloatFn::Max3,
-            FloatFn::Clamp,
-        ] {
-            let arity = op.arity();
-            let cases = if arity == 2 {
-                pairs(&vals, &vals)
-            } else {
-                triples.clone()
-            };
-            for test in [NanTest::IsNan, NanTest::Bits] {
-                for lanes in [1u8, 3] {
-                    let f = vec(float(bits), lanes);
-                    let n = usize::from(lanes);
-                    let lane_cases: Vec<Case> = cases
-                        .iter()
-                        .map(|c| c.iter().map(|o| vec![o[0]; n]).collect())
-                        .collect();
-                    check_accept(
-                        &format!("{op:?} f{bits} {test:?} x{lanes}"),
-                        &vec![f; arity],
-                        f,
-                        &|fb, x| {
-                            math::float_fn(
-                                fb,
-                                op,
-                                f,
-                                Contraction::Forbidden,
-                                test,
-                                x,
-                                &Lib::instructions(),
-                            )
-                        },
-                        &lane_cases,
-                        &|c| {
-                            let b: Vec<u64> = c.iter().map(|l| l[0]).collect();
-                            Some(vec![metal_min_max_ref(op, &b, val); n])
-                        },
-                        &|g, w| g == w,
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// Class H: Metal's `half` `fmod` answers `+0` for a zero remainder of a nonzero dividend and the
-/// dividend itself for a zero one (`fmod(-2, 0.5)` and `fmod(-65504, 65504)` are `+0`, `fmod(-0,
-/// 1)` and `fmod(-0, inf)` are `-0`), as `nan_fmod_zero` and `nan_fmod_zero_fast` read on every
-/// lane; every other remainder is C's, with the dividend's sign, which the interpreter's `OpFRem`
-/// answers. Scalars and vectors, bit for bit but for a NaN's payload (the canonical NaN is selected
-/// beside the function), and within the word estimate. A `float` remainder keeps the dividend's
-/// sign (`fmod(-2, 0.5)` is `-0`), as Metal's does.
-#[test]
-fn half_fmod_answers_metals_zero_remainder() {
+fn half_fmod_is_its_float_remainder_rounded() {
     let halves: Vec<u64> = vec![
         0, 0x8000, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4200, 0xC200, 0x3800, 0xB800, 0x3E00, 0xBE00,
         0x3A00, 0xBA00, 0x7BFF, 0xFBFF, 0x0001, 0x8001, 0x0002, 0x8002, 0x03FF, 0x7C00, 0xFC00,
@@ -2304,12 +2233,9 @@ fn half_fmod_answers_metals_zero_remainder() {
         let (a, b) = (c[0][0], c[1][0]);
         let (x, y) = (f16_to_f64(a as u16), f16_to_f64(b as u16));
         let r = x % y;
+        // A zero remainder keeps the dividend's sign; `f64_to_f16` keeps a zero's sign too.
         let bits = if r == 0.0 {
-            if x == 0.0 {
-                a
-            } else {
-                0
-            }
+            a & 0x8000
         } else {
             u64::from(f64_to_f16(r))
         };
@@ -2332,7 +2258,6 @@ fn half_fmod_answers_metals_zero_remainder() {
                     FloatFn::Fmod,
                     f,
                     Contraction::Forbidden,
-                    NanTest::IsNan,
                     x,
                     &Lib::instructions(),
                 )
@@ -2357,7 +2282,6 @@ fn half_fmod_answers_metals_zero_remainder() {
                 FloatFn::Fmod,
                 f,
                 Contraction::Forbidden,
-                NanTest::IsNan,
                 x,
                 &Lib::instructions(),
             )
@@ -2387,7 +2311,6 @@ fn half_fmod_answers_metals_zero_remainder() {
                 FloatFn::Fmod,
                 f,
                 Contraction::Allowed,
-                NanTest::IsNan,
                 x,
                 &Lib::instructions(),
             )
@@ -2405,8 +2328,9 @@ fn half_fmod_answers_metals_zero_remainder() {
 /// `fneg` and `fabs` (`nan_half`, `nan_half_fast`), answer the canonical NaN, computed exactly on
 /// the device; neither cast carries flags in either math mode. Its `half` functions answer the
 /// canonical `half` NaN, but `asin` (the operand's sign at a domain error) and `round` (the NaN
-/// operand), and those that answer a number or an operand. `float` `+ - * /` answer the canonical
-/// NaN in both states, and `frem` in neither; a `float` `fneg` is class E's. Only the canonical NaN
+/// operand) and `fract` (the NaN operand), and those that answer a number or an operand the
+/// device's picks return. `float` `+ - * /` answer the canonical NaN in both states, and `frem` in
+/// neither; a `float` `fneg` and `fabs` keep the operand's payload (class E). Only the canonical NaN
 /// of rounding arithmetic is left to a device whose arithmetic answers it.
 #[test]
 fn half_nan_answers_follow_the_measured_states() {
@@ -2435,7 +2359,12 @@ fn half_nan_answers_follow_the_measured_states() {
             function_answer(FloatFn::Abs, false, flagged, h),
             Some(A::CanonicalExact)
         );
-        assert_eq!(function_answer(FloatFn::Abs, false, flagged, f), None);
+        // `float` `fabs` keeps its operand's payload, the sign cleared: the device's `FAbs`
+        // answers its own NaN, noted.
+        assert_eq!(
+            function_answer(FloatFn::Abs, false, flagged, f),
+            Some(A::Operand)
+        );
         for op in [
             FloatFn::MulAdd,
             FloatFn::Mix,
@@ -2458,24 +2387,22 @@ fn half_nan_answers_follow_the_measured_states() {
             function_answer(FloatFn::Asin, false, flagged, h),
             Some(A::DomainSign)
         );
-        assert_eq!(
-            function_answer(FloatFn::Round, false, flagged, h),
-            Some(A::Operand)
-        );
-        for op in [
-            FloatFn::Fract,
-            FloatFn::FlaggedFract,
-            FloatFn::Sign,
-            FloatFn::Min,
-            FloatFn::Median3,
-        ] {
+        for op in [FloatFn::Round, FloatFn::Fract] {
+            assert_eq!(
+                function_answer(op, false, flagged, h),
+                Some(A::Operand),
+                "{op:?}"
+            );
+        }
+        for op in [FloatFn::Sign, FloatFn::Min, FloatFn::Median3] {
             assert_eq!(function_answer(op, false, flagged, h), None, "{op:?}");
         }
         // Metal has no `fast_` `half` function.
         assert_eq!(function_answer(FloatFn::Exp, true, flagged, h), None);
     }
     assert_eq!(fneg_answer(h), Some(A::CanonicalExact));
-    for fmt in [f, FloatFmt::BFloat, FloatFmt::F64] {
+    assert_eq!(fneg_answer(f), Some(A::Operand));
+    for fmt in [FloatFmt::BFloat, FloatFmt::F64] {
         assert_eq!(fneg_answer(fmt), None, "{fmt:?}");
     }
     assert_eq!(cast_answer(CastOp::FPTrunc, f, h), Some(A::Canonical));
@@ -2501,61 +2428,112 @@ fn half_nan_answers_follow_the_measured_states() {
         assert_eq!(cast_answer(op, from, to), None, "{op:?} {from:?} {to:?}");
     }
     use crate::device::profile::NanEncoding;
-    assert!(A::Canonical.left_to(NanEncoding::MetalCanonical));
-    for a in [A::CanonicalExact, A::Operand, A::OperandSign, A::DomainSign] {
-        assert!(!a.left_to(NanEncoding::MetalCanonical), "{a:?}");
+    assert!(A::Canonical.device_answers(NanEncoding::MetalCanonical));
+    for a in [
+        A::CanonicalExact,
+        A::Operand,
+        A::OperandSign,
+        A::DomainSign,
+        A::BaseToExponentOne,
+    ] {
+        assert!(!a.device_answers(NanEncoding::MetalCanonical), "{a:?}");
     }
-    for a in [A::Canonical, A::CanonicalExact] {
-        assert!(!a.left_to(NanEncoding::Device), "{a:?}");
-    }
-    // Native device maths leaves every answer to the device.
+    // A device not measured to answer Metal's canonical NaN answers none of Metal's NaNs.
     for a in [
         A::Canonical,
         A::CanonicalExact,
         A::Operand,
         A::OperandSign,
         A::DomainSign,
+        A::BaseToExponentOne,
     ] {
-        assert!(a.left_to(NanEncoding::Native), "{a:?}");
+        assert!(!a.device_answers(NanEncoding::Native), "{a:?}");
     }
 }
 
-/// The float facts of a profile whose `float` fused multiply-add is `OpFmaKHR`, checked by the
-/// integer routine, whose `half` one is the routine, and whose `float` functions are the device's.
+/// The float facts of a profile whose `float` fused multiply-add is `OpFmaKHR`, whose `half` one
+/// is the device's `float` `Fma`, and whose `float` functions are the device's.
 const KHR_FACTS: super::FloatFacts = super::FloatFacts {
     routes: super::fma::Routes {
         float: super::fma::Route::Khr,
-        half: super::fma::Route::HalfOdd,
-        tiny: Some(super::fma::Route::Soft),
+        half: super::fma::Route::Native,
     },
-    reciprocal: super::divide::Reciprocal::Rounded,
     metal_functions: false,
-    native: false,
-    nan_native: false,
+    device_denormals: false,
+    nans: crate::device::profile::NanEncoding::Native,
     native_min_max: false,
-    native_order: false,
 };
 
-/// Class E: Metal's `float` `fneg` and `fabs` flip or clear the sign bit alone, a NaN's payload and
-/// a denormal kept, with and without fast-math flags (`nan_signbits`, `nan_signbits_fast`), so they
-/// move on the bits on `float` only: such a `fabs` answers Metal's NaN itself and selects none,
-/// records no device note, and leaves the operand's bits observed, while a `half` `fabs` still
-/// selects its canonical NaN (class D). The bit operations are exact at every NaN, zero, and
-/// denormal.
+/// Precise `pow` on `float` leaves its NaNs to the device (the device's `Pow`, and the device's sum
+/// of NaN operands), where Metal's NaN is measured: the canonical NaN, but a NaN base to the
+/// exponent one, which is the base itself. It records `NativeNanEncoding` as fast `pow` and `atan2`
+/// do, on a device whose arithmetic answers Metal's canonical NaN too (its sum of `pow(NaN, 1)`'s
+/// operands is that NaN, not the base), and never `DeviceNanEncoding`, which is for a NaN Metal
+/// answers no NaN of (fast `sin` and `cos`).
 #[test]
-fn float_sign_operations_move_the_bits() {
-    use super::math::{sign_on_bits, SignBit};
+fn precise_pow_notes_its_measured_nan_as_the_devices() {
     use super::nan::NanAnswer as A;
     use crate::air::ir::FastMath;
-    let (h, f) = (FloatFmt::Half, FloatFmt::F32);
-    assert!(sign_on_bits(Some(f)));
-    for fmt in [h, FloatFmt::BFloat, FloatFmt::F64] {
-        assert!(!sign_on_bits(Some(fmt)), "{fmt:?}");
+    use crate::device::profile::NanEncoding;
+    use crate::pipeline::artifact::PrecisionNote;
+    let f = Form {
+        held: Held::Float(FloatFmt::F32),
+        lanes: 1,
+    };
+    for nans in [NanEncoding::Native, NanEncoding::MetalCanonical] {
+        let facts = super::FloatFacts { nans, ..KHR_FACTS };
+        let call =
+            super::float_call(FloatFn::Pow, false, FastMath::NONE, f, facts).expect("float pow");
+        assert_eq!(call.nan, Some(A::BaseToExponentOne), "{nans:?}");
+        assert!(
+            call.notes
+                .always
+                .contains(&PrecisionNote::NativeNanEncoding),
+            "{nans:?}: {:?}",
+            call.notes
+        );
+        let every_note = call
+            .notes
+            .always
+            .iter()
+            .chain(&call.notes.unless_metal_fast);
+        assert!(
+            !every_note
+                .clone()
+                .any(|n| *n == PrecisionNote::DeviceNanEncoding),
+            "{nans:?}: {:?}",
+            call.notes
+        );
+        let sin =
+            super::float_call(FloatFn::Sin, true, FastMath::NONE, f, facts).expect("fast sin");
+        assert_eq!(sin.nan, None, "{nans:?}");
+        assert!(
+            sin.notes
+                .always
+                .iter()
+                .chain(&sin.notes.unless_metal_fast)
+                .any(|n| *n == PrecisionNote::DeviceNanEncoding),
+            "{nans:?}: {:?}",
+            sin.notes
+        );
     }
-    assert!(!sign_on_bits(None));
-    assert!(FloatFn::Abs.metal_nans(f));
+}
+
+/// Class E: Metal's `float` `fneg` and `fabs` flip or clear the sign bit alone, a NaN's payload and
+/// a denormal kept (`nan_signbits`, `nan_signbits_fast`). The lowering takes the device's
+/// `OpFNegate` and `FAbs` on every format, whose NaN is the device's: a `float` `fabs` answers
+/// Metal's operand NaN by none of its own, noted `NativeNanEncoding` (and a `half` one Metal's
+/// canonical NaN, class D), and off Metal's own functions records the device's precision and
+/// denormals.
+#[test]
+fn float_sign_operations_are_the_device_instructions() {
+    use super::nan::NanAnswer as A;
+    use crate::air::ir::FastMath;
+    use crate::pipeline::artifact::PrecisionNote;
+    let (h, f) = (FloatFmt::Half, FloatFmt::F32);
+    assert!(!FloatFn::Abs.metal_nans(f));
     assert!(!FloatFn::Abs.metal_nans(h));
-    assert!(FloatFn::Abs.metal_denormals());
+    assert!(FloatFn::Abs.native_instruction());
     let scalar = |fmt| Form {
         held: Held::Float(fmt),
         lanes: 1,
@@ -2563,18 +2541,18 @@ fn float_sign_operations_move_the_bits() {
     let every = FastMath::ALL
         .iter()
         .fold(FastMath::NONE, |a, (b, _)| a.union(*b));
-    // `float` `fabs` is `air.fabs` or `air.fast_fabs`, either with or without flags; a `half` one
-    // is `air.fabs.f16` (Metal has no `fast_` `half` function) with or without them.
     for fmf in [FastMath::NONE, every] {
         for fast in [false, true] {
             let call = super::float_call(FloatFn::Abs, fast, fmf, scalar(f), KHR_FACTS)
                 .expect("float fabs");
-            assert_eq!(call.nan, None, "fast {fast}, {fmf:?}");
-            assert_eq!(
-                call.notes,
-                super::OpNotes::default(),
-                "fast {fast}, {fmf:?}"
-            );
+            assert_eq!(call.nan, Some(A::Operand), "fast {fast}, {fmf:?}");
+            for note in [
+                PrecisionNote::NativeNanEncoding,
+                PrecisionNote::NativeTranscendentals,
+                PrecisionNote::DeviceDenormals,
+            ] {
+                assert!(call.notes.always.contains(&note), "{note:?} {fmf:?}");
+            }
         }
         let call =
             super::float_call(FloatFn::Abs, false, fmf, scalar(h), KHR_FACTS).expect("half fabs");
@@ -2593,20 +2571,54 @@ fn float_sign_operations_move_the_bits() {
                 vec![v.collect()]
             })
             .collect();
-        for (op, apply) in [
-            (SignBit::Flip, (|b: u64| b ^ 0x8000_0000) as fn(u64) -> u64),
-            (SignBit::Clear, |b: u64| b & 0x7FFF_FFFF),
-        ] {
-            check_accept(
-                &format!("{op:?} f32x{lanes}"),
-                &[form],
-                form,
-                &|fb, x| math::sign_bits(fb, form, x[0], op),
-                &cases,
-                &|c| Some(c[0].iter().map(|b| apply(*b)).collect()),
-                &|g, w| g == w,
-            );
-        }
+        let words = |op: GlslOp| {
+            let m = kernel_with(&[form], form, &|fb, x| fb.glsl(op, &[x[0]]), true, false)
+                .expect("kernel");
+            crate::spirv::serialize::serialize(m).expect("words").words
+        };
+        // `fabs` is `FAbs` itself: its module is the instruction's.
+        let abs = kernel_with(
+            &[form],
+            form,
+            &|fb, x| {
+                math::float_fn(
+                    fb,
+                    FloatFn::Abs,
+                    form,
+                    Contraction::Forbidden,
+                    x,
+                    &Lib::instructions(),
+                )
+            },
+            true,
+            false,
+        )
+        .expect("fabs");
+        assert_eq!(
+            crate::spirv::serialize::serialize(abs)
+                .expect("words")
+                .words,
+            words(GlslOp::FAbs),
+            "fabs f32x{lanes}"
+        );
+        check_accept(
+            &format!("fabs f32x{lanes}"),
+            &[form],
+            form,
+            &|fb, x| {
+                math::float_fn(
+                    fb,
+                    FloatFn::Abs,
+                    form,
+                    Contraction::Forbidden,
+                    x,
+                    &Lib::instructions(),
+                )
+            },
+            &cases,
+            &|c| Some(c[0].iter().map(|b| b & 0x7FFF_FFFF).collect()),
+            &|g, w| g == w,
+        );
     }
 }
 
@@ -2626,7 +2638,6 @@ fn nan_answers_follow_the_measured_flag_states() {
     use super::nan::{function_answer, NanAnswer as A};
     use crate::air::ir::FastMath;
     let f32_ = FloatFmt::F32;
-    let fract = |infinite_nan| FloatFn::FastFract { infinite_nan };
     for (op, fast, flagged, want) in [
         (FloatFn::Exp, false, false, Some(A::Canonical)),
         (FloatFn::FastExp, true, true, Some(A::Canonical)),
@@ -2634,8 +2645,8 @@ fn nan_answers_follow_the_measured_flag_states() {
         (FloatFn::Exp, false, true, Some(A::Canonical)),
         (FloatFn::Round, true, false, Some(A::Operand)),
         (FloatFn::Round, false, true, Some(A::Operand)),
-        (fract(false), true, false, Some(A::Canonical)),
-        (fract(true), true, true, Some(A::Canonical)),
+        (FloatFn::FastFract, true, false, Some(A::Canonical)),
+        (FloatFn::FastFract, true, true, Some(A::Canonical)),
         (FloatFn::Dot, false, true, Some(A::Canonical)),
         (FloatFn::Tan, true, true, Some(A::Operand)),
         (FloatFn::Tan, false, false, Some(A::Canonical)),
@@ -2655,6 +2666,7 @@ fn nan_answers_follow_the_measured_flag_states() {
         (FloatFn::Sin, false, true, Some(A::Canonical)),
         (FloatFn::Cos, false, true, Some(A::Canonical)),
         (FloatFn::Atan2, false, true, Some(A::Canonical)),
+        (FloatFn::Pow, false, false, Some(A::BaseToExponentOne)),
         (FloatFn::Pow, false, true, None),
         (FloatFn::FastSin, true, true, None),
         (FloatFn::Sign, false, false, None),
@@ -2675,7 +2687,7 @@ fn nan_answers_follow_the_measured_flag_states() {
             .iter()
             .fold(FastMath::NONE, |every, (flag, _)| every.union(*flag));
         let fmf = if flagged { all } else { FastMath::NONE };
-        let selected = super::refine_float(op, fast, fmf, float(32), Reciprocal::Device);
+        let selected = super::refine_float(op, fast, fmf, float(32));
         assert_eq!(
             function_answer(selected, fast, flagged, f32_),
             want,
@@ -2694,16 +2706,15 @@ fn nan_answers_follow_the_measured_flag_states() {
     }
 }
 
-/// `powr(x, y)` is Metal's canonical NaN where Metal's `exp2(y * log2(x))` is a NaN for operands
-/// that are not: `x < 0` (`-0` is not), `y = ±0` with `x = ±0` or `+inf`,
-/// and `y = ±inf` with `x = 1`, an `f32` denormal read as a zero by the zero tests and, in
-/// `fast::powr` only, by the sign test; every other lane keeps the device's result, which the
-/// kernel's third input stands for, except that `fast::powr` answers IEEE's value where `y ·
-/// log2(x)` is infinite (`math::infinite_product`'s rule, on the same classification of the
-/// operands). `half`'s NaN lanes are the same rule's (`nan_half`, `nan_half_fast`, every lane,
-/// class K).
+/// `powr(x, y)` is a NaN where MSL's `exp2(y * log2(x))` is a NaN for operands that are not: `x <
+/// 0` (`-0` is not), `y = ±0` with `x = ±0` or `+inf`, and `y = ±inf` with `x = 1`, each by the
+/// device's comparisons (the interpreter reads an `f32` denormal as a value, where Metal reads a
+/// zero); every other lane keeps the device's result, which the kernel's third input stands for,
+/// except that `fast::powr` answers IEEE's value where `y · log2(x)` is infinite
+/// (`math::infinite_product`'s rule, on the same classification of the operands). `half`'s NaN
+/// lanes are the same rule's (`nan_half`, `nan_half_fast`, every lane, class K).
 #[test]
-fn powr_answers_metals_nan_at_its_special_operands() {
+fn powr_answers_c99_nan_at_its_special_operands() {
     // The answer where `y · log2(x)` is infinite (`log2(x)` read as `-inf` at a zero), for
     // operands that are not NaNs nor in the NaN rule's lanes; `None` where it is finite.
     fn infinite(x: f64, y: f64, y_negative: bool) -> Option<f64> {
@@ -2781,7 +2792,7 @@ fn powr_answers_metals_nan_at_its_special_operands() {
         -f32::NAN,
         f32::MIN_POSITIVE,
         -f32::MIN_POSITIVE,
-        // Denormals, which Metal reads as zeros.
+        // Denormals, which Metal reads as zeros and the device's comparisons as it reads them.
         f32::from_bits(1),
         -f32::from_bits(0x007F_FFFF),
     ]
@@ -2810,17 +2821,8 @@ fn powr_answers_metals_nan_at_its_special_operands() {
             },
             &cases,
             &|c| {
-                // A denormal is a zero to Metal's zero tests, and to `fast::powr`'s sign test;
-                // the precise sign is the bit's, a NaN's included.
-                let read = |v: f32| if v.is_subnormal() { 0.0 } else { v };
-                let raw = f32v(arg(c, 0));
-                let (x, y) = (read(raw), read(f32v(arg(c, 1))));
-                let below = if fast {
-                    x < 0.0
-                } else {
-                    raw.is_sign_negative() && raw != 0.0
-                };
-                let nan = below
+                let (x, y) = (f32v(arg(c, 0)), f32v(arg(c, 1)));
+                let nan = x < 0.0
                     || (y == 0.0 && (x == 0.0 || x == f32::INFINITY))
                     || (y.is_infinite() && x == 1.0);
                 if nan {
@@ -2835,97 +2837,9 @@ fn powr_answers_metals_nan_at_its_special_operands() {
                     _ => device,
                 }])
             },
-            &|g, w| g == w,
+            &|g, w| g == w || (is_nan(f, g) && is_nan(f, w)),
         );
     }
-}
-
-/// `fast::fract` answers one where `x - floor(x) = 1 + x` rounds to it, `x` in `[-2^-25, 0)` (A1
-/// case aed3faaa: `-2^-126`, `-2^-25`, and `-1e-10` give `1.0`), and the module selects that one
-/// itself: a device whose `x - floor(x)` is a fract bounded below one (RADV's `v_fract`, which
-/// Mesa's NIR folds the subtraction into) still answers Metal's one.
-#[test]
-fn an_unbounded_fract_selects_one_where_one_plus_x_rounds_to_it() {
-    let f = float(32);
-    let below_tie = f32::from_bits(0xB300_0001);
-    let xs = [
-        -2f32.powi(-25),
-        below_tie,
-        -f32::MIN_POSITIVE,
-        -1e-10,
-        -2f32.powi(-24),
-        -1e-40,
-        -0.0,
-    ];
-    let want = |x: f32| -> u64 {
-        let r = if x.to_bits() & 0x7F80_0000 == 0 {
-            0.0
-        } else if (-2f32.powi(-25)..0.0).contains(&x) {
-            1.0
-        } else {
-            x - x.floor()
-        };
-        u64::from(r.to_bits())
-    };
-    assert_eq!(want(below_tie), 0x3F7F_FFFF);
-    assert_eq!(want(-1e-10), 0x3F80_0000);
-    let cases: Vec<Case> = xs
-        .iter()
-        .map(|x| vec![vec![u64::from(x.to_bits())]])
-        .collect();
-    check(
-        "fast fract near minus zero",
-        &[f],
-        f,
-        &|fb, x| {
-            math::float_fn(
-                fb,
-                FloatFn::FastFract {
-                    infinite_nan: false,
-                },
-                f,
-                Contraction::Forbidden,
-                NanTest::IsNan,
-                x,
-                &Lib::instructions(),
-            )
-        },
-        &cases,
-        &|c| Some(vec![want(f32::from_bits(c[0][0] as u32))]),
-        false,
-    );
-    // The bound `-2^-25` is the module's own constant: the one does not come from the
-    // subtraction.
-    let has_bound = |op: FloatFn| {
-        let m = kernel(&[f], f, &|fb, x| {
-            math::float_fn(
-                fb,
-                op,
-                f,
-                Contraction::Forbidden,
-                NanTest::IsNan,
-                x,
-                &Lib::instructions(),
-            )
-        })
-        .expect("kernel");
-        let words = crate::spirv::serialize::serialize(m).expect("words").words;
-        const OP_CONSTANT: u32 = 43;
-        let mut i = 5;
-        let mut found = false;
-        while i < words.len() {
-            let (n, op) = ((words[i] >> 16) as usize, words[i] & 0xFFFF);
-            if op == OP_CONSTANT && n == 4 && words.get(i + 3) == Some(&0xB300_0000) {
-                found = true;
-            }
-            i += n.max(1);
-        }
-        found
-    };
-    assert!(has_bound(FloatFn::FastFract {
-        infinite_nan: false
-    }));
-    assert!(!has_bound(FloatFn::Fract));
 }
 
 /// The C99 Annex F special cases of `pow` run on the interpreter against the host's `powf`. The
@@ -2955,20 +2869,18 @@ fn pow_special_cases_match_c99() {
             );
         }
     }
-    for precise in [true, false] {
-        check(
-            &format!("pow special cases f32 (precise {precise})"),
-            &[f, f, f],
-            f,
-            &|fb, a| math::pow_special(fb, f, a[0], a[1], a[2], precise),
-            &cases,
-            &|c| {
-                let r = f32v(arg(c, 0)).powf(f32v(arg(c, 1)));
-                Some(vec![u64::from(r.to_bits())])
-            },
-            false,
-        );
-    }
+    check(
+        "pow special cases f32",
+        &[f, f, f],
+        f,
+        &|fb, a| math::pow_special(fb, f, a[0], a[1], a[2]),
+        &cases,
+        &|c| {
+            let r = f32v(arg(c, 0)).powf(f32v(arg(c, 1)));
+            Some(vec![u64::from(r.to_bits())])
+        },
+        false,
+    );
 }
 
 /// The inputs of the authored case `pi-scaled-sine-and-cosine-are-exact-at-every-half-integer`
@@ -3163,68 +3075,12 @@ fn pi_scaled_functions_reduce_exactly_to_metal_answers() {
     }
 }
 
-/// [`FloatFn::words`] bounds what `sinpi`, `cospi`, and `tanpi` emit on every form: on `float` and
-/// `half` the calls of Metal's routines (the routines are charged on their own), a fast call's on
-/// `float` also where the device's functions are Metal's, which is the exact reduction around the
-/// device's `Sin` and `Cos`, as on a `bfloat`, which no routine answers, the axis arms and
-/// `tanpi`'s quarter turns included. The module's growth over an identity kernel (with the same
-/// routines) is charged in full, its constants and the `GLSL.std.450` import included.
+/// [`FloatFn::words`] bounds what `sinpi`, `cospi`, and `tanpi` emit on every form: the exact
+/// reduction around the device's `Sin` and `Cos`, the axis arms and `tanpi`'s quarter turns
+/// included, whether or not the device's functions are Metal's. The module's growth over an
+/// identity kernel is charged in full, its constants and the `GLSL.std.450` import included.
 #[test]
 fn pi_scaled_functions_stay_within_their_word_estimate() {
-    use super::libm::{self, Fun, Mode};
-    use std::collections::BTreeMap;
-    let routines = [Mode::Precise, Mode::Fast]
-        .map(|m| [Fun::SinPi(m), Fun::CosPi(m), Fun::TanPi(m)])
-        .concat();
-    let defs = |b: &mut ModuleBuilder| -> BResult<Vec<FuncId>> {
-        routines
-            .iter()
-            .map(|fun| libm::define_alone(b, *fun, false))
-            .collect()
-    };
-    let module_words = |f: Form, body: BodyCalling<'_>| {
-        let m = kernel_defs(&[f], f, &defs, body, false, false).expect("kernel");
-        crate::spirv::serialize::serialize(m)
-            .expect("words")
-            .words
-            .len()
-    };
-    let precise = [FloatFn::SinPi, FloatFn::CosPi, FloatFn::TanPi];
-    let fast = [FloatFn::FastSinPi, FloatFn::FastCosPi, FloatFn::FastTanPi];
-    for f in [float(32), vec(float(32), 4), float(16), vec(float(16), 4)] {
-        let bare = module_words(f, &|_, x, _| Ok(x[0]));
-        // `refine_float` gives a `half` call no fast function.
-        let calls = if f.float_fmt() == Some(FloatFmt::F32) {
-            [precise, fast].concat()
-        } else {
-            precise.to_vec()
-        };
-        for g in calls {
-            for metal in [None, Some(Mode::Fast), Some(Mode::Precise)] {
-                let used = module_words(f, &|fb, x, funcs| {
-                    let map: BTreeMap<Fun, FuncId> = routines
-                        .iter()
-                        .copied()
-                        .zip(funcs.iter().copied())
-                        .collect();
-                    math::float_fn(
-                        fb,
-                        g,
-                        f,
-                        Contraction::Allowed,
-                        NanTest::IsNan,
-                        x,
-                        &Lib::new(metal, &map),
-                    )
-                });
-                let (emitted, bound) = (used - bare, g.words(f) as usize);
-                assert!(
-                    emitted <= bound,
-                    "{g:?} {f:?} with Metal's functions {metal:?}: {emitted} words over {bound}"
-                );
-            }
-        }
-    }
     let module_words = |f: Form, body: Body<'_>| {
         let m = kernel(&[f], f, body).expect("kernel");
         crate::spirv::serialize::serialize(m)
@@ -3232,19 +3088,26 @@ fn pi_scaled_functions_stay_within_their_word_estimate() {
             .words
             .len()
     };
-    for f in [bfloat(), vec(bfloat(), 4)] {
+    let precise = [FloatFn::SinPi, FloatFn::CosPi, FloatFn::TanPi];
+    let fast = [FloatFn::FastSinPi, FloatFn::FastCosPi, FloatFn::FastTanPi];
+    for f in [
+        float(32),
+        vec(float(32), 4),
+        float(16),
+        vec(float(16), 4),
+        bfloat(),
+        vec(bfloat(), 4),
+    ] {
         let bare = module_words(f, &|_, x| Ok(x[0]));
-        for g in [FloatFn::SinPi, FloatFn::CosPi, FloatFn::TanPi] {
+        // `refine_float` gives a narrow call no fast function.
+        let calls = if f.float_fmt() == Some(FloatFmt::F32) {
+            [precise, fast].concat()
+        } else {
+            precise.to_vec()
+        };
+        for g in calls {
             let used = module_words(f, &|fb, x| {
-                math::float_fn(
-                    fb,
-                    g,
-                    f,
-                    Contraction::Allowed,
-                    NanTest::IsNan,
-                    x,
-                    &Lib::instructions(),
-                )
+                math::float_fn(fb, g, f, Contraction::Allowed, x, &Lib::instructions())
             });
             let (emitted, bound) = (used - bare, g.words(f) as usize);
             assert!(
@@ -3255,106 +3118,22 @@ fn pi_scaled_functions_stay_within_their_word_estimate() {
     }
 }
 
-/// `air.fast_tanh` on `float` is the MSL fast-math formula `(t - 1) / (t + 1)` of `t = exp(2x)`,
-/// divided as Metal's fast division (`(t - 1) · (1 / (t + 1))`, the reciprocal flushed past
-/// `2^126`). The interpreter does not model `Exp2`, so the kernel takes `t` as an input (`exp2(x *
-/// 2 log2 e)` in `f32` on the host) and runs the quotient. Where the quotient does not depend on
-/// the last place of `t` it gives the Metal observation of the authored case
-/// `fast-tanh-through-all-three-of-its-regimes` (M3 Max, ORACLE_ABI v32): `x = 0` is 0, `x = 43`
-/// is 1, `x = 44` (where `t + 1` is above `2^126` and the reciprocal flushes) is 0, `x = 44.4`
-/// (where `t` overflows) is NaN, and `x = -100` (where `t` is 0) is -1.
-#[test]
-fn fast_tanh_is_the_fast_math_formula() {
-    let f = float(32);
-    let two_log2e = (2.0 * std::f64::consts::LOG2_E) as f32;
-    let t_of = |x: f32| (x * two_log2e).exp2();
-    // (x, Metal's fast::tanh(x)).
-    let metal: [(f32, u32); 5] = [
-        (0.0, 0x0000_0000),
-        (43.0, 0x3F80_0000),
-        (44.0, 0x0000_0000),
-        (44.4, 0x7FC0_0000),
-        (-100.0, 0xBF80_0000),
-    ];
-    // Metal's fast quotient: the numerator times the reciprocal, flushed past 2^126.
-    let quotient = |t: f32| {
-        let den = t + 1.0;
-        let r = if den.abs() > 2f32.powi(126) {
-            0.0
-        } else {
-            1.0 / den
-        };
-        (t - 1.0) * r
-    };
-    let mut xs: Vec<f32> = metal.iter().map(|m| m.0).collect();
-    xs.extend([0.5, -3.75, 5.0, 1e-3, -1e-3, 20.0, -44.4, 43.7]);
-    let cases: Vec<Case> = xs
-        .iter()
-        .map(|x| vec![vec![u64::from(t_of(*x).to_bits())]])
-        .collect();
-    check(
-        "fast tanh quotient f32",
-        &[f],
-        f,
-        &|fb, t| {
-            let divide = |fb: &mut FunctionBuilder<'_>, x: Value, y: Value| {
-                math::fast_divide(fb, f, x, y, Contraction::Forbidden, Reciprocal::Device)
-            };
-            math::tanh_of_exp(fb, f, &divide, t[0])
-        },
-        &cases,
-        &|c| {
-            let t = f32v(arg(c, 0));
-            Some(vec![u64::from(quotient(t).to_bits())])
-        },
-        false,
-    );
-    check(
-        "fast tanh quotient f32, the reciprocal rounded",
-        &[f],
-        f,
-        &|fb, t| {
-            let divide = |fb: &mut FunctionBuilder<'_>, x: Value, y: Value| {
-                math::fast_divide(fb, f, x, y, Contraction::Forbidden, Reciprocal::Rounded)
-            };
-            math::tanh_of_exp(fb, f, &divide, t[0])
-        },
-        &cases,
-        &|c| {
-            let t = f32v(arg(c, 0));
-            Some(vec![u64::from(quotient(t).to_bits())])
-        },
-        false,
-    );
-    for (x, want) in metal {
-        let got = quotient(t_of(x));
-        assert!(
-            got.to_bits() == want || (got.is_nan() && f32::from_bits(want).is_nan()),
-            "fast::tanh({x}) = {got} ({:#010x}), Metal {want:#010x}",
-            got.to_bits()
-        );
-    }
-    // x = 44: t + 1 > 2^126, where the reciprocal flushes.
-    assert!(t_of(44.0) + 1.0 > 2f32.powi(126));
-}
-
 /// The function a call computes follows its `air` symbol's `fast_` variant, never a name: on
 /// `float`, `fast_tanh` is the fast-math formula, `fast_fract` is unbounded, `fast_fmedian3`
-/// answers the second of two NaNs, `fast_pow` the canonical NaN for a NaN base to the exponent one,
-/// `fast_atan2` is the turned `atan` of the quotient, `fast_sin` and `fast_cos` flush past the last
-/// evaluated quadrant, and `fast_sqrt`, `fast_exp`, `fast_log`, and `fast_powr` are Metal's
-/// compositions; a narrow `fast_` call and the precise ones keep the precise function. The
-/// fast-math flags change only `fast_atan2`'s quotient beyond `2^126` (a call with every flag
-/// divides there, any other call flushes the reciprocal) and the infinities of `fast_fract` and
-/// `fast_asinh` (a call with every flag answers a NaN; any other call is `fract`'s `+0` and the
-/// precise `asinh`), and `llvm.minnum` and `llvm.maxnum` on `float`, which with every flag are
-/// Metal's `fmin` and `fmax`.
+/// records the device's pick of two NaNs, `fast_pow` the canonical NaN for a NaN base to the
+/// exponent one, `fast_atan2` is the turned `atan` of the quotient, `fast_sin` and `fast_cos` flush
+/// past the last evaluated quadrant, `fast_sqrt` is the device's `Sqrt`, and `fast_exp`,
+/// `fast_log`, and `fast_powr` are Metal's formulas; a narrow `fast_` call and the precise ones
+/// keep the precise function. The fast-math flags change only `fast_atan2`'s quotient beyond
+/// `2^126` (a call with every flag divides there, any other call flushes the reciprocal) and the
+/// infinities of `fast_asinh` (a call with every flag answers a NaN; any other call is the precise
+/// `asinh`), and `llvm.minnum` and `llvm.maxnum` on `float`, which with every flag are Metal's
+/// `fmin` and `fmax`.
 #[test]
 fn fast_variants_refine_float_functions() {
     use crate::air::ir::FastMath;
-    let refine = |op: FloatFn, fast: bool, fmf: FastMath, f: Form| {
-        super::refine_float(op, fast, fmf, f, Reciprocal::Rounded)
-    };
+    let refine =
+        |op: FloatFn, fast: bool, fmf: FastMath, f: Form| super::refine_float(op, fast, fmf, f);
     let every = FastMath::ALL
         .iter()
         .fold(FastMath::NONE, |all, (flag, _)| all.union(*flag));
@@ -3362,12 +3141,7 @@ fn fast_variants_refine_float_functions() {
     let f32_ = float(32);
     for fmf in [FastMath::NONE, some, every] {
         for (op, fast) in [
-            (
-                FloatFn::Tanh,
-                FloatFn::FastTanh {
-                    reciprocal: Reciprocal::Rounded,
-                },
-            ),
+            (FloatFn::Tanh, FloatFn::FastTanh),
             (
                 FloatFn::Asinh,
                 if fmf == every {
@@ -3376,22 +3150,12 @@ fn fast_variants_refine_float_functions() {
                     FloatFn::Asinh
                 },
             ),
-            (
-                FloatFn::Fract,
-                FloatFn::FastFract {
-                    infinite_nan: fmf == every,
-                },
-            ),
+            (FloatFn::Fract, FloatFn::FastFract),
             (FloatFn::Median3, FloatFn::FastMedian3),
             (FloatFn::Pow, FloatFn::FastPow),
             (FloatFn::Sin, FloatFn::FastSin),
             (FloatFn::Cos, FloatFn::FastCos),
-            (
-                FloatFn::Tan,
-                FloatFn::FastTan {
-                    reciprocal: Reciprocal::Rounded,
-                },
-            ),
+            (FloatFn::Tan, FloatFn::FastTan),
             (FloatFn::Asin, FloatFn::FastAsin),
             (FloatFn::Acos, FloatFn::FastAcos),
             (FloatFn::Atan, FloatFn::FastAtan),
@@ -3403,7 +3167,7 @@ fn fast_variants_refine_float_functions() {
             (
                 FloatFn::Atan2,
                 FloatFn::FastAtan2 {
-                    reciprocal_flushed: fmf != every,
+                    by_reciprocal: fmf != every,
                 },
             ),
             (FloatFn::SinPi, FloatFn::FastSinPi),
@@ -3412,15 +3176,9 @@ fn fast_variants_refine_float_functions() {
         ] {
             assert_eq!(refine(op, true, fmf, f32_), fast);
             assert_eq!(refine(op, false, fmf, f32_), op);
-            // A precise `half` `fract` with every flag answers `0x3BFF` at a NaN and an infinity; a
-            // `fast_` `half` symbol is not measured and keeps `op`.
-            let half = if op == FloatFn::Fract && fmf == every {
-                FloatFn::FlaggedFract
-            } else {
-                op
-            };
+            // A `fast_` `half` symbol is not measured and keeps `op`.
             assert_eq!(refine(op, true, fmf, float(16)), op);
-            assert_eq!(refine(op, false, fmf, float(16)), half);
+            assert_eq!(refine(op, false, fmf, float(16)), op);
             assert_eq!(refine(op, true, fmf, bfloat()), op);
         }
         for op in [FloatFn::Sign, FloatFn::Saturate] {
@@ -3438,35 +3196,19 @@ fn fast_variants_refine_float_functions() {
             assert_eq!(refine(op, false, fmf, bfloat()), op);
         }
     }
-    // The fast division's reciprocal is the profile's.
-    let device = super::refine_float(
-        FloatFn::Tanh,
-        true,
-        FastMath::NONE,
-        f32_,
-        Reciprocal::Device,
-    );
-    assert_eq!(
-        device,
-        FloatFn::FastTanh {
-            reciprocal: Reciprocal::Device
-        }
-    );
-    assert!(device.divides() && !FloatFn::Tanh.divides());
-    assert_eq!(
-        super::refine_float(FloatFn::Tan, true, FastMath::NONE, f32_, Reciprocal::Device),
-        FloatFn::FastTan {
-            reciprocal: Reciprocal::Device
-        }
-    );
-    for reciprocal_flushed in [false, true] {
-        assert!(FloatFn::FastAtan2 { reciprocal_flushed }.divides());
+    // The fast `tanh`, `tan` and `atanh` are the device's instructions, which divide by nothing.
+    for op in [FloatFn::FastTanh, FloatFn::FastTan, FloatFn::FastAtanh] {
+        assert!(!op.divides(), "{op:?}");
+    }
+    assert!(!FloatFn::Tanh.divides());
+    for by_reciprocal in [false, true] {
+        assert!(FloatFn::FastAtan2 { by_reciprocal }.divides());
     }
     assert!(!FloatFn::Atan2.divides());
 }
 
 /// The transcendental and device-precision functions build and pass L3 (the interpreter does not
-/// model them), `fast::tanh` with its division routine; `ldexp` and `dot` run: part `part` of `of`
+/// model them), `fast::tanh` among them; `ldexp` and `dot` run: part `part` of `of`
 /// of the checks.
 fn device_precision_float_functions(part: usize, of: usize) {
     let device = [
@@ -3486,9 +3228,7 @@ fn device_precision_float_functions(part: usize, of: usize) {
         FloatFn::FastSin,
         FloatFn::FastCos,
         FloatFn::Tan,
-        FloatFn::FastTan {
-            reciprocal: Reciprocal::Device,
-        },
+        FloatFn::FastTan,
         FloatFn::Asin,
         FloatFn::FastAsin,
         FloatFn::Acos,
@@ -3498,6 +3238,7 @@ fn device_precision_float_functions(part: usize, of: usize) {
         FloatFn::Sinh,
         FloatFn::Cosh,
         FloatFn::Tanh,
+        FloatFn::FastTanh,
         FloatFn::Asinh,
         FloatFn::FastAsinh,
         FloatFn::Acosh,
@@ -3514,10 +3255,10 @@ fn device_precision_float_functions(part: usize, of: usize) {
         FloatFn::FastPow,
         FloatFn::Atan2,
         FloatFn::FastAtan2 {
-            reciprocal_flushed: false,
+            by_reciprocal: false,
         },
         FloatFn::FastAtan2 {
-            reciprocal_flushed: true,
+            by_reciprocal: true,
         },
         FloatFn::Fmod,
         FloatFn::Fma,
@@ -3527,47 +3268,9 @@ fn device_precision_float_functions(part: usize, of: usize) {
         for op in device {
             checks.push(Box::new(move || {
                 let m = kernel(&vec![f; op.arity()], f, &|fb, x| {
-                    math::float_fn(
-                        fb,
-                        op,
-                        f,
-                        Contraction::Forbidden,
-                        NanTest::IsNan,
-                        x,
-                        &Lib::instructions(),
-                    )
+                    math::float_fn(fb, op, f, Contraction::Forbidden, x, &Lib::instructions())
                 })
                 .unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
-                assert_valid(m, &wide_profile());
-            }));
-        }
-    }
-    for lanes in [1u8, 3] {
-        let f = vec(float(32), lanes);
-        for reciprocal in [Reciprocal::Device, Reciprocal::Rounded] {
-            checks.push(Box::new(move || {
-                let routine = math::FastDivision::new(f, reciprocal, Contraction::Forbidden);
-                let m = kernel_defs(
-                    &[f],
-                    f,
-                    &|b| Ok(vec![math::define_fast_division(b, routine)?]),
-                    &|fb, x, funcs| {
-                        let divide = |fb: &mut FunctionBuilder<'_>, p: Value, q: Value| {
-                            math::call_fast_division(fb, funcs[0], p, q)
-                        };
-                        math::fast_tanh(
-                            fb,
-                            FloatFn::FastTanh { reciprocal },
-                            f,
-                            x[0],
-                            &Lib::instructions(),
-                            &divide,
-                        )
-                    },
-                    false,
-                    false,
-                )
-                .unwrap_or_else(|e| panic!("fast tanh {reciprocal:?}: {e:?}"));
                 assert_valid(m, &wide_profile());
             }));
         }
@@ -3588,7 +3291,6 @@ fn device_precision_float_functions(part: usize, of: usize) {
                     FloatFn::Ldexp,
                     f,
                     Contraction::Forbidden,
-                    NanTest::IsNan,
                     x,
                     &Lib::instructions(),
                 )
@@ -3601,12 +3303,15 @@ fn device_precision_float_functions(part: usize, of: usize) {
             false,
         );
     }));
-    // `ldexp` answers Metal's for every exponent: past GLSL's `[-126, 128]` and past the format's
-    // range, a denormal operand read as zero, a result below `2^-126` flushed, a NaN kept bit
-    // for bit (`math::ldexp_bits`); `half` rounds the exact product once.
+    // `ldexp` answers for every exponent, past GLSL's `[-126, 128]` and past the format's range,
+    // a NaN kept bit for bit (`math::ldexp_bits`), its denormals the device's: on the interpreter,
+    // which keeps them, a denormal operand scales as its value and a result below `2^-126` is the
+    // product rounded once (Metal flushes both: `PrecisionNote::DeviceDenormals`), and one within
+    // half a unit below `2^-126` rounds up to `2^-126` (Metal flushes it before rounding:
+    // `float-tininess-after-rounding`); `half` rounds the exact product once.
     checks.push(Box::new(|| {
         let f = float(32);
-        let bits: [u32; 12] = [
+        let bits: [u32; 13] = [
             0x3FC0_0000, // 1.5
             0xBFC0_0000, // -1.5
             0x7180_0000, // 2^100
@@ -3619,6 +3324,7 @@ fn device_precision_float_functions(part: usize, of: usize) {
             0x8000_0000, // -0
             0x7F7F_FFFF, // the greatest finite
             0x4040_0000, // 3.0
+            0x3FFF_FFFF, // 2 - 2^-23: times 2^-127, half a unit below 2^-126
         ];
         let exps: [i32; 16] = [
             0,
@@ -3645,22 +3351,22 @@ fn device_precision_float_functions(part: usize, of: usize) {
                     .map(move |&e| vec![vec![u64::from(x)], vec![u64::from(e as u32)]])
             })
             .collect();
-        // Metal's answer, from the exact product in `f64`.
+        // The answer with the device's denormals kept: the exact product in `f64` (a power of
+        // two's scaling, exact but where it is far below every `float`), rounded once to `f32`.
         let metal = |x: u32, e: i32| -> u32 {
-            let (sign, field) = (x & 0x8000_0000, (x >> 23) & 0xFF);
-            match field {
-                0 => sign,
+            match (x >> 23) & 0xFF {
                 0xFF => x,
                 _ => {
                     let v = f64::from(f32::from_bits(x)) * 2f64.powi(e.clamp(-1000, 1000));
-                    match v.abs() {
-                        a if a >= 2f64.powi(128) => sign | 0x7F80_0000,
-                        a if a < 2f64.powi(-126) => sign,
-                        _ => (v as f32).to_bits(),
-                    }
+                    (v as f32).to_bits()
                 }
             }
         };
+        // Metal's flush is not this answer: the least denormal doubled is `2^-148`, not zero.
+        assert_eq!(metal(0x0000_0001, 1), 0x0000_0002);
+        assert_eq!(metal(0x0080_0000, -1), 0x0040_0000);
+        // Rounded before any flush: `2^-126 - 2^-150` ties to even, `2^-126`, where Metal answers 0.
+        assert_eq!(metal(0x3FFF_FFFF, -127), 0x0080_0000);
         check_accept(
             "ldexp f32, every exponent",
             &[f, int(32)],
@@ -3671,7 +3377,6 @@ fn device_precision_float_functions(part: usize, of: usize) {
                     FloatFn::Ldexp,
                     f,
                     Contraction::Forbidden,
-                    NanTest::IsNan,
                     x,
                     &Lib::instructions(),
                 )
@@ -3713,7 +3418,6 @@ fn device_precision_float_functions(part: usize, of: usize) {
                     FloatFn::Ldexp,
                     h,
                     Contraction::Forbidden,
-                    NanTest::IsNan,
                     x,
                     &Lib::instructions(),
                 )
@@ -3750,7 +3454,6 @@ fn device_precision_float_functions(part: usize, of: usize) {
                     FloatFn::Dot,
                     v,
                     Contraction::Forbidden,
-                    NanTest::IsNan,
                     x,
                     &Lib::instructions(),
                 )
@@ -4104,26 +3807,21 @@ fn aggregate_leaf_total_is_capped_before_expansion() {
 mod atan2;
 mod bicubic;
 mod blend16;
-mod blend32;
 mod blend8;
 mod blend_packed;
 mod color_write;
-mod depth16;
 mod divide;
 mod fast;
-mod float_texel;
 mod fused;
 mod half_texel;
 mod libm;
-mod libm_exp;
 mod narrow;
-mod norm_write;
+mod pack;
 mod round_texel;
 mod snapshot_codes;
 mod specials;
 mod texel_round;
 mod wide;
-mod widening;
 
 /// `air.convert` from an integer to `bool` is C++'s `x != 0`, lane by lane, at every width and
 /// whatever the source's sign: the values that differ from the low bit (2, 0x80, the top bit) are
@@ -4275,29 +3973,20 @@ fn the_minimum_and_maximum_family_follows_the_profile() {
         }
         taken += usize::from(moltenvk);
     }
-    assert!(taken >= 2, "the MoltenVK captures take it");
+    assert!(taken >= 1, "the MoltenVK capture takes it");
 }
 
-/// Where the library says the device's `NMin`, `NMax` and `NClamp` are Metal's
-/// (`Lib::with_min_max`), each of the family is those instructions alone, with no NaN test;
-/// elsewhere it is `math::metal_min_max`'s picks, with NaN tests and no such instruction.
+/// Each of the minimum and maximum family is the device's `NMin`, `NMax` and `NClamp` alone, with
+/// no NaN test.
 #[test]
-fn the_minimum_and_maximum_family_takes_the_device_instructions_where_measured() {
+fn the_minimum_and_maximum_family_takes_the_device_instructions() {
     // SPIR-V `OpExtInst`, `OpIsNan`; GLSL.std.450 `NMin`, `NMax`, `NClamp`.
     const OP_EXT_INST: u32 = 12;
     const OP_IS_NAN: u32 = 156;
     const DEVICE: [u32; 3] = [79, 80, 81];
-    let counts = |op: FloatFn, f: Form, device: bool| -> (usize, usize) {
+    let counts = |op: FloatFn, f: Form| -> (usize, usize) {
         let m = kernel(&vec![f; op.arity()], f, &|fb, a| {
-            math::float_fn(
-                fb,
-                op,
-                f,
-                Contraction::Forbidden,
-                NanTest::IsNan,
-                a,
-                &Lib::instructions().with_min_max(device),
-            )
+            math::float_fn(fb, op, f, Contraction::Forbidden, a, &Lib::instructions())
         })
         .expect("kernel");
         let words = crate::spirv::serialize::serialize(m).expect("words").words;
@@ -4323,16 +4012,12 @@ fn the_minimum_and_maximum_family_takes_the_device_instructions_where_measured()
         FloatFn::Max3,
     ] {
         for f in [float(32), float(16), vec(float(32), 4)] {
-            let (ext, nan) = counts(op, f, true);
             let want = if matches!(op, FloatFn::Min3 | FloatFn::Max3) {
                 2
             } else {
                 1
             };
-            assert_eq!((ext, nan), (want, 0), "{op:?} on {f:?}, the device's");
-            let (ext, nan) = counts(op, f, false);
-            assert_eq!(ext, 0, "{op:?} on {f:?}, picked");
-            assert!(nan > 0, "{op:?} on {f:?}, picked: no NaN test");
+            assert_eq!(counts(op, f), (want, 0), "{op:?} on {f:?}");
         }
     }
 }

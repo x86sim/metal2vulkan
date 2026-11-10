@@ -33,6 +33,7 @@ use super::churn_counts::KeepBy;
 use super::command_buffer::rebound_use::Unlogged;
 use super::command_buffer::{recording_error, CommandBuffer};
 use super::deferred::{Deferred, StepInputs};
+use super::dirty_pages::CopyInGate;
 use super::error::{internal, invalid, vulkan, CommandBufferError, Error, Problem};
 use super::execution::Execution;
 use super::fresh_unwritten::FreshRead;
@@ -51,7 +52,7 @@ use super::residency::{Residency, Used};
 use super::resource::ResourceKey;
 use super::retained::Retained;
 use super::row_copies::RowCopies;
-use super::shadow::{CopyCause, ShadowCopy, ShadowSync, ShadowUse, Step, Within};
+use super::shadow::{CopyCause, GatedCopyIn, ShadowCopy, ShadowSync, ShadowUse, Step, Within};
 use super::shadow_copy_in::CopyIn;
 use super::shadow_merge::ShadowMerge;
 use super::sparse::encoder::SparseUpdate;
@@ -159,6 +160,14 @@ impl Segment {
     /// step left (`Deferred::holds`), which wakes the scheduler as it ends.
     pub(super) fn steps_after_pipelines(&self) -> bool {
         (!self.stepped && self.work.making()) || self.work.holds()
+    }
+
+    /// [`steps_after_pipelines`](Self::steps_after_pipelines) once its command buffer's bound
+    /// passed (`CommandBuffer::making_deadline`): its step records a draw or dispatch whose
+    /// pipeline is still being made as nothing, so its batch waits only for what its step left
+    /// (`Deferred::holds`).
+    pub(super) fn holds(&self) -> bool {
+        self.work.holds()
     }
 
     /// Whether it is a dispatch whose pipelines were being made (`pending_dispatch.rs`): an
@@ -1106,6 +1115,7 @@ impl EncoderCore {
         // A write of a carried shadowed texture's truth another way leaves its image stale: the
         // texture is no longer carried, whatever this encoder uses (`shadow::ShadowCarry`).
         self.shadows.wrote(tracked);
+        self.open.command_buffer.note_dirty(tracked);
         let barrier = self.uses.barrier(tracked, reach);
         self.uses.record_reaching(stages, tracked, barrier, reach);
         if barrier.is_some() {
@@ -1368,6 +1378,7 @@ impl EncoderCore {
             true => &self.aliased_uses[..],
             false => uses,
         };
+        self.open.command_buffer.note_dirty(all);
         self.uses.record(stages, all, None);
     }
 
@@ -1392,8 +1403,9 @@ impl EncoderCore {
         let leases = &mut self.kept_leases;
         let planned = self
             .shadows
-            .before(shadows, uses, |copies, two_ways, area| {
-                let (merge, lease) = ShadowMerge::new(&device, copies, (two_ways, area), images)?;
+            .before(shadows, uses, |copies, made_for, area| {
+                let merging = (made_for.two_ways, made_for.blocks, area);
+                let (merge, lease) = ShadowMerge::new(&device, copies, merging, images)?;
                 leases.extend(lease);
                 Ok(Arc::new(merge))
             });
@@ -1568,8 +1580,10 @@ impl EncoderCore {
     pub(super) fn shadow_copies(&mut self, copies: &[ShadowCopy]) {
         let device = self.device().clone();
         let mut run = ShadowRun::default();
-        // The keeps a dispatch at their copy in took, which record nothing.
+        // The keeps a dispatch at their copy in took, which record nothing, and those that copy
+        // the staging buffer their copy in filled.
         let mut taken = Vec::new();
+        let mut staged = Vec::new();
         for (i, copy) in copies.iter().enumerate() {
             if taken.contains(&i) {
                 continue;
@@ -1589,6 +1603,11 @@ impl EncoderCore {
                 self.retain(both);
                 continue;
             }
+            // A copy back or merge into host pages a consumer logs is reported to the log as the
+            // shadow's own at the commit (`dirty_pages.rs`).
+            if let Some((log, bytes)) = copy.written_log(&device) {
+                self.open.command_buffer.dirty().wrote_back(log, bytes);
+            }
             // A shadow takes the view a dispatch reads on a device that dispatches alone.
             let dispatched = copy.dispatched(&device);
             let rows = match dispatched {
@@ -1605,15 +1624,54 @@ impl EncoderCore {
                     copy.uses_with(rows.as_ref()),
                 ),
             };
+            // A copy in over host pages a consumer logs takes the regions its gate decides as its
+            // batch is submitted (`dirty_pages.rs`, `shadow::GatedCopyIn`).
+            let gate = match &dispatched {
+                Some(_) => None,
+                None => copy.gate_log(&device).map(|(log, texel)| {
+                    let shadows = &device.shared().dirty;
+                    (self.open.command_buffer.dirty()).gate((log, &copy.copies, texel), shadows)
+                }),
+            };
+            // A keep may copy the staging buffer its copy in filled only where that copy in
+            // copies the texture's bytes whole: recorded here, ungated.
+            if dispatched.is_none() && gate.is_none() {
+                staged.extend(staged_keep(copies, i));
+            }
+            let from_staging = staged.contains(&i);
+            if let Some(gate) = gate {
+                // Tracked here as the copy, recorded at its batch's submission.
+                let named = std::cell::Cell::new(false);
+                let tracked = |_: &Vk, _: vk::CommandBuffer| named.set(true);
+                self.shadow_command(&mut run, (stages, &uses, copy.writes_truth()), tracked);
+                if named.get() {
+                    self.defer_copy_in(copy, gate);
+                }
+                if let Some(sets) = rows.and_then(RowCopies::retained) {
+                    self.retain(sets);
+                }
+                continue;
+            }
+            let kept = std::cell::Cell::new(false);
             let record = |device: &Vk, raw: vk::CommandBuffer| match &dispatched {
                 // SAFETY: the encoder's command buffer is recording outside a render pass; its
                 // commands retain the shadowed textures (and their views) and the dispatch until
                 // it completes, and every image rests in the `GENERAL` layout.
                 Some(back) => unsafe { back.record(device, raw) },
+                None if from_staging => {
+                    // SAFETY: as above; the keep follows its texture's copy in, after the barrier
+                    // its read of the shadow takes from that copy's write, with no copy of the
+                    // shadow between them (`staged_keep`).
+                    unsafe { copy.record_keep_from_staging(device, raw) };
+                    kept.set(true);
+                }
                 // SAFETY: as above; the rows are the copy's own, made just now.
-                None => unsafe { copy.record(device, raw, rows.as_ref()) },
+                None => unsafe { copy.record_gated(device, raw, rows.as_ref(), None) },
             };
             self.shadow_command(&mut run, (stages, &uses, copy.writes_truth()), record);
+            if kept.get() {
+                device.shared().counts.shadow_keep_from_staging();
+            }
             if let Some(back) = dispatched {
                 device.shared().counts.shadow_copy_back_dispatched();
                 self.retain(back);
@@ -1654,8 +1712,39 @@ impl EncoderCore {
             return;
         };
         record(self.device().shared().vk(), raw);
+        self.open.command_buffer.note_dirty(tracked);
         self.uses.record(stages, tracked, None);
         self.touch(uses);
+    }
+
+    /// Leave `copy`, a shadow's copy in over host pages a consumer logs that the encoder tracked
+    /// already ([`shadow_command`](Self::shadow_command)), to its batch's submission, its regions
+    /// decided by `gate` then (`shadow::GatedCopyIn`), the encoder going on in a new
+    /// `VkCommandBuffer`. A render pass held for an instance recorded inline
+    /// ([`hold_pass`](Self::hold_pass)) stays held: the copies of its first instance go before
+    /// the pass, so the segment goes between the command buffers of the commands before it,
+    /// ahead of the pass's draws that read the copy. Recorded whole here instead inside a
+    /// predicated loop's laying, which its check may submit again, or where no new
+    /// `VkCommandBuffer` can be made.
+    fn defer_copy_in(&mut self, copy: &ShadowCopy, gate: Arc<CopyInGate>) {
+        let laying = (self.open.command_buffer.state().predication_mut()).laying();
+        let next = match laying {
+            true => None,
+            false => self.continuation().ok(),
+        };
+        let Some(next) = next else {
+            if let Some(raw) = self.recording() {
+                // SAFETY: the encoder's command buffer is recording outside a render pass; its
+                // commands retain the shadowed texture until it completes, and its image rests in
+                // the `GENERAL` layout.
+                unsafe { copy.record(self.device().shared().vk(), raw, None) };
+            }
+            return;
+        };
+        let work = Deferred::GatedCopyIn(Arc::new(GatedCopyIn::new(copy.clone(), gate)));
+        // Refused only where the current `VkCommandBuffer` does not end, which abandons the
+        // command buffer.
+        let _abandoned = self.defer_into(next, work);
     }
 
     /// The `VkCommandBuffer` a render pass holds ([`hold_pass`](Self::hold_pass)), until its
@@ -1698,6 +1787,7 @@ impl EncoderCore {
                 copy.record(raw, held, rows.as_ref());
             }
             let stages = copy.stages_with(rows.as_ref());
+            self.open.command_buffer.note_dirty(tracked);
             self.uses.record(stages, tracked, None);
             self.touch(&uses);
             if let Some(sets) = rows.and_then(RowCopies::retained) {
@@ -1916,6 +2006,20 @@ impl EncoderCore {
         self.fails_command_buffer = Some(error);
     }
 
+    /// A command of this encoder uses a memoryless texture's memory, which it has none of: plain
+    /// Metal fails the command buffer from the submission that holds the encoder on
+    /// (`CommandBufferError::InvalidResource`, `State::fail_submission_from`), its GPU running
+    /// none of that submission, so neither a hang nor a discard there happens. Another failure the
+    /// encoder found first keeps its error.
+    pub(super) fn fail_memoryless_use(&mut self) {
+        match self.fails_command_buffer {
+            None | Some(CommandBufferError::GpuHang | CommandBufferError::GpuRecoveryVictim) => {
+                self.fails_command_buffer = Some(CommandBufferError::InvalidResource);
+            }
+            Some(_) => {}
+        }
+    }
+
     /// Metal's GPU hangs at this encoder (a direct draw of primitive type 9, or a pass of no draw
     /// call over a mutable rasterization-rate map, `rate_mapped_pass.rs`), as the command
     /// buffer commits: it fails from the encoder on with `CommandBufferError::GpuHang`, unless
@@ -2075,6 +2179,10 @@ impl EncoderCore {
             Some(CommandBufferError::GpuHang) => {
                 state.hang_from(encoder, open.command_buffer.device())?;
             }
+            // A memoryless texture's use fails Metal's whole submission (`InvalidResource`).
+            Some(error @ CommandBufferError::InvalidResource) => {
+                state.fail_submission_from(encoder, error);
+            }
             Some(error) => state.fail_from(encoder, error),
             None => {}
         }
@@ -2138,9 +2246,6 @@ impl EncoderCore {
                 },
             );
         }
-        // SAFETY: only this call records `raw`, under the state lock, and it records until the
-        // tail ends (at the next part's end or the commit, `close_tail`).
-        unsafe { crate::recorder::reserve_end(raw) };
         state.tail = Some(raw);
         state.retained.extend(retained.into_entry());
         state.executions.extend(executions);
@@ -2419,6 +2524,21 @@ fn meets(earlier: &[Use<ResourceKey>], later: &[Use<ResourceKey>]) -> bool {
                 && !(before.write.is_empty() && used.write.is_empty())
         })
     })
+}
+
+/// The place in `copies` of the keep that copies the staging buffer the copy in at `copies[i]`
+/// fills (`ShadowCopy::keeps_from_staging`): its texture's next copy, the copies between them
+/// other textures' shadows', which leave its shadow and staging buffer as the copy in left them.
+/// `None` where the keep moves its texels out of the image, or no keep follows.
+fn staged_keep(copies: &[ShadowCopy], i: usize) -> Option<usize> {
+    let copy = &copies[i];
+    if !matches!(copy.step, Step::Into) {
+        return None;
+    }
+    let shadow = copy.copies.shadow_key;
+    let (j, keep) = (copies.iter().enumerate().skip(i + 1))
+        .find(|(_, later)| later.copies.shadow_key == shadow)?;
+    (Arc::ptr_eq(&keep.copies, &copy.copies) && keep.keeps_from_staging()).then_some(j)
 }
 
 /// The dispatch that takes the copy in at `copies[i]` and its texture's keep after it together

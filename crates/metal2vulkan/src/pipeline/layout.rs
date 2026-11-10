@@ -82,6 +82,12 @@ pub enum BindingSource {
         texture: SlotRef,
         sampler: CombinedSampler,
     },
+    /// The planes of the two-plane YCbCr texture bound at a Metal `[[texture(n)]]` slot, held as
+    /// an image the device's own sampler Y′CbCr conversion samples
+    /// (`ResourceKind::YCbCrPlanes`): one combined descriptor, its image the planes' image viewed
+    /// with the conversion, its sampler the binding's `immutable_sampler`
+    /// (`vk::SamplerDesc::ycbcr`).
+    YCbCrPlanes(SlotRef),
     /// A binding the translator adds for one stage (argument table, root or handle table,
     /// constant blob).
     Synthetic {
@@ -125,10 +131,6 @@ pub enum BindingSource {
         stage: Stage,
         sampler: CombinedSampler,
     },
-    /// The raw view of the texture bound at a Metal `[[texture(n)]]` slot: a sampled image of the
-    /// same image in the UNORM format of its channels, which reads an 8-bit sRGB texture's raw
-    /// codes (`RuntimeFact::SrgbTexture`).
-    RawTexture(SlotRef),
     /// The `half` shadow of the extended-range color attachment of this color index that the
     /// draw's render pass instance holds (`ResourceKind::ExtendedShadow`), bound as a storage
     /// image.

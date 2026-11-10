@@ -68,7 +68,7 @@ pub struct DeviceProfile {
 impl DeviceProfile {
     /// The profile of `fields`, with its fingerprint derived (the only way to build one): the
     /// fingerprint is a function of the fields, so holding them together is what keeps it true of
-    /// them. An edit goes through [`edit`](Self::edit).
+    /// them. A test's edit goes through `edit`, which only the crate's tests build.
     pub(crate) fn of(fields: ProfileFields) -> DeviceProfile {
         let fingerprint = fingerprint_of(&fields);
         DeviceProfile {
@@ -204,14 +204,13 @@ impl DeviceProfile {
         crate::memory::contain::device_drops_texel_writes(self, texel_buffer)
     }
 
-    /// Whether a `half` or `float` read of a 16-bit float texture answers the texel's own bits,
-    /// read through the texture's unsigned-integer alias at the slot's second binding
-    /// (`DevicePolicy::half_texel_bits`,
-    /// [`HalfTexelBitsPolicy::Exact`](crate::device::HalfTexelBitsPolicy::Exact)); `false` under
-    /// the default, where the read answers the device's decode of the texel. The runtime reads it
-    /// to list the alias among a sampled image's view formats.
-    pub fn reads_half_texel_bits(&self) -> bool {
-        self.fields.half_texel_bits == crate::device::policy::HalfTexelBitsPolicy::Exact
+    /// Whether a function reads a two-plane YCbCr texture's planes in place where its slot reads
+    /// the texture only so (`bind::YCbCrInPlace`): on an integrated GPU or a CPU device, which
+    /// reads host memory with no bus between; elsewhere every such texture's image of converted
+    /// texels is read. Both forms read Metal's texels exactly. The runtime reads it to state a
+    /// texture's planes (`TextureFacts::ycbcr_in_place`).
+    pub fn reads_ycbcr_planes_in_place(&self) -> bool {
+        self.fields.ycbcr_in_place
     }
 
     /// The driver workarounds the profile takes: the leaf encodings it changes and the refusals of
@@ -220,61 +219,16 @@ impl DeviceProfile {
         &self.fields.workarounds
     }
 
-    /// The stage-module word count a pipeline's largest stage must fit for this device, where its
-    /// driver faults compiling a module past it
-    /// ([`DriverWorkaround::RegisterAllocatorOverflowsLargeModules`]); `None` where no such bound
-    /// is measured. A compile of any pipeline kind over the bound retranslates with the consumer's
-    /// exact forms dropped to fit
-    /// ([`Device::fit_render_variant`](crate::device::Device::fit_render_variant),
-    /// [`fit_mesh_variant`](crate::device::Device::fit_mesh_variant),
-    /// [`fit_compute_pipeline`](crate::device::Device::fit_compute_pipeline),
-    /// [`fit_tile_pipeline`](crate::device::Device::fit_tile_pipeline)).
-    pub fn module_word_bound(&self) -> Option<u32> {
-        self.fields
-            .workarounds
-            .contains(&DriverWorkaround::RegisterAllocatorOverflowsLargeModules)
-            .then_some(REGISTER_ALLOCATOR_MODULE_WORD_BOUND)
-    }
-
-    /// The driver deviations the profile takes at a driver release newer than the last one
-    /// measured, each with that release's `driverVersion` (`device::driver_facts`): a module
-    /// compiled for the profile records each as
-    /// [`PrecisionNote::BeyondMeasuredDeviation`](crate::pipeline::PrecisionNote::BeyondMeasuredDeviation).
-    /// Empty on a measured release.
-    pub fn driver_deviations(&self) -> &BTreeMap<DriverDeviation, u32> {
-        &self.fields.deviations_beyond
-    }
-
-    /// Whether the profile's device answers samples, gathers and comparisons with its own
-    /// sampler, with no emulation of Metal's in the module: a device that samples through Metal's
-    /// own sampler (`VkProperty::MetalSampler`, MoltenVK on Apple's GPU), whose answers are
-    /// Metal's, or one that samples natively (`VkProperty::DeviceSampling`,
-    /// `SamplingPolicy::NativeDevice`, the default), whose answers are the device's
-    /// ([`PrecisionNote::DeviceSampling`]). The translation's sampler sites and the runtime's
-    /// sampler objects (`metal::sampler`) ask it alike.
-    ///
-    /// [`PrecisionNote::DeviceSampling`]: crate::pipeline::PrecisionNote::DeviceSampling
-    pub(crate) fn device_samples(&self) -> bool {
-        use crate::device::requirements::VkProperty;
-        let properties = &self.fields.enabled.properties;
-        properties.contains(&VkProperty::MetalSampler)
-            || properties.contains(&VkProperty::DeviceSampling)
-    }
-
     /// Whether the profile takes the driver deviation `deviation` (`device::driver_facts`): its
-    /// driver is measured with it at the device's release, or at an older one
-    /// ([`DeviceProfile::driver_deviations`] lists those), so the translation relies on it. A
-    /// profile that does not take it compiles the conservative route the deviation's
-    /// documentation names. A gate lane that checks a deviation on the device asks this before
+    /// driver is measured with it on the device's GPU, so the translation relies on it. A
+    /// profile that does not take it compiles the route the deviation's documentation names for a
+    /// driver without it. A gate lane that checks a deviation on the device asks this before
     /// expecting the deviation's answer.
     pub fn takes_driver_deviation(&self, deviation: DriverDeviation) -> bool {
         let f = &self.fields;
         match deviation {
             DriverDeviation::CubeGradientRoute => {
                 f.cube_gradients.compute == CubeGradientRoute::Metal
-            }
-            DriverDeviation::GraphicsCubeGradientRoute => {
-                f.cube_gradients.graphics == CubeGradientRoute::AppleSwizzled
             }
             DriverDeviation::GraphicsCubeGradientTangents => {
                 f.cube_gradients.graphics == CubeGradientRoute::AppleProjected
@@ -299,10 +253,6 @@ impl DeviceProfile {
                 .enabled
                 .properties
                 .contains(&VkProperty::MetalHalfColorNans),
-            DriverDeviation::HalfColorOutputBits => f
-                .enabled
-                .properties
-                .contains(&VkProperty::HalfColorOutputBits),
             DriverDeviation::MetalHalfFma => {
                 f.enabled.properties.contains(&VkProperty::MetalHalfFma)
             }
@@ -310,14 +260,6 @@ impl DeviceProfile {
                 .enabled
                 .properties
                 .contains(&VkProperty::MetalFloatDenormals),
-            DriverDeviation::MetalHalfQuantize => f
-                .enabled
-                .properties
-                .contains(&VkProperty::MetalHalfQuantize),
-            DriverDeviation::MetalHalfConversion => f
-                .enabled
-                .properties
-                .contains(&VkProperty::MetalHalfConversion),
             DriverDeviation::MetalCenterVaryings => f
                 .enabled
                 .properties
@@ -343,10 +285,6 @@ impl DeviceProfile {
                 .enabled
                 .properties
                 .contains(&VkProperty::MetalHalfStorageNans),
-            DriverDeviation::MetalFloatStorageNans => f
-                .enabled
-                .properties
-                .contains(&VkProperty::MetalFloatStorageNans),
             DriverDeviation::MetalFragmentSimdgroups => f
                 .enabled
                 .properties
@@ -371,10 +309,6 @@ impl DeviceProfile {
                 .enabled
                 .properties
                 .contains(&VkProperty::MetalNormStorageWrites),
-            DriverDeviation::Unorm8LinearFilter => f
-                .enabled
-                .properties
-                .contains(&VkProperty::Unorm8LinearFilter),
             DriverDeviation::MetalDepth16Stores => f
                 .enabled
                 .properties
@@ -394,6 +328,14 @@ impl DeviceProfile {
             DriverDeviation::MetalFullQuads => {
                 f.enabled.properties.contains(&VkProperty::MetalFullQuads)
             }
+            DriverDeviation::MetalNormalizedVertexFetch => f
+                .enabled
+                .properties
+                .contains(&VkProperty::MetalNormalizedVertexFetch),
+            DriverDeviation::MetalAlphaCoverage => f
+                .enabled
+                .properties
+                .contains(&VkProperty::MetalAlphaCoverage),
         }
     }
 
@@ -511,23 +453,8 @@ pub struct ProfileFields {
     pub handle_domain: HandleDomain,
     pub containment: Containment,
     pub isolation: GuestIsolation,
-    /// Whether a texel's value is the device's conversion or Metal's (the policy's).
-    pub texel_conversion: crate::device::policy::TexelConversionPolicy,
-    /// Whether a normalized vertex attribute is converted by fixed-function vertex input or
-    /// pulled and divided exactly in the shader (the policy's).
-    pub vertex_normalized: crate::device::policy::VertexNormalizedPolicy,
-    /// Whether a `half4` output of a module without fast math blends into a 16-bit float
-    /// attachment in the device's blend or in Metal's, computed by the function (the policy's).
-    pub half_blend: crate::device::policy::HalfBlendPolicy,
-    /// Whether a `half` or `float` read of a 16-bit float texture answers the device's decode of
-    /// the texel or the texel's own bits, read through the texture's unsigned-integer alias (the
-    /// policy's).
-    pub half_texel_bits: crate::device::policy::HalfTexelBitsPolicy,
-    /// Whose `half` rounding a module takes: Metal's (a measured form, or the integer rounding
-    /// the policy's `HalfRoundingPolicy::Exact` asks for) or the device's own conversion or
-    /// quantize (`lower::arith::narrow::quantize_form`). Derived, so a device measured to round
-    /// as Metal does keys the same under both policies.
-    pub half_rounding: HalfRoundingRoute,
+    /// How a fast-math `half` chain rounds without `shaderFloat16` (`DevicePolicy::half_chains`).
+    pub half_chains: crate::device::HalfChainPolicy,
     pub leaf: LeafCaps,
     pub subgroup: SubgroupModel,
     pub images: ImageCaps,
@@ -556,57 +483,38 @@ pub struct ProfileFields {
     /// The enabled capability sets `Requirements` are checked against.
     pub enabled: EnabledCaps,
     /// Which functions the device's `GLSL.std.450` instructions and `OpFDiv` of `float` compute:
-    /// Metal's own, so the translation leaves a function to the device where Metal's compile of the
-    /// module computes it in the call's math mode, and takes the fast reciprocal from the device's
-    /// division, or the device's, so the translation computes the functions whose device answer may
-    /// leave Apple's bound itself.
+    /// Metal's own, in the math mode Metal's compile of the module takes, or the device's. The
+    /// module takes the device's instructions on either; the notes it records differ.
     pub float_functions: FloatFunctions,
-    /// Which NaN the device's `float` and `half` arithmetic answers: Metal's canonical NaN, so the
-    /// translation leaves it to the device, or the device's own, so the translation selects Metal's
-    /// where a result's bits are observed.
+    /// Which NaN the device's `float` and `half` arithmetic answers: Metal's canonical NaN, measured,
+    /// or the device's own, which the module records where Metal answers a NaN. Either way the
+    /// translation leaves every NaN's bits to the device.
     pub nan_encoding: NanEncoding,
-    /// Whose NaN a `half` read, sample or gather hands back for a NaN texel: Metal's, by the
-    /// class of the texture bound, where the policy's `NanMinMaxPolicy::Exact` asks for it, on
-    /// every device, or the device's decode (the default).
-    pub texel_nans: TexelNanRoute,
-    /// Whether a linear sample the device's sampler answers (`DeviceProfile::device_samples`)
-    /// takes Metal's filter of a two-plane YCbCr texture bound at its slot, through the slot's
-    /// YCbCr variant (`RuntimeFact::YCbCrTexture`): under the policy's `YCbCrFilterPolicy::Exact`,
-    /// and on a device that samples through Metal's own sampler also under `SamplingPolicy::Exact`.
-    /// Elsewhere the device filters such a texture as any other. Derived, so a profile that answers
-    /// alike under both policies keys the same.
-    pub ycbcr_variant: bool,
-    /// Whose operand Metal's minimum and maximum functions pick (`lower::arith::native_min_max`):
-    /// Metal's, or the device's `NMin`, `NMax` and `NClamp` as they are (the policy's
-    /// `NanMinMaxPolicy::Native`). Derived, so a device that keeps Metal's picks keys the same
-    /// under both policies.
-    pub min_max: MinMaxRoute,
-    /// In whose order Metal's `dot`, `mix` and `fast::sqrt` round: Metal's, or the device's
-    /// single instructions (the policy's `RoundingOrderPolicy::Native`). Derived, as
-    /// [`ProfileFields::min_max`] is.
-    pub rounding_order: RoundingOrderRoute,
+    /// Whether a two-plane YCbCr texture's planes may be read in place
+    /// (`bind::YCbCrInPlace`): on a device whose GPU reads the planes' memory with no bus between
+    /// (`VkPhysicalDeviceType` integrated or CPU), a texture slot whose function reads such a
+    /// texture only as the in-place form reads records `RuntimeFact::YCbCrInPlace`, and the
+    /// consumer states the planes of each texture it holds so. A discrete, virtual or other
+    /// device, or one of no stated type, keeps every such texture's image of converted texels,
+    /// which its refresh reads across the bus once per encoder where the in-place form would read
+    /// the planes there at every pass. Both forms read Metal's texels exactly.
+    pub ycbcr_in_place: bool,
     /// The Function storage a thread holds correctly (`device::function_storage`): a stage's
     /// private memory, its call stacks included, may take this much a thread
     /// (`VkLimit::FunctionStorageBytesPerThread`), and a vertex or fragment function on a device
     /// not measured more ([`FunctionStorage::Assumed`]).
     pub function_storage: FunctionStorage,
     /// How the driver hands a cube sample's explicit gradients to the GPU, in a graphics and in
-    /// a compute pipeline: Vulkan's cube derivative rule unless the driver's release is measured
-    /// with another (`DriverDeviation::CubeGradientRoute`, `GraphicsCubeGradientRoute` and
-    /// `GraphicsCubeGradientTangents`).
+    /// a compute pipeline: Vulkan's cube derivative rule unless the driver is measured with
+    /// another (`DriverDeviation::CubeGradientRoute` and `GraphicsCubeGradientTangents`).
     pub cube_gradients: CubeGradients,
-    /// The driver's deviations the profile takes at a release newer than the last one measured
-    /// (`device::driver_facts`), each with that release's `driverVersion`: taken, and recorded
-    /// by every module compiled for the profile as `PrecisionNote::BeyondMeasuredDeviation`.
-    /// Empty on a measured release.
-    pub deviations_beyond: BTreeMap<DriverDeviation, u32>,
 }
 
 /// How a driver hands a cube sample's explicit gradients to the GPU
 /// ([`ProfileFields::cube_gradients`]), per pipeline kind, each decided by the driver's measured
-/// deviations (`DriverDeviation::GraphicsCubeGradientRoute`,
-/// `DriverDeviation::GraphicsCubeGradientTangents` and `DriverDeviation::CubeGradientRoute`);
-/// without them, Vulkan's rule, but [`CubeGradientRoute::Unmeasured`] on a MoltenVK `driver_id`.
+/// deviations (`DriverDeviation::GraphicsCubeGradientTangents` and
+/// `DriverDeviation::CubeGradientRoute`); without them, Vulkan's rule, the device's own reading,
+/// on every driver.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CubeGradients {
@@ -626,17 +534,13 @@ pub enum CubeGradientRoute {
     /// function hands an isotropic sample Metal's length of the two tangent components on one
     /// tangent, and an anisotropic one Metal's face gradients without their normal component
     /// (`lower::sampler::CubeFootprint::Length` and `Face`); the level and the anisotropic filter
-    /// are the device's (`PrecisionNote::CubeGradientFootprint`).
+    /// are the device's (`PrecisionNote::CubeGradientFootprint`). Also the route of a driver no
+    /// measurement covers (a MoltenVK release or GPU without the deviations), whose reading of
+    /// the form is its own.
     Vulkan,
     /// SPIRV-Cross's `spvGradientCube` (its `agx_manual_cube_grad_fixup`) projects each onto the
-    /// face as Vulkan's rule does and swizzles the two values into the components Apple's
-    /// isotropic reading took under macOS 26.7, then hands them to Metal's `gradientcube`, whose
-    /// anisotropic reading on the Apple M3 Max there takes them transposed: that GPU's macOS 26.7
-    /// footprint (`lower::sampler::CubeFootprint::Isotropic` and `AnisotropicSwizzled`), measured
-    /// on that identity alone.
-    AppleSwizzled,
-    /// The same fixup under macOS 27, whose Metal reads the face's two tangents of what it is
-    /// handed: an `x` or `z` face's gradient without its normal component reaches Metal as its
+    /// face as Vulkan's rule does and swizzles the two values, then hands them to Metal's
+    /// `gradientcube`, whose macOS 27 reading takes the face's two tangents of what it is handed: an `x` or `z` face's gradient without its normal component reaches Metal as its
     /// own, exactly; on a `y` face the fixup writes the face's `x` tangent on both, so the function
     /// hands Metal's length there, which keeps an isotropic sample's footprint and lays an
     /// anisotropic one's ellipse on the diagonal (`lower::sampler::CubeFootprint::Projected`,
@@ -645,16 +549,6 @@ pub enum CubeGradientRoute {
     /// They reach Metal's `gradientcube` as given, which the GPU reads by Metal's own rule, so
     /// the function hands Metal's own (`lower::sampler::CubeFootprint::Metal`).
     Metal,
-    /// The driver hands them to Metal by a route its description does not state: a MoltenVK
-    /// `driver_id` at a release no measurement covers, or a document of one that states no
-    /// route. The function takes Metal's footprint itself where its emulation reaches the sample
-    /// (`lower::sampler::anisotropic`): Metal's level, and an anisotropic sampler's taps, each an
-    /// explicit level of Metal's own sampler, which no route alters
-    /// (`PrecisionNote::AnisotropicFilter` for the taps). Elsewhere it hands the isotropic form's
-    /// length, on one tangent, which every route above reads alike (but a `y` face's through
-    /// [`CubeGradientRoute::AppleProjected`]'s fixup), through an isotropic sampler
-    /// (`metal::sampler::SamplerUse::cube_gradient`, `PrecisionNote::CubeGradientFootprint`).
-    Unmeasured,
 }
 
 impl CubeGradients {
@@ -694,97 +588,34 @@ impl FunctionStorage {
 
 /// Which functions a device's `GLSL.std.450` instructions and `OpFDiv` of `float` compute
 /// ([`ProfileFields::float_functions`]), decided by the driver's measured deviation
-/// [`DriverDeviation::MetalFloatFunctions`].
+/// [`DriverDeviation::MetalFloatFunctions`]. Either way the module takes the device's
+/// instructions.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FloatFunctions {
     /// Metal's own, in the math mode Metal compiles the module with: fast where the entry
     /// declares no `SignedZeroInfNanPreserve`, precise where it declares one, and precise
     /// `tanh` and `atan2` either way. The division likewise: Metal's fast division and
-    /// reciprocal in a fast-math module, its correctly rounded ones otherwise.
+    /// reciprocal in a fast-math module, its correctly rounded ones otherwise. A call that is
+    /// Metal's own in the entry's mode records no note there.
     Metal,
-    /// The device's, within Vulkan's precision table, which the translation does not take
-    /// where Metal answers beyond it: its routines of Metal's answers instead (the policy's
-    /// `FloatMathsPolicy::Exact`).
-    Device,
-    /// The device's, within Vulkan's precision table, taken as they are: native device maths
-    /// (`FloatMathsPolicy::Native`, the default), each kind recorded with its bound.
-    Native,
-}
-
-/// Whose rounding a `half` result takes ([`ProfileFields::half_rounding`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum HalfRoundingRoute {
-    /// Metal's: the device's conversion or quantize where it is measured to round as Metal does
-    /// (`DriverDeviation::MetalHalfConversion`, `DriverDeviation::MetalHalfQuantize`), else
-    /// integer arithmetic.
-    Metal,
-    /// The device's own conversion or quantize where neither is measured to be Metal's: native
-    /// half rounding (`HalfRoundingPolicy::Native`, the default), each kind recorded with its
-    /// bound.
-    Native,
-}
-
-/// Whose operand Metal's `fmin`, `fmax`, `min3`, `max3`, `clamp` and `saturate` on `float` and
-/// `half` pick ([`ProfileFields::min_max`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MinMaxRoute {
-    /// Metal's: the device's `NMin`, `NMax` and `NClamp` where they are measured to be Metal's
-    /// (`DriverDeviation::MetalMinMax`), else the translation's selects of Metal's operand, as on a
-    /// device whose functions are Metal's own (`DriverDeviation::MetalFloatFunctions`) or under
-    /// `NanMinMaxPolicy::Exact`.
-    Metal,
-    /// The device's `NMin`, `NMax` and `NClamp` as they are (`NanMinMaxPolicy::Native`, the
-    /// default), noted `PrecisionNote::NativeMinMax` with its bound.
-    Native,
-}
-
-/// In whose order Metal's `dot`, `mix` and `fast::sqrt` on `float` and `half` round
-/// ([`ProfileFields::rounding_order`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RoundingOrderRoute {
-    /// Metal's: its fused chain, its two fused multiply-adds, its `x · rsqrt(x)`, or the
-    /// device's own instruction where the device's functions are Metal's
-    /// (`DriverDeviation::MetalFloatFunctions`); under `RoundingOrderPolicy::Exact` everywhere.
-    Metal,
-    /// The device's `OpDot`, `FMix` and `Sqrt` (`RoundingOrderPolicy::Native`, the default),
-    /// noted `PrecisionNote::NativeDot`, `NativeMix` and `NativeTranscendentals` with their
-    /// bounds.
+    /// The device's, within Vulkan's precision table, taken as they are, each kind recorded with
+    /// its bound.
     Native,
 }
 
 /// Which NaN a device's `float` and `half` arithmetic answers ([`ProfileFields::nan_encoding`]),
-/// decided by the driver's measured deviation [`DriverDeviation::MetalCanonicalNans`].
+/// decided by the driver's measured deviation [`DriverDeviation::MetalCanonicalNans`]. The
+/// translation selects no NaN under either: every NaN's bits are the device's.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NanEncoding {
     /// Metal's canonical NaN, `0x7FC00000` (`0x7E00` as `half`), for every NaN result of the
-    /// arithmetic and of the functions whose NaN Metal canonicalizes.
+    /// arithmetic and of the functions whose NaN Metal canonicalizes, measured: such a result
+    /// records nothing.
     MetalCanonical,
-    /// The device's own: an operand's bits, quieted or not, or another NaN, which the
-    /// translation answers Metal's in place of (the policy's `NanMinMaxPolicy::Exact`).
-    Device,
-    /// The device's own, taken as it is (`NanMinMaxPolicy::Native`, the default), noted
-    /// `PrecisionNote::NativeNanEncoding` with its bound.
+    /// The device's own, unmeasured, noted `PrecisionNote::NativeNanEncoding` with its bound.
     Native,
-}
-
-/// Whose NaN a `half` texel access hands back for a NaN texel ([`ProfileFields::texel_nans`]).
-/// A texel's NaN is the image's decode, which the access narrows itself, not a result of the
-/// device's arithmetic, so [`ProfileFields::nan_encoding`] does not decide it: a device measured
-/// to answer Metal's canonical NaN in its arithmetic (`NanEncoding::MetalCanonical`) need not
-/// answer it for a texel, and MoltenVK on the Apple M3 Max does not (a 32-bit float texel's NaN
-/// read as `half` keeps its payload's top bits).
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TexelNanRoute {
-    /// Metal's rule (`NanMinMaxPolicy::Exact`): a 16-bit float texel's own NaN where the access
-    /// reads one texel, and `0x7e00` for every other NaN, by the class of the texture bound
-    /// (`lower::texture::texel_nans_class`).
-    Metal,
-    /// The device's decode (`NanMinMaxPolicy::Native`, the default), noted
-    /// `PrecisionNote::DeviceNanEncoding`.
-    Device,
 }
 
 /// What the consumer enabled, as the capability vocabulary `Requirements` uses
@@ -1269,13 +1100,6 @@ pub struct FormatTable {
     pub formats: BTreeMap<vk::Format, BTreeSet<FormatUsage>>,
 }
 
-/// The stage-module word bound for a device whose driver faults compiling a module past it
-/// ([`DriverWorkaround::RegisterAllocatorOverflowsLargeModules`], ANV's register allocator):
-/// its overflow is a 32-bit triangular pair index, and 400,000 words sits below the smallest
-/// module observed to fault with margin. [`DeviceProfile::module_word_bound`] returns it where the
-/// workaround is taken.
-pub(crate) const REGISTER_ALLOCATOR_MODULE_WORD_BOUND: u32 = 400_000;
-
 /// A typed driver workaround: a defect of the driver measured on it, which changes a leaf
 /// encoding or refuses the construct the driver runs wrong ([`Needs::DriverDefect`]), never the
 /// pointer model or a semantic; or a measured answer of the driver's that the specifications allow
@@ -1355,7 +1179,7 @@ pub enum DriverWorkaround {
     /// `[[barycentric_coord, center_no_perspective]]`. MoltenVK (`VK_DRIVER_ID_MOLTENVK`)
     /// 1.4.1 converts the shader with SPIRV-Cross `adec7acb`, which throws "Cannot declare both
     /// BaryCoordNV and BaryCoordNoPerspNV in same shader in MSL." whatever the GPU (measured on
-    /// an Apple M4: `corpus-pipeline --fixtures` on `moltenvk-m4`). It is keyed on
+    /// an Apple M4 with `corpus-pipeline --fixtures`). It is keyed on
     /// the driver's release (`device::driver_facts`): a newer release keeps it until a
     /// measurement says otherwise. Such a fragment function is refused there
     /// (`lower::stage_io`'s input builtins); one form alone compiles.
@@ -1416,20 +1240,20 @@ pub enum DriverWorkaround {
     /// holding the insert (`spirv::serialize::serialize_for`), which SPIRV-Cross declares in the
     /// loop.
     CompositeInsertsWrittenInPlace,
-    /// The driver's shader converter writes every function the module defines as one to inline
-    /// at each call (`static inline __attribute__((always_inline))`), whatever its function
-    /// control, so the GPU's compiler compiles a routine's body once per call. MoltenVK
-    /// (`VK_DRIVER_ID_MOLTENVK`) 1.4.1 converts with SPIRV-Cross `adec7acb`, whose MSL backend
-    /// does this whatever the GPU: measured on the Apple M3 Max and the M4 (about half of corpus
-    /// row `69a35b6f`'s compile; a synthetic routine called 300 times compiled in 0.54 to 0.58 s
+    /// The driver's shader converter writes every function the module defines as one to inline at
+    /// each call (`static inline __attribute__((always_inline))`), whatever its function control,
+    /// so the GPU's compiler compiles a routine's body once per call. MoltenVK
+    /// (`VK_DRIVER_ID_MOLTENVK`) 1.4.1 converts with SPIRV-Cross `adec7acb`, whose MSL backend does
+    /// this whatever the GPU: measured on the Apple M3 Max and the M4 (about half of corpus row
+    /// `69a35b6f`'s compile; a synthetic routine called 300 times compiled in 0.54 to 0.58 s
     /// against 0.11 to 0.13 s as calls). It is keyed on the driver's release
     /// (`device::driver_facts`). There each routine (`spirv::builder::ModuleBuilder::routine`: the
-    /// math routines, and the texel conversions, the filters' sums and the cube's face fold) is
-    /// declared `DontInline`, the standard SPIR-V statement that its calls stay calls, for a
-    /// converter that honours it; elsewhere a routine takes no function control, since NVIDIA's
-    /// 615.71.09 honours `DontInline` and ran a routine-heavy kernel 8.1 times as long with it on
-    /// the RTX 3090, and Mesa's drivers inline every function whatever the control. It changes no
-    /// answer.
+    /// wide-integer divisions, precise `fmod`, the texel conversions, the filters' sums and the
+    /// sampling routines) is declared `DontInline`, the standard SPIR-V statement that its calls
+    /// stay calls, for a converter that honours it; elsewhere a routine takes no function control,
+    /// since NVIDIA's 615.71.09 honours `DontInline` and ran a routine-heavy kernel 8.1 times as
+    /// long with it on the RTX 3090, and Mesa's drivers inline every function whatever the control.
+    /// It changes no answer.
     FunctionsInlinedAtEveryCall,
     /// The driver's shader converter writes a value loaded before a loop into the text of each
     /// instruction in the loop that reads it, so the loop reads that memory again on every
@@ -1473,18 +1297,6 @@ pub enum DriverWorkaround {
     /// that runs a simdgroup or quad operation records `PrecisionNote::VertexSimdgroupGrouping`
     /// (`lower::simd::finish`); no exact path exists.
     VertexGroupingNotApples,
-    /// The driver reads a uniform buffer at its lanes' different addresses faster than a
-    /// storage buffer. Measured with a fragment function's sRGB color writes, whose lanes read
-    /// the color table at their own channel's byte: ANV (`VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA`) on
-    /// the UHD 770 of RPL-S and the Iris Xe of RPL-P drew them in up to 1.5 and 4.0 times the time
-    /// from a storage buffer as from a uniform buffer, and lavapipe (`VK_DRIVER_ID_MESA_LLVMPIPE`)
-    /// on 128-bit vectors (`subgroupSize` 4, an arm64 host) in up to 1.3 times; NVIDIA's driver
-    /// (the RTX 3090, the RTX 5080 Laptop GPU) drew them in 3.5 to 8.6 times the time from the
-    /// uniform buffer, lavapipe on 256-bit vectors (`subgroupSize` 8, x86_64) in up to 1.5 times,
-    /// and RADV in the same time from either. Keyed on ANV whatever its GPU, and on lavapipe at
-    /// `subgroupSize` 4. There the color table lives in a uniform buffer
-    /// (`lower::arith::srgb::ColorTable`). It changes no answer.
-    UniformReadsOutpaceStorageReads,
     /// The GPU's compiler drops the texture writes of every live thread of a simdgroup that
     /// holds a discarded thread, where the fragment function discards (`discard_fragment()`),
     /// then writes a texture, samples a texture bound through an argument buffer, and calls a
@@ -1549,27 +1361,15 @@ pub enum DriverWorkaround {
     /// there (`link::tessellation::note_evaluation_stage`).
     TessellatorNotMetals,
     /// The driver's shader compiler faults creating a pipeline from a stage module past a word
-    /// bound, so a module the consumer's exact forms grow beyond it is retranslated with those
-    /// forms dropped until its largest stage fits ([`DeviceProfile::module_word_bound`]): the one
-    /// workaround that changes no leaf encoding and refuses nothing, but bounds a module's size by
-    /// trading exactness for the fast form, device by device.
-    ///
-    /// ANV (`VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA`), Mesa 26.2.4, faults in its `brw` backend's
-    /// register allocator: a bitset indexed by the triangular pair index `n·(n-1)/2` of two live
-    /// ranges, computed in 32 bits, which overflows once the function's live-range count is large
-    /// and reads outside the allocation (`libvulkan_intel.so`, `SEGV_ACCERR`). Measured on the
-    /// Iris Xe of RPL-P with a synthetic compute module whose one function keeps a sliding window
-    /// of `W` live `float` values: `vkCreateComputePipelines` compiled `W` = 50,000 (750,107 words)
-    /// and faulted `W` = 60,000, 65,000 and 92,000 (900,107 words and up); and with the consumer's
-    /// fragments, where a module carrying exact sampling alone (455,402 words) compiled but one
-    /// carrying every exact answer faulted. The bound is 400,000 words, below the smallest module
-    /// observed to combine enough exact forms to fault, with margin: a module carrying exact
-    /// sampling alone above it is reduced too, since the fault point for a module's register
-    /// pressure is not known exactly and the fault is unrecoverable, where the reduction is a
-    /// logged precision note. Keyed on the driver whatever its GPU, whatever its release, in
-    /// `device::derive`; a release that fixes the overflow keeps it until a measurement raises or
-    /// removes the bound, and the fast-default form of every module stays below it. The consumer
-    /// announces each reduced pipeline (`RuntimeFact::ExactFormsOverCompilerLimit`).
+    /// bound. ANV (`VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA`), Mesa 26.2.4, faults in its `brw`
+    /// backend's register allocator: a bitset indexed by the triangular pair index `n·(n-1)/2` of
+    /// two live ranges, computed in 32 bits, which overflows once the function's live-range count
+    /// is large and reads outside the allocation (`libvulkan_intel.so`, `SEGV_ACCERR`). Measured on
+    /// the Iris Xe of RPL-P with a synthetic compute module whose one function keeps a sliding
+    /// window of `W` live `float` values: `vkCreateComputePipelines` compiled `W` = 50,000 (750,107
+    /// words) and faulted `W` = 60,000, 65,000 and 92,000 (900,107 words and up). Keyed on the
+    /// driver whatever its GPU, whatever its release, in `device::derive`. Recorded on the profile
+    /// alone: it changes no leaf encoding, refuses nothing and reduces no module.
     RegisterAllocatorOverflowsLargeModules,
 }
 

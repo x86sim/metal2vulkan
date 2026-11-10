@@ -216,13 +216,9 @@ pub struct GraphicsTemplate {
     /// encoder's stencil state and references as `PushField::ShaderStencilState`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) shader_tests: Option<ShaderTestsTemplate>,
-    /// A pipeline compiled in a capture form (`VariantKey::captured_positions`): its draws write
-    /// `PushField::CaptureLayout`, and an indexed form's run without indices.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub(crate) capture: Option<crate::pipeline::CaptureForm>,
     /// A pipeline compiled in the primitive ID's de-indexed form of this index type
     /// (`VariantKey::primitive_id_indices`): its indexed draws write `PushField::CaptureLayout`
-    /// and run without indices, as the indexed capture form's do.
+    /// and run without indices.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) deindexed: Option<crate::metal::IndexType>,
     /// A pipeline compiled in the private list form (`VariantKey::private_list`): its draws are
@@ -235,11 +231,6 @@ pub struct GraphicsTemplate {
     /// write.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) storage_kept: u32,
-    /// `PushField::ColorWriteRule`: the rule word of each color attachment whose rules the
-    /// fragment function selects, by color index (`GraphicsState::color_write_rules`), which its
-    /// draws write.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub(crate) color_write_rules: Vec<(u32, u32)>,
 }
 
 /// What a mesh draw of a mesh render pipeline instantiates: the pipeline's specialization layout
@@ -459,11 +450,6 @@ pub(crate) struct ResourceTemplate {
     /// (`PushField::TextureLevels`): the bound texture's, 0 where a neutral stands in.
     #[cfg_attr(feature = "serde", serde(default))]
     pub texture_levels: Vec<(SlotRef, u32)>,
-    /// Whether the bound texture's channels are 16-bit floats, which the binder pushes for each
-    /// slot whose `half` writes read it (`PushField::TextureHalfChannels`): 1 or 0, 0 where a
-    /// neutral stands in.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub texture_half_channels: Vec<(SlotRef, u32)>,
     /// The integer channel widths of the bound texture, which the binder pushes for each slot
     /// whose integer writes read them (`PushField::TextureIntegerChannels`):
     /// `metal::format::integer_channels_word` of its format, 0 where a neutral stands in.
@@ -624,6 +610,19 @@ pub enum WriteSource {
         image: ImageSource,
         sampler: SamplerSource,
     },
+    /// The planes of the two-plane YCbCr texture bound at `slot`, read in place
+    /// (`TextureFacts::ycbcr_in_place`): a uniform texel buffer over the planes' bytes in
+    /// `YCbCrInPlace::format`, from the first byte of the first plane for
+    /// `YCbCrInPlace::view_bytes`. Only a slot under its in-place variant binds it
+    /// (`VariantKey::ycbcr_in_place`).
+    YCbCrInPlace { slot: SlotRef },
+    /// The planes of the two-plane YCbCr texture bound at `slot`, held as an image the device's
+    /// own sampler Y′CbCr conversion samples (`TextureShape::Texture::ycbcr_planes_sampler`): a
+    /// combined image sampler whose image is that image viewed with the conversion
+    /// (`bind::YCbCrPlanesSampler`) and whose sampler is the binding's immutable one, in
+    /// `GENERAL`. Only a slot under its planes-image variant binds it
+    /// (`VariantKey::ycbcr_planes_sampled`, `BindingSource::YCbCrPlanes`).
+    YCbCrPlanesImage { slot: SlotRef },
     /// The texture buffer bound at `slot`, as a texel buffer view.
     TexelBuffer {
         slot: SlotRef,
@@ -631,9 +630,8 @@ pub enum WriteSource {
         window: Window,
     },
     /// A `VkSampler` for the sampler bound at `slot`, made for this use: `compare` enables depth
-    /// comparison, `integer` selects integer border colors, and `cube_gradient` makes it isotropic
-    /// for a cube's explicit gradients in Metal's isotropic footprint
-    /// (`metal::sampler::SamplerUse`, `bind::sampler_desc`). The plan checks what the shape states
+    /// comparison and `integer` selects integer border colors (`metal::sampler::SamplerUse`,
+    /// `bind::sampler_desc`). The plan checks what the shape states
     /// (reduction); the rest of the descriptor is per bind. `opaque_black` says how an opaque-black
     /// border is made to read Metal's texel through every texture the sampler meets
     /// (`metal::sampler::OpaqueBlackBorder`).
@@ -641,7 +639,6 @@ pub enum WriteSource {
         slot: SlotRef,
         compare: bool,
         integer: bool,
-        cube_gradient: bool,
         opaque_black: OpaqueBlackBorder,
     },
     /// The stage's argument table; instantiation fills the bytes.
@@ -726,7 +723,7 @@ pub enum WriteSource {
     TileMap { slot: SlotRef },
     /// Element `index + 1` of a set-1 sampler array: a `VkSampler` for
     /// `BindState::argument_samplers[index]`, made for this use as `Sampler` is
-    /// (`bind::sampler_desc` with `compare`, `integer` and `cube_gradient`), or the neutral sampler
+    /// (`bind::sampler_desc` with `compare` and `integer`), or the neutral sampler
     /// (`NeutralResource::Sampler { compare }`) where the state lists fewer samplers: no handle
     /// names that element then. The plan writes every element of its shape's capacity class
     /// (`ArgumentSamplersShape::entries`), so the list may grow or shrink within the class
@@ -735,7 +732,6 @@ pub enum WriteSource {
         index: u32,
         compare: bool,
         integer: bool,
-        cube_gradient: bool,
     },
     /// The shadow of the render pass's stencil attachment that a fragment function's
     /// shader-side stencil tests and writes (`GraphicsState::shadow_stencil`): the consumer's
@@ -804,11 +800,6 @@ pub enum WriteSource {
     /// zero ([`ExecutionStatus::initial`](crate::bind::ExecutionStatus::initial)). The consumer
     /// reads it once the command buffer completes.
     ExecutionStatus,
-    /// The fragment stage's sRGB color table (`SyntheticBinding::ColorWriteTable`): a read-only
-    /// buffer holding exactly [`color_write_table`](crate::bind::color_write_table)'s bytes,
-    /// bound whole, as the write's descriptor type says (a uniform buffer, or a storage buffer).
-    /// The bytes are the same for every pipeline, so the consumer may keep one such buffer.
-    ColorWriteTable,
     /// The stand-in of the render pass's depth attachment that a fragment function that runs
     /// the draw's depth test itself tests and writes (`GraphicsState::shader_tests`): the
     /// consumer's `R32_SFLOAT` storage image of the attachment's extent, holding its samples as
@@ -853,7 +844,6 @@ pub enum SamplerSource {
         slot: SlotRef,
         compare: bool,
         integer: bool,
-        cube_gradient: bool,
         opaque_black: OpaqueBlackBorder,
     },
     /// The layout's immutable (constexpr) sampler: the write carries only the image.
@@ -868,8 +858,8 @@ pub enum SamplerSource {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ImageViewDesc {
     pub view_type: vk::ImageViewType,
-    /// The view format: the texture's own, the storage alias the variant chose, or the UNORM format
-    /// of an 8-bit sRGB texture's channels, its raw view.
+    /// The view format: the texture's own (an 8-bit sRGB texture's UNORM twin where the device
+    /// holds one), or the storage alias the variant chose.
     pub format: vk::Format,
     pub aspect: vk::ImageAspectFlags,
     /// The layout the texture is in while the draw or dispatch runs. Every write of one slot's
@@ -883,12 +873,6 @@ pub struct ImageViewDesc {
     /// first level is its parent's level `b` is the parent's level `b + i`. Every layer either way.
     #[cfg_attr(feature = "serde", serde(default))]
     pub level: Option<u32>,
-    /// The view is of the texture's depth twin: the `D32_SFLOAT` image a texture held in
-    /// `R32_SFLOAT` ([`TextureFacts::depth_twin`](crate::bind::TextureFacts)) keeps for the
-    /// comparisons the device makes of it (the shader makes the others). `false` for every other
-    /// view, which is of the texture's own image.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub twin: bool,
     /// The function applies the bound texture's swizzle (`MTLTexture.swizzle`) to the texels it
     /// reads and writes through the view, so the view takes none: its component mapping is
     /// `components` alone. Set for a storage view of a swizzled texture at a slot of
@@ -920,7 +904,6 @@ impl ImageViewDesc {
             layout,
             components,
             level: None,
-            twin: false,
             shader_swizzle: false,
         }
     }
@@ -1075,6 +1058,10 @@ pub enum AccessClass {
     Index,
     Indirect,
     Attachment,
+    /// A two-plane YCbCr texture's planes, read in place through the slot's uniform texel buffer
+    /// (`WriteSource::YCbCrInPlace`) or the image of them the device's conversion samples
+    /// (`WriteSource::YCbCrPlanesImage`): a read of the planes' bytes, not of the texture's image.
+    YCbCrPlanes,
 }
 
 /// A byte range relative to the bound offset.

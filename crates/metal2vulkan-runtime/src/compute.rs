@@ -909,6 +909,9 @@ impl ComputeCommandEncoder {
             |_| ComputeCall::Threadgroups(groups, threads),
             |this| {
                 const CALL: &str = "dispatch_threadgroups";
+                if this.fails_on_memoryless() {
+                    return Ok(());
+                }
                 let Some(threads_per_group) = this.threadgroup(CALL, threads)? else {
                     return Ok(());
                 };
@@ -934,6 +937,9 @@ impl ComputeCommandEncoder {
             |_| ComputeCall::Threads(threads, per_group),
             |this| {
                 const CALL: &str = "dispatch_threads";
+                if this.fails_on_memoryless() {
+                    return Ok(());
+                }
                 let Some(threads_per_group) = this.threadgroup(CALL, per_group)? else {
                     return Ok(());
                 };
@@ -960,11 +966,8 @@ impl ComputeCommandEncoder {
     ///
     /// An offset that is not a multiple of 4 reads at the multiple below, as plain Metal reads
     /// it. Refused, recording nothing, as `dispatch_threadgroups` refuses `threads`, and as Metal's
-    /// API validation refuses arguments past the buffer's length from there (`Invalid`); for a
-    /// buffer of another device; and, on a device at the Metal level `MacOS26_7`, as the first
-    /// indirect dispatch of a run of compute encoders in an encoder of another dispatch type than
-    /// the run's first (`Invalid`, `Problem::IndirectDispatchOfAnotherType`: that Metal ends the
-    /// process there).
+    /// API validation refuses arguments past the buffer's length from there (`Invalid`); and for
+    /// a buffer of another device.
     pub fn dispatch_threadgroups_indirect(
         &mut self,
         indirect_buffer: &Buffer,
@@ -982,6 +985,8 @@ impl ComputeCommandEncoder {
             |this| {
                 const CALL: &str = "dispatch_threadgroups_indirect";
                 let Some(threads_per_group) = this.threadgroup(CALL, threads)? else {
+                    // A threadgroup that runs nothing fails as a direct dispatch's does.
+                    this.fails_on_memoryless();
                     return Ok(());
                 };
                 let arguments = Arguments::Threadgroups { threads_per_group };
@@ -1012,9 +1017,8 @@ impl ComputeCommandEncoder {
     ///
     /// An offset that is not a multiple of 4 reads at the multiple below, as plain Metal reads
     /// it. Refused, recording nothing, with no pipeline state set, and as Metal's API validation
-    /// refuses arguments past the buffer's length from there (`Invalid`); for a buffer of another
-    /// device; and as [`dispatch_threadgroups_indirect`](Self::dispatch_threadgroups_indirect)
-    /// refuses a run's first indirect dispatch of another type.
+    /// refuses arguments past the buffer's length from there (`Invalid`); and for a buffer of
+    /// another device.
     pub fn dispatch_threads_indirect(
         &mut self,
         indirect_buffer: &Buffer,
@@ -1064,16 +1068,6 @@ impl ComputeCommandEncoder {
         offset: u64,
         arguments: Arguments,
     ) -> Result<(), Error> {
-        // Where the device's Metal level ends the process at a run's first indirect dispatch in
-        // an encoder of another type than the run's first encoder's, so does the runtime
-        // (`metal_level.rs`).
-        let ends = (self.core.device().properties().metal_level)
-            .ends_at_a_runs_first_indirect_of_another_type();
-        let goes = (self.core.command_buffer().state().predication_mut())
-            .indirect_dispatch(self.dispatch_type, ends);
-        if !goes {
-            return Err(invalid(call, Problem::IndirectDispatchOfAnotherType));
-        }
         let Some(pipeline) = self.pipeline.clone() else {
             return Err(invalid(call, Problem::NoPipelineState));
         };
@@ -1084,6 +1078,9 @@ impl ComputeCommandEncoder {
             offset,
             arguments.bytes(),
         )?;
+        if self.fails_on_memoryless() {
+            return Ok(());
+        }
         let tables = DispatchTables {
             pipeline: &pipeline,
             table: &self.table,
@@ -1169,7 +1166,9 @@ impl ComputeCommandEncoder {
 
     /// `useResource:usage:`: the encoder's later dispatches may reach `resource` through an
     /// address or a resource ID held in memory, reading or writing as `usage` says
-    /// (`residency`).
+    /// (`residency`). A memoryless texture, a texture buffer too, fails the command buffer as
+    /// plain Metal's does, with no dispatch after it too (`CommandBufferError::InvalidResource`:
+    /// the encoder's run of compute encoders runs nothing, an M3 Max under macOS 27.0.1).
     ///
     /// Refused, changing nothing: a resource of another device (`Invalid`).
     pub fn use_resource(
@@ -1204,6 +1203,10 @@ impl ComputeCommandEncoder {
     ) -> Result<(), Error> {
         for resource in resources {
             self.core.check_device(call, resource.device())?;
+        }
+        if resources.iter().any(ResourceRef::is_memoryless) {
+            self.core.fail_memoryless_use();
+            return Ok(());
         }
         for &resource in resources {
             let used = self
@@ -1632,6 +1635,20 @@ impl ComputeCommandEncoder {
         // A size other than the state's required one runs as given, as plain Metal runs it
         // (Metal's API validation stops it).
         Ok(Some(axes))
+    }
+
+    /// Whether the kernel statically uses a texture slot that holds a memoryless texture, a
+    /// texture buffer's too: plain Metal fails the command buffer of such a dispatch, of no
+    /// threadgroups or of an empty threadgroup too, the encoder's run of compute encoders running
+    /// nothing (`CommandBufferError::InvalidResource`, an M3 Max under macOS 27.0.1), so the
+    /// encoder fails it and the dispatch records nothing (`EncoderCore::fail_memoryless_use`).
+    fn fails_on_memoryless(&mut self) -> bool {
+        let uses = (self.pipeline.as_ref())
+            .is_some_and(|state| self.table.uses_memoryless(state.interface(), Stage::Kernel));
+        if uses {
+            self.core.fail_memoryless_use();
+        }
+        uses
     }
 
     /// Plan, bind, and record `dispatch` with the encoder's tables (the module's steps 2 to 4),
@@ -2531,7 +2548,6 @@ fn record(
             });
         }
     }
-    device.degrade_half_texel_writes(&variant.pipeline().dependencies, Some(formats));
     objects.degrade_bound_formats(
         std::slice::from_ref(&variant.pipeline().stage),
         Some(formats),

@@ -19,10 +19,10 @@
 //! One case a format, so a format a device cannot render is its own row rather than a refusal that
 //! costs the other five their sites.
 //!
-//! The runtime keeps the device's load and store by default (`docs/FAST-PATHS.md`), so where the
-//! device's store is not Metal's the codes stay and the draw announces `snorm-minimum-kept` or
-//! `shared-exponent-kept`, naming the attachment. That is the one field of these cases that may
-//! differ from Metal, and each case names the notice that justifies it; every other field is exact.
+//! The runtime keeps the device's load and store, so where the device's store is not Metal's the
+//! codes stay and the draw announces `snorm-minimum-kept` or `shared-exponent-kept`, naming the
+//! attachment. That is the one field of these cases that may differ from Metal, and each case names
+//! the notice that justifies it; every other field is exact.
 //!
 //! Nothing here can fault a GPU: one 4 by 4 target a case, one triangle, no loop.
 
@@ -165,19 +165,10 @@ pub fn all() -> Vec<SnormTileStore> {
 /// working: an announced difference nobody named is not an announced difference.
 const PASS_NOTICES: &[Degradation] = &[
     // The device's own load and store keeps a signed normalized minimum code where Metal's store
-    // raises it (`docs/FAST-PATHS.md`, the tile store).
+    // raises it.
     Degradation::SnormMinimumKept,
     // The same for an `RGB9E5Float` word Metal's store normalizes.
     Degradation::SharedExponentKept,
-    // The exact tile store, which the suite's replay selects by default: the load pass rewrites
-    // the tiles no fragment reached as Metal's store leaves them, so the texels **are** Metal's
-    // and the notice says the rewrite happened. Measured in the container; the two kinds above are
-    // what the fast default announces instead (`--default-policy`), where the codes stay and the
-    // texels differ.
-    Degradation::UnreachedTilesRewritten,
-    // The device's own compiler rewrote the stage's fast-math arithmetic as it made the pipeline,
-    // which MoltenVK 1.4.2 on this M3 Max announces for this fixture's stages.
-    Degradation::FastMathRewrites,
 ];
 
 /// The bytes of a `SIDE` by `SIDE` target of `texel` bytes a texel whose every channel holds

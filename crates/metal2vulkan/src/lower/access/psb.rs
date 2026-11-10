@@ -21,18 +21,18 @@
 //! load's value `select(inb, v, 0)`. A contained store lands in the sink, which no shader reads
 //! observably. Only `Containment::UnsafeOff` omits it.
 //!
-//! **A dropped store** takes the same address selection: a store through a slot bound to memory
-//! whose GPU writes Metal drops lands in the sink too, under the draw's or dispatch's
-//! `SpecKey::DroppedStoreSlots` word rather than the bounds check
-//! (`lower::access::emit::writable`, `prepare`'s `keeps`). Both conditions join into the one
-//! `select` of the address, so neither is a branch: a branch around the store would also move
-//! every value the store consumes into its block, which changes what Apple's fast-math
-//! instructions answer.
-//!
 //! The leaf itself (`memory::leaf`) sees a word memory based at the 4-aligned address below the
 //! access, and the access's byte offset within that word (0 to 3).
+//!
+//! **Narrow units.** Where the profile has the 8- or 16-bit storage access ([`narrow_units`]), the
+//! memory also loads and stores 1- and 2-byte units: a `u8` or `u16` place at the unit's device
+//! address, with the `Aligned` operand of its size, as a descriptor slot's narrow views do. Vulkan's
+//! `storageBuffer8BitAccess` and `storageBuffer16BitAccess` cover the `PhysicalStorageBuffer`
+//! storage class as they cover `StorageBuffer`. A sub-word store there is one narrow store; without
+//! the access it stays the two word atomics ([`PsbMem`]'s `write_bits`).
 
-use crate::memory::leaf::{WordMem, WordOps};
+use crate::device::DeviceProfile;
+use crate::memory::leaf::{Units, WordMem, WordOps};
 use crate::spirv::builder::FunctionBuilder;
 use crate::spirv::error::BResult;
 use crate::spirv::ids::{TypeId, Value};
@@ -121,12 +121,6 @@ pub struct PsbAccess {
 
 /// Prepare an `n`-byte access of root `root` (a static slot whose window starts at `start`) at
 /// the `u32` displacement `m` from its bind offset, for the table at `table` (a `u64`).
-///
-/// `keeps` is the condition under which the slot's memory keeps the GPU's writes, for a store
-/// through a slot whose memory may be memory Metal drops them in
-/// (`lower::access::emit::writable`): it joins the containment condition in the one address
-/// selection, so a dropped store lands in the sink and the module branches on neither. `None` for
-/// a load, an atomic, and a store through a slot that has no such word.
 pub fn prepare(
     fb: &mut FunctionBuilder<'_>,
     table: Value,
@@ -135,7 +129,6 @@ pub fn prepare(
     start: i64,
     n: u32,
     contained: bool,
-    keeps: Option<Value>,
 ) -> BResult<PsbAccess> {
     let host = entry_field(fb, table, root, HOST)?;
     let size = entry_field(fb, table, root, SIZE)?;
@@ -151,61 +144,97 @@ pub fn prepare(
         signed: false,
     })?;
     let low = fb.convert(ConvOp::UConvert, low, u32_)?;
-    let inb = match contained {
-        true => Some(crate::memory::contain::in_bounds(
-            fb,
-            off,
-            size,
-            u64::from(n),
-        )?),
-        false => None,
-    };
-    // The access lands at its own address where it is contained and where the memory keeps the
-    // GPU's writes; under either condition's negation it lands in the write-only sink, which no
-    // shader reads.
-    let at_own = match (inb, keeps) {
-        (Some(inb), Some(keeps)) => Some(fb.binary(BinOp::LogicalAnd, inb, keeps)?),
-        (Some(inb), None) => Some(inb),
-        (None, Some(keeps)) => Some(keeps),
-        (None, None) => None,
-    };
-    let (base, low) = match at_own {
-        Some(at_own) => {
-            let sink = entry_field(fb, table, SINK_ROOT, HOST)?;
-            let base = fb.select(at_own, base, sink)?;
-            let zero = fb.u32_const(0)?;
-            let zero = fb.module().const_value(zero)?;
-            (base, fb.select(at_own, low, zero)?)
-        }
-        None => (base, low),
-    };
+    if !contained {
+        return Ok(PsbAccess {
+            mem: PsbMem::at(base),
+            off: low,
+            inb: None,
+        });
+    }
+    let inb = crate::memory::contain::in_bounds(fb, off, size, u64::from(n))?;
+    let sink = entry_field(fb, table, SINK_ROOT, HOST)?;
+    let base = fb.select(inb, base, sink)?;
+    let zero = fb.u32_const(0)?;
+    let zero = fb.module().const_value(zero)?;
+    let low = fb.select(inb, low, zero)?;
     Ok(PsbAccess {
         mem: PsbMem::at(base),
         off: low,
-        inb,
+        inb: Some(inb),
     })
 }
 
+/// The narrow units a device-address memory loads and stores directly on profile `p`: the 1- and
+/// 2-byte units of [`Units::storage_on`] (the width's storage access and integer type). No `uvec4`
+/// unit: a device address below an access is only 4-byte aligned.
+pub fn narrow_units(p: &DeviceProfile) -> Units {
+    Units {
+        vec4: false,
+        ..Units::storage_on(p)
+    }
+}
+
 /// Words at a 4-aligned device address (a `u64`), loaded and stored with memory operands (a
-/// coherence and `Volatile`).
+/// coherence and `Volatile`), and the narrow units ([`narrow_units`]) it also loads and stores
+/// directly.
 #[derive(Clone, Copy, Debug)]
 pub struct PsbMem {
     base: Value,
     ops: WordOps,
+    units: Units,
 }
 
 impl PsbMem {
-    /// The words at the 4-aligned device address `base` (a `u64`), with plain accesses.
+    /// The words at the 4-aligned device address `base` (a `u64`), with plain accesses and no
+    /// narrow unit.
     pub fn at(base: Value) -> PsbMem {
         PsbMem {
             base,
             ops: WordOps::default(),
+            units: Units::NONE,
         }
     }
 
     /// The same words, loaded and stored with `ops`.
     pub fn with(self, ops: WordOps) -> PsbMem {
         PsbMem { ops, ..self }
+    }
+
+    /// The same words, also loading and storing the narrow units of `units` (a subset of
+    /// [`narrow_units`] of the profile).
+    pub fn with_units(self, units: Units) -> PsbMem {
+        PsbMem {
+            units: Units {
+                vec4: false,
+                ..units
+            },
+            ..self
+        }
+    }
+
+    /// A `PhysicalStorageBuffer` place of the `bytes`-byte unit `index` (a `u32` index of such
+    /// units) of the memory, and the unit's type.
+    fn unit_ptr(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        bytes: u32,
+        index: Value,
+    ) -> BResult<(Value, TypeId)> {
+        let u64_ = u64_ty(fb)?;
+        let i = fb.convert(ConvOp::UConvert, index, u64_)?;
+        let d = match bytes {
+            1 => i,
+            _ => {
+                let size = k64(fb, u64::from(bytes))?;
+                fb.binary(BinOp::IMul, i, size)?
+            }
+        };
+        let addr = fb.binary(BinOp::IAdd, self.base, d)?;
+        let ty = fb.module().ty(Type::Int {
+            width: if bytes == 1 { 8 } else { 16 },
+            signed: false,
+        })?;
+        Ok((fb.device_place(addr, ty)?, ty))
     }
 
     /// A `PhysicalStorageBuffer` place of word `word` (a `u32` index) of the memory.
@@ -275,5 +304,50 @@ impl WordMem for PsbMem {
         fb.atomic(AtomicOp::And, p, Scope::Device, Semantics::RELAXED, clear)?;
         fb.atomic(AtomicOp::Or, p, Scope::Device, Semantics::RELAXED, bits)?;
         Ok(())
+    }
+
+    fn units(&self) -> Units {
+        self.units
+    }
+
+    fn read_unit(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        bytes: u32,
+        index: Value,
+    ) -> BResult<Value> {
+        let (p, _) = self.unit_ptr(fb, bytes, index)?;
+        let access = self.ops.access(fb, unit_access(bytes), false)?;
+        let x = fb.load(p, access)?;
+        let u32_ = fb.module().ty(Type::Int {
+            width: 32,
+            signed: false,
+        })?;
+        let y = fb.convert(ConvOp::UConvert, x, u32_)?;
+        if bytes == 2 {
+            fb.note_widened16(y, x);
+        }
+        Ok(y)
+    }
+
+    fn write_unit(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        bytes: u32,
+        index: Value,
+        value: Value,
+    ) -> BResult<()> {
+        let (p, ty) = self.unit_ptr(fb, bytes, index)?;
+        let x = fb.convert(ConvOp::UConvert, value, ty)?;
+        let access = self.ops.access(fb, unit_access(bytes), true)?;
+        fb.store(p, x, access)
+    }
+}
+
+/// The plain memory operands of a `bytes`-byte unit: `Aligned` to its size.
+fn unit_access(bytes: u32) -> MemAccess {
+    MemAccess {
+        aligned: Some(bytes),
+        ..WORD
     }
 }

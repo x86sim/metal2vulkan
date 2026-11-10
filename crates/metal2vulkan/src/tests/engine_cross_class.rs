@@ -6,8 +6,9 @@
 //! hands back its words.
 //!
 //! - On the CPU interpreter, a read through each foreign class is the words the native slot's
-//!   read gives, a `half` result their low 16 bits, on the lavapipe and MoltenVK profiles; every
-//!   module validates.
+//!   read gives, a `half` result their low 16 bits (a NaN's any NaN where the module widens a
+//!   `half` by the device's conversion, `PrecisionNote::NativeNanEncoding`, whose NaN encoding is
+//!   the device's), on the lavapipe and MoltenVK profiles; every module validates.
 //! - The binder joins a slot bound to a texture of another class to the plan's variant, the
 //!   variant's plan states the same key, and the slot's binding views the texture's own format
 //!   (an integer slot over an 8-bit sRGB texture joins the sRGB variant too); a slot sampled
@@ -24,16 +25,17 @@ use crate::bind::{
     WriteSource,
 };
 use crate::budget::{Budget, SPIRV_WORDS};
+use crate::device::DevicePolicy;
 use crate::device::{Device, DeviceDescription};
 use crate::library::{FunctionConstantValues, Library};
 use crate::lower::select::{LowerInputs, Plan};
 use crate::metal::{self, PixelFormat, TextureType};
+use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::compile::{compile_bitcode, plan_bitcode, EntryRef};
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::sym::{
     Axis, ResourceKind, ResourceSlot, SampledType, SlotClass, SlotRef, SpecKey, Stage,
 };
-use crate::pipeline::testing::EXACT_SAMPLING;
 use crate::pipeline::testing::{
     link_and_validate, llvm_assemble, meter, profile, typed_module_with, AssembleError,
 };
@@ -124,7 +126,7 @@ enum Access {
 }
 
 /// The words of a nearest constexpr sampler of normalized coordinates, every axis clamped to
-/// its edge, no mip filter (`engine_srgb_raw`'s `sampler_words(0, 0, false)`).
+/// its edge, no mip filter (`engine_srgb_decode`'s `sampler_words(0, 0, false)`).
 fn nearest_words() -> u64 {
     const BASE: u64 = 0x007b_ff00_0008_0000;
     let edge = 1;
@@ -339,7 +341,10 @@ fn run(
 
 /// Every read through a slot of another class gives the words the slot of the texture's own
 /// class gives, a `half` result their low 16 bits: Metal's rule. A `ushort` result of an integer
-/// texture is the low 16 bits too, of a float texture the `half` read's bits.
+/// texture is the low 16 bits too, of a float texture the `half` read's bits. Where the module
+/// widens a `half` from its bits by the device and records `PrecisionNote::NativeNanEncoding` (both
+/// profiles here, which have `shaderFloat16`), a `half` result's NaN is the device's widening's,
+/// so a NaN pattern need only come back a NaN.
 #[test]
 fn accesses_through_another_class_are_the_native_words() {
     use SampledType as S;
@@ -357,7 +362,12 @@ fn accesses_through_another_class_are_the_native_words() {
     ];
     let profiles: Vec<_> = ["lavapipe", "moltenvk-m3"]
         .into_iter()
-        .map(|stem| (stem, profile(stem, EXACT_SAMPLING).expect("profile")))
+        .map(|stem| {
+            (
+                stem,
+                profile(stem, DevicePolicy::default()).expect("profile"),
+            )
+        })
         .collect();
     let mut checked = 0;
     // The interpreter models no sample or gather: theirs compile and validate in
@@ -380,6 +390,21 @@ fn accesses_through_another_class_are_the_native_words() {
             let what = format!("{name} on {stem}");
             let got = run(&cross, ty, &inputs(Some(class)), p, class, &what);
             let want = run(&own, native, &inputs(None), p, class, &what);
+            let consts = FunctionConstantValues::defaults();
+            let device_nans = ty == Ty::Half
+                && compile_bitcode(
+                    &cross,
+                    EntryRef::Name("k"),
+                    &consts,
+                    p,
+                    &inputs(Some(class)),
+                    &mut meter(),
+                    SPIRV_WORDS,
+                )
+                .unwrap_or_else(|e| panic!("{what}: {e}"))
+                .precision
+                .contains(&PrecisionNote::NativeNanEncoding);
+            let nan = |h: u32| h & 0x7C00 == 0x7C00 && h & 0x3FF != 0;
             let lanes = (SIDE * SIDE * 4) as usize;
             let lane_of = |b: &[u8], t: Ty, lane: usize| match t {
                 Ty::Half | Ty::Ushort | Ty::Short => u32::from(u16::from_le_bytes(
@@ -394,6 +419,10 @@ fn accesses_through_another_class_are_the_native_words() {
                     Ty::Half | Ty::Ushort | Ty::Short => w & 0xffff,
                     _ => w,
                 };
+                if device_nans && nan(w) {
+                    assert!(nan(g), "{what}: lane {lane}: {g:#x} for the NaN {w:#x}");
+                    continue;
+                }
                 assert_eq!(g, w, "{what}: lane {lane}: {g:#x} vs {w:#x}");
             }
             checked += 1;
@@ -417,7 +446,10 @@ fn devices() -> Vec<(String, Device)> {
             .unwrap_or_default();
         let text = std::fs::read_to_string(&path).expect("profile");
         let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-        out.push((stem, Device::new(desc, EXACT_SAMPLING).expect("device")));
+        out.push((
+            stem,
+            Device::new(desc, DevicePolicy::default()).expect("device"),
+        ));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
@@ -507,6 +539,12 @@ fn a_texture_of_another_class_joins_the_variant() {
             PixelFormat::RGBA8UnormSRGB,
             S::Float,
         ),
+        (
+            Access::Gather,
+            Ty::Uint,
+            PixelFormat::RG8UnormSRGB,
+            S::Float,
+        ),
     ];
     let mut planned = 0;
     for (access, ty, pf, class) in cases {
@@ -539,10 +577,11 @@ fn a_texture_of_another_class_joins_the_variant() {
                 BTreeMap::from([(TEXTURE, class)]),
                 "{what}"
             );
-            let srgb = pf == PixelFormat::RGBA8UnormSRGB;
+            // Only a format the device holds as its UNORM twin joins the sRGB variant.
+            let twin = crate::metal::texel_format::srgb_twin_on(pf, dev.profile());
             assert_eq!(
                 plan.variant.srgb_textures.contains(&TEXTURE),
-                srgb,
+                twin,
                 "{what}"
             );
             let key = plan.variant.lowering_inputs(Stage::Kernel);
@@ -557,25 +596,16 @@ fn a_texture_of_another_class_joins_the_variant() {
                 again.diagnostics
             );
             let view = view_format(&again).unwrap_or_else(|| panic!("{what}: no view"));
+            // Every access views the texture's own format, an sRGB one's decoding its codes; a
+            // format held as its UNORM twin, the twin's.
             let usages = [crate::device::FormatUsage::SampledImage].into();
-            let own = crate::metal::format::vk_format(pf, &usages, dev.profile())
+            let held = match twin {
+                true => crate::metal::format::srgb_raw_twin(pf).expect("a twin"),
+                false => pf,
+            };
+            let want = crate::metal::format::vk_format(held, &usages, dev.profile())
                 .expect("the format")
                 .format;
-            // Under the sRGB variant a gather reads the raw view and decodes each code through
-            // Metal's table where the device's sampler is not Metal's own, whose gather already
-            // decodes so; every other access here views the texture's own format.
-            let metal = dev
-                .profile()
-                .fields()
-                .enabled
-                .properties
-                .contains(&crate::device::requirements::VkProperty::MetalSampler);
-            let want = match (srgb, access) {
-                (true, Access::Gather) if !metal => {
-                    crate::metal::texel_format::srgb_raw_view(own).expect("a raw view")
-                }
-                _ => own,
-            };
             assert_eq!(view, want, "{what}");
             planned += 1;
             // A texture of the declared class leaves the variant.
@@ -767,7 +797,7 @@ fn a_texture_an_argument_buffer_holds_is_read_in_its_own_class() {
         let Some(bc) = assemble(&name, &held_kernel(held, ty)) else {
             return;
         };
-        for (stem, p) in crate::spirv::testing::committed_exact_profiles().expect("profiles") {
+        for (stem, p) in crate::spirv::testing::committed_profiles().expect("profiles") {
             let what = format!("{name} on {stem}");
             let a = match compile_bitcode(
                 &bc,
@@ -945,7 +975,12 @@ fn integer_writes_saturate_to_the_bound_formats_channels() {
     ];
     let profiles: Vec<_> = ["lavapipe", "moltenvk-m3"]
         .into_iter()
-        .map(|stem| (stem, profile(stem, EXACT_SAMPLING).expect("profile")))
+        .map(|stem| {
+            (
+                stem,
+                profile(stem, DevicePolicy::default()).expect("profile"),
+            )
+        })
         .collect();
     let mut checked = 0;
     for (ty, pf, format, cross) in cases {
@@ -1045,6 +1080,112 @@ fn integer_writes_saturate_to_the_bound_formats_channels() {
         }
     }
     assert_eq!(checked, (11 * 2 + 5) * 2);
+}
+
+/// An `int` or `uint` write into a texture of the float class in a half-float or small-float
+/// format stores the `float` of each lane's bits as written: the device's store converts it, as
+/// it converts every `float` write, where Metal's integer store rounds to nearest even, so the
+/// module records `PrecisionNote::DeviceColorConversion` (and requires no
+/// `VkProperty::MetalHalfStorageWrites`, whose rounding is Metal's `float` write's). A 32-bit
+/// float format's needs no conversion, and records nothing. On the interpreter the image holds the
+/// written `f32` itself.
+#[test]
+fn integer_writes_into_narrow_floats_take_the_devices_conversion() {
+    use crate::device::requirements::VkProperty;
+    use crate::pipeline::lower_inputs::{StorageImageChoice, StorageImageClass};
+    use crate::vk::Format as F;
+    let cases = [
+        (Ty::Uint, F::R16G16B16A16_SFLOAT, true),
+        (Ty::Int, F::R16G16B16A16_SFLOAT, true),
+        (Ty::Uint, F::B10G11R11_UFLOAT_PACK32, true),
+        (Ty::Int, F::R32G32B32A32_SFLOAT, false),
+    ];
+    let mut checked = 0;
+    for stem in ["lavapipe", "moltenvk-m3"] {
+        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        for (ty, format, narrow) in cases {
+            let what = format!("write {ty:?} over {format:?} on {stem}");
+            let Some(bc) = assemble(&what, &write_kernel(ty)) else {
+                return;
+            };
+            let mut inputs = LowerInputs::new();
+            inputs.cross_class.insert(TEXTURE, SampledType::Float);
+            inputs.storage_images.insert(
+                TEXTURE,
+                StorageImageChoice::new(format, StorageImageClass::Identity),
+            );
+            validate(&bc, &inputs, &p, &what);
+            let consts = FunctionConstantValues::defaults();
+            let a = compile_bitcode(
+                &bc,
+                EntryRef::Name("k"),
+                &consts,
+                &p,
+                &inputs,
+                &mut meter(),
+                SPIRV_WORDS,
+            )
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(
+                a.precision.contains(&PrecisionNote::DeviceColorConversion),
+                narrow,
+                "{what}: {:?}",
+                a.precision
+            );
+            assert!(
+                !a.requirements
+                    .properties
+                    .contains(&VkProperty::MetalHalfStorageWrites),
+                "{what}"
+            );
+            let (plan, m) =
+                typed_module_with(&bc, "k", &p, &inputs).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
+            let lane = |n: u32, c: usize| WORDS[(n as usize * 4 + c) * 7 % WORDS.len()];
+            let src: Vec<u8> = (0..SIDE * SIDE)
+                .flat_map(|n| (0..4).flat_map(move |c| lane(n, c).to_le_bytes()))
+                .collect();
+            let mut spec = BTreeMap::new();
+            for axis in [Axis::X, Axis::Y, Axis::Z] {
+                spec.insert(SpecKey::LocalSize(axis), 1);
+            }
+            spec.insert(SpecKey::FlatLocalSize, 1);
+            let res = Resources {
+                buffers: vec![Buffer {
+                    slot: Some(ResourceSlot {
+                        stage: Stage::Kernel,
+                        kind: ResourceKind::Buffer,
+                        index: 0,
+                    }),
+                    address: None,
+                    bytes: src,
+                }],
+                push,
+                spec,
+            };
+            let img = Image::new(resource(&m), [SIDE, SIDE, 1], 1, 1, 1);
+            let cfg = Config {
+                workgroups: [SIDE, SIDE, 1],
+                ..Config::default()
+            };
+            let (_, images) = run_with_images(&m, &cfg, res, vec![img])
+                .unwrap_or_else(|e| panic!("{what}: interpreter: {e:?}"));
+            let img = images.into_iter().next().expect("image");
+            for n in 0..SIDE * SIDE {
+                let at = img.index(0, 0, 0, [n % SIDE, n / SIDE, 0]).expect("texel");
+                for c in 0..4 {
+                    assert_eq!(
+                        img.texels[at][c],
+                        lane(n, c),
+                        "{what}: texel {n} lane {c} stored {:#x}",
+                        img.texels[at][c]
+                    );
+                }
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 8);
 }
 
 /// A kernel's state for [`write_kernel`]: texture slot 0 bound in `pf` (shader write), buffer 0.

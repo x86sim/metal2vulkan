@@ -537,19 +537,20 @@ pub enum Needs {
     MetalRefuses(&'static [&'static str]),
 }
 
-/// A departure of a driver from the specifications that translation relies on, measured per
-/// driver and release (`device::driver_facts`): the profile takes it on a measured release, and on
-/// a later one with `PrecisionNote::BeyondMeasuredDeviation` recorded
-/// (`ProfileFields::deviations_beyond`); elsewhere the translation takes its conservative route.
+/// A driver's measured answer where the specifications leave it to the device, per driver and
+/// GPU (`device::driver_facts`): the profile takes it on every release of a driver measured with
+/// it. Where the profile takes it a module relies on it (and requires its property) or records no
+/// note; elsewhere each variant names the route taken: the device's own answer, recorded as a
+/// precision note, or, where the answer decides a capability, its emulation or a refusal.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DriverDeviation {
     /// How the driver hands a kernel's cube sample's explicit gradients to the GPU
-    /// (`ProfileFields::cube_gradients`'s compute route, `CubeGradientRoute::Unmeasured`): as
-    /// given, to Metal's own reading. Unmeasured, the function emulates Metal's footprint where
-    /// its emulation reaches the sample, and elsewhere hands the form every route reads alike
-    /// through an isotropic sampler. A vertex or fragment function's route is
-    /// [`DriverDeviation::GraphicsCubeGradientRoute`].
+    /// (`ProfileFields::cube_gradients`'s compute route, `CubeGradientRoute::Metal`): as given, to
+    /// Metal's own reading. Unmeasured, the route is Vulkan's rule (`CubeGradientRoute::Vulkan`):
+    /// the function hands Metal's footprint in the form that rule reads, and the device's reading
+    /// of it is recorded as `PrecisionNote::CubeGradientFootprint`. A vertex or fragment
+    /// function's route is [`DriverDeviation::GraphicsCubeGradientTangents`].
     CubeGradientRoute,
     /// The device runs each 32 consecutive invocations of a compute workgroup in lockstep, as
     /// an Apple GPU runs a Metal simdgroup (`VkProperty::SimdgroupLockstep`). Unmeasured, a kernel
@@ -557,39 +558,44 @@ pub enum DriverDeviation {
     SimdgroupLockstep,
     /// The device computes each `GLSL.std.450` function and `OpFDiv` of `float` as Metal's own,
     /// in the math mode Metal compiles the module with (`FloatFunctions::Metal`). Unmeasured, the
-    /// translation computes the functions itself, within Apple's bound.
+    /// module takes the device's instructions all the same, each kind recorded with its bound
+    /// (`PrecisionNote::NativeTranscendentals`, and `NativeDivision`, `NativeDot` and `NativeMix`
+    /// for a division, a `dot` and a `mix`).
     MetalFloatFunctions,
     /// The device's `float` and `half` arithmetic answers Metal's canonical NaN
-    /// (`NanEncoding::MetalCanonical`). Unmeasured, the module selects Metal's NaN itself where a
-    /// result's bits are observed, exact.
+    /// (`NanEncoding::MetalCanonical`). The module leaves every NaN's bits to the device either
+    /// way; unmeasured, a NaN Metal answers records `PrecisionNote::NativeNanEncoding`.
     MetalCanonicalNans,
     /// The device samples, filters and converts texels through Metal's own sampler
-    /// (`VkProperty::MetalSampler`). Unmeasured, the translation emulates Metal's sampler where its
-    /// emulations reach, and notes the rest.
+    /// (`VkProperty::MetalSampler`), an 8-bit sRGB texel's decode included. Unmeasured, every
+    /// sample, gather, comparison and level query is the device's own sampler's all the same
+    /// (`VkProperty::DeviceSampling`), recorded as `PrecisionNote::DeviceSampling`, and every
+    /// read, sample, gather and input-attachment read of an sRGB texel the device's own decode,
+    /// recorded as `PrecisionNote::SrgbTexelDecode`. A `half` result is the device's `float`
+    /// texel rounded to nearest even either way; where the profile takes it the module records
+    /// `PrecisionNote::HalfTexelConversion` only for a class whose Metal `half` is not that
+    /// `float` rounded so.
     MetalSampler,
-    /// How the driver hands a vertex or fragment function's cube sample's explicit gradients to
-    /// the GPU (`ProfileFields::cube_gradients`'s graphics route,
-    /// `CubeGradientRoute::AppleSwizzled`): through SPIRV-Cross's `spvGradientCube`, whose result
-    /// the GPU reads by its own anisotropic rule, which differs between Apple's GPUs and macOS
-    /// releases, so the fact is measured per GPU and release: the Apple M3 Max's under macOS
-    /// 26.7. Unmeasured, as [`DriverDeviation::CubeGradientRoute`].
-    GraphicsCubeGradientRoute,
     /// How the driver hands a vertex or fragment function's cube sample's explicit gradients to
     /// the GPU under macOS 27 (the graphics route, `CubeGradientRoute::AppleProjected`): through
     /// SPIRV-Cross's `spvGradientCube`, whose result Metal reads by its macOS 27 rule, the face's
     /// two tangents: an `x` or `z` face's gradient reaches it as Metal's own, a `y` face's `z`
-    /// tangent is lost. Unmeasured, as [`DriverDeviation::GraphicsCubeGradientRoute`].
+    /// tangent is lost. Unmeasured, as [`DriverDeviation::CubeGradientRoute`].
     GraphicsCubeGradientTangents,
     /// The device stores a fragment function's float color output into a normalized, sRGB or
     /// half-float attachment as Metal does (`VkProperty::MetalColorWrites`): the exact product
-    /// rounded to nearest, Metal's twelve-bit sRGB encode, and `half` rounded toward zero.
-    /// Unmeasured, the fragment function rounds each such output by Metal's rule itself and writes
-    /// the code's exact value (`LoweringInputs::color_writes`), exact.
+    /// rounded to nearest, Metal's twelve-bit sRGB encode, and `half` rounded toward zero. The
+    /// fragment function writes each such output as computed either way, but a half-float channel
+    /// under `TextureWriteRoundingMode::NearestEven`, which it rounds on every profile; unmeasured,
+    /// a channel the device converts records `PrecisionNote::DeviceColorConversion`
+    /// (`LoweringInputs::color_writes`).
     MetalColorWrites,
-    /// The device stores the NaN a fragment function's rounding writes for a `float` output to a
-    /// half-float color channel (`0x7fc00000`) as `0x7e00`, the NaN Metal stores for any `float`
-    /// NaN (`VkProperty::MetalFloatColorNans`). Unmeasured, a module that writes a `float` output
-    /// to such a channel records `PrecisionNote::DeviceNanEncoding`.
+    /// The device stores the NaN `0x7fc00000` a fragment function writes for a `float` output to
+    /// a half-float color channel as `0x7e00`, the NaN Metal stores for any `float` NaN
+    /// (`VkProperty::MetalFloatColorNans`): the NaN of a lane the function rounds to nearest even
+    /// under `TextureWriteRoundingMode::NearestEven`. Where the profile takes it, such a lane
+    /// records no note. Unmeasured, it records `PrecisionNote::DeviceNanEncoding`, as an output
+    /// written as computed does on every device but one of `MetalColorWrites`.
     MetalFloatColorNans,
     /// The device stores a `half` NaN a fragment function writes (held widened to `float`, its
     /// payload in the top bits of the significand) to a half-float color channel as its own
@@ -597,44 +603,20 @@ pub enum DriverDeviation {
     /// a module that writes a `half` output to such a channel records
     /// `PrecisionNote::DeviceNanEncoding`.
     MetalHalfColorNans,
-    /// The device stores a 16-bit float color output to a half-float color channel as its bits,
-    /// a NaN's included (`VkProperty::HalfColorOutputBits`). Where the profile also declares 16-bit
-    /// outputs (`storageInputOutput16`, with `shaderInt16` and `shaderFloat16`) and the device does
-    /// not store the output's NaN as Metal does, a fragment function writes an output to an
-    /// attachment whose every written channel is half-float as the bits of the half Metal stores,
-    /// through a 16-bit output, and records no `PrecisionNote::DeviceNanEncoding` for it.
-    /// Unmeasured, the output stays 32-bit and records the note.
-    HalfColorOutputBits,
     /// The device's `GLSL.std.450 Fma` on 16-bit floats is Metal's own `half` `fma`, which
     /// rounds the exact `a * b + c` once (`VkProperty::MetalHalfFma`). Where the profile also has
     /// `shaderFloat16`, a `half` fused multiply-add converts its operands (each a `half`, so
-    /// exactly) to 16 bits, takes the device's `Fma` and widens its result. Unmeasured, it computes
-    /// the sum in `float` and rounds it to `half` itself, exact.
+    /// exactly) to 16 bits, takes the device's `Fma` and widens its result. Unmeasured, it takes
+    /// `OpFmaKHR` on 16 bits where the profile has `shaderFmaFloat16` and rounds to `half` under
+    /// the 16-bit float controls, and elsewhere the device's `float` `Fma` rounded to `half`,
+    /// recorded as `PrecisionNote::NativeFma`.
     MetalHalfFma,
     /// The device's `float` arithmetic reads an `f32` denormal operand as the zero of its sign
     /// and flushes a denormal result to one, as Metal does (`VkProperty::MetalFloatDenormals`):
     /// `OpFAdd`, `OpFSub`, `OpFMul`, `OpFmaKHR`, `OpDot`, the comparisons, and `GLSL.std.450`'s
-    /// `Ldexp`, `Sqrt`, `InverseSqrt`, `Trunc` and `RoundEven`. Unmeasured, the module reads such
-    /// operands and flushes such results itself, by their exponent field, exact.
+    /// `Ldexp`, `Sqrt`, `InverseSqrt`, `Trunc` and `RoundEven`. Unmeasured, such operands and
+    /// results are the device's own, recorded as `PrecisionNote::DeviceDenormals`.
     MetalFloatDenormals,
-    /// The device's `OpQuantizeToF16` rounds an `f32` below 65520 in magnitude to nearest even,
-    /// as Metal's conversion to `half` does, so that a value from 65504 up to 65520 is 65504, not
-    /// infinity (`VkProperty::MetalHalfQuantize`). Vulkan leaves the quantize's rounding mode to
-    /// the device. Unmeasured, the module rounds on the `f32`'s bits in integer arithmetic, which
-    /// is Metal's conversion on every device (`QuantizeForm::Integer`).
-    MetalHalfQuantize,
-    /// The device's `OpFConvert` from 32-bit to 16-bit floats, of the result of an `OpFAdd`
-    /// decorated `NoContraction` (which its compiler cannot fold the conversion into), is Metal's
-    /// conversion of a `float` to `half`: it rounds to nearest even on the half grid, half
-    /// denormals included, keeps the sign of a zero and gives infinity from 65520 up
-    /// (`VkProperty::MetalHalfConversion`). Vulkan leaves the conversion's rounding mode, and
-    /// whether it keeps a 16-bit denormal, to the device; a conversion folded into the
-    /// instruction computing its operand rounds otherwise on MoltenVK (toward zero). Where the
-    /// profile also has `shaderFloat16`, a `half` rounding is that conversion of `x + -0.0` and its
-    /// widening (`QuantizeForm::Converted`), with no `OpQuantizeToF16` and no denormal arithmetic
-    /// beside it. Unmeasured, the module rounds through the measured quantize (`MetalHalfQuantize`)
-    /// or on the bits in integer arithmetic, exact either way.
-    MetalHalfConversion,
     /// The device reads a center-sampled varying (a smooth input decorated neither `Centroid`
     /// nor `Sample`) of a multisampled pipeline at the pixel center in every fragment
     /// invocation, a sample-rate one's included, as Metal reads it
@@ -650,28 +632,29 @@ pub enum DriverDeviation {
     /// but a NaN, plain and through blending with factors one and zero
     /// (`VkProperty::MetalSmallFloatColorWrites`): rounded toward zero, a finite value past the
     /// largest stored as the largest, an infinity as itself, and where unsigned a negative value
-    /// as 0. Where the profile takes it, the function writes such an output as computed, a NaN
-    /// chosen as the `f32` NaN `0x7fc00000` (the NaN the rounding writes, whose store each driver
-    /// is measured by) except to a half-float channel of a device that stores its NaNs otherwise
-    /// (`PrecisionNote::DeviceNanEncoding`). Unmeasured, the function rounds each such output by
-    /// Metal's rule itself (`LoweringInputs::color_writes`), exact.
+    /// as 0. The function writes such an output as computed either way. Where the profile takes
+    /// it, the lane records no `PrecisionNote::DeviceColorConversion` and the module requires the
+    /// property; its NaN, as computed, is the device's (`PrecisionNote::DeviceNanEncoding`).
+    /// Unmeasured, the lane records `DeviceColorConversion` (`LoweringInputs::color_writes`).
     MetalSmallFloatColorWrites,
     /// The device stores a fragment function's float color output into a 16-bit unorm or snorm
     /// channel as Metal does, the exact product with the format's largest code rounded to
     /// nearest, for every value, a NaN's included, plain and through blending with factors one
     /// and zero, except a blended snorm channel's NaN, which Metal stores as -1.0's code
-    /// (`VkProperty::MetalNorm16ColorWrites`). Where the profile takes it, the function writes such
-    /// an output as computed, a blended snorm channel's NaN chosen as -1.0. Unmeasured, the
-    /// function rounds each such output by Metal's rule itself, exact.
+    /// (`VkProperty::MetalNorm16ColorWrites`). The function writes such an output as computed
+    /// either way. Where the profile takes it, a lane to such a channel but a blended snorm one
+    /// records no `PrecisionNote::DeviceColorConversion` and the module requires the property;
+    /// a blended snorm channel's lane, and every such lane on a profile without it, records the
+    /// note.
     MetalNorm16ColorWrites,
     /// The device's `GLSL.std.450` `NMin`, `NMax` and `NClamp` on 32-bit floats are Metal's own
     /// `fmin`, `fmax` and `clamp` (`VkProperty::MetalMinMax`): a NaN operand loses, two NaNs and a
     /// tie answer the second operand's bits, an `f32` denormal compares as a zero but is returned
     /// itself, and `clamp(x, lo, hi)` is `fmin(fmax(x, lo), hi)`, in every math mode, of every
-    /// operand class, and of every `half` held widened. Where the profile takes it, Metal's `fmin`,
-    /// `fmax`, `min3`, `max3` and `clamp` on `float` and `half` are those instructions. Unmeasured,
-    /// the module picks the operand itself (`math::metal_min_max`), by NaN tests and comparisons,
-    /// exact.
+    /// operand class, and of every `half` held widened. Metal's `fmin`, `fmax`, `min3`, `max3`,
+    /// `clamp` and `saturate` on `float` and `half` are those instructions on every profile: where
+    /// the profile takes it the module requires the property, and unmeasured it records
+    /// `PrecisionNote::NativeMinMax`.
     MetalMinMax,
     /// The device's 16-bit `OpFAdd` and `OpFSub` decorated `NoContraction`, and its 16-bit
     /// `Fma(a, b, -0.0)` decorated `NoContraction`, are Metal's own `half` `+`, `-` and `*`
@@ -680,33 +663,35 @@ pub enum DriverDeviation {
     /// denormals kept, an exact zero sum `+0` unless both addends are `-0`, and every NaN result
     /// `0x7E00`, in every math mode. Where the profile also has `shaderFloat16`, a `half` `fadd`,
     /// `fsub` or `fmul` converts its operands (each a `half`, so exactly) to 16 bits, takes that
-    /// kept instruction and widens its result. Unmeasured, it computes the result in `float` and
-    /// rounds it to `half` itself, exact. The measurement reads every `half` through the device's
-    /// widening (`x + -0` of every `x`), exact but for a NaN: a load of `half`s none of whose uses
-    /// reads a NaN's bits (a `half` sum, difference or product, a compare, a widening to `float`)
-    /// takes that widening of its bits in place of their decode in integer arithmetic.
+    /// kept instruction and widens its result. Unmeasured, it takes the same instruction under the
+    /// 16-bit float controls that make it Metal's by the Vulkan spec (`QuantizeForm::Controlled`),
+    /// and elsewhere computes the result in `float` and rounds it to `half` as every `half`
+    /// rounds (`narrow::round`, noted `NativeHalfConversion` or `NativeHalfQuantize` where that
+    /// rounding is not Metal's). The measurement reads every `half` through the device's
+    /// widening (`x + -0` of every `x`), exact but for a NaN, denormals included: a module that
+    /// reads a `half` from its bits by that widening (every profile with `shaderFloat16` does)
+    /// requires the property for its denormals, and records `PrecisionNote::NativeNanEncoding`
+    /// for its NaNs' bits.
     MetalHalfArithmetic,
     /// The device stores every `float` but a NaN that a shader writes to a half-float storage
     /// image (`R16Float`, `RG16Float`, `RGBA16Float`; a storage texel buffer of one too) as Metal
     /// stores a kernel's write (`VkProperty::MetalHalfStorageWrites`): rounded toward zero, a
-    /// finite value past 65504 stored as 65504, an infinity as itself. Where the profile takes it,
-    /// such a write is the value as computed, its NaN as [`MetalHalfStorageNans`] states
-    /// (`StorageImageClass::Identity` or `HalfQuietNan`). Unmeasured, the shader rounds each
-    /// written channel by Metal's rule itself (`StorageImageClass::HalfTowardZero`), exact.
+    /// finite value past 65504 stored as 65504, an infinity as itself. The shader writes the
+    /// value as computed either way (`StorageImageClass::Identity`), its NaN as
+    /// [`MetalHalfStorageNans`] states: a fragment function's `float` blend into a 16-bit float
+    /// attachment in the storage form among them, which Metal's blended write rounds so too.
+    /// Where the profile takes it the module requires the property; unmeasured, such a write
+    /// records `PrecisionNote::DeviceColorConversion`. An integer texel written into a half-float
+    /// image (its bits as the `float`), which Metal's integer store rounds to nearest even, is the
+    /// store's to convert either way, and records the note.
     ///
     /// [`MetalHalfStorageNans`]: DriverDeviation::MetalHalfStorageNans
     MetalHalfStorageWrites,
     /// The device stores every NaN a shader writes to a half-float storage image as Metal stores
-    /// a kernel's, `0x7e00` (`VkProperty::MetalHalfStorageNans`). With
-    /// [`MetalHalfStorageWrites`](DriverDeviation::MetalHalfStorageWrites), such a write is the
-    /// value as computed (`StorageImageClass::Identity`); without it, the shader writes a NaN as
-    /// `0x7fc00000`.
+    /// a kernel's, `0x7e00` (`VkProperty::MetalHalfStorageNans`). The shader writes the NaN as
+    /// computed either way; where the profile takes it the module requires the property, and
+    /// unmeasured such a write records `PrecisionNote::DeviceNanEncoding`.
     MetalHalfStorageNans,
-    /// The device stores the NaN `0x7fc00000` a shader writes to a half-float storage image as
-    /// Metal's `0x7e00` (`VkProperty::MetalFloatStorageNans`): the NaN a write the shader rounds
-    /// (`StorageImageClass::HalfTowardZero`) or quiets (`HalfQuietNan`) stores. Unmeasured, such a
-    /// write records `PrecisionNote::DeviceNanEncoding`.
-    MetalFloatStorageNans,
     /// The device's fragment subgroups are Metal's simdgroups
     /// (`VkProperty::MetalFragmentSimdgroups`): the driver hands the fragment function to Metal, so
     /// a fragment subgroup holds the pixels (at sample rate, the samples) Apple's rasterizer packs
@@ -749,49 +734,38 @@ pub enum DriverDeviation {
     /// half widened to `float` in a 16-bit float storage image, and the NaN `0x7fc00000` in a
     /// packed small float one (`VkProperty::MetalHalfTexelWrites`): the half's own bits, a
     /// signalling NaN's unquieted, in the first, and the format's canonical NaN in the second.
-    /// Where the profile takes it, such a write records no `PrecisionNote::DeviceNanEncoding`.
-    /// Unmeasured, it records the note, and the runtime announces it at the bind of such a
-    /// texture to a slot whose storage choice declares no format.
+    /// Where the profile takes it, a write to a slot whose storage choice declares a 16-bit float
+    /// format records no `PrecisionNote::DeviceNanEncoding` and the module requires the property.
+    /// Unmeasured, such a write records the note, which the runtime announces at the bind of such
+    /// a texture to a slot whose storage choice declares no format. A packed small float channel's NaN, the half widened, records
+    /// the note on every device.
     MetalHalfTexelWrites,
     /// The device stores a `float` texel a shader writes to a unorm or snorm storage image (not
     /// an sRGB one; a `half` texel's, widened, alike) as Metal's code
     /// (`VkProperty::MetalNormStorageWrites`): each channel's value clamped to its range (a NaN 0)
     /// times its maximum code exactly, rounded to nearest with a tie away from zero, a packed
-    /// 16-bit format's channel likewise and its 1-bit channel 1 only above one half. Where the
-    /// profile takes it, such a write is left to the device. Unmeasured, the shader rounds each
-    /// channel to Metal's code by the bound format's class.
+    /// 16-bit format's channel likewise and its 1-bit channel 1 only above one half. The shader
+    /// writes the value as computed either way. Where the profile takes it the module requires
+    /// the property, and a write that may reach a 1-bit alpha records
+    /// `PrecisionNote::DeviceColorConversion`; unmeasured, every write that may reach such a format
+    /// records it.
     MetalNormStorageWrites,
-    /// The device's linear filter of an 8-bit unsigned normalized texture (`R8Unorm`,
-    /// `RG8Unorm`, `RGBA8Unorm`, `BGRA8Unorm`), at the coordinate of the centre of Metal's 1/256
-    /// footprint step, lands within one code (1/255) of Metal's on every channel
-    /// (`VkProperty::Unorm8LinearFilter`): a bounded deviation the owner accepted, not an exact
-    /// equality. Where the profile takes it, such a 2D sample through a constexpr or runtime
-    /// sampler slot is the device's at that coordinate, under
-    /// `PrecisionNote::DeviceUnorm8LinearFilter` (`lower::sampler::native`). Unmeasured, the sample
-    /// takes Metal's filter, emulated exactly. A profile takes it only under a policy of
-    /// `Unorm8LinearFilterPolicy::DeviceWithinOneCode`; the default policy keeps Metal's filter
-    /// exact on every device.
-    Unorm8LinearFilter,
     /// The device stores every depth a draw writes to a `Depth16Unorm` attachment, unbiased, as
     /// Metal's code: the depth scaled by 65535 exactly and rounded to nearest, a tie up
     /// (`VkProperty::MetalDepth16Stores`; Metal stored 32768 for 0.5 and 6554 for 0.1's
-    /// `0x3dcccccd`). Vulkan leaves the conversion's rounding to the device. Where the profile
-    /// takes it, a single-sampled pipeline's depth is the device's own. Unmeasured, the fragment
-    /// stage writes Metal's code itself (`LoweringInputs::depth16_codes`), exact: the depth it
-    /// returns, or the depth Metal stores for the fragment, its depth bias included, which a
-    /// pipeline without a fragment function takes from a synthesized fragment stage.
+    /// `0x3dcccccd`). Vulkan leaves the conversion's rounding to the device. Every depth is the
+    /// device's own conversion; no module reads the deviation. Unmeasured, the runtime announces
+    /// `unorm-depth-rounding` at a draw that tests or writes such a depth.
     MetalDepth16Stores,
     /// The device stores every depth a draw biases on a `Depth16Unorm` attachment as Metal's code,
-    /// the bias recorded as [`depth_bias`](crate::metal::state::depth_bias) records it
-    /// (`VkProperty::MetalDepth16BiasedStores`): Metal biases by `c ± 1` units of 1/65535 as
-    /// `float` (one unit for a slope alone), adds the bias to the depth rounding toward zero, and
-    /// stores the sum rounded to nearest, a tie up. Vulkan leaves the sum's rounding, and without
-    /// `depthBiasExact` the unit, to the device. Where the profile takes it, a single-sampled
-    /// pipeline's biased depth is the device's own. Unmeasured, a draw that biases such a depth
-    /// runs the variant whose fragment stage adds the bias and writes Metal's code itself
-    /// (`VariantKey::depth16_biased`), where the profile's unbiased depths are the device's
-    /// ([`MetalDepth16Stores`](Self::MetalDepth16Stores)); elsewhere every depth already is the
-    /// stage's.
+    /// Metal's constant recorded in the device's unit as [`depth_bias`](crate::metal::state::depth_bias)
+    /// records it (`VkProperty::MetalDepth16BiasedStores`): Metal biases by `c ± 1` units of
+    /// 1/65535 as `float` (one unit for a slope alone), adds the bias to the depth rounding toward
+    /// zero, and stores the sum rounded to nearest, a tie up. Vulkan leaves the unit (at most twice
+    /// 2^-16) and the sum's rounding to the device. Every biased depth is the device's own, the
+    /// attachment's fixed-function bias applied; no module reads the deviation. Unmeasured, the
+    /// runtime announces `unorm-depth-bias` at a draw that biases such a depth by a constant, or
+    /// by a slope alone.
     MetalDepth16BiasedStores,
     /// The device interpolates a varying as Metal does, bit for bit
     /// (`VkProperty::MetalInterpolation`): the driver hands the varying and its qualifiers to
@@ -818,6 +792,29 @@ pub enum DriverDeviation {
     /// requires the property in place of the feature. Unmeasured, such a function needs the
     /// feature.
     MetalFullQuads,
+    /// The device's fixed-function vertex input converts the codes of a normalized format (the
+    /// 8- and 16-bit `Normalized` formats of either sign, `UChar4Normalized_BGRA`,
+    /// `Int1010102Normalized`, `UInt1010102Normalized`, through their `UNORM` and `SNORM` vertex
+    /// formats) to Metal's `float`, at every code (`VkProperty::MetalNormalizedVertexFetch`): the
+    /// code over its maximum correctly rounded, `c / (2^b - 1)` unsigned and
+    /// `max(c / (2^(b-1) - 1), -1)` signed, but an `Int1010102Normalized` 10-bit field's, which
+    /// Metal reads as the code times `float(1 / 511)` rounded to `float` (one `f32` ulp toward
+    /// zero at 96 of the 1,024 codes). Vulkan states the correctly rounded quotient and lets a
+    /// driver compute it otherwise. Where the profile takes it, a render pipeline whose vertex
+    /// descriptor gives such a format to an attribute fixed-function input fetches records no
+    /// `PrecisionNote::DeviceVertexConversion` for it and requires the property, but for a
+    /// 16-bit format the function reads as `half`: Metal rounds the code's quotient to `half`
+    /// once, where the module rounds the device's `float` to `half`, so that attribute records
+    /// the note on every profile. Unmeasured, every such attribute records the note.
+    MetalNormalizedVertexFetch,
+    /// The device's alpha to coverage covers Metal's samples at every pixel
+    /// (`VkProperty::MetalAlphaCoverage`): the driver hands `alphaToCoverageEnable` to Metal's own
+    /// `alphaToCoverageEnabled`, whose coverage of an alpha depends on the pixel's place in a 2x2
+    /// ordered dither at two and four samples. Vulkan specifies no algorithm for converting the
+    /// alpha to a coverage mask. Where the profile takes it, a render pipeline that covers by
+    /// alpha records no `PrecisionNote::DeviceAlphaCoverage` and requires the property.
+    /// Unmeasured, such a pipeline's fragment stage records the note.
+    MetalAlphaCoverage,
 }
 
 /// A defect of a device's driver in a command the runtime records for itself, never in a
@@ -871,8 +868,8 @@ pub enum RuntimeDriverDefect {
     /// that the driver keeps losslessly compressed rewrites some texels' bytes, as Metal's GPU
     /// blits of such a texture do (its NaNs made quiet, its shared exponents renormalized),
     /// where Metal's CPU copies keep them. Nothing is refused: the runtime makes the image of a
-    /// texture a CPU copy can reach uncompressed there, and rewrites what its blits write by
-    /// Metal's rule itself.
+    /// texture a CPU copy can reach uncompressed there, whose copies keep the bytes as every
+    /// other device's do.
     CompressedImageCopiesRewriteTexels,
     /// A copy into a multisampled image of a float format draws the samples through that format,
     /// so a NaN in a 16-bit float channel lands as the device's own NaN, its sign and payload
@@ -980,6 +977,36 @@ pub enum RuntimeDriverDefect {
     /// thread sleeps on its condition variable, woken by the completion turns, in place of
     /// waiting for the signals its held batches wait for to land on the GPU itself.
     WaitForAnyObjectLosesASignal,
+    /// A sampler Y′CbCr conversion of a two-plane 4:2:0 or 4:2:2 format reconstructs the chroma
+    /// away from where its chroma offsets place it: each chroma sample's weights, of the right
+    /// shape, lie one luma texel up and to the left of the midpoint's (or, cosited, are no
+    /// interpolation at all), and a linear filter filters the chroma twice, which Vulkan's
+    /// reconstruction (`VkChromaLocation`, `VkFilter`) forbids. Nothing is refused: the runtime
+    /// converts such a texture's planes with its own kernel there, as on a device without the
+    /// conversion.
+    TwoPlaneChromaMisplaced,
+    /// A sampler Y′CbCr conversion of a 10-bit multi-planar format (`..._3PACK16`) reads each
+    /// code's 16-bit word, its six unused low bits included, where Vulkan converts the 10-bit
+    /// code as `c / 1023` and the unused bits have no effect: as a 16-bit unsigned normalized
+    /// value (lavapipe, RADV: a code reads up to one code low, 1023 as 0.999039), or the bits as
+    /// the code's fraction (NVIDIA: up to 63/64 of a code high). Nothing is refused: the runtime
+    /// converts such a texture's planes with its own kernel there, as on a device without the
+    /// conversion.
+    TenBitCodesReadAsWords,
+    /// An import of a host pointer (`VK_EXT_external_memory_host`) over pages the kernel cannot
+    /// pin (a mapping of a dma-buf, `VM_PFNMAP`) fails as out of device memory, where Vulkan
+    /// requires `VK_ERROR_INVALID_EXTERNAL_HANDLE` of a pointer a platform restriction keeps from
+    /// being imported, and from then on the process's host-visible allocations fail as out of
+    /// device memory too, imports and plain allocations alike, on every device of the process,
+    /// where an out-of-memory error modifies no existing object. Nothing is refused that the
+    /// driver would import, and the pages are still served: on Linux the runtime asks the kernel
+    /// whether it pins each mapping over them before it hands the driver their pointer, and pages
+    /// it cannot pin are never handed to the driver. A no-copy buffer, heap or rebind over them
+    /// takes the caller's dma-buf source where one is given, and else, or where its import fails,
+    /// a copy of them, as where a pointer import fails (`copied-host-pages`); a guest RAM's chunk
+    /// over them is not imported, its objects taking their own paths. Pages that are not mapped
+    /// readable cannot be copied, and are refused (`Unsupported`, `HostMemory`).
+    UnpinnablePagesBreakHostMemory,
 }
 
 /// One device capability a refusal can name.
@@ -1323,8 +1350,8 @@ pub enum Feature {
     TextureView,
     /// A texture swizzle whose Metal behavior is not measured.
     TextureSwizzle,
-    /// `generateMipmapsForTexture:` where the device's filter is not shown to give Metal's
-    /// answer.
+    /// `generateMipmapsForTexture:` that cannot run on the device: a format neither the device's
+    /// blits filter nor the compute filter computes, or limits the filter's chain does not fit.
     MipmapGeneration,
     /// A buffer over the caller's host memory without a copy (`newBufferWithBytesNoCopy:`): it
     /// needs `VK_EXT_external_memory_host`, a memory type the pointer and the buffer both allow,
@@ -1421,21 +1448,11 @@ pub enum Feature {
     /// Metal's) set to a value whose effect the translation has not built: the property it names
     /// ([`PrivateRenderField`]). Metal's answer for each was measured; building it is open work.
     PrivateRenderState(PrivateRenderField),
-    /// Metal's blend into an extended-range attachment (`BGRA10_XR`, `BGR10_XR`,
-    /// `RGB10A8_2P_XR10` and their `_sRGB` twins), which the function computes in the shader in
-    /// the interlocked storage form, where Metal's measured model does not hold the part it names
-    /// ([`ExtendedRangeBlend`]). Every other such blend is Metal's arithmetic, bit for bit.
+    /// A blend the function computes in the shader, into an extended-range attachment
+    /// (`BGRA10_XR`, `BGR10_XR`, `RGB10A8_2P_XR10` and their `_sRGB` twins) or into a 16-bit
+    /// float attachment in the interlocked storage form, of the part it names
+    /// ([`ExtendedRangeBlend`]).
     ExtendedRangeBlend(ExtendedRangeBlend),
-    /// The tiles a render pass's primitives reach, binned on the device
-    /// ([`tile_reach_module`](crate::bind::tile_reach_module)), on a device without what the
-    /// kernel's exact arithmetic needs: `shaderInt64` ([`Needs::AnyOf`]). Also the capture form
-    /// of a vertex function, whose records hold the positions the kernel bins
-    /// (`LoweringInputs::captured_positions`): on a device without device addresses or
-    /// `vertexPipelineStoresAndAtomics` (naming what it needs), and, not implemented, for a
-    /// post-tessellation vertex function, an attribute a hand-built projection fetches in fixed
-    /// function under the indexed form, an indirect or amplified draw, and an indexed draw whose
-    /// indices run past its buffer or whose index offset is not a multiple of the index size.
-    TileReach,
     /// A program-scope buffer binding of MSL 3.2 (macOS 15 and later), `constant T* constant p
     /// [[buffer(n)]];` in Apple's `!air.global_bindings` list, valid AIR this version does not
     /// implement yet.
@@ -1450,38 +1467,25 @@ pub enum Feature {
     PostDepthCoverage,
 }
 
-/// The part of a blend into an extended-range attachment that [`Feature::ExtendedRangeBlend`]
-/// refuses: what the measured model of Metal's blend does not hold.
+/// The part of a blend the shader computes that [`Feature::ExtendedRangeBlend`] refuses. An
+/// extended-range attachment's blend, which the shader computes by the device's arithmetic, is
+/// built for every factor, operation and write mask, and refuses only [`Output`](Self::Output);
+/// a 16-bit float attachment's blend in the interlocked storage form refuses the other two, the
+/// generic blend taking their place where the function reads the attachment.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExtendedRangeBlend {
-    /// Under fast math, a factor of the second source (`Source1Color`, `Source1Alpha` and their
-    /// one-minus forms): dual-source blending into such an attachment is not built. (Without fast
-    /// math it is. A function that writes no second output to the attachment Metal refuses:
+    /// Into a 16-bit float attachment in the storage form, a factor of the second source
+    /// (`Source1Color`, `Source1Alpha` and their one-minus forms): Metal's blend is not built.
+    /// (A function that writes no second output to the attachment Metal refuses:
     /// [`DescriptorError::ColorAttachment`].)
     DualSource,
-    /// Under fast math, the color channels' `BlendColor` with `OneMinusBlendColor` (either as
-    /// the source factor) under `Subtract` or `ReverseSubtract`: Metal's result there follows
-    /// none of the model's forms for every blend color the sweeps drew, so no rule is known.
-    /// (Without fast math it is built; into a 16-bit float attachment, whose blend the storage
-    /// form computes, it is built under fast math too, Metal's exactly there: the minuend's
-    /// product fused, the subtrahend's rounded first.)
-    ConstantColorDifference,
-    /// Under fast math, a write mask of exactly one color channel: Metal blends that channel
-    /// otherwise than the two or three it blends as one vector, by a rule not known. (Without
-    /// fast math it is built.)
+    /// Into a 16-bit float attachment in the storage form under fast math, a write mask of exactly
+    /// one color channel: Metal blends that channel otherwise than the two or three it blends as
+    /// one vector, by a rule not known. (Without fast math it is built.)
     OneColorChannel,
-    /// Under fast math, a `float4` output into `BGRA10_XR_sRGB` under a blend other than those
-    /// whose color channels take one term alone, or under a write mask: measured to differ from
-    /// the models. (Into a linear form, `BGR10_XR_sRGB` or `RGB10A8_2P_XR10_sRGB` it takes its own
-    /// model; without fast math it is rounded to `half` first.)
-    FloatOutput,
-    /// Under fast math, a `BGRA10_XR_sRGB` blend other than the narrow ones, or under a write mask:
-    /// measured to differ from the models (the other `_sRGB` forms take the linear forms' models).
-    /// Without fast math every one is built.
-    SrgbForm,
     /// An output other than four `half` or `float` lanes, or a second output other than those the
-    /// blend reads: not measured.
+    /// blend reads: not built.
     Output,
 }
 
@@ -1681,9 +1685,10 @@ pub enum RuntimeInput {
     TessellationDescriptor,
     /// A fragment function writes a color attachment whose format converts its float output (a
     /// normalized, sRGB or half-float format) and was compiled for other attachments, another
-    /// blend state, or another device's conversion: how it rounds each such output
-    /// (`LoweringInputs::color_writes`) is not the pipeline's. It is compiled for the pipeline
-    /// again.
+    /// blend state, or another device's conversion: its map of how each such output reaches the
+    /// attachment (`LoweringInputs::color_writes`: which conversion records a note, and a
+    /// half-float channel's rounding under `TextureWriteRoundingMode::NearestEven`) is not the
+    /// pipeline's. It is compiled for the pipeline again.
     ColorWrites,
     /// A call to a function, or a use of a variable, that the stage's module imports from a
     /// dynamic library (a declaration its `air.dyld_flat_table` names) survived specialization,
@@ -1929,9 +1934,8 @@ pub enum BindError {
     /// and instantiates the dispatch there. Nothing is dispatched on the plan asked. A draw answers
     /// it when the pipeline planned is not the variant its vertex function's render target slice
     /// asks for at the shape's render target array length (`VariantKey::dropped_vertex_layer`);
-    /// `variant` is then the plan's own. A draw of a capture variant answers it when the draw is of
-    /// the other capture form (`VariantKey::captured_positions`): `variant` is the plan's with the
-    /// draw's form. Boxed: a key holds a set per kind of variant, and the error stays small.
+    /// `variant` is then the plan's own. Boxed: a key holds a set per kind of variant, and the
+    /// error stays small.
     NeedsVariant {
         variant: Box<crate::cache::VariantKey>,
     },
@@ -2000,9 +2004,10 @@ pub enum BindError {
     /// not a mesh render pipeline, or a draw of primitives or patches with one (Metal ends the
     /// process on `drawPrimitives` with a mesh pipeline state).
     InvalidMeshDraw { mesh: bool },
-    /// An indexed draw of an indexed capture variant (`CaptureForm::Indexed`) whose bind state
-    /// names no primitive type (`BindState::primitive_type`): whether the draw restarts at the
-    /// index type's all-ones index, where Metal shades no vertex, depends on it.
+    /// A draw of a pipeline whose vertex function writes the primitive ID
+    /// (`LoweringInputs::primitive_id_varying`) whose bind state names no primitive type
+    /// (`BindState::primitive_type`): its vertices per primitive, and whether an indexed draw
+    /// runs de-indexed (a strip's does not), depend on it.
     MissingPrimitiveType,
 }
 

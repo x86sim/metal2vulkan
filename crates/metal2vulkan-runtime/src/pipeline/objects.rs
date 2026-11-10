@@ -30,6 +30,7 @@ use crate::generated_commands::INDIRECT_BINDABLE;
 use crate::heap_sets::{self, HeapSet};
 use crate::release;
 use crate::shader_cache::driver::Making;
+use crate::ycbcr_device::YCbCrSampler;
 use crate::Device;
 use ash::vk;
 use metal2vulkan::bind::{DispatchRegion, DynamicViewsModule};
@@ -124,7 +125,28 @@ pub(crate) fn sampler_set(
         };
         return Ok((Arc::new(empty), false));
     }
+    // A warm pass makes no sampler, nor holds the device's (`warm/pass.rs`): either would count
+    // against the device's limit at a moment the program's order does not decide.
+    if crate::warm::warming() {
+        return Err(crate::warm::translation_only());
+    }
     let shared = device.shared();
+    // The device's Y′CbCr conversion of each sampler of a planes image (`texture/ycbcr_planes.rs`),
+    // the one its view is made with, so the two are identically defined: made before the sets'
+    // lock, as it takes the owned kernels' own.
+    let conversions = descs
+        .iter()
+        .map(|desc| {
+            desc.ycbcr
+                .map(|sampler| {
+                    let ycbcr = YCbCrSampler::planes(device, sampler).ok_or_else(|| {
+                        internal("a layout bakes a planes sampler the device does not convert")
+                    })?;
+                    device.made_ycbcr_conversion(ycbcr)
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
     let program = program_call();
     // The lock is held across the creation, so two of the program's calls never make two sets of
     // the same samplers.
@@ -133,11 +155,16 @@ pub(crate) fn sampler_set(
         let mut set = SamplerSet {
             samplers: Vec::with_capacity(descs.len()),
         };
-        for desc in &descs {
+        for (desc, conversion) in descs.iter().zip(&conversions) {
+            let mut chained = vk::SamplerYcbcrConversionInfo::default();
             let mut reduction = vk::SamplerReductionModeCreateInfo::default();
             let mut border = vk::SamplerBorderColorComponentMappingCreateInfoEXT::default();
-            let info =
+            let mut info =
                 metal2vulkan::ash_interop::sampler_create_info(desc, &mut reduction, &mut border);
+            if let Some(conversion) = *conversion {
+                chained = chained.conversion(conversion);
+                info = info.push_next(&mut chained);
+            }
             // SAFETY: `info` and its chain are live for the call. Counted against the device's
             // limit (`DeviceShared::create_sampler`).
             match unsafe { shared.create_sampler(&info) } {
@@ -570,7 +597,7 @@ impl VariantObjects {
     ) -> Result<VariantObjects, Error> {
         let push_set_zero = pushes_set_zero(device, layout, stages, pipeline);
         let dynamic = dynamic_bindings(device, layout, push_set_zero);
-        let set_needs = needs_of(layout, push_set_zero, &dynamic)?;
+        let set_needs = needs_of(device, layout, push_set_zero, &dynamic)?;
         // One sampler per binding that bakes one, in the layout's order: the live set of the same
         // samplers where it holds one, else one made now (`sampler_set`).
         let descs: Vec<metal2vulkan::vk::SamplerDesc> = layout
@@ -618,7 +645,7 @@ impl VariantObjects {
                 .collect(),
             heap_layout: layout.sets.get(1).cloned(),
             heap: Mutex::new(None),
-            kinds: Kinds::of(stages, pipeline),
+            kinds: Kinds::of(stages, pipeline, understates_support(device)),
             tested: tested_slots_of(stages),
             bound: Mutex::new(None),
             quiet_formats: Mutex::new(None),
@@ -658,9 +685,15 @@ impl VariantObjects {
     ) -> Result<(VariantObjects, Vec<(Place, RawPipeline)>), Error> {
         let push_set_zero = pushes_set_zero(device, layout, stages, pipeline);
         let dynamic = dynamic_bindings(device, layout, push_set_zero);
-        let set_needs = needs_of(layout, push_set_zero, &dynamic)?;
+        let set_needs = needs_of(device, layout, push_set_zero, &dynamic)?;
         let shared = device.shared();
-        let back = lock(&shared.kept).take(shared, compiled);
+        // A warm pass takes nothing back and keeps nothing (`warm/pass.rs`): the kept variants'
+        // order is the program's (the owner's HITCH rule 1), and its objects go as it lets them.
+        let warming = crate::warm::warming();
+        let back = match warming {
+            true => None,
+            false => lock(&shared.kept).take(shared, compiled),
+        };
         // The kept variants' queue applied (an evicted instance's modules let go): the device's
         // modules nothing holds now go, in the program's order.
         settle_modules(device);
@@ -672,7 +705,7 @@ impl VariantObjects {
         settle_libraries(device);
         let Some(back) = back else {
             let mut objects = VariantObjects::create(device, layout, stages, pipeline, digests)?;
-            objects.keep = Some(Instance::new(compiled));
+            objects.keep = (!warming).then(|| Instance::new(compiled));
             return Ok((objects, Vec::new()));
         };
         device.shared().counts.variant_taken_back();
@@ -698,7 +731,7 @@ impl VariantObjects {
                 .collect(),
             heap_layout: layout.sets.get(1).cloned(),
             heap: Mutex::new(None),
-            kinds: Kinds::of(stages, pipeline),
+            kinds: Kinds::of(stages, pipeline, understates_support(device)),
             tested: tested_slots_of(stages),
             bound: Mutex::new(None),
             quiet_formats: Mutex::new(None),
@@ -1100,8 +1133,7 @@ fn layout_support(
     set: &DescriptorSetLayout,
     info: &vk::DescriptorSetLayoutCreateInfo<'_>,
 ) -> SetSupport {
-    let understated = (device.properties().driver_defects)
-        .contains(&RuntimeDriverDefect::SetLayoutSupportUnderstated);
+    let understated = understates_support(device);
     let total = set.bindings.iter().map(|b| u64::from(b.count)).sum();
     set_support(total, understated, || {
         let mut support = vk::DescriptorSetLayoutSupport::default();
@@ -1115,6 +1147,13 @@ fn layout_support(
         };
         support.supported == vk::TRUE
     })
+}
+
+/// Whether `device`'s driver understates its descriptor set layout support
+/// (`RuntimeDriverDefect::SetLayoutSupportUnderstated`): it runs layouts its
+/// `vkGetDescriptorSetLayoutSupport` refuses.
+fn understates_support(device: &Device) -> bool {
+    (device.properties().driver_defects).contains(&RuntimeDriverDefect::SetLayoutSupportUnderstated)
 }
 
 /// Whether the runtime makes, on the device `description` names, a descriptor set layout its
@@ -1168,6 +1207,15 @@ pub(crate) fn set_support(
     } else {
         SetSupport::Refused
     }
+}
+
+/// Whether a layout of `total` descriptors may be one [`set_support`] answers
+/// [`SetSupport::Understated`] for on a device whose driver understates its support
+/// (`understated`): one past [`LEAST_PER_SET_DESCRIPTORS`] there, which the driver is asked about.
+/// The kinds a variant may announce (`Kinds::of`) hold `Degradation::SetPastLayoutSupport` by
+/// it, so a bind announces the notice whatever else the variant records.
+pub(crate) fn may_pass_support(total: u64, understated: bool) -> bool {
+    understated && total > LEAST_PER_SET_DESCRIPTORS
 }
 
 /// `f` of the `VkDescriptorSetLayoutCreateInfo` of `set` as [`create_set_layout`] makes it.
@@ -1246,6 +1294,7 @@ fn set_zero_shape(layout: &PipelineLayout, push_set_zero: bool, dynamic: &[u32])
 /// where it is pushed (`push_set_zero`), and set 0's bindings numbered in `dynamic` of their
 /// dynamic types.
 fn needs_of(
+    device: &Device,
     layout: &PipelineLayout,
     push_set_zero: bool,
     dynamic: &[u32],
@@ -1259,7 +1308,9 @@ fn needs_of(
                 counts: Vec::new(),
                 flags: vk::DescriptorPoolCreateFlags::empty(),
             }),
-            (false, 0) => needs_typed(set, dynamic),
+            (false, 0) => needs_typed(set, dynamic, |sampler| {
+                device.shared().ycbcr_formats.planes_descriptors(sampler)
+            }),
             _ => set_needs(set),
         })
         .collect()
@@ -1276,8 +1327,8 @@ fn needs_of(
 /// device's `maxDescriptorSetUniformBuffersDynamic` and `maxDescriptorSetStorageBuffersDynamic`
 /// take them; every other binding stays of its own type.
 ///
-/// A binding each stage using it uses through **several** variables (a slot or store sink reached
-/// through its word view and its narrow or `uvec4` unit views) stays static where the device does
+/// A binding each stage using it uses through **several** variables (a slot reached through its
+/// word view and its narrow or `uvec4` unit views) stays static where the device does
 /// not take such a binding dynamically, which the device answers itself
 /// ([`takes_multi_variable_dynamic`]): it is one driver's shader-translation defect, not a limit
 /// of Vulkan, which bounds the variables at a binding nowhere.
@@ -1286,8 +1337,8 @@ fn dynamic_bindings(device: &Device, layout: &PipelineLayout, push_set_zero: boo
         return Vec::new();
     };
     // Asked of the device only where a binding needs the answer, so a layout of one variable a
-    // binding -- every layout but the few with a narrow-unit store sink or a slot read through
-    // several types -- compiles nothing.
+    // binding -- every layout but the few with a slot read or written through several types --
+    // compiles nothing.
     let several =
         set.bindings.iter().any(|b| b.variables > 1) && takes_multi_variable_dynamic(device);
     dynamic_numbers(set, device.shared().dynamic_buffers, several)
@@ -1344,6 +1395,11 @@ fn dynamic_numbers(
 /// module with one variable per unit view the device's storage views can declare, so any plan's
 /// binding is a subset of it (`bind::DynamicViewsModule`), and destroying it. A creation that
 /// fails, for any reason, answers no, which is what every device answered before it was asked.
+/// What the driver reports inside that failed creation is its answer to the runtime's own
+/// question and names none of the program's work (MoltenVK 1.4.2 reports the Metal it could not
+/// compile and the failed pipeline as two errors), so the sink is handed one informational line
+/// carrying those messages ([`SELF_CHECK_REFUSED`]) in place of the driver's errors; a creation
+/// that succeeds hands on whatever the driver reported in it, as any other making does.
 ///
 /// The check proves the driver **compiles** the shape. A driver that compiled it and then applied
 /// the dynamic offset to one of its variables alone would still be wrong, and none is measured to
@@ -1400,14 +1456,21 @@ fn multi_variable_dynamic_creates(device: &Device) -> Result<bool, Error> {
             .layout(layout);
         // SAFETY: every pointer in `info` outlives the call; no pipeline cache, since the
         // self-check's pipeline is never made again.
-        let created =
-            unsafe { raw.create_compute_pipelines(vk::PipelineCache::null(), &[info], None) };
+        let (created, heard) = crate::device::holding(|| unsafe {
+            raw.create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
+        });
         match created {
             Ok(made) => {
                 pipeline = made.first().copied().unwrap_or(vk::Pipeline::null());
+                for (sink, message) in &heard {
+                    sink.deliver(message);
+                }
                 Ok(true)
             }
-            Err(_) => Ok(false),
+            Err((_, result)) => {
+                refused_self_check(result, &heard);
+                Ok(false)
+            }
         }
     })();
     // SAFETY: nothing uses the objects: no command recorded them, and the pipeline, where it was
@@ -1419,6 +1482,31 @@ fn multi_variable_dynamic_creates(device: &Device) -> Result<bool, Error> {
         release::object(raw, shader);
     }
     made
+}
+
+/// The id name of the informational line a device hands its sink where the driver did not make
+/// the self-check's pipeline of [`takes_multi_variable_dynamic`]: the driver's result and the
+/// messages it reported inside that creation, which the sink is not handed as the driver's own.
+pub(crate) const SELF_CHECK_REFUSED: &str = "metal2vulkan-self-check-refused";
+
+/// Tell the sink that heard the driver's messages `heard` inside the self-check's creation,
+/// informationally, that the driver did not make its pipeline ([`SELF_CHECK_REFUSED`]): its
+/// `result`, and those messages, by id name and text, in the order the driver raised them. A
+/// creation that reported nothing says nothing, as before.
+fn refused_self_check(result: vk::Result, heard: &[(crate::MessageSink, crate::DebugMessage)]) {
+    let Some((sink, _)) = heard.first() else {
+        return;
+    };
+    let mut text = format!(
+        "the device does not take a set-0 buffer binding of several variables as a dynamic \
+         descriptor: vkCreateComputePipelines of the self-check module answered {result:?}, \
+         reporting {} message(s) of its own",
+        heard.len()
+    );
+    for (_, message) in heard {
+        text.push_str(&format!("\n{}: {}", message.id_name, message.text));
+    }
+    crate::driver_facts::inform_through(Some(sink), SELF_CHECK_REFUSED, text);
 }
 
 /// The device's answer of [`takes_multi_variable_dynamic`], for the check that the restriction is
@@ -1523,11 +1611,18 @@ fn immutable_pushes(
 /// descriptor type, since a set takes every binding's whole count; and `UPDATE_AFTER_BIND` when
 /// the set layout is `UPDATE_AFTER_BIND_POOL`.
 pub(crate) fn set_needs(set: &DescriptorSetLayout) -> Result<SetNeeds, Error> {
-    needs_typed(set, &[])
+    needs_typed(set, &[], |_| 1)
 }
 
-/// [`set_needs`] of `set` with its bindings numbered in `dynamic` of their dynamic types.
-fn needs_typed(set: &DescriptorSetLayout, dynamic: &[u32]) -> Result<SetNeeds, Error> {
+/// [`set_needs`] of `set` with its bindings numbered in `dynamic` of their dynamic types, a
+/// combined image sampler binding whose immutable sampler is a planes image's Y′CbCr conversion
+/// (`SamplerDesc::ycbcr`) taking `planes` of its sampler descriptors for each of its count
+/// (`combinedImageSamplerDescriptorCount`, `ycbcr_device.rs`).
+fn needs_typed(
+    set: &DescriptorSetLayout,
+    dynamic: &[u32],
+    planes: impl Fn(metal2vulkan::bind::YCbCrPlanesSampler) -> u32,
+) -> Result<SetNeeds, Error> {
     let mut counts: std::collections::BTreeMap<i32, u32> = std::collections::BTreeMap::new();
     let mut flags = vk::DescriptorPoolCreateFlags::empty();
     let set_flags: vk::DescriptorSetLayoutCreateFlags = set.flags.into();
@@ -1540,9 +1635,15 @@ fn needs_typed(set: &DescriptorSetLayout, dynamic: &[u32]) -> Result<SetNeeds, E
             true => crate::binding::dynamic_type(ty),
             false => ty,
         };
+        let each = match binding.immutable_sampler.and_then(|desc| desc.ycbcr) {
+            Some(sampler) => planes(sampler),
+            None => 1,
+        };
         let count = counts.entry(ty.as_raw()).or_default();
-        *count = count
-            .checked_add(binding.count)
+        *count = binding
+            .count
+            .checked_mul(each)
+            .and_then(|taken| count.checked_add(taken))
             .ok_or_else(|| internal("the layout's descriptor count overflows"))?;
     }
     Ok(SetNeeds {

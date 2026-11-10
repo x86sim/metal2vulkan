@@ -3,12 +3,11 @@
 
 use super::super::blit_plan::BufferImageRegion;
 use super::super::chroma_pairs::{holds_pairs, CARRIER as PAIRS_CARRIER};
-use super::super::copy_plan::{copy_unit, BlitOption, CopyUnit, ImageRegion};
+use super::super::copy_plan::{copy_unit, BlitOption, ImageRegion};
 use super::super::driver_defects;
 use super::super::image_plan::{
-    block_family, check_image_limits, compatible, cube_compatible, holds_depth_in_colour,
-    holds_srgb_twin, plan_image, plan_images, sample_count, srgb_twin, DepthImageFacts, ImageFacts,
-    ImagePlan, ImageRefusal,
+    block_family, check_image_limits, compatible, cube_compatible, holds_srgb_twin, plan_image,
+    sample_count, srgb_twin, DepthImageFacts, ImageFacts, ImagePlan, ImageRefusal,
 };
 use super::super::memory::MemoryClass;
 use super::super::pvrtc::{holds_blocks, image_buffer_region, image_region, CARRIERS};
@@ -18,7 +17,6 @@ use super::super::texture_descriptor::{
 };
 use super::super::values::{ResourceOptions, StorageMode};
 use super::texture_descriptor::APPLE;
-use crate::MetalLevel;
 use ash::vk;
 use metal2vulkan::device::{
     Device, DeviceDescription, DevicePolicy, FormatUsage, VkExtension, VkFeature, VkProperty,
@@ -62,19 +60,6 @@ pub(super) fn facts<'a>(desc: &'a DeviceDescription, device: &'a Device) -> Imag
         storage_multisample: desc.has(VkFeature::ShaderStorageImageMultisample),
         depth_images: DepthImageFacts::of(&desc.driver_facts()),
         linear_attachments: false,
-        multisample_depth_twin: false,
-    }
-}
-
-/// [`facts`] with a multisampled `Depth32Float` texture held in colour
-/// (`MultisampleDepthTwinPolicy::Exact`).
-fn facts_holding_multisample_depth<'a>(
-    desc: &'a DeviceDescription,
-    device: &'a Device,
-) -> ImageFacts<'a> {
-    ImageFacts {
-        multisample_depth_twin: true,
-        ..facts(desc, device)
     }
 }
 
@@ -98,7 +83,6 @@ fn layout(ty: TextureType, pf: PixelFormat, samples: u64, array: u64) -> Texture
     }
     .check(TextureRules {
         sample_counts: SampleCountFlags::from_raw(0x7f),
-        level: MetalLevel::NEWEST,
     })
     .expect("a valid descriptor");
     TextureLayout {
@@ -981,132 +965,53 @@ fn multisampled_depth_targets_take_custom_sample_positions() {
     );
 }
 
-/// A `Depth32Float` texture the program only reads or samples holds its texels in an `R32_SFLOAT`
-/// image beside a `D32_SFLOAT` twin of its shape on every committed profile whose depth image its
-/// driver is not measured to keep every `float` in: without `VK_EXT_depth_range_unrestricted` and
-/// the driver's fact that its depth images keep values outside `[0, 1]`, the Xe-LP ANV ones among
-/// them, or without its fact that they keep denormals, RADV's among them; and in its depth
-/// image, as `plan_image` plans it, elsewhere: NVIDIA's 615 and lavapipe, with the extension, and
-/// MoltenVK without it. A render target (`Unknown` usage counts as one), a memoryless or
-/// multisampled texture and another depth format have no twin.
+/// A `Depth32Float` texture is held in a `D32_SFLOAT` depth image on every committed profile,
+/// whatever its driver is measured to keep in one: a texture the program only reads or samples,
+/// single-sampled or multisampled, as a render target is. A value the depth image may not keep is
+/// announced at the write that stores it (`restricted-depth-upload`, `depth-denormals`).
 #[test]
-fn depth_twins_hold_the_texels_in_colour_where_a_depth_image_may_not() {
+fn a_depth32float_texture_is_held_in_its_depth_image_on_every_profile() {
     use PixelFormat as P;
     let read = TextureUsage::SHADER_READ;
-    let mut twinned = Vec::new();
+    let mut planned = 0;
     for (name, desc, device) in committed() {
         let facts = facts(&desc, &device);
-        let unrestricted = device
-            .profile()
-            .enabled()
-            .extensions
-            .contains(&VkExtension::ExtDepthRangeUnrestricted);
-        let kept = facts.depth_images;
-        let exact = (unrestricted || kept.outside_unit_range) && kept.denormals;
-        assert_eq!(facts.depth_loss().is_none(), exact, "{name}");
-        for (ty, array) in [
-            (TextureType::Type2D, 1),
-            (TextureType::Type2DArray, 3),
-            (TextureType::Cube, 1),
+        for (ty, samples, array, usage) in [
+            (TextureType::Type2D, 1, 1, read),
+            (TextureType::Type2DArray, 1, 3, read),
+            (TextureType::Cube, 1, 1, read),
+            (
+                TextureType::Type2D,
+                1,
+                1,
+                read | TextureUsage::RENDER_TARGET,
+            ),
+            (TextureType::Type2DMultisample, 2, 1, read),
+            (TextureType::Type2DMultisample, 4, 1, read),
         ] {
-            let l = layout(ty, P::Depth32Float, 1, array);
-            let (plan, twin) = plan_images(&l, read, false, &facts).expect(&name);
-            let Some(twin) = twin else {
-                assert!(exact, "{name}: {ty:?}");
-                assert_eq!(plan, plan_image(&l, read, false, &facts).unwrap(), "{name}");
+            let l = layout(ty, P::Depth32Float, samples, array);
+            let Ok(plan) = plan_image(&l, usage, false, &facts) else {
                 continue;
             };
-            assert!(!exact, "{name}: {ty:?}");
             assert_eq!(
                 (plan.pixel_format, plan.format, plan.mapping.aspects),
-                (P::Depth32Float, Format::R32_SFLOAT, ImageAspectFlags::COLOR),
-                "{name}: {ty:?}"
-            );
-            let copies = ImageUsageFlags::TRANSFER_SRC | ImageUsageFlags::TRANSFER_DST;
-            assert!(
-                plan.usage.contains(ImageUsageFlags::SAMPLED | copies),
-                "{name}: {ty:?}"
-            );
-            assert_eq!(
-                (twin.pixel_format, twin.format, twin.mapping.aspects),
                 (P::Depth32Float, Format::D32_SFLOAT, ImageAspectFlags::DEPTH),
-                "{name}: {ty:?}"
+                "{name}: {ty:?} {samples} {usage:?}"
             );
             assert_eq!(
-                (
-                    twin.image_type,
-                    twin.flags,
-                    twin.extent,
-                    twin.levels,
-                    twin.layers,
-                    twin.samples
-                ),
-                (
-                    plan.image_type,
-                    plan.flags,
-                    plan.extent,
-                    plan.levels,
-                    plan.layers,
-                    plan.samples
-                ),
-                "{name}: {ty:?}"
+                copy_unit(P::Depth32Float, &plan.mapping, BlitOption::None)
+                    .map(|unit| unit.aspect)
+                    .ok(),
+                Some(ImageAspectFlags::DEPTH),
+                "{name}: {ty:?} {samples}"
             );
-            assert!(
-                twin.usage
-                    .contains(ImageUsageFlags::SAMPLED | ImageUsageFlags::TRANSFER_DST),
-                "{name}: {ty:?}"
-            );
-            if ty == TextureType::Type2D {
-                twinned.push(name.clone());
-            }
-        }
-        let flat = layout(TextureType::Type2D, P::Depth32Float, 1, 1);
-        for (what, l, usage, memoryless) in [
-            (
-                "a render target",
-                flat,
-                read | TextureUsage::RENDER_TARGET,
-                false,
-            ),
-            ("Unknown usage", flat, TextureUsage::empty(), false),
-            ("memoryless", flat, TextureUsage::RENDER_TARGET, true),
-            (
-                "multisampled",
-                layout(TextureType::Type2DMultisample, P::Depth32Float, 4, 1),
-                read,
-                false,
-            ),
-            (
-                "Depth16Unorm",
-                layout(TextureType::Type2D, P::Depth16Unorm, 1, 1),
-                read,
-                false,
-            ),
-        ] {
-            if let Ok((_, twin)) = plan_images(&l, usage, memoryless, &facts) {
-                assert_eq!(twin, None, "{name}: {what}");
-            }
+            planned += 1;
         }
     }
-    // Lavapipe 26.2.3 (`lavapipe`) is no measured identity, so it takes the twin too.
-    for stem in [
-        "intel-irisxe-rplp-anv",
-        "amd-780m-radv",
-        "amd-rdna3-radv",
-        "lavapipe",
-    ] {
-        assert!(twinned.iter().any(|n| n == stem), "{stem}: {twinned:?}");
-    }
-    // Drivers measured to keep every `float` in a depth image: NVIDIA's and lavapipe with the
-    // extension, MoltenVK without it.
-    for stem in [
-        "nvidia-rtx5080-laptop",
-        "gate-lavapipe",
-        "moltenvk-m3",
-        "moltenvk-m4",
-    ] {
-        assert!(!twinned.iter().any(|n| n == stem), "{stem}: {twinned:?}");
-    }
+    assert!(
+        planned > 0,
+        "no committed profile plans a Depth32Float texture"
+    );
 }
 
 /// A memoryless texture is a transient attachment, on lavapipe (whose framebuffer fetch reads
@@ -1566,11 +1471,10 @@ fn extended_range_textures_hold_their_bytes_raw() {
                 TextureUsage::RENDER_TARGET,
                 TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ,
             ] {
-                let memoryless = plan_images(&l, target, true, &facts);
+                let memoryless = plan_image(&l, target, true, &facts);
                 match renders {
                     true => {
-                        let (plan, twin) = memoryless.expect(&what);
-                        assert!(twin.is_none(), "{what}");
+                        let plan = memoryless.expect(&what);
                         assert_eq!(plan.format, raw, "{what}");
                         assert!(
                             plan.usage.contains(
@@ -1591,9 +1495,8 @@ fn extended_range_textures_hold_their_bytes_raw() {
             .optimal(Format::R8G8B8A8_UNORM)
             .contains(FormatFeatureFlags2::COLOR_ATTACHMENT)
         {
-            let (plan, twin) = plan_images(&l, TextureUsage::RENDER_TARGET, true, &facts)
+            let plan = plan_image(&l, TextureUsage::RENDER_TARGET, true, &facts)
                 .unwrap_or_else(|e| panic!("{name}: a memoryless ARGB8Unorm texture: {e:?}"));
-            assert!(twin.is_none(), "{name}");
             assert_eq!(plan.format, Format::R8G8B8A8_UNORM, "{name}");
             assert!(
                 plan.usage.contains(
@@ -2008,67 +1911,15 @@ fn padded_formats_are_held_raw_from_every_creator() {
                 "{name} {pf:?}: {:?}",
                 plan.usage
             );
-            let (images, twin) = plan_images(&l, usage, false, &facts).expect(&name);
-            assert_eq!((images, twin), (plan, None), "{name}");
         }
     }
-}
-
-/// A decoded twin's plan holds its texels' own format, so its copies move texels (not the BC
-/// image's blocks, `copy_units`); a twin routed as its BC image's CPU copies go copies both
-/// ways, as the staging queue's images do; and its start, its zero blocks' decode, is BC1's
-/// opaque black and every other decode's zero.
-#[test]
-fn decoded_twins_are_planned_in_their_texels_format() {
-    use super::super::texture::copy_units;
-    use super::super::texture::decoded_twin::{twin_plan, TwinDecode};
-    use metal2vulkan::bind::BlockDecode;
-    let both = ImageUsageFlags::TRANSFER_SRC | ImageUsageFlags::TRANSFER_DST;
-    let mut planned = 0;
-    for (name, desc, device) in committed() {
-        let facts = facts(&desc, &device);
-        for &pf in PixelFormat::ALL {
-            let Some(decode) = BlockDecode::of(pf) else {
-                continue;
-            };
-            let texel = decode.texel_pixel_format();
-            assert_eq!(direct_format(texel), Some(decode.texel_format()), "{pf:?}");
-            let zero = decode.decode(&vec![0; decode.block_bytes() as usize], [1, 1, 1]);
-            let start = match decode == BlockDecode::Bc1 {
-                true => vec![0, 0, 0, 255],
-                false => vec![0; decode.texel_bytes() as usize],
-            };
-            assert_eq!(zero, start, "{pf:?}");
-            let l = layout(TextureType::Type2DArray, pf, 1, 3);
-            let Ok((plan, _)) = plan_images(&l, TextureUsage::SHADER_READ, false, &facts) else {
-                continue;
-            };
-            planned += 1;
-            for routed in [false, true] {
-                let twin = twin_plan(&plan, &l, TwinDecode::Block(decode), routed);
-                let what = format!("{name}: {pf:?}, routed {routed}");
-                assert_eq!(
-                    (twin.pixel_format, twin.format),
-                    (texel, decode.texel_format())
-                );
-                let unit = (ImageAspectFlags::COLOR, decode.texel_bytes(), [1, 1]);
-                assert_eq!(copy_units(twin.format, twin.pixel_format), [unit], "{what}");
-                assert!(twin.usage.contains(ImageUsageFlags::SAMPLED), "{what}");
-                assert!(twin.usage.contains(ImageUsageFlags::TRANSFER_DST), "{what}");
-                assert_eq!(twin.usage.contains(both), routed, "{what}");
-                let shape = |p: &ImagePlan| (p.image_type, p.extent, p.levels, p.layers, p.samples);
-                assert_eq!(shape(&twin), shape(&plan), "{what}");
-            }
-        }
-    }
-    assert!(planned > 0);
 }
 
 /// A decode pass's bands of a region cover each of its texels once, and each band's blocks and
 /// texels take at most the budget together, so a pass in the device's decode scratch
 /// (`PassScratch::Device`, of the budget and an alignment) holds any band; only a single block
-/// row of one image past the budget is a band alone. Regions of BC decodes, of ASTC ones
-/// (blocks of 12 x 10 and 4 x 4, texels of 16 and 4 bytes), PVRTC ones, ETC2 and EAC ones
+/// row of one image past the budget is a band alone. Regions of ASTC decodes (blocks of 12 x 10
+/// and 4 x 4, texels of 4 bytes), PVRTC ones, ETC2 and EAC ones
 /// (texels of 2, 8 and 4 bytes) and 4:2:2 ones (pairs of 2 x 1), square and narrow, of sides off a
 /// multiple of the block, of layers and of depth slices, under the band budget and two small ones
 /// that make them band.
@@ -2076,7 +1927,7 @@ fn decoded_twins_are_planned_in_their_texels_format() {
 fn decode_bands_cover_each_texel_once_within_the_budget() {
     use super::super::texture::decoded_twin::{bands, TwinDecode, BAND_BYTES};
     use metal2vulkan::bind::{
-        AstcDecode, AstcTexels, BlockDecode, ChromaDecode, EtcDecode, EtcTexels, PvrtcDecode,
+        AstcDecode, AstcTexels, ChromaDecode, EtcDecode, EtcTexels, PvrtcDecode,
     };
     let shapes: [([u32; 3], u32); 7] = [
         ([2048, 2048, 1], 1),
@@ -2089,10 +1940,7 @@ fn decode_bands_cover_each_texel_once_within_the_budget() {
     ];
     let astc = |pf| AstcDecode::of(pf).expect("an ASTC decode");
     let decodes = [
-        TwinDecode::Block(BlockDecode::Bc1),
-        TwinDecode::Block(BlockDecode::Bc3),
-        TwinDecode::Block(BlockDecode::Bc5Unorm),
-        TwinDecode::Astc(astc(PixelFormat::ASTC12x10LDR), AstcTexels::Float),
+        TwinDecode::Astc(astc(PixelFormat::ASTC12x10LDR), AstcTexels::Unorm8),
         TwinDecode::Astc(astc(PixelFormat::ASTC4x4SRGB), AstcTexels::Unorm8),
         TwinDecode::Pvrtc(PvrtcDecode::of(PixelFormat::PVRTCRGBA2BPP).expect("a PVRTC decode")),
         TwinDecode::Pvrtc(PvrtcDecode::of(PixelFormat::PVRTCRGB4BPP).expect("a PVRTC decode")),
@@ -2225,134 +2073,4 @@ fn astc_carriers_hold_each_level_s_blocks() {
         }
     }
     assert!(carried > 0, "no committed device holds ASTC in a carrier");
-}
-
-/// A multisampled `Depth32Float` texture the program only reads is held in its depth image under
-/// the default, as before, and in a multisampled `R32_SFLOAT` image of its shape under
-/// `MultisampleDepthTwinPolicy::Exact` on every committed profile whose depth image its driver is
-/// not measured to keep every `float` in; in its depth image elsewhere. It takes no `D32_SFLOAT`
-/// twin beside it under either value: Metal reads a `depth2d_ms` and compares nothing, and no copy
-/// writes a multisampled depth image from a colour one. A render target, a memoryless texture, a
-/// single-sampled one (which has the twin of its own row) and another depth format are held as
-/// before under both values.
-#[test]
-fn the_switch_holds_a_multisampled_depth_texture_s_texels_in_colour() {
-    use PixelFormat as P;
-    let read = TextureUsage::SHADER_READ;
-    let mut held = Vec::new();
-    for (name, desc, device) in committed() {
-        let default = facts(&desc, &device);
-        let switched = facts_holding_multisample_depth(&desc, &device);
-        let exact = default.depth_loss().is_none();
-        for samples in [2, 4] {
-            let l = layout(TextureType::Type2DMultisample, P::Depth32Float, samples, 1);
-            // Under the default: the depth image, as `plan_image` plans it.
-            let Ok((plan, twin)) = plan_images(&l, read, false, &default) else {
-                continue;
-            };
-            assert!(twin.is_none(), "{name}: {samples} samples, default");
-            assert_eq!(
-                plan,
-                plan_image(&l, read, false, &default).unwrap(),
-                "{name}: {samples} samples, default"
-            );
-            assert_eq!(
-                (plan.pixel_format, plan.format),
-                (P::Depth32Float, Format::D32_SFLOAT),
-                "{name}: {samples} samples, default"
-            );
-            // Under the switch: the colour image where the device's depth images may lose the
-            // texels and it holds a multisampled `R32_SFLOAT` it samples and copies.
-            let (switched_plan, switched_twin) =
-                plan_images(&l, read, false, &switched).expect(&name);
-            assert!(switched_twin.is_none(), "{name}: {samples} samples, switch");
-            let colour = switched_plan.format == Format::R32_SFLOAT;
-            if !colour {
-                assert_eq!(
-                    switched_plan, plan,
-                    "{name}: {samples} samples: no colour image, so the plan is the default's"
-                );
-                continue;
-            }
-            assert!(
-                !exact,
-                "{name}: {samples} samples: a colour image without a loss"
-            );
-            assert_eq!(
-                (
-                    switched_plan.pixel_format,
-                    switched_plan.mapping.aspects,
-                    switched_plan.extent,
-                    switched_plan.levels,
-                    switched_plan.layers,
-                    switched_plan.samples
-                ),
-                (
-                    P::Depth32Float,
-                    ImageAspectFlags::COLOR,
-                    plan.extent,
-                    plan.levels,
-                    plan.layers,
-                    plan.samples
-                ),
-                "{name}: {samples} samples"
-            );
-            assert!(
-                switched_plan.usage.contains(ImageUsageFlags::SAMPLED),
-                "{name}: {samples} samples"
-            );
-            assert!(
-                !switched_plan
-                    .usage
-                    .contains(ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT),
-                "{name}: {samples} samples: a read-only texture keeps no attachment usage"
-            );
-            // The plan every blit and binding reads the choice by (`Texture::holds_depth_in_colour`
-            // for the facts and `blit_texture::held` for the images a copy moves).
-            assert!(
-                holds_depth_in_colour(&switched_plan) && !holds_depth_in_colour(&plan),
-                "{name}: {samples} samples"
-            );
-            // Every copy of the texture's texels moves them in colour, 4 bytes a texel, as a
-            // texture with a depth twin's are: a fill of its samples
-            // (`blit_fill::sample_fill` through `blit_texture::unit`) and a copy between textures
-            // (`blit_plan::pair_unit`) alike.
-            assert_eq!(
-                copy_unit(P::Depth32Float, &switched_plan.mapping, BlitOption::None).ok(),
-                Some(CopyUnit {
-                    bytes: 4,
-                    extent: [1, 1],
-                    aspect: ImageAspectFlags::COLOR
-                }),
-                "{name}: {samples} samples"
-            );
-            assert_eq!(
-                copy_unit(P::Depth32Float, &plan.mapping, BlitOption::None)
-                    .map(|unit| unit.aspect)
-                    .ok(),
-                Some(ImageAspectFlags::DEPTH),
-                "{name}: {samples} samples, default"
-            );
-            held.push(format!("{name} {samples}"));
-        }
-        // A render target, a memoryless texture and another depth format are held as before.
-        for (usage, memoryless, pf) in [
-            (TextureUsage::RENDER_TARGET | read, false, P::Depth32Float),
-            (read, true, P::Depth32Float),
-            (read, false, P::Depth32FloatStencil8),
-        ] {
-            let l = layout(TextureType::Type2DMultisample, pf, 4, 1);
-            let before = plan_images(&l, usage, memoryless, &default);
-            let after = plan_images(&l, usage, memoryless, &switched);
-            assert_eq!(
-                before.ok(),
-                after.ok(),
-                "{name}: {pf:?} {usage:?} memoryless {memoryless}"
-            );
-        }
-    }
-    assert!(
-        !held.is_empty(),
-        "no committed profile holds a multisampled depth texture in colour under the switch"
-    );
 }

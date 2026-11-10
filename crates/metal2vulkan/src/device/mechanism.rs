@@ -35,14 +35,8 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         // Keyed by a per-slot StorageImageChoice, a separate per-function compile.
         RuntimeFact::StorageTextureFormat { .. }
         | RuntimeFact::StorageTextureNumericType { .. } => Mechanism::Variant,
-        // Keyed by the slots bound in an sRGB format whose raw code the function reads.
+        // Keyed by the slots bound to an sRGB format's UNORM twin, whose codes the function decodes.
         RuntimeFact::SrgbTexture { .. } => Mechanism::Variant,
-        // The binder views a bound 16-bit float texture in its unsigned integer alias at the
-        // slot's second binding, and binds the unsigned integer neutral there for any other.
-        RuntimeFact::HalfBitsTexture { .. } => Mechanism::BinderView,
-        // Keyed by the slots bound in a YCbCr format whose filter the function emulates on a
-        // profile that takes the variant (`ProfileFields::ycbcr_variant`).
-        RuntimeFact::YCbCrTexture { .. } => Mechanism::Variant,
         RuntimeFact::SamplerCoordinates { .. } => Mechanism::Specialization,
         RuntimeFact::SamplerReduction { .. } => Mechanism::PlanTimeCheck,
         RuntimeFact::ImageViewShape { .. } => Mechanism::BinderView,
@@ -116,8 +110,6 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         RuntimeFact::BicubicTexels { .. } => Mechanism::Specialization,
         // The binder writes the bound texture's level count per draw or dispatch.
         RuntimeFact::StorageTextureLevels { .. } => Mechanism::PushConstant,
-        // The binder writes whether the bound texture's channels are 16-bit floats.
-        RuntimeFact::StorageTextureHalfChannels { .. } => Mechanism::PushConstant,
         // The binder writes the bound texture's integer channel widths.
         RuntimeFact::StorageTextureIntegerChannels { .. } => Mechanism::PushConstant,
         // The binder views each level of the bound texture at its element.
@@ -188,12 +180,12 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         RuntimeFact::MergedDraws => Mechanism::Variant,
         RuntimeFact::QuadPrimitiveIds => Mechanism::Variant,
         RuntimeFact::PrivateList => Mechanism::Variant,
+        // Keyed by the slots bound to a texture whose planes are read in place, on a profile that
+        // reads them so (`ProfileFields::ycbcr_in_place`).
+        RuntimeFact::YCbCrInPlace { .. } => Mechanism::Variant,
         // The function marks the `ExecutionStatus` buffer its `ExecutionStatus` fact binds; the
         // consumer reads the bit after the command buffer.
         RuntimeFact::AbsentArgumentRead { .. } => Mechanism::None,
-        // The planner refuses an sRGB texture the device cannot sample at a slot the function
-        // decodes through the device.
-        RuntimeFact::SrgbDeviceDecode { .. } => Mechanism::PlanTimeCheck,
         // A separate compile of the pipeline, which a pass with colors the pipeline lacks asks
         // for.
         RuntimeFact::ZeroedColor { .. } | RuntimeFact::DroppedColor { .. } => Mechanism::Variant,
@@ -230,9 +222,6 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         // The planner admits a listed cubic sampler beside the stage's sampler table; the
         // function marks the `ExecutionStatus` buffer where it reaches one.
         RuntimeFact::CubicArgumentSampler { .. } => Mechanism::PlanTimeCheck,
-        // A pipeline compiled in the capture form, which a consumer asks for; its plans state
-        // it, and the binder writes each draw's capture layout.
-        RuntimeFact::CapturedPositions { .. } => Mechanism::Variant,
         // The planner refuses a texture a heap holds by its raw texels alone that a plan names
         // beside the stage; a consumer's own heap announces one.
         RuntimeFact::HeapRawSamples { .. } => Mechanism::PlanTimeCheck,
@@ -256,27 +245,8 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         // Keyed by the slots bound to a sampler whose word states anisotropy, where the
         // function's samples take Metal's anisotropic filter, emulated.
         RuntimeFact::AnisotropicSampler { .. } => Mechanism::Variant,
-        // The binder holds each half-float member the twin takes there; the consumer announces
-        // a member it does not take where its heap holds one.
-        RuntimeFact::HeapHalfTexelWrites { .. } => Mechanism::BinderView,
-        // The binder pushes the draw's depth bias; the consumer records its Vulkan bias as zero.
-        RuntimeFact::Depth16Codes { biased: true } => Mechanism::PushConstant,
-        // The function's returned depth, which Metal does not bias: nothing to meet.
-        RuntimeFact::Depth16Codes { biased: false } => Mechanism::None,
-        // A separate compile of the pipeline, which a pass whose depth is or is not
-        // `Depth16Unorm` where the pipeline names otherwise asks for.
-        RuntimeFact::Depth16Pass { .. } => Mechanism::Variant,
-        // A separate compile of the pipeline, which a draw that biases a `Depth16Unorm` depth
-        // asks for where the device stores its biased depths otherwise than Metal.
-        RuntimeFact::Depth16Biased => Mechanism::Variant,
-        // A separate compile of the pipeline, which a draw whose depth bias has a proven side
-        // asks for where the fragment stage adds the bias itself.
-        RuntimeFact::Depth16BiasSide { .. } => Mechanism::Variant,
         // The pipeline's own stages, which every draw of its class runs; the consumer announces
         // them.
         RuntimeFact::SynthesizedGeometry { .. } => Mechanism::None,
-        // The pipeline's exact forms were dropped to fit the device's compiler word bound; the
-        // consumer announces it, and the reduced stages carry their own notes.
-        RuntimeFact::ExactFormsOverCompilerLimit { .. } => Mechanism::None,
     }
 }

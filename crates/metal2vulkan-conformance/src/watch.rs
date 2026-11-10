@@ -4,7 +4,7 @@
 //! does: [`crate::validated`] announces the call's name so the parent process can attribute
 //! Metal's own output to it, and [`crate::times`] measures what the call cost. Both want the same
 //! narrow span — around the Metal or Vulkan call and nothing else — and neither wants to reach
-//! inside [`crate::metal_side::MetalSide`] or [`crate::runtime_side::RuntimeSide`], because a span
+//! inside `metal_side::MetalSide` or [`crate::runtime_side::RuntimeSide`], because a span
 //! placed separately in each of them is two spans that can drift apart, and a cost comparison of
 //! two legs measured in different places is not a comparison.
 //!
@@ -1031,7 +1031,6 @@ mod tests {
                 device: "stub".to_owned(),
                 driver: "stub".to_owned(),
                 api: "stub".to_owned(),
-                metal_level: "stub".to_owned(),
             }
         }
 
@@ -1183,7 +1182,6 @@ mod tests {
                     device: "slow".to_owned(),
                     driver: "slow".to_owned(),
                     api: "slow".to_owned(),
-                    metal_level: "slow".to_owned(),
                 }
             }
             fn library(&mut self, _source: &ShaderSource<'_>) -> Answer<Handle> {

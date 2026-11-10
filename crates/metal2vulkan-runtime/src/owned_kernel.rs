@@ -8,7 +8,8 @@
 //!   push range, and the compute pipeline. The device keeps them
 //!   ([`OwnedKernels`]) and destroys them with itself; a command buffer holds its device, so a
 //!   kernel outlives every command that records it. The mipmap filter is one kernel per
-//!   `MipmapFilterKernel` a chain dispatches (a format's few steps; bounded by the formats), and
+//!   `MipmapFilterKernel` a chain dispatches (a format's 2D and 3D steps, fetching or not;
+//!   bounded by the formats), and
 //!   the index rewrite one per `RewriteProgram` and `RewritePhase` (closed enums of a few).
 //! - **Descriptor sets** ([`OwnedSets`]): one set per dispatch of a command, each written with the
 //!   command's image views and buffer ranges, from a fitted arena of their own
@@ -29,16 +30,16 @@ use super::device::lock;
 use super::error::{internal, vulkan, Error};
 use super::release;
 use super::texture::decoded_twin::TwinDecode;
+use super::ycbcr_device::YCbCrSampler;
 use super::Device;
 use crate::device::functions::Vk;
 use crate::shader_cache::driver::Making;
 use ash::vk;
 use metal2vulkan::bind::{
-    CompressedBlit, MipmapFilterKernel, RewritePhase, RewriteProgram, ShadowMergeRead,
-    ShadowTexelView, TessellationScanKernel, TexelWords, YCbCrConversion,
+    MipmapFilterKernel, RewritePhase, RewriteProgram, ShadowMergeRead, ShadowMergeStores,
+    ShadowTexelView, TessellationScanKernel, YCbCrCodes, YCbCrConversion,
 };
 use metal2vulkan::metal::format::ExtendedRange;
-use metal2vulkan::metal::PixelFormat;
 use std::collections::HashMap;
 
 /// A crate-owned module the runtime dispatches.
@@ -80,13 +81,10 @@ pub(super) enum OwnedModule {
     /// flat variant, from Metal's arguments (`indirect_dispatch.rs`). No descriptor: it reaches
     /// memory by device address.
     FlatDispatch,
-    /// `bind::shadow_merge_module`: a shadowed texture's writes merged into its buffer's bytes
-    /// after a command that also wrote them another way (`shadow_merge.rs`).
-    ShadowMerge,
-    /// `bind::depth_magnitude_module`: a 32-bit float depth's magnitude stand-in, written before a
-    /// pass that renders over it, and the pass's words merged back into the depth after it
-    /// (`signed_depth.rs`).
-    DepthMagnitude,
+    /// `bind::shadow_merge_module` storing in one form (`ShadowMergeStores`): a shadowed
+    /// texture's writes merged into its buffer's bytes (`shadow_merge.rs`), or a linear
+    /// attachment's pass into its surface's (`linear_merge.rs`).
+    ShadowMerge(ShadowMergeStores),
     /// `bind::shadow_copy_back_module` of one view of a texel (`ShadowTexelView`): a shadowed
     /// texture's texels stored back into its buffer's rows by a dispatch, where the device copies
     /// back faster so (`shadow_copy_back.rs`). Its shadow's unsigned-integer view is its sampled
@@ -99,20 +97,19 @@ pub(super) enum OwnedModule {
     /// texture's writes merged into its buffer's bytes, reading its shadow's texels through its
     /// unsigned-integer view or its own 8-bit unsigned normalized view, its sampled image
     /// (`shadow_merge.rs`).
-    ShadowMergeImage(ShadowMergeRead),
+    ShadowMergeImage(ShadowMergeRead, ShadowMergeStores),
     /// `bind::shadow_merge_kept_image_module` of one view of a texel (`ShadowTexelView`): as
     /// [`OwnedModule::ShadowMergeImage`], the texels before the commands read from an image copy
     /// of the shadow, its second sampled image (`shadow_merge.rs`).
-    ShadowMergeKeptImage(ShadowTexelView),
+    ShadowMergeKeptImage(ShadowTexelView, ShadowMergeStores),
     /// `bind::shadow_copy_in_module` of one view of a texel (`ShadowTexelView`): a merged
     /// shadowed texture's texels copied in from its buffer's rows and kept in its merge's scratch
     /// by one dispatch (`shadow_copy_in.rs`). Its shadow's unsigned-integer view is its storage
     /// image.
     ShadowCopyIn(ShadowTexelView),
     /// `bind::mipmap_filter_module` of one kernel: a level of a mipmap chain from the level
-    /// above it, as Metal's filter computes it (`mipmap_filter.rs`); a kernel that fetches the
-    /// first level binds its sampled view first. Needs `shaderInt64`: a device without it fails
-    /// to build it with `Unsupported`.
+    /// above it, by the compute filter of a format the device's blits cannot filter
+    /// (`mipmap_filter.rs`); a kernel that fetches the first level binds its sampled view first.
     MipmapFilter(MipmapFilterKernel),
     /// `bind::mesh_scan_module`: a scanned emulated mesh draw's mesh threadgroups, records and
     /// draw (`render/mesh.rs`).
@@ -148,6 +145,16 @@ pub(super) enum OwnedModule {
     /// the device reads through, within the two-plane formats' layouts and the ranges and
     /// matrices they convert under.
     YCbCrConvert(YCbCrConversion, bool),
+    /// `bind::ycbcr_sample_module`: a YCbCr texture's planes' image sampled through the device's
+    /// own Y′CbCr conversion into its image, the output of the codes; its layout bakes the
+    /// conversion's sampler, made with the first kernel of it and released with the device
+    /// (`ycbcr_device.rs`). One per sampler and output a texture of the device reads through.
+    YCbCrSample(YCbCrSampler, YCbCrCodes),
+    /// `bind::chroma_sample_module`: a 4:2:2 texture's pairs' image sampled through the device's
+    /// own Y′CbCr conversion into a band of its decoded twin's texels
+    /// (`texture/decoded_twin.rs`); its layout bakes the conversion's sampler, as
+    /// [`YCbCrSample`](Self::YCbCrSample)'s does. One per sampler (a format, two at most).
+    ChromaSample(YCbCrSampler),
     /// `bind::ycbcr_refresh_module`: a YCbCr texture's planes compared with the copy its last
     /// conversion read, the changed words stored over it, and the conversion's indirect group
     /// count written where any changed (`ycbcr.rs`).
@@ -161,26 +168,9 @@ pub(super) enum OwnedModule {
     /// `bind::ycbcr_write_module`: a 4:4:4 YCbCr texture's written texels encoded into its
     /// surface's two planes (`ycbcr.rs`), its write shadow bound as a storage image.
     YCbCrWrite,
-    /// `bind::unused_bits_module` of one format held as one kind of words: an extended-range,
-    /// padded 10-bit or bfloat texture's words (or, under `TileStorePolicy::Exact`, a signed
-    /// normalized or `RGB9E5Float` one's) in the tiles a mask names rewritten as Metal's tile
-    /// store leaves them, before a pass that loads it and draws (`render/unused_bits_load.rs`).
-    UnusedBits(PixelFormat, TexelWords),
     /// `bind::tiled_texels_module`: a heap texture's elements moved between its image's tight
     /// copy and Metal's tiles in the heap's bytes (`texture/heap_tiled.rs`).
     TiledTexels,
-    /// `bind::compressed_blit_module` of one rule: the texels a blit wrote rewritten as Metal's
-    /// blit through a losslessly compressed texture writes them (`compressed_blit.rs`).
-    CompressedBlit(CompressedBlit),
-    /// `bind::capture_assembly_module`: a pass's capture records assembled into its primitives
-    /// (`render/capture.rs`).
-    CaptureAssembly,
-    /// `bind::tile_reach_module`: a pass's primitives binned into the tiles they reach. Needs
-    /// `shaderInt64`: a device without it fails to build it with `Unsupported`.
-    TileReach,
-    /// `bind::capture_settle_module`: the mask made every tile where a primitive's reach was not
-    /// measured, reported in the status words.
-    CaptureSettle,
     /// `bind::extended_shadow_module` of one form: an extended-range attachment's `half` shadow
     /// set from its codes before the instance whose draws first hold it
     /// (`render/extended_shadow.rs`). Two storage images: the codes, then the shadow.
@@ -191,9 +181,8 @@ pub(super) enum OwnedModule {
     /// record's region, its unit's counter, Metal's word, its loop's flag and the overflow word.
     PredicationStep,
     /// The GPU decode of one decoded twin's blocks (`TwinDecode::module`:
-    /// `bind::block_decode_module`, `bind::astc_decode_module`): a BC1 to BC5 texture's or an
-    /// ASTC carrier's written region decoded as Metal decodes it into its decoded twin
-    /// (`texture/decoded_twin.rs`).
+    /// `bind::astc_decode_module` and the other carriers' modules): a carrier's written region
+    /// decoded as Metal decodes it into its decoded twin (`texture/decoded_twin.rs`).
     TwinDecode(TwinDecode),
     /// `bind::tessellation_scan_module` of one pipeline's tessellation state: an emulated patch
     /// draw's records and chunk draws (`render/tessellation_scan.rs`). One per state a pipeline
@@ -207,8 +196,10 @@ impl OwnedModule {
     fn images(self) -> u32 {
         match self {
             OwnedModule::MipmapFilter(kernel) => u32::from(kernel.fetches()),
-            OwnedModule::ShadowCopyBack(_) | OwnedModule::ShadowMergeImage(_) => 1,
-            OwnedModule::ShadowMergeKeptImage(_) => 2,
+            OwnedModule::ShadowCopyBack(_) | OwnedModule::ShadowMergeImage(..) => 1,
+            OwnedModule::ShadowMergeKeptImage(..) => 2,
+            // The combined image sampler of the planes' (or pairs') image.
+            OwnedModule::YCbCrSample(..) | OwnedModule::ChromaSample(_) => 1,
             _ => 0,
         }
     }
@@ -223,9 +214,9 @@ impl OwnedModule {
             OwnedModule::RowsCopy
                 | OwnedModule::ShadowCopyBack(_)
                 | OwnedModule::ShadowCopyIn(_)
-                | OwnedModule::ShadowMerge
-                | OwnedModule::ShadowMergeImage(_)
-                | OwnedModule::ShadowMergeKeptImage(_)
+                | OwnedModule::ShadowMerge(_)
+                | OwnedModule::ShadowMergeImage(..)
+                | OwnedModule::ShadowMergeKeptImage(..)
         ) && device.shared().vk().push_descriptor().is_some()
     }
 
@@ -233,6 +224,7 @@ impl OwnedModule {
     fn storage_images(self) -> u32 {
         match self {
             OwnedModule::YCbCrConvert(..)
+            | OwnedModule::YCbCrSample(..)
             | OwnedModule::YCbCrWrite
             | OwnedModule::ShadowCopyIn(_) => 1,
             OwnedModule::ExtendedShadowLoad(_) => 2,
@@ -319,17 +311,12 @@ impl OwnedModule {
                 let push_bytes = metal2vulkan::bind::FlatDispatchModule::PUSH_BYTES;
                 Ok((module.spirv.to_vec(), 0, push_bytes))
             }
-            OwnedModule::ShadowMerge => {
-                let module = metal2vulkan::bind::shadow_merge_module(device.compile_device())
-                    .map_err(Error::Compile)?;
+            OwnedModule::ShadowMerge(stores) => {
+                let module =
+                    metal2vulkan::bind::shadow_merge_module(device.compile_device(), stores)
+                        .map_err(Error::Compile)?;
                 let push_bytes = metal2vulkan::bind::ShadowMergeModule::PUSH_BYTES;
                 Ok((module.spirv.to_vec(), 3, push_bytes))
-            }
-            OwnedModule::DepthMagnitude => {
-                let module = metal2vulkan::bind::depth_magnitude_module(device.compile_device())
-                    .map_err(Error::Compile)?;
-                let push_bytes = metal2vulkan::bind::DepthMagnitudeModule::PUSH_BYTES;
-                Ok((module.spirv.to_vec(), 2, push_bytes))
             }
             OwnedModule::ShadowCopyBack(view) => {
                 let module =
@@ -344,17 +331,21 @@ impl OwnedModule {
                 let push_bytes = metal2vulkan::bind::RowsCopyModule::PUSH_BYTES;
                 Ok((module.spirv.to_vec(), 2, push_bytes))
             }
-            OwnedModule::ShadowMergeImage(read) => {
-                let module =
-                    metal2vulkan::bind::shadow_merge_image_module(device.compile_device(), read)
-                        .map_err(Error::Compile)?;
+            OwnedModule::ShadowMergeImage(read, stores) => {
+                let module = metal2vulkan::bind::shadow_merge_image_module(
+                    device.compile_device(),
+                    read,
+                    stores,
+                )
+                .map_err(Error::Compile)?;
                 let push_bytes = metal2vulkan::bind::ShadowMergeImageModule::PUSH_BYTES;
                 Ok((module.spirv.to_vec(), 2, push_bytes))
             }
-            OwnedModule::ShadowMergeKeptImage(view) => {
+            OwnedModule::ShadowMergeKeptImage(view, stores) => {
                 let module = metal2vulkan::bind::shadow_merge_kept_image_module(
                     device.compile_device(),
                     view,
+                    stores,
                 )
                 .map_err(Error::Compile)?;
                 let push_bytes = metal2vulkan::bind::ShadowMergeImageModule::PUSH_BYTES;
@@ -371,7 +362,7 @@ impl OwnedModule {
                 let module =
                     metal2vulkan::bind::mipmap_filter_module(device.compile_device(), kernel)
                         .map_err(Error::Compile)?;
-                Ok((module.spirv.to_vec(), 5 - u32::from(kernel.fetches()), 0))
+                Ok((module.spirv.to_vec(), 3 - u32::from(kernel.fetches()), 0))
             }
             OwnedModule::MeshScan => {
                 let module = metal2vulkan::bind::mesh_scan_module(device.compile_device())
@@ -422,6 +413,18 @@ impl OwnedModule {
                 .map_err(Error::Compile)?;
                 Ok((module.spirv.to_vec(), 2, 0))
             }
+            OwnedModule::YCbCrSample(_, codes) => {
+                let module =
+                    metal2vulkan::bind::ycbcr_sample_module(device.compile_device(), codes)
+                        .map_err(Error::Compile)?;
+                let push_bytes = metal2vulkan::bind::YCbCrSampleModule::PUSH_BYTES;
+                Ok((module.spirv.to_vec(), 0, push_bytes))
+            }
+            OwnedModule::ChromaSample(_) => {
+                let module = metal2vulkan::bind::chroma_sample_module(device.compile_device())
+                    .map_err(Error::Compile)?;
+                Ok((module.spirv.to_vec(), 2, 0))
+            }
             OwnedModule::RotateTexels => {
                 let module = metal2vulkan::bind::rotate_texels_module(device.compile_device())
                     .map_err(Error::Compile)?;
@@ -450,33 +453,6 @@ impl OwnedModule {
             }
             OwnedModule::TiledTexels => {
                 let module = metal2vulkan::bind::tiled_texels_module(device.compile_device())
-                    .map_err(Error::Compile)?;
-                Ok((module.spirv.to_vec(), 3, 0))
-            }
-            OwnedModule::UnusedBits(format, words) => {
-                let device = device.compile_device();
-                let module = metal2vulkan::bind::unused_bits_module(device, format, words)
-                    .map_err(Error::Compile)?;
-                Ok((module.spirv.to_vec(), 3, 0))
-            }
-            OwnedModule::CompressedBlit(rule) => {
-                let device = device.compile_device();
-                let module = metal2vulkan::bind::compressed_blit_module(device, rule)
-                    .map_err(Error::Compile)?;
-                Ok((module.spirv.to_vec(), 1, 0))
-            }
-            OwnedModule::CaptureAssembly => {
-                let module = metal2vulkan::bind::capture_assembly_module(device.compile_device())
-                    .map_err(Error::Compile)?;
-                Ok((module.spirv.to_vec(), 3, 0))
-            }
-            OwnedModule::TileReach => {
-                let module = metal2vulkan::bind::tile_reach_module(device.compile_device())
-                    .map_err(Error::Compile)?;
-                Ok((module.spirv.to_vec(), 3, 0))
-            }
-            OwnedModule::CaptureSettle => {
-                let module = metal2vulkan::bind::capture_settle_module(device.compile_device())
                     .map_err(Error::Compile)?;
                 Ok((module.spirv.to_vec(), 3, 0))
             }
@@ -528,6 +504,10 @@ pub(super) struct OwnedKernel {
     /// Whether set 0's layout is a push descriptor set's: its dispatches push their descriptors
     /// (`vkCmdPushDescriptorSetKHR`) in place of a set from a pool.
     pub(super) pushed: bool,
+    /// The descriptors its first binding takes from a pool where that binding is the combined
+    /// image sampler of a sampler of the device's Y′CbCr conversion its layout bakes
+    /// (`combinedImageSamplerDescriptorCount`, `ycbcr_device.rs`); 0 for every other kernel.
+    combined: u8,
 }
 
 impl OwnedKernel {
@@ -561,10 +541,10 @@ pub(super) struct OwnedKernels {
     draw_merge_starts: Option<OwnedKernel>,
     flat_dispatch: Option<OwnedKernel>,
     shadow_merge: Option<OwnedKernel>,
-    depth_magnitude: Option<OwnedKernel>,
+    shadow_merge_blocks: Option<OwnedKernel>,
     shadow_copy_backs: HashMap<ShadowTexelView, OwnedKernel>,
-    shadow_merge_images: HashMap<ShadowMergeRead, OwnedKernel>,
-    shadow_merge_kept_images: HashMap<ShadowTexelView, OwnedKernel>,
+    shadow_merge_images: HashMap<(ShadowMergeRead, ShadowMergeStores), OwnedKernel>,
+    shadow_merge_kept_images: HashMap<(ShadowTexelView, ShadowMergeStores), OwnedKernel>,
     shadow_copy_ins: HashMap<ShadowTexelView, OwnedKernel>,
     mipmap_filters: HashMap<MipmapFilterKernel, OwnedKernel>,
     mesh_scan: Option<OwnedKernel>,
@@ -580,15 +560,16 @@ pub(super) struct OwnedKernels {
     rows_copy: Option<OwnedKernel>,
     ycbcr_refresh: Option<OwnedKernel>,
     ycbcr_converts: HashMap<(YCbCrConversion, bool), OwnedKernel>,
+    ycbcr_samples: HashMap<(YCbCrSampler, YCbCrCodes), OwnedKernel>,
+    chroma_samples: HashMap<YCbCrSampler, OwnedKernel>,
+    /// The conversions and samplers the YCbCr and 4:2:2 sample kernels' layouts bake, made with
+    /// the first kernel of each (or the first planes image or layout of a planes sampler,
+    /// [`Device::made_ycbcr_conversion`]) and released with the device.
+    ycbcr_samplers: HashMap<YCbCrSampler, (vk::SamplerYcbcrConversion, vk::Sampler)>,
     two_plane_texels: Option<OwnedKernel>,
     plane_bytes_copy: Option<OwnedKernel>,
     ycbcr_write: Option<OwnedKernel>,
-    unused_bits: HashMap<(PixelFormat, TexelWords), OwnedKernel>,
     tiled_texels: Option<OwnedKernel>,
-    compressed_blits: HashMap<CompressedBlit, OwnedKernel>,
-    capture_assembly: Option<OwnedKernel>,
-    tile_reach: Option<OwnedKernel>,
-    capture_settle: Option<OwnedKernel>,
     extended_shadow_loads: HashMap<ExtendedRange, OwnedKernel>,
     predication_step: Option<OwnedKernel>,
     twin_decodes: HashMap<TwinDecode, OwnedKernel>,
@@ -613,7 +594,7 @@ impl OwnedKernels {
             self.draw_merge_starts,
             self.flat_dispatch,
             self.shadow_merge,
-            self.depth_magnitude,
+            self.shadow_merge_blocks,
             self.mesh_scan,
             self.mesh_object_arguments,
             self.mesh_arguments_mesh,
@@ -628,9 +609,6 @@ impl OwnedKernels {
             self.plane_bytes_copy,
             self.ycbcr_write,
             self.tiled_texels,
-            self.capture_assembly,
-            self.tile_reach,
-            self.capture_settle,
             self.predication_step,
         ]
         .into_iter()
@@ -643,23 +621,47 @@ impl OwnedKernels {
         .chain(self.index_rewrites.values().copied())
         .chain(self.index_rewrite_runs.values().copied())
         .chain(self.ycbcr_converts.values().copied())
-        .chain(self.unused_bits.values().copied())
-        .chain(self.compressed_blits.values().copied())
+        .chain(self.ycbcr_samples.values().copied())
+        .chain(self.chroma_samples.values().copied())
         .chain(self.extended_shadow_loads.values().copied())
         .chain(self.twin_decodes.values().copied())
         .chain(self.tessellation_scans.values().copied())
         {
             kernel.destroy(raw);
         }
+        for &(conversion, sampler) in self.ycbcr_samplers.values() {
+            // SAFETY: as above; the kernels whose layouts bake them are destroyed.
+            unsafe {
+                release::object(raw, sampler);
+                release::object(raw, conversion);
+            }
+        }
+    }
+
+    /// The device's conversion of `sampler` and the sampler of it that the YCbCr sample kernels
+    /// of `sampler` bake, made on first use; the sampler counted against the device's samplers.
+    fn ycbcr_sampler(
+        &mut self,
+        device: &Device,
+        sampler: YCbCrSampler,
+    ) -> Result<(vk::SamplerYcbcrConversion, vk::Sampler), Error> {
+        if let Some(&made) = self.ycbcr_samplers.get(&sampler) {
+            return Ok(made);
+        }
+        let made = sampler.make(device)?;
+        self.ycbcr_samplers.insert(sampler, made);
+        Ok(made)
     }
 
     /// The kernel of `which`, where the device has made it.
     fn get(&mut self, which: OwnedModule) -> Option<OwnedKernel> {
         match which {
             OwnedModule::ShadowCopyBack(view) => self.shadow_copy_backs.get(&view).copied(),
-            OwnedModule::ShadowMergeImage(read) => self.shadow_merge_images.get(&read).copied(),
-            OwnedModule::ShadowMergeKeptImage(view) => {
-                self.shadow_merge_kept_images.get(&view).copied()
+            OwnedModule::ShadowMergeImage(read, stores) => {
+                self.shadow_merge_images.get(&(read, stores)).copied()
+            }
+            OwnedModule::ShadowMergeKeptImage(view, stores) => {
+                self.shadow_merge_kept_images.get(&(view, stores)).copied()
             }
             OwnedModule::ShadowCopyIn(view) => self.shadow_copy_ins.get(&view).copied(),
             OwnedModule::MipmapFilter(kernel) => self.mipmap_filters.get(&kernel).copied(),
@@ -670,10 +672,10 @@ impl OwnedKernels {
             OwnedModule::YCbCrConvert(conversion, floats) => {
                 self.ycbcr_converts.get(&(conversion, floats)).copied()
             }
-            OwnedModule::UnusedBits(format, words) => {
-                self.unused_bits.get(&(format, words)).copied()
+            OwnedModule::YCbCrSample(sampler, codes) => {
+                self.ycbcr_samples.get(&(sampler, codes)).copied()
             }
-            OwnedModule::CompressedBlit(rule) => self.compressed_blits.get(&rule).copied(),
+            OwnedModule::ChromaSample(sampler) => self.chroma_samples.get(&sampler).copied(),
             OwnedModule::ExtendedShadowLoad(form) => self.extended_shadow_loads.get(&form).copied(),
             OwnedModule::TwinDecode(decode) => self.twin_decodes.get(&decode).copied(),
             OwnedModule::TessellationScan(kernel) => self.tessellation_scans.get(&kernel).copied(),
@@ -687,11 +689,11 @@ impl OwnedKernels {
             OwnedModule::ShadowCopyBack(view) => {
                 self.shadow_copy_backs.insert(view, kernel);
             }
-            OwnedModule::ShadowMergeImage(read) => {
-                self.shadow_merge_images.insert(read, kernel);
+            OwnedModule::ShadowMergeImage(read, stores) => {
+                self.shadow_merge_images.insert((read, stores), kernel);
             }
-            OwnedModule::ShadowMergeKeptImage(view) => {
-                self.shadow_merge_kept_images.insert(view, kernel);
+            OwnedModule::ShadowMergeKeptImage(view, stores) => {
+                self.shadow_merge_kept_images.insert((view, stores), kernel);
             }
             OwnedModule::ShadowCopyIn(view) => {
                 self.shadow_copy_ins.insert(view, kernel);
@@ -708,11 +710,11 @@ impl OwnedKernels {
             OwnedModule::YCbCrConvert(conversion, floats) => {
                 self.ycbcr_converts.insert((conversion, floats), kernel);
             }
-            OwnedModule::UnusedBits(format, words) => {
-                self.unused_bits.insert((format, words), kernel);
+            OwnedModule::YCbCrSample(sampler, codes) => {
+                self.ycbcr_samples.insert((sampler, codes), kernel);
             }
-            OwnedModule::CompressedBlit(rule) => {
-                self.compressed_blits.insert(rule, kernel);
+            OwnedModule::ChromaSample(sampler) => {
+                self.chroma_samples.insert(sampler, kernel);
             }
             OwnedModule::ExtendedShadowLoad(form) => {
                 self.extended_shadow_loads.insert(form, kernel);
@@ -754,18 +756,18 @@ impl OwnedKernels {
                 &mut self.draw_merge_starts
             }
             OwnedModule::FlatDispatch => &mut self.flat_dispatch,
-            OwnedModule::ShadowMerge => &mut self.shadow_merge,
-            OwnedModule::DepthMagnitude => &mut self.depth_magnitude,
+            OwnedModule::ShadowMerge(ShadowMergeStores::Words) => &mut self.shadow_merge,
+            OwnedModule::ShadowMerge(ShadowMergeStores::Blocks) => &mut self.shadow_merge_blocks,
             OwnedModule::ShadowCopyBack(_)
-            | OwnedModule::ShadowMergeImage(_)
-            | OwnedModule::ShadowMergeKeptImage(_)
+            | OwnedModule::ShadowMergeImage(..)
+            | OwnedModule::ShadowMergeKeptImage(..)
             | OwnedModule::ShadowCopyIn(_)
             | OwnedModule::MipmapFilter(_)
             | OwnedModule::IndexRewrite(..)
             | OwnedModule::IndexRewriteRun(_)
             | OwnedModule::YCbCrConvert(..)
-            | OwnedModule::UnusedBits(..)
-            | OwnedModule::CompressedBlit(_)
+            | OwnedModule::YCbCrSample(..)
+            | OwnedModule::ChromaSample(_)
             | OwnedModule::ExtendedShadowLoad(_)
             | OwnedModule::TwinDecode(_)
             | OwnedModule::TessellationScan(_) => return None,
@@ -790,15 +792,38 @@ impl OwnedKernels {
             OwnedModule::PlaneBytesCopy => &mut self.plane_bytes_copy,
             OwnedModule::YCbCrWrite => &mut self.ycbcr_write,
             OwnedModule::TiledTexels => &mut self.tiled_texels,
-            OwnedModule::CaptureAssembly => &mut self.capture_assembly,
-            OwnedModule::TileReach => &mut self.tile_reach,
-            OwnedModule::CaptureSettle => &mut self.capture_settle,
             OwnedModule::PredicationStep => &mut self.predication_step,
         })
     }
 }
 
 impl Device {
+    /// The device's Y′CbCr conversion of `sampler` that its YCbCr sample kernels bake, where a
+    /// kernel of it was made ([`OwnedKernels::ycbcr_sampler`]): an image view such a kernel
+    /// samples is made with it.
+    pub(super) fn ycbcr_conversion(
+        &self,
+        sampler: YCbCrSampler,
+    ) -> Option<vk::SamplerYcbcrConversion> {
+        let kernels = lock(&self.shared().owned_kernels);
+        let made = kernels.ycbcr_samplers.get(&sampler);
+        made.map(|&(conversion, _)| conversion)
+    }
+
+    /// The device's Y′CbCr conversion of `sampler` ([`OwnedKernels::ycbcr_sampler`]), made on
+    /// first use: a planes image's view (`texture/ycbcr_planes.rs`) and every immutable sampler
+    /// of it a pipeline's layout bakes (`pipeline/objects.rs`'s `sampler_set`) are made with this
+    /// one conversion, so each sampler's `VkSamplerYcbcrConversionInfo` is identically defined to
+    /// the view's (`VUID-VkWriteDescriptorSet-descriptorType-02738`).
+    pub(super) fn made_ycbcr_conversion(
+        &self,
+        sampler: YCbCrSampler,
+    ) -> Result<vk::SamplerYcbcrConversion, Error> {
+        let mut kernels = lock(&self.shared().owned_kernels);
+        let (conversion, _) = kernels.ycbcr_sampler(self, sampler)?;
+        Ok(conversion)
+    }
+
     /// The kernel of `which`, made on first use.
     pub(super) fn owned_kernel(&self, which: OwnedModule) -> Result<OwnedKernel, Error> {
         // A making's turn before the lock (`budget::helper_turn`): none where it is made.
@@ -811,7 +836,20 @@ impl Device {
         }
         let (spirv, buffers, push_bytes) = which.build(self)?;
         let bindings = (which.images(), which.storage_images(), buffers);
-        let kernel = make(self, &spirv, bindings, (push_bytes, which.pushed(self)))?;
+        let baked = match which {
+            OwnedModule::YCbCrSample(sampler, ..) | OwnedModule::ChromaSample(sampler) => {
+                let (_, made) = kernels.ycbcr_sampler(self, sampler)?;
+                Some((made, sampler.descriptors))
+            }
+            _ => None,
+        };
+        let kernel = make(
+            self,
+            &spirv,
+            bindings,
+            (push_bytes, which.pushed(self)),
+            baked,
+        )?;
         // Counted here, so the build attributes to the call that first needed the kernel rather
         // than to whichever path the kernel serves (`WorkCounts::owned_kernels_made`).
         self.shared().counts.owned_kernel_made(spirv.len());
@@ -822,15 +860,21 @@ impl Device {
 
 /// The objects of a kernel of `spirv` (entry point `main`) with `images` sampled images, then
 /// `storage_images` storage images and then `buffers` storage buffers in set 0, a push descriptor
-/// set's where `pushed`, and `push_bytes` of `COMPUTE` push constants.
+/// set's where `pushed`, and `push_bytes` of `COMPUTE` push constants. With `baked`, a sampler
+/// of a Y′CbCr conversion and the descriptors a combined image sampler of it takes, its first
+/// binding is that combined image sampler, the sampler immutable.
 fn make(
     device: &Device,
     spirv: &[u32],
     (images, storage_images, buffers): (u32, u32, u32),
     (push_bytes, pushed): (u32, bool),
+    baked: Option<(vk::Sampler, u32)>,
 ) -> Result<OwnedKernel, Error> {
     let shared = device.shared();
     let raw = shared.vk();
+    let (sampler, combined) = baked.unwrap_or((vk::Sampler::null(), 0));
+    let combined =
+        u8::try_from(combined).map_err(|_| internal("a YCbCr format of too many planes"))?;
     let mut kernel = OwnedKernel {
         module: vk::ShaderModule::null(),
         set_layout: vk::DescriptorSetLayout::null(),
@@ -840,7 +884,9 @@ fn make(
         storage_images,
         buffers,
         pushed,
+        combined,
     };
+    let immutable = [sampler];
     let made = (|| {
         let info = vk::ShaderModuleCreateInfo::default().code(spirv);
         // SAFETY: the code is live SPIR-V words for the call.
@@ -848,11 +894,15 @@ fn make(
         let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> =
             (0..images + storage_images + buffers)
                 .map(|binding| {
-                    vk::DescriptorSetLayoutBinding::default()
+                    let info = vk::DescriptorSetLayoutBinding::default()
                         .binding(binding)
-                        .descriptor_type(descriptor_type(binding, images, storage_images))
+                        .descriptor_type(kernel.descriptor_type(binding))
                         .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE);
+                    match kernel.baked(binding) {
+                        true => info.immutable_samplers(&immutable),
+                        false => info,
+                    }
                 })
                 .collect();
         let mut info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
@@ -923,6 +973,23 @@ fn descriptor_type(binding: u32, images: u32, storage_images: u32) -> vk::Descri
     }
 }
 
+impl OwnedKernel {
+    /// Whether binding `binding` of its set 0 is the combined image sampler of a baked Y′CbCr
+    /// conversion's sampler.
+    fn baked(&self, binding: u32) -> bool {
+        binding == 0 && self.combined > 0
+    }
+
+    /// The type of binding `binding` of its set 0: [`descriptor_type`]'s, but the combined image
+    /// sampler of a baked sampler.
+    fn descriptor_type(&self, binding: u32) -> vk::DescriptorType {
+        match self.baked(binding) {
+            true => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            false => descriptor_type(binding, self.images, self.storage_images),
+        }
+    }
+}
+
 /// What one set of an [`OwnedKernel`] binds: its sampled images' views, then its storage images'
 /// views, each in the `GENERAL` layout, then its storage buffers' `(buffer, offset, range)`.
 pub(super) struct OwnedSet {
@@ -950,8 +1017,13 @@ impl OwnedKernel {
     /// What one set of its set 0 takes from a pool: its sampled images, storage images and
     /// storage buffers (`SetNeeds`, by raw type ascending, each count above 0).
     fn set_needs(&self) -> SetNeeds {
+        let baked = u32::from(self.combined > 0);
         let counts = [
-            (vk::DescriptorType::SAMPLED_IMAGE, self.images),
+            (
+                vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                u32::from(self.combined),
+            ),
+            (vk::DescriptorType::SAMPLED_IMAGE, self.images - baked),
             (vk::DescriptorType::STORAGE_IMAGE, self.storage_images),
             (vk::DescriptorType::STORAGE_BUFFER, self.buffers),
         ];
@@ -1046,13 +1118,15 @@ impl OwnedSets {
             .collect();
         let mut writes = Vec::new();
         let infos = image_infos.iter().zip(&storage_infos).zip(&buffer_infos);
-        for (set, ((images, storage), buffers)) in owned.sets.iter().zip(infos) {
+        for ((set, ((images, storage), buffers)), kernel) in
+            owned.sets.iter().zip(infos).zip(kernels)
+        {
             for (binding, info) in images.iter().enumerate() {
                 writes.push(
                     vk::WriteDescriptorSet::default()
                         .dst_set(*set)
                         .dst_binding(binding as u32)
-                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .descriptor_type(kernel.descriptor_type(binding as u32))
                         .image_info(std::slice::from_ref(info)),
                 );
             }

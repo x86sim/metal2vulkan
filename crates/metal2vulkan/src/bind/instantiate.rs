@@ -82,28 +82,14 @@ pub enum PushHole {
         stages: vk::ShaderStageFlags,
         offset: u32,
     },
-    /// The device address of the draw's first capture record, as a `u64` at `offset` of a
-    /// capture variant's vertex push bytes (`VariantKey::captured_positions`): a multiple of 16,
-    /// in a buffer of `SHADER_DEVICE_ADDRESS` usage that the draw's vertex stage writes
-    /// (`VERTEX_SHADER`, `SHADER_WRITE`), holding 32 bytes for each vertex of each instance the
-    /// draw runs (each index of an indexed draw). The record of the draw's vertex `v` (from its
-    /// first; an indexed draw's index position) in instance `i` (from its first) is at
-    /// `32 (v + i · vertex count)`: its clip position's four `f32`s at byte 0, as the vertex
-    /// function returned them (before any viewport compensation), its point size's `f32` at byte
-    /// 16 (1.0 where the function writes none), a `u32` at byte 20 that is 1 where an indexed
-    /// draw's index there is its type's all-ones value (Metal's strip restart index) and 0
-    /// otherwise, and two words the draw leaves as they were.
-    CaptureAddress {
-        stages: vk::ShaderStageFlags,
-        offset: u32,
-    },
-    /// The device address of an indexed capture draw's first index (`CaptureForm::Indexed`), as
-    /// a `u64` at `offset` of the capture variant's vertex push bytes: the draw's index buffer's
+    /// The device address of a de-indexed draw's first index (`VariantKey::primitive_id_indices`),
+    /// as a `u64` at `offset` of the variant's vertex push bytes: the draw's index buffer's
     /// address plus its index offset, which the binder requires to be a multiple of the index
-    /// size, in a buffer of `SHADER_DEVICE_ADDRESS` usage whose address is a multiple of 4. The
-    /// draw reads its indices there in the vertex stage (`DrawCommands::uses`, as storage); a
-    /// `u16` index is read in the aligned 4-byte word that holds it, which lies inside the
-    /// `VkBuffer` an `IndexBufferRef` describes.
+    /// size, in a buffer of `SHADER_DEVICE_ADDRESS` usage whose address is a multiple of 4; or a
+    /// private list form draw's list (`VariantKey::private_list`). The draw reads its indices
+    /// there in the vertex stage (`DrawCommands::uses`, as storage); a `u16` index is read in the
+    /// aligned 4-byte word that holds it, which lies inside the `VkBuffer` an `IndexBufferRef`
+    /// describes.
     CaptureIndexAddress {
         stages: vk::ShaderStageFlags,
         offset: u32,
@@ -697,7 +683,7 @@ pub(crate) fn bind_buffers(
 
 /// The bytes of one push field ([`put`]): held in place up to [`FieldBytes::INLINE`] bytes, as
 /// every field of a few words is, so writing a draw's or a dispatch's fields allocates nothing;
-/// a longer one (a capture's layout) on the heap.
+/// a longer one on the heap.
 pub(crate) enum FieldBytes {
     /// The first `len` bytes of `bytes`.
     Inline {
@@ -787,6 +773,25 @@ pub(crate) fn slot_field(
                 .map_or(0, |s| s.instance_count);
             Some(FieldBytes::of(&count.to_le_bytes()))
         }
+        // The in-place planes of the texture bound at the slot, zeros where none is (the plan
+        // names the slot's variant only where one is).
+        PushField::YCbCrInPlace(slot) => {
+            let words = match state
+                .stages
+                .get(&slot.stage)
+                .and_then(|t| t.textures.get(&slot.index))
+            {
+                Some(BoundTexture::Texture { facts, .. }) => facts
+                    .ycbcr_in_place
+                    .map_or([0; crate::bind::YCbCrInPlace::WORDS], |p| p.words()),
+                _ => [0; crate::bind::YCbCrInPlace::WORDS],
+            };
+            let mut bytes = [0u8; 4 * crate::bind::YCbCrInPlace::WORDS];
+            for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+                chunk.copy_from_slice(&word.to_le_bytes());
+            }
+            Some(FieldBytes::of(&bytes))
+        }
         // The level count the plan bound.
         PushField::TextureLevels(slot) => resources
             .texture_levels
@@ -799,12 +804,6 @@ pub(crate) fn slot_field(
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, value)| FieldBytes::of(&value.to_le_bytes())),
-        // Whether the texture the plan bound holds 16-bit float channels.
-        PushField::TextureHalfChannels(slot) => resources
-            .texture_half_channels
-            .iter()
-            .find(|(s, _)| *s == slot)
-            .map(|(_, half)| FieldBytes::of(&half.to_le_bytes())),
         // The integer channel widths of the texture the plan bound.
         PushField::TextureIntegerChannels(slot) => resources
             .texture_integer_channels

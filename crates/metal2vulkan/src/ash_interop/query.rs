@@ -613,8 +613,6 @@ feature_sources! { c, x;
     BufferDeviceAddress => on(c.v12.buffer_device_address);
     ScalarBlockLayout => on(c.v12.scalar_block_layout);
     UniformBufferStandardLayout => on(c.v12.uniform_buffer_standard_layout);
-    VariablePointersStorageBuffer => on(c.v11.variable_pointers_storage_buffer);
-    VariablePointers => on(c.v11.variable_pointers);
     VulkanMemoryModel => on(c.v12.vulkan_memory_model);
     VulkanMemoryModelDeviceScope => on(c.v12.vulkan_memory_model_device_scope);
     WorkgroupMemoryExplicitLayout => on(c.explicit_layout.workgroup_memory_explicit_layout);
@@ -1018,9 +1016,6 @@ impl DeviceDescription {
         // decide per format.
         desc.khr_format_feature_flags2 =
             exposure.extensions.contains("VK_KHR_format_feature_flags2");
-        // A driver that reports some linear-tiling features from memory it has not initialized
-        // (`DriverFact::LinearTilingFeaturesUninitialized`) is read without them.
-        let unreliable = desc.unreliable_linear_tiling();
         for format in FormatSupport::queries_for(api, &desc.extensions) {
             let mut p = if desc.has_format_feature_flags2() {
                 let mut p3 = avk::FormatProperties3::default();
@@ -1056,7 +1051,6 @@ impl DeviceDescription {
                     vk::FormatFeatureFlags::from_raw(p.buffer_features.as_raw()),
                 )
             };
-            p.linear_tiling = p.linear_tiling.difference(unreliable);
             // SAFETY: as above.
             p.color_attachment_sample_counts =
                 unsafe { color_attachment_sample_counts(instance, physical_device, format, &p) }?;

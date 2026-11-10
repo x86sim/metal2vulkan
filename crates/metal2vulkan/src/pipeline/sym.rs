@@ -212,13 +212,6 @@ pub enum StorageFormatClass {
     Unknown,
     /// A storage image declared with this format.
     Format(vk::Format),
-    /// An unsigned integer storage image declared with format `Unknown`, of the half-float
-    /// textures a heap holds through their unsigned integer aliases (`R16_UINT`, `R16G16_UINT`,
-    /// `R16G16B16A16_UINT`): a float storage heap group's twin, through which a function writes
-    /// such a member's `half` bits where its handle's class names one, on a device not measured
-    /// to store a written `half`'s NaN as its bits. Apart from the formatless unsigned class, so
-    /// an unsigned group never reaches a half-float texture.
-    HalfBits,
 }
 
 /// The image part of a [`HandleClass`].
@@ -248,7 +241,6 @@ pub enum HandleClass {
     Sampler {
         compare: bool,
         integer: bool,
-        cube_gradient: bool,
     },
     /// The visible-function tables an argument buffer can name: a read-only storage buffer of
     /// one table's words (`pipeline::table`) per element.
@@ -261,21 +253,15 @@ impl HandleClass {
         HandleClass::Sampler {
             compare: use_.compare,
             integer: use_.integer_texture,
-            cube_gradient: use_.cube_gradient,
         }
     }
 
     /// The sampler use of a sampler class, `None` for an image class.
     pub fn sampler_use(self) -> Option<crate::metal::sampler::SamplerUse> {
         match self {
-            HandleClass::Sampler {
-                compare,
-                integer,
-                cube_gradient,
-            } => Some(
-                crate::metal::sampler::SamplerUse::new(compare, integer)
-                    .with_cube_gradient(cube_gradient),
-            ),
+            HandleClass::Sampler { compare, integer } => {
+                Some(crate::metal::sampler::SamplerUse::new(compare, integer))
+            }
             HandleClass::Image(_) | HandleClass::FunctionTable => None,
         }
     }
@@ -293,16 +279,6 @@ pub enum SyntheticBinding {
     /// writes as `WriteSource::ExecutionStatus`. A stage module of a device that addresses buffers
     /// reaches the buffer by device address ([`PushField::ExecutionStatusAddress`]) instead.
     ExecutionStatus,
-    /// The write-only sink a dropped store lands in: a storage buffer of
-    /// [`NeutralResource::SINK_BYTES`](crate::bind::NeutralResource::SINK_BYTES) bytes the binder
-    /// binds as `WriteSource::Neutral(NeutralResource::Sink { .. })`, one storage descriptor of a
-    /// stage that stores through a buffer slot's descriptor view
-    /// (`lower::access::sink`). A store the draw's or dispatch's
-    /// [`SpecKey::DroppedStoreSlots`] word drops selects a pointer into it instead of the slot's,
-    /// so the store runs with no branch of its own. No shader reads it. A stage that reaches its
-    /// written slots by device address needs none: the root table's entry 1 is the same sink
-    /// (`memory::roots::SINK_ROOT`).
-    StoreSink,
     /// The resident root table.
     RootTable,
     /// The handle table.
@@ -374,12 +350,6 @@ pub enum SyntheticBinding {
     /// the post-tessellation vertex function reads (`lower::tessellation::work`). Declared with
     /// the vertex stage's symbols.
     TessellationRecords,
-    /// A fragment function's sRGB color table: a read-only uniform or storage buffer (as the
-    /// binding's descriptor type says) holding
-    /// [`color_write_table`](crate::bind::color_write_table)'s bytes, from which a function that
-    /// writes a float to an sRGB color attachment reads the linear value of the byte Metal
-    /// stores.
-    ColorWriteTable,
     /// The stand-in of the render pass's depth attachment a fragment function that runs the
     /// draw's depth test itself tests and writes (`GraphicsState::shader_tests`): a coherent
     /// `R32f` storage image holding pixel `(x, y)`'s depth at texel `(x, y)` (its samples as the
@@ -440,10 +410,6 @@ pub enum ResourceKind {
     /// constexpr sampler is the binding's immutable sampler. `ResourceSlot::index` is the use
     /// ([`ResourceSlot::separate_sampler`]), as a heap sampler's is.
     SeparateSampler(SamplerRef),
-    /// The raw view of the texture bound at the stage's texture slot `ResourceSlot::index`: a
-    /// sampled image viewing the same image in the UNORM format of its channels, from which a
-    /// function reads the raw codes of an 8-bit sRGB texture (`RuntimeFact::SrgbTexture`).
-    RawTexture,
     /// The `half` shadow of extended-range color attachment `n` (`ResourceSlot::index` too) for
     /// the draw's render pass instance (`VariantKey::extended_shadows`): an `RGBA16_SFLOAT` 2D
     /// storage image of the attachment's extent holding Metal's tile value of each texel, which
@@ -454,6 +420,12 @@ pub enum ResourceKind {
     /// `R32G32B32A32_UINT` 2D storage image covering the draw's render area, each texel the bits
     /// of the four values a fetch of the texture's level 0 there returned.
     SnapshotTexels(u32),
+    /// The planes of the two-plane YCbCr texture bound at the stage's texture slot
+    /// `ResourceSlot::index`, held as an image of the multi-planar format that the device's own
+    /// sampler Y′CbCr conversion samples (`LoweringInputs::ycbcr_planes_sampled`): a combined
+    /// image sampler whose immutable sampler is the device's conversion of this
+    /// (`vk::SamplerDesc::ycbcr`), whose image the consumer views with the same conversion.
+    YCbCrPlanes(crate::bind::YCbCrPlanesSampler),
 }
 
 /// What a bound acceleration structure holds: the binder binds a top-level structure, so a
@@ -498,7 +470,7 @@ impl SamplerRef {
 /// How a combined image sampler samples: its sampler, and the use facts that change or check the
 /// `VkSampler` (`metal::sampler::SamplerUse`): depth comparison, which is static in AIR, whether
 /// the texture is an integer one (integer border colors), whether it samples a cube with explicit
-/// gradients (no anisotropy), and whether it samples the texture's raw view.
+/// gradients (no anisotropy).
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -508,88 +480,45 @@ pub struct CombinedSampler {
     pub compare: bool,
     /// The texture's sampled type is an integer type.
     pub integer: bool,
-    /// The shader samples a cube with explicit gradients through this binding in the isotropic
-    /// form a route its device's description does not state takes, through a sampler that may be
-    /// anisotropic (a runtime one, or an anisotropic constexpr one): the sampler is made isotropic
-    /// for it (`metal::sampler::SamplerUse::cube_gradient`). Elsewhere a sampler's footprint
-    /// follows its anisotropy.
-    pub cube_gradient: bool,
-    /// The binding samples the texture's raw view, the UNORM format of its channels, from which
-    /// the function reads an 8-bit sRGB texture's raw codes (`RuntimeFact::SrgbTexture`):
-    /// another binding than the one of the texture's own view through the same sampler.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub raw: bool,
 }
 
 impl CombinedSampler {
-    /// Sampler `sampler` used with `compare` on a texture that is `integer` or not, without
-    /// explicit cube gradients, through the texture's own view.
+    /// Sampler `sampler` used with `compare` on a texture that is `integer` or not.
     pub fn new(sampler: SamplerRef, compare: bool, integer: bool) -> CombinedSampler {
         CombinedSampler {
             sampler,
             compare,
             integer,
-            cube_gradient: false,
-            raw: false,
         }
-    }
-
-    /// This use, sampling a cube with explicit gradients or not.
-    pub fn with_cube_gradient(self, cube_gradient: bool) -> CombinedSampler {
-        CombinedSampler {
-            cube_gradient,
-            ..self
-        }
-    }
-
-    /// The same use through the texture's raw view when `raw` ([`CombinedSampler::raw`]).
-    pub fn with_raw(self, raw: bool) -> CombinedSampler {
-        CombinedSampler { raw, ..self }
     }
 
     /// The use as a heap sampler symbol's index, or a separate sampler's: bit 0 comparison, bit 1
-    /// an integer texel, bit 2 explicit cube gradients.
+    /// an integer texel.
     pub fn heap_index(&self) -> u32 {
-        u32::from(self.compare)
-            | (u32::from(self.integer) << 1)
-            | (u32::from(self.cube_gradient) << 2)
+        u32::from(self.compare) | (u32::from(self.integer) << 1)
     }
 
     /// Sampler `sampler` with the use a heap or separate sampler symbol's index `index` states
     /// ([`CombinedSampler::heap_index`]).
     pub fn from_heap_index(sampler: SamplerRef, index: u32) -> CombinedSampler {
         CombinedSampler::new(sampler, index & 1 != 0, index & 2 != 0)
-            .with_cube_gradient(index & 4 != 0)
     }
 
-    /// The use's rank in a separate texture symbol's index: comparison, then an integer texel, then
-    /// explicit cube gradients, then the raw view, from the most significant bit down, so the ranks
-    /// order as the uses' fields do in `CombinedSampler`'s derived order.
+    /// The use's rank in a separate texture symbol's index: comparison, then an integer texel,
+    /// from the most significant bit down, so the ranks order as the uses' fields do in
+    /// `CombinedSampler`'s derived order.
     fn use_rank(&self) -> u32 {
-        (u32::from(self.compare) << 3)
-            | (u32::from(self.integer) << 2)
-            | (u32::from(self.cube_gradient) << 1)
-            | u32::from(self.raw)
+        (u32::from(self.compare) << 1) | u32::from(self.integer)
     }
 
     /// Sampler `sampler` with the use of rank `rank` ([`CombinedSampler::use_rank`]).
     fn from_use_rank(sampler: SamplerRef, rank: u32) -> CombinedSampler {
-        CombinedSampler::new(sampler, rank & 8 != 0, rank & 4 != 0)
-            .with_cube_gradient(rank & 2 != 0)
-            .with_raw(rank & 1 != 0)
-    }
-
-    /// The use a separate sampler binding serves: this one through the texture's own view. A raw
-    /// view is another sampled image of the same texture, sampled through the same sampler, so a
-    /// raw separate texture shares its use's separate sampler.
-    pub fn sampler_binding_use(self) -> CombinedSampler {
-        self.with_raw(false)
+        CombinedSampler::new(sampler, rank & 2 != 0, rank & 1 != 0)
     }
 
     /// The use the binder (and link, for a constexpr sampler) builds the `VkSampler` for.
     pub fn sampler_use(&self) -> crate::metal::sampler::SamplerUse {
         crate::metal::sampler::SamplerUse::new(self.compare, self.integer)
-            .with_cube_gradient(self.cube_gradient)
     }
 }
 
@@ -821,9 +750,8 @@ pub enum SpecKey {
     UnmeasuredTexels(SlotRef),
     /// Boolean: on a device that samples through Metal's own texture unit, the texture bound to
     /// the slot converts every texel an image instruction hands back to a `half` result as that
-    /// `float` texel rounded to nearest even (default true): its class has no 32-bit float
-    /// channels (whose samples round toward zero), no 16-bit normalized grid and no YCbCr field on
-    /// the grid `8192` (`metal::texel_format::TexelFormat::plain_on_metal_sampler`). A slot bound
+    /// `float` texel rounded to nearest even (default true): its class has no YCbCr field on the
+    /// grid `8192` (`metal::texel_format::TexelFormat::plain_on_metal_sampler`). A slot bound
     /// to nothing takes true: its zero texel converts alike under every class. Where it holds, such
     /// an access converts the instruction's own texel by the device's conversion, which Metal's
     /// compiler may fold into the image instruction (`lower::texture::half`), and specialization
@@ -861,15 +789,6 @@ pub enum SpecKey {
     /// which a driver can load into registers ahead of the shader (Mesa's ANV does so only for a
     /// uniform load at a constant offset); elsewhere at the residual plus the offset.
     RangeAtBindOffset(SlotRef),
-    /// Which of the stage's buffer slots are bound to memory whose GPU writes Metal drops (`u32`,
-    /// default 0): bit `n` for `[[buffer(n)]]`, over the slots a stage can hold (Metal's 31
-    /// argument-table entries, so every bit of the word). A stage reads it only where it stores
-    /// through a buffer slot, and a store it sets the bit for is dropped
-    /// (`lower::access::emit::store_one`), as Metal drops the GPU's writes to such memory
-    /// (`metal2vulkan-runtime`'s `read_only_view.rs`). It is never a specialization constant and
-    /// no pipeline's key carries it (`SpecKey::data_only`): one pipeline runs with any mask, and
-    /// a function that stores pays one uniform branch per store.
-    DroppedStoreSlots(Stage),
 }
 
 impl SpecKey {
@@ -897,17 +816,7 @@ impl SpecKey {
     /// least. Every other key stays a specialization; read as data, the bound sampler's word, say,
     /// made one NVIDIA making cost about four times a specialized one.
     pub fn read_as_data(self) -> bool {
-        matches!(
-            self,
-            SpecKey::TexelFormat(_) | SpecKey::DroppedStoreSlots(_)
-        )
-    }
-
-    /// Whether the key is read as data alone: no stage declares a specialization constant of it,
-    /// so nothing localizes one (`lower::specialized::emit_entry`) and no pipeline's key carries
-    /// it. A function reads it from its push field where it reads it at all.
-    pub(crate) fn data_only(self) -> bool {
-        matches!(self, SpecKey::DroppedStoreSlots(_))
+        matches!(self, SpecKey::TexelFormat(_))
     }
 }
 
@@ -943,17 +852,13 @@ pub enum PushField {
     /// Device address of the `ExecutionStatus` buffer: a function that counts resident-set misses
     /// has dynamic roots, so it reaches memory by device address already.
     ExecutionStatusAddress,
-    /// Device address (`u64`) of the draw's first capture record, which a vertex function
-    /// compiled under `LoweringInputs::captured_positions` writes its vertices' records from
-    /// (`RuntimeFact::CapturedPositions`): a hole the consumer fills
-    /// (`PushHole::CaptureAddress`), placed with the other addresses so the vertex window
+    /// Device address (`u64`) of the first index a de-indexed draw reads
+    /// (`LoweringInputs::primitive_id_indices`): the index buffer's address plus the draw's index
+    /// buffer offset, a multiple of the index size; or of a private list form draw's list
+    /// (`LoweringInputs::private_list`). A vertex function compiled in either form reads its
+    /// stream position's raw index there: a hole the consumer fills
+    /// (`PushHole::CaptureIndexAddress`), placed with the other addresses so the vertex window
     /// always holds it.
-    CaptureAddress,
-    /// Device address (`u64`) of the first index an indexed capture draw reads
-    /// (`CaptureForm::Indexed`): the index buffer's address plus the draw's index buffer offset,
-    /// a multiple of the index size. A vertex function compiled in that form reads its stream
-    /// position's raw index there: a hole the consumer fills (`PushHole::CaptureIndexAddress`),
-    /// placed beside `CaptureAddress`.
     CaptureIndexAddress,
     /// Device address (`u64`) of a merged draw replay's header (`bind::replay`'s `merged.rs`),
     /// which a vertex function compiled under `LoweringInputs::merged_draws` reads its corner's
@@ -1095,32 +1000,17 @@ pub enum PushField {
     /// `[lo, hi]`, which the function clamps its compensated depth's `z / w`, the Vulkan
     /// viewport's normalized depth, to before the interpolation (`CompensatedViewport::vertex_clamp`).
     VertexDepthClamp,
-    /// The render encoder's blend color (`setBlendColorRed:green:blue:alpha:`) for a fragment
-    /// function that blends an extended-range attachment in the shader under a blend that reads
-    /// it: two `uvec4`s holding `f32`s' bits, the color as Metal's blend reads it and one minus
-    /// it (`arith::extended_range::blend_color::constant_words` of `BindState::blend_color`).
-    BlendColor,
     /// The draw's depth state for a fragment function that runs the draw's depth test itself
     /// (`RuntimeFact::ShaderTests`), a `uvec4`: word 0 holds the depth `MTLCompareFunction` in
     /// bits 0 to 2, whether depth writes are enabled in bit 3, and whether the encoder's depth
     /// clip mode is `MTLDepthClipModeClamp` in bit 4; words 1 and 2 the bits of viewport 0's near
     /// and far depth (`f32`); word 3 is 0 (`bind::shader_tests_words`).
     ShaderTestsState,
-    /// Whether the storage texture bound to the slot holds 16-bit float channels (`u32`, 1 or 0;
-    /// 0 where the binder binds a neutral): a `half` texel's write keeps the half where it is 1
-    /// and writes every NaN as `0x7fc00000` where it is 0, as Metal stores a written half
-    /// (`RuntimeFact::StorageTextureHalfChannels`, a slot whose storage choice declares no
-    /// format).
-    TextureHalfChannels(SlotRef),
-    /// The draw's capture layout for a vertex function compiled under
-    /// `LoweringInputs::captured_positions` (`RuntimeFact::CapturedPositions`), a `uvec4`. In the
-    /// vertices form: the draw's first vertex, its vertex count, its first instance, and 0. In the
-    /// indexed form, whose draw runs from vertex 0: 1 where the draw restarts at the index type's
-    /// all-ones index (a line or triangle strip, `BindState::primitive_type`) and 0 otherwise,
-    /// the index count, the first instance, and the base vertex. Stream position `p` (`VertexIndex`
-    /// less the first vertex in the vertices form, `VertexIndex` itself in the indexed form) of
-    /// instance `i` writes record `p + (i - first instance) · count` from
-    /// `PushField::CaptureAddress`.
+    /// The draw's layout for a vertex function compiled in the primitive ID's de-indexed form
+    /// (`LoweringInputs::primitive_id_indices`), a `uvec4`, of a draw run from vertex 0: 0, the
+    /// index count, the first instance, and the base vertex. Stream position `p = VertexIndex`
+    /// reads its raw index at `PushField::CaptureIndexAddress`, and its vertex is that index plus
+    /// the base vertex.
     CaptureLayout,
     /// The channels each storage-form color attachment's write keeps from its texel, where the
     /// fragment function takes them from the draw: one `u32` whose bits `4c` to `4c + 3` are color
@@ -1144,31 +1034,23 @@ pub enum PushField {
     /// signedness, as Metal stores it (`RuntimeFact::StorageTextureIntegerChannels`, a slot whose
     /// storage choice declares no format).
     TextureIntegerChannels(SlotRef),
-    /// The rule word of the color attachment of this index for a fragment function that selects
-    /// its channels' rules at the draw (`ChannelWrite::Selected`, `StageIo::selected_colors`): one
-    /// `u32` holding each channel's code (`pipeline::color_writes::rule_word`: none, the device's
-    /// conversion, an 8-bit unorm channel's, a half-float channel's), which the pipeline's
-    /// attachment decides (`GraphicsState::color_write_rules`), so every attachment format and
-    /// blend whose channels take those rules shares one module.
-    ColorWriteRule(u32),
     /// The render encoder's blend color (`setBlendColorRed:green:blue:alpha:`) for a fragment
-    /// function that blends a 16-bit float attachment in the shader under a blend that reads it
-    /// (`DevicePolicy::half_blend`): one `uvec4` holding the four `f32`s' bits as the encoder
-    /// set them (`BindState::blend_color`), which the function rounds to `half`.
+    /// function that computes a blend in the shader under a blend that reads it (an
+    /// extended-range attachment's, or a fetched attachment's in the storage form): one `uvec4`
+    /// holding the four `f32`s' bits as the encoder set them (`BindState::blend_color`).
     HalfBlendColor,
-    /// The draw's depth bias for a fragment stage that stores Metal's `Depth16Unorm` codes itself
-    /// (`RuntimeFact::Depth16Codes`): one `uvec4` holding the bits of three `f32`s and a zero
-    /// word, `[constant, slope, clamp, 0]` (`BindState::depth_bias`). The constant is Metal's
-    /// units of 1/65535 as a depth (`metal::state::depth16_bias`), the slope and clamp factors
-    /// Metal's; all three are 0 for a draw its bias does not touch (points, lines, a bias the
-    /// draw's viewports take).
-    DepthBias,
     /// The render encoder's alpha test reference (`setAlphaTestReferenceValue:`) for a fragment
     /// function compiled under `LoweringInputs::alpha_test`: one `u32`, the reference's 8-bit
     /// unorm code as Metal's alpha test compares it (`bind::alpha_test_code` of
     /// `BindState::alpha_test_reference`), which the function compares its color 0's alpha's code
     /// with.
     AlphaTestReference,
+    /// The planes of the two-plane YCbCr texture bound to the slot, read in place
+    /// (`RuntimeFact::YCbCrInPlace`, `LoweringInputs::ycbcr_in_place`): two `uvec4`s, the
+    /// texture's size, its planes' first elements and rows in the slot's texel buffer, and its
+    /// conversion (`bind::YCbCrInPlace::words`), from the bound texture's facts
+    /// (`TextureFacts::ycbcr_in_place`).
+    YCbCrInPlace(SlotRef),
     /// The value a draw or dispatch binds for specialization key `key`, carried as data rather
     /// than specialized: one `u32` holding exactly the value the binder computes for the key's
     /// specialization constant from the bound textures and samplers (a boolean key as 1 or 0; a
@@ -1207,13 +1089,9 @@ mod tests {
         for words in [[0, 0], [u64::MAX >> 1, 7]] {
             for compare in [false, true] {
                 for integer in [false, true] {
-                    for cube_gradient in [false, true] {
-                        let c =
-                            CombinedSampler::new(SamplerRef::Constexpr(words), compare, integer)
-                                .with_cube_gradient(cube_gradient);
-                        let s = ResourceSlot::heap_sampler(Stage::Fragment, c);
-                        assert_eq!(s.heap_sampler_use(), Some(c));
-                    }
+                    let c = CombinedSampler::new(SamplerRef::Constexpr(words), compare, integer);
+                    let s = ResourceSlot::heap_sampler(Stage::Fragment, c);
+                    assert_eq!(s.heap_sampler_use(), Some(c));
                 }
             }
         }
@@ -1227,12 +1105,10 @@ mod tests {
         );
     }
 
-    /// A separate texture's symbol round-trips its texture slot, sampler, and use, the raw view
-    /// included, and the symbols order as the `CombinedTextureSampler` symbols they stand for (by
-    /// sampler, use, and slot), so link numbers the bindings of both forms alike. A raw view's
-    /// texture and its own view's are two symbols, sampled through one separate sampler. A slot
-    /// past the index's 28 bits has no symbol; canonicalization refuses every slot past Metal's 128
-    /// entries first.
+    /// A separate texture's symbol round-trips its texture slot, sampler, and use, and the symbols
+    /// order as the `CombinedTextureSampler` symbols they stand for (by sampler, use, and slot), so
+    /// link numbers the bindings of both forms alike. A slot past the index's 28 bits has no
+    /// symbol; canonicalization refuses every slot past Metal's 128 entries first.
     #[test]
     fn separate_texture_symbols_round_trip_in_the_combined_order() {
         let mut pairs = Vec::new();
@@ -1244,41 +1120,31 @@ mod tests {
         ] {
             for compare in [false, true] {
                 for integer in [false, true] {
-                    for (cube_gradient, raw) in
-                        [(false, false), (false, true), (true, false), (true, true)]
-                    {
-                        let c = CombinedSampler::new(sampler, compare, integer)
-                            .with_cube_gradient(cube_gradient)
-                            .with_raw(raw);
-                        // A raw view samples through its use's separate sampler.
-                        let own = c.sampler_binding_use();
-                        assert!(!own.raw && own.with_raw(raw) == c);
-                        assert_eq!(
-                            ResourceSlot::separate_sampler(Stage::Fragment, own)
-                                .separate_sampler_use(),
-                            Some(own)
-                        );
-                        for texture in [0, 1, 127, (1 << 28) - 1] {
-                            let s = ResourceSlot::separate_texture(Stage::Fragment, texture, c)
-                                .expect("a slot the index holds");
-                            assert_eq!(s.separate_texture_of(), Some((texture, c)));
-                            let combined = ResourceSlot {
-                                stage: Stage::Fragment,
-                                kind: ResourceKind::CombinedTextureSampler(c),
-                                index: texture,
-                            };
-                            assert_eq!(combined.separate_texture_of(), None);
-                            pairs.push((combined, s));
-                        }
-                        assert_eq!(
-                            ResourceSlot::separate_texture(Stage::Fragment, 1 << 28, c),
-                            None
-                        );
-                        assert_eq!(
-                            ResourceSlot::separate_texture(Stage::Fragment, u32::MAX, c),
-                            None
-                        );
+                    let c = CombinedSampler::new(sampler, compare, integer);
+                    assert_eq!(
+                        ResourceSlot::separate_sampler(Stage::Fragment, c).separate_sampler_use(),
+                        Some(c)
+                    );
+                    for texture in [0, 1, 127, (1 << 28) - 1] {
+                        let s = ResourceSlot::separate_texture(Stage::Fragment, texture, c)
+                            .expect("a slot the index holds");
+                        assert_eq!(s.separate_texture_of(), Some((texture, c)));
+                        let combined = ResourceSlot {
+                            stage: Stage::Fragment,
+                            kind: ResourceKind::CombinedTextureSampler(c),
+                            index: texture,
+                        };
+                        assert_eq!(combined.separate_texture_of(), None);
+                        pairs.push((combined, s));
                     }
+                    assert_eq!(
+                        ResourceSlot::separate_texture(Stage::Fragment, 1 << 28, c),
+                        None
+                    );
+                    assert_eq!(
+                        ResourceSlot::separate_texture(Stage::Fragment, u32::MAX, c),
+                        None
+                    );
                 }
             }
         }
@@ -1303,7 +1169,6 @@ mod tests {
         let ordered = [
             PushField::RootTableAddress,
             PushField::ExecutionStatusAddress,
-            PushField::CaptureAddress,
             PushField::CaptureIndexAddress,
             PushField::SnapshotPhase,
             PushField::DispatchRegion,

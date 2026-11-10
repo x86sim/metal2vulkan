@@ -113,52 +113,57 @@ impl<'a> Sources<'a> {
         let compile = self.device.compile_device();
         let shared = self.device.shared();
         let cache = &shared.shader_cache;
-        let counts = &shared.counts;
-        let compiled = match cache.memo.function(key) {
-            Some(compiled) => {
-                counts.function_shared();
+        let compiled = match self.found_function(key) {
+            Some(compiled) => compiled,
+            None => {
+                let compiled = match entries {
+                    Some(entries) => {
+                        compile.compile_function_from_entries(function, inputs, budget, entries)?
+                    }
+                    None => compile.compile_function(function, inputs, budget)?,
+                };
+                shared.counts.function_translated();
+                let bytes = cache.store_function(compile, &compiled);
+                cache.memo.keep_function(&compiled, bytes);
+                self.note(Artifact::Function(compiled.clone()));
                 compiled
             }
+        };
+        Ok(compiled)
+    }
+
+    /// The function of `key`, found by its key alone: the memo's, an archive's or the disk's, as
+    /// [`function`](Self::function) finds it, counted as a function shared and kept in the memo;
+    /// `None` where none holds it, translating nothing. A render creation that holds the keys a
+    /// variant's record names links what this finds (`ShaderCache::variant_pipeline`).
+    pub(crate) fn found_function(&self, key: &FunctionCompileKey) -> Option<CompiledFunction> {
+        let compile = self.device.compile_device();
+        let shared = self.device.shared();
+        let cache = &shared.shader_cache;
+        let compiled = match cache.memo.function(key) {
+            Some(compiled) => compiled,
             None => {
-                let found = self
+                let (compiled, bytes) = self
                     .archives()
                     .iter()
                     .find_map(|archive| archive.function(compile, key))
-                    .or_else(|| cache.load_function(compile, key));
-                let (compiled, bytes) = match found {
-                    Some(found) => {
-                        counts.function_shared();
-                        found
-                    }
-                    None => {
-                        let compiled = match entries {
-                            Some(entries) => compile
-                                .compile_function_from_entries(function, inputs, budget, entries)?,
-                            None => compile.compile_function(function, inputs, budget)?,
-                        };
-                        counts.function_translated();
-                        let bytes = cache.store_function(compile, &compiled);
-                        (compiled, bytes)
-                    }
-                };
+                    .or_else(|| cache.load_function(compile, key))?;
                 cache.memo.keep_function(&compiled, bytes);
                 compiled
             }
         };
+        shared.counts.function_shared();
         self.note(Artifact::Function(compiled.clone()));
-        Ok(compiled)
+        Some(compiled)
     }
 
     /// The compute pipeline of `descriptor`, a compute or tile descriptor whose kernel or tile
     /// function is compiled: the variant of it the memo knows live, or the pipeline found or
     /// linked now under `budget` (`compile_compute_pipeline` or `compile_tile_pipeline`, each
-    /// under its own key) and held to the device's compiler word bound from `functions`, the same
-    /// descriptor holding the function, compiled under `inputs` ([`Kernel::fit`]). A refusal is
-    /// the compile layer's.
+    /// under its own key). A refusal is the compile layer's.
     pub(crate) fn kernel(
         &self,
         descriptor: &Kernel,
-        (functions, inputs): (&Kernel, &LoweringInputs),
         budget: &Budget,
     ) -> Result<Remembered<ComputePipeline, Variant>, metal2vulkan::error::Error> {
         let compile = self.device.compile_device();
@@ -186,10 +191,6 @@ impl<'a> Sources<'a> {
                                 compile.compile_tile_pipeline(descriptor, budget)?
                             }
                         };
-                        // Held to the driver's compiler word bound, translated again from the
-                        // function where its module passes it; it keeps its key, so the cache
-                        // stores and finds it as compiled.
-                        let pipeline = functions.fit(compile, inputs, budget, pipeline)?;
                         let bytes = cache.store_compute_pipeline(compile, &pipeline);
                         (pipeline, bytes)
                     }
@@ -238,13 +239,14 @@ impl<'a> Sources<'a> {
     /// disk where the directory does not hold those functions.
     ///
     /// **The artifact is stored only where re-linking it would translate.** A later process that
-    /// does not find the pipeline looks its stages' functions up by these same keys and links
-    /// what it finds (`Sources::function`, then `compile_render_variant`), so where the
-    /// directory holds every one of them the pipeline's own entry spares a link and nothing more,
-    /// while writing it costs this creation an encoding of every word of every stage -- the
-    /// largest single piece of work a creation of a sweep over one function pair does, and one
-    /// whose result is byte-identical to the previous sibling's but for its fixed-function
-    /// state. A creation that translated or linked something the directory has no function for
+    /// does not find the pipeline looks its stages' functions up by these same keys, which the
+    /// creation's variant record names (`ShaderCache::record_variant_pipeline`), and links what
+    /// it finds ([`found_function`](Self::found_function), then `compile_render_variant`), so
+    /// where the directory holds every one of them the pipeline's own entry spares a link and
+    /// nothing more, while writing it costs this creation an encoding of every word of every
+    /// stage -- the largest single piece of work a creation of a sweep over one function pair
+    /// does, and one whose result is byte-identical to the previous sibling's but for its
+    /// fixed-function state. A creation that translated or linked something the directory has no function for
     /// stores the pipeline as every creation did: there the entry is what spares the
     /// translation. So does one that names no stage key at all, which is no evidence about the
     /// directory and must not read as every key being in it.
@@ -254,11 +256,6 @@ impl<'a> Sources<'a> {
     /// way the artifact was kept. Weighing a skipped entry at the zero bytes a skipped encoding
     /// returns would let the memo hold its 4096 entries believing its bound untouched.
     ///
-    /// Answers whether the artifact went to the directory, which is also what decides whether
-    /// the creation's variant record is worth writing: a record names a pipeline to look up, and
-    /// a key whose pipeline the directory does not hold answers nothing
-    /// (`ShaderCache::record_variant_pipeline`).
-    ///
     /// The question about a stage's function names that stage's compile key and the device's
     /// profile, and nothing of the pipeline state, so the device asks the directory once per
     /// function however many states link over it (`ShaderCache::holds_function`,
@@ -267,7 +264,7 @@ impl<'a> Sources<'a> {
         &self,
         pipeline: RenderPipeline,
         stage_keys: &[FunctionCompileKey],
-    ) -> (Arc<RenderPipeline>, bool) {
+    ) -> Arc<RenderPipeline> {
         let compile = self.device.compile_device();
         let cache = &self.device.shared().shader_cache;
         let pipeline = Arc::new(pipeline);
@@ -284,6 +281,6 @@ impl<'a> Sources<'a> {
         };
         cache.memo.keep_render(&pipeline, weight);
         self.note(Artifact::Render(Arc::clone(&pipeline)));
-        (pipeline, !functions_held)
+        pipeline
     }
 }

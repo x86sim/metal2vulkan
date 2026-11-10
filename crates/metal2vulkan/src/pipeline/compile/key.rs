@@ -204,19 +204,19 @@ pub fn function_key(
             .bytes(format!("{:?}", inputs.srgb_textures).as_bytes());
     }
     // Appended only when set, as `storage_view_slots`.
-    if !inputs.srgb_twins.is_empty() {
-        h.bytes(b"srgb-twins")
-            .bytes(format!("{:?}", inputs.srgb_twins).as_bytes());
-    }
-    // Appended only when set, as `storage_view_slots`.
     if !inputs.snapshot_textures.is_empty() {
         h.bytes(b"snapshot-textures")
             .bytes(format!("{:?}", inputs.snapshot_textures).as_bytes());
     }
     // Appended only when set, as `storage_view_slots`.
-    if !inputs.ycbcr_textures.is_empty() {
-        h.bytes(b"ycbcr-textures")
-            .bytes(format!("{:?}", inputs.ycbcr_textures).as_bytes());
+    if !inputs.ycbcr_in_place.is_empty() {
+        h.bytes(b"ycbcr-in-place")
+            .bytes(format!("{:?}", inputs.ycbcr_in_place).as_bytes());
+    }
+    // Appended only when set, as `storage_view_slots`.
+    if !inputs.ycbcr_planes_sampled.is_empty() {
+        h.bytes(b"ycbcr-planes-sampled")
+            .bytes(format!("{:?}", inputs.ycbcr_planes_sampled).as_bytes());
     }
     // Appended only when set, as `storage_view_slots`.
     if !inputs.extended_range.is_empty() {
@@ -232,11 +232,6 @@ pub fn function_key(
     if !inputs.word_colors.is_empty() {
         h.bytes(b"word-colors")
             .bytes(format!("{:?}", inputs.word_colors).as_bytes());
-    }
-    // Appended only when set, as `storage_view_slots`.
-    if !inputs.srgb_fetches.is_empty() {
-        h.bytes(b"srgb-fetches")
-            .bytes(format!("{:?}", inputs.srgb_fetches).as_bytes());
     }
     // Appended only when set, as `storage_view_slots`.
     if !inputs.rotated_colors.is_empty() {
@@ -257,11 +252,6 @@ pub fn function_key(
     if !inputs.rotated_blends.is_empty() {
         h.bytes(b"rotated-blends")
             .bytes(format!("{:?}", inputs.rotated_blends).as_bytes());
-    }
-    // Appended only when set, as `storage_view_slots`.
-    if !inputs.half_output_lanes.is_empty() {
-        h.bytes(b"half-output-lanes")
-            .bytes(format!("{:?}", inputs.half_output_lanes).as_bytes());
     }
     // Appended only when set, as `storage_view_slots`.
     if !inputs.swizzled_storage.is_empty() {
@@ -433,13 +423,6 @@ pub fn function_key(
         h.bytes(b"cubic-samplers")
             .bytes(format!("{:?}", inputs.cubic_samplers).as_bytes());
     }
-    // Appended only when set; the indexed form adds its index type.
-    if let Some(form) = inputs.captured_positions {
-        h.bytes(b"captured-positions");
-        if let Some(ty) = form.index_type() {
-            h.bytes(b"indexed").u64(u64::from(ty.as_raw()));
-        }
-    }
     // Appended only when set, in its derived `Debug` form, as `dropped_colors` is: the shadowed
     // variant of a function whose fetch inputs already hold the color (a blend's) is otherwise the
     // unshadowed one's key, and a cache would hand it the unshadowed artifact.
@@ -474,13 +457,6 @@ pub fn function_key(
     if !inputs.instanced_attributes.is_empty() {
         h.bytes(b"instanced-attributes")
             .bytes(format!("{:?}", inputs.instanced_attributes).as_bytes());
-    }
-    // Appended only when set: a fragment function of any other pipeline or profile keeps its key.
-    if inputs.depth16_codes {
-        h.bytes(b"depth16-codes");
-    }
-    if let Some(raises) = inputs.depth16_bias_raises {
-        h.bytes(b"depth16-bias-raises").u64(u64::from(raises));
     }
     // Appended only when set, in its derived `Debug` form (integers), as `dropped_colors` is.
     if let Some(group) = &inputs.color_group {

@@ -1,17 +1,13 @@
 //! docs/FAST-PATHS.md, the ledger of the defaults that trade exactness against Metal for making
 //! time, stays accurate by construction: it names every accuracy choice of `DevicePolicy` with each
-//! of its values, as `field = Type::Value`, and every precision note a fast default, a
-//! not-yet-built accurate form, an opt-in or a listed device gap records, with its degrade code;
-//! and it names no policy value that no longer exists. The lists below are exhaustive matches: a
+//! of its values, as `field = Type::Value`, and every precision note a not-yet-built accurate
+//! form or a listed device gap records, with its degrade code; and it names no policy value that no longer exists. The lists below are exhaustive matches: a
 //! field, a policy value or a precision note added to the crate fails to compile here until it is
 //! classed, and so reaches the ledger.
 
 use crate::device::{
-    BatchOrderPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy, FloatMathsPolicy,
-    HalfBlendPolicy, HalfRoundingPolicy, HalfTexelBitsPolicy, HeapCompressionPolicy,
-    MultisampleDepthTwinPolicy, NanMinMaxPolicy, RenderLoweringPolicy, ResolvePolicy,
-    RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, TileStorePolicy,
-    Unorm8LinearFilterPolicy, VertexNormalizedPolicy, YCbCrFilterPolicy,
+    BatchOrderPolicy, CompletionPolicy, DevicePolicy, HalfChainPolicy, HeapCompressionPolicy,
+    HostPageTexturePolicy, PipelineWaitPolicy, RenderLoweringPolicy,
 };
 use crate::pipeline::PrecisionNote;
 use std::collections::BTreeSet;
@@ -61,63 +57,36 @@ fn choices() -> Vec<Choice> {
         containment: _,
         isolation: _,
         // The accuracy choices, below.
-        unorm8_linear_filter: _,
-        sampling: _,
-        ycbcr_filter: _,
-        float_maths: _,
-        texel_conversion: _,
-        vertex_normalized: _,
-        half_rounding: _,
-        nan_and_min_max: _,
-        rounding_order: _,
-        half_blend: _,
-        half_texel_bits: _,
-        // The runtime's: where a multisampled `Depth32Float` texture's texels are held, the
-        // texels of a carried texture's decoded twin, a heap's compressed
-        // texture's image, when the host sees a command buffer complete, a loaded attachment's
-        // tile store, a multisampled color attachment's resolve, how a batch begins after the
-        // earlier ones of its queue, and where a render encoder's calls are lowered.
-        multisample_depth_twin: _,
-        decoded_texels: _,
+        // The runtime's: a heap's compressed texture's image, when the host sees a command buffer
+        // complete, how a batch begins after the earlier ones of its queue, where a render
+        // encoder's calls are lowered, what holds a sampled texture over host pages, and whether and
+        // how long a pipeline being made is waited for (the bounds' values:
+        // `the_ledger_states_the_pipeline_wait_bounds`).
         heap_compression: _,
         completion: _,
-        tile_store: _,
-        resolve: _,
         batch_order: _,
         render_lowering: _,
+        host_page_textures: _,
+        pipeline_waits: _,
+        pipeline_creation_wait: _,
+        pipeline_commit_wait: _,
+        // The translator's: how a `half` chain rounds without `shaderFloat16`.
+        half_chains: _,
     } = p;
     vec![
-        choice!(p.unorm8_linear_filter: Unorm8LinearFilterPolicy { Exact, DeviceWithinOneCode }),
-        choice!(p.sampling: SamplingPolicy { NativeDevice, Exact }),
-        choice!(p.ycbcr_filter: YCbCrFilterPolicy { Device, Exact }),
-        choice!(p.float_maths: FloatMathsPolicy { Native, Exact }),
-        choice!(p.texel_conversion: TexelConversionPolicy { Device, Exact }),
-        choice!(p.vertex_normalized: VertexNormalizedPolicy { Device, Exact }),
-        choice!(p.half_rounding: HalfRoundingPolicy { Native, Exact }),
-        choice!(p.nan_and_min_max: NanMinMaxPolicy { Native, Exact }),
-        choice!(p.rounding_order: RoundingOrderPolicy { Native, Exact }),
-        choice!(p.half_blend: HalfBlendPolicy { Device, Exact }),
-        choice!(p.half_texel_bits: HalfTexelBitsPolicy { Device, Exact }),
-        choice!(p.multisample_depth_twin: MultisampleDepthTwinPolicy { Device, Exact }),
-        choice!(p.decoded_texels: DecodedTexelsPolicy { Compact, Exact }),
         choice!(p.heap_compression: HeapCompressionPolicy { Compressed, Uncompressed }),
         choice!(p.completion: CompletionPolicy { Grouped, Exact }),
-        choice!(p.tile_store: TileStorePolicy { Device, Exact }),
-        choice!(p.resolve: ResolvePolicy { Device, Exact }),
         choice!(p.batch_order: BatchOrderPolicy { Ends, Exact }),
         choice!(p.render_lowering: RenderLoweringPolicy { AtCall, Worker }),
+        choice!(p.host_page_textures: HostPageTexturePolicy { InPlace, Shadow }),
+        choice!(p.half_chains: HalfChainPolicy { AtExits, EachOperation }),
+        choice!(p.pipeline_waits: PipelineWaitPolicy { Bounded, Exact }),
     ]
 }
 
 /// Where a precision note stands in the ledger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ledger {
-    /// Recorded by a fast default whose accurate form is a switch: a row of the first table.
-    FastDefault,
-    /// The default's form where the accurate one is not built yet: a row of the first table.
-    NotBuilt,
-    /// Recorded only under a non-default opt-in: the list of switches whose default is Metal's.
-    OptIn,
     /// A device gap, no speed choice: a row of the second table.
     DeviceGap,
     /// None of these: docs/API.md section 9 states it.
@@ -139,48 +108,45 @@ macro_rules! notes {
 
 fn notes() -> Vec<(&'static str, Ledger)> {
     notes! {
-        FastDefault: [
-            DeviceSampling,
-            DeviceTexelConversion,
-            HalfTexelConversion,
+        DeviceGap: [
+            BicubicFilterArithmetic,
+            ExtendedRangeBlendSource,
+            ExtendedRangeFloatBlendSource,
             NativeTranscendentals,
             NativeDivision,
             NativeFma,
-            NativeNanEncoding,
-            NativeMinMax,
             NativeDot,
             NativeMix,
-            NativeHalfConversion,
-            NativeHalfQuantize,
-            HalfOutputPrecision,
-        ],
-        NotBuilt: [
-            ExtendedRangeBlendSource,
-            ExtendedRangeFloatBlendSource,
-            BicubicFilterArithmetic,
-        ],
-        OptIn: [DeviceUnorm8LinearFilter],
-        DeviceGap: [
+            DevicePackConversion,
             DeviceDenormals,
-            DeviceTexelDenormals,
+            DeviceSampling,
+            PixelSamplerScaling,
+            ArgumentPixelSamplerScaling,
+            DeviceTexelConversion,
+            HalfTexelConversion,
+            SrgbTexelDecode,
+            DeviceVertexConversion,
             RestrictedDepthRange,
             DeviceSignedZeroInfNan,
             DeviceInterpolation,
+            DeviceAlphaCoverage,
             HalfOutputFastMathBlend,
             UnmeasuredFetchBlend,
             ReductionOrder,
             FunctionStorageAssumed,
             ColorAttachmentGroups,
+            FastMathRewrites,
         ],
         Elsewhere: [
+            HalfOutputPrecision,
+            NativeHalfConversion,
+            NativeHalfQuantize,
             F16FmaDoubleRounding,
             F16IntConvDoubleRounding,
             GradFromBias,
             DeviceTranscendentals,
-            PixelSamplerScaling,
             DeviceArithmetic,
             DeviceRayIntersection,
-            FastMathRewrites,
             TessellationWinding,
             TessellationFactorEdgeCases,
             TessellationFactorScale,
@@ -192,13 +158,8 @@ fn notes() -> Vec<(&'static str, Ledger)> {
             DeviceNanEncoding,
             CubeGradientFootprint,
             HalfSampleFilter,
-            SrgbTexelDecode,
             FloatSampleFilter,
-            DeviceGatherFootprint,
-            CubeFaceReciprocal,
             QuadsCountedBeforeDiscard,
-            DeviceDepthComparison,
-            BeyondMeasuredDeviation,
             ViewBaseTexelOffset,
             DeviceColorConversion,
             QuadsSplitByClipping,
@@ -209,7 +170,6 @@ fn notes() -> Vec<(&'static str, Ledger)> {
             RotatedBlendRounding,
             LinkedSamplerNumbering,
             ComputedSampleDepth,
-            ArgumentPixelSamplerScaling,
             DiscardDropsSimdgroupStores,
             HelperBranchDropsSimdgroupStores,
             AnisotropicFilter,
@@ -221,6 +181,8 @@ fn notes() -> Vec<(&'static str, Ledger)> {
             UnmeasuredGroupSpeculation,
             NotMipmappedAnisotropicFilter,
             DeviceSampleLevel,
+            NativeNanEncoding,
+            NativeMinMax,
         ],
     }
 }
@@ -346,9 +308,8 @@ fn the_ledger_names_only_choices_the_policy_has() {
     }
 }
 
-/// The ledger names every precision note a fast default, a not-yet-built accurate form, an
-/// opt-in or a listed device gap records, each with its degrade code, which docs/API.md's
-/// catalogue lists.
+/// The ledger names every precision note a not-yet-built accurate form or a listed device gap
+/// records, each with its degrade code, which docs/API.md's catalogue lists.
 #[test]
 fn the_ledger_names_every_note_of_its_rows_with_its_code() {
     let ledger = text("../../docs/FAST-PATHS.md");
@@ -384,23 +345,23 @@ fn the_ledger_names_every_note_of_its_rows_with_its_code() {
 #[test]
 fn the_ledger_readers_read_names_and_switches() {
     assert_eq!(code("NativeHalfConversion"), "native-half-conversion");
-    assert_eq!(
-        code("DeviceUnorm8LinearFilter"),
-        "device-unorm8-linear-filter"
-    );
+    assert_eq!(code("F16FmaDoubleRounding"), "f16-fma-double-rounding");
     assert_eq!(code("DeviceSignedZeroInfNan"), "device-signed-zero-inf-nan");
-    let text = "`sampling = SamplingPolicy::Exact` and `DevicePolicy::exact_answers()`, \
-                `HalfRoundingPolicy::Exact`.";
+    let text = "`completion = CompletionPolicy::Exact` and `DevicePolicy::exact_answers()`, \
+                `BatchOrderPolicy::Ends`.";
     assert_eq!(
         policy_values(text),
         BTreeSet::from([
-            "SamplingPolicy::Exact".to_owned(),
-            "HalfRoundingPolicy::Exact".to_owned()
+            "CompletionPolicy::Exact".to_owned(),
+            "BatchOrderPolicy::Ends".to_owned()
         ])
     );
     assert_eq!(
         assignments(text),
-        BTreeSet::from([("sampling".to_owned(), "SamplingPolicy::Exact".to_owned())])
+        BTreeSet::from([(
+            "completion".to_owned(),
+            "CompletionPolicy::Exact".to_owned()
+        )])
     );
 }
 
@@ -437,42 +398,6 @@ fn the_runtime_s_completion_choice_keys_no_profile() {
     for ((stem, g), (other, e)) in grouped.iter().zip(&exact) {
         assert_eq!(stem, other);
         assert_eq!(g.fingerprint(), e.fingerprint(), "{stem}");
-    }
-}
-
-/// The runtime's choice of a loaded attachment's tile store (`tile_store`) moves no committed
-/// profile's fingerprint: no profile carries it, so no translation follows it.
-#[test]
-fn the_runtime_s_tile_store_choice_keys_no_profile() {
-    use crate::spirv::testing::committed_profiles_with;
-    let device = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
-    let exact = committed_profiles_with(DevicePolicy {
-        tile_store: TileStorePolicy::Exact,
-        ..DevicePolicy::UNTRUSTED
-    })
-    .expect("profiles");
-    assert_eq!(device.len(), exact.len());
-    for ((stem, d), (other, e)) in device.iter().zip(&exact) {
-        assert_eq!(stem, other);
-        assert_eq!(d.fingerprint(), e.fingerprint(), "{stem}");
-    }
-}
-
-/// The runtime's choice of a multisampled color attachment's resolve (`resolve`) moves no
-/// committed profile's fingerprint: no profile carries it, so no translation follows it.
-#[test]
-fn the_runtime_s_resolve_choice_keys_no_profile() {
-    use crate::spirv::testing::committed_profiles_with;
-    let device = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
-    let exact = committed_profiles_with(DevicePolicy {
-        resolve: ResolvePolicy::Exact,
-        ..DevicePolicy::UNTRUSTED
-    })
-    .expect("profiles");
-    assert_eq!(device.len(), exact.len());
-    for ((stem, d), (other, e)) in device.iter().zip(&exact) {
-        assert_eq!(stem, other);
-        assert_eq!(d.fingerprint(), e.fingerprint(), "{stem}");
     }
 }
 
@@ -513,39 +438,84 @@ fn the_runtime_s_render_lowering_choice_keys_no_profile() {
     }
 }
 
-/// The runtime's choice of where a multisampled `Depth32Float` texture's texels are held
-/// (`multisample_depth_twin`) moves no committed profile's fingerprint: no profile carries it, so
-/// no translation follows it.
+/// The runtime's choice of what holds a sampled texture over host pages (`host_page_textures`)
+/// moves no committed profile's fingerprint: no profile carries it, so no translation follows it.
 #[test]
-fn the_runtime_s_multisample_depth_twin_choice_keys_no_profile() {
+fn the_runtime_s_host_page_textures_choice_keys_no_profile() {
     use crate::spirv::testing::committed_profiles_with;
-    let device = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
-    let exact = committed_profiles_with(DevicePolicy {
-        multisample_depth_twin: MultisampleDepthTwinPolicy::Exact,
+    let in_place = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let shadow = committed_profiles_with(DevicePolicy {
+        host_page_textures: HostPageTexturePolicy::Shadow,
         ..DevicePolicy::UNTRUSTED
     })
     .expect("profiles");
-    assert_eq!(device.len(), exact.len());
-    for ((stem, d), (other, e)) in device.iter().zip(&exact) {
+    assert_eq!(in_place.len(), shadow.len());
+    for ((stem, a), (other, s)) in in_place.iter().zip(&shadow) {
         assert_eq!(stem, other);
-        assert_eq!(d.fingerprint(), e.fingerprint(), "{stem}");
+        assert_eq!(a.fingerprint(), s.fingerprint(), "{stem}");
     }
 }
 
-/// The runtime's choice of a carried texture's decoded twin (`decoded_texels`) moves no committed
-/// profile's fingerprint: no profile carries it, so no translation follows it.
+/// `DevicePolicy::exact_answers()` takes the shadow for every texture over host pages, and the
+/// default takes the image in place where the device's check passed.
 #[test]
-fn the_runtime_s_decoded_texels_choice_keys_no_profile() {
+fn exact_answers_shadow_every_texture_over_host_pages() {
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.host_page_textures,
+        HostPageTexturePolicy::InPlace
+    );
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.exact_answers().host_page_textures,
+        HostPageTexturePolicy::Shadow
+    );
+}
+
+/// The runtime's choice of how long a draw's pipeline being made is waited for (`pipeline_waits`)
+/// moves no committed profile's fingerprint: no profile carries it, so no translation follows it.
+#[test]
+fn the_runtime_s_pipeline_waits_choice_keys_no_profile() {
     use crate::spirv::testing::committed_profiles_with;
-    let codes = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let bounded = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
     let exact = committed_profiles_with(DevicePolicy {
-        decoded_texels: DecodedTexelsPolicy::Exact,
+        pipeline_waits: PipelineWaitPolicy::Exact,
         ..DevicePolicy::UNTRUSTED
     })
     .expect("profiles");
-    assert_eq!(codes.len(), exact.len());
-    for ((stem, a), (other, e)) in codes.iter().zip(&exact) {
+    assert_eq!(bounded.len(), exact.len());
+    for ((stem, b), (other, e)) in bounded.iter().zip(&exact) {
         assert_eq!(stem, other);
-        assert_eq!(a.fingerprint(), e.fingerprint(), "{stem}");
+        assert_eq!(b.fingerprint(), e.fingerprint(), "{stem}");
+    }
+}
+
+/// `DevicePolicy::exact_answers()` waits for every draw's pipeline until it is made, and the
+/// default waits a bound.
+#[test]
+fn exact_answers_wait_for_every_pipeline() {
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.pipeline_waits,
+        PipelineWaitPolicy::Bounded
+    );
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.exact_answers().pipeline_waits,
+        PipelineWaitPolicy::Exact
+    );
+}
+
+/// The ledger's row of the pipeline waits states each bound as the default policy sets it, as
+/// `field = N s`: a changed bound changes its row.
+#[test]
+fn the_ledger_states_the_pipeline_wait_bounds() {
+    let ledger = text("../../docs/FAST-PATHS.md");
+    let p = DevicePolicy::UNTRUSTED;
+    for (field, bound) in [
+        ("pipeline_creation_wait", p.pipeline_creation_wait),
+        ("pipeline_commit_wait", p.pipeline_commit_wait),
+    ] {
+        let named = format!("{field} = {} s", bound.as_secs_f64());
+        assert!(
+            ledger.contains(&named),
+            "docs/FAST-PATHS.md does not state `{named}`, the default's bound"
+        );
     }
 }

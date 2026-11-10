@@ -401,7 +401,7 @@ impl Nil {
 /// A call whose answer on plain Metal the runtime cannot prove ([`Error::Unproven`]): Metal may
 /// make what it asks for, or refuse it. Every problem the runtime answers so:
 /// [`Problem::IndirectCommandsDirectArgumentUnproven`],
-/// [`Problem::UnwrittenFragmentInputsUnproven`], a device's [`Problem::HostReleaseUnmeasured`], and
+/// [`Problem::UnwrittenFragmentInputsUnproven`], and
 /// [`Problem::IndirectCommandsDirectArgumentUndecided`].
 ///
 /// What is unproven is Metal's *answer*, not what the call then does: a call measured to return,
@@ -545,6 +545,15 @@ pub enum Problem {
     ///
     /// Basis: ours (a runtime extension's own contract: Metal imports no dma-buf).
     DmaBuf,
+    /// Guest RAM, or a run resolver's answer, that breaks its runtime extension's contract
+    /// (`HostRam::new`, `Device::use_host_ram`, `HostMemory::with_runs`; Metal has none). For the
+    /// RAM: no range, or a range that is empty, starts or ends off the host page, runs past the
+    /// address space's end or overlaps another (of the same RAM, or of another RAM the device
+    /// uses). For an answer: runs that are not whole host pages or do not cover exactly the pages
+    /// asked for.
+    ///
+    /// Basis: ours (a runtime extension's own contract: Metal imports no guest RAM).
+    HostRam,
     /// An image the caller made that cannot be wrapped as a texture of the descriptor
     /// (`new_texture_with_vk_image`).
     ///
@@ -563,18 +572,6 @@ pub enum Problem {
     /// Basis: unknown (plain Metal is held to fault at a dispatch with no pipeline state, on no
     /// measurement recorded here).
     NoPipelineState,
-    /// A run of compute encoders' first indirect dispatch (`dispatch_threadgroups_indirect`,
-    /// `dispatch_threads_indirect`) in an encoder whose dispatch type is not the run's first
-    /// encoder's, on a device whose Metal level ends the process there (a segmentation fault):
-    /// [`MetalLevel::MacOS26_7`](crate::MetalLevel::MacOS26_7), as the consumer measured on an M3
-    /// Max. A run is a command buffer's compute encoders one after another with no other encoder
-    /// and no event signal or wait between; its first encoder's type counts though it dispatches
-    /// nothing, and once one indirect dispatch of the run went through, every later one does.
-    /// macOS 27.0.1 runs it.
-    ///
-    /// Basis: metal-measured (an M3 Max, macOS 26.7: a segmentation fault, as the consumer
-    /// measured; 27.0.1 runs it).
-    IndirectDispatchOfAnotherType,
     /// An argument-table index past Metal's table (plain Metal writes past its own table: a
     /// compute texture at index 128 faulted the dispatch on an M4).
     ///
@@ -812,9 +809,9 @@ pub enum Problem {
         limit: u64,
     },
     /// [`IdPlacement::Outside`](crate::IdPlacement::Outside) for anything but a texture
-    /// `Device::new_texture` makes: a sampler state, a pipeline state, an indirect command
-    /// buffer, a view, or a heap's, a buffer's, a shared or a caller's texture. A runtime
-    /// extension's misuse: Metal has no such placement.
+    /// `Device::new_texture` or `Device::new_texture_with_vk_image` makes: a sampler state, a
+    /// pipeline state, an indirect command buffer, a view, or a heap's, a buffer's or a shared
+    /// texture. A runtime extension's misuse: Metal has no such placement.
     ///
     /// Basis: ours (a runtime extension's misuse: Metal has no such placement).
     OutsidePlacement,
@@ -881,16 +878,6 @@ pub enum Problem {
     ///
     /// Basis: ours (a runtime extension: Metal wraps no Vulkan buffer).
     WrappedBuffer(WrappedBufferProblem),
-    /// A depth/stencil state's `gpu_resource_id` on a device that does not claim Apple10, at a
-    /// [`MetalLevel`](crate::MetalLevel) whose plain Metal raises there (macOS 26.7, the
-    /// consumer's measurement on an M3 Max). Metal's API validation stops the call at every
-    /// release measured ("Obtaining the resourceID of a DepthStencilState object requires support
-    /// for MTLGPUFamilyApple10"), which is not what plain Metal does: macOS 27.0.1's plain call
-    /// answers 0 (our probe on an M3 Max), and so does the runtime at that level.
-    ///
-    /// Basis: metal-measured (an M3 Max, macOS 26.7: plain Metal raises, as the consumer measured;
-    /// 27.0.1's plain call answers 0, and so does the runtime there).
-    DepthStencilResourceId,
     /// A pipeline's `requiredThreadsPerThreadgroup` that Metal refuses at creation, or a dispatch
     /// whose threadgroup size is not it.
     ///
@@ -1012,22 +999,12 @@ pub enum Problem {
         /// The rule that keeps one.
         reason: LinkedUseGap,
     },
-    /// A device made, with no `metal_level` named, on a macOS host whose release (`macos`: major,
-    /// minor, patch; `None` where it cannot be read) is below every measured
-    /// [`MetalLevel`](crate::MetalLevel) ([`Error::Unproven`]): an older Metal's answers are
-    /// unmeasured, and a newer one's would answer above the host. Naming a level in the options
-    /// makes the device answer at it.
-    ///
-    /// Basis: unknown (no measured Metal level describes the host's release).
-    HostReleaseUnmeasured {
-        /// The host's macOS version, where it reads.
-        macos: Option<[u32; 3]>,
-    },
     /// `new_render_pipeline_state` or `new_mesh_render_pipeline_state` of a descriptor whose
-    /// `attachment` is in a pixel format (`format`) the device's
-    /// [`MetalLevel`](crate::MetalLevel) describes none of: under macOS 26.7 the values from 630
-    /// to 650 and the three-channel ones, under 27.0.1 the three-channel ones and 646 to 650, and
-    /// `Depth24Unorm_Stencil8` and `X24_Stencil8` at every level (an Apple GPU has neither).
+    /// `attachment` is in a pixel format (`format`) Metal describes none of
+    /// ([`Device::pixel_format_info`](crate::Device::pixel_format_info) answers
+    /// [`PixelFormatInfo::INVALID`](crate::PixelFormatInfo::INVALID)): the three-channel ones, the
+    /// values from 630 to 650 (an Apple M4 describes 630 to 645, an M3 Max none of them), and
+    /// `Depth24Unorm_Stencil8` and `X24_Stencil8` (an Apple GPU has neither).
     /// Plain Metal's descriptor validation stops it ("pixelFormat, for color render target(0), is
     /// not a valid MTLPixelFormat", "depthAttachmentPixelFormat is not a valid MTLPixelFormat";
     /// on an Apple M4 under 27.0.1, the consumer's run on an M3 Max under 26.7),
@@ -1325,8 +1302,7 @@ pub enum RuntimeGap {
     /// the heap's. Memory of its own would lose the heap's aliasing. (A texture whose linear image
     /// needs extended usage is checked format by format, not refused with it.) In a heap over host
     /// pages, also a texture no linear image over the pages serves and no shadow of the heap's
-    /// bytes holds, and one with a depth twin. A multisample texture there is made in memory of
-    /// its own.
+    /// bytes holds. A multisample texture there is made in memory of its own.
     HeapTextureMemory,
     /// A visible-function table of more entries than one buffer of the device's
     /// `max_buffer_length` holds words for, or than its size word holds: the runtime keeps a
@@ -1354,8 +1330,10 @@ pub enum RuntimeGap {
     /// attachment, the shader-side stencil, views, a fragment imageblock, a texture whose shadow
     /// the pass does not hold, or a memoryless attachment the pass backs and reads past its
     /// instances); an execution of render commands by a compute encoder, or of compute commands by
-    /// a render encoder; and, on a device that claims Apple10, a depth/stencil state's ID, which
-    /// names the state such a command sets.
+    /// a render encoder; a command whose functions statically use a texture slot of the encoder
+    /// that holds a memoryless texture, at which Metal's answer is not measured (an encoder's own
+    /// draw fails the command buffer, [`CommandBufferError::InvalidResource`]); and, on a device
+    /// that claims Apple10, a depth/stencil state's ID, which names the state such a command sets.
     IndirectRenderCommands,
     /// An indirect compute command's imageblock side past 65535, which Metal keeps: the record
     /// holds 16 bits a side, as a kernel's `set_imageblock_size` writes it, and no dispatch runs
@@ -1366,7 +1344,10 @@ pub enum RuntimeGap {
         /// The imageblock's height.
         height: u64,
     },
-    /// The device replay of indirect command buffers.
+    /// The device replay of indirect command buffers; and an executed compute command of a buffer
+    /// that inherits the encoder's buffers whose kernel statically uses a texture slot of the
+    /// encoder that holds a memoryless texture, at which Metal's answer is not measured (an
+    /// encoder's own dispatch fails the command buffer, [`CommandBufferError::InvalidResource`]).
     CommandReplay,
     /// Render attachments and their binding forms.
     RenderAttachments,
@@ -1645,17 +1626,22 @@ pub enum RuntimeGap {
     /// Metal's leftovers are not the runtime's, so there is nothing exact to write and the call is
     /// refused.
     EmptyFillPattern,
-    /// `Buffer::rebind_bytes_no_copy` of a no-copy buffer with a live texture over its bytes,
-    /// given memory at another offset in its page than the old: the texture's copies and texel
-    /// views are planned at the bytes' offset in their `VkBuffer` (`rebind.rs`). Also a rebind
-    /// of a no-copy buffer or heap with a texture whose image is bound to its bytes, where the
-    /// device makes no such image over the new memory: over memory it imports by its pointer, one
-    /// that takes the import's type and lies where the texture's texels do, its rows (and slices)
-    /// as far apart as the old image's, and never for a heap's texture whose image lay over
-    /// dma-bufs, whose rows the driver's `DRM_FORMAT_MOD_LINEAR` layout spaces; over memory it
-    /// imports as dma-bufs (`HostMemory::with_dma_buf`), an image of `DRM_FORMAT_MOD_LINEAR` over
-    /// a dma-buf of the texture's own new pages, which needs `VK_EXT_image_drm_format_modifier`
-    /// and `VK_EXT_queue_family_foreign`, a layout the driver takes and the source's dma-buf.
+    /// `Buffer::rebind_bytes_no_copy` of a no-copy buffer whose GPU writes are dropped (Metal's
+    /// private option bit 24) with a live texture over its bytes, given memory at another offset
+    /// in its page than the old: the texture's copies and texel views are planned at the bytes'
+    /// offset in their `VkBuffer` (`rebind.rs`), and such a buffer is never a copy laid out there,
+    /// as any other buffer's moved bytes are. Also a rebind of a no-copy buffer or heap with a
+    /// texture whose image is bound to its bytes, where the device makes no such image over the
+    /// new memory: over memory it imports by its pointer, one that takes the import's type and
+    /// lies where the texture's texels do, its rows (and slices) as far apart as the old image's,
+    /// and never for a heap's texture whose image lay over dma-bufs, whose rows the driver's
+    /// `DRM_FORMAT_MOD_LINEAR` layout spaces; over a copy of the memory (the caller's gate refused
+    /// its import, it failed, or its bytes moved in their page), a linear image of the copy's
+    /// memory at the texels' place, which for an image in place over a buffer the driver must lay
+    /// out at the texels' pitches; over memory it imports as dma-bufs
+    /// (`HostMemory::with_dma_buf`), an image of `DRM_FORMAT_MOD_LINEAR` over a dma-buf of the
+    /// texture's own new pages, which needs `VK_EXT_image_drm_format_modifier` and
+    /// `VK_EXT_queue_family_foreign`, a layout the driver takes and the source's dma-buf.
     RebindTextures,
     /// A PVRTC texture's blocks in a Metal block order the runtime does not lay out:
     /// `replaceRegion` and `getBytes` of a region other than a whole level, which Metal's API
@@ -1772,7 +1758,7 @@ pub enum RuntimeGap {
     /// A texture over a no-copy buffer's or heap's bytes (a heap's texture, or a texture over
     /// the buffer or over one of the heap's buffers) that no stand-in of zero bytes presents
     /// exactly while they are detached (a texture of a multi-planar format, a two-plane YCbCr
-    /// texture's converted texels, a texture with a depth twin, a multisample texture):
+    /// texture's converted texels, a multisample texture):
     /// `detach_backing` of the bytes, and its making over them while they are detached. Also made
     /// over detached bytes: a rotated texture, and one over a surface's two planes. And
     /// `detach_backing` while a texture is being made over the bytes, or `rebind_bytes_no_copy` of
@@ -2048,13 +2034,16 @@ pub enum CommandBufferError {
     /// `PageFault` on an M3 Max with 26.7 (the consumer's). Code 3 is
     /// [`CommandBufferError::PageFault`], and 11 [`CommandBufferError::DeviceLost`].
     Execution(u64),
-    /// The driver did not make the `VkPipeline` of a draw the command buffer recorded, which
-    /// its submission waited for: the runtime makes a draw's pipeline while the draw goes on
-    /// and the command buffer's batch waits for it, so the failure surfaces here, not at the
-    /// draw. The batch that records the draw, and those after it, did not run.
+    /// The driver did not make the `VkPipeline` of a dispatch the command buffer recorded (a
+    /// compute encoder's, or a render encoder's tile dispatch), which its submission waited
+    /// for: the runtime makes a dispatch's pipeline while the dispatch goes on and the command
+    /// buffer's batch waits for it, so the failure surfaces here, not at the dispatch. The batch
+    /// that records the dispatch, and those after it, did not run.
     /// [`CommandBuffer::failed_pipeline`](crate::CommandBuffer::failed_pipeline) names the
-    /// state and gives the driver's error. Metal makes a state's pipelines as it makes the state,
-    /// and has no such failure.
+    /// state and gives the driver's error. A draw's such failure drops the draw alone, the
+    /// command buffer running on
+    /// ([`CommandBuffer::dropped_draw`](crate::CommandBuffer::dropped_draw)). Metal makes a
+    /// state's pipelines as it makes the state, and has no such failure.
     PipelineCreation(PipelineCreationCause),
     /// A command of the command buffer named a buffer over the caller's host pages (a no-copy
     /// buffer, a heap over the caller's memory, or a resource placed in one) that was rebound
@@ -2068,7 +2057,7 @@ pub enum CommandBufferError {
     /// mapping update reads its buffer as it runs; a call refused at its encoding is refused
     /// again, and the calls after it run); this fails only an encoder that cannot be encoded
     /// again: one of a command buffer that used command predication; a render pass recorded later
-    /// (an indirect command buffer's execution) or whose end captured its draws' tile reach. Each
+    /// (an indirect command buffer's execution). Each
     /// of Metal's submissions holding such an encoder ran nothing (the command buffer's split),
     /// every other ran, the event signals fired and the handlers ran. What the command buffer's
     /// encoders made resident (`use_resource`, `use_heap`) and what its commands reach unnamed
@@ -2125,6 +2114,24 @@ pub enum CommandBufferError {
     /// whatever samples its driver rasterizes; which encoders and signals Metal runs was
     /// measured for that size alone.
     DefaultRasterSampleCount,
+    /// A command of the command buffer used a memoryless texture's memory, which it has none of:
+    /// a draw or dispatch whose function statically uses a texture slot that holds one (a texture
+    /// the function reads only behind a branch that is never taken, and a draw or dispatch that
+    /// runs nothing, included), a tile dispatch alike, a `use_resource` that names one, and a
+    /// blit that copies from or into one or makes its mipmaps of more than one level (a copy of
+    /// no texels too). Metal
+    /// takes every such call and fails the command buffer with
+    /// `MTLCommandBufferErrorInvalidResource` (9, "Invalid Resource
+    /// (00000009:kIOGPUCommandBufferCallbackErrorInvalidResource)"): the submission that holds
+    /// the command, as Metal splits the command buffer (a render pass alone, a run of blit or of
+    /// compute encoders with no event command between them), runs nothing, not even a render
+    /// pass's load or clear, nor does any submission after it, and no event signal encoded from
+    /// that submission on fires; the submissions before it run and their signals fire; the queue
+    /// runs on (an M3 Max under macOS 27.0.1, plain Metal; Metal's API validation stops the
+    /// binding instead). A binding the function does not use, rebound before the draw or never
+    /// drawn with, a memory barrier that names one, a copy of no slices or levels, the mipmaps
+    /// of one level, and a blit's `optimize_contents_*` and `synchronize_resource` fail nothing.
+    InvalidResource,
     /// A render encoder's call that the runtime refused as it lowered the call, after the call
     /// returned (`RenderLoweringPolicy::Worker`): a refusal the call's own checks of its
     /// arguments and the encoder's state could not find, such as the binder's, or a failure to
@@ -2171,8 +2178,8 @@ pub enum FailureOrigin {
     /// [`CommandBufferError::PageFault`]), a lost device (Metal's `DeviceRemoved`, where Metal may
     /// report a hang or a fault of the work and keep the device), the device's memory, a failure
     /// measured on Metal ([`CommandBufferError::RenderTargetSize`],
-    /// [`CommandBufferError::DetachedBacking`], [`CommandBufferError::DefaultRasterSampleCount`]),
-    /// or the code the program committed the command
+    /// [`CommandBufferError::DetachedBacking`], [`CommandBufferError::DefaultRasterSampleCount`],
+    /// [`CommandBufferError::InvalidResource`]), or the code the program committed the command
     /// buffer as failed with ([`CommandBufferError::Injected`]).
     Metal,
     /// The runtime's own: Metal runs the work and fails no command buffer so, where the runtime
@@ -2210,8 +2217,10 @@ impl PipelineCreationCause {
     }
 }
 
-/// A draw's or a dispatch's `VkPipeline` the driver did not make
-/// ([`CommandBufferError::PipelineCreation`]): the command, by its encoder and its order there;
+/// A draw's or a dispatch's `VkPipeline` the driver did not make (a dispatch's failing its
+/// command buffer, [`CommandBufferError::PipelineCreation`]; a draw's dropping the draw,
+/// [`CommandBuffer::dropped_draw`](crate::CommandBuffer::dropped_draw)): the command, by its
+/// encoder and its order there;
 /// the pipeline state it ran, and the variant of that state and the specialization its pipeline
 /// took; and the error the making returned, which the command returned where the runtime made
 /// the pipeline at the command. A command buffer keeps the first, in encoding order, as Metal
@@ -2288,8 +2297,8 @@ impl CommandBufferError {
     /// Metal's `MTLCommandBufferError` code for this error: `MTLCommandBufferErrorDeviceRemoved`
     /// (11) for a lost device, `OutOfMemory` (8) for the device's memory, the index pool's and the
     /// records pool's (mesh and tessellation), and a detached buffer's, `AccessRevoked` (4) for a
-    /// revoked queue's, `PageFault` (3), and
-    /// `Internal` (1), also for the runtime's refusals (a cubic argument sampler's reach among
+    /// revoked queue's, `PageFault` (3), `InvalidResource` (9) for a memoryless texture's use,
+    /// and `Internal` (1), also for the runtime's refusals (a cubic argument sampler's reach among
     /// them, a sampler state left out of an argument-sampler listing, a host step's object nothing
     /// made, a named use rebound before the submission, a predicated loop past its copies, and a
     /// mesh grid past the device's limits); a
@@ -2318,6 +2327,7 @@ impl CommandBufferError {
             | CommandBufferError::DefaultRasterSampleCount
             | CommandBufferError::CallRefused(_) => 1,
             CommandBufferError::PageFault => 3,
+            CommandBufferError::InvalidResource => 9,
             CommandBufferError::GpuHang => 2,
             CommandBufferError::GpuRecoveryVictim => 1,
             CommandBufferError::AccessRevoked => 4,
@@ -2353,7 +2363,8 @@ impl CommandBufferError {
             | CommandBufferError::DetachedBacking
             | CommandBufferError::PredicationOpenAtUnitEnd { .. }
             | CommandBufferError::ProtectedEncoder(_)
-            | CommandBufferError::DefaultRasterSampleCount => FailureOrigin::Metal,
+            | CommandBufferError::DefaultRasterSampleCount
+            | CommandBufferError::InvalidResource => FailureOrigin::Metal,
             CommandBufferError::Internal(_)
             | CommandBufferError::IndexPoolOverflow
             | CommandBufferError::CubicArgumentSampler

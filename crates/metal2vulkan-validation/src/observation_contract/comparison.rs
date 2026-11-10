@@ -172,16 +172,11 @@ impl UlpTable {
 ///   be shaded where Metal leaves it, so a coordinate the function rounds or compares can land on
 ///   another pixel, and what it reads there differs by any amount. A shader's decoder records
 ///   nothing: it is Apple's GPU decoder over Metal's own parameter data.
-/// - `BicubicFilterArithmetic`: unbounded in ulps. The weights are Metal's and an 8- or 16-bit
-///   normalized format's sum is exact, as is a 1D 32-bit float sum, but four differences remain,
-///   none an ulp bound on the stored value: a 2D normalized sum next to a rounding tie may land one
-///   grid step away (within about `2^-21` of the format's range, 1 or 2, of the tie), a 2D float or
-///   half-format sum differs by Metal's accumulator error, a fraction of the largest tap's
-///   magnitude (up to about `2^-40` and `2^-19.4`) which cancellation makes any multiple of the
-///   result's ulp, a 1D half-format sum within about `2^-19.4` of its larger tap from a tie may
-///   round to the other `half`, and a heap element's sRGB sum is the device's decode summed in
-///   `f32`, unbounded by the Vulkan specification (a texture slot's sRGB sum is exact under its
-///   `SrgbTexture` variant). The comparator cannot see a lane's footprint, so it cannot check the
+/// - `BicubicFilterArithmetic`: unbounded in ulps. An emulated filter sums its taps in the
+///   device's arithmetic under the Catmull-Rom weights computed from the fraction, where Metal sums
+///   its fixed-point weights exactly onto the format's grid: a lane may differ by a few grid steps
+///   and by the weights' distance times the taps, which cancellation makes any multiple of the
+///   result's ulp. The comparator cannot see a lane's footprint, so it cannot check the
 ///   near-tie conditions; it hands back the narrowest bound it can check.
 /// - `SparseResidency`: unbounded: the sparse form's residency and unmapped texels are the
 ///   device's, which no Metal reading has compared; another residency answer flips a whole status
@@ -194,27 +189,20 @@ impl UlpTable {
 /// - `HalfTexelConversion`: unbounded: a format whose conversion to `half` is not measured keeps
 ///   the device's quantize of its `f32` texel, so a lane can differ from Metal's by any amount (an
 ///   sRGB texel's decode).
-/// - `HalfSampleFilter`: unbounded: a filtered `half` sample the emulation does not reach is the
-///   device's filter, whose footprint, weights, and sum Vulkan bounds only by its precision rules,
-///   any number of ulps under cancellation.
+/// - `HalfSampleFilter`: unbounded: a filtered `half` sample of a two-plane YCbCr texture through
+///   Metal's own sampler (MoltenVK) filters the converted texels as an `RGBA16Float` or
+///   `RGBA32Float` texture's, off the format's grid; one step of the grid was measured on one chip
+///   and format, which no tolerance is derived from.
 /// - `SrgbTexelDecode`: unbounded: an 8-bit sRGB texel the device decodes where Metal decodes its
 ///   raw code through a twelve-bit table; Vulkan bounds the device's decode only by its precision
 ///   rules, and Metal's `float` gathers of sRGB texels are not measured.
-/// - `FloatSampleFilter`: unbounded: a filtered `float` sample the emulation does not reach is the
-///   device's filter, whose footprint, weights, and sum Vulkan bounds only by its precision rules,
-///   so a lane can differ from Metal's by any amount.
-/// - `DeviceGatherFootprint`: unbounded: a gather the module leaves to the device (a cube's, a
-///   runtime or argument-buffer sampler's, a pixel-coordinate sampler's) can read the next 2x2
-///   block, which changes whole texels, not lanes.
-/// - `CubeFaceReciprocal`: unbounded: a nearest cube sample handed the texel of Metal's position
-///   with the correctly rounded reciprocal reads the next texel where Apple's texture unit's
-///   reciprocal is the other neighbour and the position lies near a texel edge, which changes whole
-///   texels, not lanes.
+/// - `FloatSampleFilter`: unbounded: a filtered `float` sample of a two-plane YCbCr texture through
+///   Metal's own sampler (MoltenVK) filters the converted texels as an `RGBA16Float` or
+///   `RGBA32Float` texture's, off the format's grid; one step of the grid was measured on one chip
+///   and format, which no tolerance is derived from.
 /// - `QuadsCountedBeforeDiscard`: unbounded: a non-quad simdgroup operation before a discard, in a
 ///   shape whose placement by Metal's compiler is not known, takes, among its lanes, the quads the
 ///   discard drops, which moves a count, a ballot, or a reduction by whole lanes.
-/// - `DeviceDepthComparison`: unbounded: a depth comparison the device makes passes or fails a
-///   whole tap where Metal's does not.
 /// - `DeviceInterpolation`: unbounded: the device's interpolation of a varying is measured up to
 ///   about `3e-4` off Metal's on the probes (more where the varying's range is wider), and the
 ///   interpolated value is ordinary data later words use, so no word's difference is bounded by
@@ -233,6 +221,9 @@ impl UlpTable {
 /// - `CoverageReadsRoundedAlpha`: unbounded: a fragment whose alpha lies near a coverage
 ///   threshold may cover one sample more or fewer than Metal's, which moves every channel a
 ///   resolve or a later blend reads there.
+/// - `DeviceAlphaCoverage`: unbounded: the device's alpha to coverage may cover other samples
+///   than Metal's, a whole fragment stored or dropped at one sample, which moves every channel a
+///   resolve or a later blend reads there.
 /// - `RotatedBlendRounding`: unbounded: an `ARGB8Unorm` attachment blended in none of the measured
 ///   forms may store a channel one code apart from Metal's, which moves every later word that reads
 ///   it.
@@ -241,15 +232,9 @@ impl UlpTable {
 ///   performs is exposed to both; a `half` texel's NaN is the device's decode where Metal hands
 ///   back the texel's own: a difference they cause stays a mismatch for review, never accepted or
 ///   explained by the class. C3 tells which differing values they cause ([`value_difference`]).
-/// - `DeviceTexelDenormals`: [`Allowance::Recorded`]. A device's sample or gather may read a
-///   denormal 32-bit float texel as zero where Metal's keeps it, and every `float` sample or gather
-///   whose texels the device reads is exposed to it: a difference stays a mismatch for review.
 /// - `FunctionStorageAssumed`: [`Allowance::Recorded`]. A vertex or fragment function's private
 ///   memory passes the floor of a device not measured, resting on no measurement; a difference is
 ///   a mismatch for review, never accepted or explained by the note.
-/// - `BeyondMeasuredDeviation`: [`Allowance::Recorded`]. Every module compiled for a driver release
-///   past its deviations' measurement records it; a difference is a mismatch for review, never
-///   accepted or explained by the note.
 /// - `ViewBaseTexelOffset`: [`Allowance::Recorded`]. Only a view whose first level lies above its
 ///   parent's base level reads otherwise than Metal, which no authored case binds: a difference is
 ///   a mismatch for review.
@@ -277,8 +262,6 @@ pub fn allowance(note: PrecisionNote) -> Allowance {
         N::DeviceDenormals
         | N::DeviceNanEncoding
         | N::FunctionStorageAssumed
-        | N::DeviceTexelDenormals
-        | N::BeyondMeasuredDeviation
         | N::ViewBaseTexelOffset => Allowance::Recorded,
         N::DeviceColorConversion => Allowance::Recorded,
         N::LinkedSamplerNumbering | N::ColorAttachmentGroups => Allowance::Recorded,
@@ -310,10 +293,7 @@ pub fn allowance(note: PrecisionNote) -> Allowance {
         | N::HalfSampleFilter
         | N::SrgbTexelDecode
         | N::FloatSampleFilter
-        | N::DeviceGatherFootprint
-        | N::CubeFaceReciprocal
         | N::QuadsCountedBeforeDiscard
-        | N::DeviceDepthComparison
         | N::DeviceInterpolation
         | N::ComputedSampleDepth
         | N::QuadsSplitByClipping
@@ -321,6 +301,7 @@ pub fn allowance(note: PrecisionNote) -> Allowance {
         | N::FragmentSimdgroupGrouping
         | N::BlendedWriteRounding
         | N::CoverageReadsRoundedAlpha
+        | N::DeviceAlphaCoverage
         | N::RotatedBlendRounding
         | N::HalfOutputPrecision
         | N::ExtendedRangeBlendSource
@@ -330,19 +311,20 @@ pub fn allowance(note: PrecisionNote) -> Allowance {
         | N::DevicePointSize
         | N::ClippedCoverageSplit
         | N::LoopedSampleOutputs
-        | N::DeviceUnorm8LinearFilter
         | N::HalfOutputFastMathBlend
         | N::DeviceSampling
         | N::NativeTranscendentals
         | N::NativeDivision
         | N::NativeFma
         | N::DeviceTexelConversion
+        | N::DeviceVertexConversion
         | N::NativeHalfConversion
         | N::NativeHalfQuantize
         | N::NativeNanEncoding
         | N::NativeMinMax
         | N::NativeDot
         | N::NativeMix
+        | N::DevicePackConversion
         | N::DiscardDropsSimdgroupStores
         | N::HelperBranchDropsSimdgroupStores => Allowance::Unbounded,
     }

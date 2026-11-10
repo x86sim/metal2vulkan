@@ -38,6 +38,18 @@
 //!   (`bind::ycbcr_convert_module`, `owned_kernel.rs`) writing every texel. The texture reads
 //!   alpha 1 (`alpha_reads_one`) and maps those modes to clamp-to-edge (`address_mode_map`), so
 //!   a nearest sample and a border read are Metal's exactly.
+//! - **The device's own conversion.** Where the device converts the planes' format itself (a
+//!   sampler Y′CbCr conversion of the multi-planar format: unpacked 8- or 10-bit codes over plane
+//!   0 that form one image, `ycbcr_device.rs`), the conversion's dispatch copies the staging
+//!   buffer's planes into an image of that format and samples it through the device's
+//!   conversion, once per texel (`bind::ycbcr_sample_module`), into the same image of the
+//!   texture: its texels are the device's answer, not Metal's, announced where the texture is
+//!   made (`ycbcr-filter-not-exact`; `WorkCounts::ycbcr_device_conversions`,
+//!   `ycbcr_device_samples`). A render shadow's load stays Metal's arithmetic, which the store
+//!   inverts (**Passes** below). Metal's fixed-point conversion converts every other texture, and
+//!   every texture of a device without the conversion or with a defect in it (MoltenVK's 4:2:0
+//!   and 4:2:2 formats, `RuntimeDriverDefect::TwoPlaneChromaMisplaced`; lavapipe's, RADV's and
+//!   NVIDIA's 10-bit ones, `RuntimeDriverDefect::TenBitCodesReadAsWords`).
 //! - **When it converts.** Before an encoder's first command that uses the texture, and again
 //!   after a command of the encoder that writes the planes' bytes (through the buffer, a texture
 //!   over the planes such as a decoder's `R8Unorm` and `RG8Unorm` ones, or a blit): a use of the
@@ -57,6 +69,43 @@
 //!   word, past one storage range, or past the device's workgroup counts) or the planes' buffer
 //!   is not the one its set binds, the conversion copies the planes and converts whole
 //!   (`WorkCounts::ycbcr_refreshes`, `ycbcr_whole_conversions`).
+//! - **Planes read in place, by the device's kind.** On a device whose memory is the host's (Vulkan's
+//!   `deviceType` an integrated GPU or a CPU, `DeviceProperties::has_unified_memory`), a
+//!   `YCBCR8_420_2P` or `YCBCR10_420_2P` texture over plane 0 also states its planes as a function
+//!   reads them in place (`texture/ycbcr_image.rs`, `metal2vulkan::bind::YCbCrInPlace`): a slot
+//!   whose function only samples it (nearest or linear, no comparison, anisotropy or
+//!   `min_lod_clamp`) or reads its size binds a uniform texel buffer over the planes' bytes,
+//!   `R8G8_UINT` of 8-bit codes and `R16G16_UINT` of 10-bit ones, and the function fetches the codes
+//!   and converts and filters them as Metal does, exactly; the draw or dispatch reads those bytes
+//!   alone, and converts no image (`WorkCounts::ycbcr_textures_in_place`, `ycbcr_planes_bound`).
+//!   Where the device converts the 4:2:0 format as a linear image with Metal's reconstruction and
+//!   the planes lie as that image's would, in memory the runtime allocated, they are also such an
+//!   image (`texture/ycbcr_planes.rs`), and a slot whose every sample the device's sampler takes
+//!   samples it through the device's conversion instead (`WorkCounts::ycbcr_planes_images`,
+//!   `ycbcr_planes_images_bound`); elsewhere the function converts them as Metal does, on a device
+//!   that converts the format itself too, where the texture's image holds the device's conversion.
+//!   A read, a gather or any other use binds the image, converted as above. A discrete, virtual or
+//!   other GPU keeps the image alone (`ycbcr_images_kept_device`): it reads the host's planes
+//!   across its bus at every pass, where the image lies in its own memory. Both forms are Metal's
+//!   (but for the image of a device that converts the format itself); the choice is the cheaper one
+//!   by device kind, measured as GPU time of a 3840 x 2160 texture whose
+//!   planes lie in host memory composited into 1680 x 1050 (µs, best of 3 x 40; the image's form
+//!   the refresh's compare and the samples, over unchanged planes; Mesa 26.2.4, MoltenVK 1.4.2):
+//!
+//!   | Device | Codes | In place, 1 pass | Image, 1 pass | In place, 3 passes | Image, 3 passes |
+//!   |---|---|---|---|---|---|
+//!   | Radeon 780M (RADV) | 8-bit | 340 | 1178 | 1027 | 3013 |
+//!   | Radeon 780M (RADV) | 10-bit | 457 | 1509 | 1371 | 3344 |
+//!   | Radeon RX 7900 XTX (RADV) | 8-bit | 1819 | 1754 | 5460 | 1876 |
+//!   | Radeon RX 7900 XTX (RADV) | 10-bit | 3614 | 3479 | 10843 | 3613 |
+//!   | Apple M3 Max (MoltenVK) | 8-bit | 127 | 259 | 375 | 634 |
+//!   | Apple M3 Max (MoltenVK) | 10-bit | 125 | 364 | 378 | 737 |
+//!
+//!   Where the planes changed, the image's form also converts every texel: 1055 to 1252 µs more on
+//!   the 780M, 1790 to 3636 on the 7900 XTX, 350 on the M3 Max. A texture whose planes' first byte
+//!   misses `minTexelBufferOffsetAlignment`, whose planes hold more elements than
+//!   `maxTexelBufferElements` or reach past their buffer, or which has a swizzle, keeps the image on
+//!   every device, counted by the reason (`ycbcr_images_kept_*`).
 //! - **The texels Metal's copies move** are the luma plane's bytes, a code's bytes a texel
 //!   (for 4:2:2 and 4:4:4 and, for the code formats): `get_bytes`, `replace_region` and a blit to
 //!   or from a buffer move the luma rows (Metal keeps the chroma plane), the texture's `Texels`
@@ -146,9 +195,12 @@
 //!   storing every texel ([`YCbCrWriteBack`] of a store), and the texture's converted texels
 //!   convert again at their next use. A pass that clears the attachment, or leaves it to the pass
 //!   (`DontCare`), clears the shadow at its copy in and stores every texel, exact. A pass that
-//!   loads it loads each texel as the texture reads it ([`YCbCrLoad`], the conversion kernel
-//!   writing floats), and Metal stores only the 32x32 tiles its draws reach, every texel of each
-//!   re-encoded, leaving the others' bytes (a load with no draw stores nothing): the copy back
+//!   loads it loads each texel as Metal's arithmetic reads it ([`YCbCrLoad`], the conversion
+//!   kernel writing floats; Metal's even where the texture's texels are the device's
+//!   conversion's, since the store inverts Metal's read and a loaded texel no draw changes is to
+//!   keep its codes, as `MTLLoadActionLoad` keeps the attachment's contents), and Metal stores
+//!   only the 32x32 tiles its draws reach, every texel of each re-encoded, leaving the others'
+//!   bytes (a load with no draw stores nothing): the copy back
 //!   stores the tiles of the pass's drawn area (`render/shadows.rs`'s `DrawnArea`, the scissored
 //!   bounds of its draws), so a tile inside that area that no primitive reaches is re-encoded
 //!   where Metal keeps its bytes, announced (`ycbcr-load-tiles`). A `DontCare` store, and a store
@@ -162,10 +214,13 @@
 //!   format's pipeline is made, as Metal makes it, and its pass refused at its start, naming the
 //!   format (`metal::format::ycbcr_pass_refused`): Metal fails the pass's command buffer, its error
 //!   and the luma bytes it leaves varying from run to run, so no exact form exists.
-//! - **Linear filtering** is Metal's, exact: the function emulates Metal's filter of the texels on
-//!   their grid of 1/2048 or 1/8192 (`metal2vulkan::metal::texel_format::PackedTexels::YCbCr2048`,
-//!   `YCbCr8192`), under MoltenVK through the slot's YCbCr variant, and announces, naming the slot,
-//!   any sample the emulation does not reach (`ycbcr-filter-not-exact`). A function that samples
+//! - **Linear filtering** of the converted texels is the device sampler's: a device that samples
+//!   natively filters them as its own sampler does (`device-sampling`), and on MoltenVK Metal's own
+//!   sampler filters them as an `RGBA16Float` or `RGBA32Float` texture's, not on their grid of
+//!   1/2048 or 1/8192 (`metal2vulkan::metal::texel_format::PackedTexels::YCbCr2048`, `YCbCr8192`),
+//!   announced naming the slot and the format (`ycbcr-filter-not-exact`). A texture whose planes
+//!   are read in place (`TextureFacts::ycbcr_in_place`) is filtered as Metal filters it on that
+//!   grid, each tap computed from the codes, exact. A function that samples
 //!   textures through handles reads its sampler from memory and is refused where it can reach the
 //!   texture (`MappedTextureSampling`, as the texture's address-mode map is).
 
@@ -177,7 +232,9 @@ use super::shadow::ShadowCopies;
 use super::texture_descriptor::TextureLayout;
 use super::tracker::{Access, Barrier, Use, UseRange};
 use super::values::ResourceOptions;
+use super::ycbcr_device::{YCbCrDeviceSampling, YCbCrSampler};
 use super::Device;
+use crate::degradation::Degradation;
 use crate::device::functions::Vk;
 use ash::vk;
 use metal2vulkan::bind::{
@@ -470,12 +527,136 @@ pub(super) struct YCbCrConversion {
     /// Where the zeros a texture over plane 1 reads as its chroma lie in the staging buffer's
     /// `VkBuffer`, and their bytes (0 for every other texture).
     zeros: (u64, u64),
-    kernel: OwnedKernel,
-    sets: OwnedSets,
+    converts: Converts,
     groups: [u32; 2],
     /// The refresh that converts only where the planes changed, where the device makes it
     /// ([`YCbCrRefresh`]); every conversion is whole without it.
     refresh: Option<YCbCrRefresh>,
+}
+
+/// How a conversion turns its staging copy of the planes into texels: Metal's arithmetic (the
+/// conversion kernel, `bind::ycbcr_convert_module`), or the device's own Y′CbCr conversion where
+/// it converts the planes' format (`ycbcr_device.rs`).
+enum Converts {
+    Ours {
+        kernel: OwnedKernel,
+        sets: OwnedSets,
+    },
+    Device(Box<YCbCrDeviceSampling>),
+}
+
+impl Converts {
+    /// The conversion of `planes` (whose staging copy lies at `bytes` of the staging buffer's
+    /// `VkBuffer`, `held` bytes from it) into `view`, a storage view of an image of their texels:
+    /// the device's where it converts them, else [`ours`](Self::ours). `zeros` says whether the
+    /// planes read zeros past their bytes. The workgroups of its dispatch too.
+    fn new(
+        device: &Device,
+        planes: &YCbCrPlanes,
+        (raw, bytes, held): (vk::Buffer, u64, u64),
+        (shape_at, zeros): (u64, bool),
+        view: vk::ImageView,
+    ) -> Result<(Converts, [u32; 2]), Error> {
+        // The staging copy's planes at a multiple of 4 bytes, every plane's element size or a
+        // multiple of it (`ycbcr_device.rs`).
+        let sampler = YCbCrSampler::of(device, planes, zeros).filter(|_| bytes % 4 == 0);
+        if let Some(sampler) = sampler {
+            let sampling = YCbCrDeviceSampling::new(device, (planes, sampler), view)?;
+            let groups = sampling.groups();
+            announce_device_conversion(device, planes);
+            return Ok((Converts::Device(Box::new(sampling)), groups));
+        }
+        Converts::ours(device, planes, (raw, bytes, held), shape_at, (view, false))
+    }
+
+    /// Metal's fixed-point conversion of `planes` (as [`new`](Self::new)'s) into `view`: of their
+    /// texels, or, `floats`, of a render shadow's floats. The workgroups of its dispatch too.
+    fn ours(
+        device: &Device,
+        planes: &YCbCrPlanes,
+        (raw, bytes, held): (vk::Buffer, u64, u64),
+        shape_at: u64,
+        (view, floats): (vk::ImageView, bool),
+    ) -> Result<(Converts, [u32; 2]), Error> {
+        let kernel = device.owned_kernel(OwnedModule::YCbCrConvert(planes.conversion(), floats))?;
+        let set = OwnedSet {
+            images: Vec::new(),
+            storage_images: vec![view],
+            buffers: vec![
+                (
+                    raw,
+                    shape_at,
+                    4 * u64::from(YCbCrConvertModule::SHAPE_WORDS),
+                ),
+                (raw, bytes, held),
+            ],
+        };
+        let sets = OwnedSets::write_each(device, &[kernel], &[set])?;
+        let groups = planes
+            .size
+            .map(|n| n.div_ceil(YCbCrConvertModule::LOCAL_SIZE));
+        Ok((Converts::Ours { kernel, sets }, groups))
+    }
+
+    /// Record the conversion of the staging copy at `bytes` of `staging` (written before, a
+    /// barrier recorded): dispatched through the indirect arguments at `indirect` of `staging`
+    /// where given, else over every texel (`groups`).
+    ///
+    /// # Safety
+    ///
+    /// As [`YCbCrConversion::record`]'s.
+    unsafe fn record(
+        &self,
+        device: &Vk,
+        command_buffer: vk::CommandBuffer,
+        (staging, bytes): (vk::Buffer, u64),
+        indirect: Option<u64>,
+        groups: [u32; 2],
+    ) {
+        match self {
+            Converts::Device(sampling) => {
+                // SAFETY: the caller's.
+                unsafe { sampling.record(device, command_buffer, (staging, bytes), indirect) }
+            }
+            // SAFETY: the caller's; the set binds the shape and the copy.
+            Converts::Ours { kernel, sets } => unsafe {
+                let point = vk::PipelineBindPoint::COMPUTE;
+                device.cmd_bind_pipeline(command_buffer, point, kernel.pipeline);
+                device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    point,
+                    kernel.layout,
+                    0,
+                    &sets.sets,
+                    &[],
+                );
+                match indirect {
+                    Some(at) => device.cmd_dispatch_indirect(command_buffer, staging, at),
+                    None => device.cmd_dispatch(command_buffer, groups[0], groups[1], 1),
+                }
+            },
+        }
+    }
+}
+
+/// Announce, as a texture of `planes` is made, that its texels are the device's own Y′CbCr
+/// conversion's (`ycbcr_device.rs`), naming its layout.
+fn announce_device_conversion(device: &Device, planes: &YCbCrPlanes) {
+    device.degrade(Degradation::YCbCrFilterNotExact, || {
+        (
+            "texture".to_owned(),
+            format!(
+                "a two-plane YCbCr texture of {}-bit {:?} codes ({:?}, {:?}, {:?}) reads the \
+                 device's own sampler Y′CbCr conversion of its planes, not Metal's fixed-point \
+                 one",
+                planes.codes.bits,
+                planes.codes.subsampling,
+                planes.codes.output,
+                planes.range,
+                planes.matrix
+            ),
+        )
+    });
 }
 
 /// The refresh of a conversion's staging copy (the module docs' **When it converts**): one
@@ -576,19 +757,13 @@ impl YCbCrConversion {
         let (raw, start) = staging.at(0);
         let (identity, range) = staging.tracked(0..BYTES_AT + held);
         let shape = YCbCrConvertModule::shape(planes);
-        let kernel = device.owned_kernel(OwnedModule::YCbCrConvert(planes.conversion(), false))?;
-        let set = OwnedSet {
-            images: Vec::new(),
-            storage_images: vec![view],
-            buffers: vec![
-                (raw, start, shape.len() as u64),
-                (raw, start + BYTES_AT, held),
-            ],
-        };
-        let sets = OwnedSets::write_each(device, &[kernel], &[set])?;
-        let groups = planes
-            .size
-            .map(|n| n.div_ceil(YCbCrConvertModule::LOCAL_SIZE));
+        let (converts, groups) = Converts::new(
+            device,
+            planes,
+            (raw, start + BYTES_AT, held),
+            (start, zeros > 0),
+            view,
+        )?;
         let limits = &device.properties().description.limits;
         if groups[0] > limits.max_compute_work_group_count[0]
             || groups[1] > limits.max_compute_work_group_count[1]
@@ -610,8 +785,7 @@ impl YCbCrConversion {
             },
             zeros: (start + BYTES_AT + bytes, zeros),
             staging,
-            kernel,
-            sets,
+            converts,
             groups,
             refresh,
         })
@@ -766,23 +940,13 @@ impl YCbCrConversion {
                 }
             }
             Barrier::everything().record(device, command_buffer);
-            device.cmd_bind_pipeline(
+            self.converts.record(
+                device,
                 command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.kernel.pipeline,
+                (staging, self.shape_at + BYTES_AT),
+                refresh.map(|_| state_at),
+                self.groups,
             );
-            device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.kernel.layout,
-                0,
-                &self.sets.sets,
-                &[],
-            );
-            match refresh {
-                Some(_) => device.cmd_dispatch_indirect(command_buffer, staging, state_at),
-                None => device.cmd_dispatch(command_buffer, self.groups[0], self.groups[1], 1),
-            }
             Barrier::everything().record(device, command_buffer);
             device.cmd_update_buffer(command_buffer, staging, completed_at, &word(1));
         }
@@ -821,19 +985,20 @@ pub(super) struct YCbCrWriteBack {
 
 /// The load of a render shadow (the module docs' **Passes**): the copy in of a pass that loads
 /// the attachment, which converts the planes' bytes into the shadow as floats through the
-/// conversion kernel (`bind::ycbcr_convert_floats_module`), each texel what the texture reads.
+/// conversion kernel (`bind::ycbcr_convert_floats_module`), each texel what Metal's arithmetic
+/// reads (the module docs' **Passes**).
 /// It shares the write-back's staging buffer, its shape past the planes' bytes.
 struct YCbCrLoad {
     /// Where the shape lies in the staging buffer's `VkBuffer`.
     shape_at: u64,
     shape: [u8; YCbCrConvertModule::SHAPE_WORDS as usize * 4],
-    kernel: OwnedKernel,
-    sets: OwnedSets,
+    /// The load's conversion: ours, always.
+    converts: Converts,
     groups: [u32; 2],
 }
 
-/// The side of the tiles Metal loads and stores a render pass's attachment by
-/// (`bind::tile_reach`): a pass that loads a two-plane YCbCr attachment stores every texel of
+/// The side of the tiles Metal loads and stores a render pass's attachment by (32 x 32 on Apple's
+/// GPUs): a pass that loads a two-plane YCbCr attachment stores every texel of
 /// each tile it reaches, its codes re-encoded from what the tile loaded.
 const TILE: u32 = 32;
 
@@ -1088,20 +1253,13 @@ impl YCbCrWriteBack {
             device.cmd_update_buffer(command_buffer, staging, load.shape_at, &load.shape);
             device.cmd_copy_buffer(command_buffer, source, staging, &[self.into]);
             Barrier::everything().record(device, command_buffer);
-            device.cmd_bind_pipeline(
+            load.converts.record(
+                device,
                 command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                load.kernel.pipeline,
+                (staging, self.bytes_at[0]),
+                None,
+                load.groups,
             );
-            device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                load.kernel.layout,
-                0,
-                &load.sets.sets,
-                &[],
-            );
-            device.cmd_dispatch(command_buffer, load.groups[0], load.groups[1], 1);
         }
     }
 }
@@ -1118,24 +1276,18 @@ impl YCbCrLoad {
         view: vk::ImageView,
     ) -> Result<YCbCrLoad, Error> {
         let shape = YCbCrConvertModule::shape(planes);
-        let kernel = device.owned_kernel(OwnedModule::YCbCrConvert(planes.conversion(), true))?;
-        let set = OwnedSet {
-            images: Vec::new(),
-            storage_images: vec![view],
-            buffers: vec![
-                (raw, start + shape_at, shape.len() as u64),
-                (raw, start + BYTES_AT, held),
-            ],
-        };
-        let sets = OwnedSets::write_each(device, &[kernel], &[set])?;
-        let groups = planes
-            .size
-            .map(|n| n.div_ceil(YCbCrConvertModule::LOCAL_SIZE));
+        // A texture that takes passes reads no zeros past its planes (`texture/ycbcr_image.rs`).
+        let (converts, groups) = Converts::ours(
+            device,
+            planes,
+            (raw, start + BYTES_AT, held),
+            start + shape_at,
+            (view, true),
+        )?;
         Ok(YCbCrLoad {
             shape_at: start + shape_at,
             shape,
-            kernel,
-            sets,
+            converts,
             groups,
         })
     }

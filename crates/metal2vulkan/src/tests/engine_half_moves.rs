@@ -10,22 +10,19 @@
 //! - through the select and a threadgroup `half4` array, read back by another thread after a
 //!   barrier (move 2);
 //! - into an `RGBA16Float` storage texture, as loaded and through the select, through the class the
-//!   binder chooses for the profile (`storage_image_choice`): where the class stores the half's
-//!   bits (`StorageImageClass::HalfBits`) each texel must be the bits; elsewhere the module hands
-//!   the device the widened half, whose store is the device's conversion (a NaN's encoding is the
-//!   device's there, recorded as `PrecisionNote::DeviceNanEncoding`), so the texel must be the exact
-//!   widening of each value that is not a NaN, and a NaN for each NaN.
+//!   binder chooses for the profile (`storage_image_choice`): the module hands the device the
+//!   widened half, whose store is the device's conversion (a NaN's encoding is the device's there,
+//!   recorded as `PrecisionNote::DeviceNanEncoding`), so the texel must be the exact widening of
+//!   each value that is not a NaN, and a NaN for each NaN.
 //!
-//! Each runs on every committed profile under the default policy and under Metal's answers
-//! (`DevicePolicy::exact_answers`). Under Metal's answers every pattern comes back as its bits from
-//! every move on every profile, and on MoltenVK under both. Elsewhere a fast form of
-//! `docs/FAST-PATHS.md` may leave a NaN's bits to the device, and the module says so: a `half`
-//! read from its bits by the device's widening (`PrecisionNote::NativeHalfConversion`, the default
-//! `HalfRoundingPolicy::Native`) or a NaN's bits left to the device's arithmetic and conversions
-//! (`PrecisionNote::NativeNanEncoding`, the default `NanMinMaxPolicy::Native`). There a NaN pattern
-//! need only come back a NaN (a move through the select, the threadgroup array or a half-bits
-//! texel; a move straight to a buffer reuses the loaded bits). No other pattern may change, nor any
-//! where the module records neither note.
+//! Each runs on every committed profile under the default policy and under
+//! `DevicePolicy::exact_answers`. A module may leave a NaN's bits to the device, and then says so:
+//! a `half` read from its bits by the device's widening (every profile with `shaderFloat16`) or a
+//! NaN's bits left to the device's arithmetic and conversions, each `PrecisionNote::NativeNanEncoding`
+//! (under either policy), or the native conversion's `PrecisionNote::NativeHalfConversion`. There
+//! a NaN pattern need only come back a NaN (a move through the select or the threadgroup array; a
+//! move straight to a buffer reuses the loaded bits). No other pattern may change, nor any where
+//! the module records neither note.
 //!
 //! The profiles and policies compile to a few distinct modules: each runs once, all at once on
 //! threads of their own.
@@ -41,7 +38,6 @@ use crate::lower::select::{LowerInputs, Plan};
 use crate::metal::format::storage_image_choice;
 use crate::metal::PixelFormat;
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::lower_inputs::StorageImageClass;
 use crate::pipeline::sym::{
     Axis, PushField, ResourceKind, ResourceSlot, SlotClass, SlotRef, SpecKey, Stage,
 };
@@ -152,12 +148,9 @@ fn resources(plan: &Plan) -> Resources {
             (
                 PushField::SlotBindOffset(_)
                 | PushField::DispatchRegion
-                | PushField::TextureHalfChannels(_)
                 | PushField::Specialized(_),
                 PushLoc::Push { .. },
             ) => {}
-            // No slot's writes dropped: the word stays 0.
-            (PushField::Specialized(crate::pipeline::sym::SpecKey::DroppedStoreSlots(_)), _) => {}
             other => panic!("unexpected push field {other:?}"),
         }
     }
@@ -202,12 +195,10 @@ struct Found {
     texels: Vec<(u16, u32)>,
 }
 
-/// One distinct module of the kernel: what runs, whether its texture class stores the half's bits,
-/// and the notes its translation records.
+/// One distinct module of the kernel: what runs, and the notes its translation records.
 struct Compiled {
     plan: Plan,
     module: TypedModule,
-    bits: bool,
     notes: Vec<String>,
 }
 
@@ -242,14 +233,12 @@ fn compile_once(
         .iter()
         .map(|n| format!("{n:?}"))
         .collect();
-    let bits = choice.class == StorageImageClass::HalfBits;
     let words: Arc<[u32]> = Arc::from(artifact.module.words.as_slice());
     Some((
         words,
         Compiled {
             plan,
             module,
-            bits,
             notes,
         },
     ))
@@ -289,9 +278,7 @@ fn run_once(c: &Compiled, what: &str) -> Found {
             let at = imgs[0].index(0, 0, 0, [g % WIDTH, y, 0]).expect("texel");
             let t = imgs[0].texels[at][lane];
             let h = h as u16;
-            let ok = if c.bits {
-                t == u32::from(h)
-            } else if is_nan(h) {
+            let ok = if is_nan(h) {
                 f32::from_bits(t).is_nan()
             } else {
                 t == widened(h)
@@ -304,30 +291,26 @@ fn run_once(c: &Compiled, what: &str) -> Found {
     Found { changed, texels }
 }
 
-/// Every `half` pattern comes back as its bits from each move (buffer, select, threadgroup array,
-/// half-bits texel) on every profile under Metal's answers and on MoltenVK under every policy;
-/// elsewhere a NaN pattern may come back another NaN only where the module records the note that
-/// leaves a NaN's bits to the device (the module docs).
+/// Every `half` pattern comes back as its bits from each move (buffer, select, threadgroup array)
+/// and as its exact widening from the texel on every profile under every policy, but that a NaN pattern may come back
+/// another NaN where the module records the note that leaves a NaN's bits to the device (the module
+/// docs).
 #[test]
 fn every_half_pattern_moves_as_its_bits() {
     let Some(bc) = assemble() else { return };
     // Each (policy, profile) and the module it compiles to; each distinct module runs once.
-    let mut runs: Vec<(&str, bool, String, Arc<[u32]>)> = Vec::new();
+    let mut runs: Vec<(&str, String, Arc<[u32]>)> = Vec::new();
     let mut modules: BTreeMap<Arc<[u32]>, Compiled> = BTreeMap::new();
-    for (policy_name, policy, exact) in [
-        ("default", DevicePolicy::default(), false),
-        (
-            "exact answers",
-            DevicePolicy::default().exact_answers(),
-            true,
-        ),
+    for (policy_name, policy) in [
+        ("default", DevicePolicy::default()),
+        ("exact answers", DevicePolicy::default().exact_answers()),
     ] {
         for (stem, p) in committed_profiles_with(policy).expect("profiles") {
             let Some((words, compiled)) = compile_once(&stem, &p, &bc, policy_name) else {
                 continue;
             };
             modules.entry(Arc::clone(&words)).or_insert(compiled);
-            runs.push((policy_name, exact, stem, words));
+            runs.push((policy_name, stem, words));
         }
     }
     let found: BTreeMap<Arc<[u32]>, Found> = std::thread::scope(|s| {
@@ -344,19 +327,13 @@ fn every_half_pattern_moves_as_its_bits() {
     eprintln!("{} runs, {} distinct modules", runs.len(), modules.len());
     let mut report = Vec::new();
     let mut device_nans = Vec::new();
-    for (policy_name, exact, stem, words) in &runs {
+    for (policy_name, stem, words) in &runs {
         let (c, found) = (&modules[words], &found[words]);
         let notes = &c.notes;
-        let noted = !exact
-            && !stem.starts_with("moltenvk")
-            && notes
-                .iter()
-                .any(|n| n == "NativeHalfConversion" || n == "NativeNanEncoding");
-        let nan_only = |list: &[(u16, u16)]| list.iter().all(|&(h, got)| is_nan(h) && is_nan(got));
-        let nan_texels = found
-            .texels
+        let noted = notes
             .iter()
-            .all(|(h, t)| is_nan(*h) && u16::try_from(*t).is_ok_and(is_nan));
+            .any(|n| n == "NativeHalfConversion" || n == "NativeNanEncoding");
+        let nan_only = |list: &[(u16, u16)]| list.iter().all(|&(h, got)| is_nan(h) && is_nan(got));
         let mut moved_nans = 0;
         for (k, list) in found.changed.iter().enumerate() {
             if list.is_empty() {
@@ -375,17 +352,11 @@ fn every_half_pattern_moves_as_its_bits() {
             ));
         }
         if !found.texels.is_empty() {
-            if noted && c.bits && nan_texels {
-                moved_nans += found.texels.len();
-            } else {
-                report.push(format!(
-                    "{policy_name} {stem}: half bits {}: {} texel channels, first {:x?}, notes \
-                     {notes:?}",
-                    c.bits,
-                    found.texels.len(),
-                    &found.texels[..found.texels.len().min(4)]
-                ));
-            }
+            report.push(format!(
+                "{policy_name} {stem}: {} texel channels, first {:x?}, notes {notes:?}",
+                found.texels.len(),
+                &found.texels[..found.texels.len().min(4)]
+            ));
         }
         if moved_nans > 0 {
             device_nans.push(format!("{policy_name} {stem}: {moved_nans} ({notes:?})"));

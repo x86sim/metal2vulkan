@@ -415,29 +415,26 @@ impl Case for PixelDownscales {
 
     fn allowances(&self) -> Vec<Allowance> {
         // Metal announces nothing, so a notice of ours is a difference at the notices site.
-        // These are the two kinds a run of this round provoked (see `pixel_samplers`); a venue
-        // that announces another reads as divergent there until someone names it with a run.
+        // These are the kinds a run provoked (see `pixel_samplers`): the device reads the pixel
+        // coordinate divided by the size, not Metal's `1/256` cell of it. A venue that announces
+        // another reads as divergent there until someone names it with a run. The device's own
+        // filter and sRGB decode (`float-sample-filter`, `srgb-texel-decode`) are native notes the
+        // suite declares for every case (`crate::replay::NATIVE_NOTES`).
         //
-        // Two more are named from the run that shows them, which is what the paragraph above asks
-        // for: on lavapipe the device's texel decode keeps a denormal where Metal flushes it
-        // (`device-texel-denormals`) and decodes an sRGB code its own way (`srgb-texel-decode`).
-        //
-        // **Every one of these is a declaration and loosens nothing.** Each sits at the notices
-        // site alone, so a texel that differs still fails the case wherever it differs.
-        [
-            Degradation::ArgumentPixelSamplerScaling,
-            Degradation::FloatSampleFilter,
-            Degradation::DeviceTexelDenormals,
-            Degradation::SrgbTexelDecode,
-        ]
-        .iter()
-        .map(|kind| notice_allowance(kind.code()))
-        .chain([
+        // **Each is a declaration and loosens nothing.** Each sits at the notices site alone, so
+        // a texel that differs still fails the case wherever it differs.
+        vec![
+            notice_allowance(Degradation::PixelSamplerScaling.code()),
+            notice_allowance(Degradation::ArgumentPixelSamplerScaling.code()),
             // The buffer each pass writes its sampled texels into is `Shared`
             // ([`crate::replay::shared_memory_notice`]).
             crate::replay::shared_memory_notice(),
-        ])
-        .collect()
+            // A downscale through an argument buffer's texture and sampler takes the heap set,
+            // which MoltenVK's layout query refuses ([`crate::replay::set_past_layout_notice`]):
+            // announced by all 7 cases of the family on the M3 Max under MoltenVK 1.4.2, by none
+            // on lavapipe.
+            crate::replay::set_past_layout_notice(),
+        ]
     }
 
     fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {

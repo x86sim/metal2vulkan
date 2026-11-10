@@ -22,6 +22,29 @@ whose notice this run did not announce is the other direction, and is reported a
 allowance rather than failed — a notice is announced once per device per kind, so which of a case's
 notices its own run provokes depends on what ran before it in the same process.
 
+**The one set of notices no case names is the device's own arithmetic.** The owner's rule
+(AGENTS.md, rule 1) makes the GPU's native arithmetic and value answers the contract — `float` and
+`half` maths, NaN bits, denormals, minimum and maximum, rounding, texel, vertex and colour
+conversions, sampling and filtering, resolves. Where the device has a native form it is the only form the
+runtime builds, and the note that says so fires in nearly every case that computes, converts or
+samples. So the suite declares those notes itself, at the notices site, for every case:
+`replay::NATIVE_NOTES` lists them, chosen from the notes' own documentation (the translator's
+`PrecisionNote` and the runtime's `Degradation`), with the rule for what is in it and what is not.
+They are held to a case declaration's rules — the notices site alone, justified only where the code
+was announced — and they never count among the allowances a case named, so a native note a run did
+not announce is not an allowance that never fired. A note of what the device **lacks**, of an
+emulation's own precision, or of a Metal form not measured or not built is not in the set, and a
+case that provokes one still names it.
+
+**They declare nothing about a value.** Every value still compares field by field, and comparison
+is never widened for the whole suite. A value the device's native answer moves is a divergence at
+its own site. Nearly every note of the set says in its own documentation that validation derives no
+tolerance from it, and the suite loosens no value by such a note either: that would be the suite
+overruling the product's stated contract. So the site is a `known-gaps.tsv` row, scoped to the
+venue whose device answers so, that says what differs, whose answer it is, and whether the note's
+recorded bound covers it. A tolerance justified by a note is for a note whose documentation gives a
+bound validation may hold, and is never wider than that bound.
+
 A site where plain Metal answered a call and we returned a typed error is a **refusal**, and no
 allowance can make it anything else: it counts in its own verdict and is never compliant.
 
@@ -35,10 +58,13 @@ Metal never came back from the call, which is its own verdict. A refusal that ar
 mismatch instead is a bug of the suite's rather than a finding about Metal; it went unseen four
 ways in this round, and each way lost both the refused count and the ledger row.
 
-A replay holds the runtime to exact answers. `conformance replay --default-policy` replays under
-the runtime's own defaults instead — the fast form of every speed-for-accuracy choice, which is
-what a consumer runs — so the suite can say whether a difference is the policy's or the
-implementation's.
+A replay takes the accurate form of each of the runtime's speed-for-accuracy switches
+(`DevicePolicy::exact_answers()`: `heap_compression` `Uncompressed`, `completion` `Exact`,
+`batch_order` `Exact`, `render_lowering` `AtCall`, `host_page_textures` `Shadow`); no switch touches
+arithmetic, which is the device's native answer under either policy. `conformance replay
+--default-policy` replays under the runtime's own defaults instead — the fast form of every
+speed-for-accuracy choice, which is what a consumer runs — so the suite can say whether a
+difference is the policy's or the implementation's.
 
 A refusal the **venue** honestly cannot answer is not a gap of ours and reads `lacks-feature`
 instead. That fact rides in the failure's own recorded value, beside the typed error, so it reaches
@@ -86,9 +112,9 @@ the case needs is not a gap of ours at all — that is its own verdict, per site
 A row may also name the **venue** it is expected on, because a gap can be one venue's and not
 another's: a pipeline the runtime refuses on MoltenVK for a structural reason can translate on
 lavapipe, and a global row would then fail the lavapipe run for existing. The field is held, without
-case, against the venue's own description — its device name, driver, API version and Metal level —
-so a row can name one device (`Apple M3 Max`), one implementation (`llvmpipe`) or a family of them,
-and a venue that joins later needs no new vocabulary. `*` means every venue, and it is the
+case, against the venue's own description — its device name, driver and API version — so a row can
+name one device (`Apple M3 Max`), one implementation (`llvmpipe`) or a family of them, and a venue
+that joins later needs no new vocabulary. `*` means every venue, and it is the
 **stronger** claim rather than the looser one: the row is then held on every venue the run selected
 its case on, so widening a row's scope makes it harder to satisfy. That is what stops a
 venue-scoped row from becoming a way to silence a venue. A venue pattern that matches nothing holds
@@ -125,12 +151,10 @@ numbers-only.
 reconstructs a site or an answer by hand or with a parser — the step where one stream in this round
 nearly committed a row for a site that does not exist.
 
-Where the difference **is** a notice — our side announces a degrade code and Metal announces nothing, every other field
-bit-exact — the row's answer names what each side announced, because that is the whole difference
-and a row that did not name it would record a gap without saying what it waits on. Such a site is a
-divergence and not a tolerance: where the product's own degrade note says validation derives no
-explanation from it, loosening the site here would be this suite overruling the product's stated
-contract. A case that both diverges and refuses holds its refused sites in the `Divergent` verdict alongside
+Where the difference **is** a notice — our side announces a degrade code the case does not declare
+and the suite's native set does not hold, Metal announces nothing, every other field bit-exact — the
+row's answer names what each side announced, because that is the whole difference and a row that
+did not name it would record a gap without saying what it waits on. A case that both diverges and refuses holds its refused sites in the `Divergent` verdict alongside
 the differences, so neither row can go unchecked behind the other: a divergence never launders a
 refusal.
 
@@ -272,8 +296,7 @@ random on honest work. Each reason is written at its site in `cost.rs` with the 
 
 - one whose readings **moved** between the measurement's own rounds, which the record keeps as the
   range it was seen in;
-- one that says **which thread arrived first** — which thread replayed a deferred command buffer,
-  when one of our background threads ran, and everything on the asynchronous release path, whose
+- one that says **which thread arrived first** — when one of our background threads ran, and everything on the asynchronous release path, whose
   counts may land in a later case's window;
 - one that is a reading of **what was alive at that instant** rather than work a case did;
 - one that says an object was **found already made** rather than made, or that a making was
@@ -289,10 +312,9 @@ random on honest work. Each reason is written at its site in `cost.rs` with the 
 A count in the `SPARED` table is gated from below only while it is gated at all: `racy` wins, so a
 reported count has no floor either.
 
-Totals stay gated where one exists, so nothing is lost: `command_buffers_deferred` holds the two
-replay counts between them, `encoder_command_buffers_begun` holds the primaries a completion thread
-began ahead, and a `_made` count holds its `_shared` partner — finding one already made only ever
-*lowers* it, and the gate is an upper bound.
+Totals stay gated where one exists, so nothing is lost: `encoder_command_buffers_begun` holds the
+primaries a completion thread began ahead, and a `_made` count holds its `_shared` partner — finding
+one already made only ever *lowers* it, and the gate is an upper bound.
 
 ### The two shapes, and why a bound needs both
 
@@ -324,7 +346,7 @@ nothing in company is a number no regression can reach. A name earns a row on it
 never by resembling one already there, and the code holds each row to its direction: a later
 measurement that reads the lone run *lower* reports that count like any other. Each shape is
 measured by its own command, into the same record, because one process cannot measure both cleanly:
-`bc1-rgba` run on its own reads `commands_replayed.cmd_dispatch` 4 in three invocations out of
+`bc1-rgba` run on its own reads `commands_recorded.cmd_dispatch` 4 in three invocations out of
 three, and 0 when the same leg runs after a whole-set leg in the same process.
 
 That is what stops a bound going stale on a landing, because a reading a landing can change is a
@@ -357,7 +379,9 @@ were not theirs, after it had held still over seven rounds of an earlier measure
 **A device's gap is not a cost win.** A count that is lower because the device lacks the exact form,
 so the runtime announced a notice and did something cheaper, is the device's gap and not work we
 saved. A record carries the notices its measurement announced and refuses to compare a run that
-announced otherwise. Four things make a run `unmeasured` rather than a pass, each said in words: a
+announced otherwise. The device's native answers (`replay::NATIVE_NOTES`) count on neither side
+(`replay::degrading`): the native form is the only one the runtime builds, so a native note marks
+no cheaper work. Four things make a run `unmeasured` rather than a pass, each said in words: a
 venue the measurement was not taken on, a selection that is not the whole case set (a case's counts
 depend on what ran before it in the same process), a run that stopped part way, and a run the device
 degraded otherwise.
@@ -478,7 +502,8 @@ ratio is on the **totals**, so a call is weighted by how often it runs.
 **The degraded-set rule, which matters more here than for counts.** A leg that announced a degrade
 notice did a different amount of work: the device lacked the exact form and the runtime did something
 cheaper and said so. Its cost is `unmeasured`, never a fast row. Without that rule a device's honest
-gap reads as a cost win, which is the most flattering lie the suite could tell.
+gap reads as a cost win, which is the most flattering lie the suite could tell. A native note is no
+such notice and counts for neither leg, as for counts.
 
 **But the rule withholds the verdict and no longer deletes the figures, which it used to.** Every
 function that pooled, ranked or printed a figure asked `judge` whether a case was `unmeasured` and
@@ -614,7 +639,7 @@ edits one.
 | `allowance` | The justification a loosened field must name, checked against the degrade catalogue and `docs/API.md` |
 | `compare`, `diff` | Field-by-field comparison, and the diff that names the leaf that moved |
 | `verdict` | Exact, announced, divergent, refused, unrecorded, and per venue "lacks the device feature" |
-| `recording` | A case's Metal answer, keyed by chip, macOS build and Metal level, with its runs and its outcome set |
+| `recording` | A case's Metal answer, keyed by chip, macOS build and the release whose Metal it is, with its runs and its outcome set |
 | `case` | The case API and the vocabulary both sides answer in |
 | `runtime_side` | `metal2vulkan-runtime` as a side |
 | `metal_side` | Native Metal as a side (macOS only), which record mode runs |

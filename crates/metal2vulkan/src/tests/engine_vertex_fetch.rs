@@ -494,9 +494,7 @@ fn integer_formats_feed_float_attributes() {
                     scaled,
                     crate::device::requirements::FormatUsage::VertexBuffer,
                 );
-            let entry = VertexFetch::FixedFunction {
-                narrow_float: false,
-            };
+            let entry = VertexFetch::FixedFunction;
             assert_eq!(
                 proj.attributes[&attr] == entry,
                 fixed,
@@ -1022,8 +1020,6 @@ fn push_bytes(plan: &Plan) -> Vec<u8> {
                 out[at..at + 4].copy_from_slice(&STRIDE.to_le_bytes())
             }
             PushField::RootTableAddress => out[at..at + 8].copy_from_slice(&TABLE.to_le_bytes()),
-            // No slot's writes dropped: the word stays 0.
-            PushField::Specialized(crate::pipeline::sym::SpecKey::DroppedStoreSlots(_)) => {}
             other => panic!("unexpected push field {other:?}"),
         }
     }
@@ -1203,7 +1199,6 @@ fn a_label_pipeline_reads_its_integer_attribute_as_float() {
     d.depth_format = Some(PixelFormat::Depth32FloatStencil8);
     d.stencil_format = Some(PixelFormat::Depth32FloatStencil8);
     let shipped = [
-        "moltenvk-m4",
         "nvidia-rtx50-linux",
         "nvidia-rtx5080-laptop",
         "amd-780m-radv",
@@ -1256,8 +1251,8 @@ fn a_label_pipeline_reads_its_integer_attribute_as_float() {
     }
 }
 
-/// A fixed-function vertex attribute of a narrow-float format read as `float` answers Metal's
-/// canonical NaN, and one of any other format keeps the bits the device's input delivered.
+/// A fixed-function vertex attribute read as `float` keeps the words the device's input delivered,
+/// whatever its format.
 ///
 /// The owned `dsx_int_attributes` fixture's `int_attribute_to_float4` writes the one `float4`
 /// attribute it reads to `out[vid]`, so the module's answer is read bit for bit. The interpreter
@@ -1269,14 +1264,17 @@ fn a_label_pipeline_reads_its_integer_attribute_as_float() {
 /// macOS 27.0.1: a `half` code and a `FloatRG11B10` field whose 5-bit exponent is all ones both
 /// reach a `float` attribute as `0x7FC00000`, payload and sign dropped. A device's widening
 /// carries the field's bits up into the payload instead (`0x7FC02000` for the `half` codes
-/// `0x7E01` and `0xFE01`, `0x7FFE0000` for an all-ones `FloatRG11B10` field, measured on RADV).
-/// Every finite, zero, subnormal and infinite word passes through, and a `Float4` attribute keeps
-/// every word, NaNs included, as Metal's fetch of a 32-bit float does.
+/// `0x7E01` and `0xFE01`, `0x7FFE0000` for an all-ones `FloatRG11B10` field, measured on RADV),
+/// which the module keeps. Every finite, zero, subnormal and
+/// infinite word passes through, and a `Float4` attribute keeps every word, NaNs included, as
+/// Metal's fetch of a 32-bit float does. The module is the same for every format and records
+/// nothing of it: the render pipeline's link notes a narrow float's NaN on its vertex stage
+/// (`link::vertex::fixed_function_notes`).
 #[test]
-fn a_narrow_float_attribute_fetched_in_fixed_function_answers_metals_canonical_nan() {
+fn a_fixed_function_vertex_attribute_keeps_the_words_the_device_delivers() {
+    use crate::pipeline::artifact::PrecisionNote;
     use crate::pipeline::sym::VaryingKey;
     use crate::spirv::interp::run_with_inputs;
-    const CANONICAL: u32 = 0x7FC0_0000;
     let bc = match llvm_assemble(&engine_dir().join("dsx_int_attributes.ll")) {
         Ok(b) => b,
         Err(AssembleError::Missing(why)) => {
@@ -1285,8 +1283,8 @@ fn a_narrow_float_attribute_fetched_in_fixed_function_answers_metals_canonical_n
         }
         Err(AssembleError::Rejected(why)) => panic!("llvm-as rejected the fixture: {why}"),
     };
-    // The words a device's fixed-function input delivers, and Metal's answer for each: three NaN
-    // payloads of either sign, an infinity, a subnormal, a zero and a finite value.
+    // The words a device's fixed-function input delivers: three NaN payloads of either sign, an
+    // infinity, a subnormal, a zero and a finite value.
     let delivered = [
         0x7FC0_2000u32,
         0xFFC0_2000,
@@ -1297,13 +1295,6 @@ fn a_narrow_float_attribute_fetched_in_fixed_function_answers_metals_canonical_n
         0x8000_0000,
         0x3F80_0000,
     ];
-    let canonical: Vec<u32> = delivered
-        .iter()
-        .map(|w| match w & 0x7FFF_FFFF > 0x7F80_0000 {
-            true => CANONICAL,
-            false => *w,
-        })
-        .collect();
     let mut ran: BTreeMap<VertexFormat, Vec<&str>> = BTreeMap::new();
     for stem in [
         "moltenvk-m3",
@@ -1315,10 +1306,10 @@ fn a_narrow_float_attribute_fetched_in_fixed_function_answers_metals_canonical_n
         if !p.fields().leaf.vertex_stores_and_atomics {
             continue;
         }
-        for (format, narrow) in [
-            (VertexFormat::Half4, true),
-            (VertexFormat::FloatRG11B10, true),
-            (VertexFormat::Float4, false),
+        for format in [
+            VertexFormat::Half4,
+            VertexFormat::FloatRG11B10,
+            VertexFormat::Float4,
         ] {
             let mut d = VertexDescriptor::new();
             d.layouts
@@ -1329,18 +1320,20 @@ fn a_narrow_float_attribute_fetched_in_fixed_function_answers_metals_canonical_n
             let proj =
                 vertex_fetch_projection(Some(&d), &BTreeMap::from([(0, IoNumeric::Float)]), &p)
                     .unwrap_or_else(|e| panic!("{what}: {e}"));
-            // The projection's own entry says whether the format is a narrow float; a format the
-            // device's vertex input cannot fetch is pulled and is the pulled fetch's own test.
-            match proj.attributes[&0] {
-                VertexFetch::FixedFunction { narrow_float } => {
-                    assert_eq!(narrow_float, narrow, "{what}: {:?}", proj.attributes[&0])
-                }
-                VertexFetch::Pulled { .. } => continue,
+            // A format the device's vertex input cannot fetch is pulled and is the pulled
+            // fetch's own test.
+            if proj.attributes[&0] != VertexFetch::FixedFunction {
+                continue;
             }
             let i = inputs(proj);
             let a = compile_inputs_of(&bc, "int_attribute_to_float4", &p, &i)
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
             validate(&a, &p);
+            assert!(
+                !a.precision.contains(&PrecisionNote::DeviceNanEncoding),
+                "{what}: the module records nothing of the format: {:?}",
+                a.precision
+            );
             let (plan, m) = typed_module_with(&bc, "int_attribute_to_float4", &p, &i)
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
             // One vertex per set of four words the attribute delivers.
@@ -1373,11 +1366,7 @@ fn a_narrow_float_attribute_fetched_in_fixed_function_answers_metals_canonical_n
                         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])),
                 );
             }
-            let want: Vec<u32> = match narrow {
-                true => canonical.clone(),
-                false => delivered.to_vec(),
-            };
-            assert_eq!(got, want, "{what}");
+            assert_eq!(got, delivered, "{what}");
             ran.entry(format).or_default().push(stem);
         }
     }

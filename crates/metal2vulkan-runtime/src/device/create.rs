@@ -40,7 +40,6 @@ use crate::exit_guard;
 use crate::gpu_time;
 use crate::image_barrier::MemoryReads;
 use crate::loader_word::LoaderWord;
-use crate::metal_level::{choose, Chosen, Host};
 use crate::release;
 use crate::shader_cache::{CacheSetup, ShaderCacheOptions};
 use crate::sparse;
@@ -58,7 +57,7 @@ use std::sync::{Arc, Mutex, Weak};
 /// How the runtime creates its instance and devices. No Metal counterpart: these choose the
 /// Vulkan side (`MTLCreateSystemDefaultDevice` takes nothing).
 #[non_exhaustive]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct DeviceOptions {
     /// The policy each device's compile device is made with, and whose
     /// `recommended_enables` each device enables.
@@ -171,16 +170,6 @@ pub struct DeviceOptions {
     /// at a kind's notice in the call names that kind here, so the work it ends at never runs.
     /// No Metal counterpart.
     pub lowering_refuses: BTreeSet<crate::Degradation>,
-    /// The macOS release whose Metal each device answers as, where releases answer differently
-    /// ([`MetalLevel`](crate::MetalLevel): which pixel formats a descriptor takes and Metal
-    /// describes). `None` by default: on a macOS host, the host's own release, or the newest
-    /// measured release below it, announced once as `metal2vulkan-degrade-metal-level-below-host`
-    /// (a host below every measured release, or whose release cannot be read, refuses the device,
-    /// `Error::Unproven` with `Problem::HostReleaseUnmeasured`); on any other host, the newest,
-    /// [`MetalLevel::NEWEST`](crate::MetalLevel::NEWEST). Named, the devices answer at it on any
-    /// host, unannounced: for hosts that are not macOS, and for tests. No Metal counterpart:
-    /// Metal answers as the release it runs on.
-    pub metal_level: Option<crate::MetalLevel>,
     /// Keep each command buffer's execution record
     /// ([`CommandBuffer::executions`](crate::CommandBuffer::executions)): the pipeline each
     /// dispatch and draw ran, the bind shape it was planned for, and its `VkPipeline`s' creation
@@ -189,16 +178,82 @@ pub struct DeviceOptions {
     /// No Metal counterpart.
     #[doc(hidden)]
     pub record_executions: bool,
-    /// Take each device as an identity no measurement names
-    /// ([`DeviceDescription::assumed_unmeasured`]), whatever its driver, GPU and release are: as
-    /// another GPU of its driver at its release. The device then takes the paths an unmeasured
-    /// identity of its driver takes, in translation and in the runtime: no deviation or defect
-    /// measured on one GPU alone, every exact path in place of an answer fact, every defect its
-    /// driver is measured with assumed, and the informational message
-    /// `metal2vulkan-unmeasured-driver` naming them as the device is made. Off by default. A
-    /// diagnostic, for running a measured device as an unmeasured one of its driver runs (a
-    /// report from a GPU no venue measured). No Metal counterpart.
-    pub assume_unmeasured_identity: bool,
+    /// Make each device's check of the first move of an image over host pages fail whatever the
+    /// moves did (`in_place_check.rs`), and keep no record of it: every texture over host pages
+    /// is then a shadow, its notice naming the failed check. Off by default. A test hook, for the
+    /// lanes that hold the shadow to a failed check. No Metal counterpart.
+    #[doc(hidden)]
+    pub fail_in_place_check: bool,
+    /// Where each device hands its pipeline records: one [`PipelineRecord`](crate::PipelineRecord)
+    /// per pipeline state creation that made its state (compute, render, mesh render and tile
+    /// render, and the additional-binary-functions forms; and the one-sample or factor-scaling
+    /// twin the runtime makes of a render state where a draw first needs it), on the creating
+    /// thread before the call returns, as the program's own code (a panic in it is caught). A
+    /// creation that fails, a binary archive's add and a warm pass's make none. A consumer keeps
+    /// them, in the order they came, and hands a later process's device them
+    /// ([`Device::warm`](crate::Device::warm)) to make the same translations and `VkPipeline`s
+    /// before its program asks. `None` by default: no record is made. Devices of one hook are
+    /// devices of one option (it is compared by identity, as [`messages`](Self::messages) is).
+    /// No Metal counterpart: Metal keeps its own compiled pipelines in the OS's caches.
+    pub pipeline_records: Option<Arc<dyn Fn(crate::PipelineRecord) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for DeviceOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Every field is named, so a field added later is written here or this fails to compile.
+        let DeviceOptions {
+            policy,
+            layers,
+            layer_settings,
+            instance_extensions,
+            device_extensions,
+            optional_device_extensions,
+            withheld_features,
+            withheld_extensions,
+            messages,
+            loader,
+            kinds,
+            shader_cache,
+            withhold_generated_commands,
+            withhold_view_reinterpretation,
+            instance_api_version,
+            gpu_times_from_host,
+            announce_each,
+            lowering_refuses,
+            record_executions,
+            fail_in_place_check,
+            pipeline_records,
+        } = self;
+        f.debug_struct("DeviceOptions")
+            .field("policy", policy)
+            .field("layers", layers)
+            .field("layer_settings", layer_settings)
+            .field("instance_extensions", instance_extensions)
+            .field("device_extensions", device_extensions)
+            .field("optional_device_extensions", optional_device_extensions)
+            .field("withheld_features", withheld_features)
+            .field("withheld_extensions", withheld_extensions)
+            .field("messages", messages)
+            .field("loader", loader)
+            .field("kinds", kinds)
+            .field("shader_cache", shader_cache)
+            .field("withhold_generated_commands", withhold_generated_commands)
+            .field(
+                "withhold_view_reinterpretation",
+                withhold_view_reinterpretation,
+            )
+            .field("instance_api_version", instance_api_version)
+            .field("gpu_times_from_host", gpu_times_from_host)
+            .field("announce_each", announce_each)
+            .field("lowering_refuses", lowering_refuses)
+            .field("record_executions", record_executions)
+            .field("fail_in_place_check", fail_in_place_check)
+            .field(
+                "pipeline_records",
+                &pipeline_records.as_ref().map(|_| "hook"),
+            )
+            .finish()
+    }
 }
 
 /// One setting of an instance layer (`VkLayerSettingEXT`).
@@ -1060,6 +1115,36 @@ pub(super) unsafe fn graphics_pipeline_library_supported(
         && linking.graphics_pipeline_library_independent_interpolation_decoration == vk::TRUE
 }
 
+/// Whether `physical` has `samplerYcbcrConversion` (Vulkan 1.1's).
+///
+/// # Safety
+///
+/// `physical` was enumerated from `instance`, made at Vulkan 1.2 or later.
+unsafe fn ycbcr_conversion_supported(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+) -> bool {
+    let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut v11);
+    // SAFETY: the caller's contract; the chain lives for the call.
+    unsafe { instance.get_physical_device_features2(physical, &mut features) };
+    v11.sampler_ycbcr_conversion == vk::TRUE
+}
+
+/// Whether `physical` has `VK_EXT_ycbcr_2plane_444_formats`' `ycbcr2plane444Formats`.
+///
+/// # Safety
+///
+/// `physical` was enumerated from `instance`, made at Vulkan 1.2 or later, and lists the
+/// extension.
+unsafe fn ycbcr_444_supported(instance: &ash::Instance, physical: vk::PhysicalDevice) -> bool {
+    let mut formats = vk::PhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut formats);
+    // SAFETY: the caller's contract; the chain lives for the call.
+    unsafe { instance.get_physical_device_features2(physical, &mut features) };
+    formats.ycbcr2plane444_formats == vk::TRUE
+}
+
 /// Whether a device of version `api` (its own, capped by the instance's) that lists `listed`
 /// enables `VK_NV_linear_color_attachment` and its `linearColorAttachment`: it lists the
 /// extension and has what it requires, `VK_KHR_format_feature_flags2` or Vulkan 1.3, where that
@@ -1228,29 +1313,17 @@ pub(super) fn argument_buffers_kept(description: &DeviceDescription) -> Result<(
     check(Facts::of(description).argument_buffers())
 }
 
-/// `description` as `options` take its identity: an identity no measurement names where they
-/// assume one ([`DeviceOptions::assume_unmeasured_identity`]), else as the device reports it.
-pub(crate) fn identity_as_options(
-    mut description: DeviceDescription,
-    options: &DeviceOptions,
-) -> DeviceDescription {
-    description.assumed_unmeasured = options.assume_unmeasured_identity;
-    description
-}
-
-/// A device on `physical`, made from `instance`, answering at `level`.
+/// A device on `physical`, made from `instance`.
 fn create_on(
     instance: &Arc<InstanceShared>,
     physical: vk::PhysicalDevice,
     options: &DeviceOptions,
     cache: &CacheSetup,
-    level: Chosen,
 ) -> Result<Device, Error> {
     // SAFETY: `physical` was enumerated from the instance, created at `api_version`.
     let description =
         unsafe { DeviceDescription::query(&instance.raw, physical, instance.api_version) }
             .map_err(device_error)?;
-    let description = identity_as_options(description, options);
     // SAFETY: as above.
     unsafe { timeline_conformant(&instance.raw, physical) }?;
     argument_buffers_kept(&description)?;
@@ -1381,6 +1454,24 @@ fn create_on(
     if graphics_pipeline_library {
         enables.enable_graphics_pipeline_library();
     }
+    // The runtime's own need, outside the vocabulary, where the device has it: two-plane YCbCr
+    // textures convert through the device's own conversion (`ycbcr_device.rs`).
+    // SAFETY: `physical` was enumerated from the instance, made at Vulkan 1.2.
+    let ycbcr_conversion = unsafe { ycbcr_conversion_supported(&instance.raw, physical) };
+    if ycbcr_conversion {
+        enables.enable_ycbcr_conversion();
+    }
+    // And its two-plane 4:4:4 formats: core from Vulkan 1.3, else where the device lists
+    // `VK_EXT_ycbcr_2plane_444_formats` with its feature.
+    let ycbcr_444 = ycbcr_conversion
+        && (api >= ApiVersion::V1_3
+            || listed.contains(ash::ext::ycbcr_2plane_444_formats::NAME)
+                // SAFETY: `physical` was enumerated from the instance, made at Vulkan 1.2, and
+                // lists the extension.
+                && unsafe { ycbcr_444_supported(&instance.raw, physical) });
+    if ycbcr_444 && api < ApiVersion::V1_3 {
+        enables.enable_ycbcr_2plane_444();
+    }
     // The runtime's own need, outside the vocabulary: the device's pipelines are cached in the
     // shader cache's records alone, the driver's internal cache off where it allows; else the
     // device says once that the driver keeps it.
@@ -1462,11 +1553,15 @@ fn create_on(
         announce_each: options.announce_each.clone(),
         lowering_refuses: options.lowering_refuses.clone(),
         record_executions: options.record_executions,
+        pipeline_records: options.pipeline_records.clone(),
+        fail_in_place_check: options.fail_in_place_check,
         view_reinterpretation,
         generated_commands,
         host_image_copy,
         linear_color_attachment,
         graphics_pipeline_library,
+        ycbcr_conversion,
+        ycbcr_444,
         creation_feedback: creation_feedback || feedback_asked,
         dma_buf: dma_buf.is_some(),
         dma_buf_images: dma_buf_images.is_some(),
@@ -1474,7 +1569,6 @@ fn create_on(
         memory_reads,
         owned: true,
         cache: cache.clone(),
-        metal_level: level,
     };
     // SAFETY: the device was made from these parts just now.
     let device = unsafe { Device::assemble(parts) }?;
@@ -1522,9 +1616,12 @@ static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
 
 /// One group of `MADE`: the devices made with equal options.
 struct Made {
-    /// The options, less the message sink, which the instance holds (`InstanceShared::sink`):
-    /// the group keeps no sink alive past its devices.
+    /// The options, less the message sink, which the instance holds (`InstanceShared::sink`),
+    /// and the pipeline records' hook, which `records` names: the group keeps neither alive past
+    /// its devices.
     options: DeviceOptions,
+    /// The options' pipeline records' hook, which each of the group's devices holds.
+    records: Option<std::sync::Weak<dyn Fn(crate::PipelineRecord) + Send + Sync>>,
     instance: Weak<InstanceShared>,
     devices: Vec<(vk::PhysicalDevice, Weak<DeviceShared>)>,
 }
@@ -1538,7 +1635,12 @@ impl Made {
             (Some(asked), Some(made)) => asked.same(made),
             _ => false,
         };
-        (sinks && same_options(&self.options, options)).then_some(instance)
+        let records = match (&options.pipeline_records, &self.records) {
+            (None, None) => true,
+            (Some(asked), Some(made)) => std::sync::Weak::ptr_eq(&Arc::downgrade(asked), made),
+            _ => false,
+        };
+        (sinks && records && same_options(&self.options, options)).then_some(instance)
     }
 
     /// The live device of `physical`, if the group has one.
@@ -1567,7 +1669,8 @@ pub(crate) fn live_devices_with(options: &DeviceOptions) -> usize {
     })
 }
 
-/// Whether `a` and `b` are equal options, but for their message sinks (compared by `Made`).
+/// Whether `a` and `b` are equal options, but for their message sinks and pipeline records'
+/// hooks (compared by `Made`).
 fn same_options(a: &DeviceOptions, b: &DeviceOptions) -> bool {
     // Every field is named, so a field added later is compared or this fails to compile.
     let DeviceOptions {
@@ -1589,9 +1692,9 @@ fn same_options(a: &DeviceOptions, b: &DeviceOptions) -> bool {
         gpu_times_from_host,
         announce_each,
         lowering_refuses,
-        metal_level,
         record_executions,
-        assume_unmeasured_identity,
+        fail_in_place_check,
+        pipeline_records: _,
     } = a;
     *policy == b.policy
         && *layers == b.layers
@@ -1610,9 +1713,8 @@ fn same_options(a: &DeviceOptions, b: &DeviceOptions) -> bool {
         && *gpu_times_from_host == b.gpu_times_from_host
         && *announce_each == b.announce_each
         && *lowering_refuses == b.lowering_refuses
-        && *metal_level == b.metal_level
         && *record_executions == b.record_executions
-        && *assume_unmeasured_identity == b.assume_unmeasured_identity
+        && *fail_in_place_check == b.fail_in_place_check
 }
 
 /// The group of `made` for `options`: the live one, or a new one on a new instance. Its index.
@@ -1632,28 +1734,28 @@ fn group(
     made.push(Made {
         options: DeviceOptions {
             messages: None,
+            pipeline_records: None,
             ..options.clone()
         },
+        records: options.pipeline_records.as_ref().map(Arc::downgrade),
         instance: Arc::downgrade(&instance),
         devices: Vec::new(),
     });
     Ok((made.len() - 1, instance))
 }
 
-/// The device of `physical` in `group`: its live one, or one made now and kept there, answering
-/// at `level`.
+/// The device of `physical` in `group`: its live one, or one made now and kept there.
 fn device_of(
     group: &mut Made,
     instance: &Arc<InstanceShared>,
     physical: vk::PhysicalDevice,
     options: &DeviceOptions,
     cache: &CacheSetup,
-    level: Chosen,
 ) -> Result<Device, Error> {
     if let Some(device) = group.device(physical) {
         return Ok(device);
     }
-    let device = create_on(instance, physical, options, cache, level)?;
+    let device = create_on(instance, physical, options, cache)?;
     group.devices.retain(|(_, weak)| weak.strong_count() > 0);
     group.devices.push((physical, Arc::downgrade(&device.0)));
     Ok(device)
@@ -1679,18 +1781,13 @@ impl Device {
     /// it loaded for the life of the process: one bare instance, with no layers and no
     /// messenger, is never destroyed. The loader would otherwise unload the drivers with the
     /// last device and load them again for the next, which some drivers cannot do indefinitely.
-    ///
-    /// With no `options.metal_level`, a macOS host below every measured release of Metal, or
-    /// whose release cannot be read, refuses every device (`Unproven`,
-    /// `Problem::HostReleaseUnmeasured`).
     pub fn system_default_with(options: &DeviceOptions) -> Result<Device, Error> {
         let cache = CacheSetup::of(&options.shader_cache, "system_default_with")?;
-        let level = choose(options.metal_level, Host::this(), "system_default_with")?;
         let mut made = lock(&MADE);
         let (at, instance) = group(&mut made, options)?;
         let mut refusal = None;
         for physical in ranked(&instance, options)? {
-            match device_of(&mut made[at], &instance, physical, options, &cache, level) {
+            match device_of(&mut made[at], &instance, physical, options, &cache) {
                 Ok(device) => {
                     keep_drivers_loaded(&instance.entry);
                     return Ok(device);
@@ -1776,7 +1873,6 @@ impl Device {
     /// refusal of the device where the runtime cannot make it.
     pub fn with_registry_id(registry_id: u64, options: &DeviceOptions) -> Result<Device, Error> {
         let cache = CacheSetup::of(&options.shader_cache, "with_registry_id")?;
-        let level = choose(options.metal_level, Host::this(), "with_registry_id")?;
         let mut made = lock(&MADE);
         let (at, instance) = group(&mut made, options)?;
         let ranked = ranked(&instance, options)?;
@@ -1785,7 +1881,7 @@ impl Device {
         else {
             return Err(Error::NoDevice);
         };
-        let device = device_of(&mut made[at], &instance, physical, options, &cache, level)?;
+        let device = device_of(&mut made[at], &instance, physical, options, &cache)?;
         keep_drivers_loaded(&instance.entry);
         Ok(device)
     }
@@ -1804,12 +1900,11 @@ impl Device {
     /// `MTLCopyAllDevices()[0]` is `MTLCreateSystemDefaultDevice()`).
     pub fn all_with(options: &DeviceOptions) -> Result<Vec<Device>, Error> {
         let cache = CacheSetup::of(&options.shader_cache, "all_with")?;
-        let level = choose(options.metal_level, Host::this(), "all_with")?;
         let mut made = lock(&MADE);
         let (at, instance) = group(&mut made, options)?;
         let mut devices = Vec::new();
         for physical in ranked(&instance, options)? {
-            match device_of(&mut made[at], &instance, physical, options, &cache, level) {
+            match device_of(&mut made[at], &instance, physical, options, &cache) {
                 Ok(device) => devices.push(device),
                 Err(Error::Unsupported(_) | Error::NoDevice) => {}
                 Err(error) => return Err(error),

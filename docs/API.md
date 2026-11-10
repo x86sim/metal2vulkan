@@ -84,36 +84,34 @@ compile does. `DevicePolicy::default()` is `DevicePolicy::UNTRUSTED`:
   and guest shaders cannot reach each other's resources. Where the device enables
   `robustBufferAccess`, buffer accesses and vertex input are left to it. (MoltenVK advertises the
   feature without implementing it; there such accesses are not contained, as on native Metal.)
-- **Fast native forms off Apple's GPUs.** The device's own sampler (its filter of a two-plane
-  YCbCr texture among them), maths library, divisions, fused multiply-adds, texel conversions,
-  `half` rounding, NaN bits, min/max, rounding order of `dot`/`mix`/`fast::sqrt`, and blend of a
-  `half` color. Each records a precision note with its bound, and each has an exact switch.
-  `DevicePolicy::exact_answers()` turns on every exact form but sampling's, Metal's filter of a
-  two-plane YCbCr texture (`YCbCrFilterPolicy::Exact`) included; `sampling =
-  SamplingPolicy::Exact` emulates Metal's sampler too.
-  [FAST-PATHS.md](FAST-PATHS.md) lists every choice, its bound and the measured cost of its exact
-  form. On MoltenVK on an Apple GPU, whose sampler and `float` functions are Metal's own, most of
-  these choices change nothing.
-- **The device's load and store of a signed normalized or `RGB9E5Float` attachment**
-  (`TileStorePolicy::Device`, the runtime's choice; no pipeline differs). A render pass that loads
-  one and draws keeps the texels its draws do not write as they were, where Metal's tile store
-  writes a channel's minimum code back as the code above it and an unnormalized shared-exponent
-  word normalized, announced as `snorm-minimum-kept` and `shared-exponent-kept`.
-  `tile_store = TileStorePolicy::Exact`, which `exact_answers()` selects, rewrites them before
-  the pass as Metal's store leaves them, through the extended-range attachments' load pass. On
-  MoltenVK the pass is a Metal pass and stores them as Metal's under either value.
-- **The device's resolve of a multisampled color attachment** (`ResolvePolicy::Device`, the
-  runtime's choice; no pipeline differs). A pass resolves a color attachment by the device's
-  `AVERAGE` in the pass, which rounds the average (a tie, an sRGB average) as the device does and
-  answers a NaN or infinite sample as the device does, announced as `device-rounded-resolve`.
-  `resolve = ResolvePolicy::Exact`, which `exact_answers()` selects, resolves an attachment whose
-  format has Metal's rule at its sample count by that rule in one more render pass instance after
-  the pass (`shader-resolve`). On MoltenVK the device's resolve is Metal's own under either value,
-  and an attachment a fetching pass's sample planes hold as it ends resolves from them by Metal's
-  rule under either. An extended-range attachment (`BGR10_XR`, `BGRA10_XR`, their sRGB twins,
-  `RGB10A2Unorm_sRGB`), held in raw codes no device averages, resolves after the pass under either
-  value, on every device: a linear form's colors by Metal's rule, its alpha and an sRGB form's
-  colors by a near-equivalent (`extended-range-resolve`).
+- **The device's arithmetic.** The device's own maths library, divisions, fused multiply-adds,
+  `float` denormals, rounding order of `dot`/`mix`/`fast::sqrt`, the grouping and fusion of
+  fast-math sums and products (each operation in the AIR's order, its own fast-math flags its
+  decoration), NaN bits, and the operand of `fmin`, `fmax`, `min3`, `max3`, `clamp` and
+  `saturate`, on every device and with no exact form.
+  Each records a precision note with its bound; on MoltenVK on an Apple GPU, whose `float`
+  functions are Metal's own, they are Metal's answers, but for a NaN's bits where the device is
+  not measured to answer Metal's.
+- **Fast native forms off Apple's GPUs.** The device's own sampler (its filter, footprint, level,
+  anisotropy, texel conversion and comparison, a two-plane YCbCr texture's filter among them),
+  with no switch: the device's answer is the contract, recorded as `PrecisionNote::DeviceSampling`
+  with its measured bound. The device's own `half` rounding and its blend of a `half` color have
+  no switch either: each records its note. [FAST-PATHS.md](FAST-PATHS.md) lists these device gaps
+  with their bounds. On MoltenVK on an Apple GPU, whose sampler and `float` functions are Metal's
+  own, most of them change nothing.
+- `DevicePolicy::exact_answers()` selects Metal's answer for each of the runtime's choices that
+  offers one (the batch order and render lowering below, the heap texture compression, command
+  buffer completion and textures over host pages) and the AIR's rounding of each `half` operation
+  on a device without `shaderFloat16` (below), each listed in [FAST-PATHS.md](FAST-PATHS.md)
+  with its bound and the measured cost of its exact form.
+- **`half` chains held at `float` precision without `shaderFloat16`** (`HalfChainPolicy::AtExits`,
+  the default; changes emitted code). A device without 16-bit floats has no `half` arithmetic, so
+  a module computes each `half` `+ - *` in `float` and rounds it by the device's quantize. An
+  operation whose flags hold `contract` and `reassoc` and whose result only such operations read
+  is left unrounded: the chain rounds where a value leaves it, one quantize per exit instead of
+  one per operation, recorded `FastMathRewrites`. `half_chains = HalfChainPolicy::EachOperation`,
+  which `exact_answers()` selects, rounds every operation. A device with `shaderFloat16` computes
+  `half` alike under either value.
 - **Batches of a queue ordered by their ends** (`BatchOrderPolicy::Ends`, the runtime's choice; no
   pipeline differs). On ANV, RADV and NVIDIA's driver, each measured to start no kernel submission
   of a `VkQueue` before the one before it completed, each batch of command buffers ends with a
@@ -134,7 +132,8 @@ compile does. `DevicePolicy::default()` is `DevicePolicy::UNTRUSTED`:
   while the program goes on. A program that runs 16 batches ahead of that thread waits for it in
   its next call, and one 4 encoders' ends ahead in its next `end_encoding`. `end_encoding` hands the encoder's end to that thread too and returns; the next
   call that follows the end in its command buffer (another encoder, an event or semaphore
-  command, `commit_failed`, `refusal`, `used_resources`, `ended_encoders`, `failed_pipeline`)
+  command, `commit_failed`, `refusal`, `used_resources`, `ended_encoders`, `failed_pipeline`,
+  `dropped_draw`)
   lowers on the program's thread what the thread has not, and a rebind or detach of host pages
   and `Device::work_counts` lower every encoder's first. `commit` makes its checks at the call
   (committed already, an encoder open, one abandoned) and returns, its status `Committed`, its own work left to run once the end is lowered, on the
@@ -169,6 +168,31 @@ compile does. `DevicePolicy::default()` is `DevicePolicy::UNTRUSTED`:
   Notices a logged call's lowering announces name the call (`DegradeNotice::call`) and may reach
   the message sink on the lowering thread, and `DeviceOptions::lowering_refuses` turns the kinds
   it lists into such refusals (section 9).
+- **A pipeline still being made waited for a bound** (`PipelineWaitPolicy::Bounded`, the
+  default; the runtime's choice, no pipeline differs). A render or compute state's creation
+  hands the driver's making of its predicted pipeline to the runtime's pool and waits for it
+  `DevicePolicy::pipeline_creation_wait` at most; a committed command buffer waits until its
+  commit plus `DevicePolicy::pipeline_commit_wait` at most, one deadline its commands share, for
+  its draws' and dispatches' (a compute encoder's, a render pass's tile dispatches) pipelines
+  still being made, an execution's replayed draws among them (whose pipelines the commit hands to
+  the pool), then records each such command as nothing (`draw-dropped-still-making`,
+  `dispatch-dropped-still-making`, the first named by `CommandBuffer::dropped_draw` with
+  `VK_TIMEOUT`, counted `WorkCounts::draws_dropped_still_making` and
+  `dispatches_dropped_still_making`), and later command buffers draw and dispatch with the
+  pipeline once made. Both bounds are 4.5 s by default. What one call waits for the driver's
+  makings: a state's creation, its creation wait at most; a `commit`, until its own deadline at
+  most (it records there what it can, an execution of render commands the CPU writes among
+  them; every other recording runs on the runtime's scheduler thread, which no call waits for). A
+  creation waits on no command buffer's deadline and a commit on no creation's, so a host step
+  that creates a state and commits a command buffer waits their sum at most, 9 s by default,
+  under a guest's 10 s FIFO check, where a driver's cold compile took 11.6 s (MoltenVK with a cold
+  Metal compiler service). Made until made under this value too, in the call that makes them: a
+  draw that records nothing, a draw in a pass of custom sample positions, and one recorded again
+  into another instance of its pass (each in the draw's call or an execution's replay), a device
+  replay's draws (in its `commit`), and a making that failed, made again by its command's
+  recording. `pipeline_waits = PipelineWaitPolicy::Exact`, which `exact_answers()` selects, makes
+  the predicted pipeline before the creation returns, as Metal compiles there, and waits for
+  every draw's and dispatch's until made.
 
 Loops run as written: no execution bound is translated in.
 
@@ -206,25 +230,26 @@ println!("  Metal properties: {:?}", device.metal_properties());
 
 Where Vulkan leaves an answer to the driver and a driver's answer is Metal's, the profile relies on
 it only where that driver was measured to give it, keyed on the description's driver identity
-(`driver_id`, `vendor_id`, `driver_version`, and `device_id` where one GPU differs from another;
-MoltenVK's `device_id` is the macOS release and the Apple GPU family, so the M3 Max and the M4 share
-one under macOS 27 and a macOS release not measured is another identity), never on a claim of the
-description itself. A GPU that reports more than one `device_id` is read by the one it was measured
-under (`DeviceDescription::canonical_device_id`): the Radeon 780M of Hawk Point (`0x1900`) as
-Phoenix's (`0x15bf`), at the releases measured there. A release measured on one GPU of a shared
-`device_id` alone names that GPU by its `device_name`: MoltenVK 1.4.2 under macOS 27 was measured
-on the M3 Max, so the M4 at 1.4.2 is no measured identity. These are `DriverDeviation`s (simdgroups
-that run in lockstep, Metal's own `float` functions, sampler and canonical NaNs, color writes,
-...), measured on MoltenVK 1.4.1 on Apple's M3 Max and M4 and on MoltenVK 1.4.2 on the M3 Max,
-with a few per-GPU facts measured elsewhere. A driver, GPU or release that was not measured takes
-the conservative, exact route. A newer MoltenVK release
-takes the measured facts and records `PrecisionNote::BeyondMeasuredDeviation`.
+(`driver_id`, `vendor_id`, and `device_id` where one GPU differs from another; MoltenVK's
+`device_id` is the macOS release and the Apple GPU family, so the M3 Max and the M4 share one under
+macOS 27), never on its `driver_version` and never on a claim of the description itself. A row holds
+at every release of its driver. A GPU that reports more than one `device_id` is read by the one it
+was measured under (`DeviceDescription::canonical_device_id`): the Radeon 780M of Hawk Point
+(`0x1900`) as Phoenix's (`0x15bf`). These are `DriverDeviation`s (simdgroups that run in lockstep,
+Metal's own `float` functions, sampler and canonical NaNs, color writes, ...), measured on MoltenVK
+on Apple's M3 Max and M4, with a few per-GPU facts measured elsewhere. A driver or GPU that was not
+measured takes the route each deviation's docs name for it: the device's own answer, recorded as a
+precision note, or, where the answer decides a capability, its emulation or a refusal.
 
 Metal semantics the translation keeps on every device, beyond Vulkan's: Metal's 32-lane
-simdgroups (including lockstep races on threadgroup memory within a barrier interval), and the
-bit-exact `fneg`, `fabs` and `half`-to-`float` widening of NaNs and denormals. Under the exact
-switches it also keeps Metal's canonical NaNs and Metal's operand choice in `fmin`, `fmax`,
-`min3`, `max3` and `clamp`.
+simdgroups (including lockstep races on threadgroup memory within a barrier interval). `fneg` and
+`fabs` are the device's `OpFNegate` and `FAbs`, so a NaN's payload and a denormal are the
+device's (`native-nan-encoding`, `device-denormals`). A NaN's bits, the
+operand `fmin`, `fmax`, `min3`, `max3`, `clamp` and `saturate` pick beside a NaN or between two
+zeros, a `half` read from its bits, which is the device's widening on every device (a NaN's
+bits, and a denormal on a device that may flush 16-bit ones), and a `half` rounded from a value
+below the smallest normal `half` on a device without `shaderFloat16` (its `OpQuantizeToF16`'s
+zero) are the device's, each recorded as a precision note.
 
 What the runtime enables for itself outside the vocabulary enters no enable set, compile profile
 or fingerprint: among it the extensions of its dma-buf fallback for no-copy memory whose pointer
@@ -232,20 +257,51 @@ the device refuses (`HostMemory::with_dma_buf`), `VK_EXT_external_memory_dma_buf
 `VK_KHR_external_memory_fd`, and `VK_EXT_image_drm_format_modifier` with
 `VK_EXT_queue_family_foreign` beside them, wherever a device lists them.
 
-A texture over a no-copy buffer's host pages (imported by their pointer or as dma-bufs) is a shadow
-(`shadowed-texture`), as is one over a host-visible buffer of the runtime's own longer than 32 MiB
-where the device imports host pointers and the memory class's best type for the buffer takes such
-an import: that buffer lies in fresh anonymous pages imported by their pointer, zero as mapped, so
-that nothing writes its zeros (`WorkCounts::fresh_page_buffers_made`,
-`shadows_over_fresh_pages`). Such a shadow is an optimal image of the runtime's own memory, whose
-texels the encoders copy in from the pages before a use and back (merged back: only the bytes the
-commands changed) after a write. No image is bound to the pages: an image bound to imported memory
-starts in `VK_IMAGE_LAYOUT_UNDEFINED` (`VUID-VkImageCreateInfo-pNext-01443`), and its first move,
-like any layout transition, may read and write every byte bound to it, where Metal keeps every CPU
-write to bytes a command buffer does not write. `Texture::vk_image` gives `None` for such a texture. A class whose best memory type takes no such
-import -- a discrete card's write-combined class, whose best type for the buffer is a device-local
-host-visible one -- is placed as ever and its bytes set to zero on the host; the buffer reads zero
-either way, which is all a program sees.
+A texture over host pages is one over a no-copy buffer's (imported by their pointer or as
+dma-bufs), or over a host-visible buffer of the runtime's own longer than 32 MiB where the device
+imports host pointers and the memory class's best type for the buffer takes such an import: that
+buffer lies in fresh anonymous pages imported by their pointer, zero as mapped, so that nothing
+writes its zeros (`WorkCounts::fresh_page_buffers_made`). A class whose best memory type takes no
+such import -- a discrete card's write-combined class, whose best type for the buffer is a
+device-local host-visible one -- is placed as ever and its bytes set to zero on the host; the
+buffer reads zero either way, which is all a program sees.
+
+An image bound to imported memory starts in `VK_IMAGE_LAYOUT_UNDEFINED`
+(`VUID-VkImageCreateInfo-pNext-01443`), and its first move, like any layout transition, may read
+and write every byte bound to it, where Metal keeps every CPU write to bytes a command buffer does
+not write. Under the default `HostPageTexturePolicy::InPlace` the runtime relies on the driver
+there, checked: a texture over host pages whose declared usage only samples or reads it (none of
+`RenderTarget`, `ShaderWrite` and `ShaderAtomic`) is a linear image aliasing the pages (one over
+dma-buf pages a `DRM_FORMAT_MOD_LINEAR` image over a dma-buf of its own pages, acquired from
+`VK_QUEUE_FAMILY_FOREIGN_EXT`) wherever the device's own check passed for that kind of pages
+(`WorkCounts::host_textures_in_place`, `dma_buf_textures_in_place`,
+`fresh_page_textures_in_place`). The check makes such images of every texel size, small and
+3840x2160, over each kind of pages while a CPU thread writes beside their texels, and passes a kind
+only where every first move kept every byte. It runs on a thread of its own, which the first such
+texture starts, once per driver, driver version and runtime release: its verdict is kept in the
+shader cache's directory (a device without one checks once per process) and recalled as the next
+device is made (`WorkCounts::in_place_checks_run`, `_passed`, `_failed`, `_unchecked`,
+`_recalled`). Such a texture's commands read the texels in the memory the buffer's commands read,
+so a CPU write reaches them as it reaches the buffer's.
+
+Every other texture over host pages is a shadow (`shadowed-texture`, the notice naming why): under
+`HostPageTexturePolicy::Shadow` (`DevicePolicy::exact_answers`); one whose usage renders into it or
+writes it; one made before the check answered, or where it failed or made no image; and one no
+image in place serves (the bytes' pitch, placement or memory, or over dma-buf pages no dma-buf of
+the texture's own pages). `WorkCounts::host_texture_shadows_*` counts each reason apart (one
+whose usage renders into it, `_render_target`, apart from one that writes it through a shader
+alone, `_shader_write`). A shadow
+is an optimal image of the runtime's own memory, whose texels the encoders copy in from the pages
+before a use and back (merged back: only the bytes the commands changed) after a write; no image
+is bound to the pages, and `Texture::vk_image` gives `None` for it. A texture in place renders and
+is written beyond its declared usage, as plain Metal allows, through its usage shadow and an
+attachment stand-in, whose copies touch its texels alone.
+On a discrete GPU, a texture whose policy and usage take the image in place, over a no-copy
+buffer whose memory carries a log of its writes (`HostMemory::with_dirty_pages`), tracked, one
+slice laid out as one copy, is instead a device copy (`WorkCounts::device_copy_textures`, whatever
+the check answered): a shadow whose copies in take only the bands of rows the log reports changed
+(`dirty_copies_in_gated` and kin). Its notice is not announced: it holds the bytes wherever a
+command reads it.
 A texture placed in a heap over dma-buf pages is an image over a dma-buf of its own pages, which its
 first submission acquires from `VK_QUEUE_FAMILY_FOREIGN_EXT`; a linear image over a buffer of the
 runtime's own memory starts `VK_IMAGE_LAYOUT_PREINITIALIZED`, and its move from there keeps its
@@ -495,10 +551,11 @@ Where Metal's rules differ from Vulkan's, the pipeline gives Metal's answer:
 - An 8-bit sRGB attachment of one or two channels (`R8Unorm_sRGB`, `RG8Unorm_sRGB`) the device
   does not render (the RTX 5080: it renders neither `R8_SRGB` nor `R8G8_SRGB`, and holds the
   latter in its UNORM twin) renders through an `R8_UINT` or `R16_UINT` view of its texture the
-  same way: the fragment function writes Metal's bytes (its twelve-bit encode), a pass clears it
-  to the bytes of Metal's clear, and a partial mask merges the word in the interlock, or over the
-  attachment's input attachment on a device that orders fetch through rasterization-order input
-  attachments (lavapipe; `RuntimeFact::WordInputMerge`). Exact. A blend of one
+  same way: the fragment function writes the bytes of the device's sRGB encode
+  (`DevicePackConversion`), a pass clears it to the bytes of Metal's clear, and a partial mask
+  merges the word in the interlock, or over the attachment's input attachment on a device that
+  orders fetch through rasterization-order input attachments (lavapipe;
+  `RuntimeFact::WordInputMerge`). A blend of one
   other than one and zero is refused as the device lacking the format; a color input or resolve
   of one is `NotImplemented(Format)`.
 - An `RGB9E5Float` attachment the device does not render (the RTX 5080) renders through an
@@ -762,6 +819,28 @@ for dependency in &pipeline.dependencies {
   pipeline of its own: leave out a slot bound at offsets that move, so that its draws keep one
   shape and one pipeline (the runtime leaves out each slot of a state once it finds one bound at
   an offset the alignment does not divide).
+- A two-plane YCbCr texture whose planes a function may read in place states them in its facts
+  (`TextureFacts::ycbcr_in_place`, a `YCbCrInPlace` of its planes; the runtime states one on a
+  device whose memory is the host's, `DeviceProfile::reads_ycbcr_planes_in_place`: an integrated
+  GPU or a CPU device). A slot whose function only samples it (nearest or linear, no comparison,
+  anisotropy or `min_lod_clamp`) or reads its size (`RuntimeFact::YCbCrInPlace`) takes the
+  pipeline's in-place variant (`VariantKey::ycbcr_in_place`): the slot binds a uniform texel buffer
+  over the planes' bytes (`WriteSource::YCbCrInPlace`, in `YCbCrInPlace::format`), its push field
+  (`PushField::YCbCrInPlace`) holds `YCbCrInPlace::words`, and the function converts and filters
+  the codes as Metal does, exactly. Any other slot, and any texture without the fact, binds the
+  texture's image of converted texels. Where the consumer also holds the planes as a linear image
+  of their multi-planar 4:2:0 format over their bytes, which the device's sampler Y′CbCr
+  conversion reads with Metal's reconstruction, it states so (`YCbCrInPlace::with_planes_image`,
+  its conversion `YCbCrInPlace::sampler`, a `YCbCrPlanesSampler`). A slot whose every sample the
+  device's sampler takes (the fact's `device`: no border address mode, no texel offset placed by a
+  parent's size; a runtime sampler's word without a border mode) then takes the planes variant
+  (`VariantKey::ycbcr_planes_sampled`): the slot is a combined image sampler of the image
+  (`ResourceKind::YCbCrPlanes`, `BindingSource::YCbCrPlanes`, written from
+  `WriteSource::YCbCrPlanesImage`) whose immutable sampler is `SamplerDesc::ycbcr` of the
+  conversion. The consumer chains its `VkSamplerYcbcrConversionInfo` into that sampler and makes
+  the image's view with an identically defined conversion, and sizes a pool for the format's
+  `combinedImageSamplerDescriptorCount` descriptors at the binding. Each sample is the device's,
+  at level 0, its conversion and filter of the codes rather than Metal's.
 - `interface.reaches_command_buffers` and `interface.texture_writing_stages` say, provably, which
   pipelines may touch an indirect command buffer and which stages may write a texture.
   `interface.command_writes` (`CommandWrites`) says what its functions may write into the
@@ -813,8 +892,11 @@ fetch, ...). Compile it and plan it for the same shape: `device.compile_render_v
 ask too (`plan.dispatch_variant(&dispatch)`, or `BindError::NeedsVariant` from instantiation).
 
 Textures follow Metal's texel rules: sparse textures report residency where the device can,
-`Depth32Float` texels keep any `float`, `ulong` textures and their atomics use 64-bit images where
-the device has them, and `half` and sRGB reads give Metal's values or record their bound. The
+`Depth32Float` texels are the device's depth image's (a value it clamps or a denormal it flushes is
+announced, `restricted-depth-upload`, `depth-denormals`), `ulong` textures and their atomics use
+64-bit images where the device has them, and `half` and sRGB reads give Metal's values or record
+their bound (an sRGB texel is the device's own decode wherever the device samples its format,
+`srgb-texel-decode`). The
 rustdoc of `BindState`, `TextureFacts` and `BindingPlan` states each rule.
 
 ## 6. At bind time
@@ -988,7 +1070,9 @@ assert_eq!(linked, pipeline);
 ```
 
 - A compiled function states before linking what its stage will: `stage()`, `requirements()`
-  (check it against another profile with `DeviceProfile::check`), `precision_notes()`,
+  (check it against another profile with `DeviceProfile::check`), `precision_notes()` (the
+  pipeline's stage adds those of its own state: a fragment stage's attachment writes, a vertex
+  stage's formats its fixed-function vertex input converts),
   `reconvergence()`, `required_subgroup_size()`, `requires_full_subgroups()`, `module_stats()`
   (section 3) and `writes_memory()` (stores or atomics, which a render pipeline drawn in more than
   one color group refuses).
@@ -1000,17 +1084,7 @@ assert_eq!(linked, pipeline);
   the attributes its entry reads, and the kernel keys and compiles under those, so states that
   differ only in an attribute it never reads share one compiled function. What a creation reads of
   the descriptor past the fetch -- its layout agreement, its reflection, and `compute_pipeline_key`
-  -- reads it whole. Each pipeline kind's compile (`compile_render_variant`,
-  `compile_mesh_variant`, `compile_compute_pipeline`, `compile_tile_pipeline`) holds a pipeline of
-  `Function` stages to the device's compiler word bound (`DeviceProfile::module_word_bound`,
-  ANV's) itself; one linked from `Compiled` stages it cannot translate again. A caller who
-  compiles stages ahead must pass the linked pipeline, with the descriptor of its functions, to
-  the kind's fit, or its module goes to the driver unreduced: `device.fit_render_variant(
-  &descriptor, &variant, &budget, pipeline)`, `fit_mesh_variant` likewise, and
-  `fit_compute_pipeline(&descriptor, &inputs, &budget, pipeline)` or `fit_tile_pipeline` with the
-  `LoweringInputs` the kernel or tile function was compiled under. The call translates the
-  functions again with the policy's exact forms dropped where the largest stage passes the bound
-  (`exact-forms-over-compiler-limit`), under the same key.
+  -- reads it whole.
 - A key names an artifact by its inputs and versions; a content digest names it by what it says.
   `pipeline.content_digest()` hashes everything but the key and profile, and `plan.content_digest()`
   (with `serde`) everything a plan states. A cache of driver objects keyed on the digest survives a
@@ -1147,7 +1221,7 @@ How a notice reaches you:
   (`DegradeNotice::call`: its Metal selector and its index among the encoder's calls); `None`
   elsewhere.
 - Decode a notice by its `Degradation` or its code, never its text. The codes are a contract: none
-  is renamed or reused, and a retired code stays listed below.
+  is renamed.
 - `Degradation::exactness()` says whether the program still gets Metal's answer: `Exact` (most
   performance and validity kinds), `ExactWithinPool` (Metal's answer while a command buffer's pool
   holds it, else the command buffer fails), `OneOfMetals` (Metal's own answer is not one value, and
@@ -1178,19 +1252,32 @@ Whatever the variables, a placement heap's `newTextureWithDescriptor:offset:` th
 `metal2vulkan-heap-texture-refused`, `Info` severity): the descriptor, the offset, the heap's size,
 options and memory, the size and alignment the size query answers the descriptor, what the making
 planned (the size and alignment it places the texture by, its image's route, tiling and memory
-requirements) and the refusal. That text is for people, not a contract.
+requirements) and the refusal. A device's self-check that the driver does not make (the one
+pipeline it creates to ask whether a set-0 buffer binding of several variables may be a dynamic
+descriptor, `FAST-PATHS.md`) hands the sink one line saying so, with the driver's result and the
+messages it reported inside that creation (id name `metal2vulkan-self-check-refused`, `Info`
+severity), in place of those messages: they answer the runtime's own question and name none of the
+program's work (MoltenVK 1.4.2 reports two errors there). That text is for people, not a contract.
 
 Each entry below gives the code, its category, the `Degradation` kind (or the `PrecisionNote`) and
 what triggers it; a runtime kind's cost follows. The kind's rustdoc states the trigger, cost and
-how to avoid it in full. [FAST-PATHS.md](FAST-PATHS.md) lists which notes the default policy's
-fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
+how to avoid it in full. [FAST-PATHS.md](FAST-PATHS.md) lists which notes the device's native
+forms and the default policy's fast forms record, and each `PrecisionNote`'s rustdoc states its
+bound.
 
 - `metal2vulkan-degrade-shadowed-texture` (performance). `ShadowedTexture`: A 2D texture over a
   buffer is a shadow image: the buffer is over host pages (a no-copy buffer's, imported by their
   pointer or as dma-bufs, or the fresh pages a host-visible buffer of the runtime's own longer than
   32 MiB lies in), where an image bound to them would start `UNDEFINED` and Vulkan lets its layout
   transitions (its first move among them) read and write any byte bound to it, where Metal keeps
-  every CPU write; or its rows (or an array's slices) lie with the buffer's bytes between them,
+  every CPU write, and the device takes no image in place there: the policy keeps the exact form
+  (`HostPageTexturePolicy::Shadow`), the texture's usage renders into it or writes it
+  (`RenderTarget`, `ShaderWrite`, `ShaderAtomic`), the device's check that the move keeps every
+  byte over that kind of pages has not answered yet, found a byte changed or made no image, or no
+  image in place serves the texels (its rows share bytes, the device lays no linear image's rows at
+  the buffer's pitch, the image's placement or memory misses the pages, the bytes were detached, or
+  no dma-buf of the texture's own pages serves); the notice names which, and
+  `WorkCounts::host_texture_shadows_*` counts each; or its rows (or an array's slices) lie with the buffer's bytes between them,
   which an image over them would hold in its subresource, where Vulkan lets the image's layout
   transitions read and write any byte of its subresources, and a render pass's load and store
   operations read and write back any byte of an attachment's image subresource, and Metal leaves
@@ -1200,10 +1287,10 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   imported as dma-bufs where the device makes no image over a dma-buf of the texture's own pages
   (the notice names why; `WorkCounts::dma_buf_image_fallbacks` counts it). A heap's texture is a
   shadow of the heap's bytes in its range in three more shapes, each announced with its own reason.
-  A single-sample depth or stencil texture held with no depth twin, whose texels fit its image's
-  bytes, on a device whose driver lays such images apart from the memory they are bound to
-  (`DriverFact::DepthStencilImagesLieApart`): one no such shadow serves, a multisampled one or a
-  depth twin among them, is `heap-depth-stencil-apart` instead. A texture the device binds no image
+  A single-sample depth or stencil texture whose texels fit its image's bytes, on a device whose
+  driver lays such images apart from the memory they are bound to
+  (`DriverFact::DepthStencilImagesLieApart`): one no such shadow serves, a multisampled one among
+  them, is `heap-depth-stencil-apart` instead. A texture the device binds no image
   of to the heap's memory where the heap places it: its optimal image takes no memory type of the
   heap's and no linear image of the device serves (a `Shared` heap's depth texture on MoltenVK), or
   the heap lies over host pages that no linear image over them serves, or its images ask more than
@@ -1223,10 +1310,17 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   scissors copies in only the texels inside them (`WorkCounts::shadow_texels_copied_in`). Over a
   buffer's bytes that another writer may
   write while a command buffer runs, the image is kept in a scratch buffer before the first command
-  that writes through it, and each copy back is a dispatch that merges only the words the commands
+  that writes through it (a one-sample colour texture in Metal's tiles, right after its copy in, by
+  a copy of the bytes that copy took: `WorkCounts::shadow_keeps_from_staging`), and each copy back
+  is a dispatch that merges only the words the commands
   changed, so that writer's writes to the texels they left stay, as on Metal: the CPU's, over a
   `Shared` or `Managed` buffer's bytes, host pages or the caller's `VkBuffer`, and another queue's
-  commands', over an untracked buffer's. A tracked `Private` buffer's bytes have no such writer (the
+  commands', over an untracked buffer's. After a render pass that loads and stores it as a color
+  attachment inside its draws' scissors, or a command that replaces every texel over host pages
+  that log their writes, the dispatch stores each 256-byte block of the rows it merges that holds
+  a changed word whole (`WorkCounts::shadow_merge_dispatches_in_blocks`): Metal's own store of
+  such a pass writes back every texel of each tile its draws reach, so a write to a texel the
+  pass left inside its render area while it runs is not kept on Metal either. A tracked `Private` buffer's bytes have no such writer (the
   runtime orders another queue's commands that touch them before or after the command buffer, as
   Metal does), and are copied back (`shadow_texels_copied_back`), as a command that replaces every
   texel is. The scratch keeps the rectangle the commands write in, where they bound it and the
@@ -1288,38 +1382,18 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
 - `metal2vulkan-degrade-unorm-depth-bias` (precision). `UnormDepthBias`: A draw biases a
   `Depth16Unorm` depth by a constant, or by a slope alone, which brings Metal's constant unit, on a
   device whose driver is not measured to store Metal's codes so
-  (`DriverDeviation::MetalDepth16BiasedStores`), through a pipeline whose fragment stage does not
-  add the bias itself (more than one sample, early fragment tests, the draw's tests run in the
-  shader, a function that returns its depth or reads its position's depth). Elsewhere such a draw
-  runs the variant whose fragment stage adds the bias. Cost: a biased depth can store a code next
-  to Metal's: the device rounds the biased sum its own way, and without depthBiasExact counts the
-  bias in its own unit.
+  (`DriverDeviation::MetalDepth16BiasedStores`): the device biases by Metal's constant in its own
+  unit and converts the depth. Cost: a biased depth can store another code than Metal's: the
+  device biases by the constant c in its own unit, up to twice 2^-16, where Metal biases by c + 1
+  units of 1/65535 (c - 1 below 0, one unit for a slope alone), and rounds the biased sum its own
+  way.
 - `metal2vulkan-degrade-unorm-depth-rounding` (precision). `UnormDepthRounding`: A draw tests or
   writes a `Depth16Unorm` depth on a device whose driver is not measured to convert a depth to
-  Metal's code (`DriverDeviation::MetalDepth16Stores`), through a pipeline whose fragment stage
-  cannot write the code itself (more than one sample, early fragment tests, the draw's tests run
-  in the shader, a function that reads its position's depth and returns none), or through one
-  that does, in depth clamp mode through a viewport depth range an end of which lies inside
-  `(0, 1)`, where the device clamps the depth to that end. Cost: a depth
-  near a code's midpoint can store the code below Metal's: the device converts the depth to the
-  16-bit code its own way, where Metal rounds to nearest, a tie up.
-- `metal2vulkan-degrade-shader-unorm-depth` (performance). `ShaderUnormDepth`: A draw tests or
-  writes a `Depth16Unorm` depth on a device whose driver is not measured to convert a depth to
-  Metal's code (`DriverDeviation::MetalDepth16Stores`, or for a biased draw
-  `DriverDeviation::MetalDepth16BiasedStores`), through a single-sampled pipeline whose fragment
-  stage writes each depth as Metal's code, its depth bias added in the shader (a pipeline without
-  a fragment function draws through a fragment stage of its own). The render pass's depth decides
-  it, whatever depth format the pipeline names. Cost: the fragment stage writes each depth as
-  Metal's code, about 50 more instructions per fragment, which keeps the device from testing the
-  depth before the stage runs. A biased draw whose bias has a known side
-  (`metal::state::depth16_bias_side`, every Vulkan depth range of the draw inside `[0, 1]`) runs a
-  stage that declares it (`DepthGreater` or `DepthLess`, counted by
-  `WorkCounts::depth16_sided_draws`), so the device may still test first where its test compares
-  that way (docs/FAST-PATHS.md's costs of matching Metal).
-- `metal2vulkan-degrade-unorm-depth-slope` (precision). `UnormDepthSlope`: A draw biases a
-  `Depth16Unorm` depth by a slope through a fragment stage that adds Metal's bias itself. Cost:
-  the fragment stage takes the depth's slope from the depths of its 2x2 quad, where Metal takes
-  the triangle's own: a biased depth near a code's midpoint can store the code next to Metal's.
+  Metal's code (`DriverDeviation::MetalDepth16Stores`), or a pass clears one to a depth that a
+  device rounding to nearest takes above Metal's truncation: the device converts the depth. Cost:
+  a depth near a code's midpoint can store the code next to Metal's: the device converts the depth
+  to the 16-bit code its own way, where Metal's draw rounds to nearest, a tie up, and its clear
+  truncates.
 - `metal2vulkan-degrade-point-guard-band` (precision). `PointGuardBand`: A draw of points keeps
   Vulkan's clipping of points, where Metal's guard band cannot be emulated: in a rate-mapped pass,
   on a device without `shaderClipDistance` or with too few clip distances beside the vertex
@@ -1409,17 +1483,6 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   function. Announced at the state's making, naming which. Cost: each draw runs a geometry stage of
   its topology class between the vertex and fragment stages, which emits each primitive's vertices
   with the barycentric weights or the first vertex's slice and viewport.
-- `metal2vulkan-degrade-exact-forms-over-compiler-limit` (precision). `ExactFormsOverCompilerLimit`:
-  A pipeline state (render, mesh render, tile render or compute) whose largest stage module, under
-  the consumer's exact forms, exceeded the device's compiler word bound
-  (`RuntimeFact::ExactFormsOverCompilerLimit`;
-  `DriverWorkaround::RegisterAllocatorOverflowsLargeModules`, ANV's register allocator faults
-  compiling a module past it), so the translation dropped those forms until it fit: native sampling
-  first, then every module-growing exact answer native. Announced where the runtime makes a variant
-  whose pipeline the fit reduced, the base variant or another, naming the state's kind and the
-  forms dropped; the reduced stages announce their own precision notes besides.
-  Cost: the dropped exact forms' results can differ from Metal's as their notes' documentation
-  states, where the device's compiler would fault on the exact module.
 - `metal2vulkan-degrade-landed-visibility-results` (performance). `LandedVisibilityResults`:
   Visibility results start where Vulkan writes no query result. Cost: they land in an upload region
   and are copied on into the buffer after the pass.
@@ -1466,24 +1529,19 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   texture whose slices from the resolve slice hold fewer layers than the pass's. Cost: the pass
   resolves into a scratch image, whose render area is copied into the texture after the pass.
 - `metal2vulkan-degrade-shader-resolve` (performance). `ShaderResolve`: A multisample color resolve
-  drawn after the pass by Metal's exact rules, where the device's `AVERAGE` resolve is not measured
-  to be Metal's, under `ResolvePolicy::Exact` or from a fetching pass's sample planes; or a stencil resolved by `DepthResolvedSample` after `Min` or `Max`, which no
+  drawn after the pass by the crate-owned resolve: of an extended-range attachment, whose codes no
+  device's resolve averages, or into the attachment's format's sRGB twin, whose encoding no
+  device's resolve writes; or a stencil resolved by `DepthResolvedSample` after `Min` or `Max`, which no
   Vulkan resolve mode states, or a `Min` or `Max` depth on a device without the mode, drawn after
   the pass. Cost: one more render pass instance after the pass reads the stored samples (or the
   sample planes) and writes the resolve texture, where the device would resolve in the pass; where
   the attachment's image takes no input attachment usage, a copy of its samples over the render
   area into a scratch image first.
 - `metal2vulkan-degrade-shader-color-conversion` (performance). `ShaderColorConversion`: A fragment
-  function writes a float to a normalized, sRGB or half-float color attachment on a device whose own
-  conversion is not Metal's (`StageModule::rounded_colors`). Cost: the fragment function rounds each
-  such channel to the code Metal stores before it writes it: about 35 more instructions per
-  normalized or half-float channel, and about 70 and one read of a 4 KiB table per sRGB channel.
-- `metal2vulkan-degrade-shader-half-color-bits` (performance). `ShaderHalfColorBits`: A fragment
-  function writes a `half` to a half-float color attachment as the bits of the half Metal stores,
-  through a 16-bit output, on a device that does not store a 32-bit output's NaN as Metal does
-  (`StageModule::half_bit_colors`). Cost: the fragment function writes each such output as its
-  half's bits through a 16-bit output: about 20 more instructions per output, and the attachment
-  takes no Vulkan blend of one and zero.
+  function writes a float to a half-float color attachment of a pipeline under
+  `TextureWriteRoundingMode::NearestEven`, whose rounding no device's conversion gives
+  (`StageModule::rounded_colors`). Cost: the fragment function rounds each such channel to nearest
+  even before it writes it: about 35 more instructions per channel.
 - `metal2vulkan-degrade-render-pass-split` (performance). `RenderPassSplit`: A Metal render pass
   runs as several Vulkan render pass instances: a framebuffer fetch through the pixel interlock
   keeps its attachment out of its draws' subpass, and the pass's draws leave different attachments
@@ -1517,10 +1575,9 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   memoryless texture buffer (`newTextureWithDescriptor:` of a `TextureBuffer` descriptor of
   `MTLStorageModeMemoryless`, which plain Metal makes), whose texels are a buffer's bytes: the
   buffer is a `Private` one of the device's, since no Vulkan buffer takes memory lazily. The
-  texture answers the descriptor's memoryless mode, as Metal's does, and the runtime refuses every
-  use of it, as Metal's validation stops every use of a memoryless texture but as a render pass's
-  attachment, which no texture buffer is. Cost: a Private buffer of the texture's row of texels:
-  memory Metal spends none of on a memoryless texture. Nothing reaches those bytes.
+  texture answers the descriptor's memoryless mode, as Metal's does, and a command that uses it
+  fails its command buffer, as plain Metal's. Cost: a Private buffer of the texture's row of
+  texels: memory Metal spends none of on a memoryless texture. Nothing reaches those bytes.
 - `metal2vulkan-degrade-fetch-through-scratch` (performance). `FetchThroughScratch`: A color render
   target that a framebuffer fetch reads lacks the usage the fetch's form needs, so its pass renders
   into a scratch image that has it: `STORAGE` in the pixel interlock, or for its sample planes
@@ -1631,15 +1688,19 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   and end.
 - `metal2vulkan-degrade-device-rounded-resolve` (precision). `DeviceRoundedResolve`: A multisample
   color resolve averages through Vulkan's `AVERAGE` mode, which leaves the rounding of the average
-  (and the sRGB encoding) to the device, on a device not measured to round as Metal does: under
-  `ResolvePolicy::Device`, the default, any color attachment but one a fetching pass's sample
-  planes hold as it ends (resolved from them by Metal's rule); under `ResolvePolicy::Exact` a format
-  without Metal's closed rule at its count (the 16-bit float, `RG11B10Float` and `RGB9E5Float`
-  formats past 4 samples, and a format no rule covers), or an attachment whose image the exact
-  resolve can neither read nor copy: an image without input attachment usage of a format the
-  device does not copy. Never, whatever the format, on a device whose resolve is measured to round
+  (and the sRGB encoding) to the device, on a device not measured to round as Metal does: any
+  color attachment but an extended-range one and one resolving into its format's sRGB twin (each
+  resolved after the pass), one a fetching pass's sample planes hold as it ends included (the
+  planes merged back first). Never, whatever the
+  format, on a device whose resolve is measured to round
   as Metal does (`DriverFact::ColorResolveAverageIsMetals`: MoltenVK's resolve is Metal's own).
-  Measured against Metal's rules at 2 and 4 samples on RADV (Mesa 26.0.8, the Radeon 780M and the RX
+  Also, on every device, a resolve into an 8-bit UNORM attachment's sRGB twin where the device has
+  the sRGB format: the crate-owned resolve decodes the samples and encodes their average by the
+  device's own sRGB conversions, where Metal's resolve takes its own 12-bit tables (with correctly
+  rounded conversions, 1,758 of the 65,536 pairs of codes at 2 samples land one code from
+  Metal's; MoltenVK 1.4.2 on the M3 Max: 696 of 262,144 channels at 2 samples, one code below;
+  lavapipe, Mesa 26.0.8: 57,865 of 524,288 at 4, within one code). Measured against Metal's rules
+  at 2 and 4 samples on RADV (Mesa 26.0.8, the Radeon 780M and the RX
   7900 XTX), ANV (Mesa 26.2.4, the Iris Xe), NVIDIA (615.71, the RTX 5080 Laptop GPU) and lavapipe
   (Mesa 26.2.4, at 4 samples): every unorm, snorm and packed 16-bit unorm
   channel within one code of Metal's, an sRGB channel within two (NVIDIA's at 4 samples; one
@@ -1655,9 +1716,9 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
 - `metal2vulkan-degrade-unmeasured-resolve` (precision). `UnmeasuredResolve`: A multisample color
   resolve of more than 4 samples, of which Apple's GPUs make no texture: no Metal answer is measured
   there; likewise a stencil resolved by `DepthResolvedSample` after `Min` or `Max`, whose pick among
-  equal depths is measured at 2 and 4 samples. Cost: the resolve applies the rules Metal's resolve
-  follows at 2 and 4 samples (or the device's average, for a format without them), which no Metal
-  answer confirms at this count.
+  equal depths is measured at 2 and 4 samples. Cost: the resolve is the device's average, or after
+  the pass the rules Metal's resolve follows at 2 and 4 samples, which no Metal answer confirms at
+  this count.
 - `metal2vulkan-degrade-extended-range-resolve` (precision). `ExtendedRangeResolve`: A multisample
   resolve of an extended-range color attachment whose resolve Metal averages from values finer than
   the codes the attachment holds (`BGRA10_XR`'s alpha, an `_sRGB` twin's color,
@@ -1722,19 +1783,14 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   reaches for a cubic filter (a fragment stage never does); and one whose elements could not be
   written. Cost: a function reading the state through its ID in an argument buffer reads the
   neutral sampler, where Metal's reads the state.
-- `metal2vulkan-degrade-depth-twin` (performance). `DepthTwin`: A `Depth32Float` texture the program
-  only reads or samples, on a device whose driver is not measured to keep every `float` in a depth
-  image, is held in an `R32_SFLOAT` image with a `D32_SFLOAT` twin for the comparisons the device
-  makes. Cost: a second image of its size, which every copy into it writes too; a copy into it from
-  a depth texture without a twin goes through a scratch buffer.
 - `metal2vulkan-degrade-restricted-depth-upload` (precision). `RestrictedDepthUpload`: An upload
   (`replace_region`, a blit from a buffer) into the 32-bit float depth of a texture's depth image,
   on a device without `VK_EXT_depth_range_unrestricted` enabled, where Vulkan leaves a value outside
   `[0, 1]` undefined, whose driver is not measured to keep one
-  (`DriverFact::DepthImageKeepsValuesOutsideUnitRange`): a texture without a twin. And a render
-  pass's NaN clear depth on such a device, which Metal stores as `0x7fc00000`, cleared to 1.0. Cost:
-  a value outside [0, 1] may be stored clamped to [0, 1], where Metal's keeps it, so reads, samples,
-  comparisons and depth tests of it can differ.
+  (`DriverFact::DepthImageKeepsValuesOutsideUnitRange`). And a render pass's NaN clear depth on such
+  a device, which Metal stores as `0x7fc00000`, cleared to 1.0. Cost: a value outside [0, 1] may be
+  stored clamped to [0, 1], where Metal's keeps it, so reads, samples, comparisons and depth tests
+  of it can differ.
 - `metal2vulkan-degrade-host-read-dispatch-arguments` (performance). `HostReadDispatchArguments`: An
   indirect dispatch, or a dispatch after `setStageInRegionWithIndirectBuffer:indirectBufferOffset:`:
   its arguments or its stage-in region are GPU memory the work before it may write, so they are
@@ -1766,18 +1822,27 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   it across the bus, as a discrete Mac's GPU does a shared resource: coalesced accesses at the bus's
   speed, and scattered writes far slower (4-byte stores 12 bytes apart at 0.08 GB/s on an RTX 3090,
   where device-local memory takes them at 850 GB/s).
-- `metal2vulkan-degrade-mipmaps-within-spread` (precision). `MipmapsWithinSpread`:
-  `generate_mipmaps` through the device's blit chain, which the runtime's check accepted for the
-  texture's pixel format within the spread Metal's own GPUs show: Metal has no one answer, an Apple
-  M3 Max's and an Apple M4's differing by up to 1 unit in the last place. Cost: each level is the
-  device's linear blit of the one above, which on the check's inputs lay within 1 unit in the last
-  place (2 for 32-bit float) of an Apple M3 Max's or an Apple M4's answer, not at either's exactly;
-  other inputs are not checked.
+- `metal2vulkan-degrade-device-filtered-mipmaps` (precision). `DeviceFilteredMipmaps`:
+  `generate_mipmaps` of a filtered format (an integer format's texels are picked as plain Metal
+  picks them): each level is the device's linear filter of the one above at the scaled texel
+  centres, its blit chain (`vkCmdBlitImage` with `VK_FILTER_LINEAR`) where its blits filter the
+  image's format, else the runtime's bilinear (trilinear in 3D) compute filter in `float`: an
+  extended-range format, an 8-bit sRGB texture held as its UNORM twin, or a format without blits or
+  linear filtering. The compute filter's arithmetic is the device's: its products and sums as it
+  contracts them, an 8-bit or extended-range sRGB code decoded and encoded through the MSL transfer
+  by its `Pow` (as a shader's read of the UNORM twin decodes it, `srgb-texel-decode`), a half by
+  its widening and narrowing, and a NaN its own; `bind::MipmapFilterChain::outside_bound` states
+  the bound its levels keep to the filter in IEEE `f32`. Neither is Apple's datapath, whose answers
+  also differ between Apple's GPUs (an M3 Max's and an M4's by up to a unit in the last place).
+  Announced once per device; no bound against Metal's answer is measured. Cost: each level is the device's linear filter of the one
+  above (its blit, or a bilinear filter in float where its blits cannot filter the format), not
+  Apple's: a channel can differ from Metal's where the filtered value lies near a rounding boundary,
+  and wholly where a box averages infinities, NaNs or a float format's extremes.
 - `metal2vulkan-degrade-heap-depth-stencil-apart` (precision). `HeapDepthStencilApart`: A depth or
   stencil texture made in a heap on a device whose driver lays depth and stencil images apart from
   the memory they are bound to (`DriverFact::DepthStencilImagesLieApart`) that no shadow of the
-  heap's bytes serves: a multisampled texture, which Vulkan copies to and from no buffer, one whose
-  texels do not fit its bytes, or one with a depth twin. Cost: the texture's texels lie apart from
+  heap's bytes serves: a multisampled texture, which Vulkan copies to and from no buffer, or one
+  whose texels do not fit its bytes. Cost: the texture's texels lie apart from
   the heap's bytes: a write through a buffer
   or texture over its bytes changes none of them, and its writes change none of those resources'
   bytes, where Metal's texture aliases them.
@@ -1831,15 +1896,6 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   itself to its bindings, through a swizzle, and takes a shadow only for a pass that renders into
   it: Vulkan views the image in no format of the view's. Cost: its texels are copied from its
   texture's image before each use and back after each write.
-- `metal2vulkan-degrade-mipmaps-as-apple-m4` (precision). `MipmapsAsAppleM4`: `generate_mipmaps`
-  computed as Metal's filter where an Apple M3 Max's answer may differ from the chain's
-  (`MipmapFilterChain::unlike_an_m3`): a 2D texture, array or cube of three levels or more whose M3
-  Max passes are not known, an `A1BGR5Unorm` 2D texture, an `ABGR4Unorm` one of three levels or
-  more, or a 3D texture of a format summed as half floats, under macOS 26.7's rule
-  (`MipmapRule::AppleM3MaxPasses`). Under macOS 27.0.1's every level is the M3 Max's. Cost: each
-  level is the Apple M3 Max's but where its answer is not known: below the first level of a 2D chain
-  whose M3 Max passes are not known an Apple M4's filter, and a few measured values of the 4-bit and
-  1-bit formats and of 3D half-float sums one unit off.
 - `metal2vulkan-degrade-repeated-execution-start` (precision). `RepeatedExecutionStart`: A render
   encoder executes an indirect command buffer's commands from a command it executed them from before
   with another length, each range given (`executeCommandsInBuffer:withRange:`) or read from a
@@ -1870,7 +1926,7 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   sized or made in a heap (never a device's own texture, whose layout nothing shows), on a device
   whose driver keeps depth and stencil images GPU-optimized whatever their create info
   (`DriverFact::DepthStencilImagesStayGpuOptimized`), that no shadow of Metal's tiles in the heap's
-  bytes serves (a multisample texture, a depth twin, a format whose layout is not measured): Metal
+  bytes serves (a multisample texture, a format whose layout is not measured): Metal
   lays the texture out without its compression metadata, and the runtime's image keeps it. Cost: the
   texture's image keeps the GPU-optimized layout Metal
   drops with the property off, so its bytes in the heap are not Metal's layout of its texels (where
@@ -1878,8 +1934,7 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   name for the shapes they cover); heap_texture_size_and_align answers Metal's own size and
   alignment for the descriptor wherever the runtime models them, and the larger of the images' and
   Metal's for a texture whose images need more bytes or a coarser alignment that no shadow of the
-  heap's bytes holds it to (a depth twin among them), where a heap sized by Metal's answers holds
-  fewer such textures.
+  heap's bytes holds it to, where a heap sized by Metal's answers holds fewer such textures.
 - `metal2vulkan-degrade-narrow-surface-rows` (precision). `NarrowSurfaceRows`: A texture of an
   IOSurface plane of more than one row under 16 bytes a row: Metal's GPU writes its rows 16 bytes
   apart and reads every row past the first as memory-dependent bytes (zeros in a fresh process;
@@ -2032,16 +2087,24 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   the bytes Metal's blit reads from outside the texels: from outside the planes below a width of 4,
   and those an earlier blit left in a row's padding or past a plane, which Metal keeps.
 - `metal2vulkan-degrade-extended-range-bits-kept` (precision). `ExtendedRangeBitsKept`: A draw in a
-  render pass that loads a color attachment of an extended-range or padded 10-bit format
+  render pass that loads a color attachment of an extended-range, padded 10-bit or bfloat format
   (`BGR10_XR`, `BGRA10_XR`, `RGB10A8_2P_XR10`, `R10Unorm_X6`, `RG10Unorm_X12` and their sRGB twins,
-  and `RGB10A2Unorm_sRGB`) and does not discard it at the store, where the pass's load pass does
-  not take it: a multisampled attachment, a texture held as a shadow of another image or of a
-  heap's bytes, a sparse one, or one whose image the device does not copy both ways (a padded format takes no multisample texture). Cost: the
-  texels the pass's draws do not write keep their bytes; Metal's pass keeps their codes but rewrites
-  the bits they leave unused in each tile a draw reaches (BGR10_XR's bits 30 and 31 to ones,
-  BGRA10_XR's low six bits of each field to zeros, the two-plane color word's top two bits to zeros)
-  and clamps BGRA10_XR's alpha code to [384, 894]: a texel whose bytes no Metal write left (uploaded
-  bytes, or an alpha code past 894) keeps bytes Metal's pass would change.
+  `RGB10A2Unorm_sRGB`, `R16Bfloat`, `RG16Bfloat` and `RGBA16Bfloat`) and does not discard it at the
+  store, on every device: the device's pass keeps the bytes its draws do not write, where Metal's
+  pass writes each 32 x 32 tile a draw reaches back through its tile store. Also, once per device, a
+  GPU blit into, out of or between textures of which one is a `BGRA10_XR` or `BGRA10_XR_sRGB`
+  texture Metal keeps losslessly compressed: Metal's blit moves the texels through the compression,
+  which clears the same bits and clamps the same alpha, where the device's copy keeps the bytes.
+  Cost: the texels the pass's draws do not write keep their bytes; Metal's pass rewrites, in each
+  tile a draw reaches, the bits their codes leave unused (BGR10_XR's bits 30 and 31 to ones,
+  BGRA10_XR's low six bits of each field, the two-plane color word's top two bits and a padded
+  word's low six bits to zeros), clamps BGRA10_XR's alpha code to [384, 894], moves a padded sRGB
+  twin's code through its table and a bfloat code through half (out of half's range to an infinity
+  or zero, a NaN to 0x7fc0): a texel whose bytes no Metal write left (uploaded bytes, an alpha code
+  past 894, a bfloat code off half's grid) keeps bytes Metal's pass would change, and a blit
+  through a BGRA10_XR texture Metal compresses keeps the bytes Metal's blit rewrites so; an
+  extended-range texel reads the same value either way, a bfloat code off half's grid reads its own
+  value where Metal's reads the half it was moved to.
 - `metal2vulkan-degrade-snorm-minimum-kept` (precision). `SnormMinimumKept`: A draw in a render pass
   that loads a single-sampled color attachment of a signed normalized format (`R8Snorm`, `RG8Snorm`,
   `RGBA8Snorm`, `R16Snorm`, `RG16Snorm`, `RGBA16Snorm`) and does not discard it at the store. Cost:
@@ -2049,16 +2112,18 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   minimum code (-128, or -32768 for 16 bits) as the code above it (-127, -32767) in each tile a draw
   reaches: a texel whose bytes no Metal write left (uploaded or copied bytes) keeps a code Metal's
   pass would change. Not on a driver whose pass stores the codes as Metal's
-  (`DriverFact::TileStoreIsMetals`: MoltenVK on Apple's GPUs, whose pass is a Metal pass), nor under
-  `TileStorePolicy::Exact` for an attachment the load pass rewrites as Metal's store leaves it.
+  (`DriverFact::TileStoreIsMetals`: MoltenVK on Apple's GPUs, whose pass is a Metal pass).
 - `metal2vulkan-degrade-shared-exponent-kept` (precision). `SharedExponentKept`: A draw in a render
   pass that loads a single-sampled `RGB9E5Float` color attachment and does not discard it at the
-  store. Cost: the texels the pass's draws do not write keep their words; Metal's pass normalizes a
-  word whose largest mantissa is below 256 (its exponent above 0) in each tile a draw reaches: a
-  texel whose bytes no Metal write left (uploaded or copied words) keeps a word Metal's pass would
-  change, of the same value. Not on a driver whose pass stores the words as Metal's
-  (`DriverFact::TileStoreIsMetals`), nor under `TileStorePolicy::Exact` for an attachment the load
-  pass rewrites as Metal's store leaves it.
+  store; and, once per device, a GPU blit into, out of or between textures of which one is an
+  `RGB9E5Float` texture Metal keeps losslessly compressed, whose compression normalizes every such
+  word, where the device's copy keeps the bytes. Cost: the texels the pass's draws do not write keep
+  their words; Metal's pass normalizes a word whose largest mantissa is below 256 (its exponent
+  above 0) in each tile a draw reaches, and Metal's blit through an RGB9E5Float texture it
+  compresses every such word: a texel whose bytes no Metal write left (uploaded or copied words)
+  keeps a word Metal would change, of the same value. Not on a driver whose pass stores the words
+  as Metal's (`DriverFact::TileStoreIsMetals`), nor, for a blit, where the device's copy of the
+  compressed image is Metal's blit (MoltenVK's).
 - `metal2vulkan-degrade-two-plane-buffer-blit` (precision). `TwoPlaneBufferBlit`: A blit between a
   buffer and a level of `RGB10A8_2P_XR10` or its sRGB twin whose width is not a multiple of 4,
   where Metal's blit addresses the level's rows `⌊4 w / 16⌋ · 16` bytes apart, short of where they
@@ -2110,20 +2175,35 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   of the state set on it runs its program, as Metal runs a command the CPU encoded, where for a
   record the GPU wrote while another state held the ID Metal runs that state (nothing, for a
   state of the other kind).
-- `metal2vulkan-degrade-ycbcr-filter-not-exact` (precision). `YCbCrFilterNotExact`: A pipeline
-  stage's filtered sample of a texture slot bound to a two-plane YCbCr texture does not take Metal's
-  exact filter of the format: the stage records `PrecisionNote::HalfSampleFilter` or
-  `FloatSampleFilter` under the slot's bound format (a format whose filter is not measured, a
-  swizzle that moves its channels, a linear mip filter, or a sample the emulation does not reach).
-  Cost: the texels hold Metal's reads exactly, but the sample filters them as the device does, off
-  the grid Metal sums the format's steps on, so a filtered result can miss Metal's by a step of that
-  grid or more. The slot takes Metal's filter only under `YCbCrFilterPolicy::Exact` (on MoltenVK
-  also under `SamplingPolicy::Exact`). Under the default a device that samples natively answers
-  the device's filter, `metal2vulkan-degrade-device-sampling`; on MoltenVK, Metal's own sampler
-  filters the converted texels as an `RGBA16Float` or `RGBA32Float` texture's, within one step of
-  the grid (a `half` result within one `half` ulp, measured in plain Metal on an Apple M3 Max under
-  macOS 27.0.1 for `YCBCR8_420_2P` and its sRGB twin against such a texture of the same texels),
-  announced at a draw that binds such a texture.
+- `metal2vulkan-degrade-ycbcr-filter-not-exact` (precision). `YCbCrFilterNotExact`: A two-plane
+  YCbCr texture whose planes' format the device converts itself (its sampler Y′CbCr conversion:
+  unpacked 8- or 10-bit codes of a 4:2:0, 4:2:2 or 4:4:4 layout over plane 0, a 4:4:4 one read as
+  codes aside, on a device that reports the format's conversion features, Metal's midpoint chroma
+  through a linear chroma filter among them for a 4:2:0 or 4:2:2 one, and has no defect in it:
+  MoltenVK's 4:2:0 and 4:2:2 formats and lavapipe's, RADV's and NVIDIA's 10-bit ones aside) reads the device's conversion
+  of its planes, announced where the texture is made; so do the samples of a texture whose planes
+  are read in place through the device's conversion of a linear image of them (where the device's
+  linear tiling of the 4:2:0 format has Metal's reconstruction), the device's filter of the codes
+  too, announced where the image is made; and a pipeline stage's filtered sample of a
+  texture slot bound to a two-plane YCbCr texture, through Metal's own sampler (MoltenVK), does not
+  take Metal's exact filter of the format: the stage records `PrecisionNote::HalfSampleFilter` or
+  `FloatSampleFilter` under the slot's bound format. Cost: where the device converts the planes'
+  format, the texels are its own Y′CbCr conversion's, at its precision and unclamped where it does
+  not clamp, not Metal's fixed-point read; elsewhere the texels hold Metal's reads exactly, but the
+  sample filters them as the device does, off the grid Metal sums the format's steps on, so a
+  filtered result can miss Metal's by a step of that grid or more. Measured on lavapipe (Mesa
+  26.0.8; random planes, every texel), which converts the 8-bit 4:4:4 layout here: each channel
+  within 0.04/2048 of Vulkan's conversion past the `half` its image stores, and of Metal's read
+  within 6/2048 where the result lies in `[0, 1]`; outside it by what Metal's clamp takes off. On
+  NVIDIA's 615.71.09 (RTX 5080 Laptop GPU), which converts the 8-bit 4:2:0, 4:2:2 and 4:4:4
+  layouts: within 0.034/2048 of Vulkan's conversion, and of Metal's read within 12.4/2048 in
+  `[0, 1]` (19.1 through an `_sRGB` twin's curve), Metal rounding each reconstructed chroma to a
+  code where the device does not; a code-reading format's codes are Metal's. A
+  device that samples natively answers the device's filter, `metal2vulkan-degrade-device-sampling`;
+  on MoltenVK, Metal's own sampler filters the converted texels as an `RGBA16Float` or `RGBA32Float`
+  texture's, within one step of the grid (a `half` result within one `half` ulp, measured in plain
+  Metal on an Apple M3 Max under macOS 27.0.1 for `YCBCR8_420_2P` and its sRGB twin against such a
+  texture of the same texels), announced at a draw that binds such a texture.
 - `metal2vulkan-degrade-rotated-load-tiles` (precision). `RotatedLoadTiles`: A render pass that
   draws loads and stores a rotated texture of rotation 4, whose load is the plane transposed and
   whose store is rotation 1's: every tile of the frame lands mirrored, where Metal loads and stores
@@ -2169,28 +2249,6 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   read_write access) that does not name it reads what an earlier such write left in the stand-in's
   sink, where Metal drops those writes and reads zero; a sampled read, and a size query, are
   Metal's.
-- `metal2vulkan-degrade-metal-level-below-host` (precision). `MetalLevelBelowHost`: A device made,
-  with no level named in its options, on a macOS host whose release has no measured `MetalLevel`: it
-  answers as the newest measured release below the host's. Cost: where Metal's answers differ by
-  release (which pixel formats a texture descriptor takes and Metal describes, whether a run of
-  compute encoders' first indirect dispatch of another dispatch type ends the process), the device
-  gives the older release's: it can stop or refuse a texture or a dispatch the host's Metal makes,
-  and never makes one the older release stops.
-- `metal2vulkan-degrade-unreached-tiles-rewritten` (precision). `UnreachedTilesRewritten`: A render
-  pass that loads a color attachment of an extended-range, padded 10-bit or bfloat format
-  (`BGR10_XR`, `BGRA10_XR`, `RGB10A8_2P_XR10`, `R10Unorm_X6`, `RG10Unorm_X12` and their sRGB twins,
-  `RGB10A2Unorm_sRGB`, `R16Bfloat`, `RG16Bfloat` and `RGBA16Bfloat`), or under
-  `TileStorePolicy::Exact` of a signed normalized format or `RGB9E5Float`, stores it and draws,
-  whose load pass rewrites every 32 x 32 tile of its render area: Metal's pass rewrites
-  only the tiles a draw's primitives reach, and every tile only where a color attachment of the pass
-  is cleared and stored (announced where none is, or where the pass renders more than one layer).
-  Cost: in tiles no draw reaches the pass rewrites what Metal keeps: the unused bits made canonical
-  (BGR10_XR's bits 30 and 31 ones, BGRA10_XR's low six bits of each field and the two-plane color
-  word's top two bits zeros) and BGRA10_XR alpha codes clamped to [384, 894], so an out-of-range raw
-  alpha reads back changed, a padded word's low six bits zeroed (an sRGB twin's code moved through
-  Metal's table), a bfloat code moved through half (out of half's range to an infinity or zero, a
-  NaN to 0x7fc0) and, under the exact tile store, a signed normalized minimum code raised and an
-  RGB9E5Float word normalized; the tiles a draw reaches are Metal's.
 - `metal2vulkan-degrade-zero-layer-map-after-release` (precision). `ZeroLayerMapAfterRelease`: A
   draw in a render pass over a rasterization-rate map of no layers that was made after the device
   released a map of one or more layers, or reset from one of layers. Cost: the draws write nothing,
@@ -2219,11 +2277,11 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   would.
 - `metal2vulkan-degrade-heap-texture-block-compressed-layout` (precision).
   `HeapTextureBlockCompressedLayout`: A texture of a block-compressed format made in a heap over
-  host pages whose placement the device's Metal level does not measure: Metal places a format
-  family's blocks in each level by a rule that differs by family and by release, measured for BC,
-  ETC2, EAC and ASTC under macOS 27.0.1 (an Apple M3 Max and an Apple M4 alike) and 26.7 (an
-  Apple M3 Max), and for PVRTC under 27.0.1 (an Apple M3 Max), where those lie as Metal lays them
-  out, and not for PVRTC under 26.7, whose blocks lie in the runtime's layout. Cost: the texture's
+  host pages whose blocks' placement is not measured: Metal places a format family's blocks in each
+  level by a rule that differs by family and by release, measured at the release every device
+  answers as (`MACOS_RELEASE`) for the BC, ETC2, EAC, ASTC and PVRTC families (an Apple M3 Max, and
+  an Apple M4 alike but PVRTC), whose textures lie as Metal lays them out; a format of none of them
+  (ASTC's 4x2 and 8x4 footprints) lies in the runtime's layout. Cost: the texture's
   reads, writes and copies are Metal's, but its blocks lie in the heap's bytes in the runtime's
   layout, where Metal tiles them: a buffer or texture over them meets the blocks at other bytes than
   on Metal.
@@ -2261,21 +2319,6 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   the copy, memmove's answer, which is Metal's for small regions, where Metal's copy of a larger
   region races and differs from run to run; the source goes through a scratch buffer, two copies
   instead of one.
-- `metal2vulkan-degrade-mipmap-tie-rounding` (precision). `MipmapTieRounding`: `generate_mipmaps`
-  computed as Metal's filter whose levels take a rounding the chain does not fit at sums a hair from
-  a rounding boundary (`MipmapFilterChain::near_ties`): a texture of a format with an 8-bit sRGB
-  colour channel (`R8Unorm_sRGB`, `RG8Unorm_sRGB`, `RGBA8Unorm_sRGB`, `BGRA8Unorm_sRGB`), whose
-  filtered levels take it; under macOS 26.7's rule (`MipmapRule::AppleM3MaxPasses`), of an
-  extended-range sRGB format (`BGR10_XR_sRGB`, `BGRA10_XR_sRGB`), whose filtered levels and levels
-  read from kept values take it; or of a 16-bit float format (`R16Float`, `RG16Float`,
-  `RGBA16Float`) with a level read from the level above's kept values (a 2D chain's even level below
-  a square of a power of two, a pass's second level). `RGB10A2Unorm`, `BGR10A2Unorm`, `BGR10_XR`,
-  `BGRA10_XR`, `ABGR4Unorm` and `A1BGR5Unorm` are exact. Cost: each level is Metal's but at a value
-  whose sum lies a hair from a rounding boundary, which may be one unit off: an 8-bit sRGB colour
-  code of a filtered level (1 of 5,331,270 measured values), an extended-range sRGB code, a 16-bit
-  float read from kept values one unit in the last place (8 of 538,088). Under macOS 27.0.1 an Apple
-  M3 Max stores an 8-bit sRGB texel one unit below the chain's at two measured sums a hair above a
-  tie (test `the_filter_gives_the_m3_s_chains_under_macos_27_0_1`), which no rule fits yet.
 - `metal2vulkan-degrade-extended-range-blends-stored-codes` (precision).
   `ExtendedRangeBlendsStoredCodes`: A draw whose render pipeline state blends into, or reads (a
   framebuffer fetch, or the interlocked storage form an extended-range blend takes), a color
@@ -2290,9 +2333,8 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
 - `metal2vulkan-degrade-unmeasured-heap-texture-size` (precision). `UnmeasuredHeapTextureSize`: A
   heap texture sized or made (`heap_texture_size_and_align`, `Heap::new_texture`) whose size Metal's
   layout the runtime does not model: a format or a sample count whose layout in Metal's heaps is not
-  measured at the device's Metal level (8 samples; a PVRTC format at macOS 26.7's level, whose
-  blocks' placement only macOS 27.0.1's measures); a mipmapped texture Metal compresses and a
-  `Depth32Float_Stencil8` one are modelled. Cost: heap_texture_size_and_align answers the
+  measured (8 samples); a mipmapped texture Metal compresses and a `Depth32Float_Stencil8` one are
+  modelled. Cost: heap_texture_size_and_align answers the
   device's own image's size and alignment, which may be larger or smaller than Metal's, so a heap
   sized by Metal's answers may hold more or fewer such textures and they lie at other offsets.
 - `metal2vulkan-degrade-plain-state-unique-identifier` (precision). `PlainStateUniqueIdentifier`: A
@@ -2326,27 +2368,23 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   where Metal's sees the nil buffer's offset as its address; neither holds a buffer, so only the
   address's value differs.
 - `metal2vulkan-degrade-compressed-texel-decode` (precision). `CompressedTexelDecode`: A texture of
-  a BC1 to BC5 format (`BC1_RGBA` to `BC5_RGSnorm`, the sRGB forms too) made on a device whose
-  driver is not measured to decode their texels as Metal does (BC1 to BC3
-  `DriverFact::ColorBlockDecodeIsMetals`: MoltenVK 1.4.1 on Apple's GPUs and 1.4.2 on the M3 Max,
-  RADV from Mesa 26.2.4 on the 780M; BC4 and BC5 `DriverFact::ChannelBlockDecodeIsMetals`: MoltenVK
-  1.4.1 on Apple's GPUs and 1.4.2 on the M3 Max).
+  a BC format (`BC1_RGBA` to `BC7_RGBAUnorm_sRGB`) made on a device whose driver is not measured to
+  decode its texels as Metal does (BC1 to BC3 `DriverFact::ColorBlockDecodeIsMetals`: MoltenVK on
+  Apple's GPUs, RADV on the 780M; BC4 and BC5 `DriverFact::ChannelBlockDecodeIsMetals`: MoltenVK on
+  Apple's GPUs; BC6H `DriverFact::Bc6hBlockDecodeIsMetals` and BC7
+  `DriverFact::Bc7BlockDecodeIsMetals`: MoltenVK on Apple's GPUs, NVIDIA's on the RTX 3090 and RTX
+  5080 Laptop GPU, RADV on the 780M, ANV on the Iris Xe of Raptor Lake-P, and lavapipe's BC6H). The
+  texture's image is its own BC image, which the device samples through its own decode: no BC
+  texture keeps a decoded twin. The bounds are the largest differences from Metal's texels measured
+  on random blocks of every format; a driver not named is unmeasured, and validation derives no
+  tolerance from them.
   Cost: a read, sample or gather of its texels answers the device's decode of its blocks (an sRGB
-  form's code through Metal's table), where Metal interpolates with 6-bit weights: NVIDIA's
-  (615.71.09, the RTX 3090 and RTX 5080 Laptop GPU) answers a BC1 to BC3 channel up to 3/255 off
-  Metal's (BC3's alpha 6/255), BC4 and BC5 up to 7.3/255 (signed 0.064); ANV's up to 1.3/255 (signed
-  0.013), lavapipe's 2.3/255 (signed 0.021), RADV's (Mesa 26.2.4, the Radeon 780M) a BC4 or BC5
-  signed texel with an endpoint of -128 up to 1.7/255; its blocks' bytes, copies and sizes are
-  Metal's.
-- `metal2vulkan-degrade-decoded-block-twin` (performance). `DecodedBlockTwin`: A texture of a BC1 to
-  BC5 format made on a device whose driver is not measured to decode its texels as Metal does
-  (`compressed-texel-decode`'s facts), whose image is its own for good: it keeps a decoded twin,
-  Metal's texels, which its samples read, and announces no `compressed-texel-decode`. Cost: a second
-  image of its decoded texels beside its blocks, 4 to 8 times their bytes (R8G8B8A8_UNORM for BC1 to
-  BC3, R32_SFLOAT and R32G32_SFLOAT for BC4 and BC5), and a decode after each write into it: a pass
-  on the GPU for a blit, a copy from a texture or a CPU copy through a submission; on the CPU, on
-  the device's decode thread, where its CPU copies go on the host or the staging queue, and then
-  once as it is made, the first command buffer that may read it waiting for that at its submission.
+  form's code through the device's sRGB decode), where Metal interpolates with 6-bit weights: a BC1
+  to BC3 channel up to 3/255 off Metal's on NVIDIA (615.71.09, the RTX 3090 and RTX 5080 Laptop
+  GPU; BC3's alpha 6/255) and lavapipe, 1/255 on ANV; a BC4 or BC5 channel up to 7.3/255 (signed
+  0.064) on NVIDIA, 1.3/255 (signed 0.013) on ANV, 2.4/255 (signed 0.022) on lavapipe, and on RADV
+  (Mesa 26.2.4, the Radeon 780M) a signed texel with an endpoint of -128 up to 1.7/255; a BC7
+  channel a `float` ulp on lavapipe; its blocks' bytes, copies and sizes are Metal's.
 - `metal2vulkan-degrade-cpu-block-decode` (performance). `CpuBlockDecode`: A CPU copy into a texture
   with a decoded twin (`replace_region`) whose CPU copies go on the host or the staging queue: its
   region is decoded on the CPU, on the device's decode thread, and copied into the twin; the first
@@ -2364,32 +2402,40 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   lavapipe): its blocks lie in an image of a carrier format whose blocks are also 16 (ASTC,
   `EAC_RGBA8`, `RG11`) or 8 (PVRTC, the other ETC2 and EAC formats) bytes, which copies and
   `get_bytes` move unchanged, and its samples read a decoded twin, Metal's decode of the blocks in
-  the texels `DecodedTexelsPolicy` names (a PVRTC texture's, and an 8-bit ETC2 or EAC texture's,
-  8-bit codes, exact under either: its sRGB form's slots decode them through Metal's table, and one
-  twin serves the views of the linear and sRGB forms; an ASTC sRGB texture's, its own 8-bit codes,
-  read the same way), decoded after each write into it as a BC
-  texture's twin is (`decoded-block-twin`; a PVRTC texture's whole levels, since each texel's
+  codes: an ASTC LDR texture's and an EAC 11-bit texture's each nearest Metal's value
+  (`decoded-texel-precision`); a PVRTC texture's, and an 8-bit ETC2 or EAC texture's, 8-bit codes,
+  exact (its sRGB form's slots decode them through Metal's table, and one twin serves the views of
+  the linear and sRGB forms); an ASTC sRGB texture's, its own 8-bit codes, read the same way.
+  It is decoded after each write into it (a PVRTC texture's whole levels, since each texel's
   colors come from the blocks around it). An ASTC texture's first view in its other colour
   space (its sRGB form as LDR, or the other way) gives it a second twin of that form's decode, kept
   in step by GPU passes its command buffers' submissions record. Also a texture of a 4:2:2 format
-  (`GBGR422`, `BGRG422`) on every device, whose Vulkan formats reconstruct chroma by the
-  implementation's rules: its texels' bytes lie in an `R8G8_UNORM` carrier, and its twin holds
-  Metal's texels as 8-bit codes, exact (each texel's own green, its red and blue interpolated with
-  the pair beside it), decoded in whole rows. Cost: a carrier image of its
-  blocks, at most about 1 byte a texel (a 4:2:2 texture's 2), and a decoded twin of 4 bytes a texel (R8G8B8A8,
-  `DecodedTexelsPolicy::Compact`; an EAC 11-bit texture's 16-bit codes, 2 bytes a channel) or 16
-  (R32G32B32A32_SFLOAT, `DecodedTexelsPolicy::Exact`; an EAC 11-bit texture's floats, 4 bytes a
-  channel), two for an ASTC texture viewed in both colour spaces, and a decode after each write into it: a pass on
+  (`GBGR422`, `BGRG422`) on every device, whose Vulkan formats are viewed only through a sampler
+  Y′CbCr conversion: its texels' bytes lie in an `R8G8_UNORM` carrier, and its twin holds its
+  texels as 8-bit codes (each texel's own green, its red and blue interpolated with the pair beside
+  it), decoded in whole rows: the device's own conversion of its pairs where it converts the format
+  with Metal's reconstruction (`decoded-texel-precision`; every decode then a GPU pass, its CPU
+  copies through submissions), else Metal's texels, exact. Cost: a carrier image of its
+  blocks, at most about 1 byte a texel (a 4:2:2 texture's 2), and a decoded twin of 4 bytes a texel
+  (R8G8B8A8; an EAC 11-bit texture's 16-bit codes, 2 bytes a channel, or its floats, 4 bytes a
+  channel, where the device does not take those codes), two for an ASTC texture viewed in both
+  colour spaces, and a decode after each write into it: a pass on
   the GPU for a blit, a copy from a texture or a CPU copy through a submission; on the CPU, on the
   device's decode thread, where its CPU copies go on the host or the staging queue.
 - `metal2vulkan-degrade-decoded-texel-precision` (precision). `DecodedTexelPrecision`: A texture
   with an ASTC LDR decoded twin of 8-bit codes, or an EAC 11-bit one (`R11`, `RG11`) of 16-bit
-  normalized codes, under `DecodedTexelsPolicy::Compact`. Cost: a read, sample or gather of its
+  normalized codes; or a 4:2:2 texture (`GBGR422`, `BGRG422`) whose twin holds the device's own
+  sampler Y′CbCr conversion of its pairs, where the device converts `G8B8G8R8_422_UNORM` or
+  `B8G8R8G8_422_UNORM` with Metal's reconstruction (the chroma at the midpoint through a linear
+  filter: MoltenVK). Cost: a read, sample or gather of its
   texels answers the nearest 8-bit code to Metal's 12-bit value, at most 1/510 off it; an EAC 11-bit
   texture's, the nearest 16-bit normalized code to Metal's 11-bit value, at most half a 16-bit step
-  off it (Metal reads an EAC 11-bit channel as `c / 2047`, signed `c / 1023`).
-  `DecodedTexelsPolicy::Exact` holds Metal's values instead. An ASTC sRGB texture's twin holds
-  Metal's own 8-bit codes, which its slots decode through Metal's table: exact, under either.
+  off it; a 4:2:2 texture's, where the device converts its format, the nearest 8-bit code to the
+  device's own Y′CbCr conversion of its pairs, not Metal's decode (Metal reads an EAC 11-bit
+  channel as `c / 2047`, signed `c / 1023`; a 4:2:2 chroma channel as `(3 c + n + 2) >> 2` of its
+  pair's code and the code beside, whose ties the device's nearest code takes to even). An ASTC
+  sRGB texture's twin holds Metal's own 8-bit codes, which its slots read through the twin's sRGB
+  view, the device's decode (`srgb-texel-decode`).
 - `metal2vulkan-degrade-shared-present-queue` (performance). `SharedPresentQueue`: A command queue
   made for presenting (`Device::new_command_queue_for_presenting`) on a device that reserved no
   `VkQueue` for presenting: its queue family has no queue past the ones the round robin takes
@@ -2401,8 +2447,7 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   heap texture sized or made (`heap_texture_size_and_align`, `Heap::new_texture`) whose images on the
   device need more bytes or a coarser alignment than Metal's answer, which the runtime models, and
   which no shadow of the texture's bytes holds it to: not a multisample texture, whose image lies in
-  memory of its own, nor one whose planes or Metal's tiles fit its bytes, and not one held with a
-  depth twin. The answer is then the larger of the two, since no image binds at Metal's offsets.
+  memory of its own, nor one whose planes or Metal's tiles fit its bytes. The answer is then the larger of the two, since no image binds at Metal's offsets.
   Every other such texture answers Metal's numbers and announces nothing here. Not where
   `optimized-depth-stencil-texture` says why. Cost:
   heap_texture_size_and_align answers more bytes or a coarser alignment than Metal's, so a heap
@@ -2458,9 +2503,43 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   buffer, heap or rebind was made over host pages the process maps read-only, from the caller's
   dma-buf source (`HostMemory::with_dma_buf`): on Linux, where drivers pin a pointer's imported
   pages for writing, such pages are imported only as dma-bufs of their pages, whose memory the GPU
-  writes. Cost: the GPU's writes through it reach the pages, and the CPU then reads them there,
+  writes. Where the caller's gate refuses their import, or that import fails, they are a copy whose
+  GPU writes are dropped instead (`copied-host-pages`). Cost: the GPU's writes through it reach the pages, and the CPU then reads them there,
   where after Metal's GPU writes into pages the process maps read-only the CPU reads them as they
   were (an M3 Max under macOS 27.0.1, private and shared memory alike).
+- `metal2vulkan-degrade-copied-host-pages` (precision). `CopiedHostPages`: A no-copy buffer, a
+  no-copy heap or a buffer's rebind was made over a copy of the caller's host pages in memory of
+  the device's own, which no import maps (a heap's textures shadows of its bytes):
+  the caller's gate (`HostMemory::with_import_gate`) refused the pages' import, or the import the
+  device and the gate admitted failed, of the pointer or of the caller's dma-bufs (out of memory, or
+  another Vulkan error, such as a driver out of the mappings the host kernel allows), or the
+  runtime kept pages the kernel cannot pin (a dma-buf's mapping) from NVIDIA's driver, whose failed
+  import of them breaks it (`RuntimeDriverDefect::UnpinnablePagesBreakHostMemory`), and no dma-buf
+  of them served. The gate is
+  asked before the pages' write permission: pages the process maps read-only (a VMM's alias of a
+  read-only replace) are copied as any, and the copy drops the GPU's writes, as Metal drops them:
+  each batch's completion takes them back out of the copy and writes nothing to the pages
+  (`copied_dropped_bytes`; the detail says so). The copy reads the pages through the kernel, and
+  where the kernel cannot (on Linux it pins each page, which a dma-buf's mapping does not allow),
+  with plain loads where the process maps every page readable. Pages not mapped, or mapped
+  without read permission, are never copied: the buffer is refused, as their import is. A copy
+  whose own allocation fails refuses the call (`OutOfMemory`). Memory whose GPU writes Metal's
+  private option bit 24 drops is never copied. A buffer's or heap's rebind is copied the same way,
+  its heap's bound textures and its images in place made again over the copy, and a buffer's
+  rebind to bytes at another offset in their page under a texture planned at the old one is a copy
+  laid out there (the detail says which). Counted: `WorkCounts::copied_host_buffers_made`, of them
+  `copied_host_buffers_refused`, `copied_host_buffers_degraded` and `copied_rebind_pages_moved`
+  (and `copied_heaps_made`, `copied_rebind_pages_made`, `copied_rebind_images_made`); each such
+  buffer, and each buffer placed in such a heap, answers `Buffer::host_backing` with
+  `HostBacking::Copied` until its next rebind or detach. Cost: the GPU
+  uses a copy of
+  the bytes, into which each commit writes every byte the CPU changed in the pages since, and from
+  which each batch's completion writes back every byte the GPU changed, where Metal's GPU reads and
+  writes the pages themselves: a CPU write the GPU reads mid-command-buffer, or a GPU write the CPU
+  reads before the batch completes, is not seen, and each commit and completion compares every
+  byte of every copy. An event signal submitted while a copy is live is seen once its batch's
+  writes are back in the pages, as Metal's: its value at the completion turn, and a wait for it
+  held on the host until then (`event_signals_behind_merge`).
 - `metal2vulkan-degrade-grouped-completion` (precision). `GroupedCompletion`: Batches of command
   buffers committed on one queue that the scheduler found ready together, or held while two or more
   earlier submissions of their queue ran, went to the driver in one `vkQueueSubmit`, only the last
@@ -2476,6 +2555,47 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   and the submission checks of the batches behind a queue's next one run with its own, before the
   batch before them is submitted; their commands, barriers and GPU times are unchanged;
   `CompletionPolicy::Exact` submits and checks each batch alone.
+- `metal2vulkan-degrade-draw-dropped-still-making` (precision). `DrawDroppedStillMaking`: A draw
+  whose `VkPipeline` the driver was still making once its command buffer's bound passed
+  (`PipelineWaitPolicy::Bounded`, the default: its commit plus
+  `DevicePolicy::pipeline_commit_wait`, 4.5 s by default) ran nothing: its recording
+  records the barriers and the visibility query around it and no draw, and the command buffer runs
+  on without error. Metal makes a render state's pipelines inside `newRenderPipelineState`, so none
+  of its draws waits for a compile; the runtime makes them on its pool, a state's predicted one
+  among them (the creation waits for it `DevicePolicy::pipeline_creation_wait` at most), so a
+  driver's cold compile (seconds on
+  MoltenVK with a cold Metal compiler service) cannot hold the command buffer past a guest's
+  watchdog. Announced where the draw is recorded: in the program's `commit`, or the command
+  buffer's host step. Cost: the draw's commands ran nothing, where Metal's draw renders; the
+  command buffers committed after the pipeline is made draw with it;
+  `CommandBuffer::dropped_draw` names the first such draw with the error VK_TIMEOUT;
+  `PipelineWaitPolicy::Exact` waits until the pipeline is made.
+- `metal2vulkan-degrade-draw-dropped-unmade` (precision). `DrawDroppedUnmade`: A draw whose
+  `VkPipeline` the driver failed to make after the draw returned (the runtime makes a draw's
+  pipeline while the draw goes on, `render/pending.rs`) ran nothing: its recording records the
+  barriers and the visibility query around it and no draw, and the command buffer runs on without
+  error. Metal makes a render state's pipelines inside `newRenderPipelineState`, which fails there,
+  so none of its draws meets such a failure. The notice names the draw, its state, the variant and
+  the driver's error. Announced where the draw is recorded: in the program's `commit`, or the
+  command buffer's host step. Cost: the draw's commands ran nothing, where Metal's draw renders;
+  the draws after it that need the same pipeline make it again; `CommandBuffer::dropped_draw`
+  names the first such draw with the driver's error, and `WorkCounts::draws_dropped_unmade` counts
+  them.
+- `metal2vulkan-degrade-dispatch-dropped-still-making` (precision). `DispatchDroppedStillMaking`: A
+  compute dispatch, or a render pass's tile dispatch, whose `VkPipeline` the driver was still
+  making once its command buffer's bound passed (`PipelineWaitPolicy::Bounded`, the default: its
+  commit plus `DevicePolicy::pipeline_commit_wait`, 4.5 s by default) ran nothing: its recording
+  records its barriers (a tile dispatch's copies into
+  its scratch and back) and no dispatch, and the command buffer runs on without error. Metal makes
+  a compute state's pipeline inside `newComputePipelineState`, so none of its dispatches waits for
+  a compile; the runtime makes a dispatch's on its pool, a compute state's predicted one among them
+  (the creation waits for it `DevicePolicy::pipeline_creation_wait` at most), so a driver's cold
+  compile cannot hold the command
+  buffer past a guest's watchdog. Announced where the dispatch is recorded: in the program's
+  `commit`, or the command buffer's host step. Cost: the dispatch ran nothing and wrote nothing,
+  where Metal's dispatch runs; the command buffers committed after the pipeline is made dispatch
+  with it; `CommandBuffer::dropped_draw` names the first such dispatch with the error VK_TIMEOUT;
+  `PipelineWaitPolicy::Exact` waits until the pipeline is made.
 - `metal2vulkan-degrade-misplaced-notice` (performance). `MisplacedNotice`: In a build without debug
   assertions, a notice announced where the runtime's rule announces none (`DegradeNotice::misplaced`
   names its kind and `NoticePlace`): inside a pipeline pool's piece, or, for a kind announced at
@@ -2488,39 +2608,26 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   one), on a device whose driver stores one a write on the GPU gives it as a zero (no
   `DriverFact::DepthImageKeepsDenormals`: RADV, ANV; a host copy keeps it) or whose depth test
   compares one otherwise than Metal's (no `DriverFact::DepthTestKeepsDenormals`: every driver
-  measured but MoltenVK on an Apple M4). Where the driver stores it and only its depth test differs,
-  a single-sample `Depth32Float` render target's passes test the smallest normal in its place (the
-  magnitude stand-in of `signed-depth-test`): Metal's answer but for a fragment at exactly 2^-126,
-  which passes `Equal` and fails `Greater` against it, where Metal's fails and passes; the payload
-  says so. Cost: a denormal depth may read, sample and copy out as a zero, or the depth test may
-  compare it as zero (a positive one) or below zero (a negative one), where Metal keeps it and
-  compares a positive one above zero and a negative one not below it; a render target whose passes
-  test the smallest normal in its place differs only for a fragment at exactly 2^-126.
+  measured but MoltenVK on an Apple M4). Cost: a denormal depth may read, sample and copy out as a
+  zero, or the depth test may compare it as zero (a positive one) or below zero (a negative one),
+  where Metal keeps it and compares a positive one above zero and a negative one not below it.
 - `metal2vulkan-degrade-signed-depth-test` (precision). `SignedDepthTest`: A depth test that may
   compare a negative value or a NaN stored in the 32-bit float depth of a render target as it is, or
   a pass with depth writes that may store such a value with its sign, where Metal's test compares
   the stored value's magnitude (a NaN above +inf) and its pass with depth writes stores every texel
-  no fragment wrote without its sign. A single-sample `Depth32Float` render target a write may give
-  such a value, or whose new texture's pattern (a NaN with the sign set) a pass loads before a write
-  covered it, is switched on (`WorkCounts::signed_depth_switch_ons`): each pass that loads its depth
-  renders over a magnitude stand-in, merged back after a pass with depth writes
-  (`WorkCounts::magnitude_stand_in_passes`, `magnitude_write_backs`); other targets' signs are
-  stripped after such a pass (`WorkCounts::sign_strips`); MoltenVK's test is Metal's own
-  (`DriverFact::DepthTestComparesMagnitudes`). Announced for what that misses: a merge under a
-  draw's exact +inf, a depth loaded through another image, a switch while another command buffer is
-  uncommitted, a multisampled or `Depth32Float_Stencil8` target's test (at the write, or at the pass
-  that loads its new pattern, on a device that keeps such a value in a depth image:
-  `VK_EXT_depth_range_unrestricted` enabled, or `DriverFact::DepthImageKeepsValuesOutsideUnitRange`;
-  elsewhere `restricted-depth-upload` is announced), a strip the device does not make, and a NaN
-  clear depth the device does not write before the pass. Cost: a depth test against the stored
-  value, or the value a pass with depth writes stores, can differ from Metal's in the pass or target
-  named: the device compares
-  a negative value below zero and a NaN by its own rule and keeps the value's sign, or a pass's
-  merge keeps a stored NaN where a draw wrote +inf over it, where Metal compares the value's
-  magnitude, orders a NaN above every value, stores the value without its sign and stores the
-  draw's; or a NaN clear depth is stored and tested as 1.0, where Metal stores `0x7fc00000`. A
-  texture never switched on renders in place; a switched-on texture's loading pass adds two copies
-  and a dispatch over its render area before it, and the same after it where it writes the depth.
+  no fragment wrote without its sign. Announced at a write that may give a render target's depth
+  such a value, or at the pass that loads a new texture's pattern (a NaN with the sign set) before a
+  write covered it, on a device that keeps such a value in a depth image:
+  `VK_EXT_depth_range_unrestricted` enabled, or `DriverFact::DepthImageKeepsValuesOutsideUnitRange`
+  (elsewhere `restricted-depth-upload` is announced). MoltenVK's test is Metal's own
+  (`DriverFact::DepthTestComparesMagnitudes`): there it is announced at a pass that loads and stores
+  the depth and sets a state with depth writes but draws under none, whose pass keeps the signs.
+  Also announced for a NaN clear depth the device does not write before the pass. Cost: a depth test
+  against the stored value, or the value a pass with depth writes stores, can differ from Metal's in
+  the pass or target named: the device compares a negative value below zero and a NaN by its own
+  rule and keeps the value's sign, where Metal compares the value's magnitude, orders a NaN above
+  every value and stores the value without its sign; or a NaN clear depth is stored and tested as
+  1.0, where Metal stores `0x7fc00000`.
 - `metal2vulkan-degrade-first-sparse-resource-wait` (performance). `FirstSparseResourceWait`: The
   device's first sparse texture made (`Heap::new_texture` in a sparse heap) on a device whose
   driver's first sparse resource waits for the work submitted before it on every queue
@@ -2535,12 +2642,6 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   which the extension requires. Cost: the driver keeps its own cache of the device's pipelines
   beside the shader cache's records, with whatever it writes to disk and holds in memory for it; the
   pipelines made are the same.
-- `metal2vulkan-degrade-metal-level-not-macos` (precision). `MetalLevelNotMacOS`: A device made off
-  macOS with no Metal level named: it answers as the newest measured release (`MetalLevel::NEWEST`),
-  no release of the host's. Cost: where Metal's answers differ by release (which pixel formats a
-  texture descriptor takes and Metal describes, how a heap texture's blocks lie, whether a run of
-  compute encoders' first indirect dispatch of another dispatch type ends the process), the device
-  gives the newest measured release's, whatever release the program expects.
 - `metal2vulkan-degrade-private-properties-unknown` (precision). `PrivatePropertiesUnknown`: Apple's
   private device properties the device has no answer for: no document describes them and nothing the
   device reports maps to them. Cost: the device gives no answer for them (`PrivateAnswer::value` is
@@ -2599,14 +2700,13 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   attachment, on ANV (`RuntimeDriverDefect::OcclusionCountPerColorOutput`). Cost: the result is
   Metal's count multiplied by the colors the draw writes; a `Boolean` result is Metal's.
 - `metal2vulkan-degrade-float-tininess-after-rounding` (precision). `FloatTininessAfterRounding`: A
-  device whose policy takes native device maths (`FloatMathsPolicy::Native`, the default) where its
-  float functions are not Metal's own (not MoltenVK): Metal flushes a `float` product or fused
-  multiply-add whose exact value lies below `2^-126` to the zero of its sign, deciding tininess
-  before rounding, and the device rounds before it decides (measured on RADV, ANV, NVIDIA and
-  lavapipe, whether they flush denormals or keep them). Announced once, as the device is made. Cost:
-  a `float` product or fused multiply-add whose exact value lies within half a unit below `2^-126`
-  answers `2^-126` of its sign where Metal answers the zero of its sign; `FloatMathsPolicy::Exact`
-  computes Metal's.
+  device whose float functions are not Metal's own (not MoltenVK): Metal flushes a `float` product,
+  fused multiply-add or `ldexp` whose exact value lies below `2^-126` to the zero of its sign,
+  deciding tininess before rounding, and the device rounds before it decides (measured on RADV,
+  ANV, NVIDIA and lavapipe, whether they flush denormals or keep them); a `float` `ldexp`'s result
+  below `2^-126` is the device's product. Announced once, as the device is made. Cost: a `float`
+  product, fused multiply-add or `ldexp` whose exact value lies within half a unit below `2^-126`
+  answers `2^-126` of its sign where Metal answers the zero of its sign.
 - `metal2vulkan-degrade-shader-cache-entry-not-written` (performance).
   `ShaderCacheEntryNotWritten`: an entry of the device's shader cache directory was not written --
   the directory, a temporary file in it or the rename over the entry failed, on the device's cache
@@ -2630,45 +2730,63 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   `maintenance8`, a fragment's implicit-level sample with a dynamic texel offset samples with its
   derivatives too, taken before the switch over the offset's values (`docs/FAST-PATHS.md`).
 - `metal2vulkan-degrade-device-transcendentals` (precision). `PrecisionNote::DeviceTranscendentals`:
-  Transcendentals answer within Apple's stated bound, not Metal's bits: the device's own functions,
-  or the translation's routines where a device's instruction may leave the bound (and, for the
-  functions no routine covers yet, the device's precision).
+  Transcendentals answer within Apple's stated bound, not Metal's bits: the device's own functions
+  where they are Metal's (MoltenVK), and the device's precision for a call no other note bounds.
 - `metal2vulkan-degrade-reduction-order` (precision). `PrecisionNote::ReductionOrder`: Float
   reductions use the device's association order.
 - `metal2vulkan-degrade-device-denormals` (precision). `PrecisionNote::DeviceDenormals`: `float`
   denormals follow the device: Metal reads an `f32` denormal operand of its float arithmetic,
   comparisons, and functions as the zero of its sign and flushes a denormal result to one, where a
   Vulkan device keeps or flushes them by its own float controls (this translation declares no
-  `DenormFlushToZero`). Recorded only by the instructions of native device maths
-  (`FloatMathsPolicy::Native`, `fast::fmod`'s fused multiply-add among them) and of the device's
-  order (`RoundingOrderPolicy::Native`: `mix` by `FMix`, `fast::sqrt` by `Sqrt`, and `dot` of
+  `DenormFlushToZero`). Recorded where the module leaves an operation's denormals to a device not
+  measured to read them as Metal does: `+ - *`, the comparisons, `fma`, `dot`, `sqrt`, `rsqrt`,
+  `trunc`, `rint` and `ldexp` on `float` (by the device's products) but on a device that takes the
+  measured
+  `DriverDeviation::MetalFloatDenormals`; and on every device the divisions and the remainder,
+  `floor`, `ceil` and `fneg`, the device's maths functions (`fast::fmod`'s fused multiply-add,
+  `fabs`, `sign` and `fract` among them), `mix` by `FMix`, `fast::sqrt` by `Sqrt`, `dot` of
   vectors of other than two to four lanes, whose chunks' products the device sums where Metal
-  flushes each one below `2^-126`), the fast defaults off Apple's GPUs; and, under every policy, by
-  a conversion to or from `double`, where Metal's reading is not measured. Under
-  `DevicePolicy::exact_answers()` every other `float` operation reads its denormals as Metal does,
-  `mix`, `atan2`, `sinpi`, `cospi`, `tanpi`, `fast::fmod` and `fma` among them. Under
-  `FloatMathsPolicy::Native` the device's fused multiply-add rounds a result whose exact value is
-  below `2^-126` up to `2^-126`, which Metal flushes (docs/FAST-PATHS.md, known gaps).
+  flushes each one below `2^-126`, and a conversion to or from `double`, where Metal's reading is
+  not measured. The operations that read a denormal on its bits answer Metal on every device:
+  `copysign` and `atan2`; and so do the functions the device answers as Metal's own. Where the
+  minimum and maximum
+  functions and `saturate` are the device's `NMin`, `NMax` and `NClamp`, their pick of a denormal
+  is `NativeMinMax`'s. Off MoltenVK the device's multiply and fused multiply-add, and `ldexp` on
+  `float` by that multiply, round a result whose exact value is below `2^-126` up to `2^-126`, which
+  Metal flushes (`float-tininess-after-rounding`).
 - `metal2vulkan-degrade-pixel-sampler-scaling` (precision). `PrecisionNote::PixelSamplerScaling`:
-  Pixel-coordinate samplers scale coordinates in the shader, rounding differently.
+  A pixel-coordinate sampler's coordinate reaches the device's sampler divided by the texture's
+  level-0 size in the shader, on every device, and the device reads its texels from that coordinate
+  in its own arithmetic: within a few units in the last place of a texel edge (a nearest sample's
+  texel, a gather's block, a linear filter's pair) or of one of the device's sub-texel steps (a
+  linear filter's weight) it may read the neighbouring texel, block or step, where Metal reads the
+  coordinate as given. Measured: the device's normalized sampler's answer within one `f32` ulp of
+  the quotient on MoltenVK and at the quotient on lavapipe; a linear downscale by 8 within 1/255 of
+  Metal's on MoltenVK and 2/255 on lavapipe. A constexpr pixel sampler that filters nearest and
+  clamps to the edge fetches its texel instead and records nothing; a runtime sampler slot's access
+  announces it where the bound sampler states pixel coordinates.
 - `metal2vulkan-degrade-device-arithmetic` (precision). `PrecisionNote::DeviceArithmetic`: Float
   division, remainder, square root, fused multiply-add, and dot products use Vulkan's precision
   bounds (e.g. 2.5 ULP division, a possibly unfused `Fma`) rather than correct rounding.
 - `metal2vulkan-degrade-device-signed-zero-inf-nan` (precision).
   `PrecisionNote::DeviceSignedZeroInfNan`: Float operations LLVM requires to keep signed zeros,
   infinities, and NaNs run without `SignedZeroInfNanPreserve`, which the device does not support at
-  their width. Under `FloatMathsPolicy::Exact` so does an operation that answers Metal's zero of
-  its sign: a fused multiply-add the translation computes itself (in `double` or in integers
-  without `OpFmaKHR`, and a `half` one through `float`), one by `OpFmaKHR` whose result is at most
-  `2^-126` in magnitude, and a `float` product flushed below `2^-126`. Without the mode the device
-  may answer such a zero with either sign.
+  their width. Without the mode the device may answer such a zero with either sign.
 - `metal2vulkan-degrade-device-ray-intersection` (precision).
   `PrecisionNote::DeviceRayIntersection`: A ray intersection traversed by the device's ray query.
 - `metal2vulkan-degrade-fast-math-rewrites` (precision). `PrecisionNote::FastMathRewrites`: Float
   arithmetic whose AIR lets a compiler rewrite it with a neighbouring operation: an addition or
   subtraction and the multiply feeding it both carry LLVM's `contract`, two chained additions,
   subtractions, or multiplies both carry `reassoc`, or an `llvm.fmuladd` (fused or not, as the
-  implementation chooses).
+  implementation chooses). The module states each operation in the AIR's order with its own
+  flags: one carrying both `contract` and `reassoc` is the device's compiler's to group and fuse,
+  any other is kept apart (`NoContraction`); Metal's compiler groups and fuses by its own choice.
+  On a device without `shaderFloat16`, a chain of such `half` additions, subtractions and products
+  is held at `float` precision between the roundings where its values leave it
+  (`HalfChainPolicy::AtExits`, the default; `HalfChainPolicy::EachOperation` rounds each).
+  Cost: a sum of mixed signs grouped otherwise, or a multiply-add fused on one side alone, differs
+  from Metal's by any amount relative to the result; a held `half` chain by the roundings it
+  skips, a value inside it past `half`'s range staying finite.
 - `metal2vulkan-degrade-tessellation-winding` (precision). `PrecisionNote::TessellationWinding`: A
   tessellation pipeline's vertex order: Metal's clockwise output winding is declared
   `VertexOrderCcw` and its counter-clockwise one `VertexOrderCw`, as MoltenVK maps them under
@@ -2709,25 +2827,13 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   magnification filters, on a device that samples through Metal's own sampler (MoltenVK on Apple's
   GPU): no level clamp the device's sampler takes reads Metal's `NotMipmapped` footprint at
   `maxAnisotropy` 2 to 16, so the sample filters another anisotropic footprint than Metal's.
-- `metal2vulkan-degrade-device-sample-level` (precision). `PrecisionNote::DeviceSampleLevel`: A
-  sample whose level the device's level arithmetic chooses, on a device that samples neither through
-  Metal's own sampler nor natively, of a texture other than a cube, without comparison: a fragment
-  function's implicit-level sample (its bias Metal's own reading within the device's
-  `maxSamplerLodBias`), a sample with explicit gradients, a fragment function's LOD query, and a
-  sample at an explicit level Metal's level rule is not handed on (an integer texture's, or a
-  constexpr sampler's with a level bias of its own or a clamp the rule does not take), but a
-  constant level the device reads as Metal does. The device takes the level of detail by Vulkan's
-  rules, whose scale factor may be approximated, and rounds a level its own way; Metal's level of
-  detail from derivatives is not measured. Recorded for an LOD query, and for a sample through a
-  sampler that chooses a level or a filter by it where no sample-filter note records the sample:
-  nearest filters with a nearest mip filter (a constexpr sampler's, or a runtime sampler's where its
-  word states them), or an integer texture's sampler with a mip filter or filters that differ (an
-  argument buffer's sampler always). An extended-range texture's (`BGR10_XR`, `BGRA10_XR` and their
-  sRGB twins) fragment sample at an implicit level, or with explicit gradients, records it on every
-  device: its texels are read in the shader, at Vulkan's level of detail computed there and Metal's
-  level rule, where a constexpr sampler states a mip filter or a runtime sampler's word does. The
-  sample may read another level or filter than Metal's near a boundary, and the query answers the
-  device's level.
+- `metal2vulkan-degrade-device-sample-level` (precision). `PrecisionNote::DeviceSampleLevel`: An
+  extended-range texture's (`BGR10_XR`, `BGRA10_XR` and their sRGB twins) fragment sample at an
+  implicit level, or with explicit gradients, on every device: its texels are read in the shader, at
+  Vulkan's level of detail computed there and Metal's level rule, where a constexpr sampler states a
+  mip filter or a runtime sampler's word does. The device takes the level of detail by Vulkan's
+  rules, whose scale factor may be approximated; Metal's level of detail from derivatives is not
+  measured. The sample may read another level or filter than Metal's near a boundary.
 - `metal2vulkan-degrade-unmeasured-fetch-blend` (precision). `PrecisionNote::UnmeasuredFetchBlend`:
   A fragment function reads a color attachment the pipeline blends, on a device that orders
   framebuffer fetch only through the pixel interlock (MoltenVK, RADV, ANV), of a format whose Metal
@@ -2752,8 +2858,9 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   blend of the second source, a one- or two-channel one under a lerp, each in a module compiled with
   fast math, and one written by an output of fewer than four lanes, announce it too: the shader
   computes Metal's 8-bit unorm blend's rounded forms over the decoded texel, in the output's type (a
-  missing lane zero), and stores the result by Metal's sRGB encode, Metal's without fast math at
-  four lanes; under fast math Metal regroups the blend, unmeasured.
+  missing lane zero), and stores the result by the device's sRGB encode (`DevicePackConversion`),
+  Metal's blend without fast math at four lanes; under fast math Metal regroups the blend,
+  unmeasured.
 - `metal2vulkan-degrade-fp8-value` (precision). `PrecisionNote::Fp8Value`: An 8-bit float converts
   to an integer from the format's documented value with Metal's saturating float-to-integer rule,
   where Metal's device here answers otherwise: Metal on Apple M3 compiles these reads but extends
@@ -2778,60 +2885,78 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   regions' lines are this crate's tiles' exact lines, where Apple's are its fixed-point ones, so a
   fragment's evaluated point lies within a bounded distance of Metal's.
 - `metal2vulkan-degrade-bicubic-filter-arithmetic` (precision).
-  `PrecisionNote::BicubicFilterArithmetic`: Metal's bicubic filter, emulated by fetches with Metal's
-  weights, the 8- and 16-bit normalized and the extended-range formats' exact sum rounded half up
-  onto the format's grid, and the 32-bit float and half-float formats' sums through Metal's
-  accumulators, differs from an Apple M3 Max in what is not yet pinned: a 2D normalized sum within
-  about `2^-21` of the format's range (`1` unsigned, `2` signed) of a rounding tie: Metal may round
-  it to the other side, one grid step away (`1/65535` or `1/32767` for 16-bit, `1/4080` or `1/2032`
-  for 8-bit); an extended-range 2D sum (`BGR10_XR`, `BGRA10_XR`, `RGB10A8_2P_XR10` and their sRGB
-  twins) within 0.014 of a grid step of a tie likewise (`1/8160` a color lane, `1/8192` an sRGB
-  color lane, `1/4080` alpha).
+  `PrecisionNote::BicubicFilterArithmetic`: a filter emulated by fetches (Metal's bicubic filter on
+  every format, and an extended-range texture's linear, 3D and linear-mip-filter samples) sums its
+  taps in the device's arithmetic: the Catmull-Rom weights computed in `f32` from the fraction, the
+  taps summed by the device's multiply and add, a bilinear, trilinear or level blend by its `FMix`
+  at the `f32` fractions, and a `half` result the device's narrowing. The footprint, addressing,
+  filter choice, level and clamps are Metal's. Metal's fixed-point weights, exact grid sums, float
+  accumulators and sixty-fourth level fractions are not reproduced: a lane may differ by a few grid
+  steps (`1/4080` at 8 bits), by up to `2.1e-3` on an extended-range sRGB texture's bicubic sample,
+  and by up to `1/64` of the two levels' difference under a linear mip filter.
 - `metal2vulkan-degrade-sparse-residency` (precision). `PrecisionNote::SparseResidency`: A stage
   samples or gathers a texture whose residency it observes (`sparse_color::resident()`) through the
-  slot's sparse form, which the module has where the profile enables `shaderResourceResidency`.
+  slot's sparse form, which the module has where the profile enables `shaderResourceResidency`:
+  the word is the device's `OpImageSparse*` residency, whose footprint may count a texel of zero
+  weight Metal does not, and an unmapped texel's lanes the device's non-resident value. Where the
+  device has no residency of its own, the slot's tile map answers Metal's footprint rule exactly,
+  unrecorded.
 - `metal2vulkan-degrade-device-nan-encoding` (precision). `PrecisionNote::DeviceNanEncoding`: A
   `float` NaN result's bit pattern follows the device: Metal answers the canonical `0x7fc00000` for
   the NaN results of its float arithmetic and functions, and Vulkan states no encoding, so a device
-  may answer another sign or payload (llvmpipe: `0xffc00000`).
+  may answer another sign or payload (llvmpipe: `0xffc00000`). Also, once per device, a GPU blit
+  into, out of or between textures of which one is an `RG11B10Float` texture Metal keeps losslessly
+  compressed, whose compression makes a NaN field the quiet NaN (`0x7e0`, `0x3f0`), where the
+  device's copy keeps the bits. The runtime announces it too for a plain color fill
+  (`BlitCommandEncoder::fill_texture_color` without a pixel format) to a NaN of a half or
+  small-float texture the device's clear writes, which converts the NaN as the device likes, where
+  Metal's fill keeps a half NaN's sign and payload and makes a small float's all ones. Also a blend
+  a fragment function computes into a 16-bit float attachment through the pixel interlock: a NaN
+  of the blend is the device's arithmetic's, which the storage image's store converts, where Metal
+  stores every NaN of the blend as `0x7e00`.
 - `metal2vulkan-degrade-restricted-depth-range` (precision). `PrecisionNote::RestrictedDepthRange`:
   The device compares a depth texture's texels on a device without `VK_EXT_depth_range_unrestricted`
   enabled whose driver is not measured to keep depth values outside `[0, 1]` without it.
 - `metal2vulkan-degrade-cube-gradient-footprint` (precision).
   `PrecisionNote::CubeGradientFootprint`: An explicit-gradient sample of a cube texture takes
   Metal's footprint in a form a Vulkan device reads alike, but for what is not reproduced. Cost:
-  off MoltenVK a sample the shader's emulation does not reach (a depth or comparison sample, an
-  argument buffer's texture or sampler, a runtime sampler outside its anisotropic variant) takes
-  the device's logarithm of Metal's footprint and, if anisotropic, the device's taps, so a level
-  or blend near a boundary can differ from Metal's. Where the shader takes Metal's level and taps
-  itself (`PrecisionNote::AnisotropicFilter`) this note is not recorded. On a MoltenVK release or
-  GPU whose cube-gradient route is not measured, such an out-of-reach anisotropic sample is
-  filtered isotropically, at Metal's major axis. Through MoltenVK's vertex and fragment stages
+  off MoltenVK the sample takes the device's logarithm of Metal's footprint and, if anisotropic,
+  the device's taps, so a level or blend near a boundary can differ from Metal's. Where the shader
+  takes Metal's level and taps itself (`PrecisionNote::AnisotropicFilter`) this note is not
+  recorded. On a MoltenVK release or GPU whose cube-gradient route is not measured the sample
+  takes Vulkan's rule's form, the device's reading of it. Through MoltenVK's vertex and fragment stages
   under macOS 27, an isotropic sample is Metal's, but an anisotropic sample on a cube's `+Y` or
   `-Y` face loses the gradients' `z` component to SPIRV-Cross's `spvGradientCube`, so its ellipse
   lies on the face's diagonal (docs/FAST-PATHS.md's known gaps). A kernel's samples through
   MoltenVK are Metal's own, with no note.
 - `metal2vulkan-degrade-half-texel-conversion` (precision). `PrecisionNote::HalfTexelConversion`:
-  The module reads, gathers, or samples a texture with a `half` result. On MoltenVK under
-  `YCbCrFilterPolicy::Device`, also announced at a draw that binds a two-plane YCbCr texture on
-  the grid `8192` at a slot sampled through a runtime sampler: a sample of one texel rounds to
-  nearest even, one `half` ulp from Metal's ties-away rounding at a tie.
+  The module reads, gathers, or samples a texture with a `half` result, the device's `float` texel
+  rounded to nearest even on every device: within one `half` ulp of Metal's, but a 32-bit float
+  texel's sample past `±65504`, the infinity where Metal saturates. On MoltenVK, whose `float`
+  texel is Metal's, announced at a draw or dispatch that binds a texture of a class whose Metal
+  `half` differs from it (a 32-bit float texel's sample, a 16-bit normalized texel, a format not
+  measured) and a two-plane YCbCr texture on the grid `8192` at a slot sampled through a runtime
+  sampler (a sample of one texel rounds to nearest even, one `half` ulp from Metal's ties-away
+  rounding at a tie); a heap element or a depth texture wherever it is accessed.
 - `metal2vulkan-degrade-half-sample-filter` (precision). `PrecisionNote::HalfSampleFilter`: The
   module samples a texture with a `half` result through a filter (linear minification or
-  magnification, or a runtime sampler) on a device that does not sample through Metal's own sampler.
+  magnification, or a runtime sampler) that Metal's own sampler (MoltenVK) answers otherwise than
+  Metal filters the format bound there: a two-plane YCbCr texture's.
 - `metal2vulkan-degrade-srgb-texel-decode` (precision). `PrecisionNote::SrgbTexelDecode`: The module
   reads, samples, or gathers a texture with a `half` or `float` result through the device's sRGB
   decode, or decodes the device's filter of its codes, where the texture may be bound in an 8-bit
-  sRGB format.
+  sRGB format. The device's decode is the only form wherever it samples the format (an 8-bit sRGB
+  format, or the sRGB form of a BC, PVRTC, ETC2, EAC or ASTC format, through the texture's or its
+  decoded twin's sRGB view), so it is announced at a draw or dispatch that binds such a texture,
+  at an argument buffer's texture access, and at a render pipeline that reads an sRGB color
+  attachment as an input attachment; never on MoltenVK, whose decode is Metal's own. Where the
+  device holds the format as its UNORM twin, or a storage texture holds it through its UNORM
+  alias, the module decodes the codes (or the device's filter of them) by the MSL transfer
+  through the device's `Pow`, announced at every such access on every device.
 - `metal2vulkan-degrade-float-sample-filter` (precision). `PrecisionNote::FloatSampleFilter`: The
-  module samples a texture with a `float` result through a filter on a device that does not sample
-  through Metal's own sampler.
-- `metal2vulkan-degrade-device-gather-footprint` (precision).
-  `PrecisionNote::DeviceGatherFootprint`: The module leaves a gather to the device's footprint on a
-  device that does not sample through Metal's own sampler.
-- `metal2vulkan-degrade-cube-face-reciprocal` (precision). `PrecisionNote::CubeFaceReciprocal`: The
-  module hands a nearest cube sample the centre of the texel Metal reads, on a device that does not
-  sample through Metal's own sampler.
+  module samples a texture with a `float` result through a filter that Metal's own sampler
+  (MoltenVK) answers otherwise than Metal filters the format bound there: a two-plane YCbCr
+  texture's.
 - `metal2vulkan-degrade-function-storage-assumed` (precision).
   `PrecisionNote::FunctionStorageAssumed`: A vertex or fragment function keeps more private memory
   (its `alloca`s, a call stack among them, or constants held as `Private` variables) than the floor,
@@ -2842,32 +2967,49 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   `PrecisionNote::QuadsCountedBeforeDiscard`: A fragment function runs a non-quad simdgroup
   operation (a reduction, scan, ballot, broadcast, shuffle, vote, or simdgroup matrix) before a
   discard on a path to it, in a shape where Metal's placement of it is not known.
-- `metal2vulkan-degrade-device-depth-comparison` (precision).
-  `PrecisionNote::DeviceDepthComparison`: The module leaves a depth comparison (a sample or gather
-  with comparison) to the device, on a device that does not sample through Metal's own sampler (one
-  that does, `VkProperty::MetalSampler`, compares as Metal does: the module requires it instead).
-- `metal2vulkan-degrade-device-texel-denormals` (precision). `PrecisionNote::DeviceTexelDenormals`:
-  A `float` sample or gather, a comparison's included, whose texels the device reads, on a device
-  that does not sample through Metal's own sampler.
-- `metal2vulkan-degrade-beyond-measured-deviation` (precision).
-  `PrecisionNote::BeyondMeasuredDeviation`: The module is compiled for a device whose driver release
-  is newer than the last one measured with a deviation the profile takes
-  (`ProfileFields::deviations_beyond`, which names each with that release): where the specifications
-  leave the answer to the driver, the module relies on its answer being Metal's (a simdgroup's
-  lockstep, Metal's own `float` functions, its canonical NaN, its sampler, its cube-gradient route),
-  as measured on the earlier release.
 - `metal2vulkan-degrade-view-base-texel-offset` (precision). `PrecisionNote::ViewBaseTexelOffset`:
   The module places a texel offset on an axis that may repeat or mirror as Metal does in an access
-  of an argument buffer's texture: on a device that does not sample through Metal's own sampler (one
-  that does, `VkProperty::MetalSampler`, is Metal's texture unit itself), in a snapped gather or
-  nearest sample, fetched texels, or an emulated linear filter, and on every device in an emulated
-  raw sample (`heap_raw`).
+  of an argument buffer's texture: in an emulated raw sample (`heap_raw`) or a bicubic filter's
+  footprint.
 - `metal2vulkan-degrade-device-color-conversion` (precision).
   `PrecisionNote::DeviceColorConversion`: A fragment function writes a float to a color channel
-  whose conversion the device makes, not Metal's rule (`ChannelWrite::Device`): an attachment that
-  blends with factors other than one and zero, the alpha of attachment 0 under alpha-to-coverage, a
-  format whose conversion Metal was not measured with (the packed 16-bit unorm formats, `A8Unorm`,
-  the packed floats).
+  whose conversion the device makes where it is not measured to make Metal's: a normalized, sRGB or
+  small float channel on a device other than MoltenVK on an Apple GPU not measured to convert that
+  kind as Metal does, an attachment that blends with factors other than one and zero
+  (`ChannelWrite::Device`), the alpha of attachment 0 under alpha-to-coverage, a format whose
+  conversion Metal was not measured with (the packed 16-bit unorm formats, `A8Unorm`, the packed
+  floats). Near a tie between two codes the device may store the other one. Also a `float` texel a
+  function writes to a storage texture that may hold a normalized or half-float format, or
+  `ARGB8Unorm`, on a device not measured to store Metal's codes (or a 1-bit alpha, on one measured
+  to store every other normalized channel's); an integer texel written into a storage texture of
+  the float class that may hold a half-float or small-float format, which Metal rounds to nearest
+  even and the device's store as it rounds a `float` (toward zero on every measured driver, one
+  unit in the last place, a finite value past 65504 stored as 65504); and a fragment function's
+  `float` blend into a 16-bit float attachment through the pixel interlock on a device not
+  measured to round a `half` store as Metal does, and a blend into an 8-bit unorm attachment through
+  the pixel interlock, whose result the storage image's store converts to its code. The recorded bound past one code, measured on
+  lavapipe against plain Metal on an Apple M3 Max: a blend into an 8-bit unorm attachment
+  (`RGBA8Unorm`, `ARGB8Unorm`) within 2 codes of Metal's; a fragment function that fetches an 8-bit
+  sRGB attachment and writes it again, within 2 codes once a later draw reads an earlier one's code
+  (with `srgb-texel-decode`); a blend into an 8-bit sRGB attachment, within 4 codes. Another device
+  is not bounded past one code (an NVIDIA RTX 5080 Laptop GPU's blend into an 8-bit sRGB attachment
+  stored up to 11 codes from Metal's).
+  Also a render pass's clear of a normalized, sRGB,
+  packed 16-bit, half or small-float color attachment to a color whose conversion is in question
+  (a normalized channel within 1/1024 of a midpoint between two codes, an sRGB channel inside its
+  range, a value the format does not hold exactly): the device converts the clear color, where
+  Metal's clear rounds each channel to nearest, a tie to even, and truncates a small float's and a
+  shared exponent's mantissas. Not for a clear by the load operation of an attachment the pass's
+  render area covers on a driver whose load operation clears as Metal's `Clear` load action does
+  (`DriverFact::ColorClearIsMetals`: MoltenVK on the Apple9 GPUs under macOS 27, measured on the M3
+  Max); a clear made before the pass, of an attachment its first instance leaves out, is announced
+  there too. Also a plain color fill (`BlitCommandEncoder::fill_texture_color` without a pixel
+  format) of a texture of such a format the device renders, which the device's clear of the color
+  writes, to a color whose conversion is in question against Metal's fill packing (a normalized
+  channel within 1/1024 of a midpoint between two codes, more for a packed 16-bit channel, an sRGB
+  channel inside its range, a value a half, small float or shared exponent does not hold exactly):
+  Metal's fill rounds a tie half up and takes an sRGB channel's code whose decoded value is
+  nearest.
 - `metal2vulkan-degrade-device-interpolation` (precision). `PrecisionNote::DeviceInterpolation`: A
   fragment function reads a varying the device interpolates (`center_perspective`, `centroid`,
   `sample` or `no_perspective`, not `flat`) on a device not measured to interpolate as Metal does
@@ -2914,7 +3056,25 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   rounding, which no device separates, so the function rounds the alpha and the coverage reads the
   rounded one. The stored alpha is Metal's; a fragment whose alpha lies within half a `half` step
   of a coverage threshold may cover one sample more or fewer (2 of 16,384 alphas on an Apple M3
-  Max).
+  Max). Which samples an alpha covers is the device's own (`device-alpha-coverage`).
+- `metal2vulkan-degrade-device-alpha-coverage` (precision). `PrecisionNote::DeviceAlphaCoverage`:
+  A render pipeline covers by alpha (`alphaToCoverageEnabled`, over a four-component float first
+  output at attachment 0) on a device not measured to cover as Metal does
+  (`DriverDeviation::MetalAlphaCoverage`, which MoltenVK takes on the Apple M3 Max's macOS 27
+  identity: Metal covers there). The device converts the alpha to its coverage mask by its own
+  algorithm, which Vulkan does not specify ("It is intended that the number of 1's in this value be
+  proportional to the alpha value", and "The algorithm may be different at different framebuffer
+  coordinates"). Metal, measured over 639 alphas a sample count on an Apple M3 Max under macOS
+  27.0.1, covers a pixel at one sample above an alpha of 1/2, and at two and four samples
+  `ceil(alpha * n - t)` samples, `t` a 2x2 ordered dither of the pixel's window coordinates (1/8,
+  5/8; 7/8, 3/8), either count within an `f32` ulp of a threshold. Recorded bound, pixel by pixel
+  against Metal's reading: on lavapipe (Mesa 26.0.8, arm64) every pixel covers `floor(alpha * n)`
+  or `ceil(alpha * n)` samples, so within one sample of Metal's and Metal's where `alpha * n` is an
+  integer; at one sample, where lavapipe dithers too, a whole fragment is stored or dropped where
+  its alpha lies between its own threshold and 1/2 (2,560 of the sweep's 10,224 pixels); at four
+  samples a pixel is one sample apart only within an `f32` ulp of a threshold (96 of 10,224). An
+  NVIDIA RTX 5080 Laptop GPU stores a fragment of alpha 1/2 at one sample, where Metal drops it;
+  every other device and count is unmeasured.
 - `metal2vulkan-degrade-rotated-blend-rounding` (precision). `PrecisionNote::RotatedBlendRounding`:
   A fragment function writes an attachment held with its channels rotated (`ARGB8Unorm`) whose blend
   is none of the measured forms (`RotatedBlendForm::Unmeasured`), or the premultiplied form through
@@ -2934,12 +3094,12 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   sample's depth from its vertex function's window depth read at the sample, plus `FragCoord.z` less
   that depth read at the centre, which carries the depth bias.
 - `metal2vulkan-degrade-argument-pixel-sampler-scaling` (precision).
-  `PrecisionNote::ArgumentPixelSamplerScaling`: An access through an argument buffer's sampler (not
-  a 2D gather, which snaps behind the sampler's word) whose word the specialized module cannot read
-  may hand the device a pixel coordinate scaled by the texture's size: where the sampler states
-  pixel coordinates and a linear filter or a comparison, on a device without
-  `VkProperty::MetalSampler` (a filtered sample of a class the emulation does not reach), or a
-  comparison on one with it.
+  `PrecisionNote::ArgumentPixelSamplerScaling`: A sample, gather or comparison through an argument
+  buffer's sampler whose word the specialized module cannot read may hand the device a pixel
+  coordinate scaled by the texture's size, where the sampler states pixel coordinates, with
+  `pixel-sampler-scaling`'s bound. A sample without a comparison through a state that filters
+  nearest and clamps to the edge fetches its texel instead. Announced at the first draw or dispatch
+  of a pipeline that records it while the device holds a sampler state of pixel coordinates.
 - `metal2vulkan-degrade-half-output-precision` (precision). `PrecisionNote::HalfOutputPrecision`: A
   fragment function returns a `half` color output (a scalar or vector of AIR's `half`) to an
   attachment the pipeline has, and either its module is compiled without fast math
@@ -2950,9 +3110,11 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
 - `metal2vulkan-degrade-extended-range-blend-source` (precision).
   `PrecisionNote::ExtendedRangeBlendSource`: A fragment function's `half` color output (a scalar or
   vector of AIR's `half`) is blended into an extended-range attachment (`BGR10_XR`, `BGRA10_XR`,
-  `RGB10A8_2P_XR10`, or an `_sRGB` twin) where Metal may round the blend's source otherwise than the
-  function's computed blend: under fast math a lane of the output is not a load; or the module names
-  no math mode.
+  `RGB10A8_2P_XR10`, or an `_sRGB` twin), whose raw codes no device's blend unit reads, so the
+  function blends in the shader in the device's arithmetic: `S·Fs op D·Fd` in `float`, in the blend
+  equation's order, the source, second source and blend color clamped to the format's range first.
+  Metal's compiler rounds each step to `half`, so a blended channel may store another code than
+  Metal's.
 - `metal2vulkan-degrade-discard-drops-simdgroup-stores` (precision).
   `PrecisionNote::DiscardDropsSimdgroupStores`: A fragment function meets the store-dropping defect
   of `DriverWorkaround::DiscardDropsSimdgroupStores` (MoltenVK on an Apple GPU: Apple's compiler
@@ -2973,29 +3135,29 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
 - `metal2vulkan-degrade-extended-range-float-blend-source` (precision).
   `PrecisionNote::ExtendedRangeFloatBlendSource`: `PrecisionNote::ExtendedRangeBlendSource` for a
   `float` color output (a scalar or vector of AIR's `float`): blended into an extended-range
-  attachment where Metal may round the blend's source otherwise than the function's computed blend,
-  under fast math a lane of the output that is not a load, or in a module that names no math mode.
+  attachment in the shader in the device's arithmetic, where Metal's compiler rounds the output and
+  each step of the blend to `half`.
 - `metal2vulkan-degrade-anisotropic-filter` (precision). `PrecisionNote::AnisotropicFilter`: The
   module samples a texture through an anisotropic sampler with Metal's anisotropic filter emulated
-  by the device's samples at explicit levels, on a device that does not sample through Metal's own
-  sampler (`lower::sampler::anisotropic`): a sample without comparison of a 2D texture or 2D array
-  at the fragment's implicit level or with explicit gradients, or of a cube or cube array with
-  explicit gradients, through a constexpr sampler of `maxAnisotropy` above 1, or through a runtime
-  sampler slot whose word states anisotropy (under that word alone); a cube's also through
-  MoltenVK where its cube-gradient route is not measured; and an anisotropic sampler's on a device
-  without `samplerAnisotropy` whatever its sampling, every Vulkan sampler being isotropic there,
-  each tap the device's isotropic filter (a device with the feature samples as before). Cost: a
+  by the device's samples at explicit levels (`lower::sampler::anisotropic`), on a device without
+  `samplerAnisotropy`, every Vulkan sampler being isotropic there, each tap the device's isotropic
+  filter: a sample without comparison of a 2D texture or 2D array at the fragment's implicit
+  level or with explicit gradients, or of a cube or cube array with explicit gradients, through a
+  constexpr sampler of `maxAnisotropy` above 1, or through a runtime sampler slot whose word states
+  anisotropy (under that word alone). A device with the feature samples with its own anisotropic
+  filter. The footprint's logarithms and powers are the device's `Log2` and `Exp2`, its level and
+  spacing unrounded, and a linear mip filter's two levels the device's own blend at the fractional
+  level, where Metal takes a piecewise-linear `log2`, 256ths and 4096ths. Cost: a
   cube's taps step across its face by Metal's face gradients, and a tap past the face's edge reads
   the next face as the device projects it, which Metal's own is not measured against.
 - `metal2vulkan-degrade-device-anisotropic-filter` (precision).
   `PrecisionNote::DeviceAnisotropicFilter`: The module samples a texture through a sampler whose
   anisotropy is known where Metal's anisotropic filter is not emulated
-  (`PrecisionNote::AnisotropicFilter`'s reach), on a device that does not sample through Metal's own
-  sampler: a cube, a 3D texture, a comparison, a sample whose residency the function observes, or a
-  texture of another class than its declared one, at an implicit level or with explicit gradients,
-  through a constexpr sampler of `maxAnisotropy` above 1 or a runtime sampler slot whose word states
-  anisotropy (under that word alone). On a device without `samplerAnisotropy` the device filters
-  such a sample isotropically, recorded whatever the device's sampling; an argument buffer's
+  (`PrecisionNote::AnisotropicFilter`'s reach), on a device without `samplerAnisotropy`, which
+  filters it isotropically: a cube, a 3D texture, a comparison, a sample whose residency the
+  function observes, or a texture of another class than its declared one, at an implicit level or
+  with explicit gradients, through a constexpr sampler of `maxAnisotropy` above 1 or a runtime
+  sampler slot whose word states anisotropy (under that word alone). An argument buffer's
   anisotropic sampler, which the function cannot record, is refused there (`SamplerAnisotropy`).
 - `metal2vulkan-degrade-device-point-size` (precision). `PrecisionNote::DevicePointSize`: A vertex
   function writes `[[point_size]]`, or a mesh function `set_point_size`, on a device whose
@@ -3015,91 +3177,168 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   pass's outputs, where Metal writes each sample's from that sample's run: equal where every pass
   computes the same outputs. Vulkan hands an invocation under sample shading only its own sample's
   bit of the coverage.
-- `metal2vulkan-degrade-device-unorm8-linear-filter` (precision).
-  `PrecisionNote::DeviceUnorm8LinearFilter`: The module hands an 8-bit unsigned normalized texture's
-  linear sample to the device's filter, at the coordinate of Metal's footprint step
-  (`lower::sampler::native`), on a device measured to filter that class within one code of Metal
-  (`DriverDeviation::Unorm8LinearFilter`, which the module requires as
-  `VkProperty::Unorm8LinearFilter`): a sample with a `float` or `half` result of a 2D texture or 2D
-  array slot bound in `R8Unorm`, `RG8Unorm`, `RGBA8Unorm` or `BGRA8Unorm`, without comparison,
-  offset or pixel coordinates, through a constexpr sampler Metal's linear rule answers or a runtime
-  sampler slot whose word states one (under that class and word alone).
 - `metal2vulkan-degrade-half-output-fast-math-blend` (precision).
   `PrecisionNote::HalfOutputFastMathBlend`: A fragment function of a module compiled with fast math
   (`air.compile.fast_math_enable`) returns a `half` color output to an attachment the pipeline has
   that stores some channel (its write mask names one of its format's channels;
   `StageIo::half_fast_colors`, which the pipeline's stage reads, or the interlocked storage form's
   write), where `PrecisionNote::HalfOutputPrecision`'s conditions hold; or
-  computes the blend of a 16-bit or 32-bit float attachment it fetches in the interlocked storage
+  computes the blend of a 16-bit float attachment it fetches in the interlocked storage
   form (no Vulkan blend applies to a storage write) where Metal's compiler may fold the output's
   own arithmetic into that blend or regroup a sum of it: within 2 `half` units in the last place of
   Metal's at the operands' magnitude, 16 at the stored value's under cancellation. Where the output
   is opaque to the blend and its form fits every measured state, the function's blend is Metal's
   and records nothing; so does the blend of a fetched 8-bit unorm attachment it computes there
   (every factor, operation, write mask and blend color it builds), which Metal reads the output
-  into clamped, folding none of it.
+  into clamped, folding none of it (the storage image's store of its result is the device's
+  conversion, `DeviceColorConversion`). On a device that enables `storageInputOutput16` the output
+  reaches the device as a 16-bit `half` (`StageIo::half_outputs`); MoltenVK 1.4.2 on an Apple M3
+  Max then stores Metal's codes for a loaded `half4` under every blend measured (21, into 16- and
+  32-bit float formats).
 - `metal2vulkan-degrade-device-sampling` (precision). `PrecisionNote::DeviceSampling`: Native device
-  sampling: the module hands a sample, gather or comparison to the device's own sampler where a
-  device whose sampler is not Metal's would emulate Metal's (`SamplingPolicy::NativeDevice`, the
-  default; the module requires `VkProperty::DeviceSampling`). Under `YCbCrFilterPolicy::Device`
-  (the default) that includes a linear sample of a two-plane YCbCr texture, whose texels hold
-  Metal's reads exactly: the device's filter of them lands within 1.183 codes (1/255) of Metal's
-  sum on the format's grid, so a draw binding such a texture makes no pipeline of its own.
+  sampling: the module hands a sample, gather, comparison or level query to the device's own
+  sampler on a device whose sampler is not Metal's (the module requires
+  `VkProperty::DeviceSampling`), its level clamp the descriptor's as given (Metal holds it on a
+  `1/64` grid, and its nearest mip filter reads the lower level at a clamp halfway between two,
+  where the device may read the upper) and a subnormal coordinate the device's to read (Metal reads it as a zero before
+  addressing). That includes a
+  linear sample of a two-plane YCbCr texture, whose texels hold Metal's reads exactly: the device's
+  filter of them lands within 1.183 codes (1/255) of Metal's sum on the format's grid, so a draw
+  binding such a texture makes no pipeline of its own.
 - `metal2vulkan-degrade-native-transcendentals` (precision). `PrecisionNote::NativeTranscendentals`:
   Native device maths: the module computes a `float` or `half` math-library function by the device's
-  own `GLSL.std.450` instruction (or Metal's composition of the device's `Exp2` and `Log2`), not by
-  the translation's routine of Metal's answer, on a device whose functions are not Metal's own,
-  under `FloatMathsPolicy::Native`; and `fast::sqrt` the device's `Sqrt`, under
-  `RoundingOrderPolicy::Native`.
+  own `GLSL.std.450` instruction (`exp`, `log`, `pow`, `sinh`, `cosh` and `tanh` among them; a
+  composition of the device's `Exp2` and `Log2` only for `exp10` and `log10`, which no instruction
+  is) where Metal's function is not the device's own; `fast::sqrt` the device's `Sqrt`; the fast
+  `sin`, `cos`, `tan`, `sinh`, `cosh`, `tanh` and `atanh` the device's instructions, not MSL's
+  fast-math formulas (`fast::sin` of `1e7` is the device's sine, where Metal answers `+0`;
+  `fast::tanh(45)` is `1`, where Metal answers NaN); `fabs`, `sign` and `fract` the device's
+  `FAbs`, `FSign` and `Fract`, their special operands the instruction's (Metal's `sign` of a NaN,
+  a zero and an `f32` denormal is `+0`, its `fract` of an infinity `+0`); a `half` function's
+  signed zeros and NaN signs its `float` instruction's (`half` `sin(-0)` is `-0`, where Metal
+  answers `+0`), and on every device a `half` `fmod`'s zero remainder its `float` remainder's
+  (`half` `fmod(-2, 0.5)` is `-0`, where Metal answers `+0`); `pow`, `powr` and `atan2` C99's
+  special values by the device's comparisons around its instruction (`pow(x, 1)` the device's
+  `Pow`, where Metal answers `x`; an `f32` denormal operand as the device reads it); and `round`
+  C99's from the device's `Trunc` on every device (`round(-0.3)` is `-0`, where Metal answers
+  `+0`).
 - `metal2vulkan-degrade-native-division` (precision). `PrecisionNote::NativeDivision`: Native device
   maths: a precise `float` or `half` division, or Metal's fast division or reciprocal, is the
-  device's `OpFDiv`, not the translation's correctly rounded routine or its `RN(1 / y)`, on a device
-  whose division is not Metal's own, under `FloatMathsPolicy::Native` (the default).
+  device's `OpFDiv` where the device's division is not Metal's own: within Vulkan's 2.5 ulp, where
+  Metal's precise division is correctly rounded.
 - `metal2vulkan-degrade-native-fma` (precision). `PrecisionNote::NativeFma`: Native device maths: a
   `float` fused multiply-add on a device without `OpFmaKHR`, or a `half` one where the device's
   16-bit `Fma` is not measured to be Metal's and the device has no 16-bit `OpFmaKHR` under the
   16-bit float controls, is the device's `GLSL.std.450 Fma` (on the `half` operands held in
-  `float`, its result rounded to `half`), not the translation's correctly rounded routine, under
-  `FloatMathsPolicy::Native` (the default).
+  `float`, its result rounded to `half`), where Metal's rounds once.
 - `metal2vulkan-degrade-device-texel-conversion` (precision).
   `PrecisionNote::DeviceTexelConversion`: Native device sampling (a texel conversion): the module
   hands a read, sample or gather with a `float` result the device's own conversion of the texel's
-  codes, where Metal's is emulated exactly: a read's under `TexelConversionPolicy::Exact`, a
-  sample's or gather's under it with `SamplingPolicy::Exact`.
+  codes, off Apple's GPUs (`VkProperty::MetalSampler` keeps Metal's value). Recorded bound, of a
+  texel read from one texel of one level: an 8-, 10- or 16-bit normalized code within one `f32`
+  ulp of Metal's `c / (2^b - 1)` where measured (lavapipe multiplies by the reciprocal: some 8-bit
+  codes one ulp high; some 10-bit `BGR10A2Unorm`, a 16-bit and 512 `Depth16Unorm` codes one ulp
+  low), and a 10-bit code within 0.015 of a code where the device widens it by replicating its
+  bits to 16, `(c << 6 | c >> 4) / 65535` (NVIDIA's RTX 5080 Laptop GPU); a 4-, 5- or 6-bit channel of a packed format within one `f32` ulp where the device converts
+  it by the reciprocal (lavapipe: some `ABGR4Unorm` codes one ulp high), and within 0.18 of a code
+  where it widens a 5- or 6-bit channel by replicating its bits (ANV, NVIDIA; a 4-bit channel's
+  replication is exact); a half-float or small-float texel's NaN in the device's encoding, where
+  Metal answers `0x7fc00000`; every other class Metal's value.
+- `metal2vulkan-degrade-device-vertex-conversion` (precision).
+  `PrecisionNote::DeviceVertexConversion`: Native vertex input (a conversion): a render pipeline's
+  vertex descriptor gives a normalized format (`UCharNormalized` through `Short4Normalized` of
+  either sign, `UChar4Normalized_BGRA`, `Int1010102Normalized`, `UInt1010102Normalized`) to an
+  attribute that fixed-function vertex input fetches, so the attribute is the device's `UNORM` or
+  `SNORM` conversion of its codes, where Metal's fetch answers the code over its maximum correctly
+  rounded (an `Int1010102Normalized` 10-bit field times `float(1/511)`): within one `f32` ulp
+  where measured (lavapipe reads some 8-bit unsigned codes one ulp high), but lavapipe's
+  per-instance fetch, which reads the most negative code of an 8- or 16-bit signed format
+  unclamped (-128/127, -32768/32767) where Metal reads -1. Recorded on the pipeline's vertex stage
+  on every device but one whose profile takes `DriverDeviation::MetalNormalizedVertexFetch`
+  (MoltenVK on the Apple M3 Max's macOS 27 identity), where only a 16-bit format read as `half`
+  records it; one module serves every format the device fetches. A normalized attribute the shader
+  pulls from its buffer instead (an offset, stride or step fixed-function input cannot fetch, a
+  kernel's `[[stage_in]]` attribute) is the module's product of the code and its maximum's
+  reciprocal, rounded once, the signed one clamped to -1: within one `f32` ulp of Metal's quotient
+  (some 8-bit unsigned codes one ulp high, some signed, 10-bit and 16-bit codes one ulp toward
+  zero; 0, the maximum and -1 exact). The function records it on every device, read as `float` for
+  every normalized format but `Int1010102Normalized` (Metal's own product), and read as `half` for
+  a 16-bit format (one `half` ulp at four codes).
 - `metal2vulkan-degrade-native-half-conversion` (precision). `PrecisionNote::NativeHalfConversion`:
   Native half rounding (a conversion): the module rounds a `half` result it computes in `float` (a
   `half` operation's, a function's, a conversion from `float`'s, a texel's) by the device's
-  conversion of the `float` to 16 bits and its widening, not by the translation's integer rounding,
-  on a device with `shaderFloat16` whose conversion is neither measured to be Metal's `half(float)`
-  (MoltenVK on an Apple GPU) nor made Metal's by its float controls (`RoundingModeRTE`,
+  conversion of the `float` to 16 bits and its widening, on a device with `shaderFloat16` whose
+  float controls do not make that conversion Metal's `half(float)` (`RoundingModeRTE`,
   `DenormPreserve` and `SignedZeroInfNanPreserve` for 16 bits: ANV and RADV round through the
-  conversion under them, exactly, with no note), under `HalfRoundingPolicy::Native`: NVIDIA, whose
-  driver folds the conversion's round trip even under those controls
-  (`DriverWorkaround::HalfConversionPairFolded`), lavapipe, and any device without them.
+  conversion under them, exactly, with no note): NVIDIA, whose driver folds the conversion's round
+  trip even under those controls (`DriverWorkaround::HalfConversionPairFolded`), MoltenVK,
+  lavapipe, and any device without them. Also recorded where a `half` read from its bits is the
+  device's widening, or a `half` encoded to its bits (where they are not the bits it was read from)
+  is the device's narrowing, and that conversion is neither under those controls nor measured to be
+  Metal's: the conversion on NVIDIA and lavapipe, and `GLSL.std.450 UnpackHalf2x16` and
+  `PackHalf2x16` on every device without `shaderFloat16`. A half denormal may read or encode as the
+  zero of its sign.
 - `metal2vulkan-degrade-native-half-quantize` (precision). `PrecisionNote::NativeHalfQuantize`:
-  Native half rounding (a quantize): the module rounds a `half` result it computes in `float` by the
-  device's `OpQuantizeToF16`, a result the quantize flushes to zero rounded by the translation to
-  the half denormal grid, not by its integer rounding, on a device without `shaderFloat16` whose
-  quantize is not measured to round as Metal's conversion does, under `HalfRoundingPolicy::Native`.
+  Native half rounding (a quantize): the module rounds a `half` result it computes in `float` (a
+  `half` operation's, a function's, a conversion from `float`'s, a texel's) by the device's
+  `OpQuantizeToF16` alone, on every device without `shaderFloat16`, its quantize measured or not: a
+  value below the smallest normal `half` may round to a zero where Metal answers the half denormal
+  (or `2^-14`, from just below it). An integer's `half` rounds exactly instead.
 - `metal2vulkan-degrade-native-nan-encoding` (precision). `PrecisionNote::NativeNanEncoding`: Native
   device maths: a `float` or `half` operation's NaN result is the device's, its sign and payload
-  unselected, on a device whose arithmetic is not measured to answer Metal's canonical NaN, under
-  `NanMinMaxPolicy::Native`. Also recorded where a `half` read from its bits is the device's
-  widening under the float controls (ANV, RADV): a NaN's bits the device's, where Metal widens
-  every `half` NaN to `0x7fc00000`.
+  unselected, where Metal answers a NaN the device is not measured to answer (every NaN but
+  Metal's canonical one on a device measured to answer that, MoltenVK on an Apple GPU): a `float`
+  `fneg` and `fabs`, which keep a NaN operand's payload on Metal, a `half` `fract`, which returns
+  it, and a precise `float` `pow` of a NaN base to the exponent one, which returns the base, among
+  them. Also
+  recorded wherever a `half` is read from its bits, on every device, since the read is the
+  device's widening (its conversion with `shaderFloat16`, `UnpackHalf2x16` without): a NaN's bits
+  the device's, where Metal widens every `half` NaN to `0x7fc00000` and moves one it does not
+  widen with its bits. And wherever a `half` is encoded to its bits (a store, a reinterpretation, a
+  texel's bits) where they are not the bits it was read from, on every device, since the encode is
+  the device's narrowing (its conversion with `shaderFloat16`, `PackHalf2x16` without): a NaN's
+  bits the device's, where Metal keeps a `half` NaN's sign and payload.
 - `metal2vulkan-degrade-native-min-max` (precision). `PrecisionNote::NativeMinMax`: Native device
   maths: Metal's `fmin`, `fmax`, `min3`, `max3`, `clamp` or `saturate` (its `clamp(x, +0, 1)`) on
-  `float` or `half` is the device's `GLSL.std.450` `NMin`, `NMax` or `NClamp`, not the translation's
-  selects of Metal's operand, on a device not measured to answer Metal's, under
-  `NanMinMaxPolicy::Native`.
+  `float` or `half` is the device's `GLSL.std.450` `NMin`, `NMax` or `NClamp`, on a device not
+  measured to answer Metal's operand; and `median3` on every device, `min(max(c, min(a, b)),
+  max(a, b))` of the device's `NMin` and `NMax`, whose pick of two NaNs and of an `f32` denormal is
+  the device's (Metal's `fast::median3` answers `b` for two NaN first operands).
 - `metal2vulkan-degrade-native-dot` (precision). `PrecisionNote::NativeDot`: Native device maths:
-  Metal's `dot` on `float`, or on `half` where its fused multiply-add is not the measured 16-bit
-  one, is the device's `OpDot` (a `half` one summed in `float` and rounded once to `half`), not
-  Metal's fused chain of its products, under `RoundingOrderPolicy::Native`.
+  Metal's `dot` on `float` and `half` is the device's `OpDot` (a `half` one summed in `float` and
+  rounded once to `half`), not Metal's fused chain of its products, on every device but for a
+  `float` one where the device's functions are Metal's own (MoltenVK).
 - `metal2vulkan-degrade-native-mix` (precision). `PrecisionNote::NativeMix`: Native device maths:
-  Metal's `mix(x, y, t)` on `float`, or on `half` where its fused multiply-add is not the measured
-  16-bit one, is the device's `FMix` (a `half` one computed in `float` and rounded once to `half`),
-  not Metal's `fma(t, y, fma(-t, x, x))`, under `RoundingOrderPolicy::Native`.
+  Metal's `mix(x, y, t)` on `float` and `half` is the device's `FMix` (a `half` one computed in
+  `float` and rounded once to `half`), not Metal's `fma(t, y, fma(-t, x, x))`, on every device but
+  for a `float` one where the device's functions are Metal's own (MoltenVK).
+- `metal2vulkan-degrade-device-pack-conversion` (precision). `PrecisionNote::DevicePackConversion`:
+  Native device maths (a conversion): `air.pack` or `air.unpack` of a normalized format is the
+  device's: `GLSL.std.450`'s `Pack`/`Unpack` `Unorm4x8`, `Snorm4x8`, `Unorm2x16` and `Snorm2x16`,
+  their definition by the device's `NClamp`, multiply, `RoundEven` and reciprocal for `rgb10a2` and
+  `rgb565`, and the MSL transfer functions by the device's `Pow` for `unorm4x8_srgb`'s colour. Metal
+  rounds the exact product and divides correctly rounded, answers code 0 for a NaN channel, and
+  takes an sRGB colour through its twelve-bit table; a packed code is within one of Metal's, an
+  unpacked value within 2.5 ulp, a decoded sRGB colour within half a twelve-bit step (`1 / 8190`)
+  of Metal's step beyond its `Pow`'s bound. Also a write of an 8-bit sRGB storage texture held
+  through its UNORM alias, which encodes by `unorm4x8_srgb`'s pack. Not recorded for a
+  `float` conversion of the four named formats on MoltenVK, Metal's own there. The same conversions
+  serve an implicit imageblock access of a normalized attachment (a `half` load rounding the
+  unpacked `float` once more), a fragment function's read and write of an 8-bit sRGB attachment
+  in the interlocked storage form or through its word view, and a snapshot read's decode of a
+  normalized code (`c` times the `f32` nearest `1 / D`), noted alike. So does every conversion of
+  an extended-range, padded 10-bit or bfloat texel (`BGR10_XR`, `BGRA10_XR`, `RGB10A8_2P_XR10`,
+  `R10Unorm_X6`, `RG10Unorm_X12`, their sRGB twins, `RGB10A2Unorm_sRGB`, `R16Bfloat`, `RG16Bfloat`,
+  `RGBA16Bfloat`), which no Vulkan format holds: a read is `float(c - 384)` (a padded code `c`)
+  times the `f32` nearest `1 / 510` (`1 / 1023`), a write `RoundEven` of the clamped value's `f32`
+  product plus 384, an sRGB twin's colour the MSL transfer by the device's `Pow` on the magnitude,
+  a `half` result the device's narrowing, a bfloat code's NaN as it is (a write's kept a NaN by
+  its quiet bit). Metal divides correctly rounded, rounds the exact product, rounds a `half` with
+  ties away from zero, converts the sRGB twins through its own tables, makes a bfloat NaN
+  `0x7fc00000` or `0x7fc0`, and rounds a bfloat sample's `half` toward zero: a linear value within
+  one `f32` ulp, a code within one, an sRGB twin's decoded value within half a `2^-13` step of
+  Metal's table (`R10Unorm_X6_sRGB`'s 1.64 steps) beyond the `Pow`'s bound, a `half` result within
+  one `half` ulp.
 - `metal2vulkan-degrade-color-attachment-groups` (precision).
   `PrecisionNote::ColorAttachmentGroups`: A render pipeline whose color attachments the device
   draws in more than one group (more than the lesser of its `maxColorAttachments` and
@@ -3110,51 +3349,6 @@ fast forms record, and each `PrecisionNote`'s rustdoc states its bound.
   `Invariant`; Vulkan promises no more across pipelines of other fragment modules and attachments.
   Groups past the first may differ at discard or depth edges if the driver compiles the variants
   differently.
-
-- `metal2vulkan-degrade-depth-twin-comparison` (retired). Replaced by
-  metal2vulkan-degrade-device-depth-comparison and, on a device without
-  VK_EXT_depth_range_unrestricted, metal2vulkan-degrade-restricted-depth-range, which the pipeline
-  whose stage makes the device's depth comparison announces.
-- `metal2vulkan-degrade-device-half-rounding` (retired). No replacement: every half rounding is
-  Metal's conversion to half, on every device.
-- `metal2vulkan-degrade-rate-map-parameter-data` (retired). No replacement: a rasterization-rate
-  map's parameter data is Metal's bytes, which a translated decoder reads with Apple's arithmetic.
-- `metal2vulkan-degrade-ycbcr-linear-filter` (retired). Replaced by
-  metal2vulkan-degrade-ycbcr-filter-not-exact, which the pipeline whose stage filters a two-plane
-  YCbCr texture otherwise than Metal's exact filter of the format announces.
-- `metal2vulkan-degrade-reissued-resource-id` (retired). No replacement: plain allocation hands out
-  an ID a live texture holds where Metal does.
-- `metal2vulkan-degrade-padded-bits-kept` (retired). Replaced by
-  metal2vulkan-degrade-unreached-tiles-rewritten, which a pass whose load pass rewrites a padded
-  attachment's every tile announces where that is not Metal's, and
-  metal2vulkan-degrade-extended-range-bits-kept, which names an attachment the load pass does not
-  take.
-- `metal2vulkan-degrade-input-attachment-srgb-decode` (retired). No replacement: an 8-bit
-  four-channel sRGB color read through an input attachment is Metal's decode of its code.
-- `metal2vulkan-degrade-beyond-measured-driver-release` (retired). No replacement: a device whose
-  driver, GPU and release were not measured takes the exact path in place of an answer measured
-  elsewhere, which degrades nothing; it says so in the informational message
-  metal2vulkan-unmeasured-driver.
-- `metal2vulkan-degrade-unmeasured-driver` (retired). No replacement: the paths an unmeasured
-  identity takes are exact; the device says so in the informational message
-  metal2vulkan-unmeasured-driver.
-- `metal2vulkan-degrade-deferred-half-rounding` (retired). No replacement: the opt-in deferred half
-  rounding is removed; every half result rounds where it is computed, under native half rounding
-  (metal2vulkan-degrade-native-half-conversion or metal2vulkan-degrade-native-half-quantize) or
-  Metal's.
-- `metal2vulkan-degrade-shadow-copy-back-race` (retired). No replacement: a shadow over bytes the
-  CPU may write is always merged back, so the CPU's writes beside the commands' stay, as Metal
-  keeps them.
-- `metal2vulkan-degrade-deallocator-after-release` (retired). No replacement: a no-copy buffer's
-  deallocator runs in its release, on the releasing thread, as Metal runs it.
-- `metal2vulkan-degrade-unordered-framebuffer-fetch` (retired). No replacement: the opt-in
-  unordered framebuffer fetch is removed; a fetch no ordered form serves on the device is refused
-  (Unsupported FramebufferFetch).
-- `metal2vulkan-degrade-unrestored-first-move-bytes` (retired). No replacement: a texture over a
-  no-copy buffer's host pages is a shadow, which takes no first move over them.
-- `metal2vulkan-degrade-resource-id-takeover` (retired). No replacement: a command reads the
-  sampler states live as its batch is submitted, so a state made before the event wait that orders
-  its ID's write is the one its function reads, as on Metal.
 
 ## 10. Accepted differences
 
@@ -3187,19 +3381,36 @@ each item named states the rule in full.
 - **A draw's `VkPipeline` is made while the draw goes on.** A draw whose pipeline is not made yet
   returns once encoded; the pipeline is made on the device's pool of at most four threads, and the
   command buffer's work waits for it in queue order.
-- **A draw can take its key's residual form while its own pipeline is made.** A state's creation
-  makes its predicted key with every constant buffer slot read through a uniform view read at the
-  slot's residual (`RangeAtBindOffset` 0), which reads the same bytes at every bind offset: the
-  binder writes the slot's descriptor range and residual from the bind offset alone, whichever form
-  the pipeline takes, and the residual is 0 wherever the range starts at the bind offset. A slot
-  bound to nothing is read at its residual too (0), so a draw that leaves such slots unbound takes
-  the creation's pipeline itself. A draw whose own pipeline (which reads such a slot at the bind
-  offset alone, the residual-free form) is not made, and whose key's residual form's is, draws with
-  that one at once; its own is made on the pool behind the makings something waits for, and later
-  draws take it. Only GPU time moves for the draws before it lands: on ANV the residual form's reads
-  are loads where the other form's are pushed constants (`WorkCounts::residual_form_draws`,
-  `residual_form_makings`). On MoltenVK every key is its residual form (the two forms measured
-  alike there), so a state's draws at every bind offset take the one pipeline its creation made.
+- **A draw can take its key's general form while its own pipeline is made.** A state's creation
+  makes its predicted key's general form: each specialization constant with an arm that serves
+  every binding exactly at that arm. Every constant buffer slot read through a uniform view is read
+  at the slot's residual (`RangeAtBindOffset` 0), which reads the same bytes at every bind offset:
+  the binder writes the slot's descriptor range and residual from the bind offset alone, whichever
+  form the pipeline takes, and the residual is 0 wherever the range starts at the bind offset. A
+  slot bound to nothing is read at its residual too (0), so a draw that leaves such slots unbound
+  takes the creation's pipeline itself. On MoltenVK a texture slot a function converts to `half`
+  converts its texels by the class routine (`PlainHalfTexels` 0, the bound class read from push
+  data), which rounds a plain class's `float` texel to nearest even as the plain arm does (the arm
+  Metal's compiler can fold into the image instruction, which a slot bound to nothing or to a plain
+  class takes: every class but a YCbCr field on the grid 8192), and its `UnmeasuredTexels`, which
+  no instruction reads, is at 0 (a class whose `half` conversion is not measured, BC4 to BC7 and
+  the linear ASTC formats among them, takes 1). Where the predicted key is not its own general form
+  (a slot of the plain arm), the creation hands it to the pool right after, behind the makings
+  something waits for, and a draw binding a plain, measured class takes it once made. A draw whose
+  own pipeline (which reads such a buffer slot at the bind offset alone, converts by the plain arm,
+  or names an unmeasured class) is not made, and whose key's general form's is, draws with that one
+  at once; its own is made on the pool behind the makings something waits for, and later draws
+  take it. So a draw binding a texture of an unmeasured class waits for no compile of its own.
+  Only GPU time moves for the draws before it lands (`WorkCounts::residual_form_draws`,
+  `residual_form_makings`): on ANV the residual form's reads are loads where the other form's are
+  pushed constants; on MoltenVK the class routine converts each `half` read in place of the image
+  instruction's own conversion. The creation of a state
+  whose predicted key is not its general form makes two pipelines, the second on the pool, nothing
+  waiting for it. On MoltenVK every key reads its buffer slots at their residual (the two forms
+  measured alike there), so a draw's bind offsets choose no pipeline there. A constant with no arm
+  that serves every binding stays a pipeline per value, made at the first draw of it: a sampler's
+  state (`SamplerState`, each sampler word a sampling emulation of its own) and how the bicubic
+  filter treats the bound format's texels (`BicubicTexels`).
 - **A dispatch's `VkPipeline` is made while the dispatch goes on**, the same way: one pipeline per
   threadgroup size and edge region, made on the pool. A compute state whose descriptor states
   `requiredThreadsPerThreadgroup` -- the threadgroup every dispatch of the state must have -- makes
@@ -3241,7 +3452,9 @@ each item named states the rule in full.
 - **The device counts the sampler IDs it holds** (`Device::sampler_ids_live`,
   `Device::sampler_id_pool_size`), runtime extensions for a consumer that models Metal's sampler
   heap.
-- **A texture can take no resource ID** (`IdPlacement::Outside`), for a consumer's helper textures.
+- **A texture can take no resource ID** (`IdPlacement::Outside`), for a consumer's helper textures
+  and its textures over its own images (`Device::new_texture_with_vk_image`), such as swapchain
+  images.
 - **An indirect command buffer placed at an ID** (`IndirectCommandBufferDescriptor::placement`,
   Apple's private `setResourceIndex:`) takes it as Metal does; an index of 16384 or more is refused.
 - **A pipeline state placed before any pipeline ID is made** (`PipelineOptions::placement`) is made,

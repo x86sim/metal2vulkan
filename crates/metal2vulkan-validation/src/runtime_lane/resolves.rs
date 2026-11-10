@@ -9,17 +9,19 @@
 //! the depth from the vertex and the stencil from the reference.
 //!
 //! A color resolve averages: Vulkan leaves the average's rounding (and an sRGB average's space)
-//! to the device, and Metal rounds a unorm tie up (127.5 to 128). The runtime resolves a unorm,
-//! sRGB or float attachment by Metal's rules (its exact resolve, or a driver measured to resolve
-//! as Metal does), so each such resolve asserts Metal's texels; a half-float one is the device's
-//! average, asserted within one unit of Metal's (one half ulp) and printed as a near-equivalent
-//! where it differs. Depth and stencil resolves pick one sample, which Vulkan states exactly. What
-//! Metal's validation stops, the runtime refuses typed, apart from a color attachment's resolve
-//! that names no texture or a texture under a store action that does not resolve, which resolves
-//! nothing and leaves that texture untouched, and a multisampled color attachment's resolve into
-//! its format's sRGB twin, which resolves in the resolve texture's encoding, as plain Metal's.
+//! to the device, and Metal rounds a unorm tie up (127.5 to 128). The runtime resolves a color
+//! attachment by the device's average, so each resolve asserts Metal's texels on a driver measured
+//! to resolve as Metal does (`DriverFact::ColorResolveAverageIsMetals`), and elsewhere within the
+//! bound `device-rounded-resolve` states: a unorm channel within one code (an 8-bit one within
+//! two, an sRGB channel's bound), a half within one unit (one half ulp), a 32-bit float's
+//! difference printed and not bounded. A resolve that differs is printed as a near-equivalent.
+//! Depth and stencil resolves pick one sample, which Vulkan states exactly. What Metal's validation
+//! stops, the runtime refuses typed, apart from a color attachment's resolve that names no texture
+//! or a texture under a store action that does not resolve, which resolves nothing and leaves that
+//! texture untouched, and a multisampled color attachment's resolve into its format's sRGB twin,
+//! which resolves in the resolve texture's encoding, as plain Metal's.
 
-use super::degrade_notices::assert_once;
+use super::degrade_notices::{assert_once, counts};
 use super::{
     buffer_with, layer_reported_nothing_at_all, read_buffer, validated_device_with, Messages,
     ScratchCache, WAIT,
@@ -325,9 +327,10 @@ impl Channels {
     }
 }
 
-/// Print the device's resolved texels beside Metal's, and assert them Metal's, or for half
-/// floats (`channels`), whose resolve is the device's average, each channel within one unit; the
-/// differing cases are named in `differ`. A resolve that is not Metal's is printed as a
+/// Print the device's resolved texels beside Metal's, and assert them Metal's on a driver whose
+/// average is measured to be Metal's, else within the bound `device-rounded-resolve` states for
+/// `channels` (the module docs), for half floats each channel within one unit on every driver;
+/// the differing cases are named in `differ`. A resolve that is not Metal's is printed as a
 /// near-equivalent, never as Metal's answer.
 pub(super) fn near(
     lane: &Lane,
@@ -338,6 +341,11 @@ pub(super) fn near(
     differ: &RefCell<Vec<String>>,
 ) {
     let device = lane.device.name();
+    let metals = lane
+        .device
+        .properties()
+        .driver_facts
+        .contains(&DriverFact::ColorResolveAverageIsMetals);
     let exact = resolved == metal;
     eprintln!(
         "resolve {name} on {device}: {} ({})",
@@ -349,9 +357,16 @@ pub(super) fn near(
         }
     );
     let (got, want) = (channels.values(resolved), channels.values(metal));
-    let within = got.len() == want.len() && got.iter().zip(&want).all(|(a, b)| (a - b).abs() <= 1);
-    let averaged = matches!(channels, Channels::Half);
-    if !(exact || (averaged && within)) {
+    let bound = match (channels, metals) {
+        (Channels::Half, _) => Some(1),
+        (_, true) => Some(0),
+        (Channels::Unorm8, false) => Some(2),
+        (Channels::Unorm16, false) => Some(1),
+        (Channels::Float, false) => None,
+    };
+    let within = got.len() == want.len()
+        && bound.is_none_or(|bound| got.iter().zip(&want).all(|(a, b)| (a - b).abs() <= bound));
+    if !(exact || within) {
         differ.borrow_mut().push(format!(
             "{name}: {} where Metal resolved {}",
             hex(resolved),
@@ -360,8 +375,8 @@ pub(super) fn near(
     }
 }
 
-/// Probe 6's per-sample resolves of each color format: Metal's, a half one within one unit of
-/// Metal's (the module docs).
+/// Probe 6's per-sample resolves of each color format: Metal's, or within the device's announced
+/// bound of Metal's (the module docs).
 #[test]
 fn color_resolves_are_metals() {
     let (messages, _cache, lane) = lane();
@@ -1473,7 +1488,9 @@ fn a_single_sampled_colour_resolve_copies_its_texels() {
 /// decides it. There an `RGBA8Unorm_sRGB` resolve texture takes `bcbcbc80` (each color channel's
 /// codes 0xff and 0x00 decoded, averaged in linear space and encoded again, and alpha's averaged
 /// as the linear channel it is) and an `RGBA8Unorm` one `80808080` (every channel's codes
-/// averaged), whichever format the attachment is.
+/// averaged), whichever format the attachment is. Into an sRGB texture the resolve decodes and
+/// encodes by the device's own sRGB conversions, so each color channel there stands within the
+/// two codes `device-rounded-resolve` states of Metal's ([`twin_resolved`]).
 #[test]
 fn a_resolve_into_the_srgb_twin_resolves_in_the_resolve_texture_s_encoding() {
     let (messages, _cache, lane) = lane();
@@ -1537,18 +1554,49 @@ fn a_resolve_into_the_srgb_twin_resolves_in_the_resolve_texture_s_encoding() {
                 }
             })
             .unwrap();
-            assert_eq!(
-                hex(&lane.read(&resolve, (0, 0), 4, BlitOption::None)),
-                hex(&repeat(&texel, (SIZE * SIZE) as usize)),
-                "{attachment:?} into {into:?} through a view of {view:?}, samples {}",
-                match draw {
-                    true => "that disagree",
-                    false => "that agree",
-                }
+            twin_resolved(
+                &lane.read(&resolve, (0, 0), 4, BlitOption::None),
+                texel,
+                srgb_written,
+                &format!(
+                    "{attachment:?} into {into:?} through a view of {view:?}, samples {}",
+                    match draw {
+                        true => "that disagree",
+                        false => "that agree",
+                    }
+                ),
             );
         }
     }
     quiet(lane, &messages);
+}
+
+/// Hold each texel of a twin resolve's `got` to Metal's `texel` (the lane's 4x4 texture): every
+/// byte where the resolve writes a UNORM texture, and where it writes an sRGB one (`srgb`), whose
+/// decode and encode are the device's own (`bind::ColorResolveFormat::device_srgb`), each color
+/// channel within the two codes `device-rounded-resolve` states and the alpha exactly. A texel
+/// apart from Metal's is printed.
+pub(super) fn twin_resolved(got: &[u8], texel: [u8; 4], srgb: bool, what: &str) {
+    let codes = |c: usize| if srgb && c < 3 { 2 } else { 0 };
+    let within = got.chunks(4).all(|t| {
+        t.iter()
+            .zip(texel)
+            .enumerate()
+            .all(|(c, (&g, m))| g.abs_diff(m) <= codes(c))
+    });
+    assert!(
+        within && got.len() == 4 * (SIZE * SIZE) as usize,
+        "{what}: {} where Metal's is {}",
+        hex(got),
+        hex(&texel)
+    );
+    if got.chunks(4).any(|t| t != texel) {
+        eprintln!(
+            "{what}: {} where Metal's is {} (the device's sRGB conversions)",
+            hex(&got[..4]),
+            hex(&texel)
+        );
+    }
 }
 
 /// A multisampled color attachment resolved into its format's sRGB twin keeps the samples it held
@@ -1618,10 +1666,11 @@ fn samples_a_twin_resolve_reads_are_kept_as_metal_keeps_them() {
                         true => [0xbc, 0xbc, 0xbc, 0x80],
                         false => [0x80, 0x80, 0x80, 0x80],
                     };
-                    assert_eq!(
-                        hex(&lane.read(&resolve, (0, 0), 4, BlitOption::None)),
-                        hex(&repeat(&texel, (SIZE * SIZE) as usize)),
-                        "{label}: the resolve texture"
+                    twin_resolved(
+                        &lane.read(&resolve, (0, 0), 4, BlitOption::None),
+                        texel,
+                        srgb,
+                        &format!("{label}: the resolve texture"),
                     );
                 }
                 assert_eq!(
@@ -1913,17 +1962,16 @@ enum DepthTexel {
 /// with macOS 27.0.1: `Depth32Float`, `Depth16Unorm`, `Stencil8` and `Depth32Float_Stencil8`,
 /// each aspect of the combined format attached), through a stand-in: filled first by a blit
 /// (depth 0.75, stencil 0x22), each aspect cleared (0.5, 0x11) or loaded, drawn or not, stored or
-/// `DontCare`. Stored, it holds the clear or its texels where nothing is drawn, and the draw's
+/// `DontCare`. Stored, it holds the clear (on `Depth16Unorm`, the device's code for 0.5: Metal's
+/// truncated 0x7fff or the next, announced as `UnormDepthRounding`) or its texels where nothing is
+/// drawn, and the draw's
 /// depth 0.25 (`Less`, written) and stencil 0x5a (`Always`, `Replace`) where the draw passes, as
 /// the probe's drawn pixel holds them (here every pixel: the fullscreen triangle); under
-/// `DontCare`, its texels before the pass. A `Depth32Float` texture held in a color image beside
-/// its depth twin (a device whose depth images may not keep every `float`) is
-/// `NotImplemented(Render)` (printed).
+/// `DontCare`, its texels before the pass.
 #[test]
 fn a_depth_or_stencil_texture_without_render_target_usage_renders_as_metal() {
     let (messages, _cache, lane) = lane();
     let name = lane.device.name().to_owned();
-    let (_, _, keeps_floats) = super::texture_blits::depth_images(&lane.device);
     let rgba8 = PixelFormat::RGBA8Unorm;
     let (load, clear) = (LoadAction::Load, LoadAction::Clear);
     let (store, dontcare) = (StoreAction::Store, StoreAction::DontCare);
@@ -2028,17 +2076,6 @@ fn a_depth_or_stencil_texture_without_render_target_usage_renders_as_metal() {
                         l.draw(e, h, &pipeline, 0.25);
                     }
                 });
-                if pf == PixelFormat::Depth32Float && !keeps_floats {
-                    assert_eq!(
-                        ran,
-                        Err(Error::NotImplemented(RuntimeGap::Render)),
-                        "{case}"
-                    );
-                    eprintln!(
-                        "refused: {case} on {name}, a depth twin's texture (Metal renders it)"
-                    );
-                    continue;
-                }
                 ran.unwrap_or_else(|e| panic!("{case} on {name}: {e}"));
                 // What each aspect holds: the draw's where it ran and the pass stored, else the
                 // clear where it cleared and stored, else the texels before the pass.
@@ -2049,11 +2086,20 @@ fn a_depth_or_stencil_texture_without_render_target_usage_renders_as_metal() {
                     _ => (DepthTexel::Filled, 0x22),
                 };
                 if has_depth {
-                    assert_eq!(
-                        lane.read(&texture, (0, 0), depth_bytes, options(true)),
-                        depth_texel(pf, depth).repeat(16),
-                        "{case} depth on {name}"
-                    );
+                    let read = lane.read(&texture, (0, 0), depth_bytes, options(true));
+                    // The clear 0.5 is 32767.5 `Depth16Unorm` codes: Metal's clear truncates it
+                    // to 0x7fff, the device converts it its own way, announced as
+                    // `UnormDepthRounding` (asserted below): the code next to Metal's too.
+                    let next = matches!(depth, DepthTexel::Cleared)
+                        && pf == PixelFormat::Depth16Unorm
+                        && read == 0x8000_u16.to_le_bytes().repeat(16);
+                    if !next {
+                        assert_eq!(
+                            read,
+                            depth_texel(pf, depth).repeat(16),
+                            "{case} depth on {name}"
+                        );
+                    }
                 }
                 if has_stencil {
                     assert_eq!(
@@ -2070,6 +2116,13 @@ fn a_depth_or_stencil_texture_without_render_target_usage_renders_as_metal() {
                 );
             }
         }
+        let rounding =
+            counts(&messages.take_notices()).contains_key(&Degradation::UnormDepthRounding);
+        assert_eq!(
+            rounding,
+            pf == PixelFormat::Depth16Unorm,
+            "{pf:?} on {name}: depth rounding announced"
+        );
     }
     quiet(lane, &messages);
 }

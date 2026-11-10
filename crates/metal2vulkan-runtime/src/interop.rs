@@ -20,6 +20,7 @@
 
 use super::buffer::ReadApart;
 use super::device::relay::By;
+use super::device::submit_stalls::Uses;
 use super::event::EventRef;
 use super::texture::wrapped::Wrapped;
 use super::{Buffer, CommandQueue, Device, SharedEvent, Texture};
@@ -101,9 +102,7 @@ impl Texture {
     /// where the texels are a buffer's bytes the runtime copies into and out of an image of its
     /// own (a texture buffer, a texture over a no-copy buffer's host pages, or a texture over
     /// another buffer that does not alias it), or another image's texels it so copies (a view of
-    /// another component layout on a device whose views reinterpret none). A texture with a depth
-    /// twin gives its `R32_SFLOAT` image, which holds its texels; its comparisons read the twin,
-    /// which a write into the image does not reach.
+    /// another component layout on a device whose views reinterpret none).
     ///
     /// A texture over a buffer's bytes whose image aliases them gives a linear image of
     /// `VK_IMAGE_TILING_LINEAR`, bound to the buffer's memory, the runtime's own: such a texture's
@@ -188,7 +187,9 @@ impl CommandQueue {
         // Where the queue's failures are relayed, a mark after `f`'s submissions keeps a failure
         // of theirs the caller's (`device/relay.rs`); where freed memory waits for the work in
         // flight, it waits for that mark (`freed_memory.rs`).
-        let used = shared.use_queue(self.vk_queue(), By::Program, |queue| f(queue, family));
+        let used = shared.use_queue(self.vk_queue(), By::Program, Uses::Unknown, |queue| {
+            f(queue, family)
+        });
         if let Some(parking) = shared.parking.get() {
             parking.watch(self.device());
         }

@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::device::profile::DeviceProfile;
 use crate::device::requirements::{VkFeature, VkLimit, VkProperty};
+use crate::device::DevicePolicy;
 use crate::device::{Device, DeviceDescription};
 use crate::error::{Capability, Error, Feature, LowerFamily, Needs, Unsupported};
 use crate::library::FunctionArtifact;
@@ -33,11 +34,10 @@ use crate::pipeline::interface::{NumberedSampler, SlotInterface};
 use crate::pipeline::layout::BindingSource;
 use crate::pipeline::link::{link, LinkInputs};
 use crate::pipeline::sym::{ResourceKind, SamplerRef, SlotClass, SlotRef, SpecKey, Stage};
-use crate::pipeline::testing::EXACT_SAMPLING;
 use crate::pipeline::testing::{
     compile, engine_dir, link_and_validate, llvm_assemble, profile, AssembleError,
 };
-use crate::spirv::testing::committed_exact_profiles;
+use crate::spirv::testing::committed_profiles;
 
 const DATALAYOUT: &str = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32";
 
@@ -91,7 +91,7 @@ fn assemble(name: &str, body: &str) -> Option<Vec<u8>> {
 }
 
 fn m3() -> DeviceProfile {
-    profile("moltenvk-m3", EXACT_SAMPLING).expect("profile")
+    profile("moltenvk-m3", DevicePolicy::default()).expect("profile")
 }
 
 fn ok(bc: &[u8], entry: &str, p: &DeviceProfile) -> std::sync::Arc<FunctionArtifact> {
@@ -119,6 +119,25 @@ fn count(a: &FunctionArtifact, op: u16) -> usize {
         .count()
 }
 
+/// The `GLSL.std.450` instructions numbered `glsl` the module's `OpExtInst`s call.
+fn glsl_count(a: &FunctionArtifact, glsl: u32) -> usize {
+    const OP_EXT_INST: u32 = 12;
+    let words = &a.module.words;
+    let mut n = 0;
+    let mut i = 5;
+    while i < words.len() {
+        let len = (words[i] >> 16) as usize;
+        if words[i] & 0xFFFF == OP_EXT_INST && words.get(i + 4) == Some(&glsl) {
+            n += 1;
+        }
+        i += len.max(1);
+    }
+    n
+}
+
+/// `GLSL.std.450 Floor`.
+const GLSL_FLOOR: u32 = 8;
+
 const OP_SELECT: u16 = 169;
 const OP_FDIV: u16 = 136;
 const OP_IMAGE_SAMPLE_IMPLICIT_LOD: u16 = 87;
@@ -133,27 +152,17 @@ const OP_F_ORD_EQUAL: u16 = 180;
 const OP_TYPE_FLOAT: u16 = 22;
 const OP_TYPE_VECTOR: u16 = 23;
 const OP_F_CONVERT: u16 = 115;
-const OP_CONSTANT: u16 = 43;
-const OP_CONSTANT_COMPOSITE: u16 = 44;
-const OP_BITWISE_AND: u16 = 199;
 
-/// `a`'s module rounds a `half` exactly, by one of the forms `lower::arith::narrow::round` takes,
-/// at least once: on a profile that takes neither measured fact below, the integer rounding,
-/// which clears the 13 bits below the half's last with an `OpBitwiseAnd` of `0xFFFFE000`; where the
-/// device's quantize is measured Metal's (`DriverDeviation::MetalHalfQuantize`), each
-/// `OpQuantizeToF16` feeds an `OpFOrdEqual`, the test of the rounding that keeps half subnormals
-/// where the quantize gives a zero, so none rounds a `half` alone, which flushes them; or, on a
-/// profile that takes `DriverDeviation::MetalHalfConversion` (moltenvk-m3), an `OpFConvert` of an
-/// `f32` to 16 bits widened back by another, the device's conversion that is measured to be
-/// Metal's, or the same pair on a profile whose float controls make it Metal's
+/// `a`'s module rounds a `half` by one of the forms `lower::arith::narrow::round` takes, at least
+/// once: each `OpQuantizeToF16` feeds an `OpFOrdEqual`, the test of the rounding that keeps half
+/// subnormals where the quantize gives a zero, so none rounds a `half` alone, which flushes them;
+/// or an `OpFConvert` of an `f32` to 16 bits widened back by another, the device's conversion
+/// (moltenvk-m3), or the same pair on a profile whose float controls make it Metal's
 /// (`narrow::controlled_modes`).
-fn assert_exact_half_rounding(a: &FunctionArtifact) {
+fn assert_half_rounding(a: &FunctionArtifact) {
     let w = &a.module.words;
     let mut quantized = Vec::new();
     let mut compared = Vec::new();
-    // The ids of `0xFFFFE000` (scalar, and composites of it), and each `OpBitwiseAnd`'s operands.
-    let mut keep = Vec::new();
-    let mut anded = Vec::new();
     // Float types by width (scalar, and vectors by their component's width), and each
     // `OpFConvert`'s (result type, result, operand).
     let mut widths = std::collections::BTreeMap::new();
@@ -173,16 +182,10 @@ fn assert_exact_half_rounding(a: &FunctionArtifact) {
                 }
             }
             OP_F_CONVERT => converts.push((w[i + 1], w[i + 2], w[i + 3])),
-            OP_CONSTANT if n == 4 && w[i + 3] == 0xFFFF_E000 => keep.push(w[i + 2]),
-            OP_CONSTANT_COMPOSITE if n > 3 && w[i + 3..i + n].iter().all(|c| keep.contains(c)) => {
-                keep.push(w[i + 2])
-            }
-            OP_BITWISE_AND => anded.extend_from_slice(&w[i + 3..i + n]),
             _ => {}
         }
         i += n;
     }
-    let integer = anded.iter().filter(|v| keep.contains(v)).count();
     let narrowed: Vec<u32> = converts
         .iter()
         .filter(|(ty, _, _)| widths.get(ty) == Some(&16))
@@ -192,10 +195,7 @@ fn assert_exact_half_rounding(a: &FunctionArtifact) {
         .iter()
         .filter(|(ty, _, operand)| widths.get(ty) == Some(&32) && narrowed.contains(operand))
         .count();
-    assert!(
-        quantized.len() + converted + integer > 0,
-        "no half rounding"
-    );
+    assert!(quantized.len() + converted > 0, "no half rounding");
     for q in quantized {
         assert!(compared.contains(&q), "%{q} rounds a half alone");
     }
@@ -243,7 +243,7 @@ fn every_sampling_entry_compiles_or_refuses_on_every_profile() {
     let Some(bc) = fixture() else {
         return;
     };
-    for (stem, p) in committed_exact_profiles().expect("profiles") {
+    for (stem, p) in committed_profiles().expect("profiles") {
         for entry in ENTRIES {
             match compile(&bc, entry, &p) {
                 Ok(a) => {
@@ -289,11 +289,8 @@ fn runtime_samplers_select_pixel_coordinates_by_specialization() {
         .facts
         .contains(&RuntimeFact::SamplerCoordinates { slot: s }));
     assert!(a.facts.contains(&RuntimeFact::SamplerReduction { slot: s }));
-    // Read only through the pixel tests: gated by the coordinates bit.
-    assert_eq!(
-        sampler_fields(&a, s),
-        Some(SamplerWord::PIXEL_NEAREST | SamplerWord::PIXEL_GATED)
-    );
+    // The coordinates bit alone: the device's sampler reads the scaled coordinate.
+    assert_eq!(sampler_fields(&a, s), Some(SamplerWord::PIXEL_COORDINATES));
     assert!(a.precision.contains(&PrecisionNote::PixelSamplerScaling));
     assert_eq!(uses(&a, "sampler.sample"), 1);
     assert_eq!(combined(&a), vec![(0, SamplerRef::Slot(0), false, false)]);
@@ -317,58 +314,50 @@ fn runtime_samplers_select_pixel_coordinates_by_specialization() {
         .all(|d| d.slot.kind != ResourceKind::Texture));
 }
 
-/// Off MoltenVK a sample through a runtime sampler slot that Metal's linear filter may answer is
-/// planned for the emulation, which the slot's word selects in the function: its `SamplerState`
-/// fields add `SamplerWord::LINEAR_STATE` (the filter, coordinates, address modes, and border
-/// color) to the pixel fields, the census names the emulation, and the module validates on every
-/// committed profile.
+/// A sample through a runtime sampler slot is the device's on every committed profile: the
+/// function reads only the coordinates bit of the slot's word (`SamplerWord::PIXEL_COORDINATES`),
+/// never its filter, address modes or levels, and the module requires the device's own sampler
+/// (`VkProperty::MetalSampler` on MoltenVK, `VkProperty::DeviceSampling` elsewhere) and validates.
 #[test]
-fn a_runtime_sampler_reads_its_linear_state_by_specialization() {
+fn a_runtime_samplers_sample_is_the_device_s() {
     let Some(bc) = fixture() else {
         return;
     };
     let s = slot(Stage::Kernel, SlotClass::Sampler, 0);
-    for (stem, p) in committed_exact_profiles().expect("profiles") {
+    let (mut metal, mut device) = (0, 0);
+    for (stem, p) in committed_profiles().expect("profiles") {
         let a = ok(&bc, "sample_level", &p);
-        let fields = sampler_fields(&a, s);
-        // A device sampling through Metal's own sampler filters every sample.
-        if a.requirements
+        assert_eq!(
+            sampler_fields(&a, s),
+            Some(SamplerWord::PIXEL_COORDINATES),
+            "{stem}"
+        );
+        assert_eq!(uses(&a, "sampler.sample"), 1, "{stem}");
+        let property = match p
+            .fields()
+            .enabled
             .properties
             .contains(&VkProperty::MetalSampler)
         {
-            let gated = SamplerWord::PIXEL_NEAREST | SamplerWord::PIXEL_GATED;
-            assert_eq!(fields, Some(gated), "{stem}");
-            assert_eq!(uses(&a, "sampler.sample"), 1, "{stem}");
-            continue;
-        }
-        // Its level is known, so its nearest snap reads the levels its clamp leaves.
-        assert_eq!(
-            fields,
-            Some(
-                SamplerWord::PIXEL_NEAREST
-                    | SamplerWord::LINEAR_STATE
-                    | SamplerWord::LEVEL_MIN
-                    | SamplerWord::LEVEL_MAX
-            ),
-            "{stem}"
-        );
-        assert_eq!(uses(&a, "sampler.linear"), 1, "{stem}");
-        assert!(
-            a.precision.contains(&PrecisionNote::FloatSampleFilter),
-            "{stem}"
-        );
+            true => {
+                metal += 1;
+                VkProperty::MetalSampler
+            }
+            false => {
+                device += 1;
+                VkProperty::DeviceSampling
+            }
+        };
+        assert!(a.requirements.properties.contains(&property), "{stem}");
     }
+    assert!(metal > 0 && device > 0, "metal {metal}, device {device}");
 }
 
-/// A runtime sampler's sample at a level the function knows reads, off MoltenVK, the levels its
-/// sampler's clamp leaves (`SamplerWord::LEVELED_SNAP`) for its snap, and a level off every rule's
-/// grid (a dynamic level, `1.5`, a kernel's dynamic bias) the word's level rule
-/// (`SamplerWord::LEVEL_RULE`); each validates on every committed profile, and a leveled snap
-/// queries the texture's levels. On a device sampling through Metal's own sampler none is read,
-/// and the module requires the property.
+/// A runtime sampler's sample at a level (a dynamic level, `1.5`, `1.0`, a kernel's dynamic bias)
+/// reads none of the level fields of the slot's word on any committed profile: the device's
+/// sampler takes the level, the `VkSampler` holding the sampler's clamp.
 #[test]
-fn a_runtime_samples_level_reads_its_word_by_specialization() {
-    const OP_IMAGE_QUERY_LEVELS: u16 = 106;
+fn a_runtime_samples_level_is_the_device_s() {
     let kernels = [
         ("dynamic_level", true, "%l"),
         ("half_level", true, "1.5"),
@@ -376,8 +365,7 @@ fn a_runtime_samples_level_reads_its_word_by_specialization() {
         ("dynamic_bias", false, "%l"),
     ];
     let s = slot(Stage::Kernel, SlotClass::Sampler, 0);
-    let levels = SamplerWord::LEVEL_MIN | SamplerWord::LEVEL_MAX;
-    let (mut ruled, mut metal) = (0, 0);
+    let levels = SamplerWord::LEVEL_MIN | SamplerWord::LEVEL_MAX | SamplerWord::MIP_FILTER;
     for (name, level, value) in kernels {
         let text = sample_kernel(
             "%s",
@@ -391,139 +379,68 @@ fn a_runtime_samples_level_reads_its_word_by_specialization() {
         let Some(bc) = assemble(name, &text) else {
             return;
         };
-        for (stem, p) in committed_exact_profiles().expect("profiles") {
+        for (stem, p) in committed_profiles().expect("profiles") {
             let a = ok(&bc, "k", &p);
             let fields = sampler_fields(&a, s).unwrap_or(0);
-            if p.fields()
-                .enabled
-                .properties
-                .contains(&VkProperty::MetalSampler)
-            {
-                assert!(
-                    a.requirements
-                        .properties
-                        .contains(&VkProperty::MetalSampler),
-                    "{name} {stem}"
-                );
-                assert_eq!(fields & levels, 0, "{name} {stem}");
-                metal += 1;
-                continue;
-            }
-            assert_eq!(
-                fields & SamplerWord::LEVELED_SNAP,
-                SamplerWord::LEVELED_SNAP,
-                "{name} {stem}"
-            );
-            assert!(count(&a, OP_IMAGE_QUERY_LEVELS) > 0, "{name} {stem}");
-            if name != "whole_level" {
-                assert_eq!(
-                    fields & SamplerWord::LEVEL_RULE,
-                    SamplerWord::LEVEL_RULE,
-                    "{name} {stem}"
-                );
-                ruled += 1;
-            }
+            assert_eq!(fields & levels, 0, "{name} {stem}");
         }
     }
-    assert!(ruled > 0 && metal > 0, "ruled {ruled}, metal {metal}");
 }
 
-/// A sample through a runtime sampler slot reads, off MoltenVK, the word's fields that decide its
-/// nearest snap (`SamplerWord::NEAREST_SNAP`: whether it reads one texel of the base level, and its
-/// address modes) beside the others, and validates on every committed profile; on a device sampling
-/// through Metal's own sampler it takes no snap and requires the property.
+/// A sample, a gather and a comparison through a runtime sampler slot read only the coordinates
+/// bit of the slot's word (`SamplerWord::PIXEL_COORDINATES`), and hand the device's sampler the
+/// coordinate scaled behind it, on every committed profile: each records `PixelSamplerScaling`,
+/// held where the bound sampler states pixel coordinates (its one clause tests that bit), and
+/// emits no texel centre, footprint cell or block (no `Floor`).
 #[test]
-fn a_runtime_nearest_sample_reads_its_snap_by_specialization() {
-    let Some(bc) = fixture() else {
-        return;
-    };
+fn runtime_pixel_accesses_hand_the_device_the_scaled_coordinate() {
+    use crate::pipeline::artifact::SpecializedNote;
     let s = slot(Stage::Kernel, SlotClass::Sampler, 0);
-    let (mut snapped, mut metal) = (0, 0);
-    for (stem, p) in committed_exact_profiles().expect("profiles") {
-        let a = ok(&bc, "sample_level", &p);
-        let fields = sampler_fields(&a, s).unwrap_or(0);
-        if p.fields()
-            .enabled
-            .properties
-            .contains(&VkProperty::MetalSampler)
-        {
-            assert!(
-                a.requirements
-                    .properties
-                    .contains(&VkProperty::MetalSampler),
-                "{stem}"
-            );
-            assert_eq!(
-                fields & SamplerWord::NEAREST_SNAP,
-                fields & SamplerWord::PIXEL_NEAREST
-            );
-            metal += 1;
-        } else {
-            assert_eq!(
-                fields & SamplerWord::NEAREST_SNAP,
-                SamplerWord::NEAREST_SNAP,
-                "{stem}"
-            );
-            snapped += 1;
-        }
-    }
-    assert!(snapped > 0 && metal > 0, "snapped {snapped}, metal {metal}");
-}
-
-/// A sample through a runtime sampler slot reads the slot's word for a nearest pixel sampler beside
-/// its pixel coordinates (the `SamplerState` fields `SamplerWord::PIXEL_NEAREST`), and selects by
-/// it the centre of the texel Metal floors a pixel coordinate to, keeping `PixelSamplerScaling`; a
-/// gather through one reads the pixel coordinates and the `s` and `t` address modes, and snaps onto
-/// Metal's block behind them, so it records no note.
-#[test]
-fn runtime_pixel_samples_read_the_texel_centre_by_specialization() {
-    let s = slot(Stage::Kernel, SlotClass::Sampler, 0);
-    for gather in [false, true] {
-        let name = if gather {
-            "pixel_gather"
-        } else {
-            "pixel_sample"
-        };
-        let Some(bc) = assemble(name, &dynamic_offset_kernel(gather)) else {
+    let kernels = [
+        ("pixel_sample", dynamic_offset_kernel(false)),
+        ("pixel_gather", dynamic_offset_kernel(true)),
+        ("pixel_compare", COMPARE_KERNEL.to_owned()),
+    ];
+    for (name, text) in kernels {
+        let Some(bc) = assemble(name, &text) else {
             return;
         };
-        let a = ok(&bc, "k", &m3());
-        let fields = match gather {
-            true => {
-                SamplerWord::PIXEL_COORDINATES | SamplerWord::ADDRESS[0] | SamplerWord::ADDRESS[1]
-            }
-            // Read only through the pixel tests: gated.
-            false => SamplerWord::PIXEL_NEAREST | SamplerWord::PIXEL_GATED,
-        };
-        assert_eq!(sampler_fields(&a, s), Some(fields), "{name}");
-        assert!(a
-            .facts
-            .contains(&RuntimeFact::SamplerCoordinates { slot: s }));
-        assert_eq!(
-            a.precision.contains(&PrecisionNote::PixelSamplerScaling),
-            !gather,
-            "{name}"
-        );
+        for (stem, p) in committed_profiles().expect("profiles") {
+            let what = format!("{name} on {stem}");
+            let a = ok(&bc, "k", &p);
+            assert_eq!(
+                sampler_fields(&a, s),
+                Some(SamplerWord::PIXEL_COORDINATES),
+                "{what}"
+            );
+            assert!(a
+                .facts
+                .contains(&RuntimeFact::SamplerCoordinates { slot: s }));
+            assert!(
+                a.precision.contains(&PrecisionNote::PixelSamplerScaling),
+                "{what}"
+            );
+            let key = SpecKey::SamplerState {
+                slot: s,
+                fields: SamplerWord::PIXEL_COORDINATES,
+            };
+            let held: Vec<&SpecializedNote> = a
+                .specialized
+                .iter()
+                .filter(|n| n.note == PrecisionNote::PixelSamplerScaling)
+                .collect();
+            assert_eq!(held.len(), 1, "{what}: {held:?}");
+            assert!(
+                held[0].when.iter().all(|c| c
+                    .all
+                    .iter()
+                    .all(|t| t.key == key && t.mask == SamplerWord::PIXEL_COORDINATES)),
+                "{what}: {held:?}"
+            );
+            assert_eq!(glsl_count(&a, GLSL_FLOOR), 0, "{what}");
+            assert!(count(&a, OP_FDIV) >= 1, "{what}");
+        }
     }
-}
-
-/// A comparison through a runtime sampler slot reads the centre of the texel Metal floors a pixel
-/// coordinate to, as a sample does, behind the slot's word for a nearest pixel sampler
-/// (`SamplerWord::PIXEL_NEAREST`), and records `PixelSamplerScaling` (the bound sampler may filter
-/// linearly).
-#[test]
-fn a_runtime_pixel_comparison_reads_the_texel_centre_by_specialization() {
-    let s = slot(Stage::Kernel, SlotClass::Sampler, 0);
-    let Some(bc) = assemble("pixel_compare", COMPARE_KERNEL) else {
-        return;
-    };
-    let a = ok(&bc, "k", &m3());
-    assert_eq!(count(&a, OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD), 1);
-    assert_eq!(
-        sampler_fields(&a, s),
-        Some(SamplerWord::PIXEL_NEAREST | SamplerWord::PIXEL_GATED)
-    );
-    assert!(a.precision.contains(&PrecisionNote::PixelSamplerScaling));
 }
 
 /// A kernel whose one comparison samples `depth2d<float, sample>` slot 0 through runtime sampler
@@ -607,7 +524,7 @@ fn a_constexpr_pixel_sampler_with_a_compare_function_is_refused() {
         return;
     };
     ok(&normalized, "k", &m3());
-    for (stem, p) in &committed_exact_profiles().expect("profiles") {
+    for (stem, p) in &committed_profiles().expect("profiles") {
         match compile(&pixels, "k", p) {
             Err(Error::Unsupported(u)) => assert_eq!(
                 (u.feature, u.needs),
@@ -658,7 +575,7 @@ fn a_constexpr_reduction_compiles_as_the_weighted_average() {
             let Some(bc) = assemble(name, &kernel(reduction)) else {
                 return;
             };
-            for (stem, p) in &committed_exact_profiles().expect("profiles") {
+            for (stem, p) in &committed_profiles().expect("profiles") {
                 match (compile(&average, "k", p), compile(&bc, "k", p)) {
                     (Ok(a), Ok(b)) => {
                         let at = format!("{name} {reduction} on {stem}");
@@ -856,15 +773,15 @@ fn gathers_gradients_and_pixel_constexpr_samplers() {
     assert!(combined(&g)[0].3, "an integer texture's binding");
     let h = ok(&bc, "sample_grad", &p);
     assert_eq!(uses(&h, "sampler.sample_grad"), 1);
-    // The sampled `half` texel is rounded exactly: no bare quantize; its NaN is the device's
-    // decode.
-    assert_exact_half_rounding(&h);
+    // The sampled `half` texel is rounded by the module's form: no bare quantize; its NaN is the
+    // device's decode.
+    assert_half_rounding(&h);
     assert!(h.precision.contains(&PrecisionNote::DeviceNanEncoding));
-    // A linear pixel sample, which Metal's own sampler filters on this profile, snapped onto the
-    // centre of its footprint step: exact, so no `PixelSamplerScaling`.
+    // A linear pixel sample, the device's sampler's at the coordinate scaled in the shader:
+    // `PixelSamplerScaling`, on Metal's own sampler too.
     let x = ok(&bc, "sample_pixel", &p);
-    assert!(!x.precision.contains(&PrecisionNote::PixelSamplerScaling));
-    assert_eq!(uses(&x, "sampler.linear.snapped"), 1);
+    assert!(x.precision.contains(&PrecisionNote::PixelSamplerScaling));
+    assert_eq!(uses(&x, "sampler.sample"), 1);
     assert!(count(&x, OP_FDIV) >= 1);
     assert!(x
         .interface
@@ -1154,20 +1071,18 @@ const OP_SWITCH: u16 = 251;
 /// the sample needs `maintenance8`. Without `shaderImageGatherExtended` (the floor) a dynamic gather
 /// offset is taken as `ConstOffset` arms: one switch on its dynamic lane's low four bits, 16 gathers
 /// each with a `ConstOffset` and none with `Offset`, and the module needs neither feature. A
-/// runtime sampler's gather reads the offset a second time for its snap behind
-/// the word, which moves the centre back where Metal drops it, on a device without Metal's own
-/// sampler (lavapipe). On one with it (MoltenVK) only a pixel word's gather snaps, and Metal's own
-/// sampler drops the offset of the normalized centre it is handed where Metal drops the pixel
-/// coordinate's, so the snap moves nothing by the offset and reads it once.
+/// runtime sampler's gather snaps a pixel word's coordinate behind the word and moves nothing by
+/// the offset, which the device's sampler places, so it reads the offset once on every device
+/// (lavapipe, MoltenVK).
 #[test]
 fn dynamic_offsets_are_offset_operands_of_their_low_four_bits() {
     let Some(bc) = assemble("gather_dynamic_offset", &dynamic_offset_kernel(true)) else {
         return;
     };
-    let lavapipe = profile("lavapipe", EXACT_SAMPLING).expect("profile");
+    let lavapipe = profile("lavapipe", DevicePolicy::default()).expect("profile");
     let a = ok(&bc, "k", &lavapipe);
     assert_eq!(operand_masks(&a, OP_IMAGE_GATHER, 6), [MASK_OFFSET]);
-    assert_eq!(sign_extracts(&a), 2);
+    assert_eq!(sign_extracts(&a), 1);
     let p = m3();
     let a = ok(&bc, "k", &p);
     assert_eq!(uses(&a, "sampler.gather"), 1);
@@ -1178,7 +1093,7 @@ fn dynamic_offsets_are_offset_operands_of_their_low_four_bits() {
         .features
         .contains(&VkFeature::ShaderImageGatherExtended));
     assert!(!a.requirements.features.contains(&VkFeature::Maintenance8));
-    let floor = profile("vk12-floor", EXACT_SAMPLING).expect("profile");
+    let floor = profile("vk12-floor", DevicePolicy::default()).expect("profile");
     let a = ok(&bc, "k", &floor);
     assert_eq!(count(&a, OP_SWITCH), 1);
     assert_eq!(
@@ -1212,7 +1127,7 @@ fn m3_with(edit: impl FnOnce(&mut crate::device::profile::Limits)) -> DeviceProf
     let text = std::fs::read_to_string(path).expect("profile");
     let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
     edit(&mut desc.limits);
-    Device::new(desc, EXACT_SAMPLING)
+    Device::new(desc, DevicePolicy::default())
         .expect("device")
         .profile()
         .clone()

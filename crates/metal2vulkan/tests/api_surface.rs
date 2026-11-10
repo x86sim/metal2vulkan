@@ -224,25 +224,13 @@ surface! {
         struct StageSimd N;
         enum ContainmentPolicy N;
         struct DevicePolicy N;
-        enum Unorm8LinearFilterPolicy N;
-        enum SamplingPolicy N;
-        enum YCbCrFilterPolicy N;
-        enum FloatMathsPolicy N;
-        enum TexelConversionPolicy N;
-        enum VertexNormalizedPolicy N;
-        enum HalfRoundingPolicy N;
-        enum NanMinMaxPolicy N;
-        enum RoundingOrderPolicy N;
-        enum HalfBlendPolicy N;
-        enum HalfTexelBitsPolicy N;
-        enum MultisampleDepthTwinPolicy N;
-        enum DecodedTexelsPolicy N;
         enum HeapCompressionPolicy N;
         enum CompletionPolicy N;
-        enum TileStorePolicy N;
-        enum ResolvePolicy N;
         enum BatchOrderPolicy N;
         enum RenderLoweringPolicy N;
+        enum HostPageTexturePolicy N;
+        enum HalfChainPolicy N;
+        enum PipelineWaitPolicy N;
         struct DeviceProfile O;
         struct SpirvValidation N;
         struct EnabledCaps N;
@@ -412,14 +400,12 @@ surface! {
         struct AliasView N;
         struct AmplificationDraws N;
         struct BlendEquation N;
-        enum CaptureForm N;
         enum ChannelWrite N;
         struct ColorGroup N;
         struct ExtendedRangeColor N;
         enum FactorLane N;
         struct FetchedAttachment N;
         struct FramebufferFetchInputs N;
-        enum HalfOutputLane N;
         struct LoweringInputs N;
         enum RotatedBlendForm N;
         struct StorageImageChoice N;
@@ -487,7 +473,6 @@ surface! {
         fn handle_entry_flags;
         fn heap_element;
         fn heap_raw_form;
-        fn heap_write_nans_converted;
         enum HeapElement N;
         const HANDLE_ENTRY_BYTES;
         const HANDLE_TABLE_CAPACITY;
@@ -661,24 +646,9 @@ surface! {
         fn shadow_merge_kept_image_module;
         struct ShadowMergeImageModule N;
         enum ShadowMergeRead E;
-        fn depth_magnitude_module;
-        struct DepthMagnitudeModule N;
-        fn unused_bits_module;
-        struct UnusedBitsModule N;
+        enum ShadowMergeStores E;
         fn extended_shadow_module;
         struct ExtendedShadowModule N;
-        fn tile_reach_module;
-        struct TileReachModule N;
-        fn capture_assembly_module;
-        struct CaptureAssemblyModule N;
-        fn capture_settle_module;
-        struct CaptureSettleModule N;
-        enum TexelWords N;
-        fn compressed_blit_module;
-        enum CompressedBlit N;
-        struct CompressedBlitModule N;
-        fn block_decode_module;
-        enum BlockDecode N;
         struct BlockDecodeModule N;
         fn astc_decode_module;
         struct AstcDecode N;
@@ -690,6 +660,8 @@ surface! {
         enum EtcTexels N;
         fn chroma_decode_module;
         enum ChromaDecode N;
+        fn chroma_sample_module;
+        struct ChromaSampleModule N;
         fn mesh_scan_module;
         fn mesh_object_arguments_module;
         struct MeshScanModule N;
@@ -713,7 +685,6 @@ surface! {
         struct MipmapFilterKernel O;
         struct MipmapFilterLevel N;
         struct MipmapFilterModule N;
-        enum MipmapRule N;
         fn plane_copy_module;
         struct PlaneCopyModule N;
         struct PlaneRows N;
@@ -737,6 +708,8 @@ surface! {
         fn ycbcr_read;
         struct YCbCrConvertModule N;
         struct YCbCrPlanes N;
+        struct YCbCrInPlace N;
+        struct YCbCrPlanesSampler N;
         struct YCbCrConversion N;
         struct YCbCrCodes N;
         enum YCbCrOutput N;
@@ -748,6 +721,8 @@ surface! {
         struct YCbCrWriteModule N;
         fn ycbcr_refresh_module;
         struct YCbCrRefreshModule N;
+        fn ycbcr_sample_module;
+        struct YCbCrSampleModule N;
         fn planes_merge_modules;
         fn planes_split_module;
         enum PlanesCopy N;
@@ -765,7 +740,6 @@ surface! {
         enum ResolveSource N;
         const SRGB_RESOLVE_LINEAR;
         const SRGB_RESOLVE_THRESHOLDS;
-        fn color_write_table;
         fn depth_stencil_copy_modules;
         fn stencil_split_module;
         fn depth_split_module;
@@ -927,7 +901,6 @@ surface! {
         fn image_view_type;
         fn image_type;
         fn storage_image_choice;
-        fn half_bits_read_view;
         fn storage_view_formats;
         fn ycbcr;
         fn writes_dropped;
@@ -937,7 +910,6 @@ surface! {
         fn padded_words;
         fn extended_range_blend;
         fn x_channel;
-        fn half_write_nans_converted;
         fn bound_texel_format;
         struct YCbCrFormat N;
         enum ChromaSubsampling N;
@@ -979,10 +951,7 @@ surface! {
         fn polygon_mode;
         fn depth_clamp_enable;
         struct DepthBias N;
-        enum DepthBiasUnit N;
         fn depth_bias;
-        fn depth16_bias;
-        fn depth16_bias_side;
     }
     "metal::vertex" => metal2vulkan::metal::vertex {
         fn vk_vertex_format;
@@ -1058,9 +1027,7 @@ surface! {
 
 use metal2vulkan::bind::{BindState, BoundBuffer, Dispatch, DrawCall, StageTable};
 use metal2vulkan::cache::{Hash256, PipelineArtifact, PipelineKey};
-use metal2vulkan::device::{
-    Device, DeviceDescription, DevicePolicy, FloatMathsPolicy, FloatWidth, NanMinMaxPolicy,
-};
+use metal2vulkan::device::{Device, DeviceDescription, DevicePolicy, FloatWidth};
 use metal2vulkan::library::{CompiledFunction, Library};
 use metal2vulkan::metal::{PixelFormat, VertexFormat};
 use metal2vulkan::pipeline::{
@@ -1072,10 +1039,8 @@ use metal2vulkan::pipeline::{
 use metal2vulkan::Budget;
 
 /// `inputs` with the color writes `writes` (attachment, its channels' rules), the half-float
-/// channels alone where `dev`'s driver converts a fragment's float writes as Metal does, and
-/// elsewhere each attachment whose rules are each none, the device's, an 8-bit unorm channel's or a
-/// half-float channel's, one of them a rounding, selected at the draw (`ChannelWrite::Selected`):
-/// the inputs a fragment of a pipeline with those attachments compiles under.
+/// channels alone where `dev`'s driver converts a fragment's float writes as Metal does: the
+/// inputs a fragment of a pipeline with those attachments compiles under.
 fn with_color_writes(
     dev: &Device,
     mut inputs: LoweringInputs,
@@ -1088,20 +1053,10 @@ fn with_color_writes(
         signed: true,
     };
     let metal = dev.profile().takes_driver_deviation(metal);
-    // Whether a channel's rule rounds, or `None` where no code selects it.
-    let rounds = |r: Option<ChannelWrite>| match r {
-        None | Some(ChannelWrite::Device) => Some(false),
-        Some(r) => (r == ChannelWrite::Unorm { bits: 8 } || r == half).then_some(true),
-    };
-    let selects = |rules: &[Option<ChannelWrite>; 4]| {
-        let each: Option<Vec<bool>> = rules.iter().map(|&r| rounds(r)).collect();
-        each.is_some_and(|each| each.contains(&true))
-    };
     inputs.color_writes = writes
         .iter()
         .map(|&(a, rules)| match metal {
             true => (a, rules.map(|r| r.filter(|&r| r == half))),
-            false if selects(&rules) => (a, [Some(ChannelWrite::Selected); 4]),
             false => (a, rules),
         })
         .filter(|(_, rules)| rules.iter().any(Option::is_some))
@@ -1109,9 +1064,11 @@ fn with_color_writes(
     inputs
 }
 
-/// Every channel of an `RGBA8Unorm` attachment.
+/// Every channel of an `RGBA8Unorm` attachment: the device's (`ChannelWrite::Device`), since no
+/// device's lowering tells Metal's 8-bit unorm rule from the device's conversion of it
+/// (`LoweringInputs::color_writes`).
 const UNORM8: [Option<metal2vulkan::pipeline::ChannelWrite>; 4] =
-    [Some(metal2vulkan::pipeline::ChannelWrite::Unorm { bits: 8 }); 4];
+    [Some(metal2vulkan::pipeline::ChannelWrite::Device); 4];
 
 /// Owned fixture `stem` as bitcode, or `None` (skipped visibly) without `llvm-as`. Assembling is
 /// test infrastructure; everything after it uses the public surface.
@@ -1360,13 +1317,13 @@ fn content_digests_name_what_a_pipeline_says_not_its_build() {
 }
 
 /// The precision contract is public: a fast `float` division records the device's arithmetic,
-/// Metal's precise division records the device's division and NaN where the policy takes both
-/// (`NativeDivision`, `NativeNanEncoding`, native device maths), the division alone under
-/// `NanMinMaxPolicy::Exact` and nothing under `FloatMathsPolicy::Exact`, an integer operator has no
-/// notes, and a fast `float` `tanh`, which the crate computes with a division of its own, records
-/// the device's arithmetic, on a profile whose `float` functions are the device's (lavapipe's); on
-/// one whose functions are Metal's own (MoltenVK's), both are Metal's own in a fast-math entry and
-/// record nothing there, and the division records its note in an entry that keeps NaNs.
+/// Metal's precise division records the device's division, its denormals and its NaN
+/// (`NativeDivision`, `DeviceDenormals`, `NativeNanEncoding`), an integer operator has no notes, and
+/// a fast `float` `tanh`, the device's `Tanh`, records the device's transcendental, on a profile
+/// whose `float` functions are the device's (lavapipe's); on one whose functions are Metal's own
+/// (MoltenVK's), a fast-math division is Metal's own and records nothing, the division records its
+/// note in an entry that keeps NaNs, and a fast `tanh` records that its `Tanh` is Metal's precise
+/// function, not the fast one (`DeviceTranscendentals`).
 #[test]
 fn the_precision_contract_names_each_float_operations_notes() {
     use metal2vulkan_air::intrinsics::AirIntrinsic;
@@ -1387,39 +1344,21 @@ fn the_precision_contract_names_each_float_operations_notes() {
     assert!(fdiv(moltenvk, EntryMath::Precise)
         .expect("a float operator")
         .contains(&PrecisionNote::DeviceArithmetic));
-    let mut policy = DevicePolicy::default();
-    policy.float_maths = FloatMathsPolicy::Native;
-    policy.nan_and_min_max = NanMinMaxPolicy::Native;
-    let native = device_under("lavapipe", policy);
-    policy.nan_and_min_max = NanMinMaxPolicy::Exact;
-    let metal_nans = device_under("lavapipe", policy);
-    policy.float_maths = FloatMathsPolicy::Exact;
-    let exact = device_under("lavapipe", policy);
-    for (p, notes) in [
-        (
+    let native = device_under("lavapipe", DevicePolicy::default());
+    assert_eq!(
+        PrecisionNote::of_float_operator(
+            BinOp::FDiv,
+            FloatWidth::F32,
+            FastMath::NONE,
             native.profile(),
-            BTreeSet::from([
-                PrecisionNote::NativeDivision,
-                PrecisionNote::NativeNanEncoding,
-            ]),
+            EntryMath::Precise
         ),
-        (
-            metal_nans.profile(),
-            BTreeSet::from([PrecisionNote::NativeDivision]),
-        ),
-        (exact.profile(), BTreeSet::new()),
-    ] {
-        assert_eq!(
-            PrecisionNote::of_float_operator(
-                BinOp::FDiv,
-                FloatWidth::F32,
-                FastMath::NONE,
-                p,
-                EntryMath::Precise
-            ),
-            Some(notes)
-        );
-    }
+        Some(BTreeSet::from([
+            PrecisionNote::DeviceDenormals,
+            PrecisionNote::NativeDivision,
+            PrecisionNote::NativeNanEncoding,
+        ]))
+    );
     assert_eq!(
         PrecisionNote::of_float_operator(
             BinOp::Add,
@@ -1435,10 +1374,16 @@ fn the_precision_contract_names_each_float_operations_notes() {
     };
     let notes = PrecisionNote::of_math_call(tanh, fast, lavapipe, EntryMath::Fast)
         .expect("a float function");
-    assert!(notes.contains(&PrecisionNote::DeviceArithmetic));
+    assert!(
+        notes.contains(&PrecisionNote::NativeTranscendentals),
+        "{notes:?}"
+    );
     let notes = PrecisionNote::of_math_call(tanh, fast, moltenvk, EntryMath::Fast)
         .expect("a float function");
-    assert!(notes.is_empty(), "{notes:?}");
+    assert!(
+        notes.contains(&PrecisionNote::DeviceTranscendentals),
+        "{notes:?}"
+    );
 }
 
 /// A render pipeline with a signed-integer color attachment compiles its fragment function with the
@@ -1527,9 +1472,9 @@ fn a_signed_integer_attachment_compiles_the_fragment_for_it() {
 /// its center varyings where Vulkan shades, is refused as needing the input. A pipeline of one
 /// sample keeps the fragment's common-path key. `moltenvk-m3`, whose `InterpolateAtOffset` reads
 /// off the pixel center, reads the center varyings at the pixel center itself, as Metal does, so
-/// its pipeline is as lavapipe's. At MoltenVK 1.4.0, not measured so, the key is the same and the
-/// sample-rate function's center varyings have no pixel form: the pipeline is refused naming the
-/// property it lacks, compiled under the input or not.
+/// its pipeline is as lavapipe's. As the Apple8 family under macOS 27 (`deviceID` 0x1B00_0208), not
+/// measured so, the key is the same and the sample-rate function's center varyings have no pixel
+/// form: the pipeline is refused naming the property it lacks, compiled under the input or not.
 #[test]
 fn a_multisampled_pipeline_compiles_the_fragment_for_it() {
     let Some(bc) = fixture("multisample") else {
@@ -1552,23 +1497,23 @@ fn a_multisampled_pipeline_compiles_the_fragment_for_it() {
         mantissa: 10,
         signed: true,
     }); 4];
-    // MoltenVK 1.4.0 as its `driverVersion` encodes it.
-    const MOLTENVK_1_4_0: u32 = 10400;
+    // The Apple8 family under macOS 27, as MoltenVK's `deviceID` encodes it.
+    const APPLE8_MACOS_27: u32 = 0x1B00_0208;
     for (stem, release) in [
         ("moltenvk-m3", None),
-        ("moltenvk-m3", Some(MOLTENVK_1_4_0)),
+        ("moltenvk-m3", Some(APPLE8_MACOS_27)),
         ("lavapipe", None),
     ] {
         let dev = match release {
             None => device(stem),
-            Some(version) => {
+            Some(device_id) => {
                 let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("../metal2vulkan-validation/profiles")
                     .join(format!("{stem}.json"));
                 let text = std::fs::read_to_string(&path).expect("profile");
                 let mut desc =
                     DeviceDescription::from_khronos_json(&text, None).expect("description");
-                desc.driver_version = version;
+                desc.device_id = device_id;
                 Device::new(desc, DevicePolicy::default()).expect("device")
             }
         };

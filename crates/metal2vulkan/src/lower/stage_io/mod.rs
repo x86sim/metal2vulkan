@@ -12,8 +12,12 @@
 //! - User interface variables (vertex attributes, varyings, color outputs) carry a relocatable
 //!   `Location` keyed by a [`VaryingKey`] whose role the artifact states
 //!   ([`crate::pipeline::stage_io::StageIo`]); link numbers them. Every one is 32-bit: integers are
-//!   declared `uint` (held zero-extended), narrow floats `float` (held widened), so no profile
-//!   needs `storageInputOutput16`. A 32-bit integer color output to a signed-integer attachment
+//!   declared `uint` (held zero-extended), narrow floats `float` (held widened), but a `half` color
+//!   output on a profile that enables `storageInputOutput16` and `shaderFloat16`, declared with
+//!   16-bit `float` lanes (`StageIo::half_outputs`) and stored by the exact conversion of the
+//!   `half` it holds, so the device receives the `half` the function returns, as Metal's attachment
+//!   does, and blends and converts it as its own `half` output. Only that output needs
+//!   `storageInputOutput16`. A 32-bit integer color output to a signed-integer attachment
 //!   (`LoweringInputs::signed_color_attachments`) is declared `int` and stored by `OpBitcast`; a
 //!   narrower one to such an attachment is `NotImplemented`.
 //! - Builtins map one to one (`vertex_id` → `VertexIndex`, `[[position]]` → `Position` /
@@ -44,8 +48,8 @@
 //!   macOS 27.0.1: lists, strips, lines, points, indirect draws). The varying's `VertexIndex` is a
 //!   draw's own only without indices: an indexed draw's primitives share vertices, so it runs in
 //!   the de-indexed form (`LoweringInputs::primitive_id_indices`), `index count` vertices from 0
-//!   that read their indices at the draw's index address as the indexed capture form does
-//!   ([`CapturedIndex`]), whose first vertex is 0. A vertex function that writes memory is
+//!   that read their indices at the draw's index address ([`CapturedIndex`]), whose first vertex
+//!   is 0. A vertex function that writes memory is
 //!   refused there (it would run once per index), and so are the draws the binder cannot run
 //!   so (`NotImplemented(PrimitiveId)`). A draw of one of Metal's private primitive types in the
 //!   private list form (`LoweringInputs::private_list`) runs its list's positions from its first
@@ -108,8 +112,9 @@
 //! flips y with a negative viewport) and their depth and stencil modes.
 //!
 //! A vertex function's position is decorated `Invariant`, `[[invariant]]` in Metal or not: every
-//! pipeline that draws a vertex function computes its position the same way, so the tile reach's
-//! capture of a draw's positions holds the positions the draw rasterizes.
+//! pipeline that draws a vertex function computes its position the same way, so a draw run
+//! through more than one variant of its pipeline (each color group's) rasterizes the same
+//! positions in each.
 //!
 //! A fragment function compiled for a render pipeline that rasterizes more than one sample
 //! (`LoweringInputs::multisampled`) reads what Metal reads at the pixel center in every invocation
@@ -146,7 +151,6 @@
 //! the function), and the interface variables and execution modes ([`declare`]).
 
 pub(crate) mod color_write;
-pub(crate) mod depth16;
 pub(crate) mod extended_color;
 pub mod fetch;
 mod plan;
@@ -194,8 +198,9 @@ pub enum IoObject {
         numeric: IoNumeric,
         components: u8,
         deco: IoDecor,
-        /// Declared as 16-bit `half` lanes: a color output the function writes as the bits of
-        /// the half Metal stores (`color_write::half_output`).
+        /// Declared with 16-bit `float` lanes: a `half` color output on a device that enables
+        /// `storageInputOutput16` (`plan::half_variable`), stored by the conversion of the `half` it
+        /// holds widened, exact. Every other user variable is 32-bit.
         half: bool,
     },
     /// A builtin variable.
@@ -254,11 +259,12 @@ pub enum Source {
     /// `shaderDrawParameters`: the lane of `PushField::BaseVertexInstance` that holds the draw's
     /// `base`, into an integer of this form.
     DrawBase { base: DrawBase, form: Form },
-    /// A vertex function's `[[vertex_id]]` in the indexed capture form: the vertex its index
-    /// names ([`CapturedIndex`]), into an integer of this form.
+    /// A vertex function's `[[vertex_id]]` in the de-indexed or private list form: the vertex its
+    /// index names ([`CapturedIndex`]), into an integer of this form.
     CapturedVertex(Form),
-    /// A vertex function's `[[base_vertex]]` in the indexed capture form: the draw's base vertex,
-    /// lane 3 of `PushField::CaptureLayout`, into an integer of this form.
+    /// A vertex function's `[[base_vertex]]` in the de-indexed or private list form: the draw's
+    /// base vertex, lane 3 of `PushField::CaptureLayout` (the word before the private list),
+    /// into an integer of this form.
     CapturedBaseVertex(Form),
     /// A merged draw's vertex function's `[[vertex_id]]`, `[[instance_id]]`, `[[base_vertex]]` or
     /// `[[base_instance]]` (`LoweringInputs::merged_draws`): its corner's command's, which the
@@ -269,12 +275,6 @@ pub enum Source {
     /// the variable, declared `Flat`, read as Metal's interpolation returns such a value
     /// ([`metal_interpolated_constant`]).
     Uniform(Link),
-    /// A fixed-function vertex attribute of a narrow-float Metal format (a `half` format, or
-    /// `FloatRG11B10`; `VertexFetch::FixedFunction`'s `narrow_float`) read as `float`: the
-    /// variable, with Metal's canonical NaN where the device's own widening of the field left a
-    /// NaN, whose payload and sign Metal's fetch drops (`nan::canonical_on_bits`). Every finite,
-    /// zero, subnormal and infinite code the widening delivers passes through.
-    WidenedAttribute(Link),
     /// A fragment function's `[[primitive_id]]` under `LoweringInputs::quad_primitive_ids`:
     /// Vulkan's `PrimitiveId` (the variable) shifted right by one, the quad of the list's
     /// triangle, as Metal counts one primitive a quad of its private quads and quad strip.
@@ -406,17 +406,13 @@ pub struct StageIoPlan {
     /// interface parameter, one fetch per pulled attribute, the output stores, and the roundings of
     /// color outputs.
     pub words: u64,
-    /// How a fragment function writes the lanes of each color attachment's output it does not
-    /// leave to the device whole (`color_write`), through an output variable or in the storage
-    /// form: each rounded to the code Metal stores, or, where the device is measured to convert
-    /// it as Metal does, its NaN chosen.
-    pub rounded: BTreeMap<u32, [Option<crate::lower::arith::color_write::Lane>; 4]>,
-    /// The color attachments whose output the function writes as the bits of the half Metal
-    /// stores, through a 16-bit output variable (`color_write::half_output`).
-    pub halves: BTreeSet<u32>,
+    /// The lanes of each color attachment's output a fragment function rounds itself
+    /// (`color_write`), through an output variable or in the storage form: each by its rule, a
+    /// half-float channel's under `TextureWriteRoundingMode::NearestEven`.
+    pub rounded: BTreeMap<u32, [Option<crate::pipeline::lower_inputs::ChannelWrite>; 4]>,
     /// The measured driver deviations, as their properties, a fragment function's color writes
-    /// rely on: channels written as computed because the device converts them as Metal does
-    /// (`color_write`). The module requires them.
+    /// rely on: channels that record no device conversion because the device converts them as
+    /// Metal does (`color_write`). The module requires them.
     pub color_properties: BTreeSet<crate::device::requirements::VkProperty>,
     /// The extended-range color attachments whose `float` or `half` output each return stores
     /// as the raw texel Metal stores (`extended_color::encode`), with the form each is held in
@@ -430,10 +426,6 @@ pub struct StageIoPlan {
     /// A fragment function's depth output, which each return gives Metal's answer
     /// (`clamp_depth`).
     pub depth_clamp: Option<DepthClamp>,
-    /// A fragment function that returns no depth, compiled under
-    /// `LoweringInputs::depth16_codes`: the `FragDepth` output and `FragCoord` input objects its
-    /// entry stores the depth Metal stores for the fragment through ([`depth16`]).
-    pub depth16: Option<Depth16Store>,
     /// The render pipeline's private masks a fragment function applies itself
     /// (`LoweringInputs::sample_mask`), which each return ANDs into the function's own
     /// `[[sample_mask]]` output or stores as it.
@@ -465,12 +457,9 @@ pub struct StageIoPlan {
     /// A vertex function compiled under `LoweringInputs::window_depth_varying` writes its
     /// position's window depth to a varying ([`WindowDepth`]).
     pub window_depth: Option<WindowDepth>,
-    /// A vertex function compiled under `LoweringInputs::captured_positions` writes each
-    /// vertex's capture record ([`Capture`]).
-    pub capture: Option<Capture>,
-    /// A vertex function compiled in the indexed capture form (`CaptureForm::Indexed`) reads its
-    /// vertex from the draw's index buffer ([`CapturedIndex`]): planned where the function reads
-    /// it (`[[vertex_id]]`, a per-vertex attribute, or its record's restart flag).
+    /// A vertex function compiled in the de-indexed or private list form reads its vertex from
+    /// the draw's indices ([`CapturedIndex`]): planned where the function reads it
+    /// (`[[vertex_id]]`, a per-vertex attribute, `[[base_vertex]]` or the primitive ID).
     pub captured_index: Option<CapturedIndex>,
     /// A vertex function compiled under `LoweringInputs::merged_draws` finds its corner's command
     /// at entry ([`MergedRead`]).
@@ -531,7 +520,7 @@ pub enum FirstVertex {
     /// indirect one's from its arguments read on the CPU).
     Push,
     /// Vertex 0: the de-indexed form draws an indexed draw's indices as `index count` vertices
-    /// from 0 (`LoweringInputs::primitive_id_indices`), as the indexed capture form does.
+    /// from 0 (`LoweringInputs::primitive_id_indices`).
     Zero,
 }
 
@@ -555,36 +544,14 @@ pub struct WindowDepth {
 /// entry, two extracts, the division, and the store.
 const WINDOW_DEPTH_WORDS: u64 = 40;
 
-/// How a vertex function compiled under `LoweringInputs::captured_positions` writes its capture
-/// record at each return: the value it returns to its `Position` object (`position`, Metal's
-/// clip position, before any compensation) and to its own `PointSize` object (`point_size`; 1.0
-/// where it writes none), and the restart flag (the indexed form's raw index is its type's
-/// all-ones value, [`CapturedIndex`]; 0 in the vertices form), stored as one record of
-/// [`CAPTURE_RECORD_BYTES`] at its slot from `PushField::CaptureAddress`. The slot is `p +
-/// (InstanceIndex - first instance) · vertex count` from `PushField::CaptureLayout`, `p` being
-/// `VertexIndex` less the first vertex in the vertices form and `VertexIndex` itself in the
-/// indexed form (`vertex` and `instance` are the two input builtins' objects), in 64 bits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Capture {
-    pub position: usize,
-    pub point_size: Option<usize>,
-    pub vertex: usize,
-    pub instance: usize,
-}
-
-/// The bytes of one capture record: the clip position's four `f32`s at 0, the point size's
-/// `f32` at 16, the restart flag's `u32` at 20, and words 6 and 7 reserved (unwritten).
-pub(crate) const CAPTURE_RECORD_BYTES: u64 = 32;
-
-/// How a vertex function compiled in the indexed capture form (`CaptureForm::Indexed`) reads its
-/// vertex: its stream position `p = VertexIndex` (`vertex` is the input builtin's object; the
-/// capture draw starts at vertex 0) names the raw index of type `ty` at
-/// `PushField::CaptureIndexAddress + p · size`, read once at entry (`u16`: from the aligned word
-/// that holds it, shifted by its address's bit 1), and the vertex is the raw index plus the
-/// layout's base vertex (lane 3), wrapping as `u32`s. Where the draw restarts (lane 0 of
-/// `PushField::CaptureLayout` is not 0: a line or triangle strip) and the raw index is the type's
-/// all-ones value, the invocation stores its record's restart flag alone and returns before any
-/// fetch or instruction of the body, as Metal shades no vertex there.
+/// How a vertex function compiled in the primitive ID's de-indexed form
+/// (`LoweringInputs::primitive_id_indices`) reads its vertex: its stream position
+/// `p = VertexIndex` (`vertex` is the input builtin's object; the draw starts at vertex 0) names
+/// the raw index of type `ty` at `PushField::CaptureIndexAddress + p · size`, read once at entry
+/// (`u16`: from the aligned word that holds it, shifted by its address's bit 1), and the vertex is
+/// the raw index plus the layout's base vertex (lane 3 of `PushField::CaptureLayout`), wrapping
+/// as `u32`s. The draw is a list or points: a strip, which Metal restarts at the all-ones index,
+/// does not run so (`bind::graphics`).
 ///
 /// In the private list form (`LoweringInputs::private_list`, `first` is the draw's first vertex)
 /// the draw runs its list from `first` without indices: the raw index, a `u32`, lies at
@@ -602,16 +569,8 @@ pub struct CapturedIndex {
 /// The words a vertex function's index read adds: its input builtin's variable, decorations and
 /// interface entry, its load, the layout's extract, the 64-bit address arithmetic, the device
 /// place (its block and pointer types, conversion and access chain), the load, a `u16`'s
-/// alignment and shift, the base vertex's extract and add, and the restart test, its record
-/// address and the selection that returns at a strip's restart index (measured 186 for `u32` and
-/// 224 for `u16` on `tests::engine_vertex_capture`'s function).
+/// alignment and shift, and the base vertex's extract and add (at most 224, a `u16` read's).
 pub(super) const CAPTURED_INDEX_WORDS: u64 = 400;
-
-/// The words a vertex function's capture adds: the two input builtins' variables, decorations
-/// and interface entries, their loads, the layout's extracts, the slot's 64-bit arithmetic, the
-/// three device places (their block and pointer types, conversions and access chains), and the
-/// three stores (measured 246 to 259 on `tests::engine_vertex_capture`'s functions).
-const CAPTURE_WORDS: u64 = 300;
 
 /// Plan an emulated post-tessellation vertex function's primitive ID output under
 /// `LoweringInputs::primitive_id_varying`: the index of its object, the flat `uint` varying of
@@ -651,21 +610,6 @@ pub struct DepthClamp {
     pub object: usize,
     pub clamps: bool,
     pub range: bool,
-    /// Under `LoweringInputs::depth16_codes`, each return clamps the depth to `[0, 1]` and writes
-    /// it as Metal's `Depth16Unorm` code ([`depth16::code_depth`]).
-    pub codes: bool,
-}
-
-/// How a fragment function that returns no depth stores the depth Metal stores for the fragment
-/// under `LoweringInputs::depth16_codes` ([`depth16`]): at entry, its `FragDepth` output object
-/// (`depth`) takes [`depth16::biased_depth`] of its `FragCoord` input object's (`coord`) depth and
-/// `PushField::DepthBias`, bounded by that depth on the bias's side where it is known (`raises`,
-/// `LoweringInputs::depth16_bias_raises`, [`depth16::side_bounded`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Depth16Store {
-    pub depth: usize,
-    pub coord: usize,
-    pub raises: Option<bool>,
 }
 
 /// How a vertex function compiled under `LoweringInputs::viewport_compensation` stores its
@@ -1183,15 +1127,12 @@ fn metal_interpolated_constant(
 /// come after it in program order and never reach it, as Metal's attribute is fetched before its
 /// function runs.
 pub fn emit_entry(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>) -> BResult<()> {
-    // The indexed capture form's raw index, read once in the first block, where it dominates
-    // every use, and a strip's restart index's return before the body.
+    // The de-indexed or private list form's raw index, read once in the first block, where it
+    // dominates every use, and the private list form's base vertex.
     if let Some(c) = cx.plan.families.stage_io.captured_index {
-        let raw = cx.captured_index(fb)?;
-        match c.first {
-            Some(_) => {
-                cx.listed_base(fb)?;
-            }
-            None => skip_restart(cx, fb, c, raw)?,
+        cx.captured_index(fb)?;
+        if c.first.is_some() {
+            cx.listed_base(fb)?;
         }
     }
     // A merged draw's vertex finds its corner's command before the body, which every read of the
@@ -1231,7 +1172,6 @@ pub fn emit_entry(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>) -> BResult<
             | Source::CapturedBaseVertex(_)
             | Source::Merged { .. }
             | Source::Uniform(_)
-            | Source::WidenedAttribute(_)
             | Source::QuadPrimitive(_) => None,
         })
         .collect();
@@ -1241,22 +1181,6 @@ pub fn emit_entry(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>) -> BResult<
         };
         let x = fetch::emit(cx, fb, &read)?;
         cx.hold(v, x);
-    }
-    // The depth Metal stores for the fragment, in the first block, where the whole quad runs for
-    // the derivatives and the store dominates every return.
-    if let Some(d) = cx.plan.families.stage_io.depth16 {
-        let coord = global(cx, d.coord)?;
-        let coord = fb.module().global_value(coord)?;
-        let coord = fb.load(coord, MemAccess::default())?;
-        let z = fb.composite_extract(coord, &[2])?;
-        let bias = cx.push_field(fb, PushField::DepthBias)?;
-        let mut stored = depth16::biased_depth(fb, z, bias)?;
-        if let Some(raises) = d.raises {
-            stored = depth16::side_bounded(fb, stored, z, raises)?;
-        }
-        let out = global(cx, d.depth)?;
-        let out = fb.module().global_value(out)?;
-        fb.store(out, stored, MemAccess::default())?;
     }
     Ok(())
 }
@@ -1340,12 +1264,6 @@ pub fn param_value(
             let x = placed(fb, &link, x)?;
             let x = metal_interpolated_constant(fb, link.form, x)?;
             return narrow::round(fb, link.form, x);
-        }
-        Some(Source::WidenedAttribute(link)) => {
-            let p = pointer(cx, fb, &link)?;
-            let x = fb.load(p, MemAccess::default())?;
-            let x = crate::lower::arith::nan::canonical_on_bits(fb, link.form, x)?;
-            return to_lowered(cx, fb, &link, x);
         }
         Some(Source::QuadPrimitive(link)) => {
             let p = pointer(cx, fb, &link)?;
@@ -1665,7 +1583,6 @@ pub fn emit_return(
     let compensation = plan.compensation;
     let depth_clamp = plan.depth_clamp;
     let window_depth = plan.window_depth;
-    let capture = plan.capture;
     let primitive_id = plan.primitive_id;
     // The private masks: the pixel's ANDed into the function's own `[[sample_mask]]` output
     // where this return stores one, else stored as that output.
@@ -1691,17 +1608,8 @@ pub fn emit_return(
                 Some(_) => Some(selected_viewport(cx, fb, x, returned, &outputs)?),
                 None => None,
             };
-            // The capture record's position and point size, as the function returns them.
-            let (mut clip, mut size) = (None, None);
             for o in &outputs {
                 let part = output_part(cx, fb, x, returned, o)?;
-                if let Some(c) = capture {
-                    if c.position == o.link.object {
-                        clip = Some(part);
-                    } else if c.point_size == Some(o.link.object) {
-                        size = Some(part);
-                    }
-                }
                 let part =
                     match point_size_object(&cx.plan.families.stage_io.objects, o.link.object) {
                         true => metal_point_size(fb, part)?,
@@ -1718,12 +1626,7 @@ pub fn emit_return(
                             true => Some(cx.push_field(fb, PushField::DepthClampRange)?),
                             false => None,
                         };
-                        let clamped =
-                            clamp_depth(fb, part, kill, d.clamps || d.range || d.codes, range)?;
-                        match d.codes {
-                            true => depth16::code_depth(fb, clamped)?,
-                            false => clamped,
-                        }
+                        clamp_depth(fb, part, kill, d.clamps || d.range, range)?
                     }
                     None => part,
                 };
@@ -1739,9 +1642,6 @@ pub fn emit_return(
                     None => part,
                 };
                 store(cx, fb, &o.link, part)?;
-            }
-            if let (Some(c), Some(clip)) = (capture, clip) {
-                store_capture(cx, fb, c, clip, size)?;
             }
             for s in &seconds {
                 let first = match returned {
@@ -1821,8 +1721,7 @@ fn point_size_object(objects: &[IoObject], object: usize) -> bool {
 /// The point size `size` (an `f32`) a vertex or mesh function stores to `PointSize`, as Metal
 /// draws it: [`METAL_POINT_SIZE_LIMIT`] where `size` is past it (an infinity too), `size` itself
 /// otherwise. A NaN fails the ordered comparison and is stored as written: Metal's answer for a
-/// NaN, a negative or a denormal size is not measured (the tile reach reference flags them
-/// unmeasured, `bind::tile_reach`).
+/// NaN, a negative or a denormal size is not measured.
 pub(crate) fn metal_point_size(fb: &mut FunctionBuilder<'_>, size: SValue) -> BResult<SValue> {
     let f32_ = fb.module().ty(SType::Float { width: 32 })?;
     let limit = fb.module().constant(Constant::Scalar {
@@ -1897,193 +1796,9 @@ fn store_primitive_id(
     store(cx, fb, &link, id)
 }
 
-/// Store vertex capture record `c` ([`Capture`]): the clip position `clip` and the point size
-/// `size` (1.0 where the function writes none) at the vertex's slot from
-/// `PushField::CaptureAddress`, its address and slot in 64 bits. Words 5 to 7 are left unwritten.
-fn store_capture(
-    cx: &mut EmitCx<'_>,
-    fb: &mut FunctionBuilder<'_>,
-    c: Capture,
-    clip: SValue,
-    size: Option<SValue>,
-) -> BResult<()> {
-    let u64_ = fb.module().ty(SType::Int {
-        width: 64,
-        signed: false,
-    })?;
-    let f32_ = fb.module().ty(SType::Float { width: 32 })?;
-    let vec4 = fb.module().ty(SType::Vector { elem: f32_, len: 4 })?;
-    let k64 = |fb: &mut FunctionBuilder<'_>, x: u64| -> BResult<SValue> {
-        let k = fb.module().constant(Constant::Scalar {
-            ty: u64_,
-            bits: ConstBits(x),
-        })?;
-        fb.module().const_value(k)
-    };
-    let record = record_address(cx, fb, c)?;
-    let place = fb.device_place(record, vec4)?;
-    let aligned = |n| MemAccess {
-        aligned: Some(n),
-        ..MemAccess::default()
-    };
-    fb.store(place, clip, aligned(16))?;
-    let size = match size {
-        Some(size) => size,
-        None => {
-            let one = fb.module().constant(Constant::Scalar {
-                ty: f32_,
-                bits: ConstBits(u64::from(1.0f32.to_bits())),
-            })?;
-            fb.module().const_value(one)?
-        }
-    };
-    let sixteen = k64(fb, 16)?;
-    let at = fb.binary(BinOp::IAdd, record, sixteen)?;
-    let place = fb.device_place(at, f32_)?;
-    fb.store(place, size, aligned(4))?;
-    // The restart flag: the indexed form's raw index is its type's all-ones value.
-    let u32_ = fb.module().ty(SType::Int {
-        width: 32,
-        signed: false,
-    })?;
-    let k32 = |fb: &mut FunctionBuilder<'_>, x: u32| crate::memory::leaf::k32(fb, x);
-    let flag = match cx.plan.families.stage_io.captured_index {
-        Some(c) => {
-            let raw = cx.captured_index(fb)?;
-            let all = k32(fb, all_ones(c.ty))?;
-            let restart = fb.binary(BinOp::IEqual, raw, all)?;
-            let one = k32(fb, 1)?;
-            let zero = k32(fb, 0)?;
-            fb.select(restart, one, zero)?
-        }
-        None => k32(fb, 0)?,
-    };
-    let twenty = k64(fb, 20)?;
-    let at = fb.binary(BinOp::IAdd, record, twenty)?;
-    let place = fb.device_place(at, u32_)?;
-    fb.store(place, flag, aligned(4))
-}
-
-/// The address of capture record `c` of the invocation ([`Capture`]): `32 · slot` past
-/// `PushField::CaptureAddress`, `slot = p + (InstanceIndex - first instance) · vertex count` from
-/// `PushField::CaptureLayout`, where `p` is `VertexIndex` less the layout's first vertex in the
-/// vertices form, and `VertexIndex` itself in the indexed form, whose draw starts at vertex 0 (its
-/// layout's lane 0 says whether the draw restarts). The subtractions wrap as `u32`s; the rest is
-/// 64-bit.
-fn record_address(
-    cx: &mut EmitCx<'_>,
-    fb: &mut FunctionBuilder<'_>,
-    c: Capture,
-) -> BResult<SValue> {
-    let u64_ = fb.module().ty(SType::Int {
-        width: 64,
-        signed: false,
-    })?;
-    let layout = cx.push_field(fb, PushField::CaptureLayout)?;
-    let count = fb.composite_extract(layout, &[0, 1])?;
-    let first_instance = fb.composite_extract(layout, &[0, 2])?;
-    let load = |cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>, object| -> BResult<SValue> {
-        let g = global(cx, object)?;
-        let p = fb.module().global_value(g)?;
-        fb.load(p, MemAccess::default())
-    };
-    let vertex = load(cx, fb, c.vertex)?;
-    let instance = load(cx, fb, c.instance)?;
-    // The draw's vertex and instance, each from its first, wrapping as `u32`s.
-    let vertex = match cx.plan.families.stage_io.captured_index {
-        Some(_) => vertex,
-        None => {
-            let first_vertex = fb.composite_extract(layout, &[0, 0])?;
-            fb.binary(BinOp::ISub, vertex, first_vertex)?
-        }
-    };
-    let instance = fb.binary(BinOp::ISub, instance, first_instance)?;
-    let wide = |fb: &mut FunctionBuilder<'_>, x: SValue| fb.convert(ConvOp::UConvert, x, u64_);
-    let vertex = wide(fb, vertex)?;
-    let instance = wide(fb, instance)?;
-    let count = wide(fb, count)?;
-    let rows = fb.binary(BinOp::IMul, instance, count)?;
-    let slot = fb.binary(BinOp::IAdd, vertex, rows)?;
-    let bytes = fb.module().constant(Constant::Scalar {
-        ty: u64_,
-        bits: ConstBits(CAPTURE_RECORD_BYTES),
-    })?;
-    let bytes = fb.module().const_value(bytes)?;
-    let offset = fb.binary(BinOp::IMul, slot, bytes)?;
-    let base = cx.push_field(fb, PushField::CaptureAddress)?;
-    fb.binary(BinOp::IAdd, base, offset)
-}
-
-/// The indexed capture form's return at a strip's restart index: where the draw restarts (lane 0 of
-/// `PushField::CaptureLayout` is not 0) and the raw index `raw` is its type's all-ones value, Metal
-/// shades no vertex, so the invocation stores its record's restart flag (1, at byte 20; the
-/// record's other words are left as they were) where it has a record, and returns before any fetch
-/// or instruction of the body. A list or point draw shades that index as any other.
-fn skip_restart(
-    cx: &mut EmitCx<'_>,
-    fb: &mut FunctionBuilder<'_>,
-    c: CapturedIndex,
-    raw: SValue,
-) -> BResult<()> {
-    use crate::spirv::builder::constructs::{ArmEnd, ArmFn};
-    let k32 = |fb: &mut FunctionBuilder<'_>, x: u32| crate::memory::leaf::k32(fb, x);
-    let layout = cx.push_field(fb, PushField::CaptureLayout)?;
-    let restarts = fb.composite_extract(layout, &[0, 0])?;
-    let zero = k32(fb, 0)?;
-    let strip = fb.binary(BinOp::INotEqual, restarts, zero)?;
-    let all = k32(fb, all_ones(c.ty))?;
-    let at_restart = fb.binary(BinOp::IEqual, raw, all)?;
-    let skip = fb.binary(BinOp::LogicalAnd, strip, at_restart)?;
-    let flag = match cx.plan.families.stage_io.capture {
-        Some(record) => {
-            let u64_ = fb.module().ty(SType::Int {
-                width: 64,
-                signed: false,
-            })?;
-            let u32_ = fb.module().ty(SType::Int {
-                width: 32,
-                signed: false,
-            })?;
-            let record = record_address(cx, fb, record)?;
-            let twenty = fb.module().constant(Constant::Scalar {
-                ty: u64_,
-                bits: ConstBits(20),
-            })?;
-            let twenty = fb.module().const_value(twenty)?;
-            let at = fb.binary(BinOp::IAdd, record, twenty)?;
-            Some((fb.device_place(at, u32_)?, k32(fb, 1)?))
-        }
-        None => None,
-    };
-    let leave: ArmFn<'_, ()> = Box::new(move |fb, _| {
-        if let Some((place, one)) = flag {
-            fb.store(
-                place,
-                one,
-                MemAccess {
-                    aligned: Some(4),
-                    ..MemAccess::default()
-                },
-            )?;
-        }
-        fb.ret(None)?;
-        Ok(ArmEnd::Exits)
-    });
-    fb.if_(&mut (), skip, leave, None)?;
-    Ok(())
-}
-
-/// The all-ones index of `ty`, Metal's strip restart index.
-fn all_ones(ty: crate::metal::IndexType) -> u32 {
-    match ty {
-        crate::metal::IndexType::UInt16 => 0xffff,
-        crate::metal::IndexType::UInt32 => u32::MAX,
-    }
-}
-
-/// The raw index an indexed capture form's vertex reads ([`CapturedIndex`]), loaded in the open
-/// block: `PushField::CaptureIndexAddress + p · size` with `p = VertexIndex` (the capture draw
-/// starts at vertex 0), in 64 bits. A `u32` index is read where it lies (the address is a
+/// The raw index a de-indexed or private list form's vertex reads ([`CapturedIndex`]), loaded in
+/// the open block: `PushField::CaptureIndexAddress + p · size` with `p = VertexIndex` (the
+/// de-indexed draw starts at vertex 0), in 64 bits. A `u32` index is read where it lies (the address is a
 /// multiple of 4); a `u16` one from the aligned word that holds it, shifted right by 16 where its
 /// address's bit 1 is set, and masked to 16 bits. [`EmitCx::captured_index`] reads it once where
 /// it dominates.
@@ -2092,7 +1807,7 @@ pub(crate) fn read_captured_index(
     fb: &mut FunctionBuilder<'_>,
 ) -> BResult<SValue> {
     let Some(c) = cx.plan.families.stage_io.captured_index else {
-        return Err(cx.fail("a capture index read without its plan"));
+        return Err(cx.fail("an index read without its plan"));
     };
     let u64_ = fb.module().ty(SType::Int {
         width: 64,
@@ -2149,8 +1864,8 @@ pub(crate) fn read_captured_index(
     }
 }
 
-/// The vertex an indexed capture form's function runs ([`CapturedIndex`]): its raw index plus
-/// the base vertex ([`captured_base_vertex`]), wrapping as `u32`s.
+/// The vertex a de-indexed or private list form's function runs ([`CapturedIndex`]): its raw
+/// index plus the base vertex ([`captured_base_vertex`]), wrapping as `u32`s.
 pub(super) fn captured_vertex(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
@@ -2283,8 +1998,7 @@ fn output_part(
             cx.plan.families.stage_io.extended.get(&color).copied(),
         ) {
             (Some(w), _) => {
-                let srgb = word_color::srgb_table(cx);
-                let word = word_color::encode(fb, w, (o.link.form, part), srgb)?;
+                let word = word_color::encode(fb, w, (o.link.form, part))?;
                 // A write of some of the word's channels over the attachment's input attachment.
                 match cx.plan.families.fragment.word_merges.get(&color).copied() {
                     Some(kept) => {
@@ -2293,7 +2007,7 @@ fn output_part(
                     None => word,
                 }
             }
-            (None, Some(e)) => extended_color::encode(cx, fb, e, o.link.form, part)?,
+            (None, Some(e)) => extended_color::encode(fb, e, o.link.form, part)?,
             (None, None) => color_write::round(cx, fb, color, o.link.form, part)?,
         },
         None => part,
@@ -2669,9 +2383,13 @@ fn nan_drop(cx: &mut EmitCx<'_>) -> BResult<Option<NanDrop>> {
 /// flushes denormals keeps a positive one and makes -0 and a negative one +0 alike. A positive NaN
 /// fails Metal's depth test, `Always` included: neither depth nor color is written and no sample
 /// counts; the invocation is dropped by `kill` ([`nan_drop`]), which drops the same, though Metal
-/// also runs the stencil's depth-fail operation; a device that clamps the depth itself stores a NaN
-/// as anything (ANV: 0, its color written), so every profile drops it. In a function looping over
-/// its covered samples the value passes unchanged. The selects run only where the plan `clamps`,
+/// also runs the stencil's depth-fail operation. The drop is capability on every profile: no device
+/// has a defined form, since Vulkan leaves a NaN depth undefined after its clamp and range step,
+/// with or without depth clamp ("Depth Clamping and Range Adjustment": "If zf is not in the range
+/// [zmin, zmax], then zf is undefined following this step", and a NaN lies in no range; only
+/// `depthClampZeroOne`, which no profile enables, keeps a float depth unchanged), and a device
+/// that clamps the depth itself stores a NaN as anything (ANV: 0, its color written). In a
+/// function looping over its covered samples the value passes unchanged. The selects run only where the plan `clamps`,
 /// the device storing the value unclamped; elsewhere its own clamp gives Metal's answers.
 ///
 /// Under `range`, `PushField::DepthClampRange`'s `[low, high]`, the value is then clamped to the
@@ -2771,9 +2489,11 @@ fn below_count(
     fb.select(below, index, zero)
 }
 
-/// The 32-bit element type of a user variable of class `numeric`.
-fn io_elem(mb: &mut ModuleBuilder, numeric: IoNumeric) -> BResult<TypeId> {
+/// The element type of a user variable of class `numeric`: 32-bit, but a 16-bit `float` where
+/// `half` (`IoObject::User::half`).
+fn io_elem(mb: &mut ModuleBuilder, numeric: IoNumeric, half: bool) -> BResult<TypeId> {
     match numeric {
+        IoNumeric::Float if half => mb.ty(SType::Float { width: 16 }),
         IoNumeric::Float => mb.ty(SType::Float { width: 32 }),
         IoNumeric::Uint => mb.ty(SType::Int {
             width: 32,
@@ -2788,14 +2508,27 @@ fn io_elem(mb: &mut ModuleBuilder, numeric: IoNumeric) -> BResult<TypeId> {
 
 /// Store output part `x` (in its lowered representation, which is the interface type, except a
 /// `bool`, carried as `uint` 1 or 0, a 32-bit integer declared `int`, whose bits are stored by
-/// `OpBitcast`, and a color output declared `half`, whose half's bits are stored) through `link`.
+/// `OpBitcast`, and a `half` declared 16-bit, stored by `OpFConvert` of the `f32` holding it,
+/// whose value is a `half`, so the conversion is exact) through `link`.
 fn store(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>, link: &Link, x: SValue) -> BResult<()> {
-    let half = matches!(
-        cx.plan.families.stage_io.objects.get(link.object),
-        Some(IoObject::User { half: true, .. })
-    );
-    let x = if half {
-        crate::lower::arith::color_write::half_bits(fb, link.form, x)?
+    let x = if let Some(IoObject::User {
+        numeric: IoNumeric::Float,
+        components,
+        half: true,
+        ..
+    }) = cx.plan.families.stage_io.objects.get(link.object)
+    {
+        let components = *components;
+        let elem = io_elem(fb.module(), IoNumeric::Float, true)?;
+        let ty = if components == 1 {
+            elem
+        } else {
+            fb.module().ty(SType::Vector {
+                elem,
+                len: components,
+            })?
+        };
+        fb.convert(ConvOp::FConvert, x, ty)?
     } else if bool_as_uint(cx, link) {
         let one = ops::splat(fb, uint_lanes(link.form), 1)?;
         let zero = ops::splat(fb, uint_lanes(link.form), 0)?;
@@ -2807,7 +2540,7 @@ fn store(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>, link: &Link, x: SVal
     }) = cx.plan.families.stage_io.objects.get(link.object)
     {
         let components = *components;
-        let elem = io_elem(fb.module(), IoNumeric::Sint)?;
+        let elem = io_elem(fb.module(), IoNumeric::Sint, false)?;
         let ty = if components == 1 {
             elem
         } else {
@@ -2874,10 +2607,7 @@ pub fn declare(
                 deco,
                 half,
             } => {
-                let elem = match half {
-                    true => mb.ty(SType::Float { width: 16 })?,
-                    false => io_elem(mb, *numeric)?,
-                };
+                let elem = io_elem(mb, *numeric, *half)?;
                 let ty = if *components == 1 {
                     elem
                 } else {

@@ -67,6 +67,48 @@
 //!   wrote; that copy back goes before the keep of a later command that writes through the
 //!   texture, since the merge after the keep takes only the words changed since it. The keeps'
 //!   scratch is the encoder's, one per texture and rectangle.
+//! - **Overwrites over logged pages** ([`ShadowCopies::logged`]: host pages whose consumer logs
+//!   every write to them, `dirty_pages.rs`). A command that replaces every texel of such a shadow
+//!   takes the merge instead of the plain copy back: its copy in (which moves only the rows the
+//!   log reports changed since the image's last copy, and every row where the log cannot say),
+//!   the keep, the command, and the merge, which stores only the words the command changed
+//!   against the keep. The bytes are Metal's: the copy in is a gated one, decided once the log
+//!   published the stamp the command buffer asked at its commit (`DirtyPages::wait`), so the image
+//!   and then the keep hold the host bytes as of the commit, every write before it (the CPU's
+//!   among them) included, and a word the merge leaves already holds the value the command wrote
+//!   there. A byte another writer writes after the commit is one the command also writes, a race
+//!   Metal leaves unordered. Over host pages with no log the image may lag the CPU's writes, and a
+//!   word the command writes with the image's stale value would keep the CPU's: there the copy
+//!   back stays a plain copy of every texel the command wrote.
+//!   Where the merge is cut to the texels' rows (its words are texels' bytes alone, none of the
+//!   bytes between rows or past the last texel), it stores whole 256-byte blocks
+//!   (`bind::ShadowMergeStores::Blocks`, `WorkCounts::shadow_merge_dispatches_in_blocks`): each
+//!   block holding a changed word as one store without gaps, a block with none not at all. That
+//!   too is Metal's: the command wrote every byte of every such block, as the plain copy back
+//!   wrote them all, so a word it left as the keep held it is stored as the merge reads it, the
+//!   same value but for another writer's write since the commit, which races the command's own.
+//!   The scratch of such a merge is kept again only for another command whose merge stores whole
+//!   blocks; one whose merge does not takes a merge of the words alone, after the blocks' merge.
+//! - **Stored attachments** ([`ShadowUse::tile_stores`]). A render pass that loads a color
+//!   attachment and stores it, and changes it only inside its draws' scissors
+//!   (`render/shadows.rs`: the rectangle [`ShadowUse::area`], inside the render area), merges
+//!   back in whole 256-byte blocks of the rectangle's rows too, over any merged-back bytes, logged
+//!   or not: each block holding a changed word as one store, a block with none not at all, and no
+//!   word outside the rectangle's rows (each widened to whole words). Metal's own store of such a
+//!   pass writes back every texel of each tile its draws reach, those no fragment changed among
+//!   them: on an M3 Max under macOS 27.0.1, a pass loading and storing a linear `RGBA8Unorm`
+//!   texture over a no-copy buffer and drawing one pixel rewrote the other 1023 texels of the
+//!   32x32 tile holding the pixel with the values it loaded, so a CPU thread writing every texel
+//!   over and over through the passes lost its writes to each of them in 157 to 229 of 300 passes,
+//!   and to no texel of any other tile, inside the render area or past it; a kernel writing the
+//!   same pixel lost none of them. So a CPU write to a texel such a pass leaves inside its render
+//!   area, made while the pass runs, is no write Metal keeps, and a block stored with the value
+//!   the merge reads there is as Metal's answer. A block can reach past the tiles the draws reach
+//!   (a 256-byte block of a row holds 64 such texels, two of those tiles), never past the
+//!   rectangle; and the merge undoes only a write made between its read of the block and its
+//!   store, a shorter window than a tile's from its load to its store. A use joined with another
+//!   that writes through the texture otherwise (a draw's write to it as a bound texture) stores
+//!   the words alone.
 //! - **Ordering.** A copy is a command of the encoder with uses of both the buffer's bytes and the
 //!   image, so the tracker orders it against the encoder's other commands and other encoders'
 //!   like any use: the texture and its buffer are one resource to it. In an encoder whose
@@ -163,6 +205,7 @@
 //!   copy in left it.
 
 use super::buffer::{Buffer, CallerMemory, WeakBuffer};
+use super::dirty_pages::{CopyInGate, ShadowLog};
 use super::error::{Error, RuntimeGap};
 use super::resource::ResourceKey;
 use super::rotated::{RotatedCopies, Turn};
@@ -713,6 +756,39 @@ impl ShadowCopies {
         matches!(self.target(), Some(ShadowTarget::Rotated { turn, .. }) if turn.loads_apart())
     }
 
+    /// Whether the texture is tracked and its truth lies in host pages a consumer logs the writes
+    /// to (`HostMemory::with_dirty_pages`): its copies in of every texel are gated
+    /// (`dirty_pages.rs`), so none is cut to a rectangle.
+    pub(super) fn logged(&self) -> bool {
+        let ShadowSource::Bytes {
+            buffer: ShadowBuffer::Rebound(buffer),
+            ..
+        } = &self.source
+        else {
+            return false;
+        };
+        let pages = || buffer.upgrade().and_then(|buffer| buffer.host_pages());
+        self.tracked && pages().is_some_and(|pages| pages.dirty().is_some())
+    }
+
+    /// Whether the rectangle `area` (`None` every texel) covers every texel of a one-region 2D
+    /// texture's image over a buffer's bytes, or is `None`.
+    pub(super) fn covers(&self, area: Option<[u32; 4]>) -> bool {
+        let Some([x0, y0, x1, y1]) = area else {
+            return true;
+        };
+        let regions = (self.target()).and_then(|target| target.image_regions(true));
+        let Some([region]) = regions else {
+            return false;
+        };
+        let (x, y) = (region.image_offset.x, region.image_offset.y);
+        let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y)) else {
+            return false;
+        };
+        let extent = region.image_extent;
+        x0 <= x && y0 <= y && x1 >= x + extent.width && y1 >= y + extent.height
+    }
+
     /// Whether `used` touches the texture's truth: its bytes, or its image's levels and layers.
     pub(super) fn meets(&self, used: &Use<ResourceKey>) -> bool {
         let (key, range) = self.truth();
@@ -799,6 +875,67 @@ impl ShadowCopies {
                 Some(regions.first().map_or(0, |region| region.buffer_offset))
             }
         }
+    }
+
+    /// Whether a merge's keep and changed copy ([`record_kept`](Self::record_kept),
+    /// [`record_out`](Self::record_out)) each write every one of the first `length` bytes of its
+    /// part: a heap's tiled texture's do, as they copy the staging buffer's span of the texture's
+    /// bytes whole (`HeapTiledCopies::record_out`), or the heap's.
+    pub(super) fn copies_out_whole(&self, length: u64) -> bool {
+        match &self.source {
+            ShadowSource::Bytes {
+                target: ShadowTarget::Tiled { staging, .. },
+                ..
+            } => staging.into.size >= length,
+            _ => false,
+        }
+    }
+
+    /// Whether a merge's keep right after this shadow's copy in, with no copy of the shadow
+    /// between, may copy the staging buffer that copy in filled
+    /// ([`record_kept_from_staging`](Self::record_kept_from_staging)): a heap's tiled texture's
+    /// whose moves give back each byte they took (`HeapTiledCopies::moves_bits`).
+    pub(super) fn keeps_from_staging(&self) -> bool {
+        matches!(
+            &self.source,
+            ShadowSource::Bytes {
+                target: ShadowTarget::Tiled { tiles, .. },
+                ..
+            } if tiles.moves_bits()
+        )
+    }
+
+    /// Record a merge's keep into `to` from `at` as a copy of the staging buffer, right after the
+    /// shadow's copy in filled it with the heap's bytes and moved them into the image
+    /// ([`keeps_from_staging`](Self::keeps_from_staging)): the bytes a keep's move out of the
+    /// image would leave there ([`record_kept`](Self::record_kept)), the texture's bytes from its
+    /// first, without the move. Nothing for any other shadow.
+    ///
+    /// # Safety
+    ///
+    /// As `record_out`'s, after a barrier that orders the copy after the copy in, and with no
+    /// command between them that writes the shadow or its staging buffer.
+    pub(super) unsafe fn record_kept_from_staging(
+        &self,
+        device: &Vk,
+        command_buffer: vk::CommandBuffer,
+        (to, at): (vk::Buffer, u64),
+    ) {
+        let ShadowSource::Bytes {
+            target: ShadowTarget::Tiled { staging, .. },
+            ..
+        } = &self.source
+        else {
+            return;
+        };
+        let region = vk::BufferCopy {
+            src_offset: staging.into.dst_offset,
+            dst_offset: at,
+            size: staging.into.size,
+        };
+        // SAFETY: the caller's contract; the staging buffer holds the texture's bytes from its
+        // start (`HeapTiledCopies::staging`), and `to` holds them from `at`.
+        unsafe { device.cmd_copy_buffer(command_buffer, staging.raw(), to, &[region]) };
     }
 
     /// Record a merge's keep of the shadow's texels into `to` from `at`, laid out as in the
@@ -926,6 +1063,40 @@ pub(super) enum Step<M> {
     /// After the command that wrote two ways, or in place of the next copy back, the bytes
     /// changed through the texture since the keep merged into the buffer's.
     Merge(M),
+}
+
+/// A shadow's copy in over host pages a consumer logs (`dirty_pages.rs`), left by its encoder
+/// to its batch's submission (`Deferred::GatedCopyIn`): the commit asks the log for a stamp, and
+/// the copy's regions are those the log says changed once that stamp is published, which only a
+/// recording after the commit can know. Recorded in a command buffer of its own between the
+/// encoder's, behind a barrier from everything before it and before one to everything after it,
+/// so it keeps its place among the encoder's commands.
+pub(super) struct GatedCopyIn {
+    copy: ShadowCopy,
+    gate: Arc<CopyInGate>,
+}
+
+impl GatedCopyIn {
+    /// `copy`, its regions decided by `gate`.
+    pub(super) fn new(copy: ShadowCopy, gate: Arc<CopyInGate>) -> GatedCopyIn {
+        GatedCopyIn { copy, gate }
+    }
+
+    /// Record it into `command_buffer`, its regions decided now.
+    ///
+    /// # Safety
+    ///
+    /// `command_buffer` is recording, outside a render pass; the copy's texture is live (its
+    /// encoder's command buffer holds it), its image in the `GENERAL` layout.
+    pub(super) unsafe fn record(&self, device: &Vk, command_buffer: vk::CommandBuffer) {
+        // SAFETY: the caller's.
+        unsafe {
+            Barrier::everything().record(device, command_buffer);
+            let gate = Some(Arc::clone(&self.gate));
+            self.copy.record_gated(device, command_buffer, None, gate);
+            Barrier::everything().record(device, command_buffer);
+        }
+    }
 }
 
 /// One copy between a shadowed texture's buffer and its shadow.
@@ -1087,6 +1258,62 @@ fn image_copy_texels(region: &vk::ImageCopy) -> u64 {
 }
 
 impl ShadowCopy {
+    /// The log of a copy in of every texel of a tracked 2D texture's image straight from a
+    /// buffer over host pages a consumer logs (`dirty_pages.rs`), made or kept by `device`, and
+    /// the bytes of one texel: what may decide the copy's regions as its batch is submitted
+    /// ([`GatedCopyIn`]).
+    /// `None` for every other copy.
+    pub(super) fn gate_log(&self, device: &Device) -> Option<(Arc<ShadowLog>, u64)> {
+        let c = &self.copies;
+        let first = matches!(self.cause, Some(CopyCause::First));
+        if !matches!(self.step, Step::Into) || !c.covers(self.area) || !first || !c.tracked {
+            return None;
+        }
+        let ShadowSource::Bytes {
+            buffer: ShadowBuffer::Rebound(buffer),
+            target:
+                ShadowTarget::Image {
+                    regions,
+                    staging: None,
+                    texel: Some(texel),
+                    ..
+                },
+            ..
+        } = &c.source
+        else {
+            return None;
+        };
+        let buffer = buffer.upgrade()?;
+        let pages = buffer.host_pages()?;
+        let source = pages.dirty()?;
+        let contents = buffer.contents()?.as_ptr() as u64;
+        let (raw, at) = buffer.attached_at(0)?;
+        // The `VkBuffer`'s byte `v` lies at the host address `v + base`.
+        let base = contents.wrapping_sub(at);
+        let truth = copied_bytes(regions, *texel)?;
+        let log = device.shared().dirty.log(c, source, raw, base, truth)?;
+        Some((log, *texel))
+    }
+
+    /// The log of a copy back or merge of a shadow whose copies in a log decides, and the
+    /// `VkBuffer` bytes it writes (`dirty_pages.rs`): reported to the log as the shadow's own.
+    pub(super) fn written_log(&self, device: &Device) -> Option<(Arc<ShadowLog>, Range<u64>)> {
+        let c = &self.copies;
+        if !matches!(self.step, Step::Back | Step::Merge(_)) {
+            return None;
+        }
+        let ShadowSource::Bytes {
+            target: ShadowTarget::Image { regions, texel, .. },
+            ..
+        } = &c.source
+        else {
+            return None;
+        };
+        let log = device.shared().dirty.kept(c)?;
+        let bytes = copied_bytes(regions, (*texel)?)?;
+        Some((log, bytes))
+    }
+
     /// The dispatch that takes this copy where it is a copy back that dispatches
     /// (`shadow_copy_back.rs`): a one-slice 2D texture's image over a buffer's bytes, copied in
     /// place, with its integer view, of texels the copy moves, made on `device` over the buffer's
@@ -1355,6 +1582,38 @@ impl ShadowCopy {
         }
     }
 
+    /// Whether this keep may copy the staging buffer its texture's copy in just filled
+    /// ([`ShadowCopies::keeps_from_staging`]): a keep whose kept part a copy writes.
+    pub(super) fn keeps_from_staging(&self) -> bool {
+        matches!(&self.step, Step::Keep(merge) if merge.copied_kept_part().is_some())
+            && self.copies.keeps_from_staging()
+    }
+
+    /// Record this keep as a copy of its texture's staging buffer
+    /// ([`ShadowCopies::record_kept_from_staging`]), where it
+    /// [`keeps_from_staging`](Self::keeps_from_staging); any other copy as
+    /// [`record`](Self::record) records it.
+    ///
+    /// # Safety
+    ///
+    /// As `record`'s, right after its texture's copy in, with no copy of its shadow between.
+    pub(super) unsafe fn record_keep_from_staging(
+        &self,
+        device: &Vk,
+        command_buffer: vk::CommandBuffer,
+    ) {
+        if let Step::Keep(merge) = &self.step {
+            if let Some(to) = merge.copied_kept_part() {
+                // SAFETY: the caller's contract.
+                return unsafe {
+                    (self.copies).record_kept_from_staging(device, command_buffer, to)
+                };
+            }
+        }
+        // SAFETY: the caller's contract.
+        unsafe { self.record(device, command_buffer, None) }
+    }
+
     /// Record the copy into `command_buffer`, its staged rows back (where it has them) by `back`
     /// ([`staged_back`](Self::staged_back)).
     ///
@@ -1369,6 +1628,24 @@ impl ShadowCopy {
         device: &Vk,
         command_buffer: vk::CommandBuffer,
         back: Option<&RowCopies>,
+    ) {
+        // SAFETY: the caller's.
+        unsafe { self.record_gated(device, command_buffer, back, None) }
+    }
+
+    /// [`record`](Self::record), a copy in of a 2D texture's image straight from the buffer
+    /// recorded under `gate` where given: its regions decided now, as its batch is submitted
+    /// ([`GatedCopyIn`], `dirty_pages.rs`).
+    ///
+    /// # Safety
+    ///
+    /// As [`record`](Self::record).
+    pub(super) unsafe fn record_gated(
+        &self,
+        device: &Vk,
+        command_buffer: vk::CommandBuffer,
+        back: Option<&RowCopies>,
+        gate: Option<Arc<CopyInGate>>,
     ) {
         let c = &self.copies;
         let moves = self.moves.as_deref();
@@ -1613,6 +1890,20 @@ impl ShadowCopy {
                     device.cmd_copy_buffer(command_buffer, buffer, texels, &[staging.into]);
                     Barrier::everything().record(device, command_buffer);
                 }
+                if let Some(gate) = gate.filter(|_| staging.is_none()) {
+                    let mut chosen = Vec::new();
+                    gate.regions(&regions, &mut chosen);
+                    if !chosen.is_empty() {
+                        device.cmd_copy_buffer_to_image(
+                            command_buffer,
+                            texels,
+                            image,
+                            vk::ImageLayout::GENERAL,
+                            &chosen,
+                        );
+                    }
+                    return;
+                }
                 device.cmd_copy_buffer_to_image(
                     command_buffer,
                     texels,
@@ -1635,6 +1926,30 @@ impl ShadowCopy {
             }
         }
     }
+}
+
+/// The `VkBuffer` bytes `regions` copy, `texel` bytes a texel, from the first region's first byte
+/// to the last row's end; `None` for none, or a region of depth.
+fn copied_bytes(regions: &[vk::BufferImageCopy], texel: u64) -> Option<Range<u64>> {
+    let mut bytes: Option<Range<u64>> = None;
+    for region in regions {
+        let extent = region.image_extent;
+        if extent.depth > 1 || extent.width == 0 || extent.height == 0 {
+            return None;
+        }
+        let row = match region.buffer_row_length {
+            0 => extent.width,
+            row => row,
+        };
+        let pitch = u64::from(row) * texel;
+        let start = region.buffer_offset;
+        let end = start + u64::from(extent.height - 1) * pitch + u64::from(extent.width) * texel;
+        bytes = Some(match bytes {
+            Some(b) => b.start.min(start)..b.end.max(end),
+            None => start..end,
+        });
+    }
+    bytes
 }
 
 /// `region` (a one-level, one-slice texture's every texel, `texel` bytes each in the buffer) cut
@@ -1790,7 +2105,8 @@ impl Covered {
 /// Mark the shadows of `shadows` a command with `uses` replaces ([`ShadowUse::overwrites`]): it
 /// writes through the shadow, reads none of its texels, and writes every texel it holds inside
 /// the boxes `covered` ([`ShadowCopies::covered_by`]), so it takes no copy in and no keep, and
-/// its copy back moves the texels it wrote.
+/// its copy back moves the texels it wrote; but over logged host pages, a copy in, a keep and a
+/// merge ([`overwrites_unkept`]).
 pub(super) fn overwritten(
     shadows: &mut [ShadowUse],
     uses: &[Use<ResourceKey>],
@@ -1810,7 +2126,24 @@ pub(super) fn overwritten(
 /// ([`ShadowCopies::merges_back`]): kept and merged back (the module's rules), as a command that
 /// writes them two ways too ([`two_ways`]) is.
 fn merged_back(shadow: &ShadowUse) -> bool {
-    shadow.writes && !shadow.overwrites && shadow.copies.merges_back()
+    shadow.writes && !overwrites_unkept(shadow) && shadow.copies.merges_back()
+}
+
+/// Whether the merge after a command that writes through `shadow` and merges back, keeping the
+/// texels inside `kept` (`None` every texel), stores whole blocks where it is cut to the texels'
+/// rows (`shadow_merge.rs`): the command replaces every texel ([`ShadowUse::overwrites`], over
+/// logged pages, as [`merged_back`] takes it), or writes through it only by a render pass's
+/// stores of the tiles of its area ([`ShadowUse::tile_stores`]) and the keep is that area.
+fn stores_blocks(shadow: &ShadowUse, kept: Option<[u32; 4]>) -> bool {
+    shadow.overwrites || (shadow.tile_stores && kept.is_some() && kept == shadow.area)
+}
+
+/// Whether a command that replaces every texel of `shadow` ([`ShadowUse::overwrites`]) takes no
+/// copy in and no keep, its copy back a plain copy of the texels it wrote: every such shadow but
+/// one over logged host pages ([`ShadowCopies::logged`]), which is copied in, kept and merged back
+/// as a command that leaves texels in place is (the module's **Overwrites over logged pages**).
+fn overwrites_unkept(shadow: &ShadowUse) -> bool {
+    shadow.overwrites && !shadow.copies.logged()
 }
 
 /// Whether a command that uses the shadowed textures `shadows` and has `uses` writes the bytes
@@ -1876,15 +2209,17 @@ pub(super) fn copies_used<'a>(
             kept: false,
             area: None,
             loads: None,
+            tile_stores: false,
         });
     }
     shadows
 }
 
 /// Add `shadow` to `shadows`: once per shadowed texture, writing through it when either use
-/// writes (where both write, inside the rectangle bounding both areas), reading its texels inside
-/// the rectangle bounding where both read them (anywhere where either does not bound that), and
-/// overwriting it, or leaving its texels in place, only when both do.
+/// writes (where both write, inside the rectangle bounding both areas, and by tile stores alone
+/// only where both do), reading its texels inside the rectangle bounding where both read them
+/// (anywhere where either does not bound that), and overwriting it, or leaving its texels in
+/// place, only when both do.
 pub(super) fn join(shadows: &mut Vec<ShadowUse>, shadow: &ShadowUse) {
     match shadows
         .iter_mut()
@@ -1895,6 +2230,11 @@ pub(super) fn join(shadows: &mut Vec<ShadowUse>, shadow: &ShadowUse) {
                 (true, true) => bounding(other.area, shadow.area),
                 (false, true) => shadow.area,
                 (_, false) => other.area,
+            };
+            other.tile_stores = match (other.writes, shadow.writes) {
+                (true, true) => other.tile_stores && shadow.tile_stores,
+                (false, true) => shadow.tile_stores,
+                (_, false) => other.tile_stores,
             };
             other.loads = bounding(other.loads, shadow.loads);
             other.writes |= shadow.writes;
@@ -1908,6 +2248,7 @@ pub(super) fn join(shadows: &mut Vec<ShadowUse>, shadow: &ShadowUse) {
             kept: shadow.kept,
             area: shadow.area,
             loads: shadow.loads,
+            tile_stores: shadow.tile_stores,
         }),
     }
 }
@@ -2049,6 +2390,12 @@ pub(super) struct ShadowUse {
     /// its draws' scissors and read the attachment at their own pixel alone,
     /// `render/shadows.rs`); `None` for anywhere. Its copy in moves only those texels.
     pub(super) loads: Option<[u32; 4]>,
+    /// The command writes through the texture only as a render pass's color attachment it loads
+    /// and stores inside `area` (`render/shadows.rs`): Metal's own store of such a pass writes
+    /// back every texel of each tile its draws reach, those no fragment changed among them, so
+    /// its merge stores whole blocks of the rectangle's rows (the module's **Stored
+    /// attachments**).
+    pub(super) tile_stores: bool,
 }
 
 /// The rectangle bounding `a` and `b`, each `[x0, y0, x1, y1)`; `None` (anywhere) where either is.
@@ -2293,6 +2640,15 @@ impl ShadowCarry {
     pub(super) fn clear(&mut self) {
         self.entries.clear();
     }
+
+    /// The shadowed textures whose images it carries holding every texel of the truth, none
+    /// stale (`dirty_pages.rs`: what a command buffer's end leaves a later one's copy in).
+    pub(super) fn held_whole(&self) -> Vec<Arc<ShadowCopies>> {
+        (self.entries.iter())
+            .filter(|carried| carried.stale.is_none() && carried.copies.covers(carried.held))
+            .map(|carried| Arc::clone(&carried.copies))
+            .collect()
+    }
 }
 
 /// What a merge's scratch keeps of a shadow's texels (`shadow_merge.rs`): the rectangle
@@ -2300,12 +2656,34 @@ impl ShadowCarry {
 /// for every texel.
 pub(super) trait KeptArea {
     fn kept_area(&self) -> Option<[u32; 4]>;
+
+    /// Whether the scratch was made for a command whose merge stores whole blocks where it can
+    /// ([`stores_blocks`], `shadow_merge.rs`): only such a command's keep takes it again.
+    fn in_blocks(&self) -> bool {
+        false
+    }
 }
 
 impl KeptArea for Arc<ShadowMerge> {
     fn kept_area(&self) -> Option<[u32; 4]> {
         self.area()
     }
+
+    fn in_blocks(&self) -> bool {
+        ShadowMerge::in_blocks(self)
+    }
+}
+
+/// What a merge `ShadowSync::before` asks for is made for.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MergeFor {
+    /// A command that writes the bytes two ways ([`two_ways`]).
+    pub(super) two_ways: bool,
+    /// A command whose merge stores whole blocks where it is cut to the texels' rows
+    /// ([`stores_blocks`]): one that replaces every texel over logged pages
+    /// ([`overwrites_unkept`]), or a render pass that writes through the texture only by its
+    /// stores of the area's tiles ([`ShadowUse::tile_stores`]).
+    pub(super) blocks: bool,
 }
 
 impl<M: Clone + KeptArea> ShadowSync<M> {
@@ -2421,7 +2799,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
         &mut self,
         shadows: &[ShadowUse],
         uses: &[Use<ResourceKey>],
-        mut merge: impl FnMut(&ShadowCopies, bool, Option<[u32; 4]>) -> Result<M, Error>,
+        mut merge: impl FnMut(&ShadowCopies, MergeFor, Option<[u32; 4]>) -> Result<M, Error>,
     ) -> Result<Vec<ShadowCopy<M>>, Error> {
         // A copy back of an image's shadow would replace the other alias's writes, and only a
         // buffer's bytes laid out as the texture's are merged: such a command is refused before
@@ -2440,9 +2818,13 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
         let mut scratches = Vec::new();
         for (i, shadow) in shadows.iter().enumerate() {
             if two_ways(shadows, i, uses) {
+                let made_for = MergeFor {
+                    two_ways: true,
+                    blocks: false,
+                };
                 kept.push((
                     Arc::clone(&shadow.copies),
-                    merge(&shadow.copies, true, None)?,
+                    merge(&shadow.copies, made_for, None)?,
                 ));
             } else if merged_back(shadow) {
                 merged_kept.push(Arc::clone(&shadow.copies));
@@ -2453,14 +2835,24 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
                     .iter()
                     .find(|e| e.copies.shadow_key == shadow.copies.shadow_key)
                     .and_then(|e| e.scratch.as_ref());
+                // A scratch made for a command of the other kind (one whose merge stores whole
+                // blocks, or one whose does not) is merged and kept again in a new one: only such
+                // a command's merge stores whole blocks (`shadow_merge.rs`).
+                let same = |scratch: &M| scratch.in_blocks() == stores_blocks(shadow, writes);
                 let area = match scratch {
-                    Some(scratch) if holds(scratch.kept_area(), writes) => continue,
+                    Some(scratch) if holds(scratch.kept_area(), writes) && same(scratch) => {
+                        continue
+                    }
                     Some(scratch) => bounding(scratch.kept_area(), writes),
                     None => writes,
                 };
+                let made_for = MergeFor {
+                    two_ways: false,
+                    blocks: stores_blocks(shadow, area),
+                };
                 scratches.push((
                     Arc::clone(&shadow.copies),
-                    merge(&shadow.copies, false, area)?,
+                    merge(&shadow.copies, made_for, area)?,
                 ));
             }
         }
@@ -2507,13 +2899,16 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
             let two_ways = kept
                 .iter()
                 .any(|(copies, _)| copies.shadow_key == shadow.copies.shadow_key);
-            let overwrites = shadow.overwrites && !two_ways;
+            let overwrites = overwrites_unkept(shadow) && !two_ways;
             // The texels the command needs as the buffer holds them: those it reads, and those
             // it writes (which a copy back moves), where it bounds both and the copies are cut to
             // a rectangle; every texel where it writes through a shadow whose copies back move
             // every texel, or writes the bytes two ways, as the merge after it compares every
-            // texel the keep took.
-            let needs = match two_ways || !shadow.copies.cuts() {
+            // texel the keep took; and every texel of a shadow over logged host pages, whose copy
+            // in of every texel moves only the rows the log reports changed, and leaves the image
+            // holding every texel for the next command buffer's (`dirty_pages.rs`).
+            let whole = two_ways || !shadow.copies.cuts() || shadow.copies.logged();
+            let needs = match whole {
                 true => None,
                 false if shadow.writes && !shadow.copies.cuts_back() => None,
                 false if shadow.writes => bounding(shadow.loads, shadow.area),

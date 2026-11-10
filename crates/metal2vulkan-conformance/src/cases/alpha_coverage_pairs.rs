@@ -43,14 +43,16 @@
 //! On this Apple M3 Max, macOS 27.0.1, with a destination of 1 in every channel and a fragment of
 //! `(0.25, 0.5, 0.75, alpha)`:
 //!
-//! 1. **The coverage is `floor(alpha * rasterSampleCount)` samples.** The alpha sweep is what says
-//!    so and it is why the sweep is here rather than one alpha: at four samples an alpha of 0.5
-//!    covers two, 0.25 covers one, 0.75 covers three, 0 covers none and 1 covers four, read off the
-//!    resolve as five values 0x30 or more apart. The cell that pins `floor` against
-//!    round-to-nearest is the **one-sample** row — an alpha of 0.5 at one sample covers **no**
-//!    sample and the destination survives untouched, where rounding to nearest would have stored
-//!    the fragment. Neither the four-sample rows nor the one-sample row alone says which rule it
-//!    is; the pair does, and that is the sample-count cross.
+//! 1. **The coverage is `alpha * rasterSampleCount` samples where that is an integer, and at one
+//!    sample a pixel is covered only above an alpha of 1/2.** The alpha sweep is why the sweep is
+//!    here rather than one alpha: at four samples an alpha of 0.5 covers two, 0.25 covers one, 0.75
+//!    covers three, 0 covers none and 1 covers four, read off the resolve as five values 0x30 or
+//!    more apart. The **one-sample** row separates Metal's rule from rounding half up: an alpha of
+//!    0.5 at one sample covers **no** sample and the destination survives untouched, where
+//!    rounding half up would have stored the fragment. Between those points Metal's count depends
+//!    on the pixel (a 2x2 ordered dither at two and four samples), which this family's one pixel
+//!    cannot see: the validation lane `runtime_lane::alpha_coverage` reads it over 639 alphas a
+//!    count, and the model below is that rule at this family's pixel, `(0, 0)`.
 //! 2. **The alpha is read before the attachment's write mask.** A write mask that drops alpha
 //!    leaves the coverage exactly as the same alpha gives with the mask absent, and only the stored
 //!    alpha moves. A mask sweep cannot ask this and an alpha sweep cannot either.
@@ -80,7 +82,7 @@
 //! four-component output below full coverage, the one-sample row included. Two `a2c-on` rows do
 //! **not** move, and both are deliberate:
 //!
-//! - **`a2c-on-4-alpha-100`** — an alpha of 1 covers `floor(1 * 4) = 4` samples, which is every
+//! - **`a2c-on-4-alpha-100`** — an alpha of 1 covers all `1 * 4 = 4` samples, which is every
 //!   sample the rasterizer gave, so the field on and off store the same texel. It is the sweep's
 //!   endpoint and the proof that the top of the range is full coverage rather than a count the
 //!   suite never reached; it is **not** evidence that the field was read, and the rows below it
@@ -194,9 +196,10 @@ struct Row {
     /// The degrade notices a driver that is not Metal announced **for this row**, beside the one
     /// every row declares ([`crate::replay::shared_memory_notice`]).
     ///
-    /// A measured set, row by row, and not a rule fitted to the rows: the six sets below are what
-    /// the RTX 5080 Laptop (615.71.09) and llvmpipe (Mesa 26.2.4) printed, and every one of them
-    /// is a declaration at the notices site that moves no coverage and no texel.
+    /// A measured set, row by row, and not a rule fitted to the rows: the three sets below are what
+    /// the RTX 5080 Laptop (615.71.09) and llvmpipe (Mesa 26.2.4) printed, less the device's own
+    /// answers the suite declares for every case, and every one of them is a declaration at the
+    /// notices site that moves no coverage and no texel.
     notices: &'static [Degradation],
 }
 
@@ -218,95 +221,74 @@ impl Row {
     }
 }
 
-/// What a **four-sample** row with an alpha output and `alphaToCoverage` **on** announced: the
-/// coverage of a clipped edge split per sample (`clipped-coverage-split`), the device's own
-/// conversion into the attachment (`device-color-conversion`), the sample outputs written in a
-/// loop (`looped-sample-outputs`), the conversion rounded in the shader
-/// (`shader-color-conversion`) and the resolve done by a draw rather than the store
-/// (`shader-resolve`).
+/// What a **four-sample** row with an alpha output announced: the coverage of a clipped edge split
+/// per sample (`clipped-coverage-split`), the sample outputs written in a loop
+/// (`looped-sample-outputs`) and the resolve done by a draw rather than the store
+/// (`shader-resolve`), with `alphaToCoverage` on or off. With it on, the device's own conversion
+/// of the alpha into the attachment (`device-color-conversion`) and its own coverage of the alpha
+/// (`device-alpha-coverage`) fire too, which the suite declares for every case
+/// ([`crate::replay::NATIVE_NOTES`]).
 ///
-/// Measured on the RTX 5080 Laptop (615.71.09) for all eight such rows, each divergent on the
+/// Measured on the RTX 5080 Laptop (615.71.09) for all ten such rows, each divergent on the
 /// notices site and nothing else (replay-nvidia.log).
-const A2C_ON_MULTISAMPLE: &[Degradation] = &[
-    Degradation::ClippedCoverageSplit,
-    Degradation::DeviceColorConversion,
-    Degradation::LoopedSampleOutputs,
-    Degradation::ShaderColorConversion,
-    Degradation::ShaderResolve,
-];
-
-/// The same, with `alphaToCoverage` **off**: no alpha reaches the device's conversion, so
-/// `device-color-conversion` does not fire. Measured on the 5080 for both such rows.
-const A2C_OFF_MULTISAMPLE: &[Degradation] = &[
+const ALPHA_MULTISAMPLE: &[Degradation] = &[
     Degradation::ClippedCoverageSplit,
     Degradation::LoopedSampleOutputs,
-    Degradation::ShaderColorConversion,
     Degradation::ShaderResolve,
 ];
 
 /// A four-sample row whose fragment writes **no alpha**: nothing narrows the coverage, so neither
-/// the split nor the looped outputs fire, and what is left is the shader's conversion and the
-/// resolve. Measured on the 5080 and on llvmpipe for both such rows.
-const NO_ALPHA_MULTISAMPLE: &[Degradation] = &[
-    Degradation::ShaderColorConversion,
-    Degradation::ShaderResolve,
-];
+/// the split nor the looped outputs fire, and what is left is the resolve. Measured on the 5080 and
+/// on llvmpipe for both such rows.
+const NO_ALPHA_MULTISAMPLE: &[Degradation] = &[Degradation::ShaderResolve];
 
-/// A single-sample row with an alpha the device converts: no resolve, no sample loop. Measured on
-/// the 5080 and on llvmpipe for `a2c-on-1-alpha-50`.
-const SINGLE_CONVERTED: &[Degradation] = &[
-    Degradation::DeviceColorConversion,
-    Degradation::ShaderColorConversion,
-];
-
-/// A single-sample row our side converts in the shader and the device does not. Measured on the
-/// 5080 and on llvmpipe for `a2c-off-1-alpha-50` and `a2one-on-1-mask-no-alpha`.
-const SINGLE_IN_THE_SHADER: &[Degradation] = &[Degradation::ShaderColorConversion];
-
-/// A single-sample **blended** row: the blend's factors read the source alpha, so what reaches the
-/// attachment is the device's own conversion and not one our side rounded. Measured on the 5080
-/// and on llvmpipe for both `a2one-*-1-blend-source-alpha` rows.
-const SINGLE_BLEND: &[Degradation] = &[Degradation::DeviceColorConversion];
+/// A single-sample row, whose store announces nothing but the device's own answers, which the suite
+/// declares for every case ([`crate::replay::NATIVE_NOTES`]): the device's conversion of an alpha
+/// under `alphaToCoverage` or of a blend whose factors read the source alpha
+/// (`device-color-conversion`, measured on the 5080 and on llvmpipe for `a2c-on-1-alpha-50` and
+/// both `a2one-*-1-blend-source-alpha` rows), its coverage of the alpha under `alphaToCoverage`
+/// (`device-alpha-coverage`, off MoltenVK), and its arithmetic.
+const SINGLE: &[Degradation] = &[];
 
 /// Every row, grouped by the question it answers. Each group's prose is in the module header.
 const ROWS: &[Row] = &[
     // The control: the same alpha with the field off, so every coverage below is the field's doing.
     Row {
-        notices: A2C_OFF_MULTISAMPLE,
+        notices: ALPHA_MULTISAMPLE,
         ..Row::sweep("a2c-off-4-alpha-50", false, 0.5)
     },
-    // The sweep that gives `floor(alpha * samples)`.
+    // The sweep that gives `alpha * samples` where that is an integer.
     Row {
-        notices: A2C_ON_MULTISAMPLE,
+        notices: ALPHA_MULTISAMPLE,
         ..Row::sweep("a2c-on-4-alpha-00", true, 0.0)
     },
     Row {
-        notices: A2C_ON_MULTISAMPLE,
+        notices: ALPHA_MULTISAMPLE,
         ..Row::sweep("a2c-on-4-alpha-25", true, 0.25)
     },
     Row {
-        notices: A2C_ON_MULTISAMPLE,
+        notices: ALPHA_MULTISAMPLE,
         ..Row::sweep("a2c-on-4-alpha-50", true, 0.5)
     },
     Row {
-        notices: A2C_ON_MULTISAMPLE,
+        notices: ALPHA_MULTISAMPLE,
         ..Row::sweep("a2c-on-4-alpha-75", true, 0.75)
     },
     Row {
-        notices: A2C_ON_MULTISAMPLE,
+        notices: ALPHA_MULTISAMPLE,
         ..Row::sweep("a2c-on-4-alpha-100", true, 1.0)
     },
-    // The sample-count cross: the cell that pins `floor` against round-to-nearest.
+    // The sample-count cross: the cell that separates Metal's rule from rounding half up.
     Row {
         name: "a2c-on-1-alpha-50",
         samples: 1,
-        notices: SINGLE_CONVERTED,
+        notices: SINGLE,
         ..Row::sweep("a2c-on-1-alpha-50", true, 0.5)
     },
     Row {
         name: "a2c-off-1-alpha-50",
         samples: 1,
-        notices: SINGLE_IN_THE_SHADER,
+        notices: SINGLE,
         ..Row::sweep("a2c-off-1-alpha-50", false, 0.5)
     },
     // The write-mask cross: the coverage must not move, and only the stored alpha may.
@@ -315,26 +297,26 @@ const ROWS: &[Row] = &[
         write_mask: ColorWriteMask::RED
             .union(ColorWriteMask::GREEN)
             .union(ColorWriteMask::BLUE),
-        notices: A2C_ON_MULTISAMPLE,
+        notices: ALPHA_MULTISAMPLE,
         ..Row::sweep("a2c-on-4-alpha-50-mask-no-alpha", true, 0.5)
     },
     // The sample-mask cross, with its own control: the AND is only visible in the stored texel.
     Row {
         name: "a2c-off-4-alpha-50-shadermask-5",
         report: Report::Masked(0b0101),
-        notices: A2C_OFF_MULTISAMPLE,
+        notices: ALPHA_MULTISAMPLE,
         ..Row::sweep("a2c-off-4-alpha-50-shadermask-5", false, 0.5)
     },
     Row {
         name: "a2c-on-4-alpha-50-shadermask-5",
         report: Report::Masked(0b0101),
-        notices: A2C_ON_MULTISAMPLE,
+        notices: ALPHA_MULTISAMPLE,
         ..Row::sweep("a2c-on-4-alpha-50-shadermask-5", true, 0.5)
     },
     Row {
         name: "a2c-on-4-alpha-50-shadermask-a",
         report: Report::Masked(0b1010),
-        notices: A2C_ON_MULTISAMPLE,
+        notices: ALPHA_MULTISAMPLE,
         ..Row::sweep("a2c-on-4-alpha-50-shadermask-a", true, 0.5)
     },
     // The independent cell: no alpha component, so nothing for the field to read.
@@ -355,7 +337,7 @@ const ROWS: &[Row] = &[
         name: "a2one-off-1-blend-source-alpha",
         samples: 1,
         blended: true,
-        notices: SINGLE_BLEND,
+        notices: SINGLE,
         ..Row::sweep("a2one-off-1-blend-source-alpha", false, 0.5)
     },
     Row {
@@ -363,7 +345,7 @@ const ROWS: &[Row] = &[
         samples: 1,
         alpha_to_one: true,
         blended: true,
-        notices: SINGLE_BLEND,
+        notices: SINGLE,
         ..Row::sweep("a2one-on-1-blend-source-alpha", false, 0.5)
     },
     Row {
@@ -373,7 +355,7 @@ const ROWS: &[Row] = &[
         write_mask: ColorWriteMask::RED
             .union(ColorWriteMask::GREEN)
             .union(ColorWriteMask::BLUE),
-        notices: SINGLE_IN_THE_SHADER,
+        notices: SINGLE,
         ..Row::sweep("a2one-on-1-mask-no-alpha", false, 0.5)
     },
 ];
@@ -717,17 +699,25 @@ impl Case for AlphaCoverageCase {
 mod tests {
     //! The model each row's answer is held against, and the guards that keep the crosses honest.
     //!
-    //! The coverage model is Metal's, measured: `floor(alpha * rasterSampleCount)` samples, ANDed
-    //! with a sample mask the fragment writes. The tests derive each row's expected coverage from
-    //! that one rule rather than listing answers, so a row that agrees for the wrong reason fails.
+    //! The coverage model is Metal's, measured (`runtime_lane::alpha_coverage`, over 639 alphas a
+    //! sample count on this M3 Max) at this family's one pixel, `(0, 0)`, ANDed with a sample mask
+    //! the fragment writes. The tests derive each row's expected coverage from that one rule rather
+    //! than listing answers, so a row that agrees for the wrong reason fails.
 
     use super::*;
     use crate::recording::Recording;
     use crate::transcript::Transcript;
 
-    /// How many samples `alpha` covers at `samples`, by the measured rule.
+    /// How many samples `alpha` covers at `samples` at the pixel `(0, 0)`, by the measured rule:
+    /// at one sample, one above an alpha of 1/2; at more, `ceil(alpha * samples - 1/8)`, the 2x2
+    /// dither's threshold at even `x` and `y` (either count within an `f32` ulp of a threshold,
+    /// where no row lies).
     fn covered(alpha: f32, samples: u32) -> u32 {
-        (alpha * samples as f32).floor() as u32
+        let x = f64::from(alpha) * f64::from(samples);
+        match samples {
+            1 => u32::from(x > 0.5),
+            _ => (x - 0.125).ceil().clamp(0.0, f64::from(samples)) as u32,
+        }
     }
 
     /// The red code a resolve of `k` covered samples out of `samples` leaves: the fragment's own
@@ -814,10 +804,10 @@ mod tests {
         (word(0), word(4))
     }
 
-    /// Metal covers `floor(alpha * rasterSampleCount)` samples in every row of the sweep, and the
-    /// one-sample row is what separates that rule from rounding to nearest.
+    /// Metal covers its measured rule's samples in every row of the sweep, and the one-sample row
+    /// is what separates that rule from rounding half up.
     #[test]
-    fn metals_coverage_is_the_floor_of_the_alpha_times_the_samples() {
+    fn metals_coverage_is_the_measured_rule_of_the_alpha_times_the_samples() {
         for held in ROWS {
             // The coverage rows only: a blended row's red is the blend's result rather than an
             // average of covered samples, and an alpha-to-one row's is its own question.
@@ -836,8 +826,8 @@ mod tests {
                 held.name
             );
         }
-        // The cell that pins `floor`: the same alpha covers two of four samples and none of one,
-        // where rounding to nearest would have covered the one.
+        // The cell that separates the rule from rounding half up: the same alpha covers two of
+        // four samples and none of one, where rounding half up would have covered the one.
         assert_eq!(covered(0.5, 4), 2);
         assert_eq!(covered(0.5, 1), 0);
         assert_eq!(covered_in("a2c-on-4-alpha-50"), 2);
@@ -915,7 +905,7 @@ mod tests {
     /// samples than either does alone.
     ///
     /// This is the family's pair-only cell and the falsification is in the arithmetic. A coverage
-    /// derived from the alpha **after** the mask applied would cover `floor(0.5 * 4) = 2` of the
+    /// derived from the alpha **after** the mask applied would cover `0.5 * 4 = 2` of the
     /// masked samples and store two — exactly what the mask-alone control stores. It stores one.
     #[test]
     fn the_alpha_coverage_and_the_fragments_sample_mask_are_anded() {

@@ -64,9 +64,9 @@
 //! the [`PlanesCopy`] view of its texel size. A multisampled depth or stencil aspect moves
 //! between images without colour copies through the draws of [`depth_stencil_copy_modules`] and
 //! the kernel of [`stencil_split_module`], and resolves where the device's resolve modes do not
-//! state Metal's filter through the draws of [`depth_stencil_resolve_modules`]. The mipmaps of the
-//! colour formats Metal's filter computes are its answer through the [`MipmapFilterChain`]
-//! dispatches of [`mipmap_filter_module`]. Compute commands
+//! state Metal's filter through the draws of [`depth_stencil_resolve_modules`]. The mipmaps of a
+//! format the device's blits cannot filter are a bilinear filter in `float` through the
+//! [`MipmapFilterChain`] dispatches of [`mipmap_filter_module`]. Compute commands
 //! a kernel encodes into an indirect command buffer replay on the device where it has device
 //! addresses: the [`replay_preprocess`] of an execution ([`ReplayExecution`]) over registered
 //! [`ReplayVariant`]s, recorded with [`replay_preprocess_module`], writes each command's arguments
@@ -86,10 +86,7 @@
 //! [`shadow_copy_in_module`] copies a merged texture's texels in and keeps them with one dispatch.
 //! A copy of many
 //! equal rows between two buffers is one dispatch of [`rows_copy_module`] where a copy's region
-//! per row costs more. A render pass that loads a
-//! 32-bit float depth holding a value Vulkan's depth test compares otherwise than Metal's (a
-//! negative value or a NaN, whose magnitude Metal compares) renders over its stand-in, written
-//! before the pass and merged back after it by [`depth_magnitude_module`]. A blit between a buffer
+//! per row costs more. A blit between a buffer
 //! and a two-plane extended-range texture moves its color words through [`plane_words_module`],
 //! and a blit between two such textures moves both planes as Metal's blit does through
 //! [`plane_copy_module`]. A rotated texture's texels move between its
@@ -98,26 +95,17 @@
 //! [`two_plane_texels_module`]; a blit into such a texture of a heap writes the heap's bytes at
 //! Metal's rows through [`plane_bytes_copy_module`]. A heap texture over host pages keeps its
 //! elements in the heap's bytes in Metal's tiled layout, moved between its image and those bytes
-//! through [`tiled_texels_module`]. A render pass that loads an extended-range, padded 10-bit or
-//! bfloat color attachment and draws first rewrites the bits its codes leave unused through
-//! [`unused_bits_module`] of its format, in the 32 x 32 tiles a mask names, as Metal's tile store
-//! does; under the exact tile store it also raises a signed normalized attachment's minimum codes
-//! and normalizes an `RGB9E5Float` attachment's words there. The tiles a pass's draws reach, which Metal's tile store writes back, are the mask one
-//! dispatch of [`tile_reach_module`] bins its captured primitives into: [`capture_assembly_module`]
-//! assembles them from a pass's capture draws' records, and [`capture_settle_module`] widens the
-//! mask to every tile where the binning counted a primitive it cannot answer. A GPU blit that reads
-//! or writes a texture Metal keeps losslessly compressed writes the texels Metal's compression
-//! leaves of the formats whose bytes it changes ([`CompressedBlit`]), which
-//! [`compressed_blit_module`] of the rule rewrites after the copy. A BC1 to BC5 texture a device
-//! decodes otherwise than Metal is read through a twin of its texels as Metal decodes them
-//! ([`BlockDecode`]), which [`block_decode_module`] writes from the blocks each write left; an
-//! ASTC LDR texture on a device without its block through a twin of Metal's decode of its blocks
-//! ([`AstcDecode`], in the texels [`AstcTexels`] names), which [`astc_decode_module`] writes; a
+//! through [`tiled_texels_module`]. An ASTC LDR texture
+//! on a device without its block is read through a twin of Metal's decode of its blocks
+//! ([`AstcDecode`], in the texels [`AstcTexels`] names), which [`astc_decode_module`] writes from
+//! the blocks each write left, each decode module of [`BlockDecodeModule`]'s shape; a
 //! PVRTC texture on a device without its format through a twin of its texels' codes
 //! ([`PvrtcDecode`]), which [`pvrtc_decode_module`] writes; an ETC2 or EAC texture on a device
 //! without the formats through a twin of its codes or an 11-bit format's values ([`EtcDecode`], in
 //! the texels [`EtcTexels`] names), which [`etc_decode_module`] writes; a 4:2:2 texture through a
-//! twin of its texels' codes ([`ChromaDecode`]), which [`chroma_decode_module`] writes.
+//! twin of its texels' codes ([`ChromaDecode`]), which [`chroma_decode_module`] writes, or, where
+//! the device converts the format itself, [`chroma_sample_module`] samples through the device's
+//! own Y′CbCr conversion ([`ChromaSampleModule`]).
 //! [`sampler_desc`] gives the Vulkan sampler a plan's sampler write needs, [`heap_classes`] the
 //! classes of the handle heap's arrays on a profile, [`FunctionTableWords`] the words of a
 //! visible-function table's buffer, and [`FunctionTableSnapshot`] the one buffer of a command's
@@ -140,11 +128,8 @@ pub(crate) mod acceleration;
 pub(crate) mod argument_buffer;
 pub(crate) mod astc_decode;
 pub(crate) mod block_decode;
-pub(crate) mod capture_assembly;
 pub(crate) mod chroma_decode;
 pub(crate) mod color_resolve;
-pub(crate) mod compressed_blit;
-pub(crate) mod depth_magnitude;
 pub(crate) mod depth_stencil_copy;
 pub(crate) mod depth_stencil_resolve;
 pub(crate) mod dispatch;
@@ -183,14 +168,14 @@ pub(crate) mod status;
 pub(crate) mod table;
 pub(crate) mod tessellation_scan;
 pub(crate) mod tile_map;
-pub(crate) mod tile_reach;
 pub(crate) mod tiled_texels;
 pub(crate) mod two_plane_texels;
-pub(crate) mod unused_bits;
 pub(crate) mod visibility_combine;
 pub(crate) mod visibility_resolve;
 pub(crate) mod ycbcr_convert;
+pub(crate) mod ycbcr_in_place;
 pub(crate) mod ycbcr_refresh;
+pub(crate) mod ycbcr_sample;
 pub(crate) mod ycbcr_write;
 
 pub use acceleration::{
@@ -202,20 +187,14 @@ pub use argument_buffer::{
     ArgumentType, ARGUMENT_HANDLE_BYTES,
 };
 pub use astc_decode::{astc_decode_module, AstcDecode, AstcTexels};
-pub use block_decode::{block_decode_module, BlockDecode, BlockDecodeModule};
-pub use capture_assembly::{
-    capture_assembly_module, capture_settle_module, CaptureAssemblyModule, CaptureSettleModule,
+pub use block_decode::BlockDecodeModule;
+pub use chroma_decode::{
+    chroma_decode_module, chroma_sample_module, ChromaDecode, ChromaSampleModule,
 };
-pub use chroma_decode::{chroma_decode_module, ChromaDecode};
 pub use color_resolve::{
     color_resolve_modules, ColorResolveFormat, ColorResolveModules, ResolveChannel, ResolveRule,
     ResolveSource, SRGB_RESOLVE_LINEAR, SRGB_RESOLVE_THRESHOLDS,
 };
-pub use compressed_blit::{compressed_blit_module, CompressedBlit, CompressedBlitModule};
-pub use etc_decode::{etc_decode_module, EtcDecode, EtcTexels};
-// The bytes of `WriteSource::ColorWriteTable`'s buffer.
-pub use crate::lower::arith::srgb::color_write_table;
-pub use depth_magnitude::{depth_magnitude_module, DepthMagnitudeModule};
 pub use depth_stencil_copy::{
     depth_split_module, depth_stencil_copy_modules, stencil_split_module, CopySource,
     DepthSplitModule, DepthStandInForm, DepthStencilCopy, DepthStencilCopyModules, StencilBit,
@@ -226,15 +205,15 @@ pub use depth_stencil_resolve::{
     ResolveWrite,
 };
 pub use dispatch::{Dispatch, DispatchCommands, DispatchRegion, IndirectArgs};
+pub use etc_decode::{etc_decode_module, EtcDecode, EtcTexels};
 pub use extended_shadow::{extended_shadow_module, ExtendedShadowModule};
 pub use graphics::{
     DrawCall, DrawCommands, IndexOverrun, MeshDispatch, MeshGroups, MeshRecordsRegion,
     TessellationDispatch, TessellationRecords,
 };
 pub use heap::{
-    handle_entry, handle_entry_flags, heap_classes, heap_element, heap_raw_form,
-    heap_write_nans_converted, HeapElement, HeapElements, HeapSource, HANDLE_ENTRY_BYTES,
-    HANDLE_TABLE_CAPACITY, NEUTRAL_HEAP_ELEMENT,
+    handle_entry, handle_entry_flags, heap_classes, heap_element, heap_raw_form, HeapElement,
+    HeapElements, HeapSource, HANDLE_ENTRY_BYTES, HANDLE_TABLE_CAPACITY, NEUTRAL_HEAP_ELEMENT,
 };
 pub use index_bounds::{
     index_bounds_fill_module, index_bounds_fill_run_module, index_bounds_plan_module,
@@ -260,7 +239,7 @@ pub use mesh_arguments::{
 pub use mesh_scan::{mesh_object_arguments_module, mesh_scan_module, MeshScanModule};
 pub use mipmap_filter::{
     mipmap_filter_module, MipmapFilterChain, MipmapFilterKernel, MipmapFilterLevel,
-    MipmapFilterModule, MipmapRule,
+    MipmapFilterModule,
 };
 pub use neutral::NeutralResource;
 pub use plan::resources::sampler_desc;
@@ -326,7 +305,7 @@ pub use sample_planes::{
 };
 pub use shadow_copy_back::{shadow_copy_back_module, ShadowCopyBackModule, ShadowTexelView};
 pub use shadow_copy_in::{shadow_copy_in_module, ShadowCopyInModule};
-pub use shadow_merge::{shadow_merge_module, ShadowMergeModule};
+pub use shadow_merge::{shadow_merge_module, ShadowMergeModule, ShadowMergeStores};
 pub use shadow_merge_image::{
     shadow_merge_image_module, shadow_merge_kept_image_module, ShadowMergeImageModule,
     ShadowMergeRead,
@@ -340,10 +319,8 @@ pub use tessellation_scan::{
     tessellation_scan_module, TessellationScanKernel, TessellationScanModule,
 };
 pub use tile_map::{SparseTileMap, TileMapError, TileMapping};
-pub use tile_reach::{tile_reach_module, TileReachModule};
 pub use tiled_texels::{tiled_texels_module, TiledLevelMove, TiledTexelsModule};
 pub use two_plane_texels::{two_plane_texels_module, PlaneLayout, TwoPlaneTexelsModule};
-pub use unused_bits::{unused_bits_module, TexelWords, UnusedBitsModule};
 pub use visibility_combine::{
     visibility_combine_module, ContinuedResult, VisibilityCombine, VisibilityCombineModule,
 };
@@ -354,5 +331,7 @@ pub use ycbcr_convert::{
     ycbcr_convert_floats_module, ycbcr_convert_module, ycbcr_read, ycbcr_texel, YCbCrCodes,
     YCbCrConversion, YCbCrConvertModule, YCbCrMatrix, YCbCrOutput, YCbCrPlanes, YCbCrRange,
 };
+pub use ycbcr_in_place::{YCbCrInPlace, YCbCrPlanesSampler};
 pub use ycbcr_refresh::{ycbcr_refresh_module, YCbCrRefreshModule};
+pub use ycbcr_sample::{ycbcr_sample_module, YCbCrSampleModule};
 pub use ycbcr_write::{ycbcr_store, ycbcr_write, ycbcr_write_module, YCbCrWriteModule};

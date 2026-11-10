@@ -11,15 +11,13 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::bind::{
-    self, BlockDecode, CompressedBlit, DepthStandInForm, PlanesCopy, RewritePhase, RewriteProgram,
-    TessellationScanKernel, TexelWords,
+    self, DepthStandInForm, PlanesCopy, RewritePhase, RewriteProgram, TessellationScanKernel,
 };
 use crate::device::{Device, DevicePolicy};
 use crate::error::{Error, Feature};
 use crate::metal::format::ExtendedRange;
 use crate::metal::{
-    PixelFormat, TessellationFactorStepFunction as Step, TessellationPartitionMode as Partition,
-    Winding,
+    TessellationFactorStepFunction as Step, TessellationPartitionMode as Partition, Winding,
 };
 use crate::pipeline::interface::PatchDomain;
 use crate::spirv::testing::{all_ones_divisions, committed_descriptions};
@@ -47,29 +45,10 @@ const EXTENDED: [ExtendedRange; 13] = [
     ExtendedRange::Rgba16Bfloat,
 ];
 
-/// Every format a render pass's load pass rewrites (`bind::unused_bits_module`): the
-/// extended-range, padded and bfloat formats, the signed normalized formats and `RGB9E5Float`.
-const UNUSED_BITS: [PixelFormat; 20] = [
-    PixelFormat::BGR10XR,
-    PixelFormat::BGR10XRSRGB,
-    PixelFormat::BGRA10XR,
-    PixelFormat::BGRA10XRSRGB,
-    PixelFormat::RGB10A82PXR10,
-    PixelFormat::RGB10A82PXR10SRGB,
-    PixelFormat::R10UnormX6,
-    PixelFormat::RG10UnormX12,
-    PixelFormat::R10UnormX6SRGB,
-    PixelFormat::RG10UnormX12SRGB,
-    PixelFormat::R16Bfloat,
-    PixelFormat::RG16Bfloat,
-    PixelFormat::RGBA16Bfloat,
-    PixelFormat::R8Snorm,
-    PixelFormat::RG8Snorm,
-    PixelFormat::RGBA8Snorm,
-    PixelFormat::R16Snorm,
-    PixelFormat::RG16Snorm,
-    PixelFormat::RGBA16Snorm,
-    PixelFormat::RGB9E5Float,
+/// Both forms of a shadow merge's stores.
+const STORES: [bind::ShadowMergeStores; 2] = [
+    bind::ShadowMergeStores::Words,
+    bind::ShadowMergeStores::Blocks,
 ];
 
 fn modules() -> Vec<Build> {
@@ -80,9 +59,6 @@ fn modules() -> Vec<Build> {
         };
     }
     plain!(
-        capture_assembly_module,
-        capture_settle_module,
-        depth_magnitude_module,
         flat_dispatch_module,
         index_bounds_fill_module,
         index_bounds_plan_module,
@@ -96,8 +72,6 @@ fn modules() -> Vec<Build> {
         replay_preprocess_module,
         rotate_texels_module,
         rows_copy_module,
-        shadow_merge_module,
-        tile_reach_module,
         tiled_texels_module,
         two_plane_texels_module,
         visibility_combine_module,
@@ -109,20 +83,10 @@ fn modules() -> Vec<Build> {
         |name: String, build: Box<dyn Fn(&Device) -> Result<Arc<[u32]>, Error> + Sync>| {
             out.push((name, build));
         };
-    for decode in BlockDecode::ALL {
+    for stores in STORES {
         push(
-            format!("block_decode_module({decode:?})"),
-            Box::new(move |d| Ok(bind::block_decode_module(d, decode)?.spirv)),
-        );
-    }
-    for rule in [
-        CompressedBlit::ExtendedRangeFields,
-        CompressedBlit::PackedFloatNan,
-        CompressedBlit::SharedExponent,
-    ] {
-        push(
-            format!("compressed_blit_module({rule:?})"),
-            Box::new(move |d| Ok(bind::compressed_blit_module(d, rule)?.spirv)),
+            format!("shadow_merge_module({stores:?})"),
+            Box::new(move |d| Ok(bind::shadow_merge_module(d, stores)?.spirv)),
         );
     }
     for form in EXTENDED {
@@ -130,14 +94,6 @@ fn modules() -> Vec<Build> {
             format!("extended_shadow_module({form:?})"),
             Box::new(move |d| Ok(bind::extended_shadow_module(d, form)?.spirv)),
         );
-    }
-    for format in UNUSED_BITS {
-        for words in [TexelWords::Raw, TexelWords::ColorPlane] {
-            push(
-                format!("unused_bits_module({format:?}, {words:?})"),
-                Box::new(move |d| Ok(bind::unused_bits_module(d, format, words)?.spirv)),
-            );
-        }
     }
     for program in RewriteProgram::ALL {
         for phase in RewritePhase::ALL {
@@ -156,16 +112,20 @@ fn modules() -> Vec<Build> {
             format!("shadow_copy_in_module({view:?})"),
             Box::new(move |d| Ok(bind::shadow_copy_in_module(d, view)?.spirv)),
         );
-        push(
-            format!("shadow_merge_kept_image_module({view:?})"),
-            Box::new(move |d| Ok(bind::shadow_merge_kept_image_module(d, view)?.spirv)),
-        );
+        for stores in STORES {
+            push(
+                format!("shadow_merge_kept_image_module({view:?}, {stores:?})"),
+                Box::new(move |d| Ok(bind::shadow_merge_kept_image_module(d, view, stores)?.spirv)),
+            );
+        }
     }
     for read in bind::ShadowMergeRead::ALL {
-        push(
-            format!("shadow_merge_image_module({read:?})"),
-            Box::new(move |d| Ok(bind::shadow_merge_image_module(d, read)?.spirv)),
-        );
+        for stores in STORES {
+            push(
+                format!("shadow_merge_image_module({read:?}, {stores:?})"),
+                Box::new(move |d| Ok(bind::shadow_merge_image_module(d, read, stores)?.spirv)),
+            );
+        }
     }
     for conversion in crate::bind::ycbcr_convert::conversions() {
         push(

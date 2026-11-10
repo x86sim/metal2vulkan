@@ -11,12 +11,11 @@
 //!
 //! The public surface (`Device::compile_function`, `function_compile_key`,
 //! `compile_compute_pipeline`, `compile_render_pipeline`, and the pipeline keys) is [`api`]; the
-//! key derivation is [`key`]; holding a pipeline to the device's compiler word bound is `fit`.
+//! key derivation is [`key`].
 
 pub mod api;
 pub(crate) mod color_group;
 mod entry;
-mod fit;
 pub mod key;
 mod numbered;
 mod partition;
@@ -136,8 +135,6 @@ pub struct FragmentPass<'a> {
     pub(crate) color_attachments: &'a [Option<ColorAttachmentDescriptor>; 8],
     /// The pipeline has a depth or a stencil attachment.
     pub(crate) depth_or_stencil: bool,
-    /// The pipeline's depth attachment is `Depth16Unorm` (`LoweringInputs::depth16_codes`).
-    pub(crate) depth16: bool,
     pub(crate) raster_sample_count: u32,
     pub(crate) rasterization_enabled: bool,
     pub(crate) alpha_to_coverage: bool,
@@ -165,7 +162,6 @@ impl<'a> From<&'a RenderPipelineDescriptor> for FragmentPass<'a> {
         FragmentPass {
             color_attachments: &d.color_attachments,
             depth_or_stencil: d.depth_format.is_some() || d.stencil_format.is_some(),
-            depth16: d.depth_format == Some(crate::metal::PixelFormat::Depth16Unorm),
             raster_sample_count: d.raster_sample_count,
             rasterization_enabled: d.rasterization_enabled,
             alpha_to_coverage: d.alpha_to_coverage,
@@ -188,7 +184,6 @@ impl<'a> From<&'a MeshPipelineDescriptor> for FragmentPass<'a> {
         FragmentPass {
             color_attachments: &d.color_attachments,
             depth_or_stencil: d.depth_format.is_some() || d.stencil_format.is_some(),
-            depth16: d.depth_format == Some(crate::metal::PixelFormat::Depth16Unorm),
             raster_sample_count: d.raster_sample_count,
             rasterization_enabled: d.rasterization_enabled,
             alpha_to_coverage: d.alpha_to_coverage,
@@ -1843,15 +1838,11 @@ pub(crate) fn spec_request(
 
 /// The Metal attribute indices the specialized vertex entry `spec` reads: its `[[attribute(n)]]`
 /// parameters that survived function-constant specialization and that an instruction uses (the
-/// parameters `lower::stage_io` plans). Each with the numeric class it is declared with and
-/// whether its declared form is a 32-bit `float` (`float`, `float2`, `float3`, `float4`), which is
-/// what the projection's `VertexFetch::FixedFunction::narrow_float` may hold of it: only a 32-bit
-/// `float` read canonicalizes the device's widening (`lower::stage_io::plan`). Empty for any other
-/// stage.
+/// parameters `lower::stage_io` plans), each with the numeric class it is declared with. Empty for
+/// any other stage.
 pub(crate) fn declared_attributes(
     spec: &air::Entry,
-) -> std::collections::BTreeMap<u32, (crate::pipeline::stage_io::IoNumeric, bool)> {
-    use crate::lower::arith::FloatFmt;
+) -> std::collections::BTreeMap<u32, crate::pipeline::stage_io::IoNumeric> {
     use crate::pipeline::stage_io::IoNumeric;
     let mut out = std::collections::BTreeMap::new();
     if !matches!(spec.ep.stage, AbiStage::Vertex { .. }) {
@@ -1886,17 +1877,13 @@ pub(crate) fn declared_attributes(
                         _ => None,
                     };
                     let float = form.is_some_and(|f| f.is_float());
-                    let f32_read = form.is_some_and(|f| f.float_fmt() == Some(FloatFmt::F32));
                     out.insert(
                         index,
-                        (
-                            if float {
-                                IoNumeric::Float
-                            } else {
-                                IoNumeric::Uint
-                            },
-                            f32_read,
-                        ),
+                        if float {
+                            IoNumeric::Float
+                        } else {
+                            IoNumeric::Uint
+                        },
                     );
                 }
             }
@@ -1966,36 +1953,6 @@ pub(crate) fn kernel_inputs_read(
     })
 }
 
-/// The color attachments the specialized fragment entry `spec` reads (`[[color(n)]]`) whose
-/// pixel format in `colors` is `RGBA8Unorm_sRGB` or `BGRA8Unorm_sRGB`
-/// (`LoweringInputs::srgb_fetches`). Empty for any other stage.
-pub(crate) fn srgb_fetches(
-    spec: &air::Entry,
-    colors: &[Option<ColorAttachmentDescriptor>],
-) -> BTreeSet<u32> {
-    if !matches!(spec.ep.stage, AbiStage::Fragment { .. }) {
-        return BTreeSet::new();
-    }
-    spec.ep
-        .params
-        .iter()
-        .filter_map(|b| match b.role {
-            ParamRole::ColorInput {
-                index: AbiInt::Const(color),
-                ..
-            } => Some(color),
-            _ => None,
-        })
-        .filter(|&c| {
-            colors
-                .get(c as usize)
-                .copied()
-                .flatten()
-                .is_some_and(|a| crate::pipeline::color_writes::srgb_fetched(a.pixel_format))
-        })
-        .collect()
-}
-
 /// The color attachments the specialized fragment entry `spec` writes (an output of either
 /// dual-source index) whose pixel format in `colors` is a signed integer. Empty for any other
 /// stage.
@@ -2055,58 +2012,6 @@ pub(crate) fn unattached_colors_written(
         .collect()
 }
 
-/// Whether the pipeline names color attachment `color` of descriptor `c` for Metal's own blend
-/// alone, the entry `spec` writing it: an attachment the function blends in the storage form,
-/// where the profile asks for that blend (`lower::fragment::blends_half_in_shader`) and the
-/// function does not already read the attachment.
-///
-/// A 16-bit float attachment (`R16Float`, `RG16Float`, `RGBA16Float`) of a `half` output of one to
-/// four lanes of a module that states its math mode, under a blend Metal's model holds
-/// (`fetch::half_blend_attachment`, `fetch::half_output`).
-///
-/// And a 32-bit float attachment (`R32Float`, `RG32Float`, `RGBA32Float`) of a four-lane `half` or
-/// `float` output of a module **with** fast math, blended under a state whose forms are Metal's
-/// (`extended_range::Blend::float32`, whose
-/// [`fitted`](crate::lower::arith::extended_range::Blend::fitted) is the one sweep that measured
-/// the family: the two measured pairs at two or four channels, and the forms that need no
-/// measurement), where the write stores some channel of the format and the factors are not one and
-/// zero, which the device stores as the source anyway. Metal's arithmetic for the format without
-/// fast math is measured in no state, and at an unfitted state the generic blend is the
-/// measured-closer near-equivalent, so neither is named here (`fetch`'s module docs).
-///
-/// What only the function's body or the device can answer is the lowering's: whether a lane of the
-/// output folds into Metal's blend (`fetch::folds_into_blend`), and whether the attachment's
-/// storage form is blocked. A named attachment either of those drops keeps the device's blend, so
-/// this holds of more attachments than take the form.
-fn blended_in_shader(spec: &air::Entry, c: &ColorAttachmentDescriptor, color: u32) -> bool {
-    use crate::lower::arith::extended_range;
-    use crate::metal::ColorWriteMask as Mask;
-    let eq = crate::pipeline::lower_inputs::BlendEquation::of(c);
-    let half = crate::lower::fragment::half_blend_attachment(
-        c.pixel_format,
-        c.blending_enabled,
-        c.write_mask,
-        eq,
-    ) && crate::lower::fragment::half_output(spec, color);
-    // The channels the write keeps from the texel, as `fetch::storage_form` reads them: none where
-    // the mask covers every channel of the format, all four where it covers none of them, in which
-    // case the write stores nothing and the storage form would buy nothing.
-    let kept = crate::lower::fragment::kept_channels(c.pixel_format, c.write_mask, true);
-    let float32 = crate::lower::fragment::fetch::float32_format(c.pixel_format)
-        && c.blending_enabled
-        && !crate::pipeline::color_writes::replaces(c)
-        && spec.compile.fast_math == Some(true)
-        && !c.write_mask.contains(Mask::UNSPECIALIZED)
-        && kept != Mask::ALL
-        && crate::lower::fragment::fetch::blended_output(spec, color)
-            .is_some_and(|(_, lanes)| lanes == 4)
-        && eq.is_some_and(|eq| {
-            let written = Mask::ALL.difference(kept);
-            extended_range::Blend::float32(&eq, c.pixel_format, written).is_ok_and(|b| b.fitted())
-        });
-    half || float32
-}
-
 /// The framebuffer-fetch state of pass `d` for the specialized fragment entry `spec` on `p`
 /// (`LoweringInputs::framebuffer_fetch`): on a device that orders fetch only through the pixel
 /// interlock, the state of every attachment the entry declares a `[[color(n)]]` input of a constant
@@ -2118,11 +2023,7 @@ fn blended_in_shader(spec: &air::Entry, c: &ColorAttachmentDescriptor, color: u3
 /// of every extended-range attachment the entry writes that the pass blends (whose blend the
 /// function computes over its input attachment, `lower::fragment`'s `input_blend`), and of every
 /// word attachment it writes under a mask of some of the word's channels (whose word the function
-/// merges into its input attachment's, `color_writes::merged_word`). Where the
-/// profile asks for Metal's own blend of a blended output (`DevicePolicy::half_blend`) on a
-/// device that orders fetch through the interlock, also every attachment [`blended_in_shader`]
-/// holds that the entry writes, those it names for that alone in
-/// `FramebufferFetchInputs::half_blends`.
+/// merges into its input attachment's, `color_writes::merged_word`).
 pub(crate) fn fetch_inputs(
     spec: &air::Entry,
     d: FragmentPass<'_>,
@@ -2134,22 +2035,6 @@ pub(crate) fn fetch_inputs(
     if !matches!(spec.ep.stage, AbiStage::Fragment { .. }) || !(interlock || inputs) {
         return None;
     }
-    // Each attachment the entry writes whose blend Metal computes in the function, where the
-    // profile asks for Metal's blend there: a 16-bit float one of a `half` output, and a 32-bit
-    // float one of a four-lane output under fast math ([`blended_in_shader`]). The function
-    // computes it in the storage form where that form is exact, and leaves it to the device
-    // elsewhere.
-    let half_blends: BTreeSet<u32> = match crate::lower::fragment::blends_half_in_shader(p) {
-        true => d
-            .color_attachments
-            .iter()
-            .zip(0u32..)
-            .filter_map(|(c, color)| c.as_ref().map(|c| (c, color)))
-            .filter(|&(c, color)| blended_in_shader(spec, c, color))
-            .map(|(_, color)| color)
-            .collect(),
-        false => BTreeSet::new(),
-    };
     let blended = |color: u32| {
         d.color_attachments
             .get(color as usize)
@@ -2220,26 +2105,19 @@ pub(crate) fn fetch_inputs(
             _ => None,
         }))
         .collect();
-    // Those the pipeline names for that blend alone, which the function leaves to the device
-    // where the storage form is not exact.
-    let optional: BTreeSet<u32> = half_blends.difference(&read).copied().collect();
-    let read: BTreeSet<u32> = read.union(&half_blends).copied().collect();
     if read.is_empty() {
         return None;
     }
     // The blend over an input attachment depends on the attachments' state alone: its write is
     // the fixed function's, which the tests, coverage and views take as any other's.
     Some(match interlock {
-        true => crate::pipeline::lower_inputs::FramebufferFetchInputs {
-            half_blends: optional,
-            ..crate::pipeline::lower_inputs::FramebufferFetchInputs::of(
-                read,
-                d.color_attachments,
-                d.depth_or_stencil,
-                d.alpha_to_coverage,
-                d.max_vertex_amplification_count,
-            )
-        },
+        true => crate::pipeline::lower_inputs::FramebufferFetchInputs::of(
+            read,
+            d.color_attachments,
+            d.depth_or_stencil,
+            d.alpha_to_coverage,
+            d.max_vertex_amplification_count,
+        ),
         false => crate::pipeline::lower_inputs::FramebufferFetchInputs::of(
             read,
             d.color_attachments,
@@ -2283,46 +2161,8 @@ pub(crate) fn fragment_inputs(
     out.sample_mask = d.sample_mask;
     out.alpha_test = d.alpha_test;
     out.depth_compare_clamp_mask = d.depth_compare_clamp_mask;
-    out.half_output_lanes = crate::pipeline::color_writes::half_output_lanes(d.color_attachments);
     out.texture_write_rounding = d.texture_write_rounding_mode;
-    out.depth16_codes = depth16_codes(d, v, p);
-    out.depth16_bias_raises = v.depth16_bias_raises.filter(|_| out.depth16_codes);
     out
-}
-
-/// Whether a fragment stage of pass `d` under variant `v` on `p` stores Metal's `Depth16Unorm`
-/// codes itself (`LoweringInputs::depth16_codes`): the depth it renders against is
-/// `Depth16Unorm` (`VariantKey::depth16_pass`, else the pipeline's depth attachment), and
-/// [`depth16_stage_form`] holds, for a biased draw under `VariantKey::depth16_biased`.
-pub(crate) fn depth16_codes(d: FragmentPass<'_>, v: &VariantKey, p: &DeviceProfile) -> bool {
-    v.depth16_pass.unwrap_or(d.depth16)
-        && depth16_stage_form(
-            d.rasterization_enabled,
-            d.raster_sample_count,
-            v.depth16_biased,
-            p,
-        )
-}
-
-/// Whether a pipeline that rasterizes (`rasterizes`) `samples` samples per pixel on `p` takes
-/// Metal's codes from its fragment stage where it renders against a `Depth16Unorm` depth, for a
-/// draw that biases it where `biased`: it rasterizes one sample, and the profile lacks
-/// `DriverDeviation::MetalDepth16Stores`, or for a biased draw
-/// `DriverDeviation::MetalDepth16BiasedStores`. At more than one sample the device's depth is
-/// each sample's own, which one written depth would replace.
-pub(crate) fn depth16_stage_form(
-    rasterizes: bool,
-    samples: u32,
-    biased: bool,
-    p: &DeviceProfile,
-) -> bool {
-    use crate::error::DriverDeviation::{MetalDepth16BiasedStores, MetalDepth16Stores};
-    let stores = if biased {
-        MetalDepth16BiasedStores
-    } else {
-        MetalDepth16Stores
-    };
-    rasterizes && samples <= 1 && !p.takes_driver_deviation(stores)
 }
 
 /// The attributes the vertex function `spec` fetches in fixed function under `inputs` from
@@ -2350,12 +2190,7 @@ fn instanced_attributes(
     let stepped: BTreeSet<u32> = projection
         .attributes
         .iter()
-        .filter(|(_, f)| {
-            matches!(
-                f,
-                crate::pipeline::lower_inputs::VertexFetch::FixedFunction { .. }
-            )
-        })
+        .filter(|(_, f)| matches!(f, crate::pipeline::lower_inputs::VertexFetch::FixedFunction))
         .filter(|(a, _)| {
             desc.attributes
                 .get(a)
@@ -2426,32 +2261,17 @@ fn lower_inputs(
             Ok(key::canonical_inputs(&out))
         }
         InputsFrom::Vertex(desc, variant, depth, primitive_id, _) => {
-            let declared = declared_attributes(spec);
-            let attributes: BTreeMap<u32, crate::pipeline::stage_io::IoNumeric> = declared
-                .iter()
-                .map(|(index, (numeric, _))| (*index, *numeric))
-                .collect();
-            // The indexed capture form, the primitive ID's de-indexed form and the private list
-            // form pull every attribute, whatever the caller's projection would fetch in fixed
-            // function.
-            let pull_every = variant
-                .captured_positions
-                .is_some_and(|f| f.index_type().is_some())
-                || variant.primitive_id_indices.is_some()
-                || variant.private_list;
-            let mut projection = crate::pipeline::link::vertex::vertex_fetch_projection_for(
+            let attributes = declared_attributes(spec);
+            // The primitive ID's de-indexed form and the private list form pull every attribute,
+            // whatever the caller's projection would fetch in fixed function.
+            let pull_every = variant.primitive_id_indices.is_some() || variant.private_list;
+            let projection = crate::pipeline::link::vertex::vertex_fetch_projection_for(
                 desc,
                 &attributes,
                 p,
                 &variant.pulled_vertex_buffers,
                 pull_every,
             )?;
-            // `narrow_float` is key data only where the entry reads the attribute as a 32-bit
-            // `float`; a `half`-declared attribute compiles the same either way, so the bit must
-            // not key a variant of it (`link::vertex::narrow_float_of_f32_reads`).
-            crate::pipeline::link::vertex::narrow_float_of_f32_reads(&mut projection, |a| {
-                declared.get(&a).is_some_and(|&(_, f32_read)| f32_read)
-            });
             let mut out = variant.lowering_inputs(crate::pipeline::sym::Stage::Vertex);
             out.vertex_fetch = Some(projection);
             out.max_call_stack_depth = call_stack_input(depth);
@@ -2468,7 +2288,6 @@ fn lower_inputs(
             out.unattached_colors =
                 unattached_colors_written(spec, d.color_attachments, d.alpha_to_coverage);
             out.framebuffer_fetch = fetch_inputs(spec, d, variant, p);
-            out.srgb_fetches = srgb_fetches(spec, d.color_attachments);
             let read = raw_indices_read(spec);
             out.viewport_index_varying = written.viewport && read.viewport;
             out.render_target_array_index_varying = written.layer && read.layer;
@@ -2581,10 +2400,9 @@ fn decoded_module(r: &Request<'_>, m: &mut Meter) -> Result<air::Decoded, Error>
     }
 }
 
-/// [`specialize_one`], then Metal's grouping of multiply chains (`lower::arith::regroup`) and of
-/// fast-math sums (`lower::arith::reassoc`), and the order Apple's simdgroup lockstep gives
-/// threadgroup accesses made explicit for `p`: the entry selection reads, whose instruction indices
-/// a refusal's location names. [`plan_one`] and `DeviceProfile::specialized_entry` both build it
+/// [`specialize_one`], then the order Apple's simdgroup lockstep gives threadgroup accesses made
+/// explicit for `p`: the entry selection reads, whose instruction indices a refusal's location
+/// names. [`plan_one`] and `DeviceProfile::specialized_entry` both build it
 /// here, so a tool that resolves a refusal's location reads the compile's own entry.
 fn ordered_entry(r: &Request<'_>, p: &DeviceProfile, m: &mut Meter) -> Result<Specialized, Error> {
     let Specialized {
@@ -2593,11 +2411,6 @@ fn ordered_entry(r: &Request<'_>, p: &DeviceProfile, m: &mut Meter) -> Result<Sp
         spec,
         before,
     } = specialize_one(r, m)?;
-    // Metal's pairing of a multiply chain's lane-uniform factors, before lockstep's barriers name
-    // their instructions.
-    let spec = crate::lower::arith::regroup::apply(spec, m)?;
-    // Metal's grouping of each fast-math sum whose grouping the rank pins.
-    let spec = crate::lower::arith::reassoc::apply(spec, m)?;
     let spec = crate::lower::simd::lockstep::order(spec, p, m)?;
     Ok(Specialized {
         air_hash,
@@ -2710,22 +2523,11 @@ fn compile_kept<K>(
         kernel,
     } = plan_one(r, p, m)?;
     plan.estimate.check(word_cap)?;
-    let crate::lower::emit::Emitted {
-        mut module,
-        merged,
-        loop_free,
-    } = crate::lower::emit::emit_module(&spec, &plan, m)?;
+    let crate::lower::emit::Emitted { mut module, merged } =
+        crate::lower::emit::emit_module(&spec, &plan, m)?;
     // Every driver compiles each repeated region of the entry again; above the measured size,
-    // repeated regions are written once, as a loop. With the loops final, the lowering's offers for
-    // where no loop holds them are weighed: a `half` decoded by the device's widening outside every
-    // loop.
-    let held = std::mem::size_of_val(loop_free.as_slice());
-    m.charge(held)?;
-    let taken = crate::spirv::roll::roll_entry(&mut module, m)
-        .and_then(|_| crate::spirv::dead::take_outside_loops(&mut module, &loop_free, m));
-    m.release(held);
-    drop(loop_free);
-    let decoded_natively = taken? > 0;
+    // repeated regions are written once, as a loop.
+    crate::spirv::roll::roll_entry(&mut module, m)?;
     // On a driver whose compiler loses a simdgroup's storage writes after an `optnone` call only
     // its helper invocations make, those invocations take another arm where that is exact.
     let helper_guard = crate::spirv::helper_branches::guard_for(&mut module, p, m)?;
@@ -2759,23 +2561,9 @@ fn compile_kept<K>(
     // function that writes no memory. A variant compiled to read them so states its own: its only
     // texel access of each is the entry's copy, at the fragment's own pixel.
     let snapshots: Vec<u32> = plan.families.fragment.snapshot.keys().copied().collect();
-    // The fetches the copy of each makes: its image, and its unsigned integer alias too where the
-    // snapshot holds the texel's own 16 bits, the copy's two exclusive arms.
-    let copied: Vec<(u32, u32)> = snapshots
-        .iter()
-        .map(|&i| {
-            let half_bits = plan
-                .families
-                .texture
-                .slots
-                .get(&i)
-                .is_some_and(|s| s.half_bits_snapshot);
-            (i, 1 + u32::from(half_bits))
-        })
-        .collect();
     let snapshot_textures = match (snapshots.is_empty(), writes_memory) {
         (false, _) => {
-            if !crate::spirv::requirements::snapshot_copies_alone(&module, &copied, m)? {
+            if !crate::spirv::requirements::snapshot_copies_alone(&module, &snapshots, m)? {
                 return Err(Error::Internal(InternalError::new(
                     InternalKind::Invariant,
                     "a snapshot variant that reads its texture outside the copy",
@@ -2791,55 +2579,59 @@ fn compile_kept<K>(
             crate::spirv::requirements::snapshot_textures(&module, &own_pixel_textures, m)?
         }
     };
-    // A `half` rounded through `OpQuantizeToF16` (`QuantizeForm::Device`) because the device's
-    // is measured to round as Metal does: the module requires that fact. Elsewhere a `half` rounds
-    // by integer arithmetic, exact on every device, and no module holds a quantize.
+    // A `half` rounded through `OpQuantizeToF16` (`QuantizeForm::Device`): the module records the
+    // native note on every profile, a result below the smallest normal half the device's.
     let mut precision = plan.precision.clone();
     let specialized = plan.specialized.clone();
-    let device_quantize = plan.families.arith.quantize
-        == crate::spirv::builder::QuantizeForm::Device
+    let quantize = plan.families.arith.quantize;
+    let device_quantize = quantize == crate::spirv::builder::QuantizeForm::Device
         && crate::lower::arith::narrow::quantizes(&module);
-    // A `half` rounded through the device's conversion to 16 bits and back, behind a barrier
-    // Metal's compiler cannot fold it through, with no quantize, because that conversion is
-    // Metal's: the module requires that fact.
-    let converts = plan.families.arith.quantize == crate::spirv::builder::QuantizeForm::Converted
+    // A `half` rounded through the device's conversion to 16 bits and back, with no quantize: the
+    // module records the native note.
+    let converts = quantize == crate::spirv::builder::QuantizeForm::Converted
         && crate::lower::arith::narrow::rounds_by_conversion(&module, m)?;
+    // A `half` read from its bits by the device's widening, or encoded to them by its narrowing
+    // (every profile: `OpFConvert` with `shaderFloat16`, `UnpackHalf2x16` and `PackHalf2x16`
+    // without): a NaN's bits are the device's, recorded. Under the float controls its denormals
+    // are Metal's, as the conversion's; on a device whose conversion is measured to read and
+    // narrow every `half` as Metal's (`DriverDeviation::MetalHalfArithmetic`) the module requires
+    // that fact; elsewhere the device may flush them, within the native conversion's note.
+    let widens = crate::lower::arith::narrow::widens_bits(&module, m)?
+        || crate::lower::arith::narrow::encodes_bits(&module, m)?;
+    let measured_widening = widens
+        && quantize == crate::spirv::builder::QuantizeForm::Converted
+        && p.takes_driver_deviation(crate::error::DriverDeviation::MetalHalfArithmetic);
+    let native_widening =
+        widens && quantize != crate::spirv::builder::QuantizeForm::Controlled && !measured_widening;
     // A `half` rounded through the device's conversion and its widening, each decorated
     // `NoContraction`, under the float controls that make it Metal's, computed by the device's
     // 16-bit arithmetic, which they make Metal's too, or read from its bits by the device's
     // widening, which they make exact but for a NaN's bits: the entry declares them, and so
-    // requires the device's float-controls properties for them, and no fact. A module that widens
-    // so leaves a NaN's bits to the device, as the profile does (`NanMinMaxPolicy::Native`).
-    if plan.families.arith.quantize == crate::spirv::builder::QuantizeForm::Controlled {
-        let widens = crate::lower::arith::narrow::widens_bits(&module, m)?;
-        if widens
+    // requires the device's float-controls properties for them, and no fact.
+    if quantize == crate::spirv::builder::QuantizeForm::Controlled
+        && (widens
             || crate::lower::arith::narrow::computes_in_16_bits(&module)
-            || crate::lower::arith::narrow::rounds_by_conversion(&module, m)?
-        {
-            let modes = crate::lower::arith::narrow::controlled_modes(p).unwrap_or_default();
-            module.declare_modes(&modes)?;
-        }
-        if widens && !precision.contains(&PrecisionNote::NativeNanEncoding) {
-            precision.push(PrecisionNote::NativeNanEncoding);
+            || crate::lower::arith::narrow::rounds_by_conversion(&module, m)?)
+    {
+        let modes = crate::lower::arith::narrow::controlled_modes(p).unwrap_or_default();
+        module.declare_modes(&modes)?;
+    }
+    // Native half rounding and widening: a module that rounds through the device's quantize or
+    // conversion, or widens a `half` by the device where that is not measured or controlled to be
+    // Metal's, records each kind, and requires no fact.
+    let native_half = [
+        (widens, PrecisionNote::NativeNanEncoding),
+        (device_quantize, PrecisionNote::NativeHalfQuantize),
+        (
+            converts || native_widening,
+            PrecisionNote::NativeHalfConversion,
+        ),
+    ];
+    for (recorded, note) in native_half {
+        if recorded && !precision.contains(&note) {
+            precision.push(note);
             precision.sort_unstable();
         }
-    }
-    // Native half rounding: a module that rounds through the device's conversion or quantize, or
-    // decodes a `half` by the device's widening, where the profile does not take the deviation
-    // making it Metal's records the kind, and requires no fact.
-    let native_half = if device_quantize || converts || decoded_natively {
-        crate::lower::arith::narrow::native_rounding(p, plan.families.arith.quantize)
-    } else {
-        None
-    };
-    if let Some(note) = native_half {
-        precision.push(note);
-        precision.sort_unstable();
-    }
-    // A driver release past its deviations' measurement: every module relies on them.
-    if !p.fields().deviations_beyond.is_empty() {
-        precision.push(PrecisionNote::BeyondMeasuredDeviation);
-        precision.sort_unstable();
     }
     if helper_guard.exposed {
         precision.push(PrecisionNote::HelperBranchDropsSimdgroupStores);
@@ -2893,9 +2685,9 @@ fn compile_kept<K>(
             .properties
             .insert(crate::device::requirements::VkProperty::SimdgroupLockstep);
     }
-    // A filtered `half` sample left to the device's filter because it is Metal's. On a device that
-    // samples natively, every sample left to the device's sampler requires that instead, and the
-    // stage records it.
+    // Every sample, gather and comparison is the device's sampler's: Metal's own on a device
+    // that samples through it, whose answers the stage claims as Metal's, else the device's own,
+    // which the stage records. The module requires whichever it is.
     let sampling = &plan.families.sampler;
     if sampling.metal_sampler || sampling.device_sampling {
         use crate::device::requirements::VkProperty;
@@ -2904,18 +2696,10 @@ fn compile_kept<K>(
             .enabled
             .properties
             .contains(&VkProperty::DeviceSampling);
-        if native {
-            requirements.properties.insert(VkProperty::DeviceSampling);
-        } else if sampling.metal_sampler {
-            requirements.properties.insert(VkProperty::MetalSampler);
-        }
-    }
-    // An 8-bit unsigned normalized linear sample left to the device's filter because it lands
-    // within one code of Metal's at Metal's footprint step.
-    if plan.families.sampler.native_filter {
-        requirements
-            .properties
-            .insert(crate::device::requirements::VkProperty::Unorm8LinearFilter);
+        requirements.properties.insert(match native {
+            true => VkProperty::DeviceSampling,
+            false => VkProperty::MetalSampler,
+        });
     }
     // A `half` fused multiply-add left to the device's 16-bit `Fma` because it is Metal's.
     if plan.families.arith.f16_fma {
@@ -2931,8 +2715,8 @@ fn compile_kept<K>(
             .insert(crate::device::requirements::VkProperty::MetalMinMax);
     }
     // `half` `+ - * /` left to the device's 16-bit arithmetic because it is Metal's, and a `half`
-    // load's decode left to the device's widening because that measurement makes it Metal's.
-    if plan.families.arith.f16_arith || !plan.families.arith.widened.is_empty() {
+    // read from its bits by the device's widening, whose denormals that measurement makes Metal's.
+    if plan.families.arith.f16_arith || measured_widening {
         requirements
             .properties
             .insert(crate::device::requirements::VkProperty::MetalHalfArithmetic);
@@ -2956,18 +2740,6 @@ fn compile_kept<K>(
         requirements
             .properties
             .insert(crate::device::requirements::VkProperty::MetalFloatDenormals);
-    }
-    // A `half` rounding left to the device's `OpQuantizeToF16` because it rounds as Metal does.
-    if device_quantize && native_half.is_none() {
-        requirements
-            .properties
-            .insert(crate::device::requirements::VkProperty::MetalHalfQuantize);
-    }
-    // A `half` rounding left to the device's conversion because it is Metal's.
-    if converts && native_half.is_none() {
-        requirements
-            .properties
-            .insert(crate::device::requirements::VkProperty::MetalHalfConversion);
     }
     // Center varyings read as they are as their pixel form, because the device reads them at
     // the pixel center as Metal does.
@@ -2993,8 +2765,8 @@ fn compile_kept<K>(
     requirements
         .properties
         .extend(plan.families.stage_io.color_properties.iter().copied());
-    // Half-float storage writes left to the device's conversion, or their NaN to its store of
-    // `0x7fc00000`, because the device stores Metal's half.
+    // Storage writes left to the device's conversion with no note, because the device stores
+    // Metal's codes or NaN there.
     requirements
         .properties
         .extend(plan.families.texture.storage_properties.iter().copied());

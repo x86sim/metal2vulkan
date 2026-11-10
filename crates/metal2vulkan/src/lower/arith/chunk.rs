@@ -27,10 +27,9 @@
 //!   move moves both words of the lane, a dynamic index of 64 bits reads its low word (an index of
 //!   `2^32` or more is out of range), and a bitcast takes the lane's words as they are.
 //!
-//! - **`dot`** of chunked vectors is Metal's fused chain over every lane ([`dot_chain`]) where
-//!   Metal's order is the profile's, else sums each chunk's `OpDot` (a product for a one-lane
-//!   chunk) in `f32` and rounds a narrow result once; **`sincos`** of one takes each chunk's sine
-//!   and cosine, and its cosine is stored as one chunked leaf (`memory::leaf`).
+//! - **`dot`** of chunked vectors sums each chunk's `OpDot` (a product for a one-lane chunk) in
+//!   `f32` and rounds a narrow result once; **`sincos`** of one takes each chunk's sine and
+//!   cosine, and its cosine is stored as one chunked leaf (`memory::leaf`).
 //!
 //! Not lowered (`NotImplemented`): bitcasts whose lanes are `i1` or of another width, or whose
 //! total is not a whole number of words.
@@ -39,11 +38,9 @@ use crate::air::intrinsics::{AirIntrinsic, MathFn};
 use crate::air::ir::{Call, Callee, CastOp, Inst, InstId, InstKind, TypeId as AirTypeId, Value};
 use crate::budget::Meter;
 use crate::error::Error;
-use crate::lower::arith::legal::{self, chunk_lanes, not_lowered, FloatFmt, Form, Held};
+use crate::lower::arith::legal::{self, chunk_lanes, not_lowered, Form, Held};
 use crate::lower::arith::libm::Lib;
 use crate::lower::arith::math::{self, FloatFn};
-use crate::lower::arith::nan::{self, NanAnswer, NanTest};
-use crate::lower::arith::{denormal, fma};
 use crate::lower::arith::{narrow, operands_of, ops, wide, ArithStrategy};
 use crate::lower::emit::EmitCx;
 use crate::lower::select::SelectCx;
@@ -290,7 +287,7 @@ pub fn select(
         InstKind::Call(call) if is_math(call, MathFn::SinCos) => {
             super::select_sincos(cx, at, inst, call, m)
         }
-        InstKind::Call(call) if is_math(call, MathFn::Dot) => select_dot(cx, at, inst, call),
+        InstKind::Call(call) if is_math(call, MathFn::Dot) => select_dot(cx, inst, call),
         InstKind::Cast {
             op: CastOp::Bitcast,
             v,
@@ -358,24 +355,11 @@ fn is_math(call: &Call, f: MathFn) -> bool {
     )
 }
 
-/// `air.dot` of two chunked float vectors. On `float` and `half` where Metal's order is the
-/// profile's (`RoundingOrderRoute::Metal`: `RoundingOrderPolicy::Exact`, or MoltenVK), Metal's
-/// fused chain over every lane, as on two to four lanes (`math::metal_chain`): on an Apple M3 Max
-/// under macOS 27.0.1 every answer of `dot` on 5, 8 and 16 `float` lanes and on 8 and 16 `half`
-/// lanes, with and without fast-math flags, is the chain's (16,384 rows of seeded
-/// random lanes each, where the chain backwards, the chunks' sums added, and the exact sum rounded
-/// once miss 6% to 70% of them; and our probe at `float` denormals on 8 lanes). It reads its
-/// `float` operands and answers as Metal's `dot` of fewer lanes does: the lanes and the result
-/// flushed where the device keeps denormals, and the chain's values as [`ArithStrategy::Dot`]
-/// flushes them. Elsewhere the sum of each chunk's dot product, rounded once to a narrow format:
-/// `dot`'s device precision (`DeviceArithmetic`) covers the order of the sum, which Vulkan leaves
-/// to the device for `OpDot` too. Its NaN is Metal's.
-fn select_dot(
-    cx: &mut SelectCx<'_>,
-    at: InstId,
-    inst: &Inst,
-    call: &Call,
-) -> Result<ArithStrategy, Error> {
+/// `air.dot` of two chunked float vectors, on every device: the sum of each chunk's dot product by
+/// the device's `OpDot`, rounded once to a narrow format. Metal's `dot` is the products' fused
+/// chain over every lane; `dot`'s device precision (`DeviceArithmetic`) covers the order of the
+/// sum, which Vulkan leaves to the device for `OpDot` too. Its NaN is the device's.
+fn select_dot(cx: &mut SelectCx<'_>, inst: &Inst, call: &Call) -> Result<ArithStrategy, Error> {
     let (Some(&a), Some(&b)) = (call.args.first(), call.args.get(1)) else {
         return Err(cx.invariant("air.dot without its operands"));
     };
@@ -393,36 +377,6 @@ fn select_dot(
     let answer = elem.float_fmt().and_then(|fmt| {
         super::nan::function_answer(FloatFn::Dot, false, super::every_flag(call.fmf), fmt)
     });
-    let facts = super::FloatFacts::on(cx.profile);
-    if let Some(fma) = fma::Fma::by(facts.routes, elem) {
-        if !super::native_chain(facts, fma, elem) {
-            super::record(cx, super::native_fma(fma));
-            cx.families.arith.take_fma(fma);
-            super::fp_env(cx, call.fmf, elem);
-            let single = elem.float_fmt() == Some(FloatFmt::F32);
-            let (flush, reads) = if !single {
-                (false, denormal::Flush::NONE)
-            } else if denormal::device_flushes(cx.profile) {
-                cx.families.arith.device_denormals = true;
-                (false, denormal::Flush::NONE)
-            } else {
-                (
-                    fma.route.device_float(),
-                    super::denormal_flush(cx, &[a, b], 0b11, true),
-                )
-            };
-            let tiny = denormal::tiny_check(cx.profile).filter(|_| single);
-            let s = ArithStrategy::ChunkedChain {
-                lanes: shape.lanes,
-                elem,
-                fma,
-                flush,
-                reads,
-                tiny: cx.families.arith.take_tiny_check(tiny, elem),
-            };
-            return Ok(super::with_nan(cx, at, s, answer, elem));
-        }
-    }
     super::note(cx, FloatFn::Dot.precision());
     super::device_float(cx, elem, true, answer.is_none());
     super::fp_env(cx, call.fmf, elem);
@@ -431,7 +385,7 @@ fn select_dot(
         elem,
         contract: super::contraction(call.fmf),
     };
-    Ok(super::with_nan(cx, at, s, answer, elem))
+    Ok(super::with_nan(cx, s, answer))
 }
 
 /// The dot product of chunked vectors `a` and `b` of `lanes` lanes of `elem`: each chunk's `OpDot`
@@ -470,94 +424,23 @@ pub fn dot_words(lanes: u16, elem: Form) -> u32 {
         .saturating_add(8 + narrow::round_words(elem))
 }
 
-/// Metal's `dot` of chunked vectors `a` and `b` of `lanes` lanes of `elem`: its fused chain over
-/// every lane in order (`math::metal_chain`), each fused multiply-add `fma`; where `flush`, the
-/// chain's `float` values before the last read as Metal reads a denormal; each lane of the
-/// operands `reads` names, and the result where it says so, read so too ([`denormal::flush`]).
-pub fn dot_chain(
-    fb: &mut FunctionBuilder<'_>,
-    lanes: u16,
-    elem: Form,
-    [a, b]: [SValue; 2],
-    fma: math::FmaOf<'_>,
-    (flush, tiny): (bool, Option<denormal::TinyCheck>),
-    reads: denormal::Flush,
-) -> BResult<SValue> {
-    let chunks = chunk_lanes(u32::from(lanes));
-    let lane = |fb: &mut FunctionBuilder<'_>, i: u32| -> BResult<(SValue, SValue)> {
-        let c = i / 4;
-        let size = chunks.get(c as usize).copied().ok_or_else(operand_error)?;
-        let at = [c, i % 4];
-        let path = if size == 1 { &at[..1] } else { &at[..] };
-        let mut xy = [
-            fb.composite_extract(a, path)?,
-            fb.composite_extract(b, path)?,
-        ];
-        for (k, v) in xy.iter_mut().enumerate() {
-            if reads.operand(k) {
-                *v = denormal::flush(fb, elem, *v)?;
-            }
-        }
-        Ok((xy[0], xy[1]))
-    };
-    let sum = math::metal_chain(fb, elem, u32::from(lanes), &lane, fma, (flush, tiny))?;
-    if reads.result {
-        denormal::flush(fb, elem, sum)
-    } else {
-        Ok(sum)
-    }
-}
-
-/// An upper estimate of the words of [`dot_chain`] on `lanes` lanes of `elem` whose fused
-/// multiply-adds take `fma_words` each: two extractions per lane and the flushes of the lanes
-/// `reads` names, the first product and its rounding, per later lane the fused multiply-add and,
-/// where `flush`, the flush before it, and the result's flush.
-pub fn dot_chain_words(
-    lanes: u16,
-    elem: Form,
-    fma_words: u32,
-    (flush, tiny): (bool, Option<denormal::TinyCheck>),
-    reads: denormal::Flush,
-) -> u32 {
-    let lanes = u32::from(lanes);
-    let flush_words = denormal::flush_words(elem);
-    let read = reads.operands.count_ones().saturating_mul(flush_words);
-    let step = fma_words + if flush { flush_words } else { 0 };
-    let result = if reads.result { flush_words } else { 0 };
-    let check = tiny.map_or(0, |check| denormal::tiny_product_words(elem, check));
-    (12 + read)
-        .saturating_mul(lanes)
-        .saturating_add(5 + narrow::round_words(elem) + check)
-        .saturating_add(lanes.saturating_sub(1).saturating_mul(step))
-        .saturating_add(result)
-}
-
 /// The sine and cosine of `x` of shape `s`: per chunk for a chunked vector, Metal's fast ones for
-/// `air.fast_sincos` on `float` (`fast`, [`sin_cos_fns`]), each the device's instruction or the
-/// math library's routine (`lib`), with the entry's NaN `test` ([`math::float_fn`]), then Metal's
-/// NaN `answers` of each selected ([`nan::select`]).
+/// `air.fast_sincos` on `float` (`fast`, [`sin_cos_fns`]), each the device's instruction as `lib`
+/// reads it ([`math::float_fn`]).
 pub fn sin_cos(
     fb: &mut FunctionBuilder<'_>,
     s: Shape,
     x: SValue,
     fast: bool,
-    answers: [Option<NanAnswer>; 2],
-    test: NanTest,
-    lib: &Lib<'_>,
+    lib: &Lib,
 ) -> BResult<(SValue, SValue)> {
     let (sin, cos) = sin_cos_fns(fast);
     let one = |fb: &mut FunctionBuilder<'_>, f: Form, x: SValue| -> BResult<(SValue, SValue)> {
         let c = Contraction::Forbidden;
-        let mut r = [
-            math::float_fn(fb, sin, f, c, test, &[x], lib)?,
-            math::float_fn(fb, cos, f, c, test, &[x], lib)?,
-        ];
-        for (v, answer) in r.iter_mut().zip(answers) {
-            if let Some(answer) = answer {
-                *v = nan::select(fb, f, answer, test, *v, Some(x))?;
-            }
-        }
-        Ok((r[0], r[1]))
+        Ok((
+            math::float_fn(fb, sin, f, c, &[x], lib)?,
+            math::float_fn(fb, cos, f, c, &[x], lib)?,
+        ))
     };
     if !s.chunked {
         return one(fb, s.form(), x);
@@ -593,19 +476,9 @@ pub fn sin_cos_fns(fast: bool) -> (FloatFn, FloatFn) {
 }
 
 /// The words of [`sin_cos`] on shape `s`.
-pub fn sin_cos_words(s: Shape, fast: bool, answers: [Option<NanAnswer>; 2]) -> u32 {
+pub fn sin_cos_words(s: Shape, fast: bool) -> u32 {
     let (sin, cos) = sin_cos_fns(fast);
-    let per = |f: Form| {
-        let selects = answers
-            .iter()
-            .flatten()
-            .map(|a| a.words(f))
-            .fold(0u32, u32::saturating_add);
-        sin.words(f)
-            .saturating_add(cos.words(f))
-            .saturating_add(8)
-            .saturating_add(selects)
-    };
+    let per = |f: Form| sin.words(f).saturating_add(cos.words(f)).saturating_add(8);
     if !s.chunked {
         return per(s.form());
     }

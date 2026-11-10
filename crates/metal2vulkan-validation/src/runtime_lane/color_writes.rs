@@ -36,29 +36,30 @@
 //! Each case draws the same inputs into the format, every channel of a texel the same input,
 //! plain and through blending with factors one and zero, reads the attachment back, and compares
 //! every channel with the rule. One difference is the recorded near-equivalent
-//! `DeviceNanEncoding`, not a failure, where the fragment stage records it: a NaN a half-float
-//! channel stores as another NaN (ANV and RADV store `0xfe00`; lavapipe quiets or canonicalizes a
-//! `half` NaN). Such channels are counted and printed apart, with the codes stored; where the
-//! fragment stage does not record the note (the driver is measured to store Metal's NaN,
-//! `DriverDeviation::MetalFloatColorNans` and `MetalHalfColorNans`, or to store a 16-bit output's
-//! bits, `HalfColorOutputBits`, through which MoltenVK writes a `half` output), and for every other
-//! channel, a NaN's class included, the lane is exact. A case written through a 16-bit output says
-//! so. On every device but MoltenVK on Apple's GPUs, which converts as Metal does, the fragment
-//! function rounds the output by these rules itself, except where the driver is measured to convert
-//! a kind of channel as Metal does (`DriverDeviation::MetalSmallFloatColorWrites`, a `float` output
-//! to a half-float or `RG11B10Float` channel, and `MetalNorm16ColorWrites`, an output to a 16-bit
-//! unorm or snorm channel), where it writes the output as computed, a NaN chosen: a case whose
-//! fragment stage rounds nothing says so, and the lane then holds the device's own conversion to
-//! Metal's, the measurement of the deviation on that device.
+//! `DeviceNanEncoding`, not a failure, where the fragment stage records it: a NaN a half-float or
+//! unsigned small float channel stores as another NaN (ANV and RADV store `0xfe00`; lavapipe
+//! quiets or canonicalizes a `half` NaN; RADV and NVIDIA keep a small float NaN's payload). Such
+//! channels are counted and printed apart, with the codes stored; where the fragment stage does
+//! not record the note (the driver is measured to store Metal's NaN,
+//! `DriverDeviation::MetalFloatColorNans` and `MetalHalfColorNans`), and for every other channel, a
+//! NaN's class included, the lane is exact. The fragment function writes the output as computed and the device converts it: where the
+//! device is measured to convert the kind of channel as Metal does (MoltenVK on Apple's GPUs,
+//! `DriverDeviation::MetalColorWrites`; `MetalSmallFloatColorWrites`, a `float` output to a
+//! half-float or `RG11B10Float` channel; `MetalNorm16ColorWrites`, an output to a 16-bit unorm or
+//! snorm channel) the lane holds the device's conversion to Metal's, the measurement of the
+//! deviation on that device; elsewhere the fragment stage records the device's conversion
+//! (`PrecisionNote::DeviceColorConversion`), and the lane prints the channels that differ from
+//! Metal's without holding them. A word the fragment function encodes is held to Metal's rule.
 
 use super::degrade_notices::counts;
 use super::resolves::{lane, quiet, Lane};
 use crate::candidate::runtime_samples::{library, shape};
 use crate::runtime_lane::buffer_with;
 use metal2vulkan::bind::SRGB_RESOLVE_THRESHOLDS;
-use metal2vulkan::error::DriverDeviation;
 use metal2vulkan::metal::format::WordAttachment;
-use metal2vulkan::metal::{BlendFactor, ColorWriteMask, PixelFormat, PrimitiveType, TextureUsage};
+use metal2vulkan::metal::{
+    BlendFactor, ColorWriteMask, PixelFormat, PrimitiveType, TextureUsage, TextureWriteRoundingMode,
+};
 use metal2vulkan::pipeline::{
     ColorAttachmentDescriptor, PrecisionNote, Reconvergence, RenderPipelineDescriptor, StageSource,
 };
@@ -71,10 +72,7 @@ use metal2vulkan_runtime::{
 use std::collections::BTreeSet;
 
 /// The kinds [`pipeline_states_announce_the_shader_conversion_once`] takes.
-pub(super) const COLOR_WRITES: [Degradation; 2] = [
-    Degradation::ShaderColorConversion,
-    Degradation::ShaderHalfColorBits,
-];
+pub(super) const COLOR_WRITES: [Degradation; 1] = [Degradation::ShaderColorConversion];
 
 /// The texels of a row.
 const WIDTH: usize = 1024;
@@ -691,9 +689,16 @@ pub(super) fn half_toward_zero(x: f32) -> u16 {
     sign | (exponent << 10) | ((bits >> 13) & 0x3ff) as u16
 }
 
-/// Whether `code`, of `channel`, is a NaN: a half with every exponent bit and a fraction.
-fn half_nan(channel: Channel, code: u64) -> bool {
-    matches!(channel, Channel::Half) && code & 0x7c00 == 0x7c00 && code & 0x3ff != 0
+/// Whether `code`, of `channel`, is a NaN: a half, or an unsigned small float, with every
+/// exponent bit and a fraction.
+fn float_nan(channel: Channel, code: u64) -> bool {
+    let fraction = match channel {
+        Channel::Half => 10,
+        Channel::UnsignedFloat(bits) => bits,
+        _ => return false,
+    };
+    let exponent = 0x1f << fraction;
+    code & exponent == exponent && code & ((1 << fraction) - 1) != 0
 }
 
 /// The `bits` bits at `offset` of a texel.
@@ -711,17 +716,10 @@ struct Drawn {
     stored: Vec<u8>,
     /// Whether the fragment stage records `PrecisionNote::DeviceNanEncoding`.
     noted: bool,
-    /// Whether the fragment stage declares the `StorageInputOutput16` capability: its color output
-    /// is written as the bits of the half Metal stores, through a 16-bit output.
-    sixteen: bool,
-    /// Whether the fragment stage rounds the attachment's output to Metal's codes itself
-    /// (`rounded_colors`), rather than leaving its conversion to the device.
-    rounded: bool,
+    /// Whether the fragment stage records `PrecisionNote::DeviceColorConversion`: the device's own
+    /// conversion of the attachment's channels, printed against Metal's and not held to it.
+    converted: bool,
 }
-
-/// `OpCapability StorageInputOutput16`: the instruction's first word (two words, opcode 17) and
-/// the capability (4436).
-const IO16_CAPABILITY: [u32; 2] = [0x0002_0011, 4436];
 
 /// How a draw blends: not at all, with factors one and zero, or by premultiplied source-over (one
 /// and one minus the source alpha, added, for color and alpha).
@@ -780,8 +778,9 @@ fn drawn(
     let noted = fragment
         .precision_notes
         .contains(&PrecisionNote::DeviceNanEncoding);
-    let sixteen = fragment.spirv.windows(2).any(|w| w == IO16_CAPABILITY);
-    let rounded = fragment.rounded_colors.contains(&0);
+    let converted = fragment
+        .precision_notes
+        .contains(&PrecisionNote::DeviceColorConversion);
     let pipeline = device
         .new_render_pipeline_state(&pipeline, &PipelineOptions::default())
         .map_err(|e| format!("unsupported: the pipeline ({e})"))?;
@@ -823,12 +822,12 @@ fn drawn(
     Ok(Drawn {
         stored,
         noted,
-        sixteen,
-        rounded,
+        converted,
     })
 }
 
-/// Every format, plain and blended, printed against Metal's conversion and held to it.
+/// Every format, plain and blended, printed against Metal's conversion, and held to it where the
+/// fragment stage does not record the device's own conversion (`DeviceColorConversion`).
 #[test]
 fn draws_store_metals_codes() {
     let (messages, _cache, lane) = lane();
@@ -857,8 +856,7 @@ fn draws_store_metals_codes() {
             let Drawn {
                 stored,
                 noted,
-                sixteen,
-                rounded,
+                converted,
             } = match drawn(&lane, case, &values, blend, None) {
                 Ok(drawn) => drawn,
                 Err(why) => {
@@ -880,7 +878,7 @@ fn draws_store_metals_codes() {
                     channels += 1;
                     let got = field(texel, offset, channel.bits());
                     let want = metal_of(channel, x, blended, case.output);
-                    if got != want && noted && half_nan(channel, got) && half_nan(channel, want) {
+                    if got != want && noted && float_nan(channel, got) && float_nan(channel, want) {
                         nans += 1;
                         if stores.len() < 4 {
                             stores.insert(format!("{want:#06x} as {got:#06x}"));
@@ -896,37 +894,36 @@ fn draws_store_metals_codes() {
                     }
                 }
             }
-            let output = if sixteen { ", a 16-bit output" } else { "" };
             if nans > 0 {
                 let stores = stores.into_iter().collect::<Vec<_>>().join(", ");
                 eprintln!(
                     "color write {label} on {name}: {nans} NaN channels store another NaN \
-                     (DeviceNanEncoding, recorded{output}: {stores})"
+                     (DeviceNanEncoding, recorded: {stores})"
                 );
             } else if noted {
                 eprintln!(
                     "color write {label} on {name}: DeviceNanEncoding recorded, no NaN channel \
-                     differs{output}"
-                );
-            } else if sixteen {
-                eprintln!("color write {label} on {name}: written through a 16-bit output");
-            }
-            if !rounded && !sixteen {
-                eprintln!(
-                    "color write {label} on {name}: the device's own conversion (the shader \
-                     rounds nothing)"
+                     differs"
                 );
             }
+            let recorded = match converted {
+                true => " (DeviceColorConversion, recorded)",
+                false => "",
+            };
             if wrong == 0 {
                 eprintln!(
-                    "color write {label} on {name}: Metal's, 0 of {channels} channels differ"
+                    "color write {label} on {name}: Metal's, 0 of {channels} channels \
+                     differ{recorded}"
                 );
             } else {
                 eprintln!(
-                    "color write {label} on {name}: {wrong} of {channels} channels differ: {}",
+                    "color write {label} on {name}: {wrong} of {channels} channels \
+                     differ{recorded}: {}",
                     examples.join("; ")
                 );
-                differ.push(format!("{label}: {wrong} of {channels}"));
+                if !converted {
+                    differ.push(format!("{label}: {wrong} of {channels}"));
+                }
             }
         }
     }
@@ -936,7 +933,8 @@ fn draws_store_metals_codes() {
 
 /// A packed 16-bit or two-channel 8-bit sRGB format's draw under a write mask of some of its
 /// channels, over a pass that clears it: each written channel stores Metal's code of the output
-/// and each kept one the code of the clear (Metal's rule of both). A format the device holds but
+/// and each kept one the code of the clear (Metal's rule of both), held so where the fragment
+/// stage does not record the device's own conversion (`DeviceColorConversion`). A format the device holds but
 /// does not render must draw so through the view of its word (`metal::format::WordAttachment`),
 /// which the fragment function merges into the texel's, in the pixel interlock or over the
 /// attachment's input attachment on a device that orders fetch through them (lavapipe; an 8-bit
@@ -967,16 +965,17 @@ fn partly_masked_packed_formats_keep_their_fields() {
         let word = WordAttachment::of(case.pf, &profile);
         for mask in masks {
             let label = format!("{:?} under {mask:?}", case.pf);
-            let stored = match drawn(&lane, case, &values, DrawBlend::Off, Some((mask, clear))) {
-                Ok(drawn) => drawn.stored,
-                Err(why) => {
-                    eprintln!("masked color write {label} on {name}: {why}");
-                    if word.is_some() {
-                        differ.push(format!("{label}: not drawn through its word: {why}"));
+            let (stored, converted) =
+                match drawn(&lane, case, &values, DrawBlend::Off, Some((mask, clear))) {
+                    Ok(drawn) => (drawn.stored, drawn.converted),
+                    Err(why) => {
+                        eprintln!("masked color write {label} on {name}: {why}");
+                        if word.is_some() {
+                            differ.push(format!("{label}: not drawn through its word: {why}"));
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            };
+                };
             if word.is_some() {
                 eprintln!("masked color write {label} on {name}: its word merged into the texel's");
             }
@@ -1018,7 +1017,9 @@ fn partly_masked_packed_formats_keep_their_fields() {
                     "masked color write {label} on {name}: {wrong} of {channels} channels differ: {}",
                     examples.join("; ")
                 );
-                differ.push(format!("{label}: {wrong} of {channels}"));
+                if !converted {
+                    differ.push(format!("{label}: {wrong} of {channels}"));
+                }
             }
         }
     }
@@ -1166,13 +1167,13 @@ fn channel_lane(pf: PixelFormat, offset: u32) -> usize {
 }
 
 /// Render pipeline states, each made twice, announce their fragment stage's color writes once,
-/// with their stages' other kinds not announced before, and nothing else. A fragment function writing `float4` to an
-/// `RGBA8Unorm` attachment announces `shader-color-conversion` where the device does not convert
-/// as Metal does (every venue but MoltenVK), its fragment stage listing the attachment as rounded
-/// exactly there. One writing `half4` to an `RGBA16Float` attachment announces
-/// `shader-half-color-bits` where the device writes it as the half's bits through a 16-bit output
-/// (MoltenVK, `HalfColorOutputBits`), its stage listing the attachment as written so exactly there
-/// and never as rounded.
+/// with their stages' other kinds not announced before, and nothing else. A fragment function
+/// writing `float4` to an `RGBA16Float` attachment under `TextureWriteRoundingMode::NearestEven`
+/// announces `shader-color-conversion` on every device, its fragment stage listing the attachment
+/// as rounded (the one rounding the function makes: no device's conversion rounds a half to
+/// nearest even). One writing `half4` to an `RGBA16Float` attachment at Metal's default mode
+/// announces no shader conversion, its stage never listing the attachment as rounded: the half is
+/// stored as the device converts it.
 #[test]
 fn pipeline_states_announce_the_shader_conversion_once() {
     let (messages, _cache, lane) = lane();
@@ -1185,32 +1186,28 @@ fn pipeline_states_announce_the_shader_conversion_once() {
             .function_descriptor()
     };
     let compile = device.compile_device();
-    let metal = compile
-        .profile()
-        .takes_driver_deviation(DriverDeviation::MetalColorWrites);
-    let bits = compile
-        .profile()
-        .takes_driver_deviation(DriverDeviation::HalfColorOutputBits);
     // Each kind is announced once per device: the second state's are those the first did not.
     let mut seen = BTreeSet::new();
-    for (fragment, pf, kind, listed) in [
+    for (fragment, rounding, kind, listed) in [
         (
             "rt6_fill_rgba32float",
-            PixelFormat::RGBA8Unorm,
+            TextureWriteRoundingMode::NearestEven,
             Degradation::ShaderColorConversion,
-            !metal,
+            true,
         ),
         (
             "rt6_fill_rgba16float",
-            PixelFormat::RGBA16Float,
-            Degradation::ShaderHalfColorBits,
-            bits,
+            TextureWriteRoundingMode::TowardZero,
+            Degradation::ShaderColorConversion,
+            false,
         ),
     ] {
         let mut descriptor =
             RenderPipelineDescriptor::new(StageSource::Function(function("rt6_fill_vertex")));
         descriptor.fragment = Some(StageSource::Function(function(fragment)));
-        descriptor.color_attachments[0] = Some(ColorAttachmentDescriptor::new(pf));
+        descriptor.color_attachments[0] =
+            Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA16Float));
+        descriptor.texture_write_rounding_mode = rounding;
         let compiled = compile
             .compile_render_pipeline(&descriptor, &Budget::standard())
             .unwrap();
@@ -1218,15 +1215,11 @@ fn pipeline_states_announce_the_shader_conversion_once() {
             compiled.stages.iter().map(list).collect::<Vec<&[u32]>>()
         };
         let rounded = lists(&|s| s.rounded_colors.as_slice());
-        let half_bits = lists(&|s| s.half_bit_colors.as_slice());
-        let (want_rounded, want_bits): (&[&[u32]], &[&[u32]]) =
-            match (kind == Degradation::ShaderColorConversion, listed) {
-                (true, true) => (&[&[], &[0]], &[&[], &[]]),
-                (false, true) => (&[&[], &[]], &[&[], &[0]]),
-                (_, false) => (&[&[], &[]], &[&[], &[]]),
-            };
+        let want_rounded: &[&[u32]] = match listed {
+            true => &[&[], &[0]],
+            false => &[&[], &[]],
+        };
         assert_eq!(rounded, want_rounded, "{fragment}");
-        assert_eq!(half_bits, want_bits, "{fragment}");
         let mut expected: BTreeSet<Degradation> = compiled
             .stages
             .iter()
@@ -1286,8 +1279,10 @@ fn the_rules_give_metals_spot_answers() {
     assert_eq!(metal(f10, 1.0 + 1.0 / 32.0 - 1e-7, false), 15 << 5);
     assert_eq!(metal(f11, 2f32.powi(-20), false), 1);
     assert_eq!(metal(f11, 2f32.powi(-20) * 0.99, false), 0);
-    assert!(half_nan(HALF, 0x7e00) && half_nan(HALF, 0xfe00) && half_nan(HALF, 0x7c01));
-    assert!(!half_nan(HALF, 0x7c00) && !half_nan(HALF, 0xfc00) && !half_nan(U16, 0x7e00));
+    assert!(float_nan(HALF, 0x7e00) && float_nan(HALF, 0xfe00) && float_nan(HALF, 0x7c01));
+    assert!(!float_nan(HALF, 0x7c00) && !float_nan(HALF, 0xfc00) && !float_nan(U16, 0x7e00));
+    assert!(float_nan(f11, 0x7e0) && float_nan(f11, 0x7c1) && float_nan(f10, 0x3f0));
+    assert!(!float_nan(f11, 0x7c0) && !float_nan(f10, 0x3e0));
     for c in 0..0x7c0 {
         let x = unsigned_float_value(c, 6) as f32;
         assert_eq!(metal(f11, x, false), u64::from(c), "{c:#x}");

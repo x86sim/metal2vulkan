@@ -154,6 +154,9 @@ pub(super) struct ArgumentTable {
     /// with `MTLAttributeStrideStatic`, which sets none.
     pub(super) attribute_strides: BTreeMap<u32, u32>,
     pub(super) textures: BTreeMap<u32, Texture>,
+    /// The indices of `textures` that hold a memoryless texture, a texture buffer's too: none,
+    /// nearly always, so a command finds nothing to check ([`uses_memoryless`](Self::uses_memoryless)).
+    memoryless: BTreeSet<u32>,
     /// Each sampler state with the LOD clamps its bind set
     /// (`setSamplerState:lodMinClamp:lodMaxClamp:atIndex:`), which replace the state's.
     pub(super) samplers: BTreeMap<u32, (SamplerState, Option<[f32; 2]>)>,
@@ -179,6 +182,7 @@ impl Clone for ArgumentTable {
             null_tables: self.null_tables.clone(),
             attribute_strides: self.attribute_strides.clone(),
             textures: self.textures.clone(),
+            memoryless: self.memoryless.clone(),
             samplers: self.samplers.clone(),
             bytes: self.bytes.clone(),
             retained: self.retained.clone(),
@@ -810,9 +814,11 @@ impl ArgumentTable {
     }
 
     /// `setTextures:withRange:` (and `setTexture:atIndex:` as a range of one): `textures[i]` at
-    /// index `first + i`. Refused: an index past the table, a texture of another device, a
-    /// memoryless texture (measured: "texture is Memoryless, and cannot be assigned"); a refusal
-    /// binds none of them.
+    /// index `first + i`. A memoryless texture binds as plain Metal binds it (its API validation
+    /// stops the call: "texture is Memoryless, and cannot be assigned"): a command whose function
+    /// uses the slot fails its command buffer ([`uses_memoryless`](Self::uses_memoryless)).
+    /// Refused: an index past the table, a texture of another device; a refusal binds none of
+    /// them.
     pub(super) fn set_textures(
         &mut self,
         core: &mut EncoderCore,
@@ -824,14 +830,33 @@ impl ArgumentTable {
         check_range(call, first, textures.len(), TEXTURE_SLOTS)?;
         for texture in textures.iter().flatten() {
             core.check_device(call, texture.device())?;
-            texture.check_not_memoryless(call)?;
         }
         for (texture, index) in textures.iter().zip(first..) {
+            match texture {
+                Some(texture) if texture.is_memoryless() => self.memoryless.insert(index),
+                _ => self.memoryless.remove(&index),
+            };
             if let Some(replaced) = set_bare_handle(&mut self.textures, index, *texture) {
                 let_go(core, Bound::Texture(&replaced));
             }
         }
         Ok(())
+    }
+
+    /// Whether a texture slot of `stage` that `interface`'s function statically uses holds a
+    /// memoryless texture, a texture buffer's too. Plain Metal fails the command buffer of a
+    /// command that runs such a function (`CommandBufferError::InvalidResource`), whether or not
+    /// its run reads the slot, and of none whose function leaves the slot unused (an M3 Max under
+    /// macOS 27.0.1).
+    pub(super) fn uses_memoryless(&self, interface: &PipelineInterface, stage: Stage) -> bool {
+        self.memoryless.iter().any(|&index| {
+            let slot = SlotRef {
+                stage,
+                class: SlotClass::Texture,
+                index,
+            };
+            interface.slots.contains_key(&slot)
+        })
     }
 
     /// Bind `samplers` from index `first`, with `clamps` (minimums and maximums) when given.
@@ -982,7 +1007,6 @@ impl ArgumentTable {
                 table.buffers.insert(index, bound);
             }
         }
-        table.dropped_store_buffers = self.dropped_store_buffers();
         for (&index, bytes) in &self.bytes {
             table.buffers.insert(index, bound_bytes(bytes));
         }
@@ -995,21 +1019,6 @@ impl ArgumentTable {
                 .insert(index, BoundSampler::new(bound_sampler(sampler, *clamps)));
         }
         table
-    }
-
-    /// The buffer slots bound to memory whose GPU writes Metal drops
-    /// (`StageTable::dropped_store_buffers`): bit `i` where the buffer at index `i` drops them
-    /// (`Buffer::drops_writes`, no-copy memory of Metal's private option bit 24). Inline bytes
-    /// are the runtime's own upload and drop nothing. Metal holds 31 buffers a stage, so every
-    /// slot has a bit.
-    fn dropped_store_buffers(&self) -> u32 {
-        let mut slots = 0;
-        for (&index, (buffer, _)) in &self.buffers {
-            if index < u32::BITS && buffer.drops_writes() {
-                slots |= 1 << index;
-            }
-        }
-        slots
     }
 
     /// The table as `stage`'s function of `interface` reads it: `stage_table`, but a buffer bound
@@ -1101,10 +1110,6 @@ impl ArgumentTable {
         // The slots that tell the view base alignment apart first, which the buffers' shapes
         // read.
         reshape.field(&mut kept.at_bind_views, self.at_bind_views(stage, views));
-        reshape.field(
-            &mut kept.dropped_store_buffers,
-            self.dropped_store_buffers(),
-        );
         let alignment = views.alignment;
         kept.buffers.retain(|&index, _| {
             let bound = !self.reads_unbound(read, index)

@@ -234,9 +234,8 @@ pub fn bool_binary(
 }
 
 /// A float binary operator on floats of form `f` (LLVM `frem` is C `fmod`, the sign of the
-/// dividend: `OpFRem`). A narrow form rounds the `f32` result to its format; a sum or difference of
-/// two values of the format is exact below the smallest normal half
-/// ([`narrow::round_exact_below_normal`]).
+/// dividend: `OpFRem`). A narrow form rounds the `f32` result to its format by the device's
+/// rounding ([`narrow::round`]).
 pub fn float_binary(
     fb: &mut FunctionBuilder<'_>,
     op: AirBin,
@@ -253,10 +252,7 @@ pub fn float_binary(
         _ => BinOp::FRem,
     };
     let r = fb.binary_with(o, a, b, contract)?;
-    match o {
-        BinOp::FAdd | BinOp::FSub => narrow::round_exact_below_normal(fb, f, r),
-        _ => narrow::round(fb, f, r),
-    }
+    narrow::round(fb, f, r)
 }
 
 /// The census name of a `half` operator on the device's 16-bit arithmetic
@@ -287,8 +283,7 @@ pub fn f16_binary_words(f: Form) -> u32 {
 /// alternative, [`float_binary`]): `float`'s 24-bit significand is at least `2 · 11 + 2` bits, so
 /// rounding its correctly rounded sum, difference or product to `half` rounds the exact result once
 /// (the double rounding is innocuous). A NaN's bits are the device's, as the controlled rounding's
-/// are; Metal's NaN, where the profile asks for it, is selected around the instruction
-/// (`ArithStrategy::Nan`).
+/// are.
 ///
 /// The instruction is always kept apart, whatever the AIR's flags allow: a sum or difference
 /// decorated `NoContraction` (SPIRV-Cross writes its `[[clang::optnone]]` `spvFAdd` or `spvFSub`),
@@ -763,7 +758,8 @@ fn lane(fb: &mut FunctionBuilder<'_>, f: Form, x: Value, i: u8) -> BResult<Value
 }
 
 /// A lane of form `lane` as its AIR bits in an unsigned integer of its container's width
-/// (a narrow float through its exact format bits).
+/// (a narrow float through its format bits, a `half`'s by the device's narrowing,
+/// `narrow::to_bits`).
 fn lane_bits(fb: &mut FunctionBuilder<'_>, lane: Form, v: Value) -> BResult<Value> {
     if lane.is_narrow() {
         narrow::to_bits(fb, lane, v)

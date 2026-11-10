@@ -41,7 +41,9 @@
 //!   alone (probe 3 `g_r8_rgba8_in_none_rgba8` stored both colors' bytes into it).
 
 use super::degrade_notices::shared_in_system_memory;
-use super::degrade_notices::{assert_made_once, forced, made_render_kinds, resolve_kind};
+use super::degrade_notices::{
+    assert_made_once, forced, made_render_kinds, resolve_kind, tie_cleared,
+};
 use super::resolves::{lane, quiet, Lane, MSAA, ONE};
 use crate::air_library::AirLibrary;
 use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
@@ -422,11 +424,7 @@ fn a_state_color_draws_into_the_pass_color_at_its_place_in_the_record() {
             ));
         }
         if samples > 1 {
-            first.extend(resolve_kind(
-                &lane.device,
-                PixelFormat::RGBA8Unorm,
-                samples as u32,
-            ));
+            first.extend(resolve_kind(&lane.device, samples as u32));
         }
         let routed = drawn(&lane, &both, &[None, RGBA8], samples);
         let own = drawn(&lane, &alone, &[RGBA8], samples);
@@ -456,6 +454,8 @@ fn a_state_color_draws_into_the_pass_color_at_its_place_in_the_record() {
     assert_eq!(left0, [0xff, 0, 0, 0xff].repeat(8), "color 0 on {name}");
     assert_eq!(left1, [0; 32], "color 1 on {name}");
     assert_eq!(rest0, rest1, "the clear on {name}");
+    // Every pass clears to `CLEAR`, whose red 0.5 is a tie in an 8-bit channel.
+    first.extend(tie_cleared(&lane.device, true));
     let notices = assert_made_once(&messages, &[], &first);
     assert!(!notices.contains_key(&KEPT_COLORS[0]), "on {name}");
     eprintln!("colors at their places in the record on {name}: Metal's bytes");
@@ -492,6 +492,8 @@ fn an_uncovered_color_is_kept_where_metal_s_code_reads_the_attachment() {
         kept(writes);
         first.extend(made(&lane, &solid, (Fragment::Solid, &[RGBA8]), writes, 1));
     }
+    // Every pass clears to `CLEAR`, whose red 0.5 is a tie in an 8-bit channel.
+    first.extend(tie_cleared(&lane.device, true));
     let notices = assert_made_once(&messages, &[], &first);
     assert!(!notices.contains_key(&KEPT_COLORS[0]), "exact on {name}");
     kept(OVER);

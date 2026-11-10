@@ -240,16 +240,8 @@ pub fn committed_profiles() -> Result<Vec<(String, DeviceProfile)>, String> {
     committed_profiles_under(DevicePolicy::default())
 }
 
-/// Every committed device profile, as [`committed_profiles`], with Metal's sampler emulated
-/// exactly (`crate::pipeline::testing::EXACT_SAMPLING`): the profiles of a test of the sampler's
-/// emulation, which native device sampling, the default, skips on a device whose sampler is not
-/// Metal's.
-pub fn committed_exact_profiles() -> Result<Vec<(String, DeviceProfile)>, String> {
-    committed_profiles_under(crate::pipeline::testing::EXACT_SAMPLING)
-}
-
-/// [`committed_profiles`] under `policy` (the tests of the exact maths routines take
-/// `FloatMathsPolicy::Exact`, [`crate::pipeline::testing::exact_maths`]).
+/// [`committed_profiles`] under `policy` (the tests of Metal's NaN and `half` rounding take
+/// [`crate::pipeline::testing::exact_maths`]).
 pub fn committed_profiles_with(
     policy: DevicePolicy,
 ) -> Result<Vec<(String, DeviceProfile)>, String> {
@@ -309,11 +301,9 @@ pub(crate) fn committed_descriptions() -> Result<&'static [(String, DeviceDescri
         .map_err(String::clone)
 }
 
-/// The committed MoltenVK captures, MoltenVK 1.4.1 on the Apple M3 Max and on the Apple M4: they
-/// differ in their identity and allocation sizes only, so they derive one translation key and state
-/// the same deviations, and a test that singles out MoltenVK's answers among the committed profiles
-/// expects them of each.
-pub const MOLTENVK_CAPTURES: [&str; 2] = ["moltenvk-m3", "moltenvk-m4"];
+/// The committed MoltenVK captures, MoltenVK 1.4.2 on the Apple M3 Max under macOS 27.0.1: a test
+/// that singles out MoltenVK's answers among the committed profiles expects them of each.
+pub const MOLTENVK_CAPTURES: [&str; 1] = ["moltenvk-m3"];
 
 /// Whether the committed profile `stem` is one of [`MOLTENVK_CAPTURES`].
 pub fn is_moltenvk_capture(stem: &str) -> bool {

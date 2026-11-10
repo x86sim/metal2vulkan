@@ -479,7 +479,6 @@ fn store_pointer(
     if in_blob {
         return Err(refuse());
     }
-    let mut slots = Vec::with_capacity(targets.len());
     for t in &targets {
         let plan = cx
             .memory
@@ -489,12 +488,6 @@ fn store_pointer(
         if super::view_kind(cx.profile, plan) != super::ViewKind::Storage {
             return Err(cx.invariant("a pointer store through a uniform view"));
         }
-        // The store is emitted through `emit::access_at` with a value, so it is gated on the
-        // stage's dropped-store word; `access_with_leaf` below is given none and would not ask.
-        slots.push((t.slot, plan.slot));
-    }
-    for (at, slot) in slots {
-        super::request_dropped_store_word(cx, at, slot);
     }
     let to = super::access_with_leaf(cx, ptr, None, leaf, targets, null, None)?;
     let words = !cx.profile.fields().leaf.int64;
@@ -561,23 +554,24 @@ pub fn select(
 /// The null pointer in representation `ty` (a narrow or wide fat pointer), or `None` for
 /// another representation.
 pub fn null_value(fb: &mut FunctionBuilder<'_>, ty: &DemoteTy) -> BResult<Option<SValue>> {
-    let width = match ty {
-        DemoteTy::FatPtr { wide: false } => 32,
-        DemoteTy::FatPtr { wide: true } => 64,
+    // A narrow fat pointer `(root, offset)`; a wide one `(root, at, host, size)`.
+    let (width, len) = match ty {
+        DemoteTy::FatPtr { wide: false } => (32, 2),
+        DemoteTy::FatPtr { wide: true } => (64, 4),
         _ => return Ok(None),
     };
     let elem = fb.module().ty(SType::Int {
         width,
         signed: false,
     })?;
-    let v2 = fb.module().ty(SType::Vector { elem, len: 2 })?;
+    let vec = fb.module().ty(SType::Vector { elem, len })?;
     let zero = fb.module().constant(Constant::Scalar {
         ty: elem,
         bits: ConstBits(0),
     })?;
     let c = fb.module().constant(Constant::Composite {
-        ty: v2,
-        parts: [zero, zero].into(),
+        ty: vec,
+        parts: vec![zero; len as usize].into(),
     })?;
     Ok(Some(fb.module().const_value(c)?))
 }

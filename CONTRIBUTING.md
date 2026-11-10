@@ -105,11 +105,7 @@ Set `CARGO_INCREMENTAL=0` for a build that won't be edited and rebuilt.
 ## Golden output hashes and `SEMANTICS_VERSION`
 
 `src/tests/golden_hashes.rs` pins a hash of the final SPIR-V (or the refusal class) of every public
-fixture entry point on every committed profile, in `crates/metal2vulkan/tests/golden_hashes.tsv`,
-and of every fixture that samples, gathers or computes a level of detail under every exact form
-(Metal's sampler emulated and `DevicePolicy::exact_answers`), in
-`crates/metal2vulkan/tests/golden_hashes_exact.tsv`: the default policy samples natively, so only
-that table holds the sampler's emulation.
+fixture entry point on every committed profile, in `crates/metal2vulkan/tests/golden_hashes.tsv`.
 `cache::SEMANTICS_VERSION` is part of every cache key, so a change that moves a cell while its
 fixture and profile are unchanged must bump `SEMANTICS_VERSION`
 (`crates/metal2vulkan/src/cache/mod.rs`) in the same change. New, removed or edited fixtures and
@@ -154,10 +150,7 @@ where the belief that Metal refuses that input comes from and cites its evidence
 not settled is `Basis: unknown (why)`, never nothing). `docs/FAST-PATHS.md` must name every
 `DevicePolicy` accuracy choice and the notes it records (`tests::fast_paths`); `docs/API.md` must list every degrade code
 with its category and quote `examples/api_preview.rs` verbatim in its `rust` blocks; and
-`docs/METAL-COVERAGE.md` must carry the coverage table's totals. A new degrade code also goes in
-`crates/metal2vulkan-runtime/src/tests/degradation_codes.txt`, every code ever issued, which a test
-holds equal to the live codes and `Degradation::RETIRED_CODES`; a removed kind's code moves to
-`RETIRED_CODES` and to `docs/API.md`'s retired lines, and stays in the list.
+`docs/METAL-COVERAGE.md` must carry the coverage table's totals.
 
 ## Changes
 

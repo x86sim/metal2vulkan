@@ -604,11 +604,9 @@ fn instantiation_bounds_a_draw_by_its_index_buffer() {
         shadow_stencil: None,
         mesh: None,
         shader_tests: None,
-        capture: None,
         deindexed: None,
         private_list: false,
         storage_kept: 0,
-        color_write_rules: Vec::new(),
     };
     let state = BindState::default();
     let past = indexed_in(vk::IndexType::UINT32, 40, 8, 10);
@@ -654,11 +652,9 @@ fn a_draw_of_no_index_binds_inside_the_buffer() {
         shadow_stencil: None,
         mesh: None,
         shader_tests: None,
-        capture: None,
         deindexed: None,
         private_list: false,
         storage_kept: 0,
-        color_write_rules: Vec::new(),
     };
     let state = BindState::default();
     let bound = |cmds: &DrawCommands| match cmds.draw {
@@ -739,11 +735,9 @@ fn an_unbounded_indexed_indirect_draw_reads_its_arguments() {
         shadow_stencil: None,
         mesh: None,
         shader_tests: None,
-        capture: None,
         deindexed: None,
         private_list: false,
         storage_kept: 0,
-        color_write_rules: Vec::new(),
     };
     let state = BindState::default();
     for robust in [false, true] {
@@ -798,11 +792,9 @@ fn draws_bind_vertex_buffers_at_aligned_offsets_with_their_windows() {
         shadow_stencil: None,
         mesh: None,
         shader_tests: None,
-        capture: None,
         deindexed: None,
         private_list: false,
         storage_kept: 0,
-        color_write_rules: Vec::new(),
     };
     let state = |offsets: (u64, u64), stride| {
         let buffer = |offset, attribute_stride| BoundBuffer::Buffer {
@@ -890,11 +882,9 @@ fn inline_vertex_bytes_bind_the_strides_a_dynamic_layout_reads() {
         shadow_stencil: None,
         mesh: None,
         shader_tests: None,
-        capture: None,
         deindexed: None,
         private_list: false,
         storage_kept: 0,
-        color_write_rules: Vec::new(),
     };
     let state = |attribute_stride| {
         let mut t = StageTable::default();
@@ -1526,11 +1516,9 @@ fn mesh_template(flat: bool, multiples: Vec<u32>) -> GraphicsTemplate {
             records: None,
         }),
         shader_tests: None,
-        capture: None,
         deindexed: None,
         private_list: false,
         storage_kept: 0,
-        color_write_rules: Vec::new(),
     }
 }
 

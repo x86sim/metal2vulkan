@@ -443,6 +443,16 @@ impl Case for ReadWriteDescriptors {
         MetalSource::Run
     }
 
+    fn allowances(&self) -> Vec<Allowance> {
+        // The tables name block-compressed formats, which a device with no Vulkan format for one
+        // makes through a decoded twin carried beside the blocks, and the runtime says so: a
+        // performance notice at the notices site alone, every answer of the tables still
+        // compared. Measured firing on llvmpipe (LLVM 21.1.8).
+        vec![crate::replay::notice_allowance(
+            metal2vulkan_runtime::Degradation::CarriedDecodedTwin.code(),
+        )]
+    }
+
     fn inputs(&self) -> Result<Vec<Input>, String> {
         let mut words = Vec::new();
         for row in ROWS {
@@ -872,7 +882,21 @@ impl Case for HeldReadWrite {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        vec![crate::replay::shared_memory_notice()]
+        // The venue's memory model for the `Shared` read-back ([`crate::replay::shared_memory_notice`]),
+        // and the notice a device announces for a held texture whose format its heap array cannot
+        // view (`unnamed-texture-unviewable`): the array holds the class's neutral at the
+        // texture's ID. Measured firing on llvmpipe (LLVM 21.1.8), in the run whose `beyond` rows
+        // of the two sRGB formats and `BGR10A2Unorm` are refused at their dispatch. Both sit at
+        // the notices site alone: every texel is still compared. And the held textures' heap set,
+        // which MoltenVK's layout query refuses ([`crate::replay::set_past_layout_notice`]):
+        // announced on the M3 Max under MoltenVK 1.4.2, not on lavapipe.
+        vec![
+            crate::replay::shared_memory_notice(),
+            crate::replay::notice_allowance(
+                metal2vulkan_runtime::Degradation::UnnamedTextureUnviewable.code(),
+            ),
+            crate::replay::set_past_layout_notice(),
+        ]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

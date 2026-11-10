@@ -9,8 +9,7 @@
 //!   checked first), each cleared through a `Clear` load action into a 1 x 1 target: Metal's
 //!   codes, as a digest over the list. The model (`ExtendedRange::clear_texel`) gives the same
 //!   digest, checked here too: a 1 x 1 target's clear goes through `half`
-//!   (`ClearRoute::ThroughHalf`). The device answers at the M4's release
-//!   (`MetalLevel::MacOS27_0_1`), as do the loads and draws below.
+//!   (`ClearRoute::ThroughHalf`).
 //! - **Clear routes** (the consumer's M3 Max under macOS 26.7 alike). Metal clears straight to
 //!   bfloat (`ClearRoute::Straight`) where it keeps the level compressed and the pass has no draw
 //!   call, else through `half`: targets of each route clear their route's codes for colors whose
@@ -20,10 +19,10 @@
 //! - **Loads.** A 256-texel-wide target holding every bfloat code once (each channel of each
 //!   texel the next code), through one pass that stores it: loaded with no draw, which keeps
 //!   every code; loaded under a full-screen draw that writes another attachment alone, which
-//!   rewrites every code through `half` (`ExtendedRange::load_code`: 56,829 codes move); with a
-//!   `DontCare` load under that draw, which stores zeros, or with no draw, which keeps every code;
-//!   and cleared to `(0.5, -2, 3e38, 1e-30)` under that draw. Metal's answer is the SHA-256 of
-//!   the target's bytes after the pass. The probe's bfloat target was its pass's color
+//!   rewrites every code through `half` (56,829 codes move), where the device's store keeps every
+//!   code (`extended-range-bits-kept`); with a `DontCare` load under that draw, which stores
+//!   zeros, or with no draw, which keeps every code; and cleared to `(0.5, -2, 3e38, 1e-30)` under
+//!   that draw. Metal's answer is the SHA-256 of the target's bytes after the pass. The probe's bfloat target was its pass's color
 //!   attachment 0 and the drawn one attachment 1; here they are swapped, since the owned fixture
 //!   `rt6_samples`'s fill writes color 0 (Metal's pass rewrites each loaded attachment of every
 //!   tile a draw reaches, whichever it writes).
@@ -37,14 +36,14 @@
 //! A difference is printed on a `BFLOAT-TARGETS-DIFFERS` line.
 
 use super::extended_range_targets::digest;
-use super::resolves::{lane_with, quiet, Lane};
+use super::resolves::{lane, lane_with, quiet, Lane};
 use super::{buffer_with, read_buffer, WAIT};
 use crate::candidate::runtime_samples::{library, shape};
 use metal2vulkan::metal::format::{ClearRoute, ExtendedRange};
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage, TextureWriteRoundingMode};
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_runtime::{
-    BlitOption, ClearColor, LoadAction, MetalLevel, Origin, PipelineOptions, RenderPassDescriptor,
+    BlitOption, ClearColor, LoadAction, Origin, PipelineOptions, RenderPassDescriptor,
     ResourceOptions, Size, StoreAction, Texture, TextureDescriptor,
 };
 
@@ -217,15 +216,10 @@ fn texture(lane: &Lane, pf: PixelFormat, width: u64, height: u64, usage: Texture
         .unwrap_or_else(|e| panic!("a {pf:?} texture: {e}"))
 }
 
-/// The lane of the device made at the M4's release, whose Metal the probes measured.
-fn m4_lane() -> (super::Messages, super::ScratchCache, Lane) {
-    lane_with(|options| options.metal_level = Some(MetalLevel::MacOS27_0_1))
-}
-
 /// A `Clear` of a bfloat attachment stores Metal's codes for every color of the probe's.
 #[test]
 fn bfloat_clears_store_metal_s_codes() {
-    let (messages, _cache, lane) = m4_lane();
+    let (messages, _cache, lane) = lane();
     let colors = clear_colors();
     let bits = colors
         .iter()
@@ -616,12 +610,13 @@ fn load_case(lane: &Lane, pf: PixelFormat, channels: u64, case: Case) -> Vec<u8>
     read_buffer(&back, 0, length).unwrap()
 }
 
-/// A pass over a bfloat target that holds every code leaves Metal's codes: a load keeps them
-/// where nothing draws and takes them through `half` where a draw reaches their tiles, a
-/// `DontCare` load under a draw stores zeros, and a clear under a draw stores the clear's.
+/// A pass over a bfloat target that holds every code leaves the device's codes: a load keeps them
+/// where nothing draws and where a draw reaches their tiles (the device's store, where Metal's
+/// takes them through `half`: its digest is printed), a `DontCare` load under a draw stores
+/// zeros, and a clear under a draw stores the clear's, Metal's codes.
 #[test]
-fn bfloat_load_passes_leave_metal_s_codes() {
-    let (messages, _cache, lane) = m4_lane();
+fn bfloat_load_passes_leave_the_devices_codes() {
+    let (messages, _cache, lane) = lane();
     let mut wrong = Vec::new();
     for (pf, channels, _, cleared) in FORMATS {
         let form = ExtendedRange::of(pf).expect("a bfloat format");
@@ -632,14 +627,14 @@ fn bfloat_load_passes_leave_metal_s_codes() {
             Case::DontCareKept,
             Case::Cleared,
         ] {
+            // Metal's, but for a loaded target under a draw, whose codes the device's store keeps.
             let metal = match case {
-                Case::Kept | Case::DontCareKept => EVERY_CODE,
-                Case::Loaded => LOADED,
+                Case::Kept | Case::DontCareKept | Case::Loaded => EVERY_CODE,
                 Case::DontCare => DONT_CARE,
                 Case::Cleared => cleared,
             };
             let got = load_case(&lane, pf, channels, case);
-            // The model's bytes: every code, its load code, zeros, or the clear's texel.
+            // The model's bytes: every code, zeros, or the clear's texel.
             let model: Vec<u8> = got
                 .chunks(2)
                 .enumerate()
@@ -647,8 +642,7 @@ fn bfloat_load_passes_leave_metal_s_codes() {
                     let code = i as u32 & 0xffff;
                     let texel = form.clear_texel([0.5, -2.0, 3e38, 1e-30], ClearRoute::ThroughHalf);
                     let stored = match case {
-                        Case::Kept | Case::DontCareKept => code,
-                        Case::Loaded => form.load_code(code).expect("a bfloat code"),
+                        Case::Kept | Case::DontCareKept | Case::Loaded => code,
                         Case::DontCare => 0,
                         Case::Cleared => texel[i % channels as usize],
                     };
@@ -656,6 +650,9 @@ fn bfloat_load_passes_leave_metal_s_codes() {
                 })
                 .collect();
             assert_eq!(digest(&model), metal, "{pf:?} {case:?}: the model's");
+            if case == Case::Loaded {
+                println!("BFLOAT-TARGETS-KEPT {pf:?}: every code kept, Metal's {LOADED}");
+            }
             if digest(&got) != metal {
                 let first = got
                     .chunks(2)
@@ -867,7 +864,7 @@ fn drawn(
 /// and the `float`s around each code's tie, and every `half` code.
 #[test]
 fn bfloat_draws_store_metal_s_codes() {
-    let (messages, _cache, lane) = m4_lane();
+    let (messages, _cache, lane) = lane();
     let mut wrong = Vec::new();
     for (pf, sweep_of, toward_zero, nearest_even) in DRAWN {
         let channels = FORMATS

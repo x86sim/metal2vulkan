@@ -1,17 +1,15 @@
 //! The device's forms of Metal's maths, through the runtime, on the device the cfg selects, under
-//! the validation layer, with each of the policy's three choices that split native device maths set
-//! on alone, all of them on, and all of them off. Every other lane takes Metal's answers
-//! (`candidate::runtime_case::validated_options` sets `DevicePolicy::exact_answers`); this one
-//! starts from those options and turns choices on: the maths functions, divisions and fused
-//! multiply-adds (`FloatMathsPolicy::Native`: `PrecisionNote::NativeTranscendentals`,
-//! `NativeDivision`, `NativeFma`), the NaN and minimum and maximum (`NanMinMaxPolicy::Native`:
-//! `NativeNanEncoding`, `NativeMinMax`), and the rounding order (`RoundingOrderPolicy::Native`:
-//! `NativeDot`, `NativeMix`, and `NativeTranscendentals` for `fast::sqrt`). Under each setting the
-//! stage records exactly the kinds of the choices that are on (where the device's answer is not
+//! the validation layer (`candidate::runtime_case::validated_options`, whose policy changes no
+//! translation: the device's forms are the only ones). The maths functions, divisions and fused
+//! multiply-adds (`PrecisionNote::NativeTranscendentals`, `NativeDivision`, `NativeFma`) and
+//! `float` `dot`, `mix` and `fast::sqrt` (`NativeDot`, `NativeMix`, and `NativeTranscendentals`
+//! for `fast::sqrt`) are the device's on every device whose functions are not Metal's own (a
+//! `half` `dot` or `mix` records its note on every device), and the NaN
+//! and minimum and maximum (`NativeNanEncoding`, `NativeMinMax`) on every device not measured to
+//! answer Metal's.
+//! The stage records exactly the kinds of the forms it takes (where the device's answer is not
 //! Metal's own), the pipeline state announces the kinds its stage records, and every thread's
-//! answers stay within the bounds the kinds record; where a choice is off its answers are Metal's:
-//! a correctly rounded quotient and `fma`, Metal's canonical NaN `0x7fc00000`, Metal's fused `dot`
-//! and `mix`.
+//! answers stay within the bounds the kinds record.
 //!
 //! The kernel reads ten `float`s a thread and writes fourteen: `sin` and `cos` of an angle in
 //! `[-π, π]`, `exp2` of an exponent in `[-10, 10]`, `log2` of a value in `[2^-20, 2^20]`, a
@@ -26,9 +24,7 @@ use super::degrade_notices::{counts, on_device_with};
 use super::{buffer_with, read_buffer, Messages, WAIT};
 use crate::air_library::AirLibrary;
 use metal2vulkan::cache::VariantKey;
-use metal2vulkan::device::{
-    FloatControl, FloatMathsPolicy, FloatWidth, NanMinMaxPolicy, RoundingOrderPolicy, VkProperty,
-};
+use metal2vulkan::device::{FloatControl, FloatWidth, VkProperty};
 use metal2vulkan::error::DriverDeviation;
 use metal2vulkan::library::Library;
 use metal2vulkan::pipeline::{ComputePipelineDescriptor, FunctionDescriptor, PrecisionNote};
@@ -231,8 +227,11 @@ fn excess(what: &str, got: f32, want: f64, bound: f64) -> Option<String> {
 /// Metal answers its canonical `0x7fc00000`), of two numbers correctly rounded, a two-lane `dot`
 /// within `5 * 2^-24 * sum |a_i * b_i|`, a `mix` within `2^-21 * (|x * (1 - t)| + |y * t|)`, and
 /// `fast::sqrt` within Vulkan's `1 / InverseSqrt`, 4.5 ulp, and `saturate` (Metal's
-/// `clamp(x, +0, 1)`) of a NaN zero and of a number that number clamped exactly.
-fn broken(x: &[f32; IN], r: &[f32; OUT]) -> Vec<String> {
+/// `clamp(x, +0, 1)`) of a NaN zero and of a number that number clamped exactly. A `half` fused
+/// multiply-add is within one `half` ulp, or, where the stage rounds `half` natively
+/// (`native_half`: `NativeHalfQuantize` or `NativeHalfConversion`), the zero of its sign below
+/// `2^-14`.
+fn broken(x: &[f32; IN], r: &[f32; OUT], native_half: bool) -> Vec<String> {
     let [s, e, l, a, b, c, hx, hy, hz, n] = x.map(f64::from);
     let products = (c * e).abs() + (s * c).abs();
     let blend = (s * (1.0 - hx)).abs() + (c * hx).abs();
@@ -261,7 +260,10 @@ fn broken(x: &[f32; IN], r: &[f32; OUT]) -> Vec<String> {
         ),
         excess("a / b", r[4], a / b, 2.5 * ulp(a / b)),
         excess("fma", r[5], fused, 0.5 * ulp(product) + 0.5 * ulp(fused)),
-        excess("half fma", r[6], half_fused, half_ulp(half_fused)),
+        match native_half && half_fused.abs() < 2f64.powi(-14) && r[6] == 0.0 {
+            true => None,
+            false => excess("half fma", r[6], half_fused, half_ulp(half_fused)),
+        },
         excess("fmin", r[7], if n.is_nan() { a } else { a.min(n) }, 0.0),
         excess("fmax", r[8], if n.is_nan() { c } else { c.max(n) }, 0.0),
         match n.is_nan() {
@@ -283,8 +285,8 @@ fn broken(x: &[f32; IN], r: &[f32; OUT]) -> Vec<String> {
     .collect()
 }
 
-/// The native kinds of the notes `nm`'s stage records on `device`'s compile device.
-fn stage_kinds(device: &Device, bitcode: &[u8]) -> BTreeSet<Degradation> {
+/// The notes `nm`'s stage records on `device`'s compile device.
+fn stage_notes(device: &Device, bitcode: &[u8]) -> Vec<PrecisionNote> {
     let compile = device.compile_device();
     let budget = Budget::standard();
     let library = Library::from_air(bitcode).unwrap();
@@ -298,8 +300,12 @@ fn stage_kinds(device: &Device, bitcode: &[u8]) -> BTreeSet<Degradation> {
         .compile_compute_pipeline(&descriptor, &budget)
         .unwrap()
         .stage;
-    stage
-        .precision_notes
+    stage.precision_notes.to_vec()
+}
+
+/// The native kinds of [`stage_notes`].
+fn stage_kinds(notes: &[PrecisionNote]) -> BTreeSet<Degradation> {
+    notes
         .iter()
         .copied()
         .filter(|note| NATIVE.contains(note))
@@ -318,157 +324,70 @@ const NATIVE: [PrecisionNote; 7] = [
     PrecisionNote::NativeMix,
 ];
 
-/// Which of the three choices a setting turns on: the maths functions, the NaN and minimum and
-/// maximum, the rounding order.
-#[derive(Clone, Copy, Debug)]
-struct Setting {
-    maths: bool,
-    nan_min_max: bool,
-    rounding_order: bool,
-}
-
-/// Each choice alone, all of them, and none.
-const SETTINGS: [Setting; 5] = [
-    Setting {
-        maths: false,
-        nan_min_max: false,
-        rounding_order: false,
-    },
-    Setting {
-        maths: true,
-        nan_min_max: false,
-        rounding_order: false,
-    },
-    Setting {
-        maths: false,
-        nan_min_max: true,
-        rounding_order: false,
-    },
-    Setting {
-        maths: false,
-        nan_min_max: false,
-        rounding_order: true,
-    },
-    Setting {
-        maths: true,
-        nan_min_max: true,
-        rounding_order: true,
-    },
-];
-
 /// `x` rounded to a `half` to nearest even (a normal `half`'s magnitude).
 fn to_half(x: f64) -> f64 {
     let ulp = half_ulp(x);
     (x / ulp).round_ties_even() * ulp
 }
 
-/// Where a thread's answers are not Metal's under `setting` (Metal's own being known exactly for
-/// the choices that are off): a correctly rounded quotient, `float` `fma` and `half` `fma` with
-/// the maths functions off (the routines', on any device); Metal's canonical NaN for the product
-/// of a NaN with the NaN and minimum and maximum off; and Metal's fused `dot` (its chain of the
-/// products) and `mix` (`fma(t, y, fma(-t, x, x))`) with the rounding order and the maths
-/// functions off (the `float` fused multiply-add then Metal's own, correctly rounded).
-fn not_metal_s(setting: Setting, x: &[f32; IN], r: &[f32; OUT]) -> Vec<String> {
-    let [s, e, _, a, b, c, hx, hy, hz, n] = *x;
-    let mut out = Vec::new();
-    let mut want = |what: &str, got: f32, metal: f32| {
-        if got.to_bits() != metal.to_bits() {
-            out.push(format!("{what}: {got:e} for Metal's {metal:e}"));
-        }
-    };
-    if !setting.maths {
-        want("a / b", r[4], (f64::from(a) / f64::from(b)) as f32);
-        want("fma", r[5], a.mul_add(b, c));
-        let half = f64::from(hx) * f64::from(hy) + f64::from(hz);
-        want("half fma", r[6], to_half(half) as f32);
-    }
-    if !setting.nan_min_max && n.is_nan() {
-        want("n * b", r[9], f32::from_bits(0x7fc0_0000));
-    }
-    if !setting.rounding_order && !setting.maths {
-        want("dot", r[10], s.mul_add(c, c * e));
-        want("mix", r[11], hx.mul_add(c, (-hx).mul_add(s, s)));
-    }
-    out
-}
-
-/// Under each setting of the three choices, on a device whose `float` functions are not Metal's
-/// own, the stage records exactly the kinds of the choices that are on: the maths functions
-/// `NativeTranscendentals` and `NativeDivision` (and `NativeFma` where an `fma` takes the device's
-/// `Fma`), the NaN and minimum and maximum `NativeNanEncoding` (on a device whose arithmetic is not
-/// measured to answer Metal's canonical NaN) and `NativeMinMax`, and the rounding order
-/// `NativeDot`, `NativeMix` and `NativeTranscendentals` (`fast::sqrt`); the pipeline state
-/// announces each native kind of its stage once; every thread's answers are within the bounds their
-/// kinds record, and Metal's where their choice is off. On MoltenVK, whose functions, minimum and
-/// maximum, and NaNs are Metal's own, the stage records none of them under any setting and
-/// announces none. The device made with native device maths announces
-/// `float-tininess-after-rounding` as it is made, exactly off MoltenVK.
+/// On a device whose `float` functions are not Metal's own, the stage records exactly the kinds of
+/// the forms it takes: the maths functions `NativeTranscendentals` and `NativeDivision` (and
+/// `NativeFma` where an `fma` takes the device's `Fma`), `NativeDot`, `NativeMix` and
+/// `NativeTranscendentals` (`fast::sqrt`), and `NativeMinMax` where the device is not measured to
+/// answer Metal's operand; and `NativeNanEncoding` wherever the device is not measured to answer
+/// Metal's canonical NaN (on one measured to, it records the note where the kernel computes another
+/// of Metal's NaNs). The pipeline state announces each native kind of its stage once, and every
+/// thread's answers are within the bounds their kinds record. On MoltenVK, whose functions and
+/// minimum and maximum are Metal's own, the stage records none of their kinds and announces none.
+/// The device announces `float-tininess-after-rounding` as it is made, exactly off MoltenVK.
 #[test]
-fn each_choice_answers_within_its_recorded_bounds_on_and_metal_s_off() {
+fn native_maths_answers_within_its_recorded_bounds() {
     let bitcode = llvm_assemble_text(&kernel()).unwrap();
-    for setting in SETTINGS {
-        on_device_with(
-            |options| {
-                let policy = &mut options.policy;
-                if setting.maths {
-                    policy.float_maths = FloatMathsPolicy::Native;
-                }
-                if setting.nan_min_max {
-                    policy.nan_and_min_max = NanMinMaxPolicy::Native;
-                }
-                if setting.rounding_order {
-                    policy.rounding_order = RoundingOrderPolicy::Native;
-                }
-            },
-            |device, messages| answers_under(device, messages, setting, &bitcode),
-        );
-    }
+    on_device_with(
+        |_| {},
+        |device, messages| answers_under(device, messages, &bitcode),
+    );
 }
 
-/// [`each_choice_answers_within_its_recorded_bounds_on_and_metal_s_off`] under `setting`, on
-/// `device`, made with it.
-fn answers_under(device: &Device, messages: &Messages, setting: Setting, bitcode: &[u8]) {
-    let name = format!("{} {setting:?}", device.name());
-    let expected = stage_kinds(device, bitcode);
+/// [`native_maths_answers_within_its_recorded_bounds`] on `device`.
+fn answers_under(device: &Device, messages: &Messages, bitcode: &[u8]) {
+    let name = device.name().to_string();
+    let notes = stage_notes(device, bitcode);
+    let expected = stage_kinds(&notes);
+    // A `half` the device rounds natively may be the zero of its sign below `2^-14`.
+    let native_half = notes.iter().any(|note| {
+        matches!(
+            note,
+            PrecisionNote::NativeHalfQuantize | PrecisionNote::NativeHalfConversion
+        )
+    });
     let compile = device.compile_device();
     let takes = |d| compile.profile().takes_driver_deviation(d);
     let metals = takes(DriverDeviation::MetalFloatFunctions);
     eprintln!("{name}: Metal's own functions {metals}; native kinds {expected:?}");
-    let Setting {
-        maths,
-        nan_min_max,
-        rounding_order,
-    } = setting;
     // The constructor checked the creation notices against `creation_kinds`: the device's
-    // multiply and fused multiply-add, taken under native device maths, announced as it was made.
+    // multiply and fused multiply-add, announced as it was made.
     assert_eq!(
-        super::creation_kinds(device, false).contains(&Degradation::FloatTininessAfterRounding),
-        maths && !metals,
+        super::creation_kinds(device).contains(&Degradation::FloatTininessAfterRounding),
+        !metals,
         "{name}: float-tininess-after-rounding"
     );
     for (note, native) in [
-        (
-            PrecisionNote::NativeTranscendentals,
-            !metals && (maths || rounding_order),
-        ),
-        (PrecisionNote::NativeDivision, !metals && maths),
-        (PrecisionNote::NativeDot, !metals && rounding_order),
-        (PrecisionNote::NativeMix, !metals && rounding_order),
+        (PrecisionNote::NativeTranscendentals, !metals),
+        (PrecisionNote::NativeDivision, !metals),
+        (PrecisionNote::NativeDot, !metals),
+        (PrecisionNote::NativeMix, !metals),
         (
             PrecisionNote::NativeMinMax,
-            nan_min_max && !metals && !takes(DriverDeviation::MetalMinMax),
-        ),
-        (
-            PrecisionNote::NativeNanEncoding,
-            nan_min_max && !takes(DriverDeviation::MetalCanonicalNans),
+            !metals && !takes(DriverDeviation::MetalMinMax),
         ),
     ] {
         let kind = Degradation::from_precision_note(note);
         assert_eq!(expected.contains(&kind), native, "{name}: {kind:?}");
     }
-    if !maths {
-        let kind = Degradation::from_precision_note(PrecisionNote::NativeFma);
-        assert!(!expected.contains(&kind), "{name}: {kind:?}");
+    if !takes(DriverDeviation::MetalCanonicalNans) {
+        let kind = Degradation::from_precision_note(PrecisionNote::NativeNanEncoding);
+        assert!(expected.contains(&kind), "{name}: {kind:?}");
     }
 
     let library = device.new_library_with_air(bitcode).unwrap();
@@ -491,8 +410,8 @@ fn answers_under(device: &Device, messages: &Messages, setting: Setting, bitcode
         .collect();
     assert_eq!(announced, expected, "{name}: the announced native kinds");
     if metals {
-        // The device's functions are Metal's own (MoltenVK): no native maths to bound; the exact
-        // lanes check its answers against Metal's.
+        // The device's functions are Metal's own (MoltenVK): no native maths to bound;
+        // `driver_deviations` checks its answers against Metal's.
         return;
     }
 
@@ -531,9 +450,8 @@ fn answers_under(device: &Device, messages: &Messages, setting: Setting, bitcode
         .zip(results.as_chunks::<OUT>().0.iter())
         .enumerate()
     {
-        failures.extend(broken(x, r).into_iter().map(|f| format!("thread {i}: {f}")));
         failures.extend(
-            not_metal_s(setting, x, r)
+            broken(x, r, native_half)
                 .into_iter()
                 .map(|f| format!("thread {i}: {f}")),
         );
@@ -541,8 +459,8 @@ fn answers_under(device: &Device, messages: &Messages, setting: Setting, bitcode
         correctly_rounded += u32::from(r[4] == (a / b) as f32);
     }
     eprintln!(
-        "{name}: {} answers break a bound or Metal's; {correctly_rounded} of {COUNT} quotients \
-         correctly rounded",
+        "{name}: {} answers break a bound; {correctly_rounded} of {COUNT} quotients correctly \
+         rounded",
         failures.len()
     );
     assert!(
@@ -594,6 +512,37 @@ entry:
     .to_owned()
 }
 
+/// Whether `got` is within the native half rounding's recorded bound of Metal's `half` of `x`: one
+/// unit in the last place of the `half`, 65504 for an infinity, or a zero for an `x` below `2^-14`
+/// (the quantize tests the value it rounds, so Metal's `2^-14` from just below may be a zero too).
+fn half_within(got: f32, x: f64) -> bool {
+    let want = metal_half(x);
+    (want.is_finite() && (f64::from(got) - want).abs() <= half_ulp(want))
+        || (want.is_infinite() && f64::from(got) == 65504f64.copysign(want))
+        || (x.abs() < 2f64.powi(-14) && got == 0.0)
+}
+
+/// Whether `got` is within the bound ([`half_within`]) of the `half` sum of `a` and `b` each first
+/// rounded to `half` within it: the bound is each rounding's, so a sum of operands the device
+/// rounded an ulp off, or flushed, is the device's sum of those.
+fn half_within_sum(got: f32, a: f64, b: f64) -> bool {
+    let near = |x: f64| -> Vec<f64> {
+        let want = metal_half(x);
+        if want.is_infinite() {
+            return vec![want, 65504f64.copysign(want)];
+        }
+        let ulp = half_ulp(want);
+        let mut v = vec![want, want - ulp, want + ulp];
+        if x.abs() < 2f64.powi(-14) {
+            v.push(0f64.copysign(x));
+        }
+        v
+    };
+    near(a)
+        .iter()
+        .any(|ha| near(b).iter().any(|hb| half_within(got, ha + hb)))
+}
+
 /// Metal's `half(float)` of `x`: to nearest even on the `half` grid, half denormals kept,
 /// infinity from 65520 up.
 fn metal_half(x: f64) -> f64 {
@@ -621,150 +570,136 @@ fn half_operands() -> Vec<[f32; 2]> {
     (0..COUNT).map(|_| [one(), one()]).collect()
 }
 
-/// With native half rounding on, on a device whose conversion to 16 bits is neither measured to be
-/// Metal's nor made Metal's by its float controls, the stage records `NativeHalfConversion` (or
-/// `NativeHalfQuantize` without `shaderFloat16`) and the pipeline state announces it, and each
+/// On a device whose float controls do not make its conversion to 16 bits Metal's, the stage
+/// records `NativeHalfConversion` (or `NativeHalfQuantize` without `shaderFloat16`, whose narrowing
+/// and sum are the bare quantize) and the pipeline state announces it, and each
 /// `half` narrowing and sum is within the bound the note records: one unit in the last place of the
 /// `half`, 65504 where Metal answers infinity from 65520 up on a device that rounds toward zero,
-/// and the zero of its sign below `2^-14` on one that flushes 16-bit denormals; or the `float`
+/// and the zero of its sign below `2^-14` on one that flushes 16-bit denormals (or whose quantize
+/// does), the sum's of operands each so rounded ([`half_within_sum`]); or the `float`
 /// computation itself, each rounding the device dropped left out: NVIDIA's (RTX 3090) and
 /// lavapipe's (Mesa 26.2.4 with LLVM 23.1.1; 2526 of 8192 sums Metal's) compilers drop the
 /// conversion pair, so `half(a)` is `a` and the sum `a + b` rounded to `float` once (or of the
 /// operands rounded, or rounded itself), exactly. CI's lavapipe (Mesa 26.0.8 with LLVM 21.1.8)
-/// rounds here (8192 of 8192). With it off (Metal's integer rounding) each is Metal's `half(float)`
-/// exactly, and neither kind is recorded. A device measured to round as Metal does (MoltenVK), or
-/// whose float controls make its conversion Metal's (the module declares `RoundingModeRTE`,
-/// `DenormPreserve` and `SignedZeroInfNanPreserve` for 16 bits: ANV and RADV), records neither
-/// under either setting and answers Metal's exactly.
+/// rounds here (8192 of 8192). A device whose float controls make its conversion Metal's (the
+/// module declares `RoundingModeRTE`, `DenormPreserve` and `SignedZeroInfNanPreserve` for 16
+/// bits: ANV and RADV) records neither and answers Metal's exactly.
 #[test]
-fn half_rounding_answers_within_its_recorded_bound_on_and_metal_s_off() {
-    use metal2vulkan::device::HalfRoundingPolicy;
+fn half_rounding_answers_within_its_recorded_bound() {
     let bitcode = llvm_assemble_text(&half_kernel()).unwrap();
     let kinds = [
         PrecisionNote::NativeHalfConversion,
         PrecisionNote::NativeHalfQuantize,
     ];
-    for on in [false, true] {
-        on_device_with(
-            |options| {
-                if on {
-                    options.policy.half_rounding = HalfRoundingPolicy::Native;
-                }
-            },
-            |device, messages| {
-                let name = format!("{} half rounding on {on}", device.name());
-                let profile = device.compile_device().profile();
-                let measured = profile.takes_driver_deviation(DriverDeviation::MetalHalfQuantize)
-                    || profile.takes_driver_deviation(DriverDeviation::MetalHalfConversion);
-                // A module rounding under the float controls that make the device's conversion
-                // Metal's declares `DenormPreserve` for 16 bits, and so requires its property.
-                let controlled = {
-                    let library = Library::from_air(&bitcode).unwrap();
-                    let function = FunctionDescriptor::new(library.function("hr").unwrap());
-                    let inputs = VariantKey::new().lowering_inputs(Stage::Kernel);
-                    device
-                        .compile_device()
-                        .compile_function(&function, &inputs, &Budget::standard())
-                        .unwrap()
-                        .requirements()
-                        .properties
-                        .contains(&VkProperty::FloatControl(
-                            FloatControl::DenormPreserve,
-                            FloatWidth::F16,
-                        ))
-                };
-                let metal_s = measured || controlled;
-                let library = device.new_library_with_air(&bitcode).unwrap();
-                let function = library.new_function_with_name("hr").unwrap();
-                let descriptor = ComputePipelineDescriptor::new(StageSource::Function(
-                    function.function_descriptor(),
-                ));
-                let state = device
-                    .new_compute_pipeline_state(&descriptor, &PipelineOptions::default())
-                    .unwrap();
-                let announced: BTreeSet<PrecisionNote> = counts(&messages.take_notices())
-                    .into_keys()
-                    .filter_map(|kind| kind.precision_note())
-                    .filter(|note| kinds.contains(note))
-                    .collect();
-                eprintln!(
-                    "{name}: measured {measured}, float controls {controlled}; announced \
-                     {announced:?}"
-                );
-                assert_eq!(announced.len(), usize::from(on && !metal_s), "{name}");
-                let operands = half_operands();
-                let bytes: Vec<u8> = operands
-                    .iter()
-                    .flatten()
-                    .flat_map(|v| v.to_le_bytes())
-                    .collect();
-                let input = buffer_with(device, &bytes).unwrap();
-                let output = buffer_with(device, &vec![0xAB; COUNT as usize * 2 * 4]).unwrap();
-                let queue = device.new_command_queue().unwrap();
-                let command_buffer = queue.command_buffer().unwrap();
-                let mut encoder = command_buffer.compute_command_encoder().unwrap();
-                encoder.set_compute_pipeline_state(&state).unwrap();
-                encoder.set_buffer(Some(&input), 0, 0).unwrap();
-                encoder.set_buffer(Some(&output), 0, 1).unwrap();
-                encoder
-                    .dispatch_threadgroups(
-                        Size::new(COUNT / THREADS, 1, 1),
-                        Size::new(THREADS, 1, 1),
-                    )
-                    .unwrap();
-                encoder.end_encoding().unwrap();
-                command_buffer.commit().unwrap();
-                command_buffer.wait_until_completed_for(WAIT).unwrap();
-                assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
-                let results: Vec<f32> = read_buffer(&output, 0, COUNT * 2 * 4)
+    on_device_with(
+        |_| {},
+        |device, messages| {
+            let name = format!("{} half rounding", device.name());
+            // A module rounding under the float controls that make the device's conversion
+            // Metal's declares `DenormPreserve` for 16 bits, and so requires its property.
+            let required = {
+                let library = Library::from_air(&bitcode).unwrap();
+                let function = FunctionDescriptor::new(library.function("hr").unwrap());
+                let inputs = VariantKey::new().lowering_inputs(Stage::Kernel);
+                device
+                    .compile_device()
+                    .compile_function(&function, &inputs, &Budget::standard())
                     .unwrap()
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-                    .collect();
-                let mut failures = Vec::new();
-                let mut exact = 0;
-                for (i, (&[a, b], r)) in operands
-                    .iter()
-                    .zip(results.as_chunks::<2>().0.iter())
-                    .enumerate()
-                {
-                    let ha = metal_half(f64::from(a));
-                    let sum = metal_half(ha + metal_half(f64::from(b)));
-                    // The `float` computation with the device's dropped roundings left out.
-                    let hb = metal_half(f64::from(b));
-                    let unrounded_sum = [
-                        a + b,
-                        ha as f32 + hb as f32,
-                        metal_half(f64::from(a + b)) as f32,
-                    ];
-                    for (what, got, want, unrounded) in [
-                        ("half(a) + half(b)", r[0], sum, &unrounded_sum[..]),
-                        ("half(a)", r[1], ha, &[a][..]),
-                    ] {
-                        let same = got.to_bits() == (want as f32).to_bits();
-                        exact += u32::from(same);
-                        let within = same
-                            || (want.is_finite()
-                                && (f64::from(got) - want).abs() <= half_ulp(want))
-                            || (want.is_infinite() && f64::from(got) == 65504f64.copysign(want))
-                            || (want.abs() < 2f64.powi(-14) && got == 0.0)
-                            || unrounded.iter().any(|u| u.to_bits() == got.to_bits());
-                        if !((on && !metal_s && within) || same) {
-                            failures.push(format!(
-                                "thread {i}: {what} of {a:e}, {b:e}: {got:e} for Metal's {want:e}"
-                            ));
-                        }
+                    .requirements()
+                    .properties
+                    .clone()
+            };
+            let controlled = required.contains(&VkProperty::FloatControl(
+                FloatControl::DenormPreserve,
+                FloatWidth::F16,
+            ));
+            let library = device.new_library_with_air(&bitcode).unwrap();
+            let function = library.new_function_with_name("hr").unwrap();
+            let descriptor = ComputePipelineDescriptor::new(StageSource::Function(
+                function.function_descriptor(),
+            ));
+            let state = device
+                .new_compute_pipeline_state(&descriptor, &PipelineOptions::default())
+                .unwrap();
+            let announced: BTreeSet<PrecisionNote> = counts(&messages.take_notices())
+                .into_keys()
+                .filter_map(|kind| kind.precision_note())
+                .filter(|note| kinds.contains(note))
+                .collect();
+            // A rounding by the bare quantize is the device's: only the float controls answer
+            // Metal's.
+            let metal_s = controlled;
+            eprintln!("{name}: float controls {controlled}; announced {announced:?}");
+            assert_eq!(announced.len(), usize::from(!metal_s), "{name}");
+            let operands = half_operands();
+            let bytes: Vec<u8> = operands
+                .iter()
+                .flatten()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            let input = buffer_with(device, &bytes).unwrap();
+            let output = buffer_with(device, &vec![0xAB; COUNT as usize * 2 * 4]).unwrap();
+            let queue = device.new_command_queue().unwrap();
+            let command_buffer = queue.command_buffer().unwrap();
+            let mut encoder = command_buffer.compute_command_encoder().unwrap();
+            encoder.set_compute_pipeline_state(&state).unwrap();
+            encoder.set_buffer(Some(&input), 0, 0).unwrap();
+            encoder.set_buffer(Some(&output), 0, 1).unwrap();
+            encoder
+                .dispatch_threadgroups(Size::new(COUNT / THREADS, 1, 1), Size::new(THREADS, 1, 1))
+                .unwrap();
+            encoder.end_encoding().unwrap();
+            command_buffer.commit().unwrap();
+            command_buffer.wait_until_completed_for(WAIT).unwrap();
+            assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
+            let results: Vec<f32> = read_buffer(&output, 0, COUNT * 2 * 4)
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .collect();
+            let mut failures = Vec::new();
+            let mut exact = 0;
+            for (i, (&[a, b], r)) in operands
+                .iter()
+                .zip(results.as_chunks::<2>().0.iter())
+                .enumerate()
+            {
+                let ha = metal_half(f64::from(a));
+                let sum = metal_half(ha + metal_half(f64::from(b)));
+                // The `float` computation with the device's dropped roundings left out.
+                let hb = metal_half(f64::from(b));
+                let unrounded_sum = [
+                    a + b,
+                    ha as f32 + hb as f32,
+                    metal_half(f64::from(a + b)) as f32,
+                ];
+                for (what, got, want, unrounded) in [
+                    ("half(a) + half(b)", r[0], sum, &unrounded_sum[..]),
+                    ("half(a)", r[1], ha, &[a][..]),
+                ] {
+                    let same = got.to_bits() == (want as f32).to_bits();
+                    exact += u32::from(same);
+                    let rounded = match what {
+                        "half(a)" => half_within(got, f64::from(a)),
+                        _ => half_within_sum(got, f64::from(a), f64::from(b)),
+                    };
+                    let within =
+                        same || rounded || unrounded.iter().any(|u| u.to_bits() == got.to_bits());
+                    if !((!metal_s && within) || same) {
+                        failures.push(format!(
+                            "thread {i}: {what} of {a:e}, {b:e}: {got:e} for Metal's {want:e}"
+                        ));
                     }
                 }
-                eprintln!("{name}: {exact} of {} answers Metal's exactly", 2 * COUNT);
-                assert!(
-                    failures.is_empty(),
-                    "{name}: {:#?}",
-                    &failures[..failures.len().min(24)]
-                );
-            },
-        );
-    }
+            }
+            eprintln!("{name}: {exact} of {} answers Metal's exactly", 2 * COUNT);
+            assert!(
+                failures.is_empty(),
+                "{name}: {:#?}",
+                &failures[..failures.len().min(24)]
+            );
+        },
+    );
 }

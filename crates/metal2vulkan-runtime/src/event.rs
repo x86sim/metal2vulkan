@@ -14,7 +14,9 @@
 //!   `VkQueue`.
 //! - **Who observes.** A completion turn sees each batch complete, and with it the event
 //!   signals of the batch; reading the value reads the semaphore's counter too. Either one wakes
-//!   the host's waits and posts the listeners' notifications that came due.
+//!   the host's waits and posts the listeners' notifications that came due. A signal submitted
+//!   while a copied host buffer is live is the completion turn's alone, which merges first
+//!   (`event_timeline.rs`, `copied.rs`).
 //! - **A read is observed once a host wait returned for it.** The program may read what the
 //!   signalling work wrote once it sees the value, and Vulkan orders host operations after a
 //!   signal only through a wait ("signal operations happening before host operations that wait
@@ -194,6 +196,13 @@ impl EventShared {
         lock(&self.state).timeline.wait(value)
     }
 
+    /// How the host waits for `value` to land: reached, or the index of the submitted GPU signal
+    /// that reaches it, a wait held on the host included (`EventTimeline::landing`); `None` while
+    /// nothing submitted or set reaches it.
+    pub(super) fn landing(&self, value: u64) -> Option<WaitFor> {
+        lock(&self.state).timeline.landing(value)
+    }
+
     /// Whether a wait for `value` is held on the host where a Vulkan wait for a submitted GPU
     /// signal's index would have served (`event_timeline.rs`).
     pub(super) fn held_for_the_host(&self, value: u64) -> bool {
@@ -206,8 +215,10 @@ impl EventShared {
     }
 
     /// The batch of a kept signal was submitted.
-    pub(super) fn keep(&self, index: u64, value: u64, queue: usize) {
-        lock(&self.state).timeline.keep(index, value, queue);
+    pub(super) fn keep(&self, index: u64, value: u64, queue: usize, behind_merge: bool) {
+        lock(&self.state)
+            .timeline
+            .keep(index, value, queue, behind_merge);
     }
 
     /// The semaphore reached `index`: wake the host's waits and post the notifications that came

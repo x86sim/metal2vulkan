@@ -12,7 +12,6 @@ use crate::error::Error;
 use crate::gpu_time;
 use crate::image_barrier::MemoryReads;
 use crate::loader_word::LoaderWord;
-use crate::metal_level::{choose, Host};
 use crate::shader_cache::{CacheSetup, ShaderCacheOptions};
 use crate::sparse::device::SparseFeatures;
 use ash::vk;
@@ -24,7 +23,7 @@ use std::sync::Arc;
 /// The consumer's Vulkan objects a runtime device adopts ([`Device::from_raw`]). No Metal
 /// counterpart: an interop hook.
 #[non_exhaustive]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RawDevice {
     /// The `vkGetInstanceProcAddr` the instance was made through.
     pub get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
@@ -98,10 +97,57 @@ pub struct RawDevice {
     /// [`DeviceOptions::lowering_refuses`](crate::DeviceOptions::lowering_refuses) says: none by
     /// default.
     pub lowering_refuses: BTreeSet<crate::Degradation>,
-    /// The macOS release whose Metal the device answers as, as
-    /// [`DeviceOptions::metal_level`](crate::DeviceOptions::metal_level) says: `None` by default,
-    /// the host's.
-    pub metal_level: Option<crate::MetalLevel>,
+    /// Where the device hands its pipeline records, as
+    /// [`DeviceOptions::pipeline_records`](crate::DeviceOptions::pipeline_records) says: `None`
+    /// by default, no record made. Metal has no such setting.
+    pub pipeline_records: Option<Arc<dyn Fn(crate::PipelineRecord) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for RawDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Every field is named, so a field added later is written here or this fails to compile.
+        let RawDevice {
+            get_instance_proc_addr,
+            instance,
+            instance_api_version,
+            physical_device,
+            device,
+            queue_family,
+            queue_index,
+            enabled,
+            device_extensions,
+            shader_cache,
+            sparse_features,
+            view_format_reinterpretation,
+            host_image_copy,
+            gpu_times_from_host,
+            announce_each,
+            lowering_refuses,
+            pipeline_records,
+        } = self;
+        f.debug_struct("RawDevice")
+            .field("get_instance_proc_addr", get_instance_proc_addr)
+            .field("instance", instance)
+            .field("instance_api_version", instance_api_version)
+            .field("physical_device", physical_device)
+            .field("device", device)
+            .field("queue_family", queue_family)
+            .field("queue_index", queue_index)
+            .field("enabled", enabled)
+            .field("device_extensions", device_extensions)
+            .field("shader_cache", shader_cache)
+            .field("sparse_features", sparse_features)
+            .field("view_format_reinterpretation", view_format_reinterpretation)
+            .field("host_image_copy", host_image_copy)
+            .field("gpu_times_from_host", gpu_times_from_host)
+            .field("announce_each", announce_each)
+            .field("lowering_refuses", lowering_refuses)
+            .field(
+                "pipeline_records",
+                &pipeline_records.as_ref().map(|_| "hook"),
+            )
+            .finish()
+    }
 }
 
 impl RawDevice {
@@ -132,7 +178,7 @@ impl RawDevice {
             gpu_times_from_host: false,
             announce_each: BTreeSet::new(),
             lowering_refuses: BTreeSet::new(),
-            metal_level: None,
+            pipeline_records: None,
         }
     }
 }
@@ -146,9 +192,7 @@ impl Device {
     /// `Unsupported` or `Compile`), one whose timeline semaphores step less than Vulkan
     /// requires (`Unsupported`, `Feature::TimelineSemaphores`), and a MoltenVK device without
     /// Metal argument buffers (`DriverSetting`): the consumer's instance must leave MoltenVK's
-    /// `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS` on. And, with no `raw.metal_level`, a macOS host
-    /// below every measured release, or whose release cannot be read (`Unproven`,
-    /// `Problem::HostReleaseUnmeasured`).
+    /// `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS` on.
     ///
     /// # Safety
     ///
@@ -173,7 +217,6 @@ impl Device {
     ///   with the runtime.
     pub unsafe fn from_raw(raw: RawDevice, policy: DevicePolicy) -> Result<Device, Error> {
         let cache = CacheSetup::of(&raw.shader_cache, "from_raw")?;
-        let metal_level = choose(raw.metal_level, Host::this(), "from_raw")?;
         let static_fn = ash::StaticFn {
             get_instance_proc_addr: raw.get_instance_proc_addr,
         };
@@ -286,6 +329,8 @@ impl Device {
             gpu_times_from_host: raw.gpu_times_from_host,
             // An adopted device keeps no execution record: validation makes its own devices.
             record_executions: false,
+            pipeline_records: raw.pipeline_records,
+            fail_in_place_check: false,
             announce_each: raw.announce_each,
             lowering_refuses: raw.lowering_refuses,
             view_reinterpretation,
@@ -293,11 +338,14 @@ impl Device {
             host_image_copy,
             linear_color_attachment,
             graphics_pipeline_library,
+            // Nor whether `samplerYcbcrConversion` was: its YCbCr textures convert through
+            // Metal's arithmetic.
+            ycbcr_conversion: false,
+            ycbcr_444: false,
             sparse_features: raw.sparse_features.features(),
             memory_reads,
             owned: false,
             cache,
-            metal_level,
         };
         // SAFETY: the caller's contract.
         unsafe { Device::assemble(parts) }
