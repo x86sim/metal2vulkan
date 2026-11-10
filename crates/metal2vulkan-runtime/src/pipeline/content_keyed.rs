@@ -188,7 +188,7 @@ impl<K: Hash + Eq, T> ContentKeyed<K, T> {
         gone
     }
 
-    /// x86Code RAM 8: let go of the objects the map alone holds that `idle` picks, in the order
+    /// x86Sim RAM 8: let go of the objects the map alone holds that `idle` picks, in the order
     /// they were inserted: a long-lived consumer's trim (`Libraries::trim_idle`), on its own
     /// thread. Unique with an Acquire, as in `settle`, so no holder uses one.
     pub(crate) fn take_idle(&mut self, idle: impl Fn(&T) -> bool) -> Gone<T> {

@@ -193,7 +193,7 @@ impl<K: Clone + Eq + Hash, V> Making<K, V> {
         }
     }
 
-    /// x86Code RAM 8: the objects made that nothing but the memo holds, taken out (a long-lived
+    /// x86Sim RAM 8: the objects made that nothing but the memo holds, taken out (a long-lived
     /// consumer's idle trim, `RenderVariant::trim_idle`). A making in flight stays, as does an
     /// object a command buffer or a caller holds.
     pub(crate) fn take_unheld(&self) -> Vec<Arc<V>> {

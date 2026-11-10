@@ -67,7 +67,7 @@ use std::time::{Duration, Instant};
 pub(super) const BLOCK_BYTES: u64 = 64 << 20;
 
 /// The size of a pooled block of system memory: a host-visible memory type outside every
-/// device-local heap (x86Code RAM 2). A discrete GPU's driver pins such a block whole in the
+/// device-local heap (x86Sim RAM 2). A discrete GPU's driver pins such a block whole in the
 /// host's RAM as it is allocated (NVIDIA 615.78.08: a 64 MiB block of the runtime's `Shared` pool,
 /// made by [`keep_room`] at the first command queue for the upload arena's 64 KiB chunks, was 64 MiB
 /// of the process's resident memory, mostly unused). Device-local blocks stay [`BLOCK_BYTES`]:
@@ -99,7 +99,7 @@ pub(super) const KEPT_EMPTY_FOR: Duration = Duration::from_secs(1);
 const LOGGED_PLACEMENT_BYTES: u64 = 4 << 20;
 
 /// The memory types of system memory among `properties`': host-visible, in a heap that is not
-/// device-local (x86Code RAM 2, [`SYSTEM_BLOCK_BYTES`]), as bits.
+/// device-local (x86Sim RAM 2, [`SYSTEM_BLOCK_BYTES`]), as bits.
 fn system_types(properties: &vk::PhysicalDeviceMemoryProperties) -> u32 {
     let count = (properties.memory_type_count as usize).min(vk::MAX_MEMORY_TYPES);
     (properties.memory_types[..count].iter().enumerate())

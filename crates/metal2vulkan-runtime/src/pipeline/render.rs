@@ -534,19 +534,19 @@ pub(crate) struct RenderVariant {
     /// where the log is on: worked out beside its objects as it is made
     /// ([`RenderVariant::logged_spirv`]).
     logged_spirv: OnceLock<Box<[u64]>>,
-    /// x86Code RAM 8: its share of the census (`census.rs`).
+    /// x86Sim RAM 8: its share of the census (`census.rs`).
     _census: crate::census::CountedVariant,
-    /// x86Code RAM 8: when a draw last looked its `VkPipeline`s up (`census::now_secs`), which
+    /// x86Sim RAM 8: when a draw last looked its `VkPipeline`s up (`census::now_secs`), which
     /// the idle trim reads ([`RenderVariant::trim_idle`]).
     drawn: std::sync::atomic::AtomicU64,
 }
 
-/// x86Code RAM 8: the render variants made, held weakly, for the idle trim
+/// x86Sim RAM 8: the render variants made, held weakly, for the idle trim
 /// ([`RenderVariant::trim_idle`]); the dead ones go at each trim.
 static LIVE_VARIANTS: Mutex<Vec<Weak<RenderVariant>>> = Mutex::new(Vec::new());
 
 impl RenderVariant {
-    /// x86Code RAM 8: destroy the `VkPipeline`s of `device`'s render variants no draw looked up for
+    /// x86Sim RAM 8: destroy the `VkPipeline`s of `device`'s render variants no draw looked up for
     /// `idle`, but those a command buffer or a caller still holds: a long-lived consumer's trim
     /// thread (mtlvk's), for a window server's states that stay made long after their app went
     /// (CoreAnimation keeps them). Each is destroyed at once rather than kept for its variant
@@ -579,7 +579,7 @@ impl RenderVariant {
         destroyed
     }
 
-    /// x86Code RAM 8: a draw looks its `VkPipeline`s up now.
+    /// x86Sim RAM 8: a draw looks its `VkPipeline`s up now.
     fn note_drawn(&self) {
         self.drawn
             .store(crate::census::now_secs(), std::sync::atomic::Ordering::Relaxed);

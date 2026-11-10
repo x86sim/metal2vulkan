@@ -17,7 +17,7 @@
 //!   buffer; on NVIDIA's driver 615.71.09 that `vkDestroyCommandPool` intermittently never returned
 //!   (the driver spinning, with its own `[vkrt] Analysis` thread), so the command buffer never
 //!   completed and its queue stalled.
-//!   x86Code RAM 5: a long-lived consumer's trim (`Device::trim_idle`, on its own thread) does
+//!   x86Sim RAM 5: a long-lived consumer's trim (`Device::trim_idle`, on its own thread) does
 //!   release idle spares, as only a release returns the driver's memory (`Spares::trim`).
 //! - **Descriptor pools are bounded.** At most [`DESCRIPTOR_POOLS`] descriptor pools of at most
 //!   [`DESCRIPTORS`] descriptors together; a descriptor pool given back past them releases the
@@ -122,7 +122,7 @@ pub(super) const DESCRIPTORS: u64 = 1 << 18;
 /// ([`Spares::trim`]): a quiet compositor's frame takes a few.
 pub(super) const TRIM_KEEP: usize = 4;
 
-/// x86Code RAM 5: the most command buffers an idle spare among the newest keeps
+/// x86Sim RAM 5: the most command buffers an idle spare among the newest keeps
 /// ([`Spares::trim`]); a compositor's frame of a few passes makes ~5 to 10.
 pub(super) const TRIM_KEEP_BUFFERS: usize = 32;
 
@@ -149,7 +149,7 @@ pub(super) struct CommandPool {
     /// did not complete, or left one it was handed unended (the module docs), so its taker
     /// resets it.
     pub(super) recording: bool,
-    /// When it was last given back (x86Code RAM 2, [`Spares::trim`]): `None` while a command
+    /// When it was last given back (x86Sim RAM 2, [`Spares::trim`]): `None` while a command
     /// buffer holds it, and once a trim released its memory, until a command buffer takes it.
     given: Option<std::time::Instant>,
 }
@@ -304,7 +304,7 @@ impl CommandPool {
     }
 }
 
-/// x86Code RAM 10: whether settled pools given back are reset with RELEASE_RESOURCES at once
+/// x86Sim RAM 10: whether settled pools given back are reset with RELEASE_RESOURCES at once
 /// (METAL2VULKAN_POOL_RELEASE_ON_GIVE=0 = only when taken, as before).
 fn release_on_give() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -345,7 +345,7 @@ impl Spares {
             return Ok(None);
         };
         if pool.recording {
-            // x86Code RAM 8: reset with RELEASE_RESOURCES. NVIDIA's pool otherwise keeps every
+            // x86Sim RAM 8: reset with RELEASE_RESOURCES. NVIDIA's pool otherwise keeps every
             // chunk of command memory its largest command buffer grew to (2 MB chunks), so each
             // spare in flight held its busiest use's memory, and the driver maps new chunks for
             // the next burst: the device's command memory grew to the sum of the pools' high
@@ -390,7 +390,7 @@ impl Spares {
     ) {
         pool.recording = !settled;
         if settled && release_on_give() && pool.buffers() > 0 {
-            // x86Code RAM 10: a settled pool given back is reset with RELEASE_RESOURCES at once, not
+            // x86Sim RAM 10: a settled pool given back is reset with RELEASE_RESOURCES at once, not
             // when next taken. Its command buffers reused as they were (vkBeginCommandBuffer's implicit
             // reset) keep the chunks their largest recording grew to, so every spare held its own high
             // water while it waited, the next burst found the driver's cache empty, and NVIDIA mapped
@@ -421,7 +421,7 @@ impl Spares {
         *lock(&self.last_given) = Some(std::time::Instant::now());
     }
 
-    /// x86Code RAM 5: the spare command pools, the primaries and secondaries they made, and the
+    /// x86Sim RAM 5: the spare command pools, the primaries and secondaries they made, and the
     /// spare descriptor pools (both lists).
     pub(super) fn counts(&self) -> (usize, usize, usize, usize) {
         let pools = lock(&self.command_pools);
@@ -435,7 +435,7 @@ impl Spares {
         (pools.len(), made(0), made(1), descriptors)
     }
 
-    /// x86Code RAM 2 / RAM 5: release the spare command pools no command buffer took for `idle`
+    /// x86Sim RAM 2 / RAM 5: release the spare command pools no command buffer took for `idle`
     /// past the newest [`TRIM_KEEP`] of each family, and those of the newest that hold more than
     /// [`TRIM_KEEP_BUFFERS`] command buffers (`vkDestroyCommandPool`); and, where no command
     /// buffer gave back anything for `idle`, release the spare descriptor pools past

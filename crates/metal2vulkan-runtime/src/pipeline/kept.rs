@@ -195,7 +195,7 @@ struct Entry {
     instance: Instance,
     objects: Option<KeptObjects>,
     pipelines: Vec<KeptPipeline>,
-    /// x86Code RAM 8: when a release last came to it (`census::now_secs`).
+    /// x86Sim RAM 8: when a release last came to it (`census::now_secs`).
     released: u64,
 }
 
@@ -322,7 +322,7 @@ impl Kept {
         self.arrived.push(Arrival::Pipeline(instance, pipeline));
     }
 
-    /// x86Code RAM 8: destroy the `VkPipeline`s of the instances no release came to for `idle`
+    /// x86Sim RAM 8: destroy the `VkPipeline`s of the instances no release came to for `idle`
     /// (a long-lived consumer's trim thread): a state of theirs made again makes its pipelines
     /// anew, from the caches, as one past [`KEPT`] does. The instances' objects stay. Returns how
     /// many were destroyed.
@@ -351,7 +351,7 @@ impl Kept {
         destroyed
     }
 
-    /// x86Code RAM 8: the instances kept and their pipelines, the queued releases' included.
+    /// x86Sim RAM 8: the instances kept and their pipelines, the queued releases' included.
     pub(crate) fn counts(&self) -> (usize, usize) {
         let queued = self.arrived.iter().filter(|a| matches!(a, Arrival::Pipeline(..))).count();
         let pipelines = self.entries.0.iter().map(|e| e.pipelines.len()).sum::<usize>();

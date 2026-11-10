@@ -164,7 +164,7 @@ impl<K: Clone + Eq + Hash, V> Lru<K, V> {
         }
     }
 
-    /// x86Code RAM 8: remove the entries `take` picks, and give their values.
+    /// x86Sim RAM 8: remove the entries `take` picks, and give their values.
     pub(crate) fn take_where(&mut self, take: impl Fn(&V) -> bool) -> Vec<V> {
         let picked: Vec<u64> = self
             .entries

@@ -922,14 +922,14 @@ impl Device {
         &self.0
     }
 
-    /// x86Code RAM 5: the spare command pools, the primary and secondary command buffers they
+    /// x86Sim RAM 5: the spare command pools, the primary and secondary command buffers they
     /// hold, and the spare descriptor pools.
     #[doc(hidden)]
     pub fn spare_counts(&self) -> (usize, usize, usize, usize) {
         self.0.spares.counts()
     }
 
-    /// x86Code RAM 8: give back the pipelines idle for `idle`: the graphics pipeline libraries no
+    /// x86Sim RAM 8: give back the pipelines idle for `idle`: the graphics pipeline libraries no
     /// key claimed (`Libraries::trim_idle`) and the `VkPipeline`s of released variants kept
     /// (`Kept::trim_idle`). Returns (libraries, kept pipelines) destroyed. No Metal counterpart.
     #[doc(hidden)]
@@ -941,7 +941,7 @@ impl Device {
         (libraries, kept)
     }
 
-    /// x86Code RAM 8: live `VkPipeline`s, graphics pipeline libraries and render variants
+    /// x86Sim RAM 8: live `VkPipeline`s, graphics pipeline libraries and render variants
     /// (`census.rs`), and the released variant instances the device keeps (`pipeline/kept.rs`).
     #[doc(hidden)]
     pub fn pipeline_census(&self) -> String {
@@ -949,18 +949,18 @@ impl Device {
         format!("{} | kept {instances} instances ({pipelines} pipelines)", crate::census::summary())
     }
 
-    /// x86Code RAM 2: give back what the device's spares hold past their use, for a long-lived
+    /// x86Sim RAM 2: give back what the device's spares hold past their use, for a long-lived
     /// consumer whose work comes in bursts (a phone's compositor): the driver memory of spare
     /// command pools no command buffer took for `idle`, and, where nothing was given back for
     /// `idle`, the spare descriptor pools past a few (`spares.rs`, `Spares::trim`). Costs the next
     /// burst the re-growth of what it needs (a pool's chunks, a descriptor pool's making). Returns
-    /// the command pools and the descriptor pools released (x86Code RAM 5: a spare command pool
+    /// the command pools and the descriptor pools released (x86Sim RAM 5: a spare command pool
     /// is released, not reset, as only its release returns the driver's malloc). No Metal
     /// counterpart.
     #[doc(hidden)]
     pub fn trim_idle(&self, idle: std::time::Duration) -> (usize, usize) {
         let (pools, descriptors) = self.0.spares.trim(&self.0, idle);
-        // x86Code RAM 10: and the recorder's kept logs past a few (`recorder/handles.rs`, `trim`),
+        // x86Sim RAM 10: and the recorder's kept logs past a few (`recorder/handles.rs`, `trim`),
         // counted with the command pools
         (pools + crate::recorder::handles::trim(idle), descriptors)
     }

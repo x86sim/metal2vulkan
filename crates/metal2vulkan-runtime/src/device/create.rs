@@ -811,7 +811,7 @@ const LEAST_QUEUES: u32 = 4;
 /// with the queues.
 const ROUND_ROBIN_CEILING: u32 = 16;
 
-/// [`ROUND_ROBIN_CEILING`], or `METAL2VULKAN_QUEUES` where set (x86Code RAM 2): each `VkQueue`
+/// [`ROUND_ROBIN_CEILING`], or `METAL2VULKAN_QUEUES` where set (x86Sim RAM 2): each `VkQueue`
 /// NVIDIA's driver makes costs the process about 2.8 MiB of host memory (615.78.08: one queue 36
 /// MiB of PSS for a bare device, sixteen 80 MiB), so a consumer that runs few logical queues at once
 /// may take fewer. At least [`LEAST_QUEUES`].

@@ -1057,7 +1057,7 @@ fn to_lowered(
         let zero = ops::splat(fb, uint_lanes(form), 0)?;
         return fb.binary(BinOp::INotEqual, x, zero);
     }
-    // x86Code: a `bool` builtin (`FrontFacing`) read into an integer form (an `i8` `bool`
+    // x86Sim: a `bool` builtin (`FrontFacing`) read into an integer form (an `i8` `bool`
     // parameter, `plan::input_builtin`): 1 or 0.
     if matches!(form.held, Held::Int { .. })
         && matches!(

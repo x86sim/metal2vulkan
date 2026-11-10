@@ -1830,7 +1830,7 @@ fn input_builtin(
             )
         }
         Bi::FrontFacing if !vertex => {
-            // x86Code: a specialized function can take `[[front_facing]]` as its in-memory
+            // x86Sim: a specialized function can take `[[front_facing]]` as its in-memory
             // `bool`, an `i8` (RenderBox's `path_interior_fragment` as MTLSimDriver sends it);
             // `to_lowered` widens the builtin's `bool` to 1 or 0 for an integer form.
             let int_bool = matches!(f.held, Held::Int { container: 32, .. });

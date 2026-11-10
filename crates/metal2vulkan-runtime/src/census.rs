@@ -1,4 +1,4 @@
-//! x86Code RAM 8: a census of what live pipeline states hold, for a long-lived consumer's memory
+//! x86Sim RAM 8: a census of what live pipeline states hold, for a long-lived consumer's memory
 //! line (mtlvk's `MTLVK_MEMSTATS`): not part of the API.
 //!
 //! - `VkPipeline`s alive in the process (graphics pipeline libraries included), counted at the

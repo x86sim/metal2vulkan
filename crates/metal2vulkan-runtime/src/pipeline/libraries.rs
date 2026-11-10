@@ -93,7 +93,7 @@ impl Part {
 /// needs it ([`Library::made`]).
 pub(crate) struct Library {
     state: Mutex<Slot>,
-    /// x86Code RAM 8: when a caller last claimed it (`census::now_secs`), which the idle trim
+    /// x86Sim RAM 8: when a caller last claimed it (`census::now_secs`), which the idle trim
     /// reads (`Libraries::trim_idle`).
     claimed: std::sync::atomic::AtomicU64,
     /// Signalled as a making ends.
@@ -239,7 +239,7 @@ impl Libraries {
         }
     }
 
-    /// x86Code RAM 8: destroy the libraries nothing but the map holds that no caller claimed for
+    /// x86Sim RAM 8: destroy the libraries nothing but the map holds that no caller claimed for
     /// `idle` (a long-lived consumer's trim thread): those whose linked pipelines are all gone
     /// (released states, kept pipelines trimmed). The map otherwise lets them go only at a
     /// program's settle, which an idle program never reaches. A linked pipeline must keep its

@@ -31,7 +31,7 @@ struct Free {
     next: u32,
     /// Logs let go of, emptied, their room kept.
     logs: Vec<Kept>,
-    /// x86Code RAM 10: when a handle was last made ([`trim`]).
+    /// x86Sim RAM 10: when a handle was last made ([`trim`]).
     last_made: Option<std::time::Instant>,
 }
 
@@ -46,10 +46,10 @@ static FREE: Mutex<Free> = Mutex::new(Free {
     last_made: None,
 });
 
-/// x86Code RAM 10: the logs [`trim`] leaves kept.
+/// x86Sim RAM 10: the logs [`trim`] leaves kept.
 const TRIM_KEEP_LOGS: usize = 16;
 
-/// x86Code RAM 10: where no handle was made for `idle`, let go of the kept logs past the
+/// x86Sim RAM 10: where no handle was made for `idle`, let go of the kept logs past the
 /// [`TRIM_KEEP_LOGS`] reused first. Each keeps the room of its largest command buffer, and
 /// [`FREE`] keeps up to [`KEPT_LOGS`] of them: after a phone's run of apps, a window server's
 /// frames of many draws left ~45 MiB of arenas kept with nothing recording (mtlvk jemalloc
