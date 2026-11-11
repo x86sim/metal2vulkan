@@ -1024,7 +1024,9 @@ impl Device {
 
     /// x86Sim RAM 8: give back the pipelines idle for `idle`: the graphics pipeline libraries no
     /// key claimed (`Libraries::trim_idle`) and the `VkPipeline`s of released variants kept
-    /// (`Kept::trim_idle`). Returns (libraries, kept pipelines) destroyed. No Metal counterpart.
+    /// (`Kept::trim_idle`), and the pipelines of render variants idle for `idle`
+    /// (`pipeline::trim_idle_render`). Returns (libraries, pipelines) destroyed. No Metal
+    /// counterpart.
     #[doc(hidden)]
     pub fn trim_idle_pipelines(&self, idle: std::time::Duration) -> (usize, usize) {
         let shared = &*self.0;
@@ -1052,10 +1054,7 @@ impl Device {
     /// counterpart.
     #[doc(hidden)]
     pub fn trim_idle(&self, idle: std::time::Duration) -> (usize, usize) {
-        let (pools, descriptors) = self.0.spares.trim(&self.0, idle);
-        // x86Sim RAM 10: and the recorder's kept logs past a few (`recorder/handles.rs`, `trim`),
-        // counted with the command pools
-        (pools, descriptors)
+        self.0.spares.trim(&self.0, idle)
     }
 
     /// Keep room in the memory pools the runtime's encodings and commits place their own

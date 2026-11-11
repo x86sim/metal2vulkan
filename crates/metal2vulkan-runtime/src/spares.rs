@@ -5,10 +5,11 @@
 //! to 48 us and a descriptor pool 23 to 26 us on RADV (Radeon 780M), 7 to 8 and 3 on ANV, against
 //! 0.2 and 0.02, and 1.3 and 0.1, reset.
 //!
-//! - **Command pools are kept, never released while the device lives**. Every command pool a
-//!   command buffer gives back is kept, whatever its status, and every command buffer dropped with
-//!   one gives it back too: the runtime calls `vkDestroyCommandPool` on a command buffer's pool
-//!   only as the device is torn down, after its queues are idle.
+//! - **Command pools are kept** (x86Sim RAM 5: until [`Spares::trim`] destroys the idle ones
+//!   past a few). Every command pool a command buffer gives back is kept, whatever its status,
+//!   and every command buffer dropped with one gives it back too: the runtime calls
+//!   `vkDestroyCommandPool` on a command buffer's pool only in that trim and as the device is
+//!   torn down, after its queues are idle.
 //!   The spares stay bounded all the same: a command buffer makes a pool only where no spare of its
 //!   queue's family is free, so the device holds at most as many as its command buffers held at
 //!   once (Metal bounds those by each queue's `maxCommandBufferCount`), each holding what its
@@ -150,7 +151,7 @@ pub(super) struct CommandPool {
     /// resets it.
     pub(super) recording: bool,
     /// When it was last given back (x86Sim RAM 2, [`Spares::trim`]): `None` while a command
-    /// buffer holds it, and once a trim released its memory, until a command buffer takes it.
+    /// buffer holds it.
     given: Option<std::time::Instant>,
 }
 
@@ -215,12 +216,12 @@ impl CommandPool {
         self.given = None;
     }
 
-    /// Whether the pool made no secondary command buffer (the module docs).
     /// The command buffers it made, the primary begun ahead included.
     fn buffers(&self) -> usize {
         self.made[0].len() + self.made[1].len() + usize::from(self.begun.is_some())
     }
 
+    /// Whether the pool made no secondary command buffer (the module docs).
     pub(super) fn wants_secondary(&self) -> bool {
         self.made[level_index(vk::CommandBufferLevel::SECONDARY)].is_empty()
     }
