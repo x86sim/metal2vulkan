@@ -599,6 +599,60 @@ pub(super) fn parse(
     Ok(Parsed::Kept(op))
 }
 
+/// The operand position of the `i32` alignment in the pre-LLVM 7 memory intrinsics.
+pub(crate) const LEGACY_MEM_ALIGN_OPERAND: usize = 3;
+
+/// Remove the alignment operand's entry from a per-operand list of a pre-LLVM 7 memory intrinsic
+/// (its operands or their attributes), if the list reaches it.
+pub(crate) fn drop_legacy_align<T>(per_operand: &mut Vec<T>) {
+    if per_operand.len() > LEGACY_MEM_ALIGN_OPERAND {
+        per_operand.remove(LEGACY_MEM_ALIGN_OPERAND);
+    }
+}
+
+/// The modern parameter list of a pre-LLVM 7 memory intrinsic declaration: `llvm.memset`,
+/// `llvm.memcpy` or `llvm.memmove` typed `void (dst, i8 | src, len, i32 align, i1 volatile)`,
+/// the form older Metal compilers still write: the modern `void (dst, i8 | src, len, i1
+/// volatile)`. LLVM 7 moved the alignment operand into the pointer operands' `align` attributes,
+/// and decode upgrades the old form as LLVM's reader does: the declaration drops the operand and
+/// each call states its value as those attributes. `None` for any other declaration (the modern
+/// form included).
+pub(crate) fn legacy_mem_params(
+    name: &[u8],
+    types: &TypeTable,
+    fn_ty: TypeId,
+) -> Option<Vec<TypeId>> {
+    let rest = name.strip_prefix(b"llvm.")?;
+    if !["memset.", "memcpy.", "memmove."]
+        .iter()
+        .any(|base| rest.starts_with(base.as_bytes()))
+    {
+        return None;
+    }
+    let Some(Type::Function {
+        ret,
+        params,
+        vararg: false,
+    }) = types.get(fn_ty)
+    else {
+        return None;
+    };
+    let int = |i: usize, bits: u8| {
+        params
+            .get(i)
+            .is_some_and(|&p| types.get(p) == Some(&Type::Int(bits)))
+    };
+    let legacy = matches!(types.get(*ret), Some(Type::Void))
+        && params.len() == 5
+        && int(LEGACY_MEM_ALIGN_OPERAND, 32)
+        && int(4, 1);
+    legacy.then(|| {
+        let mut modern = params.to_vec();
+        drop_legacy_align(&mut modern);
+        modern
+    })
+}
+
 /// The length operand of a memory intrinsic: `i32` or `i64`; another integer width is outside
 /// the closed set.
 fn len_elem(types: &TypeTable, id: TypeId) -> Result<Elem, Fail> {

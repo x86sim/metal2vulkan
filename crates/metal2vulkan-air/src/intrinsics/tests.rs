@@ -841,6 +841,85 @@ fn llvm_bases_decode_against_their_declarations() {
     }
 }
 
+/// The pre-LLVM 7 memory intrinsics, `(dst, i8 | src, len, i32 align, i1 volatile)`, which older
+/// Metal compilers still write: the declaration's modern parameter list drops the alignment, and
+/// that list classifies as the modern intrinsic. The 5-operand type itself is no signature of
+/// the model (decode declares the modern one), and nothing else is upgraded.
+#[test]
+fn legacy_memory_intrinsics_upgrade_to_the_modern_form() {
+    let i8s = Operand::Num(NumTy::scalar(Elem::I8));
+    let i32s = Operand::Num(NumTy::scalar(Elem::I32));
+    let i64s = Operand::Num(NumTy::scalar(Elem::I64));
+    let flag = Operand::Imm(ImmKind::Bool);
+    let (p0, p1) = (
+        Operand::Ptr(AddrSpace::Thread),
+        Operand::Ptr(AddrSpace::Device),
+    );
+    let void = Operand::Void;
+    for (name, legacy, modern, want) in [
+        (
+            "llvm.memset.p0i8.i64",
+            &[p0, i8s, i64s, i32s, flag][..],
+            &[p0, i8s, i64s, flag][..],
+            LlvmIntrinsic::Memset {
+                dst: AddrSpace::Thread,
+                len: Elem::I64,
+                volatile: false,
+            },
+        ),
+        (
+            "llvm.memcpy.p0i8.p1i8.i32",
+            &[p0, p1, i32s, i32s, flag][..],
+            &[p0, p1, i32s, flag][..],
+            LlvmIntrinsic::Memcpy {
+                dst: AddrSpace::Thread,
+                src: AddrSpace::Device,
+                len: Elem::I32,
+                volatile: false,
+            },
+        ),
+        (
+            "llvm.memmove.p1i8.p0i8.i64",
+            &[p1, p0, i64s, i32s, flag][..],
+            &[p1, p0, i64s, flag][..],
+            LlvmIntrinsic::Memmove {
+                dst: AddrSpace::Device,
+                src: AddrSpace::Thread,
+                len: Elem::I64,
+                volatile: false,
+            },
+        ),
+    ] {
+        let mut t = TypeTable::new();
+        let written = fn_ty(&mut t, &Signature::new(void, legacy));
+        let expected = fn_ty(&mut t, &Signature::new(void, modern));
+        let Some(Type::Function { params, .. }) = t.get(expected) else {
+            unreachable!()
+        };
+        let upgraded = legacy_mem_params(name.as_bytes(), &t, written);
+        assert_eq!(upgraded.as_deref(), Some(&params[..]), "{name}");
+        assert_eq!(llvm(name, void, modern), DeclClass::Llvm(want), "{name}");
+        assert_eq!(llvm(name, void, legacy), DeclClass::Mismatch, "{name}");
+        // The modern form is already modern.
+        assert_eq!(legacy_mem_params(name.as_bytes(), &t, expected), None);
+    }
+    // Only the memory intrinsics, and only with an `i32` alignment and an `i1` flag.
+    for (name, params) in [
+        ("llvm.memset.p0i8.i64", &[p0, i8s, i64s, i64s, flag][..]),
+        ("llvm.memset.p0i8.i64", &[p0, i8s, i64s, i32s, i32s][..]),
+        (
+            "llvm.memset.p0i8.i64",
+            &[p0, i8s, i64s, i32s, flag, flag][..],
+        ),
+        ("llvm.fshl.i32", &[i32s, i32s, i32s, i32s, flag][..]),
+        ("air.memset.p0i8.i64", &[p0, i8s, i64s, i32s, flag][..]),
+    ] {
+        let mut t = TypeTable::new();
+        let ty = fn_ty(&mut t, &Signature::new(void, params));
+        assert_eq!(legacy_mem_params(name.as_bytes(), &t, ty), None, "{name}");
+    }
+}
+
 #[test]
 fn markers_are_dropped() {
     let (p0, i64s, void) = (

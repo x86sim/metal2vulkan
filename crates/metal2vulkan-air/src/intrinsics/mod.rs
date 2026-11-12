@@ -57,6 +57,7 @@ pub use atomic::{AccessKind, Atomic, AtomicOp, AtomicSpace, Coherent, MemoryOrde
 pub use convert::{Convert, Fp8, NumKind, Pack, PackDir, PackFormat};
 pub use intersect::{Instancing, Intersect, IntersectTags, ResultField, Role as IntersectRole};
 pub use layout::Layout;
+pub(crate) use llvm::{drop_legacy_align, legacy_mem_params, LEGACY_MEM_ALIGN_OPERAND};
 pub use llvm::{dropped_family, AgxSpace};
 pub use llvm::{AgxOp, Dropped, LlvmFloatOp, LlvmIntOp, LlvmIntrinsic};
 pub use math::{Math, MathFn, Precision};

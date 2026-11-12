@@ -860,3 +860,104 @@ fn body_of_named<'t>(t: &'t ModuleTables, name: &[u8]) -> &'t crate::ir::Body {
         .and_then(|f| f.body.as_ref())
         .unwrap()
 }
+
+/// `@k(ptr %p)` calling `llvm.memset.p0i8.i64(%p, i8 0, i64 16, [i32 4,] i1 volatile)`: with
+/// `legacy`, in the pre-LLVM 7 form older Metal compilers still write, with the `i32` alignment.
+/// Types: 0 `void`, 1 `ptr`, 2 `i8`, 3 `i64`, 4 `i1`, 5 `i32`, 6 `void (ptr)`, 7 the memset's
+/// type. Values: `@k` 0, the memset 1, `%p` 2, then the local constants `i8 0`, `i64 16`, (`i32
+/// 4`,) the flag.
+fn memset_module(legacy: bool, volatile: bool) -> Vec<u8> {
+    let memset_ty = if legacy {
+        vec![0, 0, 1, 2, 3, 5, 4]
+    } else {
+        vec![0, 0, 1, 2, 3, 4]
+    };
+    stream(2, 0, b"kllvm.memset.p0i8.i64", |w| {
+        let types = vec![
+            (1, vec![8]),
+            (2, vec![]),
+            (u64::from(codes::TYPE_OPAQUE_POINTER), vec![0]),
+            (7, vec![8]),
+            (7, vec![64]),
+            (7, vec![1]),
+            (7, vec![32]),
+            (21, vec![0, 0, 1]),
+            (21, memset_ty),
+        ];
+        block(w, codes::TYPE_BLOCK, &types);
+        w.unabbrev(8, &[0, 1, 6, 0, 0, 0, 0, 0, 0]);
+        w.unabbrev(8, &[1, 20, 7, 0, 1, 0, 0, 0, 0]);
+        let mut consts = vec![(1, vec![2]), (2, vec![]), (1, vec![3]), (4, vec![32])];
+        if legacy {
+            consts.extend([(1, vec![5]), (4, vec![8])]);
+        }
+        consts.extend([
+            (1, vec![4]),
+            if volatile { (4, vec![3]) } else { (2, vec![]) },
+        ]);
+        let next = if legacy { 7 } else { 6 };
+        let mut call = vec![0, 1 << 15, 7, rel(next, 1), rel(next, 2), rel(next, 3)];
+        call.push(rel(next, 4));
+        if legacy {
+            call.push(rel(next, 5));
+        }
+        call.push(rel(next, next - 1));
+        w.enter(u64::from(codes::FUNCTION_BLOCK), 4);
+        w.unabbrev(1, &[1]);
+        block(w, codes::CONSTANTS_BLOCK, &consts);
+        w.unabbrev(34, &call);
+        w.unabbrev(10, &[]);
+        w.end();
+    })
+}
+
+/// A pre-LLVM 7 memory intrinsic decodes as the modern one: the declaration is typed without the
+/// alignment operand, each call drops it (the module verifies, call arity against the
+/// declaration included) and keeps the alignment as the pointer's `align` attribute, and the
+/// volatile flag is read from the operand after it.
+#[test]
+fn legacy_memory_intrinsics_decode_in_their_modern_form() {
+    use crate::intrinsics::LlvmIntrinsic;
+    use crate::ir::{AddrSpace, Callee};
+    for volatile in [false, true] {
+        let modern = decode_compared(&memset_module(false, volatile)).unwrap();
+        for options in [decode_compared, decode] {
+            let t = options(&memset_module(true, volatile)).unwrap();
+            verify_module_level(&t).unwrap();
+            let decl = t.parts.funcs.get(FuncId::new(1)).unwrap();
+            let modern_decl = modern.parts.funcs.get(FuncId::new(1)).unwrap();
+            assert_eq!(
+                t.parts.types.get(decl.ty),
+                modern.parts.types.get(modern_decl.ty)
+            );
+            assert_eq!(decl.params.len(), 4);
+            let calls: Vec<_> = body_of(&t)
+                .insts
+                .values()
+                .filter_map(|i| match &i.kind {
+                    InstKind::Call(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            let [call] = calls[..] else {
+                panic!("{calls:?}")
+            };
+            assert_eq!(call.args.len(), 4);
+            // The stated `i32 4` is the destination's `align` attribute, as LLVM 7 spells it.
+            let attrs = call.attrs.as_ref().unwrap();
+            assert_eq!(attrs.params.len(), 1);
+            assert_eq!(attrs.params[0].align.map(|a| a.bytes()), Some(4));
+            assert_eq!(
+                call.callee,
+                Callee::Llvm {
+                    decl: FuncId::new(1),
+                    op: LlvmIntrinsic::Memset {
+                        dst: AddrSpace::Thread,
+                        len: crate::intrinsics::Elem::I64,
+                        volatile,
+                    },
+                }
+            );
+        }
+    }
+}

@@ -69,8 +69,8 @@ use crate::intrinsics::{self, Bound, DeclClass};
 use crate::ir::{
     AddrSpace, Align, Arena, Atomic, AtomicRmwOp, Block, BlockId, Body, Call, CallAttrs, Callee,
     CastOp, Const, ConstId, ConstTable, FastMath, FloatPredicate, FuncId, Function, Inst, InstId,
-    InstKind, IntFlags, IntPredicate, LoopHints, Md, MdId, Ordering, RangeMd, Sym, Symbols,
-    SyncScope, TailKind, Type, TypeId, TypeTable, Unroll, Value,
+    InstKind, IntFlags, IntPredicate, LoopHints, Md, MdId, Ordering, ParamAttrs, RangeMd, Sym,
+    Symbols, SyncScope, TailKind, Type, TypeId, TypeTable, Unroll, Value,
 };
 
 const B: u32 = FUNCTION_BLOCK;
@@ -113,6 +113,9 @@ pub(crate) struct FnCx<'c> {
     pub sync_scopes: &'c [Option<SyncScope>],
     /// Every `air.*`/`llvm.*` declaration with its class, sorted by function.
     pub intrinsics: &'c [(FuncId, DeclClass)],
+    /// Every pre-LLVM 7 memory intrinsic declaration (declared in its modern form) with the type
+    /// its calls spell, sorted by function. A call spelling that type drops the alignment operand.
+    pub legacy_mem: &'c [(FuncId, TypeId)],
     pub alloca_space: u32,
     /// Instructions decoded so far in the module, for `Limit::InstructionCount`.
     pub inst_total: &'c mut u64,
@@ -1373,6 +1376,9 @@ impl FnDecoder {
         let (callee, _) = self.pair(s, cx, r, m)?;
         let target = self.callee(cx, callee, fn_ty);
         let dropped = matches!(target, Target::Intrinsic(_, DeclClass::Drop(_)));
+        // A call of a pre-LLVM 7 memory intrinsic reads the operands it spells and keeps those of
+        // the modern declaration: the alignment operand and its attributes are dropped.
+        let legacy = matches!(target, Target::Intrinsic(f, _) if legacy_mem(cx, f, fn_ty));
         let mut args = Vec::new();
         m.reserve(&mut args, params.len())?;
         for &p in params.iter() {
@@ -1417,7 +1423,7 @@ impl FnDecoder {
             return self.drop_call(s, cx, m);
         }
         let mut enums = SiteEnums::default();
-        let attrs = match list {
+        let mut attrs = match list {
             None => None,
             Some(list) => {
                 let bc_params = cx.bc_types.params(fn_bc).unwrap_or(&[]);
@@ -1427,9 +1433,13 @@ impl FnDecoder {
                         .get(p)
                         .and_then(|&t| bc_types.pointee(u64::from(t)))
                 };
-                let resolved = list
+                let mut resolved = list
                     .resolve(cx.bc_types, args.len(), pointee, cx.keep_enums, m)?
                     .ok_or_else(bad)?;
+                if legacy {
+                    intrinsics::drop_legacy_align(&mut resolved.params);
+                    intrinsics::drop_legacy_align(&mut resolved.enums.params);
+                }
                 enums = resolved.enums;
                 // The lists were charged as they were resolved; the box is the call's.
                 m.charge(std::mem::size_of::<CallAttrs>())?;
@@ -1440,6 +1450,10 @@ impl FnDecoder {
                 }))
             }
         };
+        if legacy {
+            legacy_align(cx, &params, &args, &mut attrs, m)?;
+            intrinsics::drop_legacy_align(&mut args);
+        }
         let callee = match target {
             Target::Callee(c) => c,
             Target::Intrinsic(f, class) => match intrinsics::bind(class, &args, cx.consts) {
@@ -1526,7 +1540,7 @@ impl FnDecoder {
         let Some((f, decl)) = func.and_then(|f| Some((f, cx.funcs.get(f)?))) else {
             return indirect;
         };
-        if decl.ty != fn_ty {
+        if decl.ty != fn_ty && !legacy_mem(cx, f, fn_ty) {
             return indirect;
         }
         match cx.intrinsics.binary_search_by_key(&f, |&(g, _)| g) {
@@ -1614,6 +1628,59 @@ enum Target {
     Callee(Callee),
     /// A call to a classified `air.*`/`llvm.*` declaration.
     Intrinsic(FuncId, DeclClass),
+}
+
+/// Move the alignment a pre-LLVM 7 memory intrinsic call states in its `i32` operand to where
+/// LLVM 7 moved it (and LLVM's reader upgrades it to): the `align` attribute of each pointer
+/// operand that has none. An alignment of 0 or 1 states nothing. `params` and `args` are the
+/// call's as written.
+fn legacy_align(
+    cx: &FnCx<'_>,
+    params: &[TypeId],
+    args: &[Value],
+    attrs: &mut Option<Box<CallAttrs>>,
+    m: &mut Meter,
+) -> Result<(), Error> {
+    let stated = match args.get(intrinsics::LEGACY_MEM_ALIGN_OPERAND) {
+        Some(Value::Const(c)) => match cx.consts.get(*c).map(|c| &c.value) {
+            Some(Const::Int(bytes)) if *bytes > 1 => Align::from_bytes(*bytes),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(align) = stated else {
+        return Ok(());
+    };
+    let pointers = params
+        .iter()
+        .take(intrinsics::LEGACY_MEM_ALIGN_OPERAND)
+        .rposition(|&p| matches!(cx.types.get(p), Some(Type::Ptr { .. })))
+        .map_or(0, |last| last + 1);
+    let site = match attrs {
+        Some(site) => site,
+        None => {
+            m.charge(std::mem::size_of::<CallAttrs>())?;
+            attrs.insert(Box::default())
+        }
+    };
+    if site.params.len() < pointers {
+        let mut grown = Vec::new();
+        m.reserve(&mut grown, pointers)?;
+        grown.extend(site.params.iter().cloned());
+        grown.resize(pointers, ParamAttrs::default());
+        site.params = grown.into_boxed_slice();
+    }
+    for (p, attrs) in params.iter().zip(site.params.iter_mut()) {
+        if matches!(cx.types.get(*p), Some(Type::Ptr { .. })) && attrs.align.is_none() {
+            attrs.align = Some(align);
+        }
+    }
+    Ok(())
+}
+
+/// Whether a call of `f` spelling `fn_ty` is a call of a pre-LLVM 7 memory intrinsic.
+fn legacy_mem(cx: &FnCx<'_>, f: FuncId, fn_ty: TypeId) -> bool {
+    cx.legacy_mem.binary_search(&(f, fn_ty)).is_ok()
 }
 
 /// The value numbered `id` and its type: a module value below `module_count`, else a local one.

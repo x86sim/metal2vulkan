@@ -26,7 +26,8 @@ use crate::error::{Error, Feature};
 use crate::intrinsics::{self, DeclClass};
 use crate::ir::{
     AddrSpace, Align, CallConv, Const, ConstId, Constant, DataLayout, FuncId, Function, Global,
-    GlobalId, Linkage, ModuleParts, Param, Section, SyncScope, Type, UnnamedAddr, Visibility,
+    GlobalId, Linkage, ModuleParts, Param, Section, SyncScope, Type, TypeId, UnnamedAddr,
+    Visibility,
 };
 
 /// The only module version accepted (relative value ids, string table).
@@ -79,6 +80,7 @@ pub(crate) fn decode(
         sync_scopes: Vec::new(),
         defined: Vec::new(),
         intrinsics: Vec::new(),
+        legacy_mem: Vec::new(),
         marker_consts: Vec::new(),
         function_blocks: 0,
         fn_entries: Vec::new(),
@@ -212,6 +214,9 @@ struct ModuleDecoder<'a> {
     defined: Vec<FuncId>,
     /// Every declaration named `air.*`/`llvm.*` with its class, in function id order.
     intrinsics: Vec<(FuncId, DeclClass)>,
+    /// Every pre-LLVM 7 memory intrinsic declaration, declared in its modern form, with the type
+    /// its calls spell, in function id order.
+    legacy_mem: Vec<(FuncId, TypeId)>,
     /// With `opts.drop_unused_markers`, every constant operand of a dropped marker call.
     marker_consts: Vec<ConstId>,
     function_blocks: u32,
@@ -535,15 +540,45 @@ impl<'a> ModuleDecoder<'a> {
                 Some(r.ok_or_else(|| s.malformed(MODULE_BLOCK, C))?)
             }
         };
-        let (attrs, ret_attrs, mut param_attrs, enums) = match resolved {
+        let (attrs, ret_attrs, mut param_attrs, mut enums) = match resolved {
             Some(r) => (r.func, r.ret, r.params, r.enums),
             None => Default::default(),
         };
-        let mut params = Vec::new();
-        m.reserve(&mut params, arity)?;
         let missing = arity.saturating_sub(param_attrs.len());
         m.reserve(&mut param_attrs, missing)?;
         param_attrs.resize(arity, Default::default());
+        // A pre-LLVM 7 memory intrinsic is declared in its modern form, without the alignment
+        // operand; its calls, which spell the written type, drop that operand
+        // (`FnCx::legacy_mem`).
+        let written_ty = ty;
+        let legacy = if is_proto {
+            self.parts
+                .symbols
+                .get(name)
+                .and_then(|n| intrinsics::legacy_mem_params(n, &self.parts.types, ty))
+        } else {
+            None
+        };
+        let ty = match legacy {
+            None => ty,
+            Some(modern) => {
+                let ret = match self.parts.types.get(ty) {
+                    Some(Type::Function { ret, .. }) => *ret,
+                    _ => return Err(s.err(BitcodeError::BadType)),
+                };
+                intrinsics::drop_legacy_align(&mut param_attrs);
+                intrinsics::drop_legacy_align(&mut enums.params);
+                let function = Type::Function {
+                    ret,
+                    params: modern.into_boxed_slice(),
+                    vararg: false,
+                };
+                self.parts.types.intern(function, m)?
+            }
+        };
+        let arity = param_attrs.len();
+        let mut params = Vec::new();
+        m.reserve(&mut params, arity)?;
         params.extend(
             param_attrs
                 .into_iter()
@@ -569,6 +604,10 @@ impl<'a> ModuleDecoder<'a> {
         if !enums.is_empty() {
             m.charge(std::mem::size_of_val(&enums))?;
             self.enum_attrs.set_func(f, enums);
+        }
+        if ty != written_ty {
+            grow(m, &mut self.legacy_mem)?;
+            self.legacy_mem.push((f, written_ty));
         }
         if !is_proto {
             grow(m, &mut self.defined)?;
@@ -633,6 +672,7 @@ impl<'a> ModuleDecoder<'a> {
             md_kinds: self.md_kinds,
             sync_scopes: &self.sync_scopes,
             intrinsics: &self.intrinsics,
+            legacy_mem: &self.legacy_mem,
             alloca_space: data_layout.alloca_space,
             inst_total: &mut self.inst_total,
             keep_enums: self.opts.enum_attrs,
