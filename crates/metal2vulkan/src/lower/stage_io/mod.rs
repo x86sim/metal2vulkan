@@ -1006,7 +1006,10 @@ fn to_lowered(
     if matches!(form.held, Held::Int { .. })
         && matches!(
             cx.plan.families.stage_io.objects.get(link.object),
-            Some(IoObject::Builtin { shape: Shape::Bool, .. })
+            Some(IoObject::Builtin {
+                shape: Shape::Bool,
+                ..
+            })
         )
     {
         let one = ops::splat(fb, form, 1)?;

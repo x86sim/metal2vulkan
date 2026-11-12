@@ -17,7 +17,10 @@ pub(crate) static RENDER_VARIANT_BYTES: AtomicI64 = AtomicI64::new(0);
 /// Seconds since the process's first ask: the clock of the idle trims.
 pub(crate) fn now_secs() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_secs()
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs()
 }
 
 pub(crate) fn add(counter: &AtomicI64, n: i64) {

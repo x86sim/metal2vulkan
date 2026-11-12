@@ -401,7 +401,9 @@ impl Spares {
             // SAFETY: nothing of the pool is pending and none of its command buffers is recording
             // (settled); the caller gives it up, so this thread is its only user.
             let reset = exit_guard::enter().map(|_busy| unsafe {
-                device.vk().reset_command_pool(pool.raw, vk::CommandPoolResetFlags::RELEASE_RESOURCES)
+                device
+                    .vk()
+                    .reset_command_pool(pool.raw, vk::CommandPoolResetFlags::RELEASE_RESOURCES)
             });
             if let Some(Err(_)) = reset {
                 // as the take's reset failure: the pool goes

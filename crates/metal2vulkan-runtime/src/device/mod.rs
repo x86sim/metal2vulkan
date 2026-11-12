@@ -1032,7 +1032,10 @@ impl Device {
         let shared = &*self.0;
         let drawn = crate::pipeline::trim_idle_render(self, idle);
         let kept = lock(&shared.kept).trim_idle(shared, idle) + drawn;
-        let libraries = shared.libraries.as_ref().map_or(0, |l| l.trim_idle(shared, idle));
+        let libraries = shared
+            .libraries
+            .as_ref()
+            .map_or(0, |l| l.trim_idle(shared, idle));
         (libraries, kept)
     }
 
@@ -1041,7 +1044,10 @@ impl Device {
     #[doc(hidden)]
     pub fn pipeline_census(&self) -> String {
         let (instances, pipelines) = lock(&self.0.kept).counts();
-        format!("{} | kept {instances} instances ({pipelines} pipelines)", crate::census::summary())
+        format!(
+            "{} | kept {instances} instances ({pipelines} pipelines)",
+            crate::census::summary()
+        )
     }
 
     /// x86Sim RAM 2: give back what the device's spares hold past their use, for a long-lived

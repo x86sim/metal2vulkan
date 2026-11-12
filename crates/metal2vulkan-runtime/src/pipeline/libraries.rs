@@ -222,9 +222,10 @@ impl Libraries {
             drop(map);
             // Destroyed here, the map's lock released.
             gone.destroy(shared);
-            library
-                .claimed
-                .store(crate::census::now_secs(), std::sync::atomic::Ordering::Relaxed);
+            library.claimed.store(
+                crate::census::now_secs(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             library
         });
         Linked(claimed)
@@ -252,7 +253,8 @@ impl Libraries {
         for part in &self.parts {
             let gone = lock(part).take_idle(|library| {
                 let claimed = library.claimed.load(std::sync::atomic::Ordering::Relaxed);
-                now.saturating_sub(claimed) >= idle.as_secs() && !matches!(*lock(&library.state), Slot::Making)
+                now.saturating_sub(claimed) >= idle.as_secs()
+                    && !matches!(*lock(&library.state), Slot::Making)
             });
             destroyed += gone.len();
             gone.destroy(shared);

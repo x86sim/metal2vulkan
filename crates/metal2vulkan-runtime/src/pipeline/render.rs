@@ -559,8 +559,10 @@ impl RenderVariant {
 
     /// x86Sim RAM 8: a draw looks its `VkPipeline`s up now.
     fn note_drawn(&self) {
-        self.drawn
-            .store(crate::census::now_secs(), std::sync::atomic::Ordering::Relaxed);
+        self.drawn.store(
+            crate::census::now_secs(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 

@@ -353,8 +353,17 @@ impl Kept {
 
     /// x86Sim RAM 8: the instances kept and their pipelines, the queued releases' included.
     pub(crate) fn counts(&self) -> (usize, usize) {
-        let queued = self.arrived.iter().filter(|a| matches!(a, Arrival::Pipeline(..))).count();
-        let pipelines = self.entries.0.iter().map(|e| e.pipelines.len()).sum::<usize>();
+        let queued = self
+            .arrived
+            .iter()
+            .filter(|a| matches!(a, Arrival::Pipeline(..)))
+            .count();
+        let pipelines = self
+            .entries
+            .0
+            .iter()
+            .map(|e| e.pipelines.len())
+            .sum::<usize>();
         (self.entries.0.len(), pipelines + queued)
     }
 
