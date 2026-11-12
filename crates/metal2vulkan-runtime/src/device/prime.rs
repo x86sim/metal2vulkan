@@ -648,6 +648,13 @@ impl Primer<'_> {
         // SAFETY: the pool is this priming's.
         let buffer = unsafe { self.allocate_command_buffer(&allocate) }?;
         self.made(Call::AllocateCommandBuffers);
+        // A settled spare pool's reset as it is given back (`spares.rs`), here before its one
+        // command buffer is begun.
+        // SAFETY: the pool is this priming's and none of its command buffers is recording or
+        // pending.
+        unsafe { device.reset_command_pool(pool, vk::CommandPoolResetFlags::RELEASE_RESOURCES) }
+            .map_err(vulkan)?;
+        self.made(Call::ResetCommandPool);
         let queries = if timestamps {
             let info = vk::QueryPoolCreateInfo::default()
                 .query_type(vk::QueryType::TIMESTAMP)

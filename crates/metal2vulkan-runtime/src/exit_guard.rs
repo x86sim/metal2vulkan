@@ -365,6 +365,8 @@ calls! {
     QueueWaitIdle => c"vkQueueWaitIdle",
     ResetFences => c"vkResetFences",
     DestroyCommandPool => c"vkDestroyCommandPool",
+    // A settled spare pool given back (`spares.rs`, `Spares::give_command_pool`).
+    ResetCommandPool => c"vkResetCommandPool",
     DestroyFence => c"vkDestroyFence",
     DestroySemaphore => c"vkDestroySemaphore",
     DestroySampler => c"vkDestroySampler",
