@@ -72,9 +72,8 @@ use super::acceptance::{unmet_requirements, LayoutError, LayoutObjects};
 use super::buffers::{create_host_buffer, HostBuffer};
 use super::compute::{
     allocate, allocate_in, attempt, check_backend, command_replay, environment, executed_census,
-    executor_degrades, incompatible_binding, module_censuses, opened_device, refused_attempt,
-    replay_commands, table_bytes, upload_root_table, Allocation, CompileChild, Live, OnDevice,
-    Replay, ReplayPath,
+    incompatible_binding, module_censuses, opened_device, refused_attempt, replay_commands,
+    table_bytes, upload_root_table, Allocation, CompileChild, Live, OnDevice, Replay, ReplayPath,
 };
 use super::device::{with_validated_context, ExtendedDynamicState, VulkanContext};
 use super::graphics_pipeline::{self, GraphicsError};
@@ -232,7 +231,6 @@ fn run(
         escaped,
         children,
         replayed,
-        depth_upload,
     } = executed?;
     // Every stage module drawn, in the order `spv_sha256` hashes them, then each replayed
     // command's, and the guard bytes each out-of-bounds target's run changed.
@@ -249,7 +247,6 @@ fn run(
         .map(|(map, plan)| graphics::rate_map_pass_census(map, plan));
     let mut environment = environment(context, device, "engine-render");
     command_replay(&mut environment, &replayed);
-    executor_degrades(&mut environment, context, device, depth_upload);
     Ok(ComputeRun {
         output,
         spv_sha256,
@@ -700,6 +697,7 @@ fn execute(
             primitive_restart,
             encoder,
             rasterizer_discard: pipeline.graphics.rasterizer_discard,
+            graphics: &pipeline.graphics,
             draw: &commands,
             shadow: shadow.as_ref(),
             replayed: None,
@@ -916,7 +914,6 @@ fn execute(
         graphics::select_render_output(case.output, &finals).map_err(ExecutorError::Failed)?;
     drop(objects);
     drop(readers);
-    let depth_upload = resources.uploads_float_depth() || targets.uploads_float_depth;
     drop(resources);
     drop(shadow);
     drop(planes);
@@ -927,7 +924,6 @@ fn execute(
         escaped,
         children,
         replayed,
-        depth_upload,
     })
 }
 
@@ -940,9 +936,6 @@ struct Drawn {
     escaped: BTreeMap<OutOfBoundsResource, GuardCount>,
     children: Vec<crate::coverage::ModuleCensus>,
     replayed: Vec<ReplayPath>,
-    /// The draw uploaded 32-bit float depth into a depth image, a texture's or its depth
-    /// attachment's.
-    depth_upload: bool,
 }
 
 /// Draw one replayed render command: `pipeline`, compiled for `case` (a render template with the
@@ -1180,6 +1173,7 @@ fn draw_child(
             primitive_restart,
             encoder,
             rasterizer_discard: pipeline.graphics.rasterizer_discard,
+            graphics: &pipeline.graphics,
             draw: commands,
             shadow: None,
             replayed,
@@ -1553,9 +1547,6 @@ struct Targets<'a> {
     depth_stencil: Option<DepthStencilTarget>,
     extent: vk::Extent2D,
     samples: u32,
-    /// The depth/stencil attachment holds 32-bit float depth, uploaded from the case's
-    /// contents.
-    uploads_float_depth: bool,
 }
 
 impl Drop for Targets<'_> {
@@ -1625,7 +1616,6 @@ impl<'a> Targets<'a> {
                 height: 1,
             },
             samples,
-            uploads_float_depth: false,
         };
         let mut extent = None;
         // A storage-form attachment is no attachment of the subpass, but its image is one of the
@@ -1714,7 +1704,9 @@ impl<'a> Targets<'a> {
                     "color and depth/stencil targets of different extents",
                 ));
             }
-            targets.uploads_float_depth = super::plan_resources::is_float_depth(format);
+            if let Some(depths) = &authored.depth {
+                super::plan_resources::require_depth_range(context, format, depths)?;
+            }
             targets.depth_stencil = Some(match transfer {
                 AttachmentTransfer::Copy => create_depth_stencil(context, format, authored)?,
                 AttachmentTransfer::PerSample { samples } => {
@@ -2296,6 +2288,8 @@ struct Recording<'r> {
     /// The pipeline has rasterization disabled, so it has no fragment shader or fragment output
     /// state for dynamic state to set.
     rasterizer_discard: bool,
+    /// The pipeline's graphics state, whose render pass the draws record in.
+    graphics: &'r GraphicsState,
     draw: &'r DrawCommands,
     /// The shader-side stencil's shadow, copied in before the render pass and out after it.
     shadow: Option<&'r shadow::ShadowStencil<'r>>,
@@ -2787,7 +2781,14 @@ fn record_and_submit(
             dynamic(vk::DynamicState::SCISSOR),
         );
         // One draw per recording of it: the whole target, or each region of a rate-mapped pass.
+        // A fetch ordered between draws alone records after the barrier of the subpass's
+        // dependency on itself before each: the pass is `create_render_pass`'s of the pipeline's
+        // graphics state, whose subpass then reads input attachments.
+        let between_draws = graphics_pipeline::fetches_between_draws(recording.graphics);
         for (viewport, scissor) in recording.draws {
+            if between_draws {
+                graphics_pipeline::fetch_between_draws(device, command);
+            }
             if set_viewport {
                 device.cmd_set_viewport(command, 0, std::slice::from_ref(viewport));
             }

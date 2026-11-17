@@ -1517,10 +1517,9 @@ mod tests {
             };
             compile_pipeline(&[&vector], &request, &device, None).map(|c| c.pipeline)
         };
+        // Undefined, the constant reads its type's zero: Metal makes this pipeline too.
         match kernel(FunctionConstantValues::defaults()) {
-            Err(PipelineCompileError::Product(Error::NeedsInput(
-                RuntimeInput::FunctionConstant { index: 0 },
-            ))) => {}
+            Ok(AcceptancePipeline::Compute(_)) => {}
             other => panic!("{other:?}"),
         }
         let lanes = [1u32, 2, 3, 4].iter().flat_map(|lane| lane.to_le_bytes());
@@ -1638,7 +1637,7 @@ mod tests {
 
     /// A fragment row whose outputs have fewer than four components compiles: its attachments have
     /// no more channels than its outputs write, which the product, as Metal, requires (a `uint2`
-    /// target into `RGBA32Uint` was `InvalidDescriptor(ColorAttachment { index: 2 })`).
+    /// target into `RGBA32Uint` was `InvalidDescriptor(ColorAttachment { index: 2, .. })`).
     #[test]
     fn a_fragment_row_with_narrow_outputs_compiles_into_its_derived_attachments() {
         let Some(bitcode) = fixture("signed_color.ll") else {

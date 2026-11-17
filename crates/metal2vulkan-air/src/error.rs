@@ -260,12 +260,28 @@ pub struct InputError {
     pub kind: InputErrorKind,
     /// Where in the input it was found.
     pub at: Location,
+    /// What the reader found there, for diagnostics only (its Display and Debug print it): an
+    /// unknown key's string, or the operand's shape where it read no string
+    /// ([`AbiError::UnknownKey`]).
+    pub(crate) saw: Option<DiagName>,
 }
 
 impl InputError {
     /// An error of `kind` at `at`.
     pub fn new(kind: InputErrorKind, at: Location) -> InputError {
-        InputError { kind, at }
+        InputError {
+            kind,
+            at,
+            saw: None,
+        }
+    }
+
+    /// This error, naming what its reader found where it refused.
+    pub(crate) fn saw(self, what: DiagName) -> InputError {
+        InputError {
+            saw: Some(what),
+            ..self
+        }
     }
 
     /// The coarse class of this error.
@@ -291,7 +307,11 @@ impl InputError {
 
 impl fmt::Display for InputError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?} at {}", self.kind, self.at)
+        write!(f, "{:?} at {}", self.kind, self.at)?;
+        match &self.saw {
+            Some(saw) => write!(f, ", saw {saw:?}"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -341,8 +361,9 @@ pub enum InputErrorKind {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContainerError {
-    /// The input starts with no metallib, bitcode-wrapper, or bitcode magic, or a wrapper's
-    /// stream does not start with the bitcode magic.
+    /// The input starts with no metallib, bitcode-wrapper, or bitcode magic, a wrapper's stream
+    /// does not start with the bitcode magic, a universal file's AIR slice is no metallib, or a
+    /// Mach-O universal file yields no AIR slice (`container`'s module docs).
     BadMagic,
     /// The input ends before a structure it declares.
     Truncated {
@@ -358,7 +379,8 @@ pub enum ContainerError {
         /// The header's minor version.
         minor: u16,
     },
-    /// A function's bitcode does not hash to its `HASH` tag (SHA-256).
+    /// A function's bitcode does not hash to its `HASH` tag (SHA-256), in any library but a Core
+    /// Image kernel library, whose `HASH` is not checked (`container`'s docs).
     HashMismatch,
     /// An offset or size that points outside the file or its section, or ranges of two
     /// functions' bitcode or metadata that overlap.
@@ -370,7 +392,7 @@ pub enum ContainerError {
     DuplicateTag,
     /// A function entry lacks a required tag (`NAME`, `TYPE`, `HASH`, `MDSZ`, `OFFT`, `VERS`).
     MissingTag,
-    /// A universal metallib without the slice of its AIR.
+    /// Metal's own universal metallib (`0xCBFEBABE`) without the slice of its AIR.
     NoAirSlice,
 }
 
@@ -406,7 +428,8 @@ pub enum BitstreamError {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BitcodeError {
-    /// The module's `VERSION` record states a version other than 2.
+    /// The module's `VERSION` record states a version other than 1 or 2 (version 0, absolute value
+    /// ids, is not read).
     UnsupportedBitcodeVersion {
         /// The version the record states.
         version: u64,
@@ -619,7 +642,7 @@ impl std::error::Error for Error {}
 impl From<InputError> for Error {
     /// The mapping of input error kinds to outcome classes.
     fn from(e: InputError) -> Error {
-        let InputError { kind, at } = e;
+        let InputError { kind, at, saw } = e;
         match kind {
             InputErrorKind::Unsupported(feature) => {
                 Error::Unsupported(Unsupported::not_implemented(feature).at(at))
@@ -636,7 +659,7 @@ impl From<InputError> for Error {
             }
             kind @ InputErrorKind::Canon(
                 CanonError::UndefCondition | CanonError::CallTypeMismatch,
-            ) => Error::InvalidInput(InputError { kind, at }),
+            ) => Error::InvalidInput(InputError { kind, at, saw }),
             InputErrorKind::Request(r) => Error::InvalidRequest(r),
             InputErrorKind::Limit(l) => Error::LimitExceeded(l),
             kind @ (InputErrorKind::Container(_)
@@ -644,7 +667,7 @@ impl From<InputError> for Error {
             | InputErrorKind::Bitcode(_)
             | InputErrorKind::Verify(_)
             | InputErrorKind::Intrinsic(_)
-            | InputErrorKind::Abi(_)) => Error::InvalidInput(InputError { kind, at }),
+            | InputErrorKind::Abi(_)) => Error::InvalidInput(InputError { kind, at, saw }),
         }
     }
 }
@@ -710,13 +733,15 @@ impl fmt::Display for Unsupported {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Feature {
     // ---- Input constructs outside the typed model ----
-    /// A metallib that is not an executable library (dynamic library, companion).
+    /// A metallib of a kind the container does not read: its header's `file_type` is none of 0 (an
+    /// executable library), 1 (a Core Image kernel library) and 2 (a dynamic library).
     LibraryKind(u8),
     /// A function stage the model does not cover.
     Stage(u8),
     /// An LLVM address space the typed model does not define (it defines AIR's `thread` 0
-    /// through `threadgroup_imageblock` 4). The 5 and 6 of Apple's AGX ray-tracing and
-    /// tessellation library modules have no established meaning and stay refused.
+    /// through `threadgroup_imageblock` 4, `object_data` 6, the mesh output handle's 7 and MSL
+    /// 4.1's generic 8). The 5 of Apple's AGX ray-tracing and tessellation library modules has no
+    /// established meaning and stays refused.
     AddressSpace(u32),
     /// A module-level record outside the accepted subset (alias, ifunc, comdat, …).
     ModuleRecord {
@@ -743,13 +768,18 @@ pub enum Feature {
     Recursion,
     /// Indirect calls, function pointers, visible/intersection function tables (one variant).
     DynamicCall,
+    /// A call to inline assembly (`asm`) that an entry reaches, other than the empty
+    /// `asm sideeffect "", ""` decode drops: the IR gives no assembly a meaning. The refusal names
+    /// the expression (`asm "nop", ""`).
+    InlineAsm,
     /// Linkage signatures / stitching / dynamic libraries.
     Linking,
-    /// A bitcode constant record outside the typed model (block address, inline asm, `select`
-    /// and other constant expressions the IR has no form for).
+    /// A constants-block record LLVM defines that the typed model has no form for (a block
+    /// address, a `select` and the other constant expressions of [`ConstantRecord`]), by LLVM's
+    /// name for it.
     Constant {
-        /// The constants block's record code.
-        code: u32,
+        /// The record.
+        record: ConstantRecord,
     },
     /// An LLVM attribute kind that changes the calling ABI and that AIR does not use
     /// (`inalloca`, `preallocated`, `byref`, `nest`, the `swift*` kinds).
@@ -802,16 +832,80 @@ pub enum Feature {
     /// [[buffer(n)]];` in Apple's `!air.global_bindings` list, valid AIR this version does not
     /// implement yet.
     ProgramScopeBinding,
+    /// A generic pointer (MSL 4.1's `addrspace(8)`) that canonicalization cannot make a pointer of
+    /// one address space, by how it comes to hold a space only the run knows
+    /// ([`GenericPointer`]). Vulkan's logical addressing has no pointer that may point into either
+    /// of two storage classes.
+    GenericPointer(GenericPointer),
+}
+
+/// How a refused generic pointer comes to hold an address space only the run knows
+/// (`Feature::GenericPointer`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum GenericPointer {
+    /// Pointers of two address spaces reach it: a `select` or `phi` of a device and a thread
+    /// pointer, as the run picks.
+    TwoSpaces,
+    /// It is loaded from memory other than a thread allocation whose every use the translation
+    /// sees and whose generic pointers no other write may overlap, or is an atomic operation's
+    /// old value.
+    Memory,
+    /// It is held in an aggregate or a vector value the translation does not follow element by
+    /// element: one an instruction makes other than `insertvalue`, `extractvalue`,
+    /// `insertelement`, `extractelement`, `shufflevector`, `phi`, `select` and `freeze` (a load's
+    /// is [`GenericPointer::Memory`], a call's [`GenericPointer::Call`]), a part taken from a
+    /// constant aggregate, or a constant expression in an aggregate constant.
+    Aggregate,
+    /// It crosses a call, alone or in an aggregate: a call's argument or result (other than a
+    /// space query's pointer), a parameter, or the returned value.
+    Call,
+    /// It is made from an integer (`inttoptr`), or is a constant that is no address space's
+    /// pointer made generic.
+    Integer,
+}
+
+/// A constants-block record that LLVM defines (`LLVMBitCodes.h`'s `ConstantsCodes`, and
+/// `CAST_PTRTOADDR` among its cast opcodes) and that the typed model has no form for
+/// (`Feature::Constant`), by LLVM's name. LLVM's code follows each name. A later LLVM's new
+/// record is a new variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum ConstantRecord {
+    /// A `select` constant expression (`CST_CODE_CE_SELECT`, 13).
+    Select,
+    /// An `extractelement` constant expression (`CST_CODE_CE_EXTRACTELT`, 14).
+    ExtractElement,
+    /// An `insertelement` constant expression (`CST_CODE_CE_INSERTELT`, 15).
+    InsertElement,
+    /// A `shufflevector` constant expression (`CST_CODE_CE_SHUFFLEVEC`, 16, and
+    /// `CST_CODE_CE_SHUFVEC_EX`, 19, whose result length differs from its operands').
+    ShuffleVector,
+    /// An `icmp` or `fcmp` constant expression (`CST_CODE_CE_CMP`, 17).
+    Compare,
+    /// A `blockaddress` (`CST_CODE_BLOCKADDRESS`, 21).
+    BlockAddress,
+    /// A unary constant expression, `fneg` (`CST_CODE_CE_UNOP`, 25).
+    UnaryOp,
+    /// A `dso_local_equivalent` (`CST_CODE_DSO_LOCAL_EQUIVALENT`, 27).
+    DsoLocalEquivalent,
+    /// A `no_cfi` function reference (`CST_CODE_NO_CFI_VALUE`, 29).
+    NoCfi,
+    /// A `getelementptr` constant expression with an `inrange` range (`CST_CODE_CE_GEP_WITH_INRANGE`,
+    /// 31).
+    GepWithInrange,
+    /// A signed pointer, `ptrauth` (`CST_CODE_PTRAUTH`, 33, and `CST_CODE_PTRAUTH2`, 34).
+    PtrAuth,
+    /// A constant of LLVM's byte type (`CST_CODE_BYTE`, 35, and `CST_CODE_WIDE_BYTE`, 36), which
+    /// the type table refuses too.
+    Byte,
+    /// A `ptrtoaddr` cast constant expression (`CST_CODE_CE_CAST` with `CAST_PTRTOADDR`, 13).
+    PtrToAddr,
 }
 
 /// An input the request did not supply.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MissingInput {
-    /// A value use of an unsupplied function constant survived SCCP.
-    FunctionConstant {
-        /// The constant's index.
-        index: u32,
-    },
     /// A call through a visible-function reference (`!air.visible_function_references`)
     /// survived specialization, and no linked function has the name it references. `symbol` is that
     /// name.
@@ -891,6 +985,19 @@ pub enum RequestError {
         /// The blend index both write.
         index: u32,
     },
+    /// Entry parameter `param` remains under the function's function-constant values in an
+    /// argument table (buffer, threadgroup memory, texture, or sampler) at slots `index ..
+    /// index + count` that overlap those of an earlier parameter that remains: Metal refuses the
+    /// specialization when it makes the function ("argument has invalid location (<index,count>)").
+    /// MSL refuses such a pair outright, so only constants that set an argument's slot make one.
+    OverlappingArgument {
+        /// The later parameter, by its index in the function.
+        param: u32,
+        /// Its first slot.
+        index: u32,
+        /// Its slot count.
+        count: u32,
+    },
 }
 
 /// Why a linked function cannot resolve a visible-function reference.
@@ -901,10 +1008,19 @@ pub enum LinkProblem {
     Ambiguous,
     /// The function is not a visible function of its module (`!air.visible`).
     NotVisible,
-    /// The reference's function type is not the linked function's.
-    Signature,
     /// The linked function's module has another data layout than the module that references it.
     DataLayout,
+    /// The linked function was made unspecialized (`newFunctionWithName:`), and what it reaches
+    /// reads function constant `index` of its module, which then has no value: Metal fails the
+    /// pipeline's creation ("cannot lower module with unresolved function constants"), even for a
+    /// read only `is_function_constant_defined` guards. A specialized function
+    /// (`newFunctionWithName:constantValues:` or `newFunctionWithDescriptor:`) reads such a
+    /// constant as undefined instead, and links (`linked_function_specialized_name.m`, an M3 Max
+    /// under macOS 27.0.1).
+    UnresolvedConstant {
+        /// The constant's `[[function_constant(index)]]` index in the linked function's module.
+        index: u32,
+    },
 }
 
 /// A deterministic structural or accounting cap. Values live in `budget`.

@@ -4,26 +4,39 @@
 //! moves at the call itself, before the encoder ends and before the commit, where a command
 //! logged for a later recording would move it only after the commit.
 //!
+//! That count is the whole device's, whatever the thread: the queue-switch check
+//! (`queue_switch_check.rs`, started by the device's first command queue) records its rounds'
+//! openings, fills of a scratch buffer of its own, on its thread. So the test waits for that check
+//! to end before it counts.
+//!
 //! Device tests: compiled only under the validation crate's GPU safety cfgs (`m2v_gpu`,
 //! `m2v_cpu_icd`).
 
 use super::blit_holds::{device, Scratch, WAIT};
 use crate::{CommandBufferStatus, CommandsRecorded, ResourceOptions};
+use std::time::Duration;
 
-/// The fills recorded so far, as `vkCmdFillBuffer` or, where the runtime records fills as
-/// transfers, `vkCmdUpdateBuffer` (`WorkCounts::fills_by_transfers`).
+/// How long the device's queue-switch check may take to end.
+const SETTLE: Duration = Duration::from_secs(120);
+
+/// The fills recorded so far, each one `vkCmdFillBuffer` (`word_fill.rs`).
 fn fills(counts: &CommandsRecorded) -> u64 {
-    counts.cmd_fill_buffer + counts.cmd_update_buffer
+    counts.cmd_fill_buffer
 }
 
 /// A blit encoder's fill of a buffer's word is in the driver's command buffer as the call
 /// returns: the count of fills recorded rose by one at the call, the encoder still open and the
-/// command buffer uncommitted, and by no more at its end and commit. The bytes are the fill's.
+/// command buffer uncommitted, and by no more at its end and commit, the device's queue-switch
+/// check ended before (the module docs). The bytes are the fill's.
 #[test]
 fn a_fill_is_recorded_at_its_call() {
     let scratch = Scratch::new("recorded-at-the-call");
     let device = device(&scratch.0);
     let queue = device.new_command_queue().unwrap();
+    assert!(
+        device.settle_queue_switch_check(SETTLE),
+        "the device's queue-switch check ended"
+    );
     let buffer = (device.new_buffer(16, ResourceOptions::shared())).unwrap();
     let command_buffer = queue.command_buffer().unwrap();
     let mut blit = command_buffer.blit_command_encoder().unwrap();

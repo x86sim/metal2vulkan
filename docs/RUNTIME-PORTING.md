@@ -149,9 +149,11 @@ narrow refusal that the call's rustdoc describes.
 | `compute_encoder_for_pass` | `computeCommandEncoderWithDescriptor:` | `CommandBuffer::compute_command_encoder_with_dispatch_type`; `compute_command_encoder_with_raw_dispatch_type` for a raw `MTLDispatchType` (every value but 1 serial, as Metal's) |
 | `used_resources` | (none: a runtime extension) | `CommandBuffer::used_resources`: the buffers, textures and heaps its ended encoders' commands use, each as what owns its memory, until it completes; what `detach_backing` waits on |
 | `ended_encoders` | (none: a runtime extension) | `CommandBuffer::ended_encoders`: each ended encoder's kind, the event waits and signals before it, and what its own commands use; with `commit_failed`'s `FailedEncoders::Set`, what fails the one submission that uses a detached resource |
-| `add_submission_handler` | (none: a runtime extension) | `CommandBuffer::add_submission_handler`: a handler run once the command buffer's last batch reached its `VkQueue`, on the device's scheduler thread, which submitted it, before it is `Scheduled`; never for one that fails before |
-| `set_submission_check` | (none: a runtime extension) | `CommandBuffer::set_submission_check`: a check of each of Metal's submissions of the command buffer, run once its event waits are met, just before it is submitted; a code it answers fails that submission alone, as Metal fails one that uses a resource detached by then |
-| `object_id` | (none: Metal names an object by pointer) | `Buffer::object_id`, `Texture::object_id`, `Heap::object_id`: an `ObjectId` unique for the object's life, never reused (a sparse heap's `gpu_address` is 0) |
+| `add_submission_handler` | (none: a runtime extension) | `CommandBuffer::add_submission_handler`: a handler run once the command buffer's last batch reached its `VkQueue`, on the thread that submitted it (the device's scheduler thread, or one in `commit_and_submit` or making the pass of one left for a render encoder's end), in submission order, before it is `Scheduled`; never for one that fails before |
+| `commit_and_submit` | (none: a runtime extension) | `CommandBuffer::commit_and_submit`: `commit`, then the calling thread submits the ready command buffers in commit order, this one among them (one held back holding back only the later commits that wait behind it, as on the scheduler's thread), where no other pass is under way and each needs no host step or storage-form switch, running their submission checks just before each submission (one that waits for a shared event's GPU signal to land is left to the scheduler's thread; a plain event's wait goes to the `VkQueue`) and their submission handlers inside the call; the rest goes to the scheduler's thread. One left for a render encoder's end (`RenderLoweringPolicy::Worker`) returns as `commit` does, and the thread that runs its commit once the end is lowered makes the pass |
+| `add_completion_seen_handler` | (none: a runtime extension) | `CommandBuffer::add_completion_seen_handler`: a handler run once the command buffer completed, its status and GPU times final, on the runtime's thread that saw it complete where its transition to `Completed` runs there, or runs to its completion-seen handlers there (one with completed handlers, the rest on its queue's handler thread), else on its queue's handler thread, before its completed handlers; short, and never blocking |
+| `set_submission_check` | (none: a runtime extension) | `CommandBuffer::set_submission_check`: a check of each of Metal's submissions of the command buffer, run once its event waits are met (an `Event` wait for a submitted signal at once, its wait on the `VkQueue`; a `SharedEvent` wait only a GPU signal still running reaches once that signal lands, as Metal schedules each), just before it is submitted, on the thread that submits it (the device's scheduler thread, or one in `commit_and_submit` or making the pass of one left for a render encoder's end); a code it answers fails that submission alone, as Metal fails one that uses a resource detached by then |
+| `object_id` | (none: Metal names an object by pointer) | `Buffer::object_id`, `Texture::object_id`, `Heap::object_id`, `CommandBuffer::object_id`: an `ObjectId` unique for the object's life, never reused (a sparse heap's `gpu_address` is 0); a degrade notice announced for a command buffer's work names its command buffer's (`DegradeNotice::command_buffer`) |
 
 ### `ComputeCmd`: `MTLComputeCommandEncoder` commands
 
@@ -161,7 +163,7 @@ narrow refusal that the call's rustdoc describes.
 | `DispatchThreadgroupsIndirect` | `dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:…` | `ComputeCommandEncoder::dispatch_threadgroups_indirect` |
 | `DispatchThreads` | `dispatchThreads:threadsPerThreadgroup:` | `ComputeCommandEncoder::dispatch_threads` |
 | `DispatchThreadsIndirect` | `dispatchThreadsWithIndirectBuffer:indirectBufferOffset:` (SPI) | `ComputeCommandEncoder::dispatch_threads_indirect` (a host step reads the arguments) |
-| `EncodeStartDoWhile` | `encodeStartDoWhile` (SPI) | `ComputeCommandEncoder::encode_start_do_while`, as Metal runs it, its body in its unit's later encoders included, nested to any depth, laid down as 64 copies of the loop's commands (16 inside another loop, fewer past 16384 steps and gated dispatches, at least one), submitted again from where the loop stopped until it ends; a loop without bound runs until the process ends, as Metal's does |
+| `EncodeStartDoWhile` | `encodeStartDoWhile` (SPI) | `ComputeCommandEncoder::encode_start_do_while`, as Metal runs it, its body in its unit's later encoders included, nested to any depth, laid down as 64 copies of the loop's commands (16 inside another loop, fewer past 16384 steps and gated dispatches or 16 pieces of work a host step records after the GPU's work before it, at least one), submitted again from where the loop stopped until it ends; a loop without bound runs until the process ends, as Metal's does |
 | `EncodeStartElse` | `encodeStartElse` (SPI) | `ComputeCommandEncoder::encode_start_else`, as Metal runs it; with no block open an unbalanced record, dropping its range of the unit's work as Metal's does, the unit's dispatches before its first record included |
 | `EncodeStartIf` | `encodeStartIf:offset:comparison:referenceValue:` (SPI) | `ComputeCommandEncoder::encode_start_if`, as Metal runs it, on a counter the runtime's step kernel moves; a live block open where its unit ends fails the command buffer where its commands skip there, as Metal's GPU recovery does (`PredicationOpenAtUnitEnd`); a word past its buffer reads as Metal reads it (the heap's bytes, or zero; zero announced where Metal reads unrelated memory) *(partial)* |
 | `EncodeStartWhile` | `encodeStartWhile:offset:comparison:referenceValue:` (SPI) | `ComputeCommandEncoder::encode_start_while`, as Metal runs it, laid down as `encode_start_do_while`'s loops are; its word read as `encode_start_if` reads it *(partial)* |
@@ -245,7 +247,7 @@ narrow refusal that the call's rustdoc describes.
 | Item | Metal | Runtime |
 |---|---|---|
 | `heap_texture_size_and_align` | `heapTextureSizeAndAlignWithDescriptor:` | `Device::heap_texture_size_and_align`: Metal's answer wherever the runtime models it, the device's images' own footprint where it does not |
-| `new_buffer_over_host_memory` | `newBufferWithBytesNoCopy:length:options:deallocator:` | `unsafe Device::new_buffer_with_bytes_no_copy` over a `HostMemory` (`VK_EXT_external_memory_host`; where the device refuses the pointer, the dma-bufs of `HostMemory::with_dma_buf`'s source, `VK_EXT_external_memory_dma_buf`) *(partial)* |
+| `new_buffer_over_host_memory` | `newBufferWithBytesNoCopy:length:options:deallocator:` | `unsafe Device::new_buffer_with_bytes_no_copy` over a `HostMemory` (`VK_EXT_external_memory_host`; where the device refuses the pointer or imports none, the dma-bufs of `HostMemory::with_dma_buf`'s source, `VK_EXT_external_memory_dma_buf`) *(partial)* |
 | `new_buffer_of_length` | `newBufferWithLength:options:` | `Device::new_buffer` |
 | `new_command_queue` | `newCommandQueue` | `Device::new_command_queue` |
 | `new_compute_pipeline_state` | `newComputePipelineStateWithDescriptor:options:reflection:error:` | `Device::new_compute_pipeline_state` |
@@ -412,7 +414,7 @@ narrow refusal that the call's rustdoc describes.
 | `SetFragmentTexture` | `setFragmentTexture:atIndex:` | `RenderCommandEncoder::set_fragment_texture` |
 | `SetFragmentTextures` | `setFragmentTextures:withRange:` | `RenderCommandEncoder::set_fragment_textures` |
 | `SetFrontFacingWinding` | `setFrontFacingWinding:` | `RenderCommandEncoder::set_front_facing_winding` |
-| `SetLineWidth` | `setLineWidth:` (SPI) | `RenderCommandEncoder::set_line_width`: 1 accepted; anything else refused `AppleOnly::LineWidth` *(partial)* |
+| `SetLineWidth` | `setLineWidth:` (SPI) | `RenderCommandEncoder::set_line_width`: every width accepted, quantized as Metal does; drawn by the device's lines where they draw it (announced `device-wide-lines`, no device's taken as Metal's parallelogram) or as the band variant; what neither draws (a triangle's edges, a line without `tessellationShader`, a rate-mapped pass's or an execution's lines) by the device's lines at the nearest width they draw, announced `lines-at-nearest-width` (the runtime's README, line widths) *(partial)* |
 | `SetPointSize` | `setPointSize:` (SPI) | `RenderCommandEncoder::set_point_size`: a no-op, as on Metal |
 | `SetProvokingVertexMode` | `setProvokingVertexMode:` (SPI) | `RenderCommandEncoder::set_provoking_vertex_mode`: modes 0 and 1 drawn as Metal draws them; every other mode, which Metal draws a third way, drawn as 1 (patches as 0), each draw Metal's third way draws otherwise announced (`provoking-vertex-unmatched`) *(partial)* |
 | `SetRenderPipelineState` | `setRenderPipelineState:` | `RenderCommandEncoder::set_render_pipeline_state` |
@@ -481,6 +483,7 @@ narrow refusal that the call's rustdoc describes.
 | `length` | `length` | `Buffer::length` |
 | `new_linear_texture` | `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` (SPI) | `Buffer::new_linear_texture` (an aliasing image, or a shadow image where Vulkan cannot alias) *(partial)* |
 | `new_texture` | `newTextureWithDescriptor:offset:bytesPerRow:` | `Buffer::new_texture`, as `new_linear_texture` *(partial)* |
+| `new_tiled_texture` | `newTiledTextureWithDescriptor:offset:bytesPerRow:` (SPI) | `Buffer::new_tiled_texture`: one level as `new_texture`; more, one image of every level, a copy of the bytes taken at the first use and after each `Texture::did_modify_data`, its later levels made as `generate_mipmaps` makes them; the CPU's first level is the bytes (`shadowed-texture`) *(partial)* |
 
 ### `Texture`: `MTLTexture`
 
@@ -488,6 +491,7 @@ narrow refusal that the call's rustdoc describes.
 |---|---|---|
 | `array_length` | `arrayLength` | `Texture::array_length` |
 | `depth` | `depth` | `Texture::depth` |
+| `did_modify_data` | `didModifyData` (SPI) | `Texture::did_modify_data`: a tiled texture of more than one level takes its copy of the bytes again at its next use; nothing on another texture |
 | `gpu_resource_id` | `gpuResourceID` | `Texture::gpu_resource_id` |
 | `height` | `height` | `Texture::height` |
 | `is_shareable` | `isShareable` | `Texture::is_shareable` |
@@ -572,7 +576,13 @@ narrow refusal that the call's rustdoc describes.
 | `sample_counts` | `supportsTextureSampleCount:` | `DeviceProperties::supports_texture_sample_count` |
 | `families` | `supportsFamily:` | `Device::supports_family`; `Device::family_blockers` names what blocks a family |
 | `heap_buffer_page_private` | `heapBufferSizeAndAlignWithLength:options:` | `Device::heap_buffer_size_and_align` |
-| `min_linear_alignment_bgra8` | `minimumLinearTextureAlignmentForPixelFormat:` | `DeviceProperties::minimum_linear_texture_alignment_for_pixel_format` |
+| `min_linear_alignment_bgra8` | `minimumLinearTextureAlignmentForPixelFormat:` | `Device::minimum_linear_texture_alignment_for_pixel_format` |
+
+### `IdentityCaps`: `MTLDevice` identity and size answers
+
+| Item | Metal | Runtime |
+|---|---|---|
+| `sizes.max_argument_buffer_sampler_count` | `maxArgumentBufferSamplerCount` | `DeviceProperties::max_argument_buffer_sampler_count`: one fewer than the smaller of a set-1 sampler array's elements (`metal2vulkan::pipeline::heap_sampler_capacity`) and `maxSamplerAllocationCount`; 65535 on MoltenVK on an M3 Max, where Metal answers 500000 *(partial)* |
 
 ## Composed from runtime calls
 

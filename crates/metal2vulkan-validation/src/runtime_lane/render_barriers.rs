@@ -33,8 +33,8 @@ use super::degrade_notices::assert_once;
 use super::memoryless::{memoryless, memoryless_msaa};
 use super::resolves::{color_pass, lane, quiet, repeat, FULL, MASKED, ONE, SAMPLES, SIZE, WHITE};
 use super::{
-    buffer_with, buffer_with_options, layer_reported_nothing_at_all, read_buffer, validated_device,
-    validated_device_with, Messages, ScratchCache, WAIT,
+    at_plan, buffer_with, buffer_with_options, layer_reported_nothing_at_all, read_buffer,
+    validated_device, validated_device_with, Messages, ScratchCache, WAIT,
 };
 use crate::air_library::AirLibrary;
 use crate::candidate::runtime_case::executor_layer_settings;
@@ -46,6 +46,7 @@ use metal2vulkan::metal::{
 };
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_devtools::llvm_assemble;
+use metal2vulkan_runtime::DeviceOptions;
 use metal2vulkan_runtime::{
     BlitOption, Buffer, CommandBuffer, CommandBufferStatus, CpuCacheMode, Degradation,
     DegradeNotice, Device, Error, HazardTrackingMode, IndirectCommandBufferDescriptor, LoadAction,
@@ -53,7 +54,6 @@ use metal2vulkan_runtime::{
     ResourceOptions, Size, StorageMode, StoreAction, TextureDescriptor,
     VertexAmplificationViewMapping,
 };
-use std::path::Path;
 
 /// The words after one draw: every pixel's sample 0, then the four invocations.
 const ONE_DRAW: [u32; 5] = [1, 1, 1, 1, 4];
@@ -65,11 +65,21 @@ const TWO_DRAWS: [u32; 5] = [1, 1, 1, 1, 8];
 /// `test` runs on it with the fixture's state and the list, which is returned once the device is
 /// destroyed.
 fn on_device(test: impl FnOnce(&Device, &RenderPipelineState, &Messages)) -> Messages {
+    on_device_with(|_| {}, test)
+}
+
+/// [`on_device`], `adjust` applied to the options of each device it makes (`at_plan` gives them
+/// their queue plan).
+fn on_device_with(
+    adjust: fn(&mut DeviceOptions),
+    test: impl FnOnce(&Device, &RenderPipelineState, &Messages),
+) -> Messages {
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
     {
         let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |options| {
-            options.layer_settings = executor_layer_settings()
+            options.layer_settings = executor_layer_settings();
+            adjust(options)
         })
         .unwrap();
         let state = state(&device);
@@ -81,8 +91,7 @@ fn on_device(test: impl FnOnce(&Device, &RenderPipelineState, &Messages)) -> Mes
 /// The fixture's fullscreen triangle and sample-rate fragment, at one sample, without
 /// attachments.
 fn state(device: &Device) -> RenderPipelineState {
-    let ll =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/public/engine/rt6_attachmentless.ll");
+    let ll = metal2vulkan_devtools::engine_dir().join("rt6_attachmentless.ll");
     let library = device
         .new_library_with_air(&llvm_assemble(&ll).unwrap())
         .unwrap();
@@ -217,7 +226,7 @@ fn split(messages: &Messages) -> Option<DegradeNotice> {
 /// announced once, its reason naming the barriers; barriers that order nothing split nothing.
 #[test]
 fn a_memory_barrier_orders_a_render_encoders_draws() {
-    let messages = on_device(|device, state, messages| {
+    let messages = on_device_with(at_plan, |device, state, messages| {
         let words = pass(device, state, |encoder| {
             encoder.memory_barrier_with_scope(BUFFERS, FRAGMENT, FRAGMENT);
             draw(encoder);
@@ -629,8 +638,7 @@ fn a_render_target_barrier_stays_inside_a_multiview_pass() {
     let messages = Messages::default();
     {
         let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
-        let ll =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/public/engine/rt6_amplified.ll");
+        let ll = metal2vulkan_devtools::engine_dir().join("rt6_amplified.ll");
         let library = device
             .new_library_with_air(&llvm_assemble(&ll).unwrap())
             .unwrap();

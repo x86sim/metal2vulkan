@@ -17,8 +17,10 @@
 //!   completed and answers `false`, detaching nothing; a heap's answers `false` at once. A later
 //!   submission of a command buffer, behind an event wait, holds nothing until it is submitted: a
 //!   detach while it waits detaches at once, whatever the command buffer's earlier submissions
-//!   held, which keep their pages until they complete. A lost device ends the wait
-//!   (`Err(DeviceLost)`). The wait holds no lock of the runtime's: a completion turn lets each
+//!   held, which keep their pages until they complete. A lost device ends the wait: where the
+//!   device recovers from the loss, refused as made before the recovery
+//!   (`NotImplemented(MadeBeforeRecovery)`, `device/line.rs`), else `Err(DeviceLost)`. The wait
+//!   holds no lock of the runtime's: a completion turn lets each
 //!   submission's hold go without one.
 //! - **A detach in a completed handler is a race on Metal, whose deterministic side is `true`.**
 //!   Metal releases what a command buffer used as it processes the completion, and that release
@@ -51,7 +53,8 @@
 //!   runtime's own shared by every detached buffer (`buffer::Detached`), never memory of its
 //!   size. No command that takes the stand-in runs: an encoder whose command names a detached
 //!   buffer records nothing from that command on (`EncoderCore::skips`), and its submission
-//!   fails as above; `contents` answers `None` while the buffer is detached.
+//!   fails as above. `contents` answers the caller's pointer of the pages it was detached from,
+//!   as Metal's does, through which the runtime reads and writes nothing until a rebind.
 //! - **Textures**. A texture over the bytes (over the buffer, or over one of a heap's buffers, or
 //!   in the heap) stays, and presents a stand-in of its image's plan while they are detached
 //!   (`texture/stand_in.rs`): its size and level queries answer its own, an unnamed read reads zero
@@ -62,6 +65,10 @@
 //!   names it fails as one naming the buffer does. A texture being made over the bytes refuses
 //!   the detach (`NotImplemented(DetachTextures)`), and no texture is made over detached bytes
 //!   yet.
+//! - **Tiled textures** (`Buffer::new_tiled_texture`, more than one level): the image of its own
+//!   that holds every level, a copy of the bytes taken at use (`shadow.rs`'s **Copies taken at
+//!   use**), presents no stand-in, and keeps every level through the detach, which its reads,
+//!   writes and CPU calls take, as a Mac's texture's own memory does.
 //! - **Attaching again.** `rebind_bytes_no_copy` gives a detached buffer or heap pages again.
 
 use super::buffer::{Buffer, Detached, HostCell, Lying};
@@ -95,8 +102,9 @@ impl Buffer {
     /// handler, and this one is the side of it Metal settles on (the module docs). The old
     /// memory's import goes once nothing holds it; its deallocator runs at the buffer's next
     /// rebind, inside the call, or at its release, never at the detach, as Metal's. The buffer, its
-    /// `gpu_address` and its options stay; `contents` answers `None` while it is detached, where
-    /// Metal's answers the old pointer.
+    /// `gpu_address`, its options and its `contents` stay: `contents` answers the caller's pointer
+    /// of the pages it was detached from, as Metal's does (a heap's buffer, its offset from its
+    /// heap's), and the runtime reads and writes nothing through it until a rebind.
     ///
     /// A submission after the call, the command buffer's first or a later one behind an event
     /// wait, whose commands named the buffer or made it resident (a render pass whose attachment
@@ -108,6 +116,13 @@ impl Buffer {
     /// pages again: its queries answer its own descriptor, an unnamed read reads zeros, and a
     /// command that names it fails as one that names the buffer.
     ///
+    /// A `Managed` no-copy buffer on a device without unified memory is two copies
+    /// ([`HostBacking::DeviceCopy`](crate::HostBacking::DeviceCopy)): the call lets go of its host
+    /// copy (an import of the pages answers as above; pages no import maps detach at once) and
+    /// keeps the GPU's copy, which commands go on reading and writing, with no stand-in and no
+    /// failed command buffer; `synchronize_resource` copies nothing out until a rebind gives it
+    /// pages again, which it copies in whole.
+    ///
     /// Refused: a buffer that is not a no-copy buffer of its own (`Invalid`,
     /// [`RebindProblem::NotHostMemory`]); a buffer with a texture being made over its bytes
     /// (`NotImplemented(DetachTextures)`); a texture over it whose stand-in the device makes none
@@ -116,9 +131,14 @@ impl Buffer {
     pub fn detach_backing(&self) -> Result<bool, Error> {
         const CALL: &str = "detach_backing";
         let Some(cell) = self.host_cell() else {
+            // A two-copy buffer's host copy lets go of its pages; the GPU's copy stays
+            // (`managed_copy.rs`).
+            if let Some(caller) = self.caller_copy() {
+                return caller.detach();
+            }
             return Err(invalid(CALL, Problem::Rebind(RebindProblem::NotHostMemory)));
         };
-        self.device().detach_host_pages(self, cell, None)
+        self.generation().detach_host_pages(self, cell, None)
     }
 }
 
@@ -145,7 +165,7 @@ impl Heap {
         else {
             return Err(invalid(CALL, Problem::Rebind(RebindProblem::NotHostMemory)));
         };
-        self.device().detach_host_pages(own, cell, Some(self))
+        self.generation().detach_host_pages(own, cell, Some(self))
     }
 }
 
@@ -160,7 +180,7 @@ impl Device {
         heap: Option<&Heap>,
     ) -> Result<bool, Error> {
         if self.is_lost() {
-            return Err(Error::DeviceLost);
+            return Err(self.lost_refusal());
         }
         let shared = self.shared();
         // The render encoders' calls and ends that their calls left to the device's lowering
@@ -189,18 +209,22 @@ impl Device {
         let stand_ins = images.stand_ins(self)?;
         let detached = Arc::new(Detached::new(self.detach_stand_in()?, &from)?);
         drop(from);
-        let Some((old, resident)) = rebinds.detach(key, cell, detached) else {
+        let Some((old, twins, resident)) = rebinds.detach(key, cell, detached) else {
             drop(textures);
             return refuse();
         };
+        // Its read twins over the old pages go, the rebinds' lock let go of (`LeftTwins`).
+        drop(twins);
         // What the textures over the old pages made of them goes: the images bound there and
         // every view (the texel views of texture buffers too, made again over pages the next
         // bind finds).
         let gone = images.present_stand_ins(stand_ins);
         let texels = cell.texels();
         // Pages a submitted command buffer made resident stay Metal's textures' unnamed reads;
-        // and a stand-in's sink holds what unnamed writes left.
-        let stale = textures.textures().flat_map(|noted| {
+        // and a stand-in's sink holds what unnamed writes left. A texture whose image keeps its
+        // own texels presents no stand-in.
+        let presenting = textures.textures().filter(|noted| !noted.keeps());
+        let stale = presenting.flat_map(|noted| {
             let pages = resident.then_some(Unexact::StalePages);
             let sink = noted.sink().then_some(Unexact::StorageSink);
             let (texture, id) = (noted.texture(), noted.id);
@@ -242,7 +266,9 @@ impl Device {
                     pages.park(gone);
                     super::heap_sets::retire(self, Box::new(Arc::clone(pages)));
                 }
-                Lying::Detached(_) => super::heap_sets::retire(self, Box::new(gone)),
+                Lying::Detached(_) | Lying::Gone(_) => {
+                    super::heap_sets::retire(self, Box::new(gone))
+                }
             }
         }
         // The old pages go now where no command buffer holds them, their import freed; their
@@ -308,7 +334,7 @@ impl Device {
     /// buffer bound a heap set (`reaches`) may reach every texture through its resource ID unnamed,
     /// so each texture whose bytes were detached after a submitted command buffer made them
     /// resident is announced now, once
-    /// ([`Degradation::StaleDetachedReach`](super::Degradation::StaleDetachedReach), with its
+    /// ([`Degradation::StaleDetachedReach`], with its
     /// ID), and counted (`WorkCounts::stale_detached_reaches`). Metal's unnamed read of such a
     /// texture reads the pages the program gave back, which a correct program never relies on;
     /// the stand-in's reads zero. The trigger is reachability, not a read. On the submitting
@@ -323,7 +349,7 @@ impl Device {
     /// The storage-sink degrade's trigger, the one place it is decided: a command buffer that bound
     /// a heap set (`reaches`) may reach every texture through its resource ID unnamed, so each
     /// texture over detached bytes whose stand-in has a sink is announced as it commits, once
-    /// ([`Degradation::DetachedStorageKeepsWrites`](super::Degradation::DetachedStorageKeepsWrites),
+    /// ([`Degradation::DetachedStorageKeepsWrites`],
     /// with its ID), and counted (`WorkCounts::detached_storage_reaches`): a read through a
     /// storage-class element there reads what an unnamed write left in the sink, where Metal's
     /// reads zero. In the program's `commit`, with no lock held, so a handler asked for each

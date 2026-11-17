@@ -5,7 +5,9 @@
 //!
 //! - [`Library::parse`] accepts a metallib, a bitcode wrapper, or a raw bitcode module. A
 //!   metallib's table comes from its container tags (every function `HASH` is verified, linear in
-//!   the input); its bitcode and AIR metadata are decoded only when a function is compiled.
+//!   the input, but a Core Image kernel library's, which Apple's toolchain does not write as its
+//!   module's SHA-256: that digest is computed instead); its bitcode and AIR metadata are decoded
+//!   only when a function is compiled.
 //! - A wrapper or raw module ([`Library::from_air`]) is one bitcode module that may hold several
 //!   entry points. Enumerating them needs the module's AIR metadata, so construction decodes the
 //!   module once under the standard budget and records **every** entry.
@@ -118,10 +120,13 @@ struct MetallibTags {
 impl Library {
     /// Parse a metallib, a bitcode wrapper (`0x0b17c0de`), or a raw bitcode module. A metallib is
     /// parsed from its container tags alone (no bitcode is decoded); a wrapper or raw module is
-    /// decoded once to enumerate its entry points, as [`Library::from_air`].
+    /// decoded once to enumerate its entry points, as [`Library::from_air`]. A universal file
+    /// (Metal's own, or a Mach-O universal file) is the metallib its AIR slice holds: the library
+    /// keeps and hashes that slice alone ([`Library::bytes`]), and its slices of GPU code are not
+    /// read.
     pub fn parse(bytes: &[u8]) -> Result<Library, Error> {
         crate::pipeline::compile::guarded(|| match container::parse(bytes)? {
-            Container::Metallib(ml) => from_metallib(bytes, &ml),
+            Container::Metallib(ml) => from_metallib(&ml),
             Container::Module(module) => from_module(bytes, module.hash),
         })
     }
@@ -149,7 +154,7 @@ impl Library {
     /// metallib; [`Library::parse`] and [`Library::from_air`] take it.
     pub fn from_metallib(bytes: &[u8]) -> Result<Library, Error> {
         crate::pipeline::compile::guarded(|| match container::parse(bytes)? {
-            Container::Metallib(ml) => from_metallib(bytes, &ml),
+            Container::Metallib(ml) => from_metallib(&ml),
             Container::Module(_) => Err(InputError::new(
                 InputErrorKind::Container(ContainerError::BadMagic),
                 Location::container(0),
@@ -158,12 +163,12 @@ impl Library {
         })
     }
 
-    /// The container bytes the library was parsed from.
+    /// The container bytes the library was parsed from: of a universal file, its AIR slice.
     pub fn bytes(&self) -> &[u8] {
         &self.0.bytes
     }
 
-    /// SHA-256 of the whole container.
+    /// SHA-256 of [`Library::bytes`].
     pub fn content_hash(&self) -> &Hash256 {
         &self.0.content_hash
     }
@@ -278,7 +283,8 @@ fn range_in(whole: &[u8], part: &[u8]) -> Result<Range<usize>, Error> {
     }
 }
 
-fn from_metallib(bytes: &[u8], ml: &container::Metallib<'_>) -> Result<Library, Error> {
+fn from_metallib(ml: &container::Metallib<'_>) -> Result<Library, Error> {
+    let bytes = ml.bytes;
     let mut functions = Vec::with_capacity(ml.functions.len());
     for f in &ml.functions {
         let cnst = &f.public.constants;
@@ -561,6 +567,17 @@ impl Function {
     pub fn function_constants_dictionary(
         &self,
     ) -> Result<BTreeMap<String, ReflectedConstant>, Error> {
+        let mut m = Meter::new(&Budget::standard());
+        self.constants_dictionary_with(|bitcode, m| Ok(crate::air::decode(bitcode, m)?), &mut m)
+    }
+
+    /// [`Function::function_constants_dictionary`] under `m`, a module function's AIR decoded by
+    /// `decode` (`pipeline::compile`'s stage entries copy a decode they keep).
+    pub(crate) fn constants_dictionary_with(
+        &self,
+        decode: impl FnOnce(&[u8], &mut Meter) -> Result<crate::air::Decoded, Error>,
+        m: &mut Meter,
+    ) -> Result<BTreeMap<String, ReflectedConstant>, Error> {
         let e = self.entry()?;
         let index = match &e.source {
             EntrySource::Metallib(tags) => {
@@ -570,9 +587,8 @@ impl Function {
             EntrySource::Module { index } | EntrySource::Visible { index } => *index,
         };
         let bitcode = self.bitcode()?;
-        let mut m = Meter::new(&Budget::standard());
         crate::pipeline::compile::guarded(|| {
-            let decoded = crate::air::decode(bitcode, &mut m)?;
+            let decoded = decode(bitcode, m)?;
             let abi = &decoded.abi;
             let i = usize::try_from(index).ok();
             let func = match &e.source {
@@ -582,7 +598,7 @@ impl Function {
                 _ => i.and_then(|i| abi.entries.get(i)).map(|ep| ep.func),
             }
             .ok_or_else(|| invariant("a library function outside its module"))?;
-            crate::reflection::module_constants(&decoded.module, abi, func, &e.name, &mut m)
+            crate::reflection::module_constants(&decoded.module, abi, func, &e.name, m)
         })
     }
 
@@ -603,9 +619,12 @@ impl Function {
             .ok_or_else(|| invariant("a function's bitcode outside its library"))?;
         Ok(match &e.source {
             // A metallib's visible function is no stage, as a module's is not; nor is a function
-            // a dynamic library exports.
+            // a dynamic library exports, or a Core Image kernel library's extern function.
             EntrySource::Metallib(_)
-                if matches!(e.stage, FunctionStage::Visible | FunctionStage::Exported) =>
+                if matches!(
+                    e.stage,
+                    FunctionStage::Visible | FunctionStage::Exported | FunctionStage::Extern
+                ) =>
             {
                 FunctionSource::Visible
             }
@@ -658,7 +677,8 @@ pub(crate) enum FunctionSource<'a> {
     Metallib(Box<LibraryFunction<'a>>),
     /// Entry `index` of a wrapper or raw module.
     Module { bitcode: &'a [u8], index: u32 },
-    /// A visible function, or a function a dynamic library exports: not a stage.
+    /// A visible function, a function a dynamic library exports, or a Core Image kernel
+    /// library's extern function: not a stage.
     Visible,
 }
 
@@ -669,7 +689,8 @@ pub struct FunctionInfo<'a> {
     pub name: &'a str,
     pub stage: FunctionStage,
     /// SHA-256 of the function's bitcode (its content key): a metallib function's verified
-    /// `HASH`, or the hash of the whole wrapper or raw module its entries share.
+    /// `HASH` (a Core Image kernel library's module's SHA-256, computed, since its `HASH` is not
+    /// that), or the hash of the whole wrapper or raw module its entries share.
     pub air_hash: Hash256,
     /// Function constants from the metallib `CNST` tag, or from the module's AIR metadata.
     pub constants: &'a [FunctionConstant],
@@ -695,9 +716,15 @@ pub struct FunctionConstant {
 }
 
 /// Function-constant values supplied with a function (`MTLFunctionConstantValues`), by index or by
-/// name. A constant with no value is "not defined": `is_function_constant_defined` folds to false
-/// and arguments gated on it are absent; a surviving value use is
-/// `Error::NeedsInput(FunctionConstant)`.
+/// name. A constant with no value is "not defined": `is_function_constant_defined` folds to false,
+/// arguments gated on it are absent, a branch or `select` on it takes its false way, and a value
+/// computed from it alone is its type's zero. It compiles for a specialized function (made with
+/// constant values, none among them too, or by `newFunctionWithDescriptor:`), whose pipeline plain
+/// Metal makes too, its own reads of the constant varying from read to read (docs/API.md,
+/// "Accepted differences"). Metal makes no pipeline state of a function made by
+/// `newFunctionWithName:` whose function declares a constant: its creation ends the process
+/// ([`FunctionDescriptor::needs_specialization`](crate::pipeline::FunctionDescriptor::needs_specialization)),
+/// and the runtime refuses it as Metal does.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

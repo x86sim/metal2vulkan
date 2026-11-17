@@ -4,7 +4,8 @@
 //! Layout (little-endian, packed), as observed in Apple output of formats 2.7–2.9:
 //!
 //! - Header (0x58 bytes): `MTLB`, `platform u16`, `version u16 u16`, `file_type u8` (0 an
-//!   executable library, 2 a dynamic library), `os u8`, `os_version u16 u16`, then `u64`
+//!   executable library, 1 a Core Image kernel library, 2 a dynamic library), `os u8`,
+//!   `os_version u16 u16`, then `u64`
 //!   `file_size` and `(offset, size)` pairs for the function list, public metadata, private
 //!   metadata, and bitcode sections.
 //! - Function list: `u32 count`, then `count` entries of `u32 entry_size` (counting itself) and a
@@ -12,13 +13,29 @@
 //!   list follows the last entry.
 //! - Per function, `OFFT` holds its public-metadata, private-metadata, and bitcode offsets relative
 //!   to their section bases. Each metadata record is `u32 size` and a tag list of exactly that
-//!   size. The bitcode is `MDSZ` bytes of wrapped bitcode, and `HASH` is its SHA-256.
+//!   size. The bitcode is `MDSZ` bytes of wrapped bitcode, and `HASH` is its SHA-256, except in a
+//!   Core Image kernel library (below).
+//! - A Core Image kernel library's `HASH` is 32 bytes that are not, in general, the SHA-256 of
+//!   the module its functions share. Apple's `metallib -cikernel` writes one value for every
+//!   function, which for some modules is the written module's SHA-256 and for others is not (the
+//!   same input gives the same value; observed with modules written from scratch under Xcode
+//!   27.2's toolchain, and in each of Core Image's own libraries on macOS 27.0.1); what it is a
+//!   digest of is not known. Metal does not check `HASH` (a probe, an M3 Max under macOS 27.0.1:
+//!   an executable library and a Core Image kernel library with one bit of every `HASH` flipped
+//!   load, and the executable library's kernel runs). So a Core Image kernel library's `HASH` is
+//!   read as 32 bytes and kept raw, uninterpreted, and each of its functions' content key is the
+//!   SHA-256 of its bitcode, computed here; every other library's `HASH` is verified.
 //! - No two functions share or overlap a public-metadata record, a private-metadata record, or a
 //!   bitcode range. Apple output never does, and requiring it keeps parsing (and the parsed
 //!   result) linear in the file size: otherwise many entries could re-parse one large record.
-//!   The one exception is a dynamic library (`MTLLibraryTypeDynamic`): Apple's toolchain lists each
-//!   function it exports (`TYPE` 3, its symbol as `NAME`) over the library's one module, so its
-//!   functions may share exactly one bitcode range, hashed once.
+//!   The exceptions are a dynamic library (`MTLLibraryTypeDynamic`), whose functions Apple's
+//!   toolchain lists as the symbols it exports (`TYPE` 3, each as `NAME`) over the library's one
+//!   module, and a Core Image kernel library (`metallib -cikernel`), whose kernels it lists as
+//!   extern functions (`TYPE` 5) over the one module `metal -fcikernel` compiled: their functions
+//!   may share exactly one bitcode range, hashed once. Their functions may also share one empty
+//!   metadata record (its size word and `ENDT`, no tags), as macOS 11's own Core Image libraries
+//!   (format 2.5) share one 8-byte private-metadata record among all their functions. A shared
+//!   record holding any tag stays refused, so the result stays linear in the file size.
 //! - The extended header's `HDYN` and `ILST` tags each hold an `(offset, size)` of a region of
 //!   the file. `HDYN`'s is a tag list: `NAME`, the library's install name (a dynamic library's
 //!   `installName`; an executable's file name), and one `DYNL` per dynamic library it was linked
@@ -39,6 +56,8 @@ const MIN_ENTRY_LEN: u64 = 8;
 const SUPPORTED_MAJOR: [u16; 2] = [1, 2];
 /// `file_type` of an executable library.
 const FILE_TYPE_EXECUTABLE: u8 = 0;
+/// `file_type` of a Core Image kernel library (`metallib -cikernel`).
+const FILE_TYPE_CORE_IMAGE: u8 = 1;
 /// `file_type` of a dynamic library (`MTLLibraryTypeDynamic`).
 const FILE_TYPE_DYNAMIC: u8 = 2;
 
@@ -46,7 +65,9 @@ const FILE_TYPE_DYNAMIC: u8 = 2;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LibraryType {
-    /// `MTLLibraryTypeExecutable` (`file_type` 0): a library of entry points.
+    /// `MTLLibraryTypeExecutable` (`file_type` 0): a library of entry points. A Core Image kernel
+    /// library (`file_type` 1) is one too, as Metal answers it: its functions are extern functions
+    /// (`TYPE` 5), which Core Image links into a kernel of its own.
     Executable,
     /// `MTLLibraryTypeDynamic` (`file_type` 2): a library whose functions resolve other
     /// libraries' external symbols (`MTLDynamicLibrary`).
@@ -84,6 +105,9 @@ pub struct MtlbHeader {
 /// A parsed metallib.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Metallib<'a> {
+    /// The metallib's own bytes, which its header's ranges count in and its functions' slices lie
+    /// in: the input, or a universal file's AIR slice (the module docs).
+    pub bytes: &'a [u8],
     /// The file header: its version, target, and section ranges.
     pub header: MtlbHeader,
     /// The function list's entries, in file order.
@@ -129,7 +153,10 @@ pub struct LibraryFunction<'a> {
     pub name: &'a str,
     /// `TYPE`: the function's stage.
     pub stage: FunctionStage,
-    /// The verified SHA-256 of [`LibraryFunction::bitcode`]: the function's content key.
+    /// The SHA-256 of [`LibraryFunction::bitcode`]: the function's content key. It is the
+    /// function's `HASH`, verified, in every library but a Core Image kernel library, whose
+    /// `HASH` is not its module's SHA-256 (the module docs): there it is computed, and `HASH` is
+    /// kept as read in [`LibraryFunction::raw_tags`].
     pub hash: Hash256,
     /// `VERS`: the AIR version, major and minor.
     pub air_version: (u16, u16),
@@ -141,7 +168,8 @@ pub struct LibraryFunction<'a> {
     pub public: FunctionPublicMetadata<'a>,
     /// Private metadata tags, kept raw (no content observed).
     pub private: Vec<RawTag<'a>>,
-    /// Function-table tags this layer does not interpret (`LAYR`, `TESS`, `RFLT`, …).
+    /// Function-table tags this layer does not interpret (`LAYR`, `TESS`, `RFLT`, …; a Core Image
+    /// kernel library's `HASH`).
     pub raw_tags: Vec<RawTag<'a>>,
 }
 
@@ -248,7 +276,10 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Metallib<'_>, Error> {
             6,
         ));
     }
-    if header.file_type != FILE_TYPE_EXECUTABLE && header.file_type != FILE_TYPE_DYNAMIC {
+    if !matches!(
+        header.file_type,
+        FILE_TYPE_EXECUTABLE | FILE_TYPE_CORE_IMAGE | FILE_TYPE_DYNAMIC
+    ) {
         return Err(InputError::new(
             InputErrorKind::Unsupported(Feature::LibraryKind(header.file_type)),
             Location::container(10),
@@ -330,8 +361,11 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Metallib<'_>, Error> {
     }
 
     // Function bitcode ranges are disjoint, so verifying every hash is linear in the file size. A
-    // dynamic library's functions may share one range exactly, which is hashed once.
-    let shared = header.file_type == FILE_TYPE_DYNAMIC;
+    // dynamic library's functions, and a Core Image kernel library's, may share one range exactly,
+    // which is hashed once. A Core Image kernel library's `HASH` is not its module's SHA-256 (the
+    // module docs), so its functions take the computed digest instead of having it verified.
+    let shared = matches!(header.file_type, FILE_TYPE_DYNAMIC | FILE_TYPE_CORE_IMAGE);
+    let verified = header.file_type != FILE_TYPE_CORE_IMAGE;
     let mut ranges: Vec<(u64, u64, u64, usize)> = parsed
         .iter()
         .enumerate()
@@ -349,7 +383,7 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Metallib<'_>, Error> {
     let mut hashed: Option<(u64, u64, Hash256)> = None;
     for &(start, len, entry, i) in &ranges {
         let p = parsed
-            .get(i)
+            .get_mut(i)
             .ok_or_else(|| container_error(ContainerError::BadOffset, entry))?;
         let digest = match hashed {
             Some((s, l, digest)) if s == start && l == len => digest,
@@ -359,22 +393,26 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Metallib<'_>, Error> {
                 digest
             }
         };
-        if digest != p.function.hash {
+        if !verified {
+            p.function.hash = digest;
+        } else if digest != p.function.hash {
             return Err(container_error(ContainerError::HashMismatch, entry));
         }
     }
 
-    // Metadata records are parsed only after their offsets are known to be disjoint, so each
-    // record's bytes are read (and its tags held) once.
+    // Metadata records are parsed only after their offsets are known to be disjoint (or one
+    // shared empty record), so each record's bytes are read (and its tags held) once.
     let public = records(
         file,
         header.public_metadata,
         parsed.iter().map(|p| (p.public_at, p.entry)),
+        shared,
     )?;
     let private = records(
         file,
         header.private_metadata,
         parsed.iter().map(|p| (p.private_at, p.entry)),
+        shared,
     )?;
     let mut functions = Vec::with_capacity(parsed.len());
     for ((p, public), private) in parsed.into_iter().zip(public).zip(private) {
@@ -385,6 +423,7 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Metallib<'_>, Error> {
     }
 
     Ok(Metallib {
+        bytes,
         header,
         functions,
         extended: extended.into_iter().map(|t| t.raw).collect(),
@@ -526,7 +565,15 @@ fn function<'a>(
         let slot_filled = match &tag.raw.fourcc {
             b"NAME" => set(&mut name, r.cstr()?),
             b"TYPE" => set(&mut stage, FunctionStage::from_type_tag(r.u8()?)),
-            b"HASH" => set(&mut hash, r.array::<32>()?),
+            b"HASH" => {
+                let value = r.array::<32>()?;
+                if header.file_type == FILE_TYPE_CORE_IMAGE {
+                    // Not the module's SHA-256 (the module docs): kept as read, and the content
+                    // key is computed once the bitcode ranges are checked.
+                    raw_tags.push(tag.raw);
+                }
+                set(&mut hash, value)
+            }
             b"MDSZ" => set(&mut size, r.u64()?),
             b"OFFT" => set(&mut offsets, (r.u64()?, r.u64()?, r.u64()?)),
             b"VERS" => set(&mut versions, ((r.u16()?, r.u16()?), (r.u16()?, r.u16()?))),
@@ -578,12 +625,15 @@ fn function<'a>(
 
 /// The metadata records in `section` at the given `(offset, entry)` pairs, one per function and in
 /// the same order. Records are read in file order, and one that starts before the previous record
-/// ends (including a shared record) is `BadOffset` at the later function's entry. The records are
-/// therefore disjoint, and the total work and the returned tags are linear in the section size.
+/// ends (including a shared record) is `BadOffset` at the later function's entry, except that
+/// where `share_empty` (a library whose functions share one module) a function may name exactly
+/// the record the previous one did when that record holds no tags. The records are therefore
+/// disjoint or empty, and the total work and the returned tags are linear in the section size.
 fn records<'a>(
     file: &'a [u8],
     section: Section,
     offsets: impl Iterator<Item = (u64, u64)>,
+    share_empty: bool,
 ) -> Result<Vec<Vec<Tag<'a>>>, Error> {
     let mut order: Vec<(u64, u64, usize)> = offsets
         .enumerate()
@@ -592,12 +642,18 @@ fn records<'a>(
     order.sort_unstable();
     let mut out: Vec<Option<Vec<Tag<'a>>>> = vec![None; order.len()];
     let mut end = 0;
+    // The start of the last record read, where it held no tags.
+    let mut empty_at = None;
     for (at, entry, i) in order {
+        if share_empty && empty_at == Some(at) {
+            continue; // The shared empty record: this function's metadata is no tags.
+        }
         if at < end {
             return Err(container_error(ContainerError::BadOffset, entry));
         }
         let (list, list_end) = metadata(file, section, at, entry)?;
         end = list_end - section.offset;
+        empty_at = list.is_empty().then_some(at);
         if let Some(slot) = out.get_mut(i) {
             *slot = Some(list);
         }

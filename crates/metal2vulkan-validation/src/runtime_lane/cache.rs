@@ -12,7 +12,8 @@
 //!   the same.
 //! - A state made again on the same device takes its translations from the device's memo: no lookup
 //!   reaches the disk. Under a memory capacity no artifact fits in, the memo keeps nothing, and the
-//!   same creation's lookups reach the disk and hit.
+//!   same creation's function lookup reaches the disk and hits (a compute pipeline is linked from
+//!   its function, never kept on disk).
 //! - A creation whose cancel token is cancelled, or whose deadline has passed, refuses typed and
 //!   keeps nothing; once the translation is cached, the same creation compiles nothing and
 //!   succeeds.
@@ -22,7 +23,7 @@
 //!   cache data"): every making's data is read, nothing fails, and nothing is reported.
 
 use super::{
-    layer_reported_nothing_at_all, needs_later_steps, pipeline_state, public_case,
+    at_plan, layer_reported_nothing_at_all, needs_later_steps, pipeline_state, public_case,
     public_case_names, public_cases, run_case, run_with, validated_device, validated_device_with,
     Messages, PublicCase, ScratchCache,
 };
@@ -72,7 +73,7 @@ struct CacheRun {
     run: Duration,
 }
 
-/// The makings' pipeline cache records (`M2VPPLC\0`, `shader_cache/driver.rs`) under `cache`'s
+/// The makings' pipeline cache records (`M2VPPL4\0`, `shader_cache/driver.rs`) under `cache`'s
 /// layout directory, by path, with their bytes (It counted them).
 fn driver_records(cache: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut found = BTreeMap::new();
@@ -84,7 +85,7 @@ fn driver_records(cache: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
             for entry in std::fs::read_dir(group.unwrap().path()).unwrap() {
                 let path = entry.unwrap().path();
                 let bytes = std::fs::read(&path).unwrap();
-                if bytes.starts_with(b"M2VPPLC\0") {
+                if bytes.starts_with(b"M2VPPL4\0") {
                     found.insert(path, bytes);
                 }
             }
@@ -144,11 +145,12 @@ fn two_processes(case: &str) {
     let cache = ScratchCache::new().unwrap();
     let cold = cache_run(cache.path(), case);
     let first_records = driver_records(cache.path());
-    // Each variant the run compiled is a function and a pipeline, each missed and written.
+    // Each variant the run compiled is a function, missed and written; its pipeline is linked
+    // from it, never kept.
     let c = cold.statistics;
     let compiled = c.writes;
     assert!(
-        c.hits == 0 && c.misses == compiled && compiled >= 2 && compiled.is_multiple_of(2),
+        c.hits == 0 && c.misses == compiled && compiled >= 1,
         "the first process: {c:?}"
     );
     let child = Command::new(std::env::current_exe().unwrap())
@@ -346,7 +348,7 @@ fn second_process() {
 }
 
 /// An entry under the right name holding another case's translated function is refused and
-/// removed; the function is translated and written again, the pipeline still hits, and the
+/// removed; the function is translated and written again, every other entry still hits, and the
 /// output is unchanged.
 #[test]
 fn an_entry_holding_another_translation_is_refused_and_replaced() {
@@ -374,16 +376,18 @@ fn an_entry_holding_another_translation_is_refused_and_replaced() {
 
 /// A state made again on the same device takes its function and pipeline from the device's
 /// memo, so the disk cache counts no lookup, and runs to the same output; under a memory
-/// capacity of one byte the memo keeps nothing, and the same two lookups reach the disk and hit.
+/// capacity of one byte the memo keeps nothing, and the function's lookup reaches the disk and
+/// hits (its pipeline is linked from it, never looked up there).
 #[test]
 fn a_state_made_again_takes_the_memos_translations() {
     let case = public_case(CASE).unwrap();
-    for (memory_capacity, disk_lookups) in [(DEFAULT_MEMORY_CAPACITY, 0), (1, 2)] {
+    for (memory_capacity, disk_lookups) in [(DEFAULT_MEMORY_CAPACITY, 0), (1, 1)] {
         let cache = ScratchCache::new().unwrap();
         let messages = Messages::default();
         {
             let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |options| {
                 options.shader_cache.memory_capacity = memory_capacity;
+                at_plan(options)
             })
             .unwrap();
             let first = pipeline_state(&device, &case).unwrap();
@@ -506,7 +510,7 @@ fn makings_on_several_threads_each_read_their_own_cache() {
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
     let (statistics, failed) = {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let next = AtomicUsize::new(0);
         let failed = std::thread::scope(|scope| {
             let makers: Vec<_> = (0..MAKERS)
@@ -591,7 +595,8 @@ fn set_mode(dir: &Path, mode: u32) {
 /// An entry the directory will not take is announced once as
 /// [`Degradation::ShaderCacheEntryNotWritten`] and ends nothing: the pipeline state is made, it
 /// runs to the same output as one whose entries were written, and the device counts the failures.
-/// The announcement names the directory and its cap.
+/// The announcement names the directory and its cap. A device without unified memory announces
+/// `SharedInSystemMemory` beside it, for the run's first `Shared` buffer.
 ///
 /// The directory is made writable for the device to open (`Directory::open` checks that it takes
 /// a write and fails the creation otherwise, which is the one shader-cache error there is), and
@@ -608,7 +613,7 @@ fn an_entry_that_cannot_be_written_is_announced_and_ends_nothing() {
     let expected = cache_run(writable.path(), CASE);
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
-    let (statistics, output, notices) = {
+    let (statistics, output, notices, system_memory) = {
         let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
         let build = build_dir(cache.path());
         set_mode(&build, READ_ONLY_DIR);
@@ -640,6 +645,7 @@ fn an_entry_that_cannot_be_written_is_announced_and_ends_nothing() {
             device.shader_cache_statistics(),
             output,
             messages.take_notices(),
+            super::degrade_notices::shared_in_system_memory(&device),
         )
     };
     assert_eq!(
@@ -650,17 +656,28 @@ fn an_entry_that_cannot_be_written_is_announced_and_ends_nothing() {
         statistics.write_failures > 0,
         "the directory must have refused an entry at all: {statistics:?}"
     );
-    let kinds: Vec<Degradation> = notices
+    let mut kinds: Vec<Degradation> = notices
         .iter()
         .filter_map(|notice| notice.degradation.as_ref().map(|d| d.degradation))
         .collect();
+    kinds.sort();
+    let mut expected = UNWRITTEN_ENTRY.to_vec();
+    if system_memory {
+        expected.push(Degradation::SharedInSystemMemory);
+    }
+    expected.sort();
     assert_eq!(
-        kinds, UNWRITTEN_ENTRY,
+        kinds, expected,
         "the kinds a device whose cache entries could not be written announced"
     );
     let notice = notices
         .iter()
-        .find(|notice| notice.degradation.is_some())
+        .find(|notice| {
+            notice
+                .degradation
+                .as_ref()
+                .is_some_and(|d| UNWRITTEN_ENTRY.contains(&d.degradation))
+        })
         .expect("the notice");
     let root = cache.path().display().to_string();
     let cap = metal2vulkan_runtime::DEFAULT_CAPACITY.to_string();

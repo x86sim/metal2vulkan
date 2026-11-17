@@ -69,7 +69,7 @@ impl TessellationWork {
         dispatch: &TessellationDispatch,
     ) -> Result<TessellationWork, Error> {
         let device = core.device().clone();
-        let queue = core.command_buffer().command_queue().id();
+        let queue = core.command_buffer().queue_place().id();
         let mut state = core.command_buffer().state();
         let (records, pool) = match dispatch.records {
             TessellationRecords::Exact { .. } => {
@@ -203,7 +203,7 @@ impl TessellationSteps {
             (None, Some(zeros)) => (zeros.raw(), zeros.offset(), zeros.len()),
             (None, None) => return Err(internal("a tessellation scan without its factors")),
         };
-        let owned = OwnedSets::write(&device, &kernel, &[set.to_vec()])?;
+        let owned = OwnedSets::write(&device, &kernel, &[set])?;
         let sets = owned.sets.clone();
         core.retain(owned);
         let copy = arguments.map(|(raw, offset)| {

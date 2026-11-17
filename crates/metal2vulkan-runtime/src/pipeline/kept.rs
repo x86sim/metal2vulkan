@@ -14,9 +14,24 @@
 //!   layout made it: each is kept under its instance, and an instance's objects taken back keep
 //!   the instance. A pipeline released after its instance's objects left (taken back, or
 //!   evicted) waits for them under its instance, as a pipeline released first does.
-//! - **Bounded.** At most [`KEPT`] instances, the least recently released going first; an
-//!   evicted instance's objects and pipelines are destroyed then. An instance keeps at most what
-//!   its variant's memo of `VkPipeline`s held.
+//! - **Bounded.** At most [`KEPT`] instances, the least recently released going first; an evicted
+//!   instance's objects and pipelines are destroyed then. An instance keeps at most what its
+//!   variant's memo of `VkPipeline`s held, and of its region pipelines only those the device's
+//!   ledger lists, under its bound across every compute variant (`region_ledger.rs`). A guest's
+//!   CoreAnimation process (RenderBox) made a render state's key again after 51 other keys at the
+//!   median and fewer than 256 at most, over a cold boot of 8455 repeats; 16 instances held 157 of
+//!   them, 128 would hold 8308, and 256 hold them all. A kept instance of a vertex and fragment
+//!   function of a few instructions each (`tests/kept_variants.rs`, `what_a_kept_instance_holds`,
+//!   release builds) held 333 KiB of
+//!   resident memory on lavapipe (three runs alike), 1022 KiB of GTT on RADV on a Radeon 780M (two
+//!   runs alike), and 792 KiB of physical footprint on MoltenVK on an M3 Max (four runs alike; 158
+//!   KiB in one whose functions Metal compiled cold): about 83 MiB, 256 MiB and 198 MiB at the
+//!   bound for such pipelines (larger functions not measured). A state made again from a kept
+//!   instance took 26 to 40 us at the median on each, with 64 or with 256 kept (the linear scan of
+//!   the instances included), against 73 to 151 us where its `VkPipeline` was made again. A kept
+//!   instance's immutable samplers count against the device's limit (`SamplerLimit`) while it is
+//!   kept: a sampler the device refuses there evicts the least recently released instance that
+//!   holds any first ([`Kept::evict_for_samplers`]), in a program's call, and is made again.
 //! - **On the guest's threads, in a fixed order** (the owner's HITCH rule 1). A last release can
 //!   happen on any thread: a handler thread when a command buffer lets its objects go, a pool
 //!   thread whose making evicts a memo's entry, or a program's thread. A release only queues there
@@ -24,15 +39,18 @@
 //!   is evicted, nothing is destroyed. The queue is applied where a variant is made
 //!   ([`Kept::take`]), on the program's thread that creates a state or draws (a host step's making
 //!   neither takes nor settles), in the order of the instances' numbers, which the program's calls
-//!   gave them ([`Number`]: a host step's from its command buffer's commit): so which instance is
-//!   evicted, and when its immutable samplers stop counting against the device's limit
-//!   (`SamplerLimit`), follow the program's own order of creations and releases. What remains
-//!   timing's is only whether a command buffer let a variant go before a creation, as before.
+//!   gave them ([`Number`]: a host step's from its command buffer's commit); and where a dispatch
+//!   on the program's thread looks up a region pipeline after the device's ledger let kept ones go
+//!   ([`Kept::settle_let_go`]). So which instance is evicted, and when its immutable samplers stop
+//!   counting against the device's limit (`SamplerLimit`), follow the program's own order of
+//!   creations, dispatches and releases. What remains timing's is only whether a command buffer
+//!   let a variant go before a creation or such a dispatch.
 //! - **Teardown.** The device destroys what is left at its teardown (`DeviceShared::drop`), the
 //!   queue's included.
 
 use super::graphics::GraphicsKey;
 use super::objects::{SamplerSet, StageObject};
+use super::region_ledger::{Listed, Unlisted};
 use super::shared_layouts::SharedLayout;
 use super::RegionKey;
 use crate::device::DeviceShared;
@@ -44,8 +62,9 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// The most released variant instances kept.
-pub(crate) const KEPT: usize = 16;
+/// The most released variant instances kept: a guest's working set of render states (the
+/// module docs).
+pub(crate) const KEPT: usize = 256;
 
 /// The compiled pipeline a variant is of: the device memo's key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -62,7 +81,7 @@ pub(crate) enum Place {
 }
 
 /// One variant instance: the objects made once, and every `VkPipeline` made with its layout.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Instance {
     pub(crate) compiled: Compiled,
     number: Number,
@@ -92,8 +111,8 @@ thread_local! {
 /// `(at, 0)` for one made in the program's call, `at` drawn then; `(at, n)` for the `n`th one
 /// the host steps of a command buffer made (from 1), `at` drawn at its commit. So an instance a
 /// host step makes falls where its command buffer's commit fell among the program's calls, and
-/// after the step's earlier ones, however the scheduler's thread is timed against the program's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// after the step's earlier ones, however the steps' thread is timed against the program's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Number {
     at: u64,
     step: u32,
@@ -116,8 +135,8 @@ impl Number {
 }
 
 /// The numbers a command buffer's host steps give the instances they make: drawn at its commit,
-/// in the program's call, and counted across its steps, which its scheduler's thread runs one
-/// after another in the batches' order.
+/// in the program's call, and counted across its steps, which the steps' threads
+/// (`scheduler/steps.rs`) run one after another in the batches' order, one at a time.
 pub(crate) struct StepNumbers {
     at: u64,
     made: AtomicU32,
@@ -179,8 +198,20 @@ pub(crate) struct KeptPipeline {
     pub(crate) place: Place,
     pub(crate) raw: vk::Pipeline,
     pub(crate) unannounced: bool,
-    /// The libraries it was linked from, kept with it (`libraries.rs`).
+    /// The device's linked pipeline it is, with its libraries, kept with it (`libraries.rs`).
     pub(crate) linked: Option<super::libraries::Linked>,
+}
+
+impl KeptPipeline {
+    /// Destroy it where it is the variant's own, a pipeline made whole: a linked one is the
+    /// device's, which other variants may share, destroyed by its map once nothing holds it
+    /// (`libraries.rs`), and dropping this lets go of its share.
+    fn destroy(&self, shared: &DeviceShared) {
+        if self.linked.is_none() {
+            // SAFETY: released by its last holder, so no pending command uses it.
+            unsafe { release::object(shared.vk(), self.raw) };
+        }
+    }
 }
 
 /// What a variant made again takes back: its instance, objects and pipelines.
@@ -200,13 +231,58 @@ struct Entry {
 }
 
 impl Entry {
-    /// Destroy its pipelines; dropping it lets go of its objects' shares.
+    /// Destroy its pipelines, its region pipelines no longer listed in the device's ledger
+    /// (`region_ledger.rs`); dropping it lets go of its objects' shares.
     fn destroy(&self, shared: &DeviceShared) {
         for pipeline in &self.pipelines {
-            // SAFETY: released by its last holder, so no pending command uses it.
-            unsafe { release::object(shared.vk(), pipeline.raw) };
+            if let Place::Region(key) = &pipeline.place {
+                shared.region_ledger.forget_destroyed(self.instance, key);
+            }
+            pipeline.destroy(shared);
         }
     }
+
+    /// Destroy its region pipelines the device's ledger no longer lists: those it let go past its
+    /// bound (`region_ledger.rs`).
+    fn prune(&mut self, shared: &DeviceShared) {
+        let instance = self.instance;
+        self.pipelines.retain(|pipeline| match &pipeline.place {
+            Place::Region(key) if !listed(shared, instance, key) => {
+                pipeline.destroy(shared);
+                false
+            }
+            _ => true,
+        });
+    }
+
+    /// Destroy its region pipeline at `key`, if it keeps one.
+    fn prune_key(&mut self, shared: &DeviceShared, key: &RegionKey) {
+        let at = (self.pipelines.iter())
+            .position(|pipeline| matches!(&pipeline.place, Place::Region(at) if at == key));
+        if let Some(at) = at {
+            self.pipelines.remove(at).destroy(shared);
+        }
+    }
+}
+
+/// Whether the device's ledger lists `instance`'s `key`, for a prune of the kept variants.
+fn listed(shared: &DeviceShared, instance: Instance, key: &RegionKey) -> bool {
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    PRUNE_LOOKS.with(|looks| looks.set(looks.get() + 1));
+    shared.region_ledger.lists(instance, key)
+}
+
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+thread_local! {
+    /// The keys this thread's prunes of the kept variants asked the device's ledger of, in the
+    /// device tests that read it (`tests::region_widths`).
+    static PRUNE_LOOKS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many keys this thread's prunes of the kept variants asked the device's ledger of so far.
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) fn prune_looks() -> u64 {
+    PRUNE_LOOKS.with(Cell::get)
 }
 
 /// A release from any thread, queued until a variant is made ([`Kept::take`]).
@@ -225,8 +301,7 @@ impl Arrival {
     /// Destroy its pipeline; dropping it lets go of its objects' shares.
     fn destroy(&self, shared: &DeviceShared) {
         if let Arrival::Pipeline(_, pipeline) = self {
-            // SAFETY: released by its last holder.
-            unsafe { release::object(shared.vk(), pipeline.raw) };
+            pipeline.destroy(shared);
         }
     }
 }
@@ -285,6 +360,17 @@ impl Entries {
         entries.back_mut()
     }
 
+    /// Destroy the kept region pipeline of `listed`, a key that left the device's ledger, where
+    /// the ledger lists it no longer.
+    fn prune(&mut self, shared: &DeviceShared, (instance, key): Listed) {
+        if listed(shared, instance, &key) {
+            return;
+        }
+        if let Some(entry) = self.0.iter_mut().find(|e| e.instance == instance) {
+            entry.prune_key(shared, &key);
+        }
+    }
+
     /// Apply `arrival`, a release by its last holder: an instance's objects, or one of its
     /// `VkPipeline`s.
     fn apply(&mut self, shared: &DeviceShared, arrival: Arrival) {
@@ -295,15 +381,19 @@ impl Entries {
                     entry.objects = Some(objects);
                 }
             }
+            // A region pipeline the device's ledger let go past its bound is not kept.
+            Arrival::Pipeline(instance, pipeline)
+                if matches!(&pipeline.place, Place::Region(key)
+                    if !shared.region_ledger.lists(instance, key)) =>
+            {
+                pipeline.destroy(shared);
+            }
             Arrival::Pipeline(instance, pipeline) => match self.entry(shared, instance) {
                 // The instance made its place again after taking the first back: one is enough.
                 Some(entry) if !entry.pipelines.iter().any(|p| p.place == pipeline.place) => {
                     entry.pipelines.push(pipeline);
                 }
-                _ => {
-                    // SAFETY: released by its last holder.
-                    unsafe { release::object(shared.vk(), pipeline.raw) };
-                }
+                _ => pipeline.destroy(shared),
             },
         }
     }
@@ -375,6 +465,33 @@ impl Kept {
         for arrival in self.arrived.drain(..) {
             self.entries.apply(shared, arrival);
         }
+        // The region pipelines the ledger let go past its bound since the last settle: those of
+        // the keys it names, each looked up once (`region_ledger.rs`).
+        if let Some((times, unlisted)) = shared.region_ledger.take_unlisted() {
+            match unlisted {
+                Unlisted::Keys(keys) => {
+                    for listed in keys {
+                        self.entries.prune(shared, listed);
+                    }
+                }
+                Unlisted::Every => {
+                    for entry in &mut self.entries.0 {
+                        entry.prune(shared);
+                    }
+                }
+            }
+            shared.region_ledger.pruned_at(times);
+        }
+    }
+
+    /// Apply the queued releases, and so destroy the kept region pipelines the device's ledger
+    /// let go past its bound (`region_ledger.rs`): on the program's thread, outside a host step
+    /// and a pipeline pool's piece, as [`take`](Self::take) settles; elsewhere nothing.
+    pub(crate) fn settle_let_go(&mut self, shared: &DeviceShared) {
+        if crate::exit_guard::in_host_step() || super::pool::in_piece() {
+            return;
+        }
+        self.settle(shared);
     }
 
     /// The kept instance of `compiled` whose objects are here, taken back, once the queued
@@ -400,6 +517,42 @@ impl Kept {
             objects: entry.objects?,
             pipelines: entry.pipelines,
         })
+    }
+
+    /// Make room for a sampler the device refused at its limit: the least recently released
+    /// instance whose objects hold immutable samplers goes, once the queued releases are applied,
+    /// and with it its share of those samplers. Whether one went. On the program's thread, as
+    /// [`take`](Self::take) is; the device's sampler sets nothing holds then go at their settle.
+    pub(crate) fn evict_for_samplers(&mut self, shared: &DeviceShared) -> bool {
+        self.settle(shared);
+        let entries = &mut self.entries.0;
+        let at = entries.iter().position(|e| {
+            (e.objects.as_ref()).is_some_and(|objects| objects.samplers.holds_samplers())
+        });
+        let Some(entry) = at.and_then(|at| entries.remove(at)) else {
+            return false;
+        };
+        entry.destroy(shared);
+        true
+    }
+
+    /// What it holds of released variants, kept or queued: how many instances' objects, and how
+    /// many region pipelines (a test's look).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn held(&self) -> (usize, usize) {
+        let kept = self.entries.0.iter();
+        let objects = kept.clone().filter(|e| e.objects.is_some()).count()
+            + (self.arrived.iter())
+                .filter(|a| matches!(a, Arrival::Objects(..)))
+                .count();
+        let pipelines = (kept.flat_map(|e| &e.pipelines))
+            .chain(self.arrived.iter().filter_map(|a| match a {
+                Arrival::Pipeline(_, pipeline) => Some(pipeline),
+                Arrival::Objects(..) => None,
+            }))
+            .filter(|p| matches!(p.place, Place::Region(_)))
+            .count();
+        (objects, pipelines)
     }
 
     /// Destroy everything kept, and every release queued: the device's teardown.

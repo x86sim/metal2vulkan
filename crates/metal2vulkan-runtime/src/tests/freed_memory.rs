@@ -24,6 +24,7 @@
 //! Device tests: compiled only under the validation crate's GPU safety cfgs (`m2v_gpu`,
 //! `m2v_cpu_icd`), on the kind of device the cfg selects.
 
+use crate::command_buffer::completion::trace::{self, Point};
 use crate::freed_memory::Parking;
 use crate::{
     BufferContents, BufferDescriptor, CommandBuffer, CommandQueue, Device, DeviceKind,
@@ -177,19 +178,46 @@ fn until(what: &str, done: impl Fn() -> bool) {
     }
 }
 
+/// The queue waiters held before they publish a value their queue's timeline completed
+/// ([`Point::Publish`]), let go as this drops, a failing test's unwinding too.
+struct Unpublished;
+
+impl Unpublished {
+    fn hold() -> Unpublished {
+        trace::hold_at(Point::Publish);
+        Unpublished
+    }
+}
+
+impl Drop for Unpublished {
+    fn drop(&mut self) {
+        trace::release(Point::Publish);
+    }
+}
+
 /// Where the device parks freed memory, a host import released while a batch submitted before it
 /// runs keeps its memory, its deallocator waiting, until that batch completed; then both go, on a
-/// thread of the runtime's, and the wait was announced once. Which path the release took is the
-/// parking's count (`WorkCounts::freed_memory_parked`), not the command buffer's status: the
-/// release reads the value the queue's waiter published, and the turn that finishes the command
-/// buffer comes after it. Where the fills had completed, the memory and the deallocator go inside
-/// the release, on the releasing thread, as Metal's do.
+/// thread of the runtime's, and the wait was announced once. The queue waiters are held before
+/// they publish a completed value ([`Point::Publish`]) from before the batch's commit until the
+/// release's counts and the deallocator's runs are read: the host sees the batch complete only
+/// once they are let go, however soon the GPU ran the fills, so the release parks the import, and
+/// a deallocator that ran by the read did not wait for the batch. A read with the waiters running
+/// is no such sign: the batch may complete as the release returns, and the release the waiter
+/// posts then (`freed_memory.rs`'s `Unpark`) runs the deallocator before the read. The device's
+/// own checks answered first, so nothing of theirs waits for a completion while the waiters are
+/// held.
 #[test]
 fn a_release_waits_for_the_batch_in_flight_where_the_device_parks_freed_memory() {
     let scratch = Scratch::new("parked");
     let host = Host::new();
     let device = device(&scratch.0);
     device.park_freed_memory();
+    // False where the device runs no in-place check (its policy keeps no texture in place).
+    let _ = device.settle_in_place_checks(WAIT);
+    assert!(
+        device.settle_submit_checks(WAIT),
+        "the submission checks never answered"
+    );
     let queue = device.new_command_queue().unwrap();
     let runs = Arc::new(Runs::default());
     let Some(buffer) = unused(&device, &host, &runs) else {
@@ -198,55 +226,30 @@ fn a_release_waits_for_the_batch_in_flight_where_the_device_parks_freed_memory()
     let target = device
         .new_buffer(FILLED, ResourceOptions::private())
         .unwrap();
+    let unpublished = Unpublished::hold();
     let command_buffer = filling(&queue, &target);
     let before = device.work_counts();
-    let status = command_buffer.status();
     drop(buffer);
     let after = device.work_counts();
     let parked = after.freed_memory_parked - before.freed_memory_parked;
     let delayed = after.host_deallocators_delayed - before.host_deallocators_delayed;
     let ran = runs.count.load(Ordering::SeqCst);
     eprintln!(
-        "FREED-MEMORY: at the release ({status:?}): parked {parked}, waiting {}, deallocators \
-         delayed {delayed}, run {ran}",
+        "FREED-MEMORY: at the release, its batch's completion unpublished: parked {parked}, \
+         waiting {}, deallocators delayed {delayed}, run {ran}",
         after.freed_memory_waiting,
     );
-    // Whether the release found work in flight is the parking's own answer, the one it acted on,
-    // and no command buffer's status: the queue's waiter publishes the value it saw the queue's
-    // timeline reach, which the release reads, before the completion turn that finishes the
-    // command buffers of that value (`command_buffer/completion.rs`), so a status short of
-    // `Completed` is no sign that the release waited, and the fills complete whenever the GPU
-    // and a loaded host let them.
-    let waited = parked == 1;
-    match waited {
-        true => {
-            assert_eq!(after.freed_memory_waiting, 1);
-            assert_eq!(delayed, 1, "the deallocator's wait is announced");
-            assert_eq!(
-                ran, 0,
-                "the deallocator ran while the batch submitted before its release ran"
-            );
-        }
-        false => {
-            eprintln!("FREED-MEMORY: the fills completed before the release: none waited");
-            assert_eq!(parked, 0, "the release parked {parked} blocks");
-            assert_eq!(
-                after.freed_memory_waiting, 0,
-                "a block waits although the release freed its memory"
-            );
-            assert_eq!(
-                delayed, 0,
-                "a deallocator's wait is announced although the release freed its memory"
-            );
-            // As Metal's release runs it, on the releasing thread (the module docs).
-            assert_eq!(ran, 1, "the deallocator ran inside the release");
-            assert_eq!(
-                *runs.thread.lock().unwrap(),
-                Some(std::thread::current().id()),
-                "the deallocator ran on the releasing thread"
-            );
-        }
-    }
+    assert_eq!(
+        parked, 1,
+        "the release freed its import with its batch in flight"
+    );
+    assert_eq!(after.freed_memory_waiting, 1);
+    assert_eq!(delayed, 1, "the deallocator's wait is announced");
+    assert_eq!(
+        ran, 0,
+        "the deallocator ran while the batch submitted before its release ran"
+    );
+    drop(unpublished);
     command_buffer.wait_until_completed_for(WAIT).unwrap();
     assert_eq!(command_buffer.error(), None);
     until("the deallocator never ran", || {
@@ -260,20 +263,24 @@ fn a_release_waits_for_the_batch_in_flight_where_the_device_parks_freed_memory()
         device.work_counts().freed_memory_waiting,
         runs.count.load(Ordering::SeqCst)
     );
-    // A release after its batch completed runs the deallocator at once, on the program's thread.
-    if waited {
-        assert_ne!(
-            *runs.thread.lock().unwrap(),
-            Some(std::thread::current().id()),
-            "the deallocator ran on the program's thread after its batch completed"
-        );
-    }
+    assert_ne!(
+        *runs.thread.lock().unwrap(),
+        Some(std::thread::current().id()),
+        "the deallocator ran on the program's thread after its batch completed"
+    );
 }
 
 /// The bytes of a private buffer that takes a block of its own, with a buffer of addresses (past
 /// half a pooled block, `memory.rs`), and that the recycler parks for no later buffer (past its
-/// bytes, `recycle.rs`): its release frees its block.
+/// bytes, `recycle.rs`): its release frees its block where the device keeps no empty block
+/// ([`keeping_no_empty_block`]).
 const OWN_BLOCK: u64 = 128 << 20;
+
+/// `device`, keeping no empty block for reuse past its pools' two (the heaps' budget's test
+/// stand-in at 0, `memory.rs`'s `KEPT_EMPTY_BYTES`): a block that empties goes.
+fn keeping_no_empty_block(device: &Device) {
+    crate::device::lock(&device.shared().memory).kept_budget_stand_in = Some(0);
+}
 
 /// The `vkDestroyBuffer` calls the memory's own code made so far (`memory.rs`): its blocks'
 /// buffers of addresses (`WorkCounts::object_churn`'s release sites). Read from the counters
@@ -298,6 +305,7 @@ fn addresses_destroyed(device: &Device) -> u64 {
 fn a_block_s_buffer_of_addresses_goes_with_no_submission_inside_its_vk_queue_submit() {
     let scratch = Scratch::new("gated");
     let device = device(&scratch.0);
+    keeping_no_empty_block(&device);
     device.park_freed_memory();
     let parking = Arc::clone(device.shared().parking.get().expect("the device parks"));
     let buffer = device
@@ -343,6 +351,7 @@ const ROUNDS: usize = 24;
 fn blocks_go_while_submissions_that_make_buffers_run() {
     let scratch = Scratch::new("orders");
     let device = device(&scratch.0);
+    keeping_no_empty_block(&device);
     device.park_freed_memory();
     let (done, ended) = mpsc::channel();
     let submitter = {
@@ -546,7 +555,7 @@ fn a_release_waits_for_the_program_s_own_submission_where_the_device_parks_freed
     // SAFETY: the queue is used only inside `f`, under the runtime's lock; the submission waits
     // for a value of the program's semaphore that the program signals below.
     unsafe {
-        queue.with_vk_queue(|vk_queue, _| {
+        queue.with_vk_queue(|_, vk_queue, _| {
             vk_device
                 .queue_submit(vk_queue, &[submit], vk::Fence::null())
                 .unwrap()
@@ -699,6 +708,35 @@ fn a_release_with_nothing_waiting_frees_its_import_before_it_returns() {
     );
 }
 
+/// A no-copy buffer over `host` with `keep_alive` and no deallocator, that no command uses; `None`,
+/// printed, where the device imports no host memory.
+pub(super) fn kept_alive(
+    device: &Device,
+    host: &Host,
+    keep_alive: KeepAlive,
+) -> Option<crate::Buffer> {
+    let contents = BufferContents::NoCopy {
+        // SAFETY: the memory outlives the buffer (dropped after the device), and nothing else
+        // uses it.
+        memory: unsafe { HostMemory::new(host.0) },
+        deallocator: None,
+        keep_alive: Some(keep_alive),
+    };
+    let made = device.new_buffer_with_descriptor(BufferDescriptor::new(
+        BYTES as u64,
+        ResourceOptions::default(),
+        contents,
+    ));
+    match made {
+        Ok(buffer) => Some(buffer),
+        Err(Error::Unsupported(gap)) => {
+            eprintln!("IMPORT-RELEASE: the device imports no host memory: {gap:?}");
+            None
+        }
+        Err(error) => panic!("new_buffer_with_descriptor: {error:?}"),
+    }
+}
+
 /// A keep-alive's drop (a runtime extension) tells the caller the pages may go.
 struct Dropped(Arc<Runs>);
 
@@ -718,26 +756,8 @@ fn a_release_with_a_keep_alive_alone_posts_its_free() {
     let host = Host::new();
     let device = device(&scratch.0);
     let runs = Arc::new(Runs::default());
-    let keep_alive: KeepAlive = Box::new(Dropped(Arc::clone(&runs)));
-    let contents = BufferContents::NoCopy {
-        // SAFETY: the memory outlives the buffer (dropped after the device), and nothing else
-        // uses it.
-        memory: unsafe { HostMemory::new(host.0) },
-        deallocator: None,
-        keep_alive: Some(keep_alive),
-    };
-    let made = device.new_buffer_with_descriptor(BufferDescriptor::new(
-        BYTES as u64,
-        ResourceOptions::default(),
-        contents,
-    ));
-    let buffer = match made {
-        Ok(buffer) => buffer,
-        Err(Error::Unsupported(gap)) => {
-            eprintln!("IMPORT-RELEASE: the device imports no host memory: {gap:?}");
-            return;
-        }
-        Err(error) => panic!("new_buffer_with_descriptor: {error:?}"),
+    let Some(buffer) = kept_alive(&device, &host, Box::new(Dropped(Arc::clone(&runs)))) else {
+        return;
     };
     let before = device.work_counts();
     drop(buffer);
@@ -803,12 +823,31 @@ fn the_in_place_check_s_buffers_delay_no_deallocator_behind_batches_in_flight() 
             && now.host_imports_live == before.host_imports_live
             && now.host_import_releases_pending == before.host_import_releases_pending
     };
+    // The check's steps the test sees: its verdicts as they come, its rounds' images
+    // (`ObjectChurn::vk_images_made`; the program's fills make none), and its imports' releases
+    // and frees. Each of its submissions waits behind a batch of fills on the device's queue, so
+    // the whole check is as long as its submissions times a batch, which a loaded host stretches
+    // past any bound; the bound holds for each step.
+    let steps = || {
+        let now = device.work_counts();
+        let imports = (now.host_import_releases_posted, now.host_imports_live);
+        let images = now.object_churn.vk_images_made;
+        (device.in_place_check_report(), images, imports)
+    };
+    let (mut seen, mut stepped, mut longest) = (steps(), Instant::now(), Duration::ZERO);
     // The first batch is in flight as the check starts, and a next one is submitted before each
     // completes, until it is done.
     let mut in_flight = filling(&queue, &target);
-    let deadline = Instant::now() + WAIT;
     while !done() {
-        assert!(Instant::now() < deadline, "the check's buffers never went");
+        let now = steps();
+        if now != seen {
+            (seen, longest) = (now, longest.max(stepped.elapsed()));
+            stepped = Instant::now();
+        }
+        assert!(
+            stepped.elapsed() < WAIT,
+            "the check's buffers never went: no step of the check in {WAIT:?}"
+        );
         let next = filling(&queue, &target);
         in_flight.wait_until_completed_for(WAIT).unwrap();
         in_flight = next;
@@ -820,10 +859,13 @@ fn the_in_place_check_s_buffers_delay_no_deallocator_behind_batches_in_flight() 
     let posted = after.host_import_releases_posted - before.host_import_releases_posted;
     let parked = after.freed_memory_parked - before.freed_memory_parked;
     eprintln!(
-        "IN-PLACE-CHECK-RELEASES: {report:?}: posted {posted}, parked {parked}, delayed {delayed}"
+        "IN-PLACE-CHECK-RELEASES: {report:?}: posted {posted}, parked {parked}, delayed {delayed}, \
+         longest step {longest:?}"
     );
+    // Of the verdicts' lines, before the check's notes.
     let checked = |class: &str| {
-        (report.iter()).any(|line| line.starts_with(class) && !line.ends_with("Unchecked"))
+        (report.iter().take(crate::in_place::VERDICTS))
+            .any(|line| line.starts_with(class) && !line.ends_with("Unchecked"))
     };
     if !checked("Pointer") && !checked("DmaBuf") {
         eprintln!("IN-PLACE-CHECK-RELEASES: the check made no no-copy buffer");

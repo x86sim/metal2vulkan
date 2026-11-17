@@ -46,6 +46,8 @@ use super::degrade_notices::{
 };
 use super::host_memory::{gpu_read, on_device, recording, Mapping, Seen};
 use super::no_copy_heaps::shared;
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
+use super::property_reads::{batches_submitted, first_batch_submitted};
 use super::rebind_reach::{
     buffer_len, buffer_over, heap_member, kept_member_over, member_over, node, pages,
     rebind_heap_to, rebind_to, walk, Outputs, Uses, Walked, A, B, POINTER_WALKER,
@@ -64,7 +66,9 @@ use metal2vulkan_runtime::{
     HostMemory, Invalid, LoadAction, PipelineOptions, Problem, RebindProblem, Region,
     RenderPassDescriptor, ResourceOptions, SharedEvent, Size, StoreAction, TextureDescriptor,
 };
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -220,7 +224,8 @@ fn table_1_a_pending_command_buffer_reaching_a_detached_buffer_unnamed_reads_zer
 /// A command that names a detached buffer records nothing, nor does any after it in its
 /// encoder or its command buffer's later encoders: a blit's copy (the fills around it unrun) and
 /// a dispatch, each failing `DetachedBacking`; the old pages' deallocator ran in the detach,
-/// which nothing held, and `contents` answers `None`. Encoded while detached and given pages
+/// which nothing held, and `contents` answers the old pages' pointer, as Metal's does. Encoded
+/// while detached and given pages
 /// again before its first submission, a blit encoder is encoded again by the rebind (It failed
 /// `EncodedUseRebound` before) and its copy reads the new pages, with no notice. A command buffer
 /// encoded after the rebind reads the new pages. A buffer of the runtime's memory, or a heap's
@@ -234,10 +239,11 @@ fn a_command_naming_a_detached_buffer_records_nothing_and_its_command_buffer_run
             return;
         };
         gpu_read(&queue, &member, 0..16);
-        assert!(member.contents().is_some());
+        let pointer = member.contents();
+        assert!(pointer.is_some());
         detach(&member);
         assert_eq!(old.runs.load(Ordering::SeqCst), 0, "ran at the detach");
-        assert_eq!(member.contents(), None, "a detached buffer's contents");
+        assert_eq!(member.contents(), pointer, "a detached buffer's contents");
         detach(&member);
 
         let before = buffer_with(device, &[0; 16]).unwrap();
@@ -514,64 +520,72 @@ fn the_spin_cap_holds_both_ends() {
     );
 }
 
+/// The owned fixture's kernel that loads a word no one raises until its cap
+/// (`kernel_spin_on_an_unraised_word`): its GPU work runs until the host raises the word. Run once
+/// on `queue`, its word raised from the start, so its `VkPipeline` is made: a dispatch whose
+/// pipeline is still being made records at a host step, which its submission waits for.
+fn spin_kernel(device: &Device, queue: &CommandQueue) -> ComputePipelineState {
+    let ll = engine_dir().join("kernel_spin_on_an_unraised_word.ll");
+    let library = device
+        .new_library_with_air(&llvm_assemble(&ll).unwrap())
+        .unwrap();
+    let function = library
+        .new_function_with_name("spin_on_an_unraised_word")
+        .unwrap();
+    let state = device
+        .new_compute_pipeline_state(
+            &ComputePipelineDescriptor::new(StageSource::Function(function.function_descriptor())),
+            &PipelineOptions::default(),
+        )
+        .unwrap();
+    let raised = buffer_with(device, &1u32.to_le_bytes()).unwrap();
+    let loads = buffer_with(device, &[0; 4]).unwrap();
+    let command_buffer = queue.command_buffer().unwrap();
+    let mut encoder = command_buffer.compute_command_encoder().unwrap();
+    encoder.set_compute_pipeline_state(&state).unwrap();
+    encoder.set_buffer(Some(&raised), 0, 0).unwrap();
+    encoder.set_buffer(Some(&loads), 0, 1).unwrap();
+    encoder.set_bytes(&cap_for(0.0).to_le_bytes(), 2).unwrap();
+    encoder
+        .dispatch_threadgroups(Size::new(1, 1, 1), Size::new(1, 1, 1))
+        .unwrap();
+    encoder.end_encoding().unwrap();
+    command_buffer.commit().unwrap();
+    command_buffer.wait_until_completed_for(WAIT).unwrap();
+    assert_eq!(command_buffer.error(), None, "the spin, raised");
+    assert_eq!(
+        read_buffer(&loads, 0, 4).unwrap(),
+        [0; 4],
+        "the spin, raised"
+    );
+    state
+}
+
 /// The spin kernel and the cap calibrated for the device it will run on.
 ///
 /// [`first_use::Busy`]'s shape, for this lane's own kernel rather than a second mechanism: the cap
 /// grows sixteenfold until a run takes [`first_use::MEASURED`] at the fastest rate measured so
 /// far, and the cap that ships is [`cap_for`] of that rate. The fastest run is the kernel's own
-/// rate, because the GPU's other work can only slow a run.
+/// rate, because the GPU's other work can only slow a run. A GPU hazard (`m2v_gpu_hazards`): where
+/// the device does not show a running kernel the host's store (the M3 Max), its spins run to their
+/// cap, one dispatch of about [`SPIN`], up to [`HANG`] on a loaded device, and Metal ended some
+/// single dispatches of about half a second there as hung (`cross_queue_shadows`).
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
 struct Spin {
     state: ComputePipelineState,
     /// The loads the spin makes at most.
     cap: u32,
 }
 
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
 impl Spin {
-    /// The owned fixture's kernel that loads a word no one raises until its cap
-    /// (`kernel_spin_on_an_unraised_word`): its GPU work runs until the host raises the word. Run
-    /// once on `queue`, its word raised from the start, so its `VkPipeline` is made: a dispatch
-    /// whose pipeline is still being made records at a host step, which its submission waits for.
-    /// That first run is also the one the calibration does not measure, for
-    /// [`first_use::Busy`]'s reason: it holds the device's first use of the pipeline and of a
-    /// command buffer, which on a loaded host take past [`first_use::MEASURED`] by themselves.
+    /// [`spin_kernel`], and its cap. Its run in [`spin_kernel`] is the one the calibration does
+    /// not measure, for [`first_use::Busy`]'s reason: it holds the device's first use of the
+    /// pipeline and of a command buffer, which on a loaded host take past
+    /// [`first_use::MEASURED`] by themselves.
     fn new(device: &Device, queue: &CommandQueue) -> Spin {
-        let ll = engine_dir().join("kernel_spin_on_an_unraised_word.ll");
-        let library = device
-            .new_library_with_air(&llvm_assemble(&ll).unwrap())
-            .unwrap();
-        let function = library
-            .new_function_with_name("spin_on_an_unraised_word")
-            .unwrap();
-        let state = device
-            .new_compute_pipeline_state(
-                &ComputePipelineDescriptor::new(StageSource::Function(
-                    function.function_descriptor(),
-                )),
-                &PipelineOptions::default(),
-            )
-            .unwrap();
-        let raised = buffer_with(device, &1u32.to_le_bytes()).unwrap();
-        let loads = buffer_with(device, &[0; 4]).unwrap();
-        let command_buffer = queue.command_buffer().unwrap();
-        let mut encoder = command_buffer.compute_command_encoder().unwrap();
-        encoder.set_compute_pipeline_state(&state).unwrap();
-        encoder.set_buffer(Some(&raised), 0, 0).unwrap();
-        encoder.set_buffer(Some(&loads), 0, 1).unwrap();
-        encoder.set_bytes(&cap_for(0.0).to_le_bytes(), 2).unwrap();
-        encoder
-            .dispatch_threadgroups(Size::new(1, 1, 1), Size::new(1, 1, 1))
-            .unwrap();
-        encoder.end_encoding().unwrap();
-        command_buffer.commit().unwrap();
-        command_buffer.wait_until_completed_for(WAIT).unwrap();
-        assert_eq!(command_buffer.error(), None, "the spin, raised");
-        assert_eq!(
-            read_buffer(&loads, 0, 4).unwrap(),
-            [0; 4],
-            "the spin, raised"
-        );
         let mut spin = Spin {
-            state,
+            state: spin_kernel(device, queue),
             cap: 1 << 12,
         };
         // The fastest rate of every measured run, in loads per second of its time on the GPU, and
@@ -635,6 +649,7 @@ impl Spin {
 /// A command buffer whose first batch spins over a buffer until [`Spinning::release`] (the
 /// buffer bound as the kernel's output, or made resident), and whose next batch, behind an event
 /// wait, fills a buffer of its own; committed, its first batch submitted.
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
 struct Spinning {
     command_buffer: CommandBuffer,
     flag: Buffer,
@@ -642,6 +657,7 @@ struct Spinning {
     gate: SharedEvent,
 }
 
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
 impl Spinning {
     fn new(
         device: &Device,
@@ -678,15 +694,11 @@ impl Spinning {
         let mut blit = command_buffer.blit_command_encoder().unwrap();
         blit.fill_buffer(&filled, 0..16, 0x3c).unwrap();
         blit.end_encoding().unwrap();
+        // Its kernel start shows only with its end, which waits for the gate: the device's
+        // submitted batches show the first.
+        let before = batches_submitted(device);
         command_buffer.commit().unwrap();
-        let deadline = Instant::now() + WAIT;
-        while command_buffer.kernel_start_time() == 0.0 {
-            assert!(
-                Instant::now() < deadline,
-                "the first batch was never submitted"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        first_batch_submitted(device, before);
         Spinning {
             command_buffer,
             flag,
@@ -714,6 +726,7 @@ impl Spinning {
     }
 }
 
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
 impl Drop for Spinning {
     /// The GPU is never left spinning, whatever failed.
     fn drop(&mut self) {
@@ -725,6 +738,7 @@ impl Drop for Spinning {
 /// `detach`, called on another thread while `spinning`'s first batch spins: it must not return
 /// before the spin ends, and answers `false` once it ended, the command buffer still waiting for
 /// its event: the hold is the submission's, not the command buffer's.
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
 fn waits_then_refuses(spinning: &Spinning, detach: impl FnOnce() -> Result<bool, Error> + Send) {
     let returned = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -759,7 +773,9 @@ fn waits_then_refuses(spinning: &Spinning, detach: impl FnOnce() -> Result<bool,
 /// reaching no buffer through an address), is detached only once that work completed: the detach blocks until then and answers `false`,
 /// detaching nothing, though the command buffer still waits for an event behind it. A heap one of
 /// whose buffers that work named answers `false` at once. A buffer it does not take is detached at
-/// once.
+/// once. A GPU hazard (`m2v_gpu_hazards`): its spins are single dispatches of about [`SPIN`] that
+/// the cap alone ends where the device does not show them the host's store ([`Spin`]).
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
 #[test]
 fn table_3_a_detach_waits_for_running_work_then_refuses() {
     on_device(|device| {
@@ -774,7 +790,11 @@ fn table_3_a_detach_waits_for_running_work_then_refuses() {
         detach(&unrelated);
         waits_then_refuses(&named, || member.detach_backing());
         named.finish();
-        assert!(member.contents().is_some(), "detached though refused");
+        assert_ne!(
+            member.host_backing(),
+            Some(metal2vulkan_runtime::HostBacking::Detached),
+            "detached though refused"
+        );
         // Once its command buffer completed and the wait returned, it detaches.
         detach(&member);
         rebind_to(&member, A);
@@ -806,13 +826,13 @@ fn table_3_a_detach_waits_for_running_work_then_refuses() {
 }
 
 /// A command buffer of `queue`, behind a wait for `gate` where it is given, whose compute encoder
-/// makes `resident` resident and runs the spin over a raised word, which reaches no buffer through
-/// an address: committed. Its spin writes 0 loads into the returned buffer, which holds `0xff`
-/// bytes until then.
+/// makes `resident` resident and runs `spin` ([`spin_kernel`]) over a raised word, which reaches no
+/// buffer through an address: committed. Its spin ends at its first load and writes 0 loads into
+/// the returned buffer, which holds `0xff` bytes until then.
 fn resident_unreached(
     device: &Device,
     queue: &CommandQueue,
-    spin: &Spin,
+    spin: &ComputePipelineState,
     resident: &Buffer,
     gate: Option<&SharedEvent>,
 ) -> (CommandBuffer, Buffer) {
@@ -828,10 +848,10 @@ fn resident_unreached(
     encoder
         .use_resource(resident.as_resource(), ResourceUsage::READ)
         .unwrap();
-    encoder.set_compute_pipeline_state(&spin.state).unwrap();
+    encoder.set_compute_pipeline_state(spin).unwrap();
     encoder.set_buffer(Some(&raised), 0, 0).unwrap();
     encoder.set_buffer(Some(&loads), 0, 1).unwrap();
-    encoder.set_bytes(&spin.cap.to_le_bytes(), 2).unwrap();
+    encoder.set_bytes(&cap_for(0.0).to_le_bytes(), 2).unwrap();
     encoder
         .dispatch_threadgroups(Size::new(1, 1, 1), Size::new(1, 1, 1))
         .unwrap();
@@ -848,7 +868,7 @@ fn resident_unreached(
 fn a_resident_buffer_no_command_reaches_fails_its_submission_once_detached() {
     on_device(|device| {
         let queue = device.new_command_queue().unwrap();
-        let spin = Spin::new(device, &queue);
+        let spin = spin_kernel(device, &queue);
         let Some((member, _)) = member_over(device, A) else {
             return;
         };

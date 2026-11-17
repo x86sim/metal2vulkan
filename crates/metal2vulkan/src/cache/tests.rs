@@ -346,12 +346,11 @@ fn earlier_format_versions_are_stale() {
     const { assert!(ARTIFACT_FORMAT_VERSION >= 4) };
     for good in [compiled.to_bytes(), pipe.to_bytes()] {
         for version in 1..ARTIFACT_FORMAT_VERSION {
-            let end = good.len() - 32;
+            let end = good.len() - 8;
             let mut old = good[..end].to_vec();
             old[8..12].copy_from_slice(&version.to_le_bytes());
-            use sha2::Digest;
-            let checksum = sha2::Sha256::digest(&old);
-            old.extend_from_slice(&checksum);
+            let checksum = super::checksum::of(&old);
+            old.extend_from_slice(&checksum.to_le_bytes());
             assert_eq!(
                 CompiledFunction::from_bytes(&old, &dev).err(),
                 Some(ArtifactError::Stale),
@@ -807,6 +806,31 @@ fn the_version_377_member_round_trips() {
     }
 }
 
+/// The member format version 485 appends encodes and decodes as itself: the word of the sampler
+/// bound at a slot, which a specialized note's test alone reads.
+#[test]
+fn the_version_485_member_round_trips() {
+    use crate::pipeline::sym::SpecKey;
+    let slot = SlotRef {
+        stage: Stage::Fragment,
+        class: SlotClass::Sampler,
+        index: 2,
+    };
+    let key = SpecKey::BoundSamplerWord(slot);
+    assert_eq!(decode::<SpecKey>(&encode(&key)), Ok(key));
+    assert_ne!(encode(&key), encode(&SpecKey::NearestPixelSampler(slot)));
+}
+
+/// The member format version 486 appends encodes and decodes as itself: the measured unary
+/// operations' kept denormals, a property a module requires.
+#[test]
+fn the_version_486_member_round_trips() {
+    use crate::device::requirements::VkProperty;
+    let p = VkProperty::MetalUnaryDenormals;
+    assert_eq!(decode::<VkProperty>(&encode(&p)), Ok(p));
+    assert_ne!(encode(&p), encode(&VkProperty::MetalSmallFloatNans));
+}
+
 /// The members format versions 153, 154, 155, 157 and 161 joined from every side encode and
 /// decode together in one render pipeline: `PrecisionNote::CubeGradientFootprint` and
 /// `CombinedSampler`, `RuntimeFact::InterlockedFramebufferFetch` and
@@ -878,6 +902,7 @@ fn the_merged_members_round_trip_in_one_render_pipeline() {
                 immutable_sampler: None,
                 flags: vk::DescriptorBindingFlags::empty(),
                 variables: 1,
+                immutable_samplers: Vec::new(),
             },
             DescriptorBinding {
                 binding: 1,
@@ -888,6 +913,7 @@ fn the_merged_members_round_trip_in_one_render_pipeline() {
                 immutable_sampler: None,
                 flags: vk::DescriptorBindingFlags::empty(),
                 variables: 1,
+                immutable_samplers: Vec::new(),
             },
         ],
         flags: vk::DescriptorSetLayoutCreateFlags::empty(),
@@ -907,6 +933,7 @@ fn the_merged_members_round_trip_in_one_render_pipeline() {
             immutable_sampler: None,
             flags: vk::DescriptorBindingFlags::PARTIALLY_BOUND,
             variables: 1,
+            immutable_samplers: Vec::new(),
         },
         DescriptorBinding {
             binding: 3,
@@ -920,6 +947,7 @@ fn the_merged_members_round_trip_in_one_render_pipeline() {
             immutable_sampler: None,
             flags: vk::DescriptorBindingFlags::empty(),
             variables: 1,
+            immutable_samplers: Vec::new(),
         },
     ];
     if let Some(last) = p.layout.sets.last_mut() {
@@ -1745,11 +1773,10 @@ fn the_frame_layout_is_pinned() {
     expected.extend_from_slice(&[0xbb; 32]);
     expected.extend_from_slice(&4u64.to_le_bytes());
     expected.extend_from_slice(b"body");
-    assert_eq!(bytes[..bytes.len() - 32], expected[..]);
-    use sha2::Digest;
+    assert_eq!(bytes[..bytes.len() - 8], expected[..]);
     assert_eq!(
-        bytes[bytes.len() - 32..],
-        sha2::Sha256::digest(&expected)[..]
+        bytes[bytes.len() - 8..],
+        super::checksum::of(&expected).to_le_bytes()
     );
 }
 
@@ -1842,9 +1869,9 @@ fn a_content_digest_is_the_content_not_the_key() {
 /// and loads them under) and byte-identical artifacts, so the compile carries nothing of the
 /// stand-in beyond its key. Every bind of another format at any of the slots plans another key,
 /// except where the plan does not bind that texture at all: a texture the slot cannot take is
-/// replaced by the slot's neutral (`IncompatibleBinding`, or `CrossClassNeutral` for a storage read
-/// of another numeric class), an `R32` texture of the slot's texel type, whose compile is the
-/// stand-in's.
+/// replaced by the slot's neutral (`IncompatibleBinding`, `CrossClassNeutral` for a storage read
+/// of another numeric class, or `AstcStorageNeutral` for an ASTC texture), an `R32` texture of the
+/// slot's texel type, whose compile is the stand-in's.
 #[test]
 fn a_stand_in_compile_is_the_compile_of_its_formats_bind_and_no_other() {
     use crate::bind::{BindState, BoundTexture, PlanDiagnostic, StageTable, TextureFacts};
@@ -1938,7 +1965,8 @@ fn a_stand_in_compile_is_the_compile_of_its_formats_bind_and_no_other() {
             };
             let neutral = plan.diagnostics.iter().any(|d| match d {
                 PlanDiagnostic::IncompatibleBinding { slot: s, .. }
-                | PlanDiagnostic::CrossClassNeutral { slot: s, .. } => *s == slot(bound[at].0),
+                | PlanDiagnostic::CrossClassNeutral { slot: s, .. }
+                | PlanDiagnostic::AstcStorageNeutral { slot: s, .. } => *s == slot(bound[at].0),
                 _ => false,
             });
             if neutral {
@@ -1954,6 +1982,20 @@ fn a_stand_in_compile_is_the_compile_of_its_formats_bind_and_no_other() {
         same.is_empty(),
         "binds that plan the stand-ins' key: {same:?}"
     );
+    // An ASTC texture, of every profile and footprint, at a storage slot: the slot's neutral, and
+    // the plan says why (`PlanDiagnostic::AstcStorageNeutral`), which the runtime announces.
+    let astc = metal::PixelFormat::ALL
+        .iter()
+        .filter(|&&pf| crate::bind::AstcDecode::of(pf).is_some());
+    for &pf in astc {
+        let mut bound = formats;
+        bound[0].1 = pf;
+        let plan = planned(&bound).unwrap_or_else(|e| panic!("{pf:?}: {e}"));
+        let said = plan.diagnostics.iter().any(
+            |d| matches!(d, PlanDiagnostic::AstcStorageNeutral { slot: s, .. } if *s == slot(0)),
+        );
+        assert!(said, "{pf:?}: {:?}", plan.diagnostics);
+    }
     assert!(other_keys > 0, "no other format plans");
     eprintln!(
         "{other_keys} binds of other formats plan other keys; {replaced} are replaced by the \

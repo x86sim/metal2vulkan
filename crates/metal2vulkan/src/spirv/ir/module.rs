@@ -1239,9 +1239,49 @@ pub struct LoopMeta {
     pub cont: BlockId,
     pub preheader: BlockId,
     pub exit_sel: Option<VarId>,
-    /// The loop's `OpLoopMerge` asks `DontUnroll`: a loop `spirv::roll` wrote to compile a
-    /// repeated region once, which a downstream compiler that unrolled it would write out again.
-    pub dont_unroll: bool,
+    /// What the loop's `OpLoopMerge` asks of the driver's unrolling.
+    pub unrolling: Unrolling,
+}
+
+/// What a loop's `OpLoopMerge` asks of the driver's unrolling: its `LoopControl`, a hint the
+/// driver may take; the loop computes the same either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Unrolling {
+    /// Nothing (`None`): the driver decides.
+    #[default]
+    Driver,
+    /// `Unroll`, to the degree possible: the loop's AIR latch carries `llvm.loop.unroll.full`
+    /// (Metal's compiler writes it for `#pragma clang loop unroll(full)`) or
+    /// `llvm.loop.unroll.enable` (`#pragma unroll`: fully where the trip count is known, else
+    /// partly).
+    Unroll,
+    /// `DontUnroll`: a loop written so that the driver compiles its body once (a region
+    /// `spirv::roll` rolled, a routine's own loop), or one whose AIR latch carries
+    /// `llvm.loop.unroll.disable` (`#pragma nounroll`).
+    DontUnroll,
+    /// `PartialCount` and its factor (SPIR-V 1.4): the loop's AIR latch carries
+    /// `llvm.loop.unroll.count` of that factor (`#pragma unroll N`), at least 1.
+    PartialCount(u32),
+}
+
+impl Unrolling {
+    /// The `LoopControl` bits.
+    pub const fn control(self) -> u32 {
+        match self {
+            Unrolling::Driver => 0,
+            Unrolling::Unroll => 0x1,
+            Unrolling::DontUnroll => 0x2,
+            Unrolling::PartialCount(_) => 0x100,
+        }
+    }
+
+    /// The literal the `LoopControl` bits take after them: `PartialCount`'s factor.
+    pub const fn literal(self) -> Option<u32> {
+        match self {
+            Unrolling::PartialCount(n) => Some(n),
+            _ => None,
+        }
+    }
 }
 
 /// The execution models the new core emits.
@@ -1420,17 +1460,32 @@ pub struct TypedModule {
     /// User varyings decorated `PerPrimitiveEXT` (`ModuleBuilder::per_primitive`): a mesh entry's
     /// primitive outputs, and the fragment inputs that read them.
     pub(in crate::spirv) per_primitive: std::collections::BTreeSet<GlobalId>,
+    /// The `InterpolateAtOffset` offsets are Metal's moved by 7/16
+    /// (`ModuleBuilder::offsets_from_seven_sixteenths`).
+    pub(in crate::spirv) offsets_from_seven_sixteenths: bool,
     /// Resources decorated `Coherent`: every storage buffer and storage image resource of a
     /// module built with `ModuleBuilder::coherent_resources`.
     pub(in crate::spirv) coherent: std::collections::BTreeSet<GlobalId>,
     /// Storage-image resources decorated `Volatile` (`ModuleBuilder::volatile`).
     pub(in crate::spirv) volatile: std::collections::BTreeSet<GlobalId>,
+    /// Buffer bindings whose memory nothing in the module writes (`ModuleBuilder::unwritten_buffer`):
+    /// a compute module's storage views of one are decorated `NonWritable` where the serializer's
+    /// walk finds no write to the binding.
+    pub(in crate::spirv) unwritten_buffers:
+        std::collections::BTreeSet<crate::pipeline::sym::ResourceSlot>,
     /// The enabling capability chosen for a builtin whose registry offers alternatives
     /// (`ModuleBuilder::enable_builtin`).
     pub(in crate::spirv) enabling: std::collections::BTreeMap<GlobalId, crate::spv::Capability>,
     /// The values decorated `NonUniform`: every result that carries a non-uniform descriptor
     /// element ([`Inst::carries_non_uniform`]), recorded as the builder appends it.
     pub(in crate::spirv) non_uniform: std::collections::BTreeSet<Value>,
+    /// The narrowings to 16 bits of the conversion pairs that round a `half` in a form measured
+    /// to answer Metal's where the driver takes `DriverDeviation::MetalHalfConversion`
+    /// (`ModuleBuilder::measured_roundings`), recorded as the builder emits them.
+    pub(in crate::spirv) measured_roundings: std::collections::BTreeSet<Value>,
+    /// The texels the texture family's writes store, whose stored NaN the write's own notes
+    /// account for (`ModuleBuilder::stored_texels`), recorded as the builder emits them.
+    pub(in crate::spirv) stored_texels: std::collections::BTreeSet<Value>,
     /// The `Function` variables the emitter holds workgroup uniform by construction: the `cont`
     /// flag of a predicated loop that iterates together, which the lowering's uniformity analysis
     /// proved. An in-memory record for checks (`spirv::testing::barriers`), kept only where they
@@ -1454,6 +1509,17 @@ impl TypedModule {
     /// The constant table.
     pub fn consts(&self) -> &Consts {
         &self.consts
+    }
+
+    /// The narrowings to 16 bits of the conversion pairs that round a `half` in a form measured to
+    /// answer Metal's (`ModuleBuilder::note_measured_rounding`).
+    pub fn measured_roundings(&self) -> &std::collections::BTreeSet<Value> {
+        &self.measured_roundings
+    }
+
+    /// The texels the texture family's writes store (`ModuleBuilder::note_stored_texel`).
+    pub fn stored_texels(&self) -> &std::collections::BTreeSet<Value> {
+        &self.stored_texels
     }
 
     /// The SSA value of a constant.

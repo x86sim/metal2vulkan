@@ -79,13 +79,13 @@
 //! two-plane, YCbCr, padded, `Invalid` and the private formats) Metal packs nothing and fills
 //! bytes of the calling thread's stack, the texel's bytes of a 16-byte buffer the packing writes:
 //! a probe that set the stack below its call to one byte read that byte back in every texel, and
-//! two consecutive color fills in one encoder find the first's packed texel there. Whether calls
-//! between them keep it depends on the calling code's stack: in our probe `slot.m` an encoder's
-//! end, a blit or a byte fill between them left other bytes (pointers of the process, differing
-//! between processes), while the consumer's process found the first's packed texel across the
-//! encoders of one command buffer. The runtime holds that buffer per command buffer, zeros at its
-//! start, each color fill's packed texel over its first bytes, and fills its bytes there, as
-//! Metal's consecutive fills and the consumer's encoders do; announced once
+//! two consecutive color fills in one encoder find the first's packed texel there. A call between
+//! them leaves other bytes: in our probe `slot.m` an encoder's end, a blit or a byte fill between
+//! them left pointers of the process (differing between processes), and a plain Objective-C
+//! process on the M3 Max (macOS 27.0.1) found the earlier fill's texel only where no call came
+//! between the two fills. The runtime holds that buffer per command buffer, zeros at its start,
+//! each color fill's packed texel over its first bytes, and fills its bytes there: Metal's bytes
+//! for consecutive fills, and bytes the stack may hold elsewhere; announced once
 //! (`Degradation::UnpackedFillColor`). Metal's
 //! validation stops such a fill ("must be a color format", "is not compatible with the texture
 //! format").
@@ -111,7 +111,8 @@
 //! first. The block is the power of two of bytes at least `n` and 16, holding the pattern's whole
 //! copies from its start and, past them and past the block, bytes of the calling thread's stack:
 //! zeros in every probe of ours, a 9-byte fill after an 8-byte one in the same encoder too, while
-//! the consumer's process read an earlier fill's bytes there. The runtime writes zeros there,
+//! the consumer's dev-build Rust process, whose sends run objc2's method check first, read an
+//! earlier fill's bytes there (not measured in a plain process). The runtime writes zeros there,
 //! announced once where a chunk reads them (`Degradation::TextureBufferFillLeftover`). The rule
 //! holds byte for byte for long patterns too (our probe `tblf.m`: 18 fills of patterns of 16 to
 //! 32752 bytes into `R8Uint`, `R32Uint` and `RGBA32Uint` texture buffers at offsets 4 to 64, up
@@ -173,7 +174,7 @@ use super::blit_texture;
 use super::chroma_pairs::{is_four_two_two, TEXEL_BYTES};
 use super::clear_value;
 use super::clear_value::has_channels;
-use super::compressed_blit::degrade_compressed_blit;
+use super::compressed_blit::{self, degrade_compressed_blit, Writer};
 use super::copy_plan::{
     block_bytes, block_extent, level_extent, BlitOption, CopyUnit, ImageRegion,
 };
@@ -195,10 +196,11 @@ use super::values::{Origin, Region, Size};
 use super::Device;
 use super::{Buffer, Degradation};
 use ash::vk;
-use metal2vulkan::bind::{PlanesCopy, YCbCrCodes};
+use metal2vulkan::bind::{clamped_depth, PlanesCopy, YCbCrCodes};
 use metal2vulkan::device::FormatUsage;
+use metal2vulkan::error::{Feature, Unsupported};
 use metal2vulkan::metal::format::{
-    byte_format, padded_words, ycbcr_format, ClearRoute, ExtendedRange, FormatMapping,
+    byte_format, copies_only, padded_words, ycbcr_format, ClearRoute, ExtendedRange, FormatMapping,
 };
 use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
 use metal2vulkan::vk::{
@@ -224,7 +226,8 @@ pub(super) enum FillUnit {
 }
 
 /// The fill unit of `pf`, `None` for a format the runtime makes no texture of (`Invalid`, the
-/// private formats it holds none of, the 24-bit depth formats, which Apple GPUs make none of).
+/// private formats it holds none of, the 24-bit depth formats, which Apple GPUs make none of) and
+/// for one it holds for copies alone (`metal::format::copies_only`), whose fills are refused.
 pub(super) fn fill_unit(pf: PixelFormat) -> Option<FillUnit> {
     use PixelFormat as P;
     let texels = |bytes, option| Some(FillUnit::Texels { bytes, option });
@@ -558,8 +561,9 @@ fn degrade_fill_conversion(device: &Device, pf: PixelFormat, color: [f64; 4]) {
             (
                 format!("a color fill of a {pf:?} texture to {color:?}"),
                 "the device clears the region by its own conversion of the color, which Vulkan \
-                 asks it to round to nearest, leaving a tie, an sRGB encode and a float's \
-                 rounding to it, where Metal's fill packs it by rules of its own (a tie rounded \
+                 lets store either of the two codes nearest a normalized channel's value (it asks \
+                 for the nearest) and which takes an sRGB encode and a float's rounding its own \
+                 way, where Metal's fill packs it by rules of its own (a tie rounded \
                  half up, an sRGB channel the code whose decoded value is nearest): a channel can \
                  store a code next to Metal's"
                     .to_owned(),
@@ -732,7 +736,7 @@ fn in_place(texture: &Texture, level: u32, extent: [u32; 3]) -> Result<bool, Err
     if planned != extent || !plan.usage.contains(ImageUsageFlags::TRANSFER_DST) {
         return Ok(false);
     }
-    let device = texture.device();
+    let device = texture.generation();
     let profile = device.compile_device().profile();
     let facts = device.shared().textures.facts(profile);
     let features = match texture.linear_image()? {
@@ -774,7 +778,9 @@ impl BlitCommandEncoder {
     /// texture's fill is refused, `Unsupported`, where the device cannot run the sample planes'
     /// merge (sample-rate shading, the sample count among its integer color attachments') or the
     /// copy into the texture (`copy_from_texture`'s refusals of copies between multisampled
-    /// textures).
+    /// textures). A texture of a format held for copies alone (`metal::format::copies_only`) has
+    /// its fill refused `Unsupported(Format, NotImplemented)`: Metal's fills of one are not
+    /// measured.
     pub fn fill_texture(
         &mut self,
         texture: &Texture,
@@ -904,7 +910,7 @@ impl BlitCommandEncoder {
             |_| BlitCall::FillBufferPattern4(buffer.clone(), range.clone(), pattern),
             |this| {
                 const CALL: &str = "fill_buffer_pattern4";
-                this.core().check_device(CALL, buffer.device())?;
+                this.core().check_device(CALL, buffer.generation())?;
                 let size = range.end.saturating_sub(range.start);
                 if size == 0 {
                     return Ok(());
@@ -953,8 +959,7 @@ impl BlitCommandEncoder {
                     // both, and the buffer's regions are disjoint.
                     unsafe { device.cmd_copy_buffer(raw, source, destination, &regions) };
                 })?;
-                this.core().retain(staging);
-                this.core().retain(buffer.clone());
+                this.core().retain_shared(staging.held());
                 Ok(())
             },
         )
@@ -1016,7 +1021,8 @@ impl BlitCommandEncoder {
         region: Region,
         (value, color): (vk::ClearColorValue, [f64; 4]),
     ) -> Result<(), Error> {
-        self.core().check_device(call, texture.device())?;
+        self.core().check_device(call, texture.generation())?;
+        texture.check_plane_copied()?;
         self.see(texture);
         let Size {
             width,
@@ -1113,7 +1119,7 @@ impl BlitCommandEncoder {
                 device.cmd_clear_color_image(raw, image, vk::ImageLayout::GENERAL, &value, &[range])
             };
         })?;
-        self.core().retain(texture.clone());
+        self.core().retain_shared(texture.held());
         let written = ImageRegion {
             aspect: ImageAspectFlags::COLOR,
             level,
@@ -1270,10 +1276,19 @@ impl BlitCommandEncoder {
         region: Region,
         pattern: &[u8],
     ) -> Result<(), Error> {
-        self.core().check_device(call, texture.device())?;
+        self.core().check_device(call, texture.generation())?;
+        texture.check_plane_copied()?;
         self.see(texture);
         check_pattern(call, texture.texture_type(), pattern)?;
-        let unit = fill_unit(texture.pixel_format())
+        let pf = texture.pixel_format();
+        // A texture held for copies alone (`metal::format::copies_only`): Metal's fills of one are
+        // not measured.
+        if copies_only(pf) {
+            return Err(Error::Unsupported(
+                Unsupported::not_implemented(Feature::Format).naming_format(pf),
+            ));
+        }
+        let unit = fill_unit(pf)
             .ok_or_else(|| internal("a fill of a format the runtime makes no texture of"))?;
         // A texture buffer's fill writes one row whatever the region's height and depth.
         if texture.texture_type() == TextureType::TextureBuffer {
@@ -1307,7 +1322,11 @@ impl BlitCommandEncoder {
         if texture.record().samples > 1 {
             return self.sample_fill(call, texture, (level_u32, slice), option, (x, y), pattern);
         }
-        let unit_bytes = unit_of(pattern, bytes);
+        let mut unit_bytes = unit_of(pattern, bytes);
+        // Into a texture Metal keeps compressed: Metal's encoding of the texel, written as it is.
+        if compressed_blit::canonical(texture) {
+            compressed_blit::canonical_fill_unit(&mut unit_bytes);
+        }
         if unit == FillUnit::PackedCodes {
             return self.packed_code_fill(texture, (x, y));
         }
@@ -1350,7 +1369,9 @@ impl BlitCommandEncoder {
     /// moves into the texture's region as a copy between multisampled textures moves it
     /// (`blit_texture.rs`: an image copy, the planes' copies where the device's copy converts
     /// float NaNs, a depth or stencil aspect's copies or draws, `sample_copy.rs`, exact or
-    /// announced as there).
+    /// announced as there). A 32-bit float depth on a device that may store one outside `[0, 1]`
+    /// clamped takes its samples' depths clamped on the CPU first, announced
+    /// `restricted-depth-upload` (`depth_clamp.rs`).
     fn sample_fill(
         &mut self,
         call: &'static str,
@@ -1375,10 +1396,24 @@ impl BlitCommandEncoder {
                 ))
             }
         };
+        // A 32-bit float depth on a device that may store a value outside [0, 1] clamped takes
+        // each sample's depth clamped first, as every upload into such a depth does
+        // (`depth_clamp.rs`): the copy into the depth image takes no value outside.
+        let clamps = bytes == 4 && texture.clamps_depth_upload(aspect);
         let values: Vec<[u32; 4]> = sample_units(pattern, bytes, samples)
             .iter()
-            .map(|unit| words(unit))
+            .map(|unit| {
+                let mut words = words(unit);
+                if clamps {
+                    words[0] = clamped_depth(words[0]);
+                }
+                words
+            })
             .collect();
+        if clamps {
+            texture.degrade_depth_upload(call, aspect, false);
+            self.core().device().shared().counts.depth_upload_clamped();
+        }
         let narrow = |range: &Range<u64>| -> Result<[u32; 2], Error> {
             let start = u32::try_from(range.start).map_err(|_| internal("a fill's origin"))?;
             let end = u32::try_from(range.end).map_err(|_| internal("a fill's extent"))?;
@@ -1439,16 +1474,11 @@ impl BlitCommandEncoder {
                 let top = row * block[1];
                 let height = (end * block[1]).min(size[1]) - top;
                 self.unlogged(|this| {
-                    this.copy_from_buffer_to_texture(
-                        &staging,
-                        0,
-                        row_bytes,
-                        row_bytes * (end - row),
+                    this.buffer_into_texture(
+                        Writer::Fill,
+                        (&staging, 0, row_bytes, row_bytes * (end - row)),
                         Size::new(width, height, 1),
-                        texture,
-                        slice,
-                        level,
-                        Origin::new(left, top, z),
+                        (texture, slice, level, Origin::new(left, top, z)),
                         option,
                     )
                 })?;
@@ -1485,7 +1515,7 @@ impl BlitCommandEncoder {
             }
         }
         self.fill_spans(bytes, &spans, word)?;
-        self.core().retain(texture.clone());
+        self.core().retain_shared(texture.held());
         Ok(())
     }
 
@@ -1529,8 +1559,7 @@ impl BlitCommandEncoder {
             // and the buffer's regions are disjoint.
             unsafe { device.cmd_copy_buffer(raw, source, destination, &regions) };
         })?;
-        self.core().retain(staging);
-        self.core().retain(buffer.clone());
+        self.core().retain_shared(staging.held());
         Ok(())
     }
 
@@ -1587,7 +1616,7 @@ impl BlitCommandEncoder {
                     )
                 });
         }
-        self.core().retain(texture.clone());
+        self.core().retain_shared(texture.held());
         Ok(())
     }
 
@@ -1608,7 +1637,7 @@ impl BlitCommandEncoder {
             .collect();
         let buffer = texels.buffer.clone();
         self.fill_spans(&buffer, &spans, &[0])?;
-        self.core().retain(texture.clone());
+        self.core().retain_shared(texture.held());
         Ok(())
     }
 
@@ -1693,7 +1722,7 @@ impl BlitCommandEncoder {
             .core()
             .device()
             .write_combined_buffer(bytes.len() as u64)?;
-        let Some(contents) = buffer.contents() else {
+        let Some(contents) = buffer.mapped_contents() else {
             return Err(Error::Vulkan(super::error::VkResultCode(
                 vk::Result::ERROR_MEMORY_MAP_FAILED.as_raw(),
             )));

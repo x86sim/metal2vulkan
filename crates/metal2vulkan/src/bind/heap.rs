@@ -13,7 +13,9 @@
 //!   Used textures come first, by token, then bound ones by slot; member `i` is element `i + 1`
 //!   of **every** class array, so the table maps a resource id to one element. Element 0
 //!   ([`NEUTRAL_ELEMENT`]) is each class's neutral, the value of the null handle and of every
-//!   missed id. Texture buffers are not members (no heap class holds one).
+//!   missed id. Texture buffers are no members: only a heap set a consumer keeps for every
+//!   command holds them, each at its resource ID's element of the texel-buffer classes
+//!   ([`heap_element`]), so a planned heap's handle naming one misses.
 //! - **Elements.** Element `e` of the array of a class holds member `e - 1` when it fits the
 //!   class (`fit`: the Metal texture type's dimension, arrayedness, and multisampling, a
 //!   sample count above 1 exactly when multisampled, the numeric type, a depth format for a
@@ -22,14 +24,26 @@
 //!   a write of either), which never holds a depth or stencil format), through its
 //!   view: a sampled one as a slot's (`plan::resources::sampled_view`), a storage one the direct
 //!   format (an `A8Unorm` texture held in red its `R8_UNORM` image, whose texels a heap access
-//!   converts where the handle carries `A8Unorm`'s class), which the class's formatless declaration
-//!   serves exactly when the format's storage choice for every access the device lets a heap make
-//!   (`heap_storage_use`) is `Identity` (or `AlphaInRed`) without an alias and the format serves
-//!   those accesses without a format
+//!   converts where the handle carries `A8Unorm`'s class), or the alias of a storage choice a heap
+//!   access converts by ([`storage_conversions`]: an 8-bit sRGB texture's UNORM twin, a blue-first
+//!   texture's RGBA-order twin, converted where the handle carries the texture's class and red-blue
+//!   order), which the class's formatless declaration serves exactly when the format's storage
+//!   choice for every access the device lets a heap make (`heap_storage_use`) is `Identity` (or
+//!   `AlphaInRed`) without an alias, or such an alias, and the view's format serves those accesses
+//!   without a format
 //!   (`metal::format::without_format_gaps`: the device's features and the format's own
 //!   `VkFormatFeatureFlags2` bits). A fitting member the heap cannot view (another storage choice,
 //!   a format the profile cannot sample or store) is `Unsupported`, as for a slot: a handle may
-//!   name it. Every other element up to the members' count is the class's neutral; the elements
+//!   name it. A storage class holds a texture whose writes Metal drops
+//!   (`metal::format::writes_dropped`: the 4:2:2 formats, the subsampled and packed two-plane
+//!   YCbCr ones) as its neutral ([`Fit::Dropped`]), which the writes leave as Metal leaves the
+//!   texture, and a 4:4:4 two-plane YCbCr texture whose writes Metal stores into its planes
+//!   (`metal::format::ycbcr_writes_stored`) through the `R32G32B32A32_SFLOAT` view of its write
+//!   shadow, whose texels a heap write marks where the handle carries [`FLAG_YCBCR_WRITES`] and
+//!   which the consumer encodes into the planes as a slot's writes; a stage that reads such a
+//!   class (`RuntimeFact::HeapStorageReads`) refuses either texture it reaches there,
+//!   `Unsupported { feature: Format, needs: NotImplemented }`, as a slot that reads one is
+//!   refused. Every other element up to the members' count is the class's neutral; the elements
 //!   past it are left unwritten (the arrays are `PARTIALLY_BOUND`, and no table entry names them).
 //!   All heap writes of one member share one layout, `GENERAL` when some storage array holds it; a
 //!   member bound at a slot shares it with the slot's own writes, `GENERAL` when either is a
@@ -61,12 +75,20 @@
 //!   entry is the null entry, and every id resolves as [`lookup_host`] says. A texture no member
 //!   names misses. A member's flags are [`FLAG_OUT_OF_BOUNDS_ALPHA_ONE`] where its pixel format
 //!   has no alpha (`metal::format::out_of_bounds_alpha_one`): a module whose shader-checked heap
-//!   read observes the alpha takes Metal's out-of-bounds alpha from it; and its texel class in
+//!   read observes the alpha takes Metal's out-of-bounds alpha from it; [`FLAG_RED_BLUE`] where
+//!   its pixel format is blue-first (`metal::format::red_blue_exchanged`); its border texels in
+//!   [`FLAG_BORDER_TEXELS`] (`metal::sampler::border_texels` of its pixel format and swizzle, a
+//!   placeholder format's those of the neutral it reads), which a read through a sampler hands
+//!   back at a border; [`FLAG_YCBCR_WRITES`] where it is a 4:4:4 two-plane YCbCr texture whose
+//!   writes Metal stores (`metal::format::ycbcr_writes_stored`); and its texel class in
 //!   [`FLAG_TEXEL_CLASS`]. Every other bit is 0.
 //! - **Heap samplers**. A heap image is sampled through a separate sampler binding
 //!   (`BindingSource::HeapSampler`) in set 0: a constexpr sampler is the layout's immutable sampler
 //!   and takes no write; a runtime `[[sampler(n)]]` is written with the sampler bound at slot `n`
-//!   made for the use, or the neutral sampler where none is. One with an opaque-black border (the
+//!   made for the use, or the neutral sampler where none is. A sampling that chooses among
+//!   constexpr samplers by its sampler handle reads an element of a constexpr sampler array
+//!   (`BindingSource::SamplerArray`), whose elements are the layout's immutable samplers and take
+//!   no write, each checked as a constexpr heap sampler is. One with an opaque-black border (the
 //!   immutable sampler's, or the bound sampler's shape) meets every member a sampled array holds,
 //!   so each such member's sampled view must read that border exactly
 //!   (`metal::sampler::check_border_view`), as a separate slot sampler's textures must. One that
@@ -115,6 +137,7 @@
 //!   directory's entry holds the table's address in its element and flags words, and a listed table
 //!   without one cannot be represented.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::bind::neutral::image_classes;
@@ -137,12 +160,13 @@ use crate::device::requirements::FormatUsage;
 use crate::device::DeviceProfile;
 use crate::error::{BindError, Feature, Unsupported};
 use crate::memory::handles::{
-    lookup_host, ENTRY_ELEMENT, ENTRY_FLAGS, ENTRY_ID_HI, ENTRY_ID_LO,
-    FLAG_OUT_OF_BOUNDS_ALPHA_ONE, FLAG_TEXEL_CLASS, NEUTRAL_ELEMENT, TABLE_CAPACITY,
-    TABLE_ENTRY_BYTES,
+    lookup_host, ENTRY_ELEMENT, ENTRY_FLAGS, ENTRY_ID_HI, ENTRY_ID_LO, FLAG_BORDER_TEXELS,
+    FLAG_OUT_OF_BOUNDS_ALPHA_ONE, FLAG_RED_BLUE, FLAG_TEXEL_CLASS, FLAG_YCBCR_WRITES,
+    NEUTRAL_ELEMENT, TABLE_CAPACITY, TABLE_ENTRY_BYTES,
 };
 use crate::metal::format::{
-    is_depth_stencil, sampled_type, storage_choice, vk_format, without_format_gaps, StorageUse,
+    is_depth_stencil, red_blue_exchanged, sampled_type, storage_choice, storage_view_formats,
+    vk_format, without_format_gaps, writes_dropped, ycbcr_writes_stored, StorageUse,
 };
 use crate::metal::sampler::{
     check_argument_sampler, check_border_view, vk_filtering, SamplerUse, SamplerWord,
@@ -219,6 +243,9 @@ pub(crate) enum Fit {
     Raw,
     /// It fits in everything but its numeric type.
     NumericType,
+    /// A storage class's member whose writes Metal drops (`metal::format::writes_dropped`): the
+    /// class's array holds its neutral, which the writes leave as Metal leaves the texture.
+    Dropped,
     /// It is another class's.
     No,
 }
@@ -242,15 +269,21 @@ fn dims(t: TextureType) -> (ImageDim, bool, bool) {
 
 /// How a texture of view facts `shape` fits the heap array of `class` (the module docs).
 pub(crate) fn fit(shape: &TextureShape, class: &ImageHandleClass) -> Fit {
-    let TextureShape::Texture {
-        texture_type,
-        pixel_format,
-        sample_count,
-        usage,
-        ..
-    } = *shape
-    else {
-        return Fit::No;
+    let (texture_type, pixel_format, sample_count, usage) = match *shape {
+        TextureShape::Texture {
+            texture_type: TextureType::TextureBuffer,
+            pixel_format,
+            usage,
+            ..
+        } => return buffer_fit(pixel_format, Some(usage), class),
+        TextureShape::Buffer { pixel_format, .. } => return buffer_fit(pixel_format, None, class),
+        TextureShape::Texture {
+            texture_type,
+            pixel_format,
+            sample_count,
+            usage,
+            ..
+        } => (texture_type, pixel_format, sample_count, usage),
     };
     let storage = class.access == ImageAccess::Storage;
     // Metal's validation takes a write to a texture of `BlockWritesOnly` as one of `ShaderWrite`.
@@ -270,6 +303,7 @@ pub(crate) fn fit(shape: &TextureShape, class: &ImageHandleClass) -> Fit {
     // does not know which of its textures the function reads.
     match sampled_type(pixel_format) {
         _ if !shaped => Fit::No,
+        _ if storage && writes_dropped(pixel_format) => Fit::Dropped,
         // A form a heap reads: its raw texels in the unsigned integer class, the neutral in the
         // float one.
         _ if raw_held(shape) && class.access == ImageAccess::Sampled => match class.sampled_type {
@@ -283,9 +317,87 @@ pub(crate) fn fit(shape: &TextureShape, class: &ImageHandleClass) -> Fit {
     }
 }
 
+/// How a texture buffer of `pixel_format` and `usage` (where its facts state one: a slot's bound
+/// texture buffer states none) fits the heap array of `class`: a texel-buffer class of its numeric
+/// type holds it where its usage has the class's access, as an image class's member's must, and
+/// one of another numeric type fits it in everything but that.
+fn buffer_fit(
+    pixel_format: metal::PixelFormat,
+    usage: Option<metal::TextureUsage>,
+    class: &ImageHandleClass,
+) -> Fit {
+    let needs = match class.access {
+        ImageAccess::Storage => {
+            metal::TextureUsage::SHADER_WRITE | metal::TextureUsage::BLOCK_WRITES_ONLY
+        }
+        _ => metal::TextureUsage::SHADER_READ,
+    };
+    if class.dim != ImageDim::Buffer
+        || class.arrayed
+        || class.multisampled
+        || class.depth_compare
+        || usage.is_some_and(|usage| !usage.intersects(needs))
+    {
+        return Fit::No;
+    }
+    match sampled_type(pixel_format) {
+        _ if class.access == ImageAccess::Storage && writes_dropped(pixel_format) => Fit::Dropped,
+        Some(t) if t == class.sampled_type => Fit::Holds,
+        Some(_) => Fit::NumericType,
+        None => Fit::No,
+    }
+}
+
+/// The format of the texel buffer view through which the texel-buffer class `class` holds a
+/// texture buffer of `pixel_format` and `swizzle` that fits it ([`buffer_fit`]): its direct
+/// format, which a uniform class's view takes as a slot's does and a storage class's formatless
+/// declaration serves for every access the device lets a heap make (`heap_storage_use`). A texel
+/// buffer view has no component mapping, so `Unsupported` for a swizzled texture buffer (a slot's
+/// read applies the swizzle in its function, a heap read does not), for a format the device views
+/// only through a converting or swizzled stand-in, and for one it cannot view for the class's
+/// usage or access without a format.
+fn member_texel_view(
+    profile: &DeviceProfile,
+    pixel_format: metal::PixelFormat,
+    swizzle: metal::TextureSwizzleChannels,
+    class: &ImageHandleClass,
+) -> Result<vk::Format, BindError> {
+    if !swizzle.is_default() {
+        return Err(BindError::Unsupported(Unsupported::not_implemented(
+            Feature::TextureSwizzle,
+        )));
+    }
+    let storage = class.access == ImageAccess::Storage;
+    let usage = match storage {
+        true => FormatUsage::StorageTexelBuffer,
+        false => FormatUsage::UniformTexelBuffer,
+    };
+    let m = vk_format(pixel_format, &[usage].into(), profile).map_err(bind_error)?;
+    if m.emulation != crate::metal::format::FormatEmulation::Direct {
+        return Err(BindError::Unsupported(Unsupported::not_implemented(
+            Feature::ArgumentBufferTextures,
+        )));
+    }
+    if storage {
+        let images = &profile.fields().images;
+        let use_ = StorageUse::texel_buffer(
+            images.storage_read_without_format,
+            images.storage_write_without_format,
+        );
+        let gaps = without_format_gaps(m.format, use_, profile);
+        if !gaps.is_empty() {
+            return Err(BindError::Unsupported(Unsupported::needs_any_of(
+                Feature::ArgumentBufferTextures,
+                vec![gaps],
+            )));
+        }
+    }
+    Ok(m.format)
+}
+
 /// Whether a member of facts `shape` is a texture a heap reads by its raw texels: an unswizzled,
 /// not sparse texture of one sample, of a form of `ExtendedRange::HEAP_READ`.
-fn raw_held(shape: &TextureShape) -> bool {
+pub(crate) fn raw_held(shape: &TextureShape) -> bool {
     match *shape {
         TextureShape::Texture {
             pixel_format,
@@ -302,6 +414,56 @@ fn raw_held(shape: &TextureShape) -> bool {
                     .is_some()
         }
         TextureShape::Buffer { .. } => false,
+    }
+}
+
+/// The bit of `SpecKey::HeapRawTextures`' value that a texture the stage's handles can name is held
+/// by its raw texels alone ([`heap_raw_form`]), whose decode the function's `float` read, sample or
+/// gather takes (`lower::texture::heap_raw`).
+pub(crate) const HELD: u32 = 1;
+
+/// The bit of `SpecKey::HeapRawTextures`' value that such a texture is of a form whose sample the
+/// function filters (`lower::sampler::heap_raw`): every form of `ExtendedRange::HEAP_READ` but a
+/// bfloat one, whose sample reads the nearest texel under either filter.
+pub(crate) const FILTERED: u32 = 2;
+
+/// The bit of `SpecKey::HeapNanFamilies` of a 16-bit float format: its written `half` NaN is
+/// Metal's on a device of `DriverDeviation::MetalHalfTexelWrites`, a written `float`'s NaN on one of
+/// `DriverDeviation::MetalHalfStorageNans` and its rounding on one of
+/// `DriverDeviation::MetalHalfStorageWrites`.
+pub(crate) const NAN_SIXTEEN: u32 = 1;
+
+/// The bit of `SpecKey::HeapNanFamilies` of a 32-bit float format: its written `half` NaN is
+/// Metal's on a device of `DriverDeviation::MetalNanMoves`.
+pub(crate) const NAN_WIDE: u32 = 2;
+
+/// The bit of `SpecKey::HeapNanFamilies` of a packed small float format (`RG11B10Float`,
+/// `RGB9E5Float`): its written NaN is Metal's on a device of `DriverDeviation::MetalSmallFloatNans`.
+pub(crate) const NAN_SMALL: u32 = 4;
+
+/// The bit of `SpecKey::HeapNanFamilies` of a float format of none of those families whose texels
+/// may hold a NaN: its written NaN is the device's.
+pub(crate) const NAN_OTHER: u32 = 8;
+
+/// The bit of `SpecKey::HeapNanFamilies` of a texture of pixel format `pf`: its class's family
+/// (`metal::texel_format::TexelFormat`, as `lower::texture::half_write_nans` tests a bound
+/// texture's), or 0 for a format whose texels hold no NaN (normalized, sRGB, extended-range,
+/// another packed one) or that a float texture does not view (integer, stencil).
+pub(crate) fn nan_family(pf: metal::PixelFormat) -> u32 {
+    use crate::metal::bicubic::BicubicTexels as B;
+    use crate::metal::texel_format::{PackedTexels, TexelFormat};
+    use crate::pipeline::sym::SampledType;
+    if crate::metal::format::sampled_type(pf) != Some(SampledType::Float) {
+        return 0;
+    }
+    let class = crate::metal::format::bound_texel_format(pf);
+    let family = class & (B::LINEAR | B::HALF | TexelFormat::NAN_FREE);
+    match class & TexelFormat::PACKED_MASK {
+        p if p == PackedTexels::SmallFloat.class().0 => NAN_SMALL,
+        0 if family == B::HALF => NAN_SIXTEEN,
+        0 if family == B::LINEAR => NAN_WIDE,
+        0 if family == 0 => NAN_OTHER,
+        _ => 0,
     }
 }
 
@@ -322,10 +484,12 @@ pub fn heap_raw_form(facts: &TextureFacts) -> Option<crate::metal::format::Exten
 /// `layout`, on `profile` (the module docs): a sampled class's as a slot's
 /// (`plan::resources::sampled_view`), a storage class's the direct format (an `A8Unorm` texture
 /// held in red its `R8_UNORM` image), which the class's formatless declaration must serve.
-/// `Unsupported` where the array cannot view it: an extended-range format (its raw texels need its
-/// function's decode) but a form a heap reads in the unsigned integer class ([`Fit::Raw`]), its raw
-/// view, a storage member whose storage choice or format the formatless declaration cannot serve,
-/// or an `A8Unorm` one held in red whose swizzle moves its alpha (its handle's class is not
+/// A storage member whose choice is an alias a heap access converts by ([`storage_conversions`])
+/// takes that alias. `Unsupported` where the array cannot view it: an extended-range format (its
+/// raw texels need its function's decode) but a form a heap reads in the unsigned integer class
+/// ([`Fit::Raw`]), its raw view, a storage member whose storage choice or format the formatless
+/// declaration cannot serve (another alias, or a converting one whose swizzle loses its class), or
+/// an `A8Unorm` one held in red whose swizzle moves its alpha (its handle's class is not
 /// `A8Unorm`'s).
 fn member_view(
     profile: &DeviceProfile,
@@ -348,6 +512,28 @@ fn member_view(
         // The class does not say which accesses the function makes, so the member serves
         // every access the device lets a heap make.
         let use_ = heap_storage_use(profile);
+        // A 4:4:4 two-plane YCbCr texture whose writes Metal stores into its planes: its write
+        // shadow's float view, whose texels a heap write marks (`FLAG_YCBCR_WRITES`), the
+        // consumer's to encode into the planes.
+        if ycbcr_writes_stored(pixel_format) {
+            let format = vk::Format::R32G32B32A32_SFLOAT;
+            let gaps = without_format_gaps(format, use_, profile);
+            if !gaps.is_empty() {
+                return Err(BindError::Unsupported(Unsupported::needs_any_of(
+                    Feature::ArgumentBufferTextures,
+                    vec![gaps],
+                )));
+            }
+            return Ok(ImageViewDesc {
+                view_type: view_type(class)?,
+                format,
+                aspect: vk::ImageAspectFlags::COLOR,
+                layout,
+                components: vk::ComponentMapping::IDENTITY,
+                level: None,
+                shader_swizzle: false,
+            });
+        }
         let c = storage_choice(pixel_format, use_, profile).map_err(bind_error)?;
         // The class's one formatless declaration cannot convert per element: a member is viewed
         // through its own format.
@@ -358,6 +544,18 @@ fn member_view(
         // (`metal::texel_format::heap_alpha_in_red_index`), which a swizzle that moves its alpha
         // does not keep.
         let alpha_in_red = c.class == StorageImageClass::AlphaInRed;
+        // A texture viewed through its storage choice's alias, whose channels a heap access
+        // exchanges or whose sRGB codes it decodes and encodes where the handle carries its
+        // class and red-blue order ([`storage_conversions`]): the alias, which its image lists
+        // among its view formats.
+        let converted = aliased
+            && !c.x_channel
+            && storage_conversions(profile).contains(&StorageConversion {
+                index: crate::metal::texel_format::heap_class_index(pixel_format, shape.swizzle()),
+                red_blue: red_blue_exchanged(pixel_format),
+                class: c.class,
+            })
+            && storage_view_formats(pixel_format, profile).contains(&c.vk_format);
         if alpha_in_red
             && crate::metal::texel_format::heap_class_index(pixel_format, shape.swizzle())
                 != crate::metal::texel_format::heap_alpha_in_red_index()
@@ -366,12 +564,12 @@ fn member_view(
                 Feature::ArgumentBufferTextures,
             )));
         }
-        if !(per_element || alpha_in_red) || aliased || c.x_channel {
+        if !(per_element || alpha_in_red || converted) || (aliased && !converted) || c.x_channel {
             return Err(BindError::Unsupported(Unsupported::not_implemented(
                 Feature::ArgumentBufferTextures,
             )));
         }
-        let format = match alpha_in_red {
+        let format = match alpha_in_red || converted {
             true => c.vk_format,
             false => crate::metal::format::direct_format(pixel_format)
                 .ok_or_else(|| internal("a storage heap member without a format"))?,
@@ -405,16 +603,22 @@ fn member_view(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeapElement {
     /// The array's class's neutral ([`NeutralResource::for_image`]): the texture fits another
-    /// class, or no class (a texture buffer, a format the table holds no representation of).
+    /// class, or no class (a format the table holds no representation of).
     Neutral,
     /// The texture, through this view.
     View(ImageViewDesc),
+    /// The texture buffer, through a texel buffer view of this format over its texels, as a slot's
+    /// view of it lies: from its offset (a multiple of `minTexelBufferOffsetAlignment`) over the
+    /// whole texel blocks of its length, at most `maxTexelBufferElements` of them. The array is a
+    /// texel-buffer class's: a uniform texel buffer array, or a storage one.
+    TexelBuffer(vk::Format),
 }
 
 /// What the element at a texture's resource ID of the set-1 heap array `class` holds for that
 /// texture, of `facts`, on `profile`, in `layout`, whichever command reads the ID: the
 /// texture's view where it fits the class, as a plan's member's (the module docs' **Elements**),
-/// else the class's neutral. A consumer that keeps one heap set for every command buffer (under
+/// a texture buffer's texel buffer view where it fits a texel-buffer class
+/// ([`HeapElement::TexelBuffer`]), else the class's neutral. A consumer that keeps one heap set for every command buffer (under
 /// `HeapPlacement::ResourceId`) writes every live texture's elements so, so an ID a function
 /// loads from memory reaches its texture though no command named it, as Metal's does.
 ///
@@ -438,19 +642,30 @@ pub fn heap_element(
     };
     let shape = facts.shape();
     match fit(&shape, image) {
+        Fit::Holds if facts.texture_type == TextureType::TextureBuffer => {
+            member_texel_view(profile, shape.pixel_format(), shape.swizzle(), image)
+                .map(HeapElement::TexelBuffer)
+        }
         Fit::Holds => member_view(profile, &shape, image, layout).map(HeapElement::View),
         // The float array holds its neutral, and a function's float read takes its raw texels
         // from the unsigned integer array, which views it ([`Fit::Holds`] there).
-        Fit::Raw | Fit::NumericType | Fit::No => Ok(HeapElement::Neutral),
+        Fit::Raw | Fit::NumericType | Fit::No | Fit::Dropped => Ok(HeapElement::Neutral),
     }
 }
 
 /// The flags word of the handle-table entry of a texture of `facts`, for [`handle_entry`]: bit 1
 /// where its pixel format has no alpha, so a shader-checked read past the texture takes Metal's
-/// out-of-bounds alpha of 1; bits 16 to 28 the index of the texture's texel class
+/// out-of-bounds alpha of 1; bit 2 where its pixel format is blue-first
+/// (`metal::format::red_blue_exchanged`), so a storage access exchanges red and blue where the
+/// heap views it through its RGBA-order twin; bits 3 to 14 its border texels
+/// (`metal::sampler::border_texels` of its pixel format and swizzle), which a Metal 4.1 read
+/// through a sampler hands back at a border; bits 16 to 28 the index of the texture's texel class
 /// (`metal::texel_format::heap_class_index` of its pixel format and swizzle), by which the shader
-/// emulates Metal's linear filter of the texture's texels, 0 for a swizzled texture; every other
-/// bit 0. A caller passes the word through as is.
+/// emulates Metal's linear filter of the texture's texels, 0 for a swizzled texture; bit 15 where
+/// it is a 4:4:4 two-plane YCbCr texture whose writes Metal stores into its planes
+/// (`metal::format::ycbcr_writes_stored`), so a heap write marks its write shadow
+/// (`memory::handles::FLAG_YCBCR_WRITES`); every other bit 0. A caller passes the word through
+/// as is.
 pub fn handle_entry_flags(facts: &TextureFacts) -> u32 {
     entry_flags(&facts.shape())
 }
@@ -463,9 +678,85 @@ fn entry_flags(shape: &TextureShape) -> u32 {
         Some(true) => FLAG_OUT_OF_BOUNDS_ALPHA_ONE,
         _ => 0,
     };
+    let red_blue = match red_blue_exchanged(pixel_format) {
+        true => FLAG_RED_BLUE,
+        false => 0,
+    };
+    // A placeholder pixel format's member reads its neutral, whose border texels a slot bound to
+    // one takes too.
+    let border = crate::metal::sampler::border_texels(pixel_format, swizzle)
+        .unwrap_or(crate::metal::sampler::NEUTRAL_BORDER_TEXELS)
+        << FLAG_BORDER_TEXELS.trailing_zeros();
     let index = crate::metal::texel_format::heap_class_index(pixel_format, swizzle);
     let class = index << FLAG_TEXEL_CLASS.trailing_zeros();
-    alpha | (class & FLAG_TEXEL_CLASS)
+    let ycbcr = match ycbcr_writes_stored(pixel_format) {
+        true => FLAG_YCBCR_WRITES,
+        false => 0,
+    };
+    alpha | red_blue | ycbcr | (border & FLAG_BORDER_TEXELS) | (class & FLAG_TEXEL_CLASS)
+}
+
+/// A conversion a storage access through a heap handle makes of the texels of a member its
+/// storage array views through the member's storage choice's alias ([`storage_conversions`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct StorageConversion {
+    /// The member's texel class index (`metal::texel_format::heap_class_index`), which its
+    /// handle carries.
+    pub index: u32,
+    /// Its pixel format is blue-first (`metal::format::red_blue_exchanged`), which its handle
+    /// carries (`memory::handles::FLAG_RED_BLUE`).
+    pub red_blue: bool,
+    /// The conversion: `SwizzleBgra` exchanges red and blue, `SrgbEncode` decodes and encodes the
+    /// sRGB codes of the color lanes by the device's transfer, `SrgbEncodeBgra` both.
+    pub class: StorageImageClass,
+}
+
+/// The conversions of the storage elements of a heap on `profile`, one for each texel class and
+/// red-blue order whose formats' storage choices for every access the device lets a heap make
+/// ([`heap_storage_use`]) agree on one alias class that a function converts by (`SwizzleBgra`,
+/// `SrgbEncode` or `SrgbEncodeBgra`, as a slot of that choice converts, an RGBX format's left
+/// out): an 8-bit sRGB texture where the device stores no sRGB format, and a blue-first one where
+/// it stores its RGBA-order twin only. A class and order whose formats choose otherwise (another
+/// alias, or `Identity` beside a converting one) has none: its converting member is refused, as
+/// before. The binder views a member of such a choice through its alias ([`member_view`]) and the
+/// texture lowering converts where the handle carries the class and order
+/// (`lower::texture::heap_storage_conversions`); both come from this list, so the two agree.
+pub(crate) fn storage_conversions(profile: &DeviceProfile) -> Vec<StorageConversion> {
+    let use_ = heap_storage_use(profile);
+    let mut chosen: BTreeMap<(u32, bool), BTreeSet<Option<StorageImageClass>>> = BTreeMap::new();
+    for &pf in metal::PixelFormat::ALL {
+        let Ok(c) = storage_choice(pf, use_, profile) else {
+            continue;
+        };
+        let converts = matches!(
+            c.class,
+            StorageImageClass::SwizzleBgra
+                | StorageImageClass::SrgbEncode
+                | StorageImageClass::SrgbEncodeBgra
+        ) && c.alias.is_some()
+            && !c.x_channel;
+        let index = crate::metal::texel_format::heap_class_index(
+            pf,
+            crate::metal::TextureSwizzleChannels::DEFAULT,
+        );
+        chosen
+            .entry((index, red_blue_exchanged(pf)))
+            .or_default()
+            .insert(converts.then_some(c.class));
+    }
+    chosen
+        .into_iter()
+        .filter_map(|((index, red_blue), classes)| {
+            match classes.into_iter().collect::<Vec<_>>().as_slice() {
+                [Some(class)] => Some(StorageConversion {
+                    index,
+                    red_blue,
+                    class: *class,
+                }),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// The bytes of one handle-table entry (the module docs' **Tables**): resource ID `id` at heap
@@ -649,6 +940,8 @@ pub(crate) struct HeapPlanner<'a> {
     /// neutral (`RuntimeFact::HeapCrossClassNeutral`), each with whether every such member does
     /// (else only one of a format a crossing read does not take).
     cross_neutral: BTreeMap<Stage, BTreeMap<ImageHandleClass, bool>>,
+    /// The storage classes each stage reads (`RuntimeFact::HeapStorageReads`).
+    storage_reads: BTreeMap<Stage, BTreeSet<ImageHandleClass>>,
     /// The sampler tables, `(stage, set, binding)`.
     sampler_tables: Vec<(Stage, u32, u32)>,
     /// The argument samplers' shape, the entries of every sampler array and table, and what
@@ -740,6 +1033,12 @@ impl<'a> HeapPlanner<'a> {
                 *write_rounding.entry(stage).or_insert(false) |= halves;
             }
         }
+        let mut storage_reads: BTreeMap<Stage, BTreeSet<ImageHandleClass>> = BTreeMap::new();
+        for d in dependencies {
+            if let RuntimeFact::HeapStorageReads { stage, class } = d.fact {
+                storage_reads.entry(stage).or_default().insert(class);
+            }
+        }
         for set in &layout.sets {
             for b in &set.bindings {
                 match b.source {
@@ -776,6 +1075,25 @@ impl<'a> HeapPlanner<'a> {
                                 filtering,
                                 compare: sampler.compare,
                             });
+                        }
+                    }
+                    // A constexpr sampler array's elements: each its immutable sampler's border
+                    // and filtering.
+                    BindingSource::SamplerArray {
+                        stage,
+                        compare,
+                        integer,
+                    } => {
+                        for d in &b.immutable_samplers {
+                            opaque_black |= opaque_black_border(d);
+                            let filtering = desc_filtering(d);
+                            if filtering.0 && !integer {
+                                filters.push(HeapFilter {
+                                    stage,
+                                    filtering,
+                                    compare,
+                                });
+                            }
                         }
                     }
                     _ => {}
@@ -886,6 +1204,24 @@ impl<'a> HeapPlanner<'a> {
         };
         let stages: Vec<Stage> = tables.iter().map(|t| t.0).collect();
         let members = members(shape, &stages, reach);
+        // A sparse texture a stage's handle tables reach where the stage observes the residency
+        // of its heap accesses, which answer the word of a texture that is not sparse
+        // (`RuntimeFact::HeapResidency`).
+        let residency: BTreeSet<Stage> = dependencies
+            .iter()
+            .filter_map(|d| match d.fact {
+                RuntimeFact::HeapResidency { stage } => Some(stage),
+                _ => None,
+            })
+            .collect();
+        if members
+            .iter()
+            .any(|m| m.shape.sparse() && m.stages.iter().any(|s| residency.contains(s)))
+        {
+            return Err(BindError::Unsupported(Unsupported::not_implemented(
+                Feature::ArgumentBufferTextures,
+            )));
+        }
         let count = members.len() as u64 + 1;
         if count > u64::from(capacity) {
             return Err(BindError::HeapTooLarge {
@@ -934,6 +1270,7 @@ impl<'a> HeapPlanner<'a> {
             sampling,
             write_rounding,
             cross_neutral,
+            storage_reads,
             sampler_tables,
             samplers,
             directories,
@@ -1146,10 +1483,11 @@ impl<'a> HeapPlanner<'a> {
             }
             HandleClass::FunctionTable => return self.function_table_array(set, b),
         };
-        let expected = if image.access == ImageAccess::Storage {
-            vk::DescriptorType::STORAGE_IMAGE
-        } else {
-            vk::DescriptorType::SAMPLED_IMAGE
+        let expected = match (image.access, image.dim == ImageDim::Buffer) {
+            (ImageAccess::Storage, false) => vk::DescriptorType::STORAGE_IMAGE,
+            (ImageAccess::Storage, true) => vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+            (_, false) => vk::DescriptorType::SAMPLED_IMAGE,
+            (_, true) => vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
         };
         if ty != expected {
             return Err(internal(format!("a heap array of {class:?} as {ty:?}")));
@@ -1167,7 +1505,15 @@ impl<'a> HeapPlanner<'a> {
         for (i, m) in self.members.iter().enumerate() {
             let element =
                 u32::try_from(i + 1).map_err(|_| internal("a heap element beyond u32"))?;
-            let source = match fit(&m.shape, &image) {
+            let fits = fit(&m.shape, &image);
+            // A texture whose writes Metal drops or stores through its write shadow, in a storage
+            // class a stage it reaches reads: Metal's read of it is not measured.
+            if matches!(fits, Fit::Holds | Fit::Dropped) && self.reads_unmeasured(m, &image) {
+                return Err(BindError::Unsupported(Unsupported::not_implemented(
+                    Feature::Format,
+                )));
+            }
+            let source = match fits {
                 // A texture a stage may write by a mode-2 write the function has not built.
                 Fit::Holds if image.access == ImageAccess::Storage && self.rounds(m) => {
                     return Err(BindError::Unsupported(Unsupported::not_implemented(
@@ -1200,6 +1546,8 @@ impl<'a> HeapPlanner<'a> {
                     )));
                 }
                 Fit::Raw => WriteSource::Neutral(n),
+                // The writes Metal drops leave the neutral as Metal leaves the texture.
+                Fit::Dropped => WriteSource::Neutral(n),
                 fit => {
                     if fit == Fit::NumericType && self.defaulted.contains(&image) {
                         self.diagnostics
@@ -1242,6 +1590,23 @@ impl<'a> HeapPlanner<'a> {
             out.push(write(element, source));
         }
         Ok(out)
+    }
+
+    /// Whether a stage member `m` reaches reads it in the storage class `class`
+    /// (`RuntimeFact::HeapStorageReads`) where `m` is a texture whose writes Metal drops
+    /// (`metal::format::writes_dropped`) or stores into its planes through its write shadow
+    /// (`metal::format::ycbcr_writes_stored`), whose read there is not measured.
+    fn reads_unmeasured(&self, m: &HeapMember, class: &ImageHandleClass) -> bool {
+        let TextureShape::Texture { pixel_format, .. } = m.shape else {
+            return false;
+        };
+        class.access == ImageAccess::Storage
+            && (writes_dropped(pixel_format) || ycbcr_writes_stored(pixel_format))
+            && m.stages.iter().any(|s| {
+                self.storage_reads
+                    .get(s)
+                    .is_some_and(|classes| classes.contains(class))
+            })
     }
 
     /// Whether a stage member `m` reaches writes it by a mode-2 write the function states it has
@@ -1490,9 +1855,82 @@ pub(crate) fn planner<'p, 'a>(
         .ok_or_else(|| internal("a heap binding without a handle table"))
 }
 
-/// The used resources of a bind state by token, in the state's order: built once per
-/// instantiation, so each heap member finds its entries without rescanning the state.
-type UsedByToken<'s> = BTreeMap<u32, Vec<&'s UsedResource>>;
+/// The used resources of a bind state by token, in the state's order: a list the consumer gives
+/// in token order (`BindState::used_in_token_order`), whose entries of a token a heap member finds
+/// by search forward from where the last member's ended (a plan's members ascend by token,
+/// [`members`]), so a plan's members together cost about the list's length; else gathered by
+/// token once per instantiation, so each heap member finds its entries without rescanning the
+/// state.
+enum UsedByToken<'s> {
+    /// The list, and where the last lookup's entries ended in it.
+    Listed(&'s [UsedResource], Cell<usize>),
+    Gathered(BTreeMap<u32, Vec<&'s UsedResource>>),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The entries of a listed state that lookups of its used resources compared
+    /// ([`forward`]), on this thread.
+    static LISTED_LOOKED_AT: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The partition point of `items` under `below`, which holds of a prefix of them: found by
+/// doubling a bound from their start, then searching under it, at the logarithm of the point
+/// rather than of their count.
+fn forward<T>(items: &[T], below: impl Fn(&T) -> bool) -> usize {
+    let below = |item: &T| {
+        #[cfg(test)]
+        LISTED_LOOKED_AT.with(|looked| looked.set(looked.get() + 1));
+        below(item)
+    };
+    let mut end = 1;
+    while end <= items.len() && below(&items[end - 1]) {
+        end *= 2;
+    }
+    let start = end / 2;
+    start + items[start..end.min(items.len())].partition_point(below)
+}
+
+impl<'s> UsedByToken<'s> {
+    /// `state`'s used resources by token.
+    fn of(state: &'s BindState) -> UsedByToken<'s> {
+        let used = &state.used_resources;
+        if state.used_in_token_order {
+            debug_assert!(
+                used.windows(2).all(|w| w[0].token <= w[1].token),
+                "used resources listed in token order are not"
+            );
+            return UsedByToken::Listed(used, Cell::new(0));
+        }
+        let mut gathered: BTreeMap<u32, Vec<&UsedResource>> = BTreeMap::new();
+        for u in used {
+            gathered.entry(u.token).or_default().push(u);
+        }
+        UsedByToken::Gathered(gathered)
+    }
+
+    /// The entries of `token`, in the state's order; `None` where it lists none. A listed
+    /// state's are searched forward from where the last lookup's ended, where they lie past it,
+    /// else from the list's start.
+    fn get(&self, token: u32) -> Option<impl Iterator<Item = &'s UsedResource> + '_> {
+        let (listed, gathered): (&'s [UsedResource], &[&'s UsedResource]) = match self {
+            UsedByToken::Listed(used, from) => {
+                let before = from.get().checked_sub(1).and_then(|at| used.get(at));
+                let base = match before {
+                    Some(before) if before.token < token => from.get(),
+                    Some(_) | None => 0,
+                };
+                let start = base + forward(&used[base..], |u| u.token < token);
+                let end = start + forward(&used[start..], |u| u.token == token);
+                from.set(end);
+                (&used[start..end], &[])
+            }
+            UsedByToken::Gathered(gathered) => (&[], gathered.get(&token)?),
+        };
+        let none = listed.is_empty() && gathered.is_empty();
+        (!none).then(|| listed.iter().chain(gathered.iter().copied()))
+    }
+}
 
 /// The resource id of heap member `m` in `state` (whose used resources are `used`), checked
 /// against the plan's shape.
@@ -1510,7 +1948,7 @@ fn member_id(
     match m.source {
         HeapSource::Used(token) => {
             let mut id = None;
-            let entries = used.get(&token).ok_or_else(mismatch)?;
+            let entries = used.get(token).ok_or_else(mismatch)?;
             for u in entries {
                 let ResourceClass::Texture(facts) = u.class else {
                     return Err(mismatch());
@@ -1661,10 +2099,7 @@ fn handle_table_bytes(
     if members.is_empty() && tables.is_empty() {
         return Ok(Vec::new());
     }
-    let mut used = UsedByToken::new();
-    for u in &state.used_resources {
-        used.entry(u.token).or_default().push(u);
-    }
+    let used = UsedByToken::of(state);
     let mut ids = Vec::with_capacity(members.len());
     for m in members {
         ids.push(member_id(m, &used, state)?);
@@ -1893,6 +2328,42 @@ fn relisted_sampler_tables(
 }
 
 impl BindingPlan {
+    /// This plan's heap tables for `state`, written over `tables` (emptied first): the bytes of
+    /// its handle tables, sampler tables and function-table directories, which
+    /// [`instantiate_draw_into`](Self::instantiate_draw_into) writes after a draw's stage tables
+    /// and [`instantiate_draw_apart_into`](Self::instantiate_draw_apart_into) leaves out. They
+    /// are a function of the plan and of the state's heap inputs alone: its used resources (and
+    /// whether it lists them in token order), the textures it binds at the plan's
+    /// [`heap_slots`](Self::heap_slots), its argument samplers, its function tables and its heap
+    /// placement. Their cost grows with the used resources and those slots. A state of another
+    /// shape than the plan's is an internal error, a list past a table's planned entries
+    /// [`BindError::HeapTooLarge`], and a function-table directory the plan cannot represent the
+    /// consumer's [`BindError::Unsupported`] (`DynamicCall`); on an error `tables` holds none.
+    pub fn heap_tables_into(
+        &self,
+        state: &BindState,
+        tables: &mut Vec<crate::bind::instantiate::DescriptorBytes>,
+    ) -> Result<(), BindError> {
+        tables.clear();
+        let template = self
+            .resource_template()
+            .ok_or_else(|| internal("a plan without a template"))?;
+        tables.extend(table_bytes(template, state)?);
+        Ok(())
+    }
+
+    /// The texture slots whose textures this plan's heap tables and heap elements read
+    /// ([`heap_tables_into`](Self::heap_tables_into), [`heap_elements`](Self::heap_elements)):
+    /// those of its heap members a slot binds, beside the used resources. None for a plan whose
+    /// handles name used resources alone, or that reads no handle.
+    pub fn heap_slots(&self) -> impl Iterator<Item = SlotRef> + '_ {
+        let members = self.resource_template().map(|t| &t.heap_members);
+        (members.into_iter().flatten()).filter_map(|m| match m.source {
+            HeapSource::Bound(slot) => Some(slot),
+            HeapSource::Used(_) => None,
+        })
+    }
+
     /// Where this plan's heap writes go for `state` ([`HeapElements`]), each heap array having
     /// `capacity` elements (the layout's set-1 count). Under [`HeapPlacement::ResourceId`] a
     /// member's element is its resource ID and a listed sampler's its
@@ -1931,10 +2402,7 @@ fn heap_elements(
             None => Ok(None),
         }
     };
-    let mut used = UsedByToken::new();
-    for u in &state.used_resources {
-        used.entry(u.token).or_default().push(u);
-    }
+    let used = UsedByToken::of(state);
     let members = template
         .heap_members
         .iter()

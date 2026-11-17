@@ -4,13 +4,21 @@
 
 use super::SLOTS;
 use crate::generated_commands::GeneratedCommandsInfo;
+use crate::shards::{held, SHARDS};
 use ash::vk;
 use std::ffi::{c_void, CStr};
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
-/// Each slot's commands recorded so far, one count per command at its index.
-static COUNTS: [[AtomicU64; Command::COUNT]; SLOTS] =
-    [const { [const { AtomicU64::new(0) }; Command::COUNT] }; SLOTS];
+/// One shard of a slot's counts, one per command at its index, on cache lines of its own (128
+/// bytes, the line of Apple's and the pair of lines x86's prefetchers fetch together): a thread
+/// counts into the one it holds, else the one threads share (`shards::held`), and a slot's count
+/// of a command is the sum of its shards'.
+#[repr(align(128))]
+struct Shard([AtomicU64; Command::COUNT]);
+
+/// Each slot's commands recorded so far, by shard.
+static COUNTS: [[Shard; SHARDS + 1]; SLOTS] =
+    [const { [const { Shard([const { AtomicU64::new(0) }; Command::COUNT]) }; SHARDS + 1] }; SLOTS];
 
 /// Slot `index`'s counts.
 pub(super) fn counts(index: usize) -> CommandsRecorded {
@@ -19,8 +27,10 @@ pub(super) fn counts(index: usize) -> CommandsRecorded {
 
 /// Zero slot `index`'s counts, as a device takes it.
 pub(super) fn clear_counts(index: usize) {
-    for count in &COUNTS[index] {
-        count.store(0, Ordering::Relaxed);
+    for shard in &COUNTS[index] {
+        for count in &shard.0 {
+            count.store(0, Ordering::Relaxed);
+        }
     }
 }
 
@@ -91,12 +101,16 @@ macro_rules! commands {
         }
 
         impl CommandsRecorded {
-            /// The counts `counts` holds, one per command at its index.
-            fn read(counts: &[AtomicU64; Command::COUNT]) -> CommandsRecorded {
+            /// The counts `shards` hold, one per command at its index in each: their sums.
+            fn read(shards: &[Shard; SHARDS + 1]) -> CommandsRecorded {
+                let sum = |command: Command| {
+                    let counts = shards.iter().map(|shard| &shard.0[command as usize]);
+                    counts.map(|count| count.load(Ordering::Relaxed)).sum()
+                };
                 CommandsRecorded {
-                    $($f0: counts[Command::$v0 as usize].load(Ordering::Relaxed),)*
-                    $($f3: counts[Command::$v3 as usize].load(Ordering::Relaxed),)*
-                    $($fe: counts[Command::$ve as usize].load(Ordering::Relaxed),)*
+                    $($f0: sum(Command::$v0),)*
+                    $($f3: sum(Command::$v3),)*
+                    $($fe: sum(Command::$ve),)*
                 }
             }
         }
@@ -137,6 +151,16 @@ macro_rules! commands {
             }
         }
 
+        /// Slot `index`'s `command` as its device's driver gave it: null where none is stored.
+        pub(super) fn real(index: usize, command: Command) -> *const c_void {
+            let real = match command {
+                $(Command::$v0 => REAL.$f0[index].load(Ordering::Acquire),)*
+                $(Command::$v3 => REAL.$f3[index].load(Ordering::Acquire),)*
+                $(Command::$ve => REAL.$fe[index].load(Ordering::Acquire),)*
+            };
+            real.cast_const()
+        }
+
         /// Forget slot `index`'s commands.
         pub(super) fn clear(index: usize) {
             $(REAL.$f0[index].store(std::ptr::null_mut(), Ordering::Release);)*
@@ -167,7 +191,8 @@ macro_rules! commands {
                 command_buffer: vk::CommandBuffer,
                 $($a: $t,)*
             ) $(-> $r)? {
-                COUNTS[S][Command::$v as usize].fetch_add(1, Ordering::Relaxed);
+                let at = held();
+                crate::shards::add(at, &COUNTS[S][at].0[Command::$v as usize], 1);
                 let real = REAL.$f[S].load(Ordering::Acquire);
                 if real.is_null() {
                     missing($n);
@@ -402,6 +427,23 @@ commands! {
                 count_offset: vk::DeviceSize,
                 max_count: u32,
                 stride: u32
+            );
+        CmdDrawMulti cmd_draw_multi c"vkCmdDrawMultiEXT"
+            (
+                count: u32,
+                draws: *const vk::MultiDrawInfoEXT,
+                instances: u32,
+                first_instance: u32,
+                stride: u32
+            );
+        CmdDrawMultiIndexed cmd_draw_multi_indexed c"vkCmdDrawMultiIndexedEXT"
+            (
+                count: u32,
+                draws: *const vk::MultiDrawIndexedInfoEXT,
+                instances: u32,
+                first_instance: u32,
+                stride: u32,
+                vertex_offset: *const i32
             );
         CmdExecuteGeneratedCommands cmd_execute_generated_commands
             c"vkCmdExecuteGeneratedCommandsEXT"

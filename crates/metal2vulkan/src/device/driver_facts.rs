@@ -11,9 +11,13 @@
 //! A GPU that reports more than one `deviceID` is one device class under each: every table here
 //! names it by the ID it was measured under, and a description is read by its
 //! [`DeviceDescription::canonical_device_id`]. MoltenVK's `deviceID` on Apple's GPUs is the macOS
-//! release and the GPU family, so a row of one names every GPU of the family under that macOS.
-//! A driver or GPU no row names takes no fact: the reader takes the route each fact's docs name
-//! for a driver without it.
+//! release and the GPU family, so a row of one names every GPU of the family under that macOS. A
+//! driver or GPU no row names takes no fact: the reader takes the route each fact's docs name for a
+//! driver without it. A question a device answers about itself in a few milliseconds is no row: the
+//! runtime's device checks measure it on each device, once per driver and release (whether its
+//! submissions that signal nothing merge, whether a held host-pointer import adds to each
+//! submission's cost: the runtime's `submit_check.rs`; textures in place over host pages,
+//! `in_place_check.rs`; the GPU's idling between `VkQueue`s, `queue_switch_check.rs`).
 
 use crate::device::description::APPLE_VENDOR_ID;
 use crate::device::profile::DriverWorkaround;
@@ -95,12 +99,11 @@ pub(crate) fn among<F: Copy + Ord>(
 ///
 /// The color-NaN stores, measured by `runtime_lane::color_writes` (at 0c344d06f,
 /// 2026-10-06): every NaN class of `float` outputs (the rounding writes `0x7fc00000`) to
-/// `R16Float`, `RG16Float` and `RGBA16Float`, and every `half` NaN of a `half` output to
-/// `RGBA16Float`, plain and blended with factors one and zero, against Metal's `0x7e00` and the
-/// `half`'s own bits:
-/// - `MetalFloatColorNans` and `MetalHalfColorNans`: NVIDIA's (`NVIDIA_PROPRIETARY`) 615.71.09
-///   on the GeForce RTX 3090 (`deviceID` `0x2204`) and the RTX 5080 Laptop GPU (`0x2c19`): every
-///   channel Metal's. One row per GPU, as measured.
+/// `R16Float`, `RG16Float` and `RGBA16Float`, plain and blended with factors one and zero,
+/// against Metal's `0x7e00`:
+/// - `MetalFloatColorNans`: NVIDIA's (`NVIDIA_PROPRIETARY`) 615.71.09 on the GeForce RTX 3090
+///   (`deviceID` `0x2204`) and the RTX 5080 Laptop GPU (`0x2c19`): every channel Metal's. One row
+///   per GPU, as measured.
 /// - `MetalFloatColorNans` alone: lavapipe (`MESA_LLVMPIPE`) from Mesa 26.0.8 through 26.2.4,
 ///   every `float` NaN Metal's and a `half` NaN another: Mesa 26.0.8 on LLVM 21.1.8, x86_64 (the
 ///   linux-gate container; signalling `half` NaNs quieted) and arm64 (on an M4 mini; every `half`
@@ -110,7 +113,11 @@ pub(crate) fn among<F: Copy + Ord>(
 /// Measured to store another NaN for both outputs, so not listed: RADV, Mesa 26.2.4 on the
 /// Radeon 780M, and ANV, Mesa 26.2.4 on the Iris Xe (RPL-P), `0xfe00`. MoltenVK 1.4.1 stores a
 /// `half` NaN as `0x7e00` on the M3 Max and the M4, and its `float` NaN as Metal does
-/// (`MetalColorWrites`).
+/// (`MetalColorWrites`). A `half` output's NaN reaches the attachment through the device's
+/// widening of the `half` (`OpFConvert`), whose NaN is the device's, so no driver is listed for
+/// it: NVIDIA's 615.71.09 on the RTX 5080 Laptop GPU stores every `half` NaN of the lane's `half`
+/// output to `RGBA16Float` as `0x7fff`, where Metal stores the `half`'s own bits (at 961b1ff319,
+/// 2026-11-05).
 ///
 /// `MetalHalfFma`: MoltenVK 1.4.1's `GLSL.std.450 Fma` on 16-bit floats, which SPIRV-Cross writes
 /// as Metal's `fma(half, half, half)`, the operation a Metal `half` fused multiply-add compiles to.
@@ -131,7 +138,10 @@ pub(crate) fn among<F: Copy + Ord>(
 /// the RTX 3090 likewise. lavapipe keeps them (Mesa 26.0.8 on LLVM 21.1.8, x86_64 and arm64:
 /// 1,249 and 1,032 words of the two probes differ), so it is not listed. NVIDIA's `Floor` and
 /// `Ceil` keep a denormal, which the deviation does not cover: every profile leaves their
-/// denormals to the device, noted (`lower::arith::denormal`). One row per GPU, as measured.
+/// denormals to the device, noted (`lower::arith::denormal`). The probes declare no float-controls
+/// mode; in an entry that declares the 16-bit controls NVIDIA's driver keeps `f32` denormals
+/// (`DriverWorkaround::FloatDenormalsKeptUnderHalfControls`, in `DEFECTS`), and there the
+/// deviation is not taken. One row per GPU, as measured.
 ///
 /// `MetalCenterVaryings`: MoltenVK 1.4.1 hands Metal a smooth input decorated neither `Centroid`
 /// nor `Sample` with no interpolation qualifier (SPIRV-Cross `adec7acb`, `spirv_msl.cpp`
@@ -186,7 +196,10 @@ pub(crate) fn among<F: Copy + Ord>(
 /// differs. The same operations undecorated differ in the fast and relaxed modes, which fold the
 /// narrowings and the widening away (3,468,601,344 pairs for a sum, 4,014,926,892 for a product,
 /// 6,140 for a quotient); so does SPIRV-Cross's `NoContraction` `OpFMul`, `spvFMul`, which answers
-/// `+0` for a `-0` product (126,974 pairs). The translation emits none of them. The sums read every
+/// `+0` for a `-0` product (126,974 pairs). The translation emits the undecorated `OpFAdd`,
+/// `OpFSub` and `OpFMul` only for an operation whose AIR flags carry `contract` and `reassoc`, the
+/// AIR's own contraction, and records `PrecisionNote::FastMathRewrites` for it; never the decorated
+/// `OpFMul`. The sums read every
 /// `half` through the device's widening (`x + -0` of every `x`), which every `half` read from its
 /// bits takes on a profile with `shaderFloat16` (`lower::arith::narrow::from_bits`), so a module
 /// that reads one requires this fact for its denormals; Metal's own widening, read on the M3 Max
@@ -202,7 +215,10 @@ pub(crate) fn among<F: Copy + Ord>(
 /// order; elsewhere, the rasterizer packs the covered quads of several blocks and primitives into
 /// one simdgroup. The gate lane
 /// `runtime_lane::driver_deviations::fragment_simdgroup_lanes_are_metal_s` compares MoltenVK's
-/// subgroup lanes with Metal's lanes of the same draws on each chip. One row per GPU.
+/// subgroup lanes with Metal's lanes of the same draws on each chip. Its quads are Metal's too: in
+/// a function that discards, where the M3 Max shades some quads as several partial quads, the
+/// public `helper-threads-*` cases' MoltenVK rows answer Metal's ballots of the helper query word
+/// for word. One row per GPU.
 ///
 /// `MetalVertexSimdgroups` (the coordinator's reversal of the MoltenVK refusal, 2026-10-08):
 /// MoltenVK 1.4.1 leaves the vertex stage out of `subgroupSupportedStages`, but hands the vertex
@@ -243,14 +259,17 @@ pub(crate) fn among<F: Copy + Ord>(
 /// zero, past the largest 65504, every NaN `0x7e00`; every form, plain and under Metal's debug
 /// layer):
 /// - `MetalHalfStorageWrites`: every channel but NaNs Metal's, on MoltenVK 1.4.1 on the M3 Max
-///   and the M4, RADV, Mesa 26.2.4 on the Radeon 780M, ANV, Mesa 26.2.4 on the Iris Xe (RPL-P) and
-///   the UHD 770 (RPL-S), and NVIDIA's 615.71.09 on the RTX 3090 and the RTX 5080 Laptop GPU, and
-///   lavapipe (`MESA_LLVMPIPE`) from Mesa 26.0.8 through 26.2.4: Mesa 26.0.8 on LLVM 21.1.8, x86_64
-///   (the linux-gate container) and arm64 (on an M4 mini), and Mesa 26.2.4 on LLVM 23.1.1, x86_64
-///   (Arch's, on an i9-13900), all at fd90c81e3.
+///   and the M4, ANV, Mesa 26.2.4 on the Iris Xe (RPL-P) and the UHD 770 (RPL-S), and NVIDIA's
+///   615.71.09 on the RTX 3090 and the RTX 5080 Laptop GPU, and lavapipe (`MESA_LLVMPIPE`) from
+///   Mesa 26.0.8 through 26.2.4: Mesa 26.0.8 on LLVM 21.1.8, x86_64 (the linux-gate container) and
+///   arm64 (on an M4 mini), and Mesa 26.2.4 on LLVM 23.1.1, x86_64 (Arch's, on an i9-13900), all
+///   at fd90c81e3; and RADV (`MESA_RADV`) on three GPUs of two generations: RDNA3, Mesa 26.2.4 on
+///   the Radeon 780M at fd90c81e3 and Mesa 26.2.6 on the RX 7900 XTX at 92202c5ea, and GCN4, Mesa
+///   26.2.6 on the RX 550 (Polaris 12) at 5020ce945 (2026-11-09).
 /// - `MetalHalfStorageNans`: every NaN `0x7e00` too, on MoltenVK 1.4.1 on the M3 Max and the M4.
 ///
-/// One row per GPU, as measured.
+/// One row per GPU, as measured; lavapipe's and RADV's one row each, of the driver on every GPU,
+/// every GPU each was measured on agreeing.
 ///
 /// `MetalHalfTexelWrites`, measured by `runtime_lane::half_write_nans` (at f38e6b9fc, 2026-10-09):
 /// a kernel's `half4` write through `access::write` and `access::read_write` of quiet and
@@ -396,6 +415,115 @@ pub(crate) fn among<F: Copy + Ord>(
 /// RTX 5080 Laptop GPU, which stores a fragment of alpha 1/2 at one sample (the conformance case
 /// `a2c-on-1-alpha-50`).
 ///
+/// `MetalNanMoves`: MoltenVK 1.4.2 (its SPIRV-Cross `6c09849f`) writes a 16-bit float's widening
+/// as Metal's `float(half)`, the narrowing as `half(float)`, `OpFNegate` as `-x` and `FAbs` as
+/// `abs(x)`, Metal's own conversions and operators, and the driver's compiler folds a narrowing of
+/// a widening moved through the registers (a select, a branch's merge, a function's `float`
+/// variable) into the `half` itself, as Metal moves a `half` unwidened. Measured on the M3 Max
+/// under macOS 27.0.1 (2026-11-02), word for word against plain Metal: every one of the 65,536
+/// `half` bit patterns widened (every NaN `0x7FC00000`), moved through a `select`, a branch's
+/// merge (a `half` and a `half2`) and to a later block and stored (each its own bits), and its
+/// `half` `fabs` (every NaN `0x7E00`); and 262,144 `float` words (every `half` value widened,
+/// 65,536 NaNs of both signs over every top-12 payload bits and four low patterns, 32,768 random
+/// NaNs, 131,072 random words) narrowed to `half`, negated and their magnitude taken: none
+/// differs, with and without fast math (the AIR of `runtime_lane::nan_moves`, which checks the
+/// runtime against Metal's answers, run on Metal too). The `half` `fneg` matched too, but by the
+/// driver's compiler moving the
+/// negation onto the `half`, which nothing states, so it stays noted; and a module that carries a
+/// widened `half` elsewhere or reads its bits is outside the measurement
+/// (`narrow::moves_unfolded`). Measured to differ, so outside it too (2026-11-03, every `half` bit
+/// pattern through Metal's compiler, with and without fast math): a merge of a select of the
+/// widened `half` against a constant (`b ? float(h) : 0.0`, as the translation's bounds check
+/// selects a read) with another widened value answers 2045 of the 2046 NaNs `0x7E00`
+/// (`narrow::merges::merges_mixed_selects`, followed member by member where a struct, an array or
+/// a vector carries the select and the other value, as a texel read's `{T, i8}` does: not measured
+/// through a struct, whose members' merges are the measured shape), where the select merged with a
+/// constant, a select of two
+/// widened values merged with a third, a merge then a select, two selects and two merges keep
+/// every NaN's bits. One row per GPU, as measured.
+///
+/// `MetalPackConversions`: MoltenVK 1.4.2 hands `GLSL.std.450`'s `PackUnorm4x8`, `PackSnorm4x8`,
+/// `PackUnorm2x16`, `PackSnorm2x16` and their unpacks to Metal's own `pack_float_to_*` and
+/// `unpack_*_to_float`, and the other formats' definition to Metal's arithmetic; on the M3 Max
+/// under macOS 27.0.1 (2026-11-02) the module's conversion answers Metal's, word for word against plain Metal with and without fast math, for
+/// `unpack_unorm565_to_float` (every word: the code times the `float` nearest `1 / D`, as Metal's
+/// does), `pack_float_to_unorm565` (3,083,776 `float`s and 385,152 around its products' ties:
+/// Metal rounds the product to `float` first), the `half` unpacks of `unorm4x8`, `snorm4x8`,
+/// `unorm10a2` and `unorm565` (every code: Metal's quotient rounded once to `half`), and the
+/// `half` packs
+/// of `unorm4x8`, `snorm4x8`, `unorm2x16`, `snorm2x16`, `unorm10a2` and `unorm565` (every `half`
+/// in every channel). The AIR of `runtime_lane::pack_conversions`, which checks the runtime
+/// against Metal's answers, run on Metal too, matches its model in every word. Measured to
+/// differ, so outside it: the sRGB format (85,511 of 3,083,776 `float` packs, 3,286 `half` ones),
+/// `unorm10a2` in `float` (9,163 of 131,072 unpacked words, 1,257 packed `float`s), and the `half`
+/// unpacks of `unorm2x16` and `snorm2x16` (8 lanes, a `float` quotient rounded twice);
+/// `snorm10a2` is unmeasured. One row per GPU, as measured.
+///
+/// `MetalHalfConversion`: MoltenVK 1.4.2 writes `OpFConvert` from 32 to 16 bits as Metal's
+/// `half(x)`, and Metal's compiler folds the conversion of an image instruction's `float` texel
+/// into the access. On the M3 Max under macOS 27.0.1 (2026-11-03), word for word against plain
+/// Metal, with and without fast math: the conversion of a `float` loaded (425,216 words: every
+/// `half`'s value, each midpoint between two `half`s and the `float`s either side of it, values
+/// inside each interval, the overflow edge, the `half` denormals' range and below it, NaNs and
+/// random words, both signs), of a sum, a product and a quotient of two (144,896 pairs each, built
+/// to land on and beside the `half` ties), of a fused multiply-add (123,648) and of an integer's
+/// quotient (190,208): none differs. Nor does the `half` result of a `read()`, a nearest sample at
+/// the texel's centre, a linear sample a quarter texel off it and a gather of every texel of
+/// `RGBA32Float` (every `float` word above), `RGBA16Float` (every `half`), `RGBA8Unorm`, its sRGB
+/// twin, `RGBA8Snorm`, `RGBA16Unorm` and `RGBA16Snorm` (every code), `RGB10A2Unorm` (every code)
+/// and `RG11B10Float` and `RGB9E5Float` (16,384 random words each). Measured to differ, so outside
+/// it: Metal's `half` `tanh`, which answers 7 of the 65,536 `half`s otherwise than the nearest
+/// even `half` of its `float` `tanh`; `exp`, `sqrt` and a reciprocal on `half` matched, but each is
+/// a function or an operation computed otherwise than by the conversion, so it stays noted
+/// (`narrow::rounds_unmeasured`). A texel the module decodes itself rounds by the same conversion
+/// of the `float` it holds (`narrow::round_texel`): the gate lane
+/// `runtime_lane::heap_extended_reads::heap_half_reads_of_every_code_round_their_float` reads every
+/// code of the five forms a heap holds by its raw texels that the runtime makes, as `half` through
+/// an argument buffer, against the nearest even `half` of the same read as `float` and the slot's
+/// `half` read: on the M3 Max under macOS 27.0.1 (2026-11-05), none of the 262,144 channels of
+/// `BGRA10_XR`, `BGR10_XR`, `R16Bfloat`, `RG16Bfloat` and `RGBA16Bfloat` each differs. An argument
+/// buffer's `half` read of a member of another numeric class rounds
+/// nothing: its arms merge the texel's `half` bits as integers (`lower::texture::emit`'s
+/// `read_crossed`), widened once after the merge as a slot's read widens them, which the gate lane
+/// `runtime_lane::cross_class_reads::argument_buffer_cross_class_reads_are_the_native_words` reads
+/// against the slot's words: there, the same day, each of its 2,170 lanes is the slot's words, a
+/// NaN's bits included. One row per GPU, as measured.
+///
+/// `MetalSmallFloatNans`: MoltenVK 1.4.2 hands a storage image write to Metal's own texture
+/// write. On the M3 Max under macOS 27.0.1 (2026-11-03), byte for byte against plain Metal, a
+/// kernel's `float4` write of 33,792 words (every top-13 payload pattern of a NaN of both signs,
+/// 16,384 random words, the quiet and signalling edges and the infinities) and its `half4` write
+/// of every one of the 65,536 `half`s (its 2,046 NaNs among them) into `RG11B10Float` store
+/// Metal's bytes in every texel, as the same writes do into `RGBA32Float`, `RG32Float` and
+/// `R32Float` (a `half` widened by Metal's own `float(half)`, `MetalNanMoves`). Into `R16Float`
+/// and `RGBA16Float` a `half` NaN's payload differs (the device stores `0x7e00`), which
+/// `MetalHalfTexelWrites` would state, so outside it. One row per GPU, as measured. lavapipe
+/// (`MESA_LLVMPIPE`) packs a small float in its shader code, which writes every NaN as the
+/// field's quiet NaN with its sign dropped, Metal's: Mesa 26.2.4 on LLVM 23.1.1, x86_64 (an
+/// Ultra 9 275HX), through a kernel's `write`, `read_write`, texture buffer and argument buffer
+/// forms, stored Metal's field for each of 32,766 `float` NaNs (every pattern of the top 13
+/// payload bits, its 10 low bits clear and set, both signs) and each of the 2,046 `half` NaNs
+/// (the gate lanes
+/// `runtime_lane::half_storage_writes::every_nan_a_kernel_writes_to_a_small_float_texture_is_metal_s_where_measured`
+/// and
+/// `runtime_lane::half_write_nans::every_half_nan_written_to_a_small_float_texture_is_metal_s_where_measured`).
+/// One row, of the driver on every CPU. Measured to store another NaN, so not listed: RADV on the
+/// Radeon 780M (a `half` NaN's payload bits kept) and NVIDIA's 615.71.09 on the RTX 5080 Laptop
+/// GPU (every bit of each NaN field set).
+///
+/// `MetalUnaryDenormals`: MoltenVK 1.4.2's `OpFNegate`, `FAbs`, `Floor` and `Ceil` on 32-bit
+/// floats, which SPIRV-Cross writes as Metal's `-x`, `fabs`, `floor` and `ceil`. On the M3 Max
+/// under macOS 27.0.1, against plain Metal's rows: the gate lane
+/// `runtime_lane::driver_deviations::float_denormals_read_as_metal_reads_them` checks the
+/// denormal probes' (`nan_denormals`, `nan_denormals_fast`: 256 lanes of operand triples rich in
+/// denormals of both signs and the smallest normals) words of `-a`, `fabs(a)`, `floor(a)` and
+/// `ceil(a)` beside `0 - a` and `-(a * b)`, and
+/// `runtime_lane::driver_deviations::owned_float_fixtures_answer_metal` the owned fixtures'
+/// `floor` and `ceil` rows of every pair of a 32-value pool; the committed MoltenVK rows of all
+/// four cases are Metal's, word for word. NVIDIA's 615.71.09 and lavapipe answer `floor` and `ceil`
+/// of a denormal as `-1` and `1`, and RADV and ANV flush a negated denormal, so they are not
+/// listed. One row per GPU, as measured.
+///
 /// Another driver has none of them, as Vulkan states, and a listed driver on another vendor's GPU
 /// (or another GPU than a row's) is unmeasured: the profile then takes each one's route without
 /// it, which the deviation's docs name (`derive.rs`).
@@ -415,8 +543,6 @@ pub(crate) const DEVIATIONS: &[Measured<DriverDeviation>] = &[
     },
     nvidia_on(DriverDeviation::MetalFloatColorNans, NVIDIA_RTX_3090),
     nvidia_on(DriverDeviation::MetalFloatColorNans, NVIDIA_RTX_5080_LAPTOP),
-    nvidia_on(DriverDeviation::MetalHalfColorNans, NVIDIA_RTX_3090),
-    nvidia_on(DriverDeviation::MetalHalfColorNans, NVIDIA_RTX_5080_LAPTOP),
     Measured {
         device: Some(APPLE9),
         ..moltenvk_on_apple(DriverDeviation::MetalHalfFma)
@@ -485,11 +611,12 @@ pub(crate) const DEVIATIONS: &[Measured<DriverDeviation>] = &[
         device: Some(APPLE9),
         ..moltenvk_on_apple(DriverDeviation::MetalHalfStorageWrites)
     },
-    mesa_on(
-        DriverDeviation::MetalHalfStorageWrites,
-        DriverId::MESA_RADV,
-        (AMD_VENDOR_ID, AMD_RADEON_780M),
-    ),
+    Measured {
+        fact: DriverDeviation::MetalHalfStorageWrites,
+        driver: DriverId::MESA_RADV,
+        vendor: None,
+        device: None,
+    },
     mesa_on(
         DriverDeviation::MetalHalfStorageWrites,
         DriverId::INTEL_OPEN_SOURCE_MESA,
@@ -582,6 +709,32 @@ pub(crate) const DEVIATIONS: &[Measured<DriverDeviation>] = &[
         device: Some(APPLE9),
         ..moltenvk_on_apple(DriverDeviation::MetalAlphaCoverage)
     },
+    Measured {
+        device: Some(APPLE9),
+        ..moltenvk_on_apple(DriverDeviation::MetalNanMoves)
+    },
+    Measured {
+        device: Some(APPLE9),
+        ..moltenvk_on_apple(DriverDeviation::MetalPackConversions)
+    },
+    Measured {
+        device: Some(APPLE9),
+        ..moltenvk_on_apple(DriverDeviation::MetalHalfConversion)
+    },
+    Measured {
+        device: Some(APPLE9),
+        ..moltenvk_on_apple(DriverDeviation::MetalSmallFloatNans)
+    },
+    Measured {
+        fact: DriverDeviation::MetalSmallFloatNans,
+        driver: DriverId::MESA_LLVMPIPE,
+        vendor: None,
+        device: None,
+    },
+    Measured {
+        device: Some(APPLE9),
+        ..moltenvk_on_apple(DriverDeviation::MetalUnaryDenormals)
+    },
 ];
 
 /// NVIDIA's `vendorID`.
@@ -612,8 +765,11 @@ const AMD_VENDOR_ID: u32 = 0x1002;
 /// ([`DeviceDescription::canonical_device_id`]).
 pub(crate) const AMD_RADEON_780M: u32 = 0x15bf;
 
-/// The `deviceID` of the Radeon RX 7900 XTX (Navi 31) its rows were measured under.
+/// The `deviceID` of the Radeon RX 7900 XTX (Navi 31) its rows were measured on, under RADV.
 pub(crate) const AMD_RX_7900_XTX: u32 = 0x744c;
+
+/// The `deviceID` of the Radeon RX 550 (Polaris 12) its rows were measured on, under RADV.
+pub(crate) const AMD_RX_550: u32 = 0x699f;
 
 /// The `deviceID` of the Intel UHD Graphics 770 of Raptor Lake-S (the committed capture
 /// `intel-uhd770-rpls-anv`).
@@ -669,6 +825,12 @@ const fn moltenvk_on_apple<F>(fact: F) -> Measured<F> {
 ///   nonzero offset, in control flow the helper invocations of the pixel's quad had left (a bare
 ///   Vulkan program; the RTX 3090 and ANV answered every variant right). The row names no vendor:
 ///   RADV runs only AMD's GPUs.
+/// - `PerspectiveReadsExtrapolated`: RADV on the Radeon 780M, Mesa 26.2.6 (Arch's), answered
+///   `runtime_lane::pull_model_interpolation`'s perspective reads at a sample or an offset as the
+///   pixel center's value extrapolated along the quad's coarse derivatives: a model of that form,
+///   from the lane's geometry, gave each of the 1113 values off Metal's within 0.005, and the
+///   form with fine derivatives was up to 0.98 off. The row names no vendor: RADV runs only AMD's
+///   GPUs.
 /// - `MeshIndexComponentStoresMisplaced`: lavapipe, Mesa 26.0.8 (Ubuntu's, x86, the Linux gate's),
 ///   drew none of `runtime_lane::mesh_draws`'s triangles, whose indices the mesh function writes
 ///   one at a time. The row names no vendor: the defect is the driver's
@@ -706,6 +868,15 @@ const fn moltenvk_on_apple<F>(fact: F) -> Measured<F> {
 ///   without, and its linear sampler's pipeline in 8.9 to 11.9 s against 14.8 to 14.9 s, drawing in
 ///   0.32 against 0.43 ms. Its rows name those two GPUs, the GPUs measured; another NVIDIA GPU
 ///   takes it once measured.
+/// - `FloatDenormalsKeptUnderHalfControls`: NVIDIA's 615.71.09 on the RTX 5080 Laptop GPU and
+///   620.70.06 on the RTX 3090 kept `f32` denormals in an entry declaring the 16-bit float
+///   controls, where their `MetalFloatDenormals` rows' probes, which declare no float-controls
+///   mode, read them as Metal does: the gate lane
+///   `runtime_lane::driver_deviations::fused_pairs_answer_metals_nans_and_denormals` (2026-11-14,
+///   at 400efe7932), 33 of 4,096 words of each of its two fixtures. RADV, Mesa 26.2.6 on the
+///   Radeon 780M (Phoenix and Hawk Point), answered every word of both as Metal's under the same
+///   modes, so it is not listed. One row per GPU, the GPUs NVIDIA's `MetalFloatDenormals` rows
+///   name.
 pub(crate) const DEFECTS: &[Measured<DriverWorkaround>] = &[
     Measured {
         fact: DriverWorkaround::BothBarycentricFormsRejected,
@@ -716,6 +887,12 @@ pub(crate) const DEFECTS: &[Measured<DriverWorkaround>] = &[
     moltenvk_on_apple(DriverWorkaround::MemoryWritingFragmentsRunPerSample),
     Measured {
         fact: DriverWorkaround::InterpolationNeedsTheWholeQuad,
+        driver: DriverId::MESA_RADV,
+        vendor: None,
+        device: None,
+    },
+    Measured {
+        fact: DriverWorkaround::PerspectiveReadsExtrapolated,
         driver: DriverId::MESA_RADV,
         vendor: None,
         device: None,
@@ -761,6 +938,14 @@ pub(crate) const DEFECTS: &[Measured<DriverWorkaround>] = &[
         DriverWorkaround::DontInlineKeepsCalls,
         NVIDIA_RTX_5080_LAPTOP,
     ),
+    nvidia_on(
+        DriverWorkaround::FloatDenormalsKeptUnderHalfControls,
+        NVIDIA_RTX_3090,
+    ),
+    nvidia_on(
+        DriverWorkaround::FloatDenormalsKeptUnderHalfControls,
+        NVIDIA_RTX_5080_LAPTOP,
+    ),
 ];
 
 /// The defects translation works around on the driver `description` names, on its GPU.
@@ -797,12 +982,6 @@ pub enum DriverFact {
     /// (`replace_region` on the host), so a write on the GPU that may store a denormal there
     /// announces `depth-denormals`.
     DepthImageKeepsDenormals,
-    /// Without `VK_EXT_depth_range_unrestricted` enabled, a `D32_SFLOAT` image keeps each value
-    /// outside `[0, 1]` a copy writes into it, where Vulkan leaves such a value undefined
-    /// (`VUID-vkCmdCopyBufferToImage-pRegions-07931`) and ANV stores it clamped. With the extension
-    /// Vulkan keeps it on every driver. On a driver without either, an upload into a depth image
-    /// announces `restricted-depth-upload`.
-    DepthImageKeepsValuesOutsideUnitRange,
     /// A fragment shader's `FragDepth` is stored in a 32-bit float depth attachment unchanged:
     /// each value in `[0, 1]` it is given, and, for the rest, the value it stored when given it
     /// again. Vulkan states the stored value only inside the depth range. A multisampled depth
@@ -835,22 +1014,30 @@ pub enum DriverFact {
     /// formats has on Apple's GPUs), so its average is Metal's resolve by construction. The
     /// runtime announces no `device-rounded-resolve` for such an attachment on a driver with it.
     ColorResolveAverageIsMetals,
-    /// A render pass's `CLEAR` load operation of a colour attachment its render area covers
-    /// stores the texel Metal's own `Clear` load action stores for the clear colour: MoltenVK
-    /// hands the operation to Metal as the attachment's load action wherever the render area
-    /// covers the attachment, the clear value's floats as Metal's clear colour, and Metal's
-    /// conversion of a clear colour takes its `float` first. Vulkan leaves a clear's tie, its sRGB
-    /// encode and a float's rounding to the device, so elsewhere a clear whose rounding is in
-    /// question is announced (`device-color-conversion`, `render_pass.rs`); on a driver with it
-    /// the runtime announces none for a clear by the load operation of an attachment the pass's
-    /// render area covers, and announces it for the same clear made otherwise (before the pass,
-    /// of an attachment the pass's first instance leaves out). Measured by
+    /// A render pass's `CLEAR` load operation of a colour attachment its render area covers stores
+    /// the texel Metal's own `Clear` load action stores for the clear colour: MoltenVK hands the
+    /// operation to Metal as the attachment's load action wherever the render area covers the
+    /// attachment, the clear value's floats as Metal's clear colour, and Metal's conversion of a
+    /// clear colour takes its `float` first. Vulkan lets a clear store either of the two codes
+    /// closest to a normalized channel's scaled value and leaves its sRGB encode and a float's
+    /// rounding to the device, so elsewhere a clear whose rounding is in question (a normalized
+    /// channel's value off a whole code among them) is announced (`device-color-conversion`,
+    /// `render_pass.rs`). The driver's clear command (`vkCmdClearColorImage`) of a whole level and
+    /// layer with the same clear value stores the same texel. On a driver with it the runtime
+    /// announces none for a clear by the load operation of an attachment the pass's render area
+    /// covers, nor for the same clear made by the clear command (an attachment the pass's first
+    /// instance leaves out, cleared before the pass; a memoryless attachment's backing; the copy a
+    /// draw after a memory barrier at the pass's start reads, `texture/attached_reads.rs`), and
+    /// announces it for the same clear made otherwise (a render pass of the attachment alone, or
+    /// its sample planes). Measured by
     /// `runtime_lane::renders::clears_are_the_device_s_conversion_of_the_clear_value`, which on
-    /// such a driver also holds that the note stays unannounced: MoltenVK 1.4.2 on the M3 Max
-    /// under macOS 27.0.1, each of the 71 colour clears Metal was measured with (ties of 8-bit,
-    /// 10-bit and 16-bit unorm and snorm channels, sRGB channels, the packed 16-bit formats, half
-    /// and small floats, shared exponents and NaNs among them) into a 1x1 attachment, its 11
-    /// depth and 4 stencil clears beside them: all 86 texels Metal's bytes, none a code apart.
+    /// such a driver also holds that the note stays unannounced: MoltenVK 1.4.2 on the M3 Max under
+    /// macOS 27.0.1, each of the 71 colour clears Metal was measured with (ties of 8-bit, 10-bit
+    /// and 16-bit unorm and snorm channels, sRGB channels, the packed 16-bit formats, half and
+    /// small floats, shared exponents and NaNs among them) into a 1x1 attachment, its 11 depth and
+    /// 4 stencil clears beside them: all 86 texels Metal's bytes, none a code apart; and each of
+    /// the 71 by the clear command of the load operation's clear value over the whole 1x1 texture
+    /// (a plain fill of it): all 71 Metal's bytes.
     ColorClearIsMetals,
     /// An optimal colour image may keep its compression state apart from the memory it is bound
     /// to, so a write through a buffer or another image over its bytes can leave its texels as
@@ -865,6 +1052,16 @@ pub enum DriverFact {
     /// covers. Vulkan states no such rule; on such a driver the heap textures that
     /// [`DriverFact::CompressedImagesHideAliasedWrites`] concerns take that usage.
     HostTransferImagesKeepTheirBytes,
+    /// A command's use of an image misses what a command recorded before it in the same
+    /// `VkCommandBuffer` wrote through a buffer over the image's memory, though a global memory
+    /// barrier orders the two: a copy out of the image reads its texels as they were. Vulkan
+    /// defines the result: a buffer and a linear image in `GENERAL` over the same memory are
+    /// host-accessible aliases, and a memory dependency between two uses makes the earlier write
+    /// visible to the later. The same two commands in two `VkCommandBuffer`s, the barrier between
+    /// them, answer as Vulkan says. On such a driver the runtime records such a use in a new
+    /// `VkCommandBuffer` (`alias_split.rs`), counted by
+    /// `WorkCounts::command_buffers_split_at_aliases`.
+    ImageUsesMissBufferWritesInOneCommandBuffer,
     /// A depth or stencil image is laid out as Metal lays out its texture with
     /// `allowGPUOptimizedContents` on, compression metadata included, whatever the image's create
     /// info: no Vulkan request drops the layout, where the image's size is Metal's texture's.
@@ -901,6 +1098,15 @@ pub enum DriverFact {
     /// split, where the interlock's attachments alone split a pass: the device's faster form.
     /// Elsewhere such a split is announced.
     InterlockedPassSplitNoSlower,
+    /// A cost fact (the module docs): a render pass ran no slower with a `CLEAR` load of an
+    /// attachment it does not store (a colour and a depth/stencil, stored `DONT_CARE`) than with
+    /// a `DONT_CARE` load. Metal's draws read zero (a colour) or the clear value (depth, stencil)
+    /// of an attachment the pass loads `DontCare` and does not store, wherever they read it, where
+    /// Vulkan's `DONT_CARE` leaves the contents undefined. On a driver with it the runtime clears
+    /// such an attachment under `UnstoredDontCarePolicy::Driver`, the default, Metal's answer at
+    /// no cost; elsewhere it leaves it `DONT_CARE` and announces `dont-care-unstored-load`
+    /// (`clear_reach.rs`).
+    UnstoredClearNoSlower,
     /// A driver diagnostic (the module docs): the driver reports a warning as it creates a
     /// graphics pipeline that makes the primitive restart dynamic with its topology dynamic or a
     /// strip or fan, whatever restart the draws set later: a `VALIDATION` message named
@@ -932,18 +1138,6 @@ pub enum DriverFact {
     /// pipeline does. On a driver with it the runtime withholds exactly those messages inside that
     /// pipeline's creation, and counts them, as [`DriverFact::DynamicRestartWarns`]'s.
     BlendlessColorAttachmentsWarn,
-    /// A cost fact (the module docs): the driver runs `vkCmdFillBuffer` as a compute dispatch of
-    /// a pipeline it compiles at the first fill each `VkCommandPool`'s command buffers encode,
-    /// inside `vkQueueSubmit`, through the OS's shader compiler, which serves the process's
-    /// compiles in order, so a submission waits behind every pipeline compile ahead of it. MoltenVK
-    /// keeps the pipeline per pool (`MVKCommandEncodingPool::getCmdFillBufferMTLComputePipelineState`
-    /// at 1.4.1). Measured on the Apple M4: behind a storm of pipeline creations, a commit holding
-    /// a pool's first fill waited 250 to 330 ms in that submit (sampled). On
-    /// a driver with it the runtime records each fill as transfers the driver compiles nothing
-    /// for: `vkCmdUpdateBuffer` of the first words, then copies of the filled words onto the rest
-    /// (`word_fill.rs`); elsewhere `vkCmdFillBuffer`. MoltenVK's own code on every GPU, so the row
-    /// names no vendor.
-    FillCompiledPerCommandPool,
     /// A render pass's attachment stored `DONT_CARE` is stored as Metal's own `DontCare` on the
     /// same GPU, `MultisampleResolve` where it resolves in the subpass: MoltenVK hands the
     /// operation to Metal (`MVKAttachmentDescription::getMTLStoreAction` at 1.4.1) wherever it
@@ -983,8 +1177,8 @@ pub enum DriverFact {
     /// weight of 64 (BC7's: 21 and 43 for the thirds, 9 to 55 for BC3's alpha's sevenths, 13 to
     /// 51 for its fifths, 32 for BC1's half) summed as `(64 - w) a + w b` and rounded half up to
     /// 8 bits; BC2's alpha its 4-bit code times 17. NVIDIA's 615.71.09 (the RTX 3090 and the RTX
-    /// 5080 Laptop GPU) answers channels up to 3/255 off (BC3's alpha 6/255), ANV up to 1/255,
-    /// lavapipe 3/255. On a driver without it a texture of such a format announces
+    /// 5080 Laptop GPU) answers channels up to 4/255 off (BC3's alpha 6/255; the 5080's 6-bit
+    /// green 4/255 at 961b1ff319, its other channels 3/255), ANV up to 1/255, lavapipe 3/255. On a driver without it a texture of such a format announces
     /// `compressed-texel-decode` where the runtime makes it, and its reads, samples and gathers
     /// are the device's decode of its own BC image: the runtime keeps no decoded twin of a BC
     /// texture.
@@ -994,7 +1188,7 @@ pub enum DriverFact {
     /// BC3's alpha, the sum `(64 - w) a + w b` unrounded, `sum / 16320` (signed `sum / 8128`,
     /// an endpoint of -128 summed as it is and the value clamped to -1 after), the six-value
     /// constants 0 and 1 (signed -1 and 1), each correctly rounded to `float`. NVIDIA's 615.71.09
-    /// answers up to 7.3/255 off (signed 0.064), ANV 1.3/255 (signed 0.013), lavapipe 2.4/255
+    /// answers up to 7.4/255 off (signed 0.065), ANV 1.3/255 (signed 0.013), lavapipe 2.4/255
     /// (signed 0.022), and RADV (Mesa 26.2.4, the Radeon 780M) clamps an endpoint of -128 to -127
     /// before the sum (signed up to 1.7/255 off) and rounds some unsigned values a `float` ulp
     /// off. On a driver without it a texture of such a format announces
@@ -1170,31 +1364,6 @@ pub enum DriverFact {
     /// with a 1 made a second `VkPipeline` there (Metal's specialization and pipeline compile,
     /// 5.6 to 24.5 ms).
     ConstantOffsetUniformReadsPreloaded,
-    /// A cost fact (the module docs): the driver's queue is Mesa's common one, where each
-    /// `vkQueueSubmit`'s `VkSubmitInfo`s that signal nothing merge into the next one's kernel
-    /// submission, so batches that signal nothing but their queue's timeline may wait and go in
-    /// one call for the cost of one kernel submission (Mesa 26.2.4, `vulkan/runtime/vk_queue.c`,
-    /// `vk_queue_submits_merge`: "Don't merge if there are signals in between"; ANV chains the
-    /// merged command buffers into one batch buffer,
-    /// `anv_queue_submit_cmd_buffers_locked`). Each kernel submission costs CPU time for every
-    /// `VkDeviceMemory` of the device there: ANV on i915 lists each in every execbuffer
-    /// (`i915/anv_batch_chain.c`, `setup_execbuf_for_cmd_buffers`), RADV each in every CS. On a
-    /// driver without it each batch takes its own `vkQueueSubmit`, which is the exact path and
-    /// the one every batch took before grouping: a group changes when a batch's `vkQueueSubmit`
-    /// is made and nothing it submits (`command_buffer/group.rs` in the runtime).
-    ///
-    /// Counted where the merge pays, on Mesa 26.2.4's ANV on the Intel UHD 770: 24 kernel
-    /// submissions a frame grouped against 30 ungrouped, at 67 command buffers a frame committed
-    /// 1 ms apart behind 1.3 ms of GPU work each, the GPU as idle either way (0.62 ms a frame).
-    ///
-    /// Measured without it, so not listed: MoltenVK, whose queue is its own and merges nothing
-    /// -- it commits a Metal command buffer for each `VkSubmitInfo` of a call and one for a call
-    /// of none with a fence (`MVKQueue::submit`), about 65 us of a thread of Metal's on an Apple
-    /// M3 Max whether or not the info holds work -- and NVIDIA's proprietary driver, which has
-    /// no Mesa queue. The Mesa drivers no lane measures (Turnip, V3DV, PanVK, NVK, Honeykrisp,
-    /// PowerVR) take no row: the merge is in the common queue they share, but no identity of
-    /// theirs was measured, so each takes the ungrouped exact path.
-    SubmissionsWithoutSignalsMerge,
     /// A defect fact (the module docs): the driver reports a command buffer's execution failure
     /// only to the instance's debug-utils messengers, naming the `VkQueue` and not the
     /// submission, and by default marks the whole `VkDevice` lost for it, where Metal fails the
@@ -1323,28 +1492,6 @@ pub enum DriverFact {
     /// Metal's by construction. On a driver with it the runtime announces no `snorm-minimum-kept`
     /// or `shared-exponent-kept`.
     TileStoreIsMetals,
-    /// A buffer bound to memory the driver imported from a host pointer
-    /// (`VK_EXT_external_memory_host`) reads and writes, at each submission, the pages mapped at
-    /// that pointer then: pages the process maps over the address after the import (`mmap` with
-    /// `MAP_FIXED`) take the place of those it was made over, for the GPU as for the CPU. Vulkan
-    /// states nothing of a remap under a live import, and Metal's no-copy buffer keeps the pages
-    /// wired when it was made. ANV on i915 imports a pointer as a userptr object, whose pages the
-    /// kernel gets again at the next execbuffer once a remap invalidated them (Linux 7.2.9's
-    /// `i915_gem_object_userptr_submit_init`, or at its first execbuffer, before which nothing was
-    /// pinned); RADV imports it as an amdgpu userptr object, whose pages the kernel gets again in
-    /// each command submission once a remap invalidated them (Linux 7.2.9's
-    /// `amdgpu_cs_parser_bos`, through `amdgpu_ttm_tt_get_user_pages`), and refuses a shared
-    /// `memfd`'s pointer where it imports private anonymous pages'; lavapipe reads the memory
-    /// through the pointer itself (`lvp_AllocateMemory`'s `LVP_DEVICE_MEMORY_TYPE_USER_PTR`). On a
-    /// driver with it a no-copy buffer's own pointer import is released while idle and imported
-    /// again at the same pointer at its next blit, which reads the pages the kept import would
-    /// read (`host_residency.rs` in the runtime): on ANV on i915 every execbuffer lists every
-    /// memory of the device, an import of a pointer costing about 0.16 us of the kernel's time in
-    /// each, and on RADV amdgpu gets every page of each live pointer import again in each
-    /// submission: about 0.5 us an import and 29 ns a 4 KiB page on the RX 7900 XTX under Linux
-    /// 7.0.0, about a quarter of that a page on the Radeon 780M under Linux 7.2.9. Elsewhere such
-    /// an import stays imported, as the driver may keep the pages it was made over.
-    PointerImportsFollowTheirAddress,
     /// Consecutive draws of a subpass whose fragment shaders read and write a storage image in
     /// the ordered pixel interlock, every access coherent, are ordered by the interlock alone, as
     /// Vulkan states: each fragment's interlocked operations happen before those of a later draw's
@@ -1357,6 +1504,22 @@ pub enum DriverFact {
     /// shader's writes to its reads and writes, which RADV on the Radeon 780M needs (a later draw
     /// read texels from before an earlier one's writes without it).
     InterlockOrdersDraws,
+    /// Under the GPU work of other processes, consecutive draws of a subpass whose fragment
+    /// shaders read and write a storage image in the ordered pixel interlock, every access
+    /// coherent, are not ordered for every fragment, though Vulkan orders them by the interlock
+    /// alone (`InterlockOrdersDraws`'s sentences): a later draw read, in whole 8x4 groups of
+    /// fragments, a color's texels as they were before an earlier draw of the instance wrote them,
+    /// with or without a by-region barrier from the fragment shader's writes between the draws.
+    /// The causes are MoltenVK's and Metal's: MoltenVK puts each such storage image in Metal's
+    /// raster order group 0 as a coherent read-write texture, which did not order the draws under
+    /// that load; and MoltenVK 1.4.2 sets its `memoryBarriers` feature false on the Apple GPU
+    /// families ("Apple GPUs don't support them") and so encodes a plain `VkMemoryBarrier` inside
+    /// a render pass as nothing (it restarts its Metal render pass only for an image barrier into
+    /// `GENERAL` or a by-region one whose destination reads input attachments), so the barrier the
+    /// runtime records there orders nothing. On a driver with it the runtime records such a draw into a new render pass
+    /// instance after the one the earlier draw wrote in, in place of the barrier (`render.rs`'s
+    /// `InterlockedStorage`), and the instances' boundary orders the two.
+    InterlockedDrawsRaceUnderLoad,
     /// A single-sample colour image bound to memory lies in it as Metal lays out a heap texture
     /// of the image's usage there: a buffer over the memory meets each texel at the byte Metal's
     /// tiles place it. Vulkan leaves an optimal image's layout to the driver. On a driver without
@@ -1374,6 +1537,50 @@ pub enum DriverFact {
     /// where Metal's layout is not the image's (a texture Metal keeps losslessly compressed,
     /// `heap-texture-lossless-layout`; a layout not measured).
     MultisampleColorImagesLieAsMetalHeapTextures,
+    /// The driver's lines of width 1, as the runtime draws them (Bresenham's mode,
+    /// `VK_LINE_RASTERIZATION_MODE_BRESENHAM_EXT`, where the pipeline's multisample state allows
+    /// it), cover the pixel Metal's do where a line runs through a vertex shared by two pixels'
+    /// diamonds: Metal covers the lower one. Vulkan's diamond is open, so a line that only touches
+    /// such a vertex exits neither diamond and the tie is the driver's, with no Vulkan control
+    /// over it. On a driver without it the runtime announces `device-line-ties` at each draw whose
+    /// lines or edges the device's lines draw at width 1 (`render/line_width.rs`).
+    LineTiesAreMetals,
+    /// The driver's rasterizer snaps a vertex half a step off its 1/256-pixel subpixel grid as
+    /// Metal snaps a line's endpoint there: up. The runtime's band of a line or an edge
+    /// (`pipeline::link::band`) places its corners at the endpoint offset by a multiple of 1/32
+    /// pixel and leaves their snap to the rasterizer, where Metal snaps the endpoint first and
+    /// then offsets it: the two agree on the grid, and at a half step only where the driver
+    /// rounds it up. Vulkan leaves the rounding to the implementation. On a driver without it
+    /// the runtime announces `device-subpixel-snap` at each draw whose lines or edges the band
+    /// draws (`render/line_width.rs`).
+    SubpixelSnapIsMetals,
+    /// A pass at custom sample positions whose load operation clears its depth attachment
+    /// (`VK_ATTACHMENT_LOAD_OP_CLEAR`) stores and tests each sample's depth at the standard
+    /// position of its index, at every draw of the pass, while it covers each sample at its custom
+    /// one: the depth is the triangle's plane where the standard position lies. A pass that loads
+    /// the depth (`VK_ATTACHMENT_LOAD_OP_LOAD`) takes the custom positions, whatever cleared it
+    /// before (a render pass of the attachment alone, by its load operation or by
+    /// `vkCmdClearAttachments`). Vulkan rasterizes a depth attachment made with
+    /// `VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT` at the pass's locations, as
+    /// Metal does. On a driver with it, the depth a pass at custom positions clears is cleared
+    /// before the pass by a render pass of its own, which the pass then loads (`clear_reach.rs` in
+    /// the runtime), memoryless and unstored ones too.
+    ClearedDepthAtStandardPositions,
+    /// A cost fact (the module docs): an allocation of memory of a heap that is not device-local
+    /// made with no export holds every submission of the process while the kernel fills its pages,
+    /// under the reservation of the process's GPU address space, which each submission's ioctl
+    /// takes too; one made exportable, a buffer object of its own reservation, holds none; and the
+    /// pages of an allocation freed reach the kernel's page pool, from which the next allocation
+    /// of their kind takes them in a fraction of a millisecond. Measured with the runtime's reclaim
+    /// bench (`tests::reclaim_submit_bench` in the runtime, the kernel's page pools drained before
+    /// each run): a 64 MiB allocation of the system heap filled from the page allocator took 9.7
+    /// to 10.6 ms at the median, nearly all of it on a CPU in the kernel, and held the submission
+    /// made meanwhile for as long, where one that took the pages of a 64 MiB allocation freed 20 ms
+    /// earlier took 0.12 to 0.31 ms. The runtime makes a pooled block of plain memory by its own
+    /// allocation alone on every driver, this one too, so that its making holds the submissions
+    /// (`docs/FAST-PATHS.md`, known gaps). RADV on the Radeon 780M, Mesa 26.2.6 under Linux
+    /// 7.3.1; held on the GPU measured alone.
+    PlainAllocationsHoldSubmissions,
 }
 
 impl DriverFact {
@@ -1470,24 +1677,24 @@ const DYNAMIC_RESTART_WARNING: DriverDiagnostic = DriverDiagnostic {
 /// its fetch past the range has no one answer; MoltenVK, which enables no
 /// `robustBufferAccess2`; and every driver and release not measured.
 ///
-/// `DepthImageKeepsDenormals` and `DepthImageKeepsValuesOutsideUnitRange`, measured by
+/// `DepthImageKeepsDenormals`, measured by
 /// `runtime_lane::texture_blits::depth_images_keep_what_their_drivers_claim` (at
-/// d0c9878a, 2026-10-06): 11 denormals of both signs and 5 values outside `[0, 1]` through
-/// `replace_region` into a render target's `Depth32Float` depth image, read back by `get_bytes`:
+/// d0c9878a, 2026-10-06): 11 denormals of both signs through `replace_region` into a render
+/// target's `Depth32Float` depth image, read back by `get_bytes`:
 /// - NVIDIA's from 615.71.09 keeps every denormal, with `VK_EXT_depth_range_unrestricted`: the
 ///   GeForce RTX 3090 and the RTX 5080 Laptop GPU, both 615.71.09.
 /// - lavapipe from Mesa 26.0.8 keeps every denormal, with the extension: arm64, Mesa 26.0.8 with
 ///   LLVM 21.1.8, in `scripts/linux-gate` on an M4 mini; x86, Mesa 26.2.4
 ///   with LLVM 23.1.1, on an Iris Xe (RPL-P) host.
-/// - MoltenVK from 1.4.1 (`driverVersion` 10401) keeps both, without the extension: an Apple M4
-///   mini and the M3 Max.
+/// - MoltenVK from 1.4.1 (`driverVersion` 10401) keeps every denormal, without the extension: an
+///   Apple M4 mini and the M3 Max.
 ///
-/// Measured to keep neither, so not listed: RADV (`MESA_RADV`), Mesa 26.2.4 on the Radeon 780M
-/// (no denormal; every value outside `[0, 1]` under the extension), and ANV
-/// (`INTEL_OPEN_SOURCE_MESA`), Mesa 26.2.4 on Intel Graphics (RPL-S) and the Iris Xe (RPL-P)
-/// without the extension (no denormal, every value outside `[0, 1]` clamped). A driver with the
-/// extension is not measured for `DepthImageKeepsValuesOutsideUnitRange`, which only a device
-/// without it reads.
+/// Measured to keep none, so not listed: RADV (`MESA_RADV`), Mesa 26.2.4 on the Radeon 780M, and
+/// ANV (`INTEL_OPEN_SOURCE_MESA`), Mesa 26.2.4 on Intel Graphics (RPL-S) and the Iris Xe (RPL-P).
+/// No fact states a value outside `[0, 1]` kept: Vulkan keeps one only under
+/// `VK_EXT_depth_range_unrestricted`, and without it takes none into a depth image
+/// (`VUID-vkCmdCopyBufferToImage-pRegions-07931`), so a consumer's uploads clamp there, which
+/// that lane checks, whatever a driver is measured to keep.
 ///
 /// `DepthImageKeepsDenormals` again and `DepthTestKeepsDenormals`, measured by
 /// `runtime_lane::depth_denormals` (2026-10-10): the smallest and largest denormal of each sign,
@@ -1615,6 +1822,18 @@ const DYNAMIC_RESTART_WARNING: DriverDiagnostic = DriverDiagnostic {
 /// usage, are no image the format takes. Neither device lists `VK_EXT_image_compression_control`,
 /// the route the ruling ordered first.
 ///
+/// `ImageUsesMissBufferWritesInOneCommandBuffer`, measured by a probe of
+/// `runtime_lane::heap_textures::a_buffer_write_shows_in_an_overlapping_texture`'s sequence (a
+/// `Shared` placement heap's buffer and `RGBA8Unorm` texture over the same bytes, the texture a
+/// linear image there; a copy into the buffer, then the texture's texels copied out): NVIDIA's
+/// 620.70.06 on the RTX 3090 (2026-11-14): at 64x64 texels, the two copies in one
+/// `VkCommandBuffer`, a global memory barrier between them, read all 4,096 texels as they were,
+/// in one blit encoder and in two, three times each; in two `VkCommandBuffer`s of one
+/// submission, the barrier between them, or in two command buffers, every texel changed. At
+/// 1024x1024 texels every texel changed in all four forms. A write through the image, then a use
+/// through the buffer, is not measured. NVIDIA's 615.71.09 on the RTX 5080 Laptop GPU changed
+/// every texel in all four forms, so it is not listed.
+///
 /// `DepthStencilImagesStayGpuOptimized`, measured by
 /// `runtime_lane::heap_textures::heap_textures_answer_and_place_as_metal_s_do` (a 64x64
 /// `Depth32Float` render target's heap size with `allowGPUOptimizedContents` on and off; the
@@ -1712,6 +1931,24 @@ const DYNAMIC_RESTART_WARNING: DriverDiagnostic = DriverDiagnostic {
 /// Not listed: lavapipe, which fetches through input attachments and so never splits for the
 /// interlock, and every GPU and release not measured, which split such a pass and announce it.
 ///
+/// `UnstoredClearNoSlower`, a cost fact: each driver ran the same frame in both forms, a probe
+/// built with the runtime still handing such a `DontCare` load to the driver as `DONT_CARE`
+/// (2026-11-11; debug builds, which change no GPU time, without the validation layer; the GPU's
+/// own span per pass, medians of 15 frames after an untimed one, two rounds, `DONT_CARE` against
+/// `CLEAR`): eight passes a frame over 3648x2038, each a `BGRA8Unorm` colour loaded and stored and
+/// an `RG16Float` colour and a `Depth32Float_Stencil8` depth and stencil loaded by the form and
+/// stored `DONT_CARE`, one draw over the whole target writing all three (depth `Always`, stencil
+/// replaced). One row per GPU, as measured:
+/// - RADV, Mesa 26.2.6, on the Radeon 780M: 1147 and 988 against 861 and 865 us.
+/// - MoltenVK 1.4.2 on the M3 Max under macOS 27.0.1 ([`APPLE9`]'s identity): 224 and 217 against
+///   218 and 218 us, the forms apart by less than one form's two rounds.
+///
+/// Measured not to have it, so not listed: lavapipe (Mesa 26.2.6, llvmpipe on LLVM 23.1.4, x86_64),
+/// 7280 and 7259 against 10480 and 10744 us, its clear a write of every texel; ANV, Mesa 26.2.6, on
+/// the Iris Xe (RPL-P), 1907 and 1151 against 1936 and 1936 us; NVIDIA's 615.71.09 on the RTX 5080
+/// Laptop GPU, 71.2 and 71.4 against 74.4 and 74.6 us. Every GPU and release not measured (the RTX
+/// 3090 among them) leaves such a load `DONT_CARE`.
+///
 /// `DontCareStoreIsMetals`, read in MoltenVK 1.4.1's source
 /// (`MVKAttachmentDescription::getMTLStoreAction`; the restarts of `MVKCommandEncoder`,
 /// `MVKCmdPipelineBarrier` and the draws' compute stages) against Metal's answer on the GPU, and
@@ -1730,7 +1967,8 @@ const DYNAMIC_RESTART_WARNING: DriverDiagnostic = DriverDiagnostic {
 /// of the fourteen BC formats' random blocks byte for byte as plain Metal did; our probe
 /// repeats it on the M3 Max. RADV, Mesa 26.2.4, on the Radeon 780M takes the first, its BC1 to BC3
 /// texels Metal's and its BC4 and BC5 not (an endpoint of -128 clamped before the sum, some values
-/// a `float` ulp off). Each is checked by `runtime_lane::compressed_decode` against the decode
+/// a `float` ulp off); RADV, Mesa 26.2.6, on the RX 7900 XTX takes the first too, its BC1 to BC3
+/// texels, unorm and sRGB, Metal's (0 of the lane's 4096 channels of each off, 2026-11-07). Each is checked by `runtime_lane::compressed_decode` against the decode
 /// fitted to Metal's. NVIDIA's 615.71.09 (the RTX 3090 and the RTX 5080 Laptop GPU), ANV, Mesa
 /// 26.2.4, on the Iris Xe and lavapipe, Mesa 26.0.8 decode both families otherwise. Every other
 /// driver and GPU is unmeasured, and announces.
@@ -1761,6 +1999,20 @@ const DYNAMIC_RESTART_WARNING: DriverDiagnostic = DriverDiagnostic {
 /// passed rendering the texture's own image (at 53ae2b964). There the RTX 3090 passed through the
 /// stand-in.
 ///
+/// `ClearedDepthAtStandardPositions`, measured by `runtime_lane::sample_positions` and probes of
+/// it on RADV, Mesa 26.2.6, on the Radeon RX 550 (POLARIS12), 2026-11-09: plane X drawn at four
+/// custom positions into a 4x `Depth32Float`, `Depth16Unorm` and `Depth32Float_Stencil8` its pass
+/// cleared stored each sample's depth at the standard position of its index (16 of 16 samples), and
+/// so did a second draw of the pass and a pass whose `DontCare` load the runtime clears; its own
+/// test under `Less` against a clear of 0.4375 drew samples 0 and 2 of each first-column pixel,
+/// the standard positions', where Metal draws 0 and 1; a pass at four other positions that loaded
+/// that depth drew and stored at its own positions. Cleared by a pass without a draw and then
+/// loaded and drawn at the custom positions, the depth was Metal's (16 of 16), and so was every
+/// such pass of the lane with the depth cleared before it by `vkCmdClearAttachments` in a render
+/// pass of its own. The pass covered each sample at the custom positions throughout (the lane's
+/// coverage and stencil cases passed). The row names the RX 550 alone: RADV on the Radeon 780M
+/// keeps the custom positions' depths (`PositionedDepthReadAtStandardPositions`'s measure).
+///
 /// `TimestampPoolsAreCounterSampleBuffers` (the probe): MoltenVK 1.4.1 on the M3 Max
 /// and the M4 made 32 timestamp query pools and failed the 33rd, and failed a pool of 8192
 /// timestamps, with `VK_ERROR_OUT_OF_DEVICE_MEMORY`; its source makes each pool one Metal counter
@@ -1788,26 +2040,6 @@ const DYNAMIC_RESTART_WARNING: DriverDiagnostic = DriverDiagnostic {
 /// left a third answer; RADV on the RX 7900 XTX, clean at dd718a7905 at Mesa 26.0.8 but not
 /// measured since; and every GPU not measured, which store with `STORE`.
 ///
-/// `PointerImportsFollowTheirAddress`: ANV, Mesa 26.2.4 on the Iris Xe of RPL-P under Linux 7.2.9's
-/// i915, measured with a probe outside the runtime (2026-10-17): a page of a `memfd` filled with
-/// `0xaa`, mapped shared at an address and imported by its pointer as a buffer's memory, read
-/// `0xaa` through a copy; another `memfd`'s page of `0xbb` mapped over the address with `MAP_FIXED`,
-/// the next copy read `0xbb`; a page of `0xa2` imported and replaced by one of `0xb2` before any
-/// submission, the first copy read `0xb2`. lavapipe (`MESA_LLVMPIPE`) from Mesa 26.0.8 through
-/// 26.2.4 by construction, read in both releases' `lvp_AllocateMemory`, which binds an import's
-/// buffers at the host pointer. RADV, Mesa 26.2.4 on the Radeon 780M under Linux 7.2.9's amdgpu,
-/// measured through the runtime (2026-10-17): a no-copy buffer over two fresh anonymous private
-/// pages, read by a blit; fresh anonymous pages mapped over the address with `MAP_FIXED` and
-/// `Device::host_range_remapped` told, the next blit read the new pages, and the newer ones after a
-/// second remap; remapped between the buffer's making and its first submission, the first blit
-/// read the new pages. RADV, Mesa 26.2.4 on the RX 7900 XTX under the same kernel, measured through
-/// the runtime (2026-10-22, `tests::pointer_residency` before its row): a no-copy buffer over two
-/// fresh anonymous private pages, read by a blit; fresh anonymous pages mapped over the address
-/// with `MAP_FIXED` and `Device::host_range_remapped` told, the next blit of the import kept all
-/// along read the new pages; Mesa 26.0.8 on both under Linux 7.0.0 answered the same.
-/// `tests::pointer_residency` in the runtime checks it on a device with it. Every other driver is
-/// unmeasured, and keeps its pointer imports.
-///
 /// `InterlockOrdersDraws`, measured with no barrier between such draws on any driver (a scratch
 /// build of the commit that adds it), by `runtime_lane::interlocked_draw_order` (passes of 84
 /// draws, fullscreen and held to bands, of two read-modify-writes of an `R32Uint` color that do
@@ -1819,6 +2051,19 @@ const DYNAMIC_RESTART_WARNING: DriverDiagnostic = DriverDiagnostic {
 /// Measured not to have it: RADV, Mesa 26.2.4 on the Radeon 780M, which passes the first but
 /// leaves 19 of the second's 495 bands wrong. Every other driver is unmeasured, and takes the
 /// barrier.
+///
+/// `InterlockedDrawsRaceUnderLoad`, measured by a scratch loop of
+/// `runtime_lane::framebuffer_fetch::coverage_chain`'s 21 passes, six processes of it at once on
+/// the Apple M3 Max under macOS 27.0.1 (MoltenVK 1.4.2), each build in turn: with the barrier
+/// between such draws, 16 of 20,790 passes lost whole 8x4 groups of the target's texels (the
+/// colour draw's fetch read the coverage as it was before the draw before it wrote it), every one
+/// in a pass whose coverage writes and fetches share one render pass instance; without the
+/// barrier, 6 of 7,560, the same rate; split where the barrier went, 0 of 20,790; one process
+/// alone, 0 of 840 with the barrier. MoltenVK's shaders of the lanes' fetches (its
+/// `MVK_CONFIG_SHADER_DUMP_DIR`) declare every interlocked storage image `access::read_write`,
+/// `memory_coherence_device` and `raster_order_group(0)`, and read and write it there alone. The
+/// row names Apple's GPUs through MoltenVK, whose render pass barriers it turns off for every
+/// Apple GPU family; only the M3 Max is measured.
 ///
 /// `ColorImagesLieAsMetalHeapTextures`, measured by
 /// `runtime_lane::heap_textures::device_heap_textures_lie_in_metal_s_tiles` (textures Metal keeps
@@ -1844,10 +2089,27 @@ const DYNAMIC_RESTART_WARNING: DriverDiagnostic = DriverDiagnostic {
 /// per sample or blitted, every sample there). It decides a notice, not an answer, so the M4 is
 /// not measured. Every other driver is unmeasured.
 ///
+/// `LineTiesAreMetals`, measured by `runtime_lane::line_widths` (Metal's maps of the probe's
+/// width-1 lines and strips, pixel for pixel) and the conformance case
+/// `primitive-type-restart-indices` (a line through the shared vertex (3.5, 1.0)): MoltenVK 1.4.2
+/// on the M3 Max under macOS 27.0.1, whose lines are Metal's own. NVIDIA's 615.71.09 on the RTX
+/// 5080 Laptop GPU covers the other pixel (the case's two texels, and the lane's three-vertex
+/// strip at width 1, its diagonal a row higher). lavapipe (llvmpipe on LLVM 23.1.1, Mesa 26.2.4)
+/// draws the case's line as Metal does but leaves out the strip's first pixel, where it starts at
+/// such a vertex (3.5, 1.0), which Metal covers, so it does not take the fact. Every other driver
+/// is unmeasured.
+///
+/// `SubpixelSnapIsMetals`, measured by `runtime_lane::line_widths` (Metal's maps of the probe's
+/// lines at widths 0 and 1/16 offset from rows and columns of centres by `(r - 32) / 512` pixel,
+/// half of them half a step off the grid, which the band draws): MoltenVK 1.4.2 on the M3 Max
+/// under macOS 27.0.1, every map Metal's. NVIDIA's 615.71.09 on the RTX 5080 Laptop GPU and
+/// lavapipe (llvmpipe on LLVM 23.1.1, Mesa 26.2.4) both draw the rows' map a row lower than
+/// Metal's (rows 18 to 49 where Metal draws 17 to 48), as a half step rounded down gives, so
+/// neither takes the fact. Every other driver is unmeasured.
+///
 /// MoltenVK 1.4.2 on the M3 Max under macOS 27.0.1 (2026-10-21, the runtime lanes in release
 /// builds under `--cfg m2v_gpu`, each fact taken):
 /// - Measured by the lane that measured its 1.4.1 row, which passed: `DepthImageKeepsDenormals`
-///   and `DepthImageKeepsValuesOutsideUnitRange`
 ///   (`texture_blits::depth_images_keep_what_their_drivers_claim`, `depth_denormals`),
 ///   `DepthTestKeepsDenormals` and `DepthTestComparesMagnitudes` (`depth_denormals`' stored
 ///   depths, tested and compared as Metal's), `DepthStencilImagesLieApart`
@@ -1878,12 +2140,16 @@ const DYNAMIC_RESTART_WARNING: DriverDiagnostic = DriverDiagnostic {
 ///   `MVKPixelFormats.mm` hands every BC format to Metal as Metal's own, line for line 1.4.1's.
 ///
 /// Not re-measured at 1.4.2, and taken there as at 1.4.1: `InterlockedPassSplitNoSlower`, a cost
-/// fact whose 1.4.1 timing needed a scratch build that keeps such a pass whole; and
-/// `FillCompiledPerCommandPool`, whose wait our probe did not find at 1.4.2: a command buffer of
-/// one `vkCmdFillBuffer`, the first in a fresh command pool, took 0.022 to 0.038 ms (median) in
-/// `vkQueueSubmit` beside one to eight threads making compute pipelines (91 and 496 made), as a
-/// `vkCmdUpdateBuffer` did, though `MVKCommandEncodingPool::getCmdFillBufferMTLComputePipelineState`
-/// is 1.4.1's. Its fills take the transfers either way, the same bytes.
+/// fact whose 1.4.1 timing needed a scratch build that keeps such a pass whole.
+///
+/// `PlainAllocationsHoldSubmissions`, a cost fact, measured by the runtime's reclaim bench
+/// (`tests::reclaim_submit_bench`, its remade arms and its making parts, the kernel's TTM page
+/// pools drained before each run) on RADV on the Radeon 780M (RADV PHOENIX, Mesa 26.2.6, Linux
+/// 7.3.1): a command buffer committed about every millisecond waited for each 64 MiB block's
+/// making that began before it, 10 to 29 ms, 90 to 96% of the making on a CPU in the kernel; a
+/// plain allocation of 64 MiB took 9.7 to 10.6 ms at the median from the page allocator and 0.12
+/// to 0.31 ms from the pages of one freed 20 ms before. Every other driver and GPU is
+/// unmeasured.
 pub(crate) const MEASURED: &[Measured<DriverFact>] = &[
     Measured {
         fact: DriverFact::RobustIndexFetchReadsZero,
@@ -1914,12 +2180,6 @@ pub(crate) const MEASURED: &[Measured<DriverFact>] = &[
     },
     Measured {
         fact: DriverFact::DepthImageKeepsDenormals,
-        driver: DriverId::MOLTENVK,
-        vendor: None,
-        device: None,
-    },
-    Measured {
-        fact: DriverFact::DepthImageKeepsValuesOutsideUnitRange,
         driver: DriverId::MOLTENVK,
         vendor: None,
         device: None,
@@ -1967,6 +2227,10 @@ pub(crate) const MEASURED: &[Measured<DriverFact>] = &[
         vendor: Some(INTEL_VENDOR_ID),
         device: None,
     },
+    nvidia_on(
+        DriverFact::ImageUsesMissBufferWritesInOneCommandBuffer,
+        NVIDIA_RTX_3090,
+    ),
     Measured {
         fact: DriverFact::DepthStencilImagesStayGpuOptimized,
         driver: DriverId::MOLTENVK,
@@ -2036,14 +2300,17 @@ pub(crate) const MEASURED: &[Measured<DriverFact>] = &[
         DriverId::INTEL_OPEN_SOURCE_MESA,
         (INTEL_VENDOR_ID, INTEL_UHD_770_RPL_S),
     ),
+    mesa_on(
+        DriverFact::UnstoredClearNoSlower,
+        DriverId::MESA_RADV,
+        (AMD_VENDOR_ID, AMD_RADEON_780M),
+    ),
     Measured {
-        fact: DriverFact::DynamicRestartWarns,
-        driver: DriverId::MOLTENVK,
-        vendor: None,
-        device: None,
+        device: Some(APPLE9),
+        ..moltenvk_on_apple(DriverFact::UnstoredClearNoSlower)
     },
     Measured {
-        fact: DriverFact::FillCompiledPerCommandPool,
+        fact: DriverFact::DynamicRestartWarns,
         driver: DriverId::MOLTENVK,
         vendor: None,
         device: None,
@@ -2093,6 +2360,11 @@ pub(crate) const MEASURED: &[Measured<DriverFact>] = &[
         DriverFact::ColorBlockDecodeIsMetals,
         DriverId::MESA_RADV,
         (AMD_VENDOR_ID, AMD_RADEON_780M),
+    ),
+    mesa_on(
+        DriverFact::ColorBlockDecodeIsMetals,
+        DriverId::MESA_RADV,
+        (AMD_VENDOR_ID, AMD_RX_7900_XTX),
     ),
     moltenvk_on_apple(DriverFact::ColorBlockDecodeIsMetals),
     moltenvk_on_apple(DriverFact::ChannelBlockDecodeIsMetals),
@@ -2152,32 +2424,6 @@ pub(crate) const MEASURED: &[Measured<DriverFact>] = &[
         device: None,
     },
     nvidia_on(DriverFact::RowCopiesDispatchFaster, NVIDIA_RTX_5080_LAPTOP),
-    Measured {
-        fact: DriverFact::SubmissionsWithoutSignalsMerge,
-        driver: DriverId::MESA_LLVMPIPE,
-        vendor: None,
-        device: None,
-    },
-    mesa_on(
-        DriverFact::SubmissionsWithoutSignalsMerge,
-        DriverId::MESA_RADV,
-        (AMD_VENDOR_ID, AMD_RADEON_780M),
-    ),
-    mesa_on(
-        DriverFact::SubmissionsWithoutSignalsMerge,
-        DriverId::MESA_RADV,
-        (AMD_VENDOR_ID, AMD_RX_7900_XTX),
-    ),
-    mesa_on(
-        DriverFact::SubmissionsWithoutSignalsMerge,
-        DriverId::INTEL_OPEN_SOURCE_MESA,
-        (INTEL_VENDOR_ID, INTEL_IRIS_XE_RPL_P),
-    ),
-    mesa_on(
-        DriverFact::SubmissionsWithoutSignalsMerge,
-        DriverId::INTEL_OPEN_SOURCE_MESA,
-        (INTEL_VENDOR_ID, INTEL_UHD_770_RPL_S),
-    ),
     mesa_on(
         DriverFact::SampledDepthKeepsHiZ,
         DriverId::INTEL_OPEN_SOURCE_MESA,
@@ -2189,27 +2435,7 @@ pub(crate) const MEASURED: &[Measured<DriverFact>] = &[
         (INTEL_VENDOR_ID, INTEL_IRIS_XE_RPL_P),
     ),
     moltenvk_on_apple(DriverFact::TileStoreIsMetals),
-    mesa_on(
-        DriverFact::PointerImportsFollowTheirAddress,
-        DriverId::INTEL_OPEN_SOURCE_MESA,
-        (INTEL_VENDOR_ID, INTEL_IRIS_XE_RPL_P),
-    ),
-    mesa_on(
-        DriverFact::PointerImportsFollowTheirAddress,
-        DriverId::MESA_RADV,
-        (AMD_VENDOR_ID, AMD_RADEON_780M),
-    ),
-    mesa_on(
-        DriverFact::PointerImportsFollowTheirAddress,
-        DriverId::MESA_RADV,
-        (AMD_VENDOR_ID, AMD_RX_7900_XTX),
-    ),
-    Measured {
-        fact: DriverFact::PointerImportsFollowTheirAddress,
-        driver: DriverId::MESA_LLVMPIPE,
-        vendor: None,
-        device: None,
-    },
+    moltenvk_on_apple(DriverFact::InterlockedDrawsRaceUnderLoad),
     mesa_on(
         DriverFact::InterlockOrdersDraws,
         DriverId::INTEL_OPEN_SOURCE_MESA,
@@ -2227,6 +2453,24 @@ pub(crate) const MEASURED: &[Measured<DriverFact>] = &[
         device: Some(APPLE9),
         ..moltenvk_on_apple(DriverFact::MultisampleColorImagesLieAsMetalHeapTextures)
     },
+    Measured {
+        device: Some(APPLE9),
+        ..moltenvk_on_apple(DriverFact::LineTiesAreMetals)
+    },
+    Measured {
+        device: Some(APPLE9),
+        ..moltenvk_on_apple(DriverFact::SubpixelSnapIsMetals)
+    },
+    mesa_on(
+        DriverFact::ClearedDepthAtStandardPositions,
+        DriverId::MESA_RADV,
+        (AMD_VENDOR_ID, AMD_RX_550),
+    ),
+    mesa_on(
+        DriverFact::PlainAllocationsHoldSubmissions,
+        DriverId::MESA_RADV,
+        (AMD_VENDOR_ID, AMD_RADEON_780M),
+    ),
 ];
 
 /// Intel's `vendorID`.

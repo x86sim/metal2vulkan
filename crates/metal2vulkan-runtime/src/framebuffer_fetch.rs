@@ -1,29 +1,46 @@
 //! Framebuffer fetch (its fourth part).
 //!
 //! Metal orders a fragment function's read of its color attachment after every earlier fragment
-//! of the pixel, within a draw and across draws. The compile layer emits one of two exact forms
+//! of the pixel, within a draw and across draws. The compile layer emits one of three forms
 //! (`lower::fragment::fetch`), by what the compile device has:
 //!
 //! - **Input attachments** (`GraphicsState::input_attachments`) with rasterization-order
 //!   attachment access (`GraphicsState::rasterization_order_attachment_access`), where the device
-//!   has `rasterizationOrderColorAttachmentAccess` (both lavapipes of the venues).
+//!   has `rasterizationOrderColorAttachmentAccess` (both lavapipes of the venues): exact.
 //! - **Storage attachments in the ordered pixel interlock** (`GraphicsState::storage_attachments`),
-//!   where it has `fragmentShaderPixelInterlock` alone (RADV, ANV, NVIDIA and MoltenVK).
+//!   where it has `fragmentShaderPixelInterlock` alone (RADV, ANV, NVIDIA and MoltenVK): exact.
+//! - **Input attachments ordered between draws**, where it has neither (Honeykrisp on Apple's
+//!   M2 Pro, Mesa 25.3.6; [`inputs_between_draws`]): exact across draws, the overlapping
+//!   fragments of one draw unordered (`PrecisionNote::UnorderedFetchWithinDraw`, below).
 //!
-//! Where neither form is open to the pipeline (a device with neither feature, or a pipeline state
-//! the storage form cannot keep exact, such as a blending fetched attachment), the compile layer
-//! refuses the pipeline: an unordered read could see a pixel before an earlier fragment's write.
+//! Where the storage form is the device's but not open to the pipeline (a pipeline state it cannot
+//! keep exact, such as a blending fetched attachment), the compile layer refuses the pipeline: an
+//! unordered read could see a pixel before an earlier fragment's write.
 //!
 //! The input attachment form ([`through_inputs`]): a pass cannot foresee which of its draws
 //! fetch, so on such a device every color render target is also an input attachment
 //! (`image_plan.rs`; a caller's image made without that usage is not, `texture/wrapped.rs`, and
 //! a pass that fetches it renders it into a scratch image that has it, `attachment_stand_in.rs`),
-//! every pass's draws' subpass reads each color attachment as the input attachment of its index
-//! with rasterization-order access (`render_target.rs`), and every
+//! every pass's draws' subpass reads each color attachment as the input attachment of its index,
+//! with rasterization-order access where the device has it (`render_target.rs`), and every
 //! graphics pipeline made for such a subpass orders its color attachment accesses so
 //! (`pipeline/graphics.rs`): a fetch then reads what each earlier fragment of the pixel wrote,
 //! whichever pipeline drew it. Every attachment rests in `GENERAL`, the layout an attachment
 //! read as both needs.
+//!
+//! Without rasterization-order access ([`inputs_between_draws`]) Vulkan orders an input attachment
+//! read after an earlier draw's color write of the subpass only by a barrier between them, of the
+//! subpass's dependency on itself by region (the Render Pass chapter's Common Render Pass Data
+//! Races: "A vkCmdPipelineBarrier inside a subpass can synchronize prior attachment writes in the
+//! subpass with subsequent input attachment reads"), which every pass has
+//! (`render_target::DRAWS_SELF_DEPENDENCY`). So a draw that reads input attachments after an
+//! earlier draw of its render pass instance, or its load operations, wrote a color, and a draw
+//! that writes a color after an earlier one read input attachments, records after that barrier
+//! (`render.rs`'s `InterlockedStorage`, `WorkCounts::fetch_draw_barriers`): every draw reads what
+//! the draws before it stored, Metal's answer. Nothing orders the overlapping fragments of one draw there, which the
+//! fetching fragment stage records (`PrecisionNote::UnorderedFetchWithinDraw`, announced as the
+//! stage's other notes are, where the pipeline is made): such a fragment may read the texel from
+//! before an earlier fragment of its draw wrote it.
 //!
 //! The storage form ([`through_storage`]): a draw's fetched attachments are storage images it
 //! reads and writes in the interlock, which its subpass leaves out (`render_target.rs`); a pass
@@ -48,7 +65,12 @@
 //! order such draws by the interlock alone, and a memoryless color's copy through a fetch read
 //! texels as they were before the blends of the draws just before it. Not on a driver measured to
 //! order them (`DriverFact::InterlockOrdersDraws`: ANV on the Iris Xe), where the colors' barrier
-//! goes, about 15,000 GPU cycles a draw there.
+//! goes, about 15,000 GPU cycles a draw there. On a driver whose such draws race under load
+//! (`DriverFact::InterlockedDrawsRaceUnderLoad`: MoltenVK on Apple's GPUs, where a later draw read
+//! whole 8x4 groups of fragments from before the earlier one's writes, barrier or not, while other
+//! processes' work ran on the GPU; MoltenVK encodes no Metal barrier inside a render pass there),
+//! the later draw records into a new render pass instance after the earlier one's instead: the
+//! instances' boundary orders them.
 //!
 //! An 8-bit sRGB attachment (with the compile form) is read and written through a storage view in
 //! the unsigned-integer format of its texel size ([`storage_view_format`]): Metal's tile keeps the
@@ -98,7 +120,7 @@ use super::image_plan::{hiz_candidate, ImagePlan};
 use super::key_hash::KeyMap;
 use super::Device;
 use metal2vulkan::bind::PlanesCopy;
-use metal2vulkan::device::{DeviceProfile, DriverFact, FormatUsage, VkProperty};
+use metal2vulkan::device::{DeviceProfile, DriverFact, FormatUsage, VkFeature, VkProperty};
 use metal2vulkan::error::Capability;
 use metal2vulkan::metal::format::WordAttachment;
 use metal2vulkan::metal::TextureType;
@@ -107,10 +129,50 @@ use metal2vulkan::vk::{Format, ImageCreateFlags, ImageUsageFlags, NumericFormat}
 use std::collections::BTreeMap;
 
 /// Whether the compile layer reads `profile`'s fetched color attachments as input attachments
-/// in rasterization order (`lower::fragment::fetch`): where the device has
-/// `rasterizationOrderColorAttachmentAccess`.
+/// (`lower::fragment::fetch`): in rasterization order where the device has
+/// `rasterizationOrderColorAttachmentAccess` ([`inputs_in_raster_order`]), ordered between draws
+/// where it has neither that nor `fragmentShaderPixelInterlock` ([`inputs_between_draws`]).
 pub(crate) fn through_inputs(profile: &DeviceProfile) -> bool {
+    inputs_in_raster_order(profile) || inputs_between_draws(profile)
+}
+
+/// Whether `profile`'s input attachment form reads in rasterization order: its subpasses and
+/// pipelines take rasterization-order color attachment access.
+pub(crate) fn inputs_in_raster_order(profile: &DeviceProfile) -> bool {
     profile.fragment().rasterization_order_color_access
+}
+
+/// Whether `profile`'s input attachment form is ordered between draws alone, by the barrier a draw
+/// that reads input attachments, or writes a color after one did, records after (`render.rs`): a
+/// device with neither rasterization-order color attachment access nor
+/// `fragmentShaderPixelInterlock`.
+pub(crate) fn inputs_between_draws(profile: &DeviceProfile) -> bool {
+    let fragment = profile.fragment();
+    !fragment.rasterization_order_color_access && !fragment.pixel_interlock
+}
+
+/// Whether a render pass on `profile` of `samples` samples, fetching through input attachments
+/// where `fetch_inputs`, may hold an extended-range color's `half` shadow
+/// (`render/extended_shadow.rs`): every pass that fetches in the pixel interlock, whose storage
+/// form reads and writes it; and one that fetches through input attachments on a device with
+/// `fragmentShaderPixelInterlock` and `fragmentStoresAndAtomics` that stores the shadow's format,
+/// and at more than one sample multisampled storage images, whose functions read and write the
+/// shadow beside the input attachment in the interlock (`lower::fragment`'s `input_shadow`).
+pub(crate) fn holds_extended_shadows(
+    profile: &DeviceProfile,
+    fetch_inputs: bool,
+    samples: u32,
+) -> bool {
+    if !fetch_inputs {
+        return true;
+    }
+    profile.fragment().pixel_interlock
+        && profile
+            .enabled()
+            .features
+            .contains(&VkFeature::FragmentStoresAndAtomics)
+        && profile.supports_format(Format::R16G16B16A16_SFLOAT, FormatUsage::StorageImage)
+        && (samples <= 1 || profile.images().storage_multisample)
 }
 
 /// Whether the compile layer reads `profile`'s fetched color attachments as storage images in the
@@ -490,6 +552,20 @@ impl Device {
         candidate: ImagePlan,
         texture_type: TextureType,
     ) -> Result<ImagePlan, Error> {
+        #[cfg(test)]
+        if (self.shared().storage_costs_forced).load(std::sync::atomic::Ordering::Relaxed)
+            && candidate.usage.contains(ImageUsageFlags::STORAGE)
+            && !plan.usage.contains(ImageUsageFlags::STORAGE)
+        {
+            return Ok(plan);
+        }
+        #[cfg(test)]
+        if (self.shared().sampled_costs_forced).load(std::sync::atomic::Ordering::Relaxed)
+            && candidate.usage.contains(ImageUsageFlags::SAMPLED)
+            && !plan.usage.contains(ImageUsageFlags::SAMPLED)
+        {
+            return Ok(plan);
+        }
         let answers = &self.shared().textures.usage_answers;
         let known = lock(answers).answer(&plan, &candidate);
         let free = match known {

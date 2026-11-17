@@ -112,10 +112,12 @@
 //!   report of the stage passes. Elsewhere the device's own grouping draws, which the test prints,
 //!   or each state is refused, typed, where the vertex stage has no subgroups.
 
-use super::degrade_notices::{counts as notice_counts, on_device};
+use super::degrade_notices::counts as notice_counts;
+use super::degrade_notices::on_device_with;
 use super::{
-    buffer_with, layer_reported_nothing_at_all, public_case, read_buffer, run_case,
-    validated_device, CaseResources, Messages, PublicCase, ScratchCache, METAL_ENVIRONMENT, WAIT,
+    at_plan, buffer_with, layer_reported_nothing_at_all, public_case, read_buffer, run_case,
+    validated_device, validated_device_with, CaseResources, Messages, PublicCase, ScratchCache,
+    METAL_ENVIRONMENT, WAIT,
 };
 use crate::air_library::AirLibrary;
 use crate::case::{AuthoredCase, OutputSelection, Primitive};
@@ -141,13 +143,11 @@ use metal2vulkan_runtime::{
     Error as RuntimeError, LoadAction, Origin, PipelineOptions, RenderPassDescriptor,
     ResourceOptions, Size, StoreAction, TextureDescriptor,
 };
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// The owned fixture at `name` under `validation/fixtures/public/engine`.
 fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/public/engine")
-        .join(name)
+    metal2vulkan_devtools::engine_dir().join(name)
 }
 
 /// Whether `device`'s profile takes `deviation`.
@@ -295,7 +295,7 @@ fn threadgroup_words_only_lockstep_orders_answer_as_metal() {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let name = device.name().to_owned();
         let lockstep = takes(&device, DriverDeviation::SimdgroupLockstep);
         let bitcode = llvm_assemble(&fixture("rtl_lockstep.ll")).unwrap();
@@ -348,12 +348,15 @@ const PRECISE_DEVICE_WORDS: &[usize] = &[
 
 /// The same for `FAST`, in a fast-math entry: the fast `sin`, `cos`, `tan`, `sincos`'s two,
 /// `asin`, `acos` and `atan`, the fast hyperbolic functions' own instructions (`sinh`, `cosh`,
-/// `asinh`, `acosh`, `atanh`), `tanh` (SPIRV-Cross writes `precise::tanh`), `exp2` and `log2`
-/// (Metal's fast ones are its precise ones), `sqrt`, `rsqrt` and `x / y` (the device's division
-/// in a fast-math entry). Not `atan2` (words 8 and 30: SPIRV-Cross writes `precise::atan2`, so the
-/// translation composes Metal's fast one), the fast `exp`, `log`, `exp10`, `log10`, `pow` and
-/// `powr` (15, 17, 18, 20 to 22: compositions of the device's `exp2` and `log2`), `fmod` (25: a
-/// composition of the device's reciprocal), nor `sinpi`, `cospi`, `tanpi` and `y`.
+/// `asinh`, `acosh`, `atanh`), `exp2` and `log2` (Metal's fast ones are its precise ones), `sqrt`,
+/// `rsqrt` and `x / y` (the device's division in a fast-math entry). Not `atan2` (words 8 and 30:
+/// SPIRV-Cross writes `precise::atan2`, so the translation composes Metal's fast one), the fast
+/// `tanh` (word 11: the device's `Tanh`, which SPIRV-Cross writes as `precise::tanh`, where
+/// Metal's fast one is MSL's formula `(t - 1) / (t + 1)`; the stage records
+/// `PrecisionNote::DeviceTranscendentals`, and 599 of the 1024 words differ on the Apple M3 Max
+/// through MoltenVK 1.4.2), the fast `exp`, `log`, `exp10`, `log10`, `pow` and `powr` (15, 17,
+/// 18, 20 to 22: compositions of the device's `exp2` and `log2`), `fmod` (25: a composition of the
+/// device's reciprocal), nor `sinpi`, `cospi`, `tanpi` and `y`.
 ///
 /// Words 12 and 13, `asinh` and `acosh`, are the two whose answer is not a function of the operand
 /// alone. The translation hands Metal the same `air.fast_asinh.f32`/`air.fast_acosh.f32` call on
@@ -368,7 +371,7 @@ const PRECISE_DEVICE_WORDS: &[usize] = &[
 /// index, which reads the same word and tests the same bit but branches on neither, answers every
 /// one of these words exactly.
 const FAST_DEVICE_WORDS: &[usize] = &[
-    0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 16, 19, 23, 24, 29,
+    0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 12, 13, 14, 16, 19, 23, 24, 29,
 ];
 
 /// The words of `words` in each 32-word thread of `output` and `metal` that differ: `(thread,
@@ -411,7 +414,7 @@ fn float_functions_the_device_answers_are_metals() {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let name = device.name().to_owned();
         let metals = takes(&device, DriverDeviation::MetalFloatFunctions);
         for (case_name, words) in [(PRECISE, PRECISE_DEVICE_WORDS), (FAST, FAST_DEVICE_WORDS)] {
@@ -465,7 +468,7 @@ const LANES: u64 = 72;
 
 /// The output of `case`'s Metal row in `environment`.
 fn metal_row(case: &PublicCase, environment: &str) -> Vec<u8> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+    let root = metal2vulkan_devtools::validation_dir().join("corpus");
     let store = CorpusStore::new(&root);
     let row = MetalObservation::current(
         store.read_metal_of_case(&case.case).unwrap(),
@@ -587,7 +590,7 @@ fn cube_gradients_through_an_anisotropic_sampler_answer_as_metal() {
     let cache = ScratchCache::new().unwrap();
     let mut failures = Vec::new();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let name = device.name().to_owned();
         let tangents = takes(&device, DriverDeviation::GraphicsCubeGradientTangents);
         let compute = takes(&device, DriverDeviation::CubeGradientRoute);
@@ -735,15 +738,41 @@ fn half_pair_holds(got: u32, want: u32, canonical: bool) -> bool {
     })
 }
 
+/// [`half_pair_holds`] within what the stage's `notes` record of a [`HALF_FMA_CASES`] thread's two
+/// `half` results, `fma(a, b, c)` in the low half and `a * b + c` in the high: each within one unit
+/// in its last place of Metal's where the stage records `PrecisionNote::NativeFma` (the device's
+/// `Fma` of the operands held in `float`, its result rounded to `half`; `llvm.fmuladd` takes it
+/// too), and the high half any `half` where the stage records `PrecisionNote::FastMathRewrites`
+/// (the device's compiler fuses the contractible pair or not, unbounded where one side alone
+/// fuses it).
+fn half_pair_within(got: u32, want: u32, canonical: bool, notes: &[PrecisionNote]) -> bool {
+    let native_fma = notes.contains(&PrecisionNote::NativeFma);
+    let rewrites = notes.contains(&PrecisionNote::FastMathRewrites);
+    // A `half`'s place among the finite values and the infinities, both zeros one place.
+    let rank = |h: u16| match h & 0x8000 {
+        0 => i32::from(h),
+        _ => -i32::from(h & 0x7FFF),
+    };
+    [0, 16].into_iter().all(|shift| {
+        let (g, w) = ((got >> shift) as u16, (want >> shift) as u16);
+        half_pair_holds(u32::from(g), u32::from(w), canonical)
+            || (native_fma && !half_nan(g) && !half_nan(w) && (rank(g) - rank(w)).abs() <= 1)
+            || (shift == 16 && rewrites)
+    })
+}
+
 /// Where the profile takes the deviation, both cases' kernels take the device's 16-bit `Fma`
 /// (they require `VkProperty::MetalHalfFma`) and every thread's two `half` results are the Metal
-/// row's of the same chip, with and without fast math. Elsewhere neither kernel requires it.
+/// row's of the same chip, with and without fast math, but the high half (`a * b + c`) where the
+/// stage records `PrecisionNote::FastMathRewrites`: the device's compiler fuses the contractible
+/// pair or not (MoltenVK's on the Apple M3 Max does not, where Metal's does, 559 of the 1024
+/// threads). Elsewhere neither kernel requires it.
 #[test]
 fn half_fused_multiply_adds_the_device_answers_are_metals() {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let name = device.name().to_owned();
         let metals = takes(&device, DriverDeviation::MetalHalfFma);
         for case_name in HALF_FMA_CASES {
@@ -754,14 +783,20 @@ fn half_fused_multiply_adds_the_device_answers_are_metals() {
                 "{case_name} on {name}: the kernel takes the device's 16-bit Fma exactly where \
                  the profile takes the deviation"
             );
+            let rewrites = case_notes(&device, &case).contains(&PrecisionNote::FastMathRewrites);
             let run = run_case(&device, &case).unwrap();
             let metal = metal_row(&case, METAL_ENVIRONMENT);
-            let differ = differing_of(&run.output, &metal, 4, &[HALF_WORD]);
+            let mut differ = differing_of(&run.output, &metal, 4, &[HALF_WORD]);
+            let all = differ.len();
+            // The contractible pair's half, the device compiler's choice under the rewrites.
+            differ.retain(|&(_, _, got, want)| !rewrites || got & 0xFFFF != want & 0xFFFF);
             eprintln!(
-                "half fma {case_name} on {name} (the device's Fma: {metals}): {} of {} half \
-                 words differ from Metal",
+                "half fma {case_name} on {name} (the device's Fma: {metals}; fast-math rewrites \
+                 recorded: {rewrites}): {} of {} half words differ from Metal, {} more in the \
+                 contractible pair's half alone",
                 differ.len(),
-                metal.len() / 16
+                metal.len() / 16,
+                all - differ.len()
             );
             if metals {
                 assert!(
@@ -782,19 +817,48 @@ fn half_fused_multiply_adds_the_device_answers_are_metals() {
 
 /// The NaN model's denormal probe (`nan_denormals`, `nan_denormals_fast`): 256 threads of 48
 /// words over operand triples rich in denormals of both signs and the smallest normals; the
-/// second is the first's program under fast math.
-const DENORMAL_PROBES: [&str; 2] = [
-    "nan-model-float-denormals-per-operation",
-    "nan-model-float-denormals-per-operation-under-fast-math",
+/// second is the first's program under fast math. Each with whether it is the fast one, whose
+/// `a < b ? a : b` ([`DENORMAL_PROBE_SELECT`]) Metal's compiler makes a minimum function
+/// (`llvm.minnum`) and whose `0 - a` ([`DENORMAL_PROBE_NEGATE`]) a sign move (`fneg fast`).
+const DENORMAL_PROBES: [(&str, bool); 2] = [
+    ("nan-model-float-denormals-per-operation", false),
+    (
+        "nan-model-float-denormals-per-operation-under-fast-math",
+        true,
+    ),
 ];
 
+/// `a < b ? a : b`, a word of [`DENORMAL_PROBE_WORDS`]. In `nan_denormals` it is a compare and a
+/// select, which read `float` denormals as Metal does where the profile takes
+/// `DriverDeviation::MetalFloatDenormals`. In `nan_denormals_fast` Metal's compiler makes it
+/// `llvm.minnum`, which is Metal's `fmin` (as `fmin(a, b)`, word 42, which neither probe checks):
+/// the device's `NMin`, Metal's answer where the profile takes `DriverDeviation::MetalMinMax`,
+/// else noted `PrecisionNote::NativeMinMax`, which compares an `f32` denormal beside a zero or
+/// another denormal by its value where the device's minimum keeps it. Under fast math the word is
+/// checked only where the profile takes that deviation. On the RTX 5080 Laptop GPU, whose
+/// arithmetic flushes its denormals as Metal's does, its `NMin` keeps them: 15 lanes of the word
+/// differ from Metal there, as 15 of word 42 do in both probes.
+const DENORMAL_PROBE_SELECT: usize = 45;
+
+/// `0 - a`, a word of [`DENORMAL_PROBE_WORDS`]. In `nan_denormals` it is `fsub float 0.0, %a`, a
+/// subtraction, which reads `float` denormals as Metal does where the profile takes
+/// `DriverDeviation::MetalFloatDenormals`. In `nan_denormals_fast` Metal's compiler folds it, with
+/// no signed zeros to keep, into `fneg fast float %a`, the same instruction as `-a` (word 6): a sign
+/// move, which reads denormals as Metal does where the profile takes
+/// `DriverDeviation::MetalUnaryDenormals` ([`DENORMAL_PROBE_UNARY`]). ANV on the Iris Xe (Mesa
+/// 26.2.6), whose subtraction is Metal's and whose sign moves are not, answers the fast probe's
+/// `0 - a` of the denormal `0x00000001` as `0x80000000`, where Metal's sign move answers
+/// `0x80000001`.
+const DENORMAL_PROBE_NEGATE: usize = 7;
+
 /// The words of a [`DENORMAL_PROBES`] thread whose operations read `float` denormals as Metal
-/// does on every profile: `a + b`, `a - b`, `a * b`, `0 - a`, `a < b`, `a == b`, `floor`, `ceil`,
-/// `trunc`, `rint`, `ldexp`, `step`, `(a * b) * c`, `a < b ? a : b`, `-(a * b)` and
-/// `fabs(a - b)`; and `sqrt` and `rsqrt` ([`DENORMAL_PROBE_ROOTS`]) where Metal answers a zero, an
-/// infinity or a NaN. Not `round` (15), C99's on every device (`NativeTranscendentals`), whose
-/// zero below zero is `-0` where Metal answers `+0`; not `floor` and `ceil` (12, 13), whose reading
-/// no device measured matches, the quotients (3, 40, 44), the device's division, the fused
+/// does where the profile takes `DriverDeviation::MetalFloatDenormals`: `a + b`, `a - b`, `a * b`,
+/// `0 - a` (under fast math a sign move: [`DENORMAL_PROBE_NEGATE`]), `a < b`, `a == b`, `trunc`, `rint`, `ldexp`, `step`, `(a * b) * c`, `a < b ? a : b`
+/// (under fast math a minimum: [`DENORMAL_PROBE_SELECT`]), `-(a * b)` and `fabs(a - b)`; and `sqrt` and `rsqrt` ([`DENORMAL_PROBE_ROOTS`]) where Metal
+/// answers a zero, an infinity or a NaN. Not `round` (15), C99's on every device
+/// (`NativeTranscendentals`), whose zero below zero is `-0` where Metal answers `+0`; not `-a`,
+/// `fabs(a)`, `floor` and `ceil` ([`DENORMAL_PROBE_UNARY`]), the other deviation's; not the
+/// quotients (3, 40, 44), the device's division, the fused
 /// multiply-adds (4, 5), `dot` and `length` (36, 37) and `mix` (38), the device's `OpDot` and
 /// `FMix`, whose sums Metal fuses and flushes at the tininess edge before rounding, nor the math
 /// library's functions.
@@ -806,30 +870,61 @@ const DENORMAL_PROBE_WORDS: &[usize] = &[0, 1, 2, 7, 10, 11, 14, 16, 35, 39, 43,
 /// are an ulp below Metal's (the committed rows of 615.71.09, 16 lanes each).
 const DENORMAL_PROBE_ROOTS: &[usize] = &[20, 21];
 
+/// The words of a [`DENORMAL_PROBES`] thread whose operations read `float` denormals as Metal's do
+/// where the profile takes `DriverDeviation::MetalUnaryDenormals`: `-a` (6), `fabs(a)` (8),
+/// `floor(a)` (12) and `ceil(a)` (13), and in the fast probe `0 - a` ([`DENORMAL_PROBE_NEGATE`]).
+/// NVIDIA's 615.71.09 and lavapipe answer `floor` and `ceil` of a denormal as `-1` and `1`, where
+/// Metal reads it as a zero.
+const DENORMAL_PROBE_UNARY: &[usize] = &[6, 8, 12, 13];
+
 /// Both probes answer Metal's `float` denormals where the profile takes the deviation (the kernels
 /// then require `VkProperty::MetalFloatDenormals`): every word of [`DENORMAL_PROBE_WORDS`] and
 /// each word of [`DENORMAL_PROBE_ROOTS`] where Metal answers a zero, an infinity or a NaN is the
-/// Metal row's of the same chip, but a NaN's bits, which are the device's where the profile does
-/// not take `DriverDeviation::MetalCanonicalNans` ([`float_word_holds`]): a root of a negative
-/// operand is then any NaN. Elsewhere the denormals are the device's and nothing is checked. The
+/// Metal row's of the same chip; so is every word of [`DENORMAL_PROBE_UNARY`], and the fast probe's
+/// [`DENORMAL_PROBE_NEGATE`], where the profile takes `DriverDeviation::MetalUnaryDenormals` (the
+/// kernels then require `VkProperty::MetalUnaryDenormals`), but a NaN's bits, which are the
+/// device's where the profile does not take `DriverDeviation::MetalCanonicalNans`
+/// ([`float_word_holds`]): a root of a negative operand is then any NaN. Elsewhere the denormals are the device's and nothing is checked; so is
+/// the fast probe's [`DENORMAL_PROBE_SELECT`], a minimum, where the profile does not take
+/// `DriverDeviation::MetalMinMax`, and the stage then records `PrecisionNote::NativeMinMax`. The
 /// test prints how many words differ.
 #[test]
 fn float_denormals_read_as_metal_reads_them() {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let name = device.name().to_owned();
         let metals = takes(&device, DriverDeviation::MetalFloatDenormals);
+        let unary = takes(&device, DriverDeviation::MetalUnaryDenormals);
         let canonical = takes(&device, DriverDeviation::MetalCanonicalNans);
+        let min_max = takes(&device, DriverDeviation::MetalMinMax);
         let mut failures = Vec::new();
-        for case_name in DENORMAL_PROBES {
+        for (case_name, fast) in DENORMAL_PROBES {
             let case = public_case(case_name).unwrap();
+            let native_select = fast && !min_max;
+            // The word's operation: the fast probe's `0 - a` is a sign move.
+            let moves_sign = |w: usize| {
+                DENORMAL_PROBE_UNARY.contains(&w) || (fast && w == DENORMAL_PROBE_NEGATE)
+            };
+            if native_select {
+                assert!(
+                    case_notes(&device, &case).contains(&PrecisionNote::NativeMinMax),
+                    "{case_name} on {name}: its minimum is the device's, and the stage does not \
+                     record it"
+                );
+            }
             assert_eq!(
                 requires_property(&device, &case, VkProperty::MetalFloatDenormals),
                 metals,
                 "{case_name} on {name}: the kernel leaves its denormals to the device exactly \
                  where the profile takes the deviation"
+            );
+            assert_eq!(
+                requires_property(&device, &case, VkProperty::MetalUnaryDenormals),
+                unary,
+                "{case_name} on {name}: the kernel leaves its sign moves', floors' and ceilings' \
+                 denormals to the device exactly where the profile takes that deviation"
             );
             let run = run_case(&device, &case).unwrap();
             let metal = metal_row(&case, METAL_ENVIRONMENT);
@@ -843,9 +938,12 @@ fn float_denormals_read_as_metal_reads_them() {
             for i in 0..metal.len() / 4 {
                 let w = i % 48;
                 let (got, want) = (word(&run.output, i), word(&metal, i));
-                if metals
-                    && (DENORMAL_PROBE_WORDS.contains(&w)
-                        || (DENORMAL_PROBE_ROOTS.contains(&w) && special(want)))
+                if (metals
+                    && ((DENORMAL_PROBE_WORDS.contains(&w)
+                        && !moves_sign(w)
+                        && !(native_select && w == DENORMAL_PROBE_SELECT))
+                        || (DENORMAL_PROBE_ROOTS.contains(&w) && special(want))))
+                    || (unary && moves_sign(w))
                 {
                     checked += 1;
                     if !float_word_holds(got, want, canonical) {
@@ -858,7 +956,8 @@ fn float_denormals_read_as_metal_reads_them() {
                 }
             }
             eprintln!(
-                "float denormals {case_name} on {name} (the device's, as Metal's: {metals}): {} of \
+                "float denormals {case_name} on {name} (the device's, as Metal's: {metals}; its \
+                 sign moves, floors and ceilings: {unary}): {} of \
                  {checked} checked words differ from Metal, {nans} more NaNs of the device's bits; \
                  other words differing, by word: {by_word:?}",
                 differ.len()
@@ -878,20 +977,25 @@ fn float_denormals_read_as_metal_reads_them() {
 }
 
 /// The probe's cases ([`HALF_FMA_CASES`]): every word, `fma(a, b, c)`, `a * b + c`, the two `half`
-/// results and the lone product `a * w`, is the Metal row's of the same chip where the profile
-/// takes `DriverDeviation::MetalFloatDenormals`: the product answers Metal's flushed denormal
-/// (2.2), and the fused pair Metal's canonical NaN where the profile takes
-/// `DriverDeviation::MetalCanonicalNans`, a NaN of the device's bits elsewhere
-/// (`PrecisionNote::NativeNanEncoding`, [`float_word_holds`]). Elsewhere the denormals are the
-/// device's and the test prints how many words differ.
+/// results and the lone product `a * w`, is the Metal row's of the same chip where the kernel
+/// leaves its `float` denormals to the device as Metal's (it requires
+/// `VkProperty::MetalFloatDenormals`): the product answers Metal's flushed denormal (2.2), and the
+/// fused pair Metal's canonical NaN where the profile takes `DriverDeviation::MetalCanonicalNans`,
+/// a NaN of the device's bits elsewhere (`PrecisionNote::NativeNanEncoding`,
+/// [`float_word_holds`]); the two `half` results within what the stage's notes record
+/// ([`half_pair_within`]: the device's `half` `Fma` on the RTX 5080 Laptop GPU, a unit in the last
+/// place from Metal's in 300 threads). The kernels compute `half` in 16 bits, so their entries
+/// declare the 16-bit float controls where the profile has them: there NVIDIA's driver keeps
+/// `f32` denormals (`DriverWorkaround::FloatDenormalsKeptUnderHalfControls`), and the kernel
+/// requires no such property. Elsewhere the denormals are the device's, the stage records
+/// `PrecisionNote::DeviceDenormals`, and the test prints how many words differ.
 #[test]
 fn fused_pairs_answer_metals_nans_and_denormals() {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let name = device.name().to_owned();
-        let metals = takes(&device, DriverDeviation::MetalFloatDenormals);
         let canonical = takes(&device, DriverDeviation::MetalCanonicalNans);
         let word = |bytes: &[u8], i: usize| {
             u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap())
@@ -899,26 +1003,34 @@ fn fused_pairs_answer_metals_nans_and_denormals() {
         let mut failures = Vec::new();
         for case_name in HALF_FMA_CASES {
             let case = public_case(case_name).unwrap();
+            let notes = case_notes(&device, &case);
+            let metals = requires_property(&device, &case, VkProperty::MetalFloatDenormals);
+            assert!(
+                metals || notes.contains(&PrecisionNote::DeviceDenormals),
+                "{case_name} on {name}: the kernel leaves its denormals to the device unmeasured, \
+                 and the stage does not record it"
+            );
             let run = run_case(&device, &case).unwrap();
             let metal = metal_row(&case, METAL_ENVIRONMENT);
             assert_eq!(run.output.len(), metal.len(), "{case_name} on {name}");
-            let (mut differ, mut nans) = (Vec::new(), 0);
+            let (mut differ, mut within) = (Vec::new(), 0);
             for i in 0..metal.len() / 4 {
                 let (got, want) = (word(&run.output, i), word(&metal, i));
                 // Word 2 holds the two `half` results, the others a `float` each.
                 let holds = match i % 4 == HALF_WORD {
-                    true => half_pair_holds(got, want, canonical),
+                    true => half_pair_within(got, want, canonical, &notes),
                     false => float_word_holds(got, want, canonical),
                 };
                 if !holds {
                     differ.push((i / 4, i % 4, got, want));
                 } else if got != want {
-                    nans += 1;
+                    within += 1;
                 }
             }
             eprintln!(
-                "fused pairs {case_name} on {name} (the device's denormals, as Metal's: {metals}): \
-                 {} of {} words differ from Metal, {nans} more NaNs of the device's bits",
+                "fused pairs {case_name} on {name} (the kernel's denormals, as Metal's: {metals}; \
+                 notes {notes:?}): {} of {} words differ from Metal, {within} more within what the \
+                 notes record",
                 differ.len(),
                 metal.len() / 4
             );
@@ -947,27 +1059,36 @@ const HALF_EDGE_CASES: [&str; 6] = [
     "nan-model-half-operations-and-widening-of-nan-operands-under-fast-math",
 ];
 
-/// Every word of [`HALF_EDGE_CASES`] whose Metal answer holds the largest `half` (`0x7BFF` or
-/// `0xFBFF` in either half, or the `float` 65504 of either sign) is the Metal row's of the same
-/// chip where the kernel rounds as Metal does: the device's conversion to 16 bits and back under
-/// the float controls that make it Metal's where the profile has them (the kernels then declare
-/// them and require no fact). A kernel that rounds by the device's own form (`rounds_natively`:
-/// its conversion, or its quantize) answers the device's words, which the test prints.
+/// Every edge of [`HALF_EDGE_CASES`], a half of a word whose Metal answer is the largest `half`
+/// (`0x7BFF` or `0xFBFF`) or a word that is the `float` 65504 of either sign, is the Metal row's
+/// of the same chip where the kernel rounds as Metal does: the device's conversion to 16 bits and
+/// back under the float controls that make it Metal's where the profile has them (the kernels then
+/// declare them and require no fact). A kernel that rounds by the device's own form
+/// (`rounds_natively`: its conversion, or its quantize) answers the device's words, which the test
+/// prints. A word's other half is another operation's result, held by its own test: `nan_half`'s
+/// word 26 packs `fmod(a, b)` beside `-a`, and the module's `half` `fmod` answers a zero remainder
+/// of a negative dividend `-0`, where Metal's answers `+0` (the translator's
+/// `FloatFn::half_zero_of_float`, recorded as `PrecisionNote::NativeTranscendentals`): ANV on the
+/// Iris Xe answers `0x7bff8000` for `fmod(-65504, b)` and `-(-65504)`, where Metal's word is
+/// `0x7bff0000`.
 #[test]
 fn half_quantize_rounds_as_metal_at_the_edge() {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let name = device.name().to_owned();
         let word = |bytes: &[u8], i: usize| {
             u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap())
         };
-        let largest = |w: u32| {
-            [w & 0xFFFF, w >> 16]
-                .iter()
-                .any(|h| matches!(h, 0x7BFF | 0xFBFF))
-                || matches!(w, 0x477F_E000 | 0xC77F_E000)
+        // The bits of Metal's word `w` that are an edge: the whole of a `float` 65504, else each
+        // half that is the largest `half`.
+        let edge_bits = |w: u32| match w {
+            0x477F_E000 | 0xC77F_E000 => u32::MAX,
+            _ => [(0, 0x0000_FFFF), (16, 0xFFFF_0000)]
+                .into_iter()
+                .filter(|&(shift, _)| matches!((w >> shift) & 0xFFFF, 0x7BFF | 0xFBFF))
+                .fold(0, |bits, (_, half)| bits | half),
         };
         let mut failures = Vec::new();
         for case_name in HALF_EDGE_CASES {
@@ -978,12 +1099,12 @@ fn half_quantize_rounds_as_metal_at_the_edge() {
             let metal = metal_row(&case, METAL_ENVIRONMENT);
             assert_eq!(run.output.len(), metal.len(), "{case_name} on {name}");
             let edge: Vec<usize> = (0..metal.len() / 4)
-                .filter(|&i| largest(word(&metal, i)))
+                .filter(|&i| edge_bits(word(&metal, i)) != 0)
                 .collect();
             let differ: Vec<(usize, u32, u32)> = edge
                 .iter()
                 .map(|&i| (i, word(&run.output, i), word(&metal, i)))
-                .filter(|(_, a, b)| a != b)
+                .filter(|&(_, a, b)| (a ^ b) & edge_bits(b) != 0)
                 .collect();
             eprintln!(
                 "half quantize {case_name} on {name} (the device's own rounding: {native}, \
@@ -1014,8 +1135,8 @@ const DFL_DENORMAL_CASES: [&str; 2] = [
 /// The rows of a [`DFL_DENORMAL_CASES`] thread checked on every lane where the profile takes
 /// `DriverDeviation::MetalFloatDenormals`: `a + b`, `a - b`, `a * b`, `fma`, `a * b + c`, the six
 /// comparisons, `ldexp`, `(a * b) * c`, `float(n) * a - c`, the three comparisons of results,
-/// `fmin(a, b) * c` and `step`. `floor` (6) and `ceil` (7) of a denormal are the device's own on
-/// every profile (`denormal::Covered::Never`). The fused
+/// `fmin(a, b) * c` and `step`. `floor` (6) and `ceil` (7) of a denormal are the other
+/// deviation's ([`DFL_UNARY_ROWS`]). The fused
 /// rows' lanes are clear of the tininess edge before rounding: Metal's rows are the operands
 /// flushed, one rounding, and the result flushed, on every lane (and under fast math `a * b + c` is
 /// two roundings, the product having other uses). `sqrt` (8) and `rsqrt` (9) are checked where
@@ -1026,6 +1147,16 @@ const DFL_DENORMAL_ROWS: &[usize] = &[0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15];
 /// The `sqrt` and `rsqrt` rows of a [`DFL_DENORMAL_CASES`] thread: their other words are the
 /// device's roots' rounding, not their denormals.
 const DFL_ROOT_ROWS: &[usize] = &[8, 9];
+
+/// The `floor` and `ceil` rows of a [`DFL_DENORMAL_CASES`] thread: checked on every lane where the
+/// profile takes `DriverDeviation::MetalUnaryDenormals`.
+const DFL_UNARY_ROWS: &[usize] = &[6, 7];
+
+/// The `fmin(a, b) * c` row of a [`DFL_DENORMAL_CASES`] thread: where the stage records
+/// `PrecisionNote::NativeMinMax` (its `fmin` the device's `NMin`), a lane whose minimum picks
+/// between `+0` and `-0` (or two denormals the device flushes) answers either zero, its product a
+/// zero of either sign, as the note's bound states; Metal answers the second operand.
+const DFL_MIN_ROW: usize = 14;
 
 /// The owned `half` edge fixtures (`dfl_half_edge`, `dfl_half_edge_fast`): 64 threads of 16 words,
 /// every word a `half` pair rounded at the edge of the `half` range or among its denormals.
@@ -1039,33 +1170,53 @@ const DFL_HALF_EDGE_CASES: [&str; 2] = [
 /// them.
 const DFL_TRIG_CASE: &str = "precise-trigonometric-functions-at-nan-operands-under-fast-math";
 
+/// The word of a [`DFL_TRIG_CASE`] thread that holds its operand `x` itself; the eleven before it
+/// are the functions' answers.
+const DFL_TRIG_OPERAND: usize = 11;
+
 /// The owned fixtures answer Metal: in the denormal cases every lane of [`DFL_DENORMAL_ROWS`] and
 /// the special lanes of [`DFL_ROOT_ROWS`] where the profile takes
-/// `DriverDeviation::MetalFloatDenormals` (elsewhere a denormal is the device's own, and the test
-/// prints how many words differ), the kernels requiring `VkProperty::MetalFloatDenormals` exactly
-/// where the profile takes the deviation; in the `half`
+/// `DriverDeviation::MetalFloatDenormals`, and every lane of [`DFL_UNARY_ROWS`] where it takes
+/// `DriverDeviation::MetalUnaryDenormals` (elsewhere a denormal is the device's own, and the test
+/// prints how many words differ), but a minimum's zero of either sign in [`DFL_MIN_ROW`] where the
+/// stage records `PrecisionNote::NativeMinMax`, which the runtime then announces, the kernels
+/// requiring `VkProperty::MetalFloatDenormals` exactly where the profile takes the deviation; in
+/// the `half`
 /// edge cases every word where the kernel rounds as Metal does (under the float controls), the
 /// device's words printed where it rounds by its own form (its conversion, or its quantize);
 /// and in [`DFL_TRIG_CASE`] every word whose Metal answer is a NaN (the functions' other words are
 /// the math library's precision, not their NaNs). A NaN's bits are Metal's only where the profile
-/// takes `DriverDeviation::MetalCanonicalNans` and Metal answers its canonical NaN; elsewhere the
-/// device answers a NaN of its own bits ([`float_word_holds`]), which the trigonometric kernel
-/// records (`PrecisionNote::NativeNanEncoding`) and the runtime announces. The test prints how many
-/// words of the other rows differ, by row.
+/// takes `DriverDeviation::MetalCanonicalNans`, Metal answers its canonical NaN and the
+/// trigonometric kernel records no `PrecisionNote::NativeNanEncoding`; elsewhere the device answers
+/// a NaN of its own bits ([`float_word_holds`]), which the kernel records and the runtime
+/// announces. A function's answer at a NaN operand may be a number where the kernel records
+/// `PrecisionNote::DeviceTranscendentals`, which the runtime announces: Apple states no answer at a
+/// NaN under fast math, and MoltenVK compiles the kernel's precise functions in its fast-math
+/// entry by their fast forms (`precise::sin`, `precise::cos` and `precise::sincos` of a NaN answer
+/// `0` on the Apple M3 Max through MoltenVK 1.4.2). The test prints how many words of the other
+/// rows differ, by row.
 #[test]
 fn owned_float_fixtures_answer_metal() {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let name = device.name().to_owned();
         let word = |bytes: &[u8], i: usize| {
             u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap())
         };
         let special = |w: u32| w & 0x7FFF_FFFF == 0 || w & 0x7F80_0000 == 0x7F80_0000;
         let mut failures = Vec::new();
+        // The notes whose answers a case gave, which the runtime must have announced.
+        let mut announces = Vec::new();
         let denormals = takes(&device, DriverDeviation::MetalFloatDenormals);
+        let unary = takes(&device, DriverDeviation::MetalUnaryDenormals);
         let canonical = takes(&device, DriverDeviation::MetalCanonicalNans);
+        // Whether a row's differences fail the run: its deviation's, where the profile takes it.
+        let gated = |row: usize| match DFL_UNARY_ROWS.contains(&row) {
+            true => unary,
+            false => denormals,
+        };
         for case_name in DFL_DENORMAL_CASES {
             let case = public_case(case_name).unwrap();
             assert_eq!(
@@ -1074,19 +1225,35 @@ fn owned_float_fixtures_answer_metal() {
                 "{case_name} on {name}: the kernel leaves its denormals to the device exactly \
                  where the profile takes the deviation"
             );
+            assert_eq!(
+                requires_property(&device, &case, VkProperty::MetalUnaryDenormals),
+                unary,
+                "{case_name} on {name}: the kernel leaves its floors' and ceilings' denormals to \
+                 the device exactly where the profile takes that deviation"
+            );
+            // The minimum's pick of `+0` and `-0` (of two denormals flushed, too) is either zero
+            // where the stage's `fmin` is the device's `NMin` (`PrecisionNote::NativeMinMax`).
+            let native_min = case_notes(&device, &case).contains(&PrecisionNote::NativeMinMax);
             let run = run_case(&device, &case).unwrap();
             let metal = metal_row(&case, METAL_ENVIRONMENT);
             assert_eq!(run.output.len(), metal.len(), "{case_name} on {name}");
-            let (mut checked, mut differ, mut nans) = (0, Vec::new(), 0);
+            let (mut checked, mut differ, mut nans, mut zeros) = (0, Vec::new(), 0, 0);
             let mut others = std::collections::BTreeMap::<usize, usize>::new();
             for i in 0..metal.len() / 4 {
                 let row = i % 64 / 4;
                 let (got, want) = (word(&run.output, i), word(&metal, i));
                 let check = DFL_DENORMAL_ROWS.contains(&row)
-                    || (DFL_ROOT_ROWS.contains(&row) && special(want));
+                    || (DFL_ROOT_ROWS.contains(&row) && special(want))
+                    || DFL_UNARY_ROWS.contains(&row);
+                let zero = |w: u32| w & 0x7FFF_FFFF == 0;
                 if check {
                     checked += 1;
-                    if !float_word_holds(got, want, canonical) {
+                    if row == DFL_MIN_ROW && zero(got) && zero(want) && got != want {
+                        zeros += 1;
+                        if !native_min {
+                            differ.push((i / 64, i % 64, got, want));
+                        }
+                    } else if !float_word_holds(got, want, canonical) {
                         differ.push((i / 64, i % 64, got, want));
                     } else if got != want {
                         nans += 1;
@@ -1096,17 +1263,23 @@ fn owned_float_fixtures_answer_metal() {
                 }
             }
             eprintln!(
-                "owned float denormals {case_name} on {name} (the device's: {denormals}): {} of \
-                 {checked} checked words differ from Metal, {nans} more NaNs of the device's \
-                 bits; other words differing, by row: {others:?}",
+                "owned float denormals {case_name} on {name} (the device's: {denormals}; the \
+                 device's minimum: {native_min}): {} of {checked} checked words differ from \
+                 Metal, {nans} more NaNs of the device's bits, {zeros} minimums' zeros of the \
+                 other sign; other words differing, by row: {others:?}",
                 differ.len()
             );
-            if denormals && !differ.is_empty() {
+            if zeros > 0 && native_min {
+                announces.push((case_name, PrecisionNote::NativeMinMax));
+            }
+            // A word's row: its place in the thread's 64 words, four lanes a row.
+            let failing: Vec<_> = differ.iter().filter(|d| gated(d.1 / 4)).collect();
+            if !failing.is_empty() {
                 failures.push(format!(
                     "{case_name} on {name}: {} words differ from Metal (thread, word, device, \
                      Metal): {:x?}",
-                    differ.len(),
-                    &differ[..differ.len().min(24)]
+                    failing.len(),
+                    &failing[..failing.len().min(24)]
                 ));
             }
         }
@@ -1133,9 +1306,14 @@ fn owned_float_fixtures_answer_metal() {
             }
         }
         let case = public_case(DFL_TRIG_CASE).unwrap();
+        let notes = case_notes(&device, &case);
         let run = run_case(&device, &case).unwrap();
         let metal = metal_row(&case, METAL_ENVIRONMENT);
         assert_eq!(run.output.len(), metal.len(), "{DFL_TRIG_CASE} on {name}");
+        // The NaN's bits are the device's where the stage records them so, and a function's NaN
+        // operand may answer a number where it records the device's functions.
+        let device_bits = !canonical || notes.contains(&PrecisionNote::NativeNanEncoding);
+        let functions = notes.contains(&PrecisionNote::DeviceTranscendentals);
         let nans: Vec<usize> = (0..metal.len() / 4)
             .filter(|&i| float_nan(word(&metal, i)))
             .collect();
@@ -1143,28 +1321,45 @@ fn owned_float_fixtures_answer_metal() {
             .iter()
             .filter(|&&i| word(&run.output, i) != word(&metal, i))
             .count();
+        let numbers = nans
+            .iter()
+            .filter(|&&i| !float_nan(word(&run.output, i)))
+            .count();
         let differ: Vec<(usize, usize, u32, u32)> = nans
             .iter()
             .map(|&i| (i / 12, i % 12, word(&run.output, i), word(&metal, i)))
-            .filter(|&(_, _, a, b)| !float_word_holds(a, b, canonical))
+            .filter(|&(_, w, a, b)| {
+                let number = !float_nan(a) && functions && w < DFL_TRIG_OPERAND;
+                !number && !float_word_holds(a, b, !device_bits)
+            })
             .collect();
         eprintln!(
-            "owned precise trig {DFL_TRIG_CASE} on {name} (Metal's canonical NaN: {canonical}): \
-             {} of {} NaN words differ from Metal past a NaN's bits, {bits} in their bits",
+            "owned precise trig {DFL_TRIG_CASE} on {name} (Metal's canonical NaN: {canonical}; \
+             notes {notes:?}): {} of {} NaN words differ from Metal past what the notes record, \
+             {bits} in their bits, {numbers} a number",
             differ.len(),
             nans.len()
         );
         assert!(!nans.is_empty(), "{DFL_TRIG_CASE}: no NaN word");
-        if !canonical {
-            let note = PrecisionNote::NativeNanEncoding;
-            assert!(
-                case_notes(&device, &case).contains(&note),
-                "{DFL_TRIG_CASE} on {name}: the device's NaN, unrecorded"
-            );
-            let announced = notice_counts(&messages.take_notices());
+        for (note, needed) in [
+            (PrecisionNote::NativeNanEncoding, !canonical),
+            (PrecisionNote::DeviceTranscendentals, numbers > 0),
+        ] {
+            if needed {
+                assert!(
+                    notes.contains(&note),
+                    "{DFL_TRIG_CASE} on {name}: {note:?}'s answers, unrecorded"
+                );
+            }
+            if notes.contains(&note) {
+                announces.push((DFL_TRIG_CASE, note));
+            }
+        }
+        let announced = notice_counts(&messages.take_notices());
+        for (case_name, note) in announces {
             assert!(
                 announced.contains_key(&Degradation::from_precision_note(note)),
-                "{DFL_TRIG_CASE} on {name}: the device's NaN, unannounced: {announced:?}"
+                "{case_name} on {name}: {note:?} unannounced: {announced:?}"
             );
         }
         if !differ.is_empty() {
@@ -1196,14 +1391,18 @@ const DOT_CASES: [&str; 2] = [
 /// `PrecisionNote::NativeDot` (its `half` lanes', held as `float`, on every device). Both cases
 /// answer Metal where the device's `OpDot` is Metal's own `dot`: every `float` word where the
 /// profile takes `DriverDeviation::MetalFloatFunctions` (MoltenVK). The test prints how many of
-/// the other words differ. The kernels leave their `float` denormals to the device exactly where
-/// the profile takes `DriverDeviation::MetalFloatDenormals`.
+/// the other words differ. A kernel leaves its `float` denormals to the device as Metal's (it
+/// requires `VkProperty::MetalFloatDenormals`) only where the profile takes
+/// `DriverDeviation::MetalFloatDenormals`; there, one that requires no such property records
+/// `PrecisionNote::DeviceDenormals` (an entry that declares the 16-bit float controls on a driver
+/// that keeps `f32` denormals under them, `DriverWorkaround::FloatDenormalsKeptUnderHalfControls`:
+/// the kernels' `half` lanes), as in [`fused_pairs_answer_metals_nans_and_denormals`].
 #[test]
 fn owned_dot_fixtures_answer_metal() {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let name = device.name().to_owned();
         let denormals = takes(&device, DriverDeviation::MetalFloatDenormals);
         let metals = takes(&device, DriverDeviation::MetalFloatFunctions);
@@ -1212,14 +1411,20 @@ fn owned_dot_fixtures_answer_metal() {
         let mut failures = Vec::new();
         for case_name in DOT_CASES {
             let case = public_case(case_name).unwrap();
-            assert_eq!(
-                requires_property(&device, &case, VkProperty::MetalFloatDenormals),
-                denormals,
-                "{case_name} on {name}: the kernel leaves its denormals to the device exactly \
-                 where the profile takes the deviation"
+            let notes = case_notes(&device, &case);
+            let required = requires_property(&device, &case, VkProperty::MetalFloatDenormals);
+            assert!(
+                !required || denormals,
+                "{case_name} on {name}: the kernel takes the device's denormals as Metal's where \
+                 the profile does not take the deviation"
             );
             assert!(
-                case_notes(&device, &case).contains(&PrecisionNote::NativeDot),
+                required || !denormals || notes.contains(&PrecisionNote::DeviceDenormals),
+                "{case_name} on {name}: the kernel leaves its denormals to the device unmeasured, \
+                 and the stage does not record it"
+            );
+            assert!(
+                notes.contains(&PrecisionNote::NativeDot),
                 "{case_name} on {name}: the device's dot, unrecorded"
             );
             let run = run_case(&device, &case).unwrap();
@@ -1228,9 +1433,9 @@ fn owned_dot_fixtures_answer_metal() {
             let all = differing_of(&run.output, &metal, 8, &(0..8).collect::<Vec<_>>());
             let differ: Vec<_> = all.iter().filter(|d| checked.contains(&d.1)).collect();
             eprintln!(
-                "owned dot {case_name} on {name} (the device's denormals: {denormals}, Metal's \
-                 float functions: {metals}): {} of {} words differ from Metal, {} of them in the \
-                 words checked ({checked:?})",
+                "owned dot {case_name} on {name} (the device's denormals: {denormals}, the \
+                 kernel's as Metal's: {required}, Metal's float functions: {metals}): {} of {} \
+                 words differ from Metal, {} of them in the words checked ({checked:?})",
                 all.len(),
                 metal.len() / 4,
                 differ.len()
@@ -1277,7 +1482,7 @@ fn minimums_and_maximums_answer_as_metal() {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let name = device.name().to_owned();
         let metals = takes(&device, DriverDeviation::MetalMinMax);
         let mut failures = Vec::new();
@@ -1328,11 +1533,18 @@ fn minimums_and_maximums_answer_as_metal() {
 
 /// Cases whose every word is `half` arithmetic (with the narrowing of `float` operands and the
 /// `half` fused multiply-add of the NaN model's): the NaN model's `half` arithmetic, without and
-/// under fast math, and the `half` denormal results of `+`, `-` and `*`.
-const HALF_ARITHMETIC_CASES: [&str; 3] = [
-    "nan-model-float-to-half-narrowing-and-half-arithmetic",
-    "nan-model-float-to-half-narrowing-and-half-arithmetic-under-fast-math",
-    "half-denormal-results-of-arithmetic-and-conversions",
+/// under fast math, and the `half` denormal results of `+`, `-` and `*`. Each with whether its
+/// kernel's `half` `+`, `-` and `*` carry fast math's flags (contraction allowed).
+const HALF_ARITHMETIC_CASES: [(&str, bool); 3] = [
+    (
+        "nan-model-float-to-half-narrowing-and-half-arithmetic",
+        false,
+    ),
+    (
+        "nan-model-float-to-half-narrowing-and-half-arithmetic-under-fast-math",
+        true,
+    ),
+    ("half-denormal-results-of-arithmetic-and-conversions", false),
 ];
 
 /// The notes of a module's own `half` forms, whose words are the device's: its rounding by the
@@ -1351,8 +1563,10 @@ fn holds_a_nan(w: u32) -> bool {
 
 /// Every word of [`HALF_ARITHMETIC_CASES`] is the Metal row's of the same chip where the profile
 /// takes `DriverDeviation::MetalHalfArithmetic`: the device's 16-bit `OpFAdd`, `OpFSub` and
-/// `Fma(a, b, -0.0)`, kept apart (the kernels then require `VkProperty::MetalHalfArithmetic`).
-/// Elsewhere the module computes in `float` and rounds to `half` by its form
+/// `Fma(a, b, -0.0)`, kept apart where the AIR forbids contraction, and `OpFAdd`, `OpFSub` and
+/// `OpFMul` left to the device's compiler where fast math allows it (the stage then records
+/// `PrecisionNote::FastMathRewrites`), and every kernel requires `VkProperty::MetalHalfArithmetic` (for its kept arithmetic or its
+/// `half` reads' widening). Elsewhere the module computes in `float` and rounds to `half` by its form
 /// (`lower::arith::narrow::round`), and its words are Metal's where its stage records none of
 /// [`HALF_NATIVE`] (the float controls that make the device's conversion Metal's, or a quantize
 /// measured to be). A stage that records a native rounding (`NativeHalfConversion`,
@@ -1364,20 +1578,27 @@ fn half_arithmetic_answers_as_metal() {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let name = device.name().to_owned();
         let metals = takes(&device, DriverDeviation::MetalHalfArithmetic);
         let mut failures = Vec::new();
         let mut recorded = std::collections::BTreeSet::new();
-        for case_name in HALF_ARITHMETIC_CASES {
+        for (case_name, contracts) in HALF_ARITHMETIC_CASES {
             let case = public_case(case_name).unwrap();
             assert_eq!(
                 requires_property(&device, &case, VkProperty::MetalHalfArithmetic),
                 metals,
-                "{case_name} on {name}: the kernel takes the device's 16-bit arithmetic exactly \
-                 where the profile takes the deviation"
+                "{case_name} on {name}: the kernel requires the measured fact (for its kept \
+                 16-bit arithmetic or its `half` reads' widening) exactly where the profile takes \
+                 the deviation"
             );
-            let native: Vec<PrecisionNote> = case_notes(&device, &case)
+            let notes = case_notes(&device, &case);
+            assert!(
+                !(metals && contracts) || notes.contains(&PrecisionNote::FastMathRewrites),
+                "{case_name} on {name}: the device's 16-bit arithmetic takes the rewrites fast \
+                 math allows, and the stage records them: {notes:?}"
+            );
+            let native: Vec<PrecisionNote> = notes
                 .into_iter()
                 .filter(|note| HALF_NATIVE.contains(note))
                 .collect();
@@ -1985,7 +2206,7 @@ fn fragment_simdgroup_lanes_are_metal_s() {
     let cache = ScratchCache::new().unwrap();
     let mut failures = Vec::new();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let name = device.name().to_owned();
         let metals = takes(&device, DriverDeviation::MetalFragmentSimdgroups);
         let r32 = (PixelFormat::R32Uint, 1);
@@ -2108,7 +2329,7 @@ const VERTEX_SIMDGROUP_FIXTURES: [&str; 3] = [
 /// lane's environment (the M3 Max's; the M4 drew the same words).
 fn fixture_cases(name: &str) -> Vec<(AuthoredCase, Vec<u8>)> {
     let source = format!("{}/engine/{name}", crate::source::PUBLIC_FIXTURE_DIR);
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+    let root = metal2vulkan_devtools::validation_dir().join("corpus");
     let store = CorpusStore::new(&root);
     let mut out = Vec::new();
     for shard in 0..64 {
@@ -2212,7 +2433,7 @@ fn vertex_points(
 /// the test prints, and one without them refuses each state, typed (`SubgroupOperations`).
 #[test]
 fn vertex_simdgroups_are_metal_s() {
-    on_device(|device, messages| {
+    on_device_with(at_plan, |device, messages| {
         let name = device.name().to_owned();
         let compile = device.compile_device();
         let profile = compile.profile();

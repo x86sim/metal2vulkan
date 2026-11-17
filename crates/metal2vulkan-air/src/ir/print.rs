@@ -104,6 +104,7 @@ impl Printer<'_> {
                     self.const_list(ops);
                     self.out.push(')');
                 }
+                Const::InlineAsm(a) => self.out.push_str(&a.spelling()),
                 Const::Int(_)
                 | Const::Float(_)
                 | Const::Null
@@ -433,6 +434,9 @@ impl Printer<'_> {
                     Callee::Air { decl, op } => w!(self, "@f{} [air {op:?}]", decl.raw()),
                     Callee::Llvm { decl, op } => w!(self, "@f{} [llvm {op:?}]", decl.raw()),
                     Callee::UnknownIntrinsic(f) => w!(self, "@f{} [unknown]", f.raw()),
+                    Callee::Unbound { decl, template } => {
+                        w!(self, "@f{} [unbound {template:?}]", decl.raw())
+                    }
                 }
                 self.out.push('(');
                 for (i, &a) in call.args.iter().enumerate() {
@@ -693,7 +697,7 @@ impl Printer<'_> {
             Const::Poison => "poison".into(),
             Const::GlobalAddr(g) => format!("@g{}", g.raw()),
             Const::FuncAddr(f) => format!("@f{}", f.raw()),
-            Const::Aggregate(_) | Const::Expr(_) => return None,
+            Const::Aggregate(_) | Const::Expr(_) | Const::InlineAsm(_) => return None,
         })
     }
 

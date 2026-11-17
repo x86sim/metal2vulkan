@@ -1,14 +1,13 @@
 //! `capabilities`: Metal's device queries over every committed device profile
 //! (`validation/profiles/`, read-only), each checked against its source.
 
-use std::path::PathBuf;
-
 use crate::capabilities::{
-    amplification_count_supported, rate_map_layers_supported, sample_count_supported,
-    DeviceIdentity, RATE_MAP_LAYERS,
+    amplification_count_supported, linear_alignment_rule, rate_map_layers_supported,
+    sample_count_supported, working_set_buffer_bound, DeviceIdentity, RATE_MAP_LAYERS,
 };
 use crate::{
-    BufferTextureProblem, DeviceKind, DeviceProperties, Error, Invalid, Problem, Query, Size,
+    BufferTextureProblem, DeviceKind, DeviceProperties, Error, Invalid, MacClass, Problem, Query,
+    Size,
 };
 use metal2vulkan::bind::{RasterizationRateMap, RateMapDescriptor, RateMapLayerDescriptor};
 use metal2vulkan::device::{
@@ -16,11 +15,13 @@ use metal2vulkan::device::{
 };
 use metal2vulkan::error::{Feature, Unsupported};
 use metal2vulkan::metal::PixelFormat;
+use metal2vulkan::pipeline::heap_sampler_capacity;
 use metal2vulkan::vk::{ApiVersion, Format, SampleCountFlags};
+use std::collections::BTreeMap;
 
 /// Every committed profile's description: (file stem, description), sorted by stem.
 pub(super) fn committed_descriptions() -> Vec<(String, DeviceDescription)> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../metal2vulkan-validation/profiles");
+    let dir = metal2vulkan_devtools::validation_dir().join("profiles");
     let mut out: Vec<(String, DeviceDescription)> = std::fs::read_dir(&dir)
         .expect("validation/profiles is readable")
         .map(|e| e.expect("directory entry").path())
@@ -37,9 +38,9 @@ pub(super) fn committed_descriptions() -> Vec<(String, DeviceDescription)> {
     out
 }
 
-/// The sample counts the profile `stem` states under the `VkPhysicalDeviceLimits` member `key`;
-/// none where it states none (the roadmap profiles), as the description reads its own counts.
-fn profile_counts(stem: &str, key: &str) -> SampleCountFlags {
+/// The value the profile `stem` states under the member `key`, the first in its file; `None`
+/// where it states none.
+pub(super) fn profile_value(stem: &str, key: &str) -> Option<serde_json::Value> {
     fn find<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
         match value {
             serde_json::Value::Object(map) => map
@@ -49,12 +50,19 @@ fn profile_counts(stem: &str, key: &str) -> SampleCountFlags {
             _ => None,
         }
     }
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join(format!("../metal2vulkan-validation/profiles/{stem}.json"));
+    let path = metal2vulkan_devtools::validation_dir()
+        .join("profiles")
+        .join(format!("{stem}.json"));
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{stem}: {e}"));
     let json: serde_json::Value =
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("{stem}: {e}"));
-    let Some(list) = find(&json, key) else {
+    find(&json, key).cloned()
+}
+
+/// The sample counts the profile `stem` states under the `VkPhysicalDeviceLimits` member `key`;
+/// none where it states none (the roadmap profiles), as the description reads its own counts.
+pub(super) fn profile_counts(stem: &str, key: &str) -> SampleCountFlags {
+    let Some(list) = profile_value(stem, key) else {
         return SampleCountFlags::empty();
     };
     list.as_array()
@@ -77,18 +85,39 @@ fn identity(stem: &str) -> DeviceIdentity {
         drm_render: None,
         api_version: ApiVersion::V1_3,
         max_viewports: 16,
+        max_sampler_allocation_count: sampler_allocation_count(stem),
         gpu_core_count: None,
         sampled_sample_counts: profile_counts(stem, "sampledImageColorSampleCounts")
             & profile_counts(stem, "sampledImageDepthSampleCounts"),
+        device_local_heap: None,
     }
+}
+
+/// The profile `stem`'s `maxSamplerAllocationCount`, or Vulkan's least, 4000, where it states none
+/// (the roadmap profile).
+fn sampler_allocation_count(stem: &str) -> u32 {
+    profile_value(stem, "maxSamplerAllocationCount").map_or(4000, |count| {
+        let count = count.as_u64().unwrap_or_else(|| panic!("{stem}: {count}"));
+        u32::try_from(count).unwrap_or_else(|e| panic!("{stem}: {e}"))
+    })
 }
 
 /// The properties of a device created from `desc` as the runtime creates one: the recommended
 /// enables for the untrusted policy, the description restricted to them, and the compile device
-/// built from that.
+/// built from that, presenting its GPU's class of Mac.
 pub(super) fn created(
     stem: &str,
     desc: &DeviceDescription,
+) -> (DeviceDescription, DeviceProperties) {
+    created_as(stem, desc, None)
+}
+
+/// As [`created`], presenting the class of Mac `declared` declares (`None`: the GPU's, of the
+/// profile's own `vendorID`).
+fn created_as(
+    stem: &str,
+    desc: &DeviceDescription,
+    declared: Option<MacClass>,
 ) -> (DeviceDescription, DeviceProperties) {
     let policy = DevicePolicy::UNTRUSTED;
     let enables = desc.recommended_enables(&policy);
@@ -97,7 +126,12 @@ pub(super) fn created(
         .with_enabled(&enables)
         .unwrap_or_else(|e| panic!("{stem}: {e}"));
     let compile = Device::new(enabled.clone(), policy).unwrap_or_else(|e| panic!("{stem}: {e}"));
-    let properties = DeviceProperties::new(identity(stem), enabled.clone(), &compile);
+    let identity = DeviceIdentity {
+        vendor_id: enabled.vendor_id,
+        device_id: enabled.device_id,
+        ..identity(stem)
+    };
+    let properties = DeviceProperties::new(identity, enabled.clone(), &compile, declared);
     (enabled, properties)
 }
 
@@ -124,14 +158,143 @@ fn unified_memory_is_the_device_kinds() {
             kind,
             ..identity(stem)
         };
-        let p = DeviceProperties::new(identity, enabled.clone(), &compile);
+        let p = DeviceProperties::new(identity, enabled.clone(), &compile, None);
         assert_eq!(p.has_unified_memory, unified, "{kind:?}");
+    }
+}
+
+/// `lossless_compression` is the Mac class the device presents: the one the consumer declares,
+/// whatever its GPU, else its GPU's, which is an Apple silicon Mac's on an Apple GPU alone. An
+/// integrated GPU that is not Apple's, of unified memory as an Intel Mac's is, presents a Mac
+/// keeping no texture compressed by default, as the consumer's probe of an Intel UHD 630 reads.
+#[test]
+fn lossless_compression_is_the_presented_mac_class() {
+    let (stem, desc) = &committed_descriptions()[0];
+    let policy = DevicePolicy::UNTRUSTED;
+    let enabled = desc
+        .clone()
+        .with_enabled(&desc.recommended_enables(&policy))
+        .unwrap_or_else(|e| panic!("{stem}: {e}"));
+    let compile = Device::new(enabled.clone(), policy).unwrap_or_else(|e| panic!("{stem}: {e}"));
+    // Apple, Intel, AMD, NVIDIA, and Mesa's for a CPU implementation (lavapipe).
+    let gpus = [
+        (0x106b, DeviceKind::Integrated, MacClass::AppleSilicon),
+        (0x8086, DeviceKind::Integrated, MacClass::IntelOrAmd),
+        (0x1002, DeviceKind::Integrated, MacClass::IntelOrAmd),
+        (0x1002, DeviceKind::Discrete, MacClass::IntelOrAmd),
+        (0x10de, DeviceKind::Discrete, MacClass::IntelOrAmd),
+        (0x10005, DeviceKind::Cpu, MacClass::IntelOrAmd),
+    ];
+    for (vendor_id, kind, own) in gpus {
+        assert_eq!(MacClass::of_vendor(vendor_id), own, "{vendor_id:#x}");
+        for declared in [
+            None,
+            Some(MacClass::AppleSilicon),
+            Some(MacClass::IntelOrAmd),
+        ] {
+            let identity = DeviceIdentity {
+                kind,
+                vendor_id,
+                ..identity(stem)
+            };
+            let p = DeviceProperties::new(identity, enabled.clone(), &compile, declared);
+            let class = declared.unwrap_or(own);
+            assert_eq!(
+                p.lossless_compression,
+                class == MacClass::AppleSilicon,
+                "{vendor_id:#x} {kind:?} declared {declared:?}"
+            );
+            assert_eq!(p.has_unified_memory, kind.has_unified_memory(), "{kind:?}");
+        }
+    }
+}
+
+/// `maxThreadgroupMemoryLength` is the device's `maxComputeSharedMemorySize` up to what Metal
+/// answers on the class of Mac the device presents: 32 KiB on an Apple silicon Mac (an M3 Max),
+/// 64 KiB on a Mac with an Intel or AMD GPU (a Radeon Pro 5300M and a UHD 630). RADV's 65536
+/// bytes answer 65536 where the device presents its own GPU's Mac, an AMD one, and 32768 where it
+/// presents an Apple silicon Mac; the M3 Max's MoltenVK device answers its 32768 either way, as it
+/// did; no device answers past its own limit.
+#[test]
+fn threadgroup_memory_is_the_presented_mac_class_s() {
+    use MacClass::{AppleSilicon, IntelOrAmd};
+    let pinned: [(&str, Option<MacClass>, u64); 8] = [
+        ("amd-780m-radv", None, 65536),
+        ("amd-780m-radv", Some(IntelOrAmd), 65536),
+        ("amd-780m-radv", Some(AppleSilicon), 32768),
+        ("moltenvk-m3", None, 32768),
+        ("moltenvk-m3", Some(IntelOrAmd), 32768),
+        ("nvidia-rtx5080-laptop", None, 49152),
+        ("gate-lavapipe", None, 32768),
+        ("vk12-floor", None, 16384),
+    ];
+    let profiles = committed_descriptions();
+    for (stem, declared, memory) in pinned {
+        let (_, desc) = profiles.iter().find(|(s, _)| s == stem).unwrap();
+        let (_, p) = created_as(stem, desc, declared);
+        assert_eq!(
+            p.max_threadgroup_memory_length, memory,
+            "{stem} {declared:?}"
+        );
+    }
+    for (stem, desc) in &profiles {
+        for declared in [None, Some(AppleSilicon), Some(IntelOrAmd)] {
+            let (enabled, p) = created_as(stem, desc, declared);
+            let limit = u64::from(enabled.limits.max_compute_shared_memory_size);
+            let mac = match declared.unwrap_or(MacClass::of_vendor(enabled.vendor_id)) {
+                AppleSilicon => 32 * 1024,
+                IntelOrAmd => 64 * 1024,
+            };
+            assert_eq!(
+                p.max_threadgroup_memory_length,
+                limit.min(mac),
+                "{stem} {declared:?}"
+            );
+        }
+    }
+}
+
+/// Metal's rule for `maxBufferLength`, three quarters of the working set to 16 KiB, gives what
+/// Metal answered: an AMD Radeon Pro 5300M (4 GiB, macOS 26.7.1) of `recommendedMaxWorkingSetSize`
+/// 4,278,190,080 and an Apple M3 Max (64 GiB, macOS 27.0.1) of 55,662,788,608. A device's answer
+/// is the compile layer's bound by its largest device-local heap's (a 16 GiB heap's 12 GiB, a heap
+/// of the limit's size three quarters of it), and the compile layer's where the bound lies above
+/// it or no heap was read.
+#[test]
+fn max_buffer_length_is_three_quarters_of_the_device_local_heap_at_most() {
+    assert_eq!(working_set_buffer_bound(4_278_190_080), 3_208_642_560);
+    assert_eq!(working_set_buffer_bound(55_662_788_608), 41_747_087_360);
+    let (stem, desc) = &committed_descriptions()[0];
+    let policy = DevicePolicy::UNTRUSTED;
+    let enabled = desc
+        .clone()
+        .with_enabled(&desc.recommended_enables(&policy))
+        .unwrap_or_else(|e| panic!("{stem}: {e}"));
+    let compile = Device::new(enabled.clone(), policy).unwrap_or_else(|e| panic!("{stem}: {e}"));
+    let limit = compile.metal_properties().max_buffer_length;
+    for heap in [
+        None,
+        Some(16 << 30),
+        Some(64 << 30),
+        Some(limit),
+        Some(u64::MAX),
+    ] {
+        let identity = DeviceIdentity {
+            device_local_heap: heap,
+            ..identity(stem)
+        };
+        let p = DeviceProperties::new(identity, enabled.clone(), &compile, None);
+        let want = heap.map_or(limit, |heap| {
+            limit.min(heap / 4 * 3 / (16 << 10) * (16 << 10))
+        });
+        assert_eq!(p.max_buffer_length, want, "{stem}: heap {heap:?}");
+        assert!(p.max_buffer_length <= limit, "{stem}: heap {heap:?}");
     }
 }
 
 /// Every answer equals its source on every committed profile: the Vulkan limit, feature or
 /// format the device was created with, or the compile layer's answer for it, an Apple GPU's at
-/// most.
+/// most; the threadgroup memory a Mac of its GPU's class answers at most.
 #[test]
 fn every_committed_profile_answers_from_its_sources() {
     let profiles = committed_descriptions();
@@ -147,9 +310,13 @@ fn every_committed_profile_answers_from_its_sources() {
             Size::new(axis(0), axis(1), axis(2)),
             "{stem}"
         );
+        let mac = match enabled.vendor_id {
+            0x106b => 32 * 1024,
+            _ => 64 * 1024,
+        };
         assert_eq!(
             p.max_threadgroup_memory_length,
-            u64::from(l.max_compute_shared_memory_size.min(32 * 1024)),
+            u64::from(l.max_compute_shared_memory_size.min(mac)),
             "{stem}"
         );
         let addressed = has(VkFeature::BufferDeviceAddress) && has(VkFeature::ShaderInt64);
@@ -203,6 +370,19 @@ fn every_committed_profile_answers_from_its_sources() {
             Ok(programmable),
             "{stem}"
         );
+        // The interpolation functions: `sampleRateShading`, and on a portability-subset device
+        // its member for them.
+        let portability = enabled
+            .extensions
+            .contains(&VkExtension::KhrPortabilitySubset);
+        let functions = has(VkFeature::SampleRateShading)
+            && (!portability || has(VkFeature::ShaderSampleRateInterpolationFunctions));
+        assert_eq!(
+            p.supports_pull_model_interpolation(),
+            Ok(functions),
+            "{stem}"
+        );
+        assert_eq!(answers.pull_model_interpolation, functions, "{stem}");
         assert_eq!(p.description, enabled, "{stem}");
         assert_eq!(p.max_viewports, 16, "{stem}");
         assert_eq!(p.name, "test device", "{stem}");
@@ -226,7 +406,7 @@ fn raster_order_groups_agree_with_the_compile_layer() {
             .unsupported_features
             .iter()
             .any(|u: &Unsupported| u.feature == Feature::RasterOrderGroups);
-        let p = DeviceProperties::new(identity(stem), enabled, &compile);
+        let p = DeviceProperties::new(identity(stem), enabled, &compile, None);
         if p.device_answers().raster_order_groups {
             assert!(!refused, "{stem}");
         }
@@ -237,9 +417,10 @@ fn raster_order_groups_agree_with_the_compile_layer() {
 #[test]
 fn the_venue_devices_answer_as_pinned() {
     // (stem, threads per threadgroup, threadgroup memory, raster order groups, sample counts,
-    // amplification count: Metal's 8 wherever multiview is). The threadgroup memory and sample
-    // counts are an Apple GPU's at most: RADV's 65536 bytes and ANV's and NVIDIA's 49152 answer
-    // 32768, and their 8 and 16 samples (lavapipe's 8) no.
+    // amplification count: Metal's 8 wherever multiview is). The threadgroup memory is what a Mac
+    // of the GPU's class answers at most: a Mac with an Intel or AMD GPU's 65536 bytes off Apple's
+    // GPUs, so RADV's 65536 and ANV's and NVIDIA's 49152 answer themselves. The sample counts are
+    // an Apple GPU's at most: their 8 and 16 samples (lavapipe's 8) answer no.
     let pinned: [(&str, [u64; 3], u64, bool, &[u64], u64); 7] = [
         (
             "moltenvk-m3",
@@ -261,7 +442,7 @@ fn the_venue_devices_answer_as_pinned() {
         (
             "amd-780m-radv",
             [1024, 1024, 1024],
-            32768,
+            65536,
             true,
             &[1, 2, 4],
             8,
@@ -269,7 +450,7 @@ fn the_venue_devices_answer_as_pinned() {
         (
             "intel-irisxe-rplp-anv",
             [1024, 1024, 1024],
-            32768,
+            49152,
             true,
             &[1, 2, 4],
             8,
@@ -277,7 +458,7 @@ fn the_venue_devices_answer_as_pinned() {
         (
             "intel-uhd770-rpls-anv",
             [1024, 1024, 1024],
-            32768,
+            49152,
             true,
             &[1, 2, 4],
             8,
@@ -285,7 +466,7 @@ fn the_venue_devices_answer_as_pinned() {
         (
             "nvidia-rtx5080-laptop",
             [1024, 1024, 64],
-            32768,
+            49152,
             true,
             &[1, 2, 4],
             8,
@@ -313,12 +494,54 @@ fn the_venue_devices_answer_as_pinned() {
             answers.max_vertex_amplification_count, amplification,
             "{stem}"
         );
-        // Every venue takes custom sample positions at every count it renders.
+        // Every venue takes custom sample positions at every count it renders, and reads an
+        // interpolant every way (as the M3 Max, a Radeon Pro 5300M and a UHD 630 answer).
         assert_eq!(
             p.are_programmable_sample_positions_supported(),
             Ok(true),
             "{stem}"
         );
+        assert_eq!(p.supports_pull_model_interpolation(), Ok(true), "{stem}");
+    }
+}
+
+/// `maxArgumentBufferSamplerCount` is one fewer than the smaller of a set-1 sampler array's
+/// elements (`heap_sampler_capacity` of the device's profile) and the device's
+/// `maxSamplerAllocationCount`, on every committed profile. Pinned: the handle table's 65536
+/// entries bound it on MoltenVK (whose driver takes 500000 samplers, as Metal's answer on the M3
+/// Max is 500000), RADV and ANV (65536 samplers); lavapipe's 32768 samplers and NVIDIA's 4000 bound
+/// it there; the desktop baseline's 16 update-after-bind samplers a stage bound it there; and on
+/// the floor, which has no descriptor indexing, no function reads a set-1 array.
+#[test]
+fn argument_buffer_samplers_are_one_fewer_than_the_array_and_the_sampler_limit() {
+    let pinned = [
+        ("moltenvk-m3", 65535),
+        ("amd-780m-radv", 65535),
+        ("intel-irisxe-rplp-anv", 65535),
+        ("intel-uhd770-rpls-anv", 65535),
+        ("lavapipe", 32767),
+        ("gate-lavapipe", 32767),
+        ("gate-lavapipe-x86_64", 32767),
+        ("nvidia-rtx5080-laptop", 3999),
+        ("lunarg-desktop-baseline-2023", 15),
+        ("vk12-floor", 0),
+    ];
+    let profiles = committed_descriptions();
+    let mut answers = BTreeMap::new();
+    for (stem, desc) in &profiles {
+        let (enabled, p) = created(stem, desc);
+        let compile = Device::new(enabled, DevicePolicy::UNTRUSTED).unwrap();
+        let elements = heap_sampler_capacity(compile.profile());
+        let limit = sampler_allocation_count(stem);
+        assert_eq!(
+            p.max_argument_buffer_sampler_count,
+            u64::from(elements.min(limit).saturating_sub(1)),
+            "{stem}: {elements} elements, {limit} samplers"
+        );
+        answers.insert(stem.as_str(), p.max_argument_buffer_sampler_count);
+    }
+    for (stem, answer) in pinned {
+        assert_eq!(answers.get(stem), Some(&answer), "{stem}: {answers:?}");
     }
 }
 
@@ -412,12 +635,16 @@ fn every_query_answers_the_device() {
             );
         }
         Query::MinimumLinearTextureAlignment => {
-            let answer =
-                p.minimum_linear_texture_alignment_for_pixel_format(PixelFormat::BGRA8Unorm);
+            // The device's answer is a probe of its images (`texture/linear_alignment.rs`), at
+            // least Metal's rule's.
+            let answer = linear_alignment_rule(PixelFormat::BGRA8Unorm);
             assert_eq!(answer, Ok(16));
         }
         Query::SamplerReductionMode => {
             assert_eq!(p.supports_sampler_reduction_mode(), Ok(false));
+        }
+        Query::PullModelInterpolation => {
+            assert_eq!(p.supports_pull_model_interpolation(), Ok(true));
         }
     };
     for q in Query::ALL {
@@ -431,21 +658,16 @@ fn every_query_answers_the_device() {
 }
 
 /// `minimumLinearTextureAlignmentForPixelFormat:` asserts on a format no buffer can back, which
-/// the runtime refuses as `Invalid`.
+/// the runtime refuses as `Invalid`, before it asks the device anything.
 #[test]
 fn the_linear_alignment_of_a_compressed_or_depth_format_is_refused() {
-    let (_, desc) = committed_descriptions()
-        .into_iter()
-        .find(|(s, _)| s == "moltenvk-m3")
-        .unwrap();
-    let (_, p) = created("moltenvk-m3", &desc);
     for pf in [
         PixelFormat::BC1RGBA,
         PixelFormat::Depth32Float,
         PixelFormat::GBGR422,
     ] {
         assert_eq!(
-            p.minimum_linear_texture_alignment_for_pixel_format(pf),
+            linear_alignment_rule(pf),
             Err(Error::Invalid(Invalid::new(
                 "minimum_linear_texture_alignment_for_pixel_format",
                 Problem::BufferTexture(BufferTextureProblem::NotLinear { pixel_format: pf }),
@@ -453,4 +675,26 @@ fn the_linear_alignment_of_a_compressed_or_depth_format_is_refused() {
             "{pf:?}"
         );
     }
+}
+
+/// `supportsPullModelInterpolation` answers no on a device without `sampleRateShading`, the Vulkan
+/// 1.2 floor's, where the compile layer refuses every interpolation function but
+/// `interpolate_at_center`; and on MoltenVK only with its portability member for them.
+#[test]
+fn pull_model_interpolation_needs_the_interpolation_functions() {
+    let profiles = committed_descriptions();
+    let (_, floor) = profiles.iter().find(|(s, _)| s == "vk12-floor").unwrap();
+    let (enabled, p) = created("vk12-floor", floor);
+    assert!(!enabled.has(VkFeature::SampleRateShading));
+    assert_eq!(p.supports_pull_model_interpolation(), Ok(false));
+    let (_, moltenvk) = profiles.iter().find(|(s, _)| s == "moltenvk-m3").unwrap();
+    let member = VkFeature::ShaderSampleRateInterpolationFunctions;
+    let (enabled, p) = created("moltenvk-m3", moltenvk);
+    assert!(enabled.has(member));
+    assert_eq!(p.supports_pull_model_interpolation(), Ok(true));
+    let mut withheld = moltenvk.clone();
+    withheld.features.remove(&member);
+    let (enabled, p) = created("moltenvk-m3", &withheld);
+    assert!(!enabled.has(member));
+    assert_eq!(p.supports_pull_model_interpolation(), Ok(false));
 }

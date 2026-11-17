@@ -14,17 +14,22 @@
 //! `Callee::UnknownIntrinsic` and the post-canonical check refuses them only if they survive
 //! function-constant specialization. The same holds for a known name whose immediate names an
 //! enumerator the model does not define. A known name whose declaration disagrees with its
-//! signature is [`IntrinsicError::SignatureMismatch`], and a non-constant immediate is
-//! [`IntrinsicError::ImmediateNotConstant`] (both malformed input). The `llvm.*` markers
+//! signature is [`IntrinsicError::SignatureMismatch`] (malformed input). A call whose immediate is
+//! not an integer constant in the function that makes it keeps its [`Template`]
+//! (`Callee::Unbound`): an internal function's parameter passed on to the intrinsic, as Metal's
+//! compiler leaves OpenCL C's `barrier(flags)`, is each call site's constant once inlining gives
+//! the parameter its argument, and the inliner binds the call there. An immediate still not a
+//! constant after inlining is [`IntrinsicError::ImmediateNotConstant`]. The `llvm.*` markers
 //! [`Dropped`] lists are dropped at decode.
 //!
 //! A [`Signature`]'s `Operand::Handle` parameters and [`Signature::ret_handle`] give the typed handle positions that
 //! seed memory's provenance lattice. Families decoded here: math, conversions and packing, memory
 //! atomics and coherent accesses, derivatives, textures and samplers, barriers and fences,
 //! simdgroup and quad operations, simdgroup matrices, function constants, fragment operations,
-//! imageblocks, async copies, function tables, acceleration-structure queries, ray intersection
-//! (`air.intersect`), tensor descriptors, indirect commands, and the closed `llvm.*` set with the
-//! AGX family. Every other `air.*` name (names whose declarations have not been observed) stays
+//! pull-model interpolation, imageblocks, async copies, function tables, acceleration-structure
+//! queries, ray intersection (`air.intersect`), tensor descriptors, indirect commands, OpenCL C's
+//! vector data loads and stores, MSL 4.1's generic-pointer space queries, and the
+//! closed `llvm.*` set with the AGX family. Every other `air.*` name (names whose declarations have not been observed) stays
 //! unknown. [`UNDECODED`] lists the known families among them, and the intrinsic census of the
 //! `bitcode-reader` audit reports every unknown name with row counts. [`UNDECODED_FEATURES`] names
 //! the undecoded families that belong to a typed feature not implemented yet (intersection function
@@ -32,6 +37,7 @@
 
 mod atomic;
 mod convert;
+mod generic;
 mod intersect;
 mod layout;
 mod llvm;
@@ -45,6 +51,7 @@ mod stage;
 mod sync;
 mod texture;
 mod ty;
+mod vector_data;
 
 #[cfg(test)]
 mod families_tests;
@@ -54,7 +61,8 @@ mod intersect_tests;
 mod tests;
 
 pub use atomic::{AccessKind, Atomic, AtomicOp, AtomicSpace, Coherent, MemoryOrder, ThreadScope};
-pub use convert::{Convert, Fp8, NumKind, Pack, PackDir, PackFormat};
+pub use convert::{Convert, Fp8, NumKind, Pack, PackDir, PackFormat, Rounding};
+pub use generic::PointerSpace;
 pub use intersect::{Instancing, Intersect, IntersectTags, ResultField, Role as IntersectRole};
 pub use layout::Layout;
 pub(crate) use llvm::{drop_legacy_align, legacy_mem_params, LEGACY_MEM_ALIGN_OPERAND};
@@ -73,13 +81,15 @@ pub use sig::{HandleKind, ImageDim, ImageShape, Immediates, Operand, Signature};
 pub use simd::{Group, GroupOp, GroupScope, IsUniform, SimdgroupSize};
 pub use stage::Imageblock;
 pub use stage::{AbsentAccess, BoolReduce, Derivative, DerivativeOp, Fragment, FunctionConstant};
-pub use stage::{GlobalBuiltin, GlobalVar};
+pub use stage::{GlobalBuiltin, GlobalVar, WorkItem};
+pub use stage::{Interpolate, InterpolateAt};
 pub use sync::{BarrierName, MemFlags, Sync};
 #[cfg(test)]
 pub use texture::{Access, Form};
 pub use texture::{Component, LodMode, Query, SamplerOp, TexOp, TexRole, Texture};
 pub use ty::NumTy;
 pub use ty::{Elem, Sign};
+pub use vector_data::{HalfRounding, VectorData, VectorDataOp};
 
 use crate::error::Feature;
 use crate::error::IntrinsicError;
@@ -117,12 +127,18 @@ pub enum AirIntrinsic {
     SimdgroupSize(SimdgroupSize),
     /// `air.get_<built-in>.<i16|i32>`: a kernel built-in a program-scope variable declares.
     GlobalBuiltin(GlobalBuiltin),
+    /// `air.get_global_offset.i32` and `air.get_work_dim.i32`: an OpenCL C work-item function no
+    /// Metal built-in answers.
+    WorkItem(WorkItem),
     /// A simdgroup-matrix operation: `air.simdgroup_matrix_{8x8,16x16x16}_*`.
     SimdMatrix(SimdMatrix),
     /// A function-constant query, resolved by canonicalization's specialization.
     FunctionConstant(FunctionConstant),
     /// A fragment operation: a discard, a rate-map coordinate mapping, or the sample count.
     Fragment(Fragment),
+    /// `air.interpolate_<at>_<perspective>.<type>`: an interpolation function of an
+    /// `interpolant` fragment input (Metal's pull-model interpolation).
+    Interpolate(Interpolate),
     /// An imageblock operation: its data pointer, its size, or an implicit-imageblock load or
     /// store.
     Imageblock(Imageblock),
@@ -140,6 +156,12 @@ pub enum AirIntrinsic {
     IndirectCommand(IndirectCommand),
     /// An object or mesh function's operation.
     Mesh(Mesh),
+    /// OpenCL C's vector data loads and stores: `air.vload[a][_half].<space>.<type>` and
+    /// `air.vstore[a][_half].<space>[.<rounding>].<type>`.
+    VectorData(VectorData),
+    /// `air.is_{device,thread,threadgroup}_pointer`: which address space a generic pointer points
+    /// into (MSL 4.1).
+    PointerSpace(PointerSpace),
 }
 
 impl AirIntrinsic {
@@ -185,22 +207,27 @@ impl AirIntrinsic {
             .or_else(|| IsUniform::parse(rest).map(A::IsUniform))
             .or_else(|| SimdgroupSize::parse(rest).map(A::SimdgroupSize))
             .or_else(|| GlobalBuiltin::parse(rest).map(A::GlobalBuiltin))
+            .or_else(|| WorkItem::parse(rest).map(A::WorkItem))
             .or_else(|| SimdMatrix::parse(rest).map(A::SimdMatrix))
             .or_else(|| FunctionConstant::parse(rest).map(A::FunctionConstant))
             .or_else(|| Fragment::parse(rest).map(A::Fragment))
+            .or_else(|| Interpolate::parse(rest).map(A::Interpolate))
             .or_else(|| AsyncCopy::parse(rest).map(A::AsyncCopy))
             .or_else(|| FunctionTable::parse(rest).map(A::FunctionTable))
             .or_else(|| AccelerationStructure::parse(rest).map(A::AccelerationStructure))
             .or_else(|| Tensor::parse(rest).map(A::Tensor))
             .or_else(|| IndirectCommand::parse(rest).map(A::IndirectCommand))
             .or_else(|| Mesh::parse(rest).map(A::Mesh))
+            .or_else(|| VectorData::parse(rest).map(A::VectorData))
+            .or_else(|| PointerSpace::parse(rest).map(A::PointerSpace))
             .or_else(|| Math::parse(rest).map(A::Math))
     }
 
     /// Another operand form the same name may be declared with (a texture read's legacy form, a
     /// 64-bit atomic min or max without its result, the AIR 2.9 form of an atomic or a barrier,
     /// the AIR 2.7 form of a simdgroup-matrix block load or store, the AIR 2.5 kernel or vertex
-    /// buffer setter without its attribute stride).
+    /// buffer setter without its attribute stride, the AIR 2.9 form of a tensor's extent or
+    /// strided initialization).
     fn alternative(self) -> Option<AirIntrinsic> {
         match self {
             AirIntrinsic::Texture(t) => t.alternative().map(AirIntrinsic::Texture),
@@ -208,6 +235,7 @@ impl AirIntrinsic {
             AirIntrinsic::Sync(s) => s.alternative().map(AirIntrinsic::Sync),
             AirIntrinsic::SimdMatrix(m) => m.alternative().map(AirIntrinsic::SimdMatrix),
             AirIntrinsic::IndirectCommand(c) => c.alternative().map(AirIntrinsic::IndirectCommand),
+            AirIntrinsic::Tensor(t) => t.alternative().map(AirIntrinsic::Tensor),
             _ => None,
         }
     }
@@ -230,9 +258,11 @@ impl AirIntrinsic {
             AirIntrinsic::IsUniform(u) => u.signature(),
             AirIntrinsic::SimdgroupSize(s) => s.signature(),
             AirIntrinsic::GlobalBuiltin(g) => g.signature(),
+            AirIntrinsic::WorkItem(w) => w.signature(),
             AirIntrinsic::SimdMatrix(m) => m.signature(),
             AirIntrinsic::FunctionConstant(f) => f.signature(),
             AirIntrinsic::Fragment(f) => f.signature(),
+            AirIntrinsic::Interpolate(i) => i.signature(),
             AirIntrinsic::Imageblock(i) => i.signature(),
             AirIntrinsic::AsyncCopy(a) => a.signature(),
             AirIntrinsic::FunctionTable(f) => f.signature(),
@@ -241,6 +271,8 @@ impl AirIntrinsic {
             AirIntrinsic::Tensor(t) => t.signature(),
             AirIntrinsic::IndirectCommand(c) => c.signature(),
             AirIntrinsic::Mesh(m) => m.signature(),
+            AirIntrinsic::VectorData(v) => v.signature(),
+            AirIntrinsic::PointerSpace(p) => p.signature(),
         }
     }
 
@@ -439,6 +471,42 @@ pub fn classify(name: &[u8], sym: Sym, fn_ty: TypeId, types: &TypeTable) -> Opti
         }
     };
     Some(class)
+}
+
+impl DeclClass {
+    /// The template of an intrinsic in the closed set: `None` for a dropped marker, an unknown
+    /// name or a mismatched declaration.
+    pub fn template(self) -> Option<Template> {
+        match self {
+            DeclClass::Air(op) => Some(Template::Air(op)),
+            DeclClass::Llvm(op) => Some(Template::Llvm(op)),
+            DeclClass::Drop(_) | DeclClass::Unknown | DeclClass::Mismatch => None,
+        }
+    }
+}
+
+/// An intrinsic in the closed set before a call's immediates are read in: the template its
+/// declaration classifies as. A call whose immediate operand is not an integer constant in the
+/// function that makes it keeps its template (`Callee::Unbound`) until canonicalization reads
+/// the immediates where inlining gives them each call site's arguments ([`Template::bind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Template {
+    /// An `air.*` intrinsic's template.
+    Air(AirIntrinsic),
+    /// An `llvm.*` intrinsic's template.
+    Llvm(LlvmIntrinsic),
+}
+
+impl Template {
+    /// Bind one call with `args` to an intrinsic of this template, as [`bind`] binds a call to
+    /// its declaration's class.
+    pub fn bind(self, args: &[Value], consts: &ConstTable) -> Result<Bound, IntrinsicError> {
+        let class = match self {
+            Template::Air(op) => DeclClass::Air(op),
+            Template::Llvm(op) => DeclClass::Llvm(op),
+        };
+        bind(class, args, consts)
+    }
 }
 
 /// A call's decoded callee, from its declaration's class and its arguments.

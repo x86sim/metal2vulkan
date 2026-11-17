@@ -13,11 +13,12 @@
 //!   draw's target byte for byte the first device's. A making handed a cache loaded from its
 //!   record that the driver reports found there reads no data back and writes nothing
 //!   (`driver_data_found`: MoltenVK's data after such a making is the record's entries in the
-//!   other order, which a byte comparison took for a change at every making). One the driver does
-//!   not report found writes it again exactly where the driver's data after the making is no
-//!   longer what the cache was loaded with or last wrote (RADV's after its first hit from a
-//!   compile's record is not, and settles), and counts every other read unchanged
-//!   (`driver_data_unchanged`).
+//!   other order, which a byte comparison took for a change at every making, and RADV's now and
+//!   then differs from the record's in a byte at the same length). Where the device links its
+//!   pipelines from libraries, each library of shaders is such a making and reports as a whole
+//!   pipeline does. One the driver does not report found writes it again exactly where the
+//!   driver's data after the making is no longer what the cache was loaded with or last wrote,
+//!   and counts every other read unchanged (`driver_data_unchanged`).
 //! - **Lines from the triangles' cache.** A state's line pipeline, made at its first line draw,
 //!   names the record its triangle sibling named, which the state's creation made the cache of:
 //!   the topology reaches the driver's conversion of a stage through the point class alone
@@ -47,13 +48,18 @@
 //! inside the making.
 //!
 //! **Makings where the device links libraries**: a pipeline there is linked from libraries of its
-//! parts, and each library of shaders is a making of its own with its record ([`Makings`]): a
-//! state's creation makes two, its pre-rasterization and fragment shader libraries, and the points'
-//! draw one, its pre-rasterization library (Metal biases depth for triangles only, so the points'
-//! pre-rasterization state is another, and their fragment's is the state's). Every count above is
-//! of those makings there; a library's record written over with the compute pipeline's data holds
-//! another pipeline's data, whichever library it is. The driver reports no hit or miss of a
-//! library, which [`assert_reported`] takes.
+//! parts, and each library of shaders is a making of its own under its part's record
+//! ([`Makings`]): a state's creation makes two, its pre-rasterization and fragment shader
+//! libraries, and the points' draw one, its pre-rasterization library (Metal biases depth for
+//! triangles only, so the points' pre-rasterization state is another, and their fragment's is the
+//! state's). A part's record leaves out the depth bias, as a whole pipeline's does, and the point
+//! class, which only a whole pipeline's names, so the points' library is made under the state's
+//! pre-rasterization record: handed the cache the creation made, the driver reports it found
+//! there, it reads its data (unchanged, or written again where the driver's data grew), and it
+//! leaves no record of its own. A later device's points' library is handed that record's cache,
+//! loaded at the state's creation, and loads nothing. Every count above is of those makings
+//! there; a library's record written over with the compute pipeline's data holds another
+//! pipeline's data, whichever library it is.
 //!
 //! **The driver's own cache is fresh for each device**: Mesa's and NVIDIA's shader disk caches are
 //! pointed into a new scratch directory before each device or maker process is made
@@ -74,7 +80,9 @@
 //! `validation/fixtures/public/examples/runtime_examples.ll`. The tests print the driver's data and
 //! each device's counts (`PIPELINE-RECORDS`).
 
-use super::{layer_reported_nothing_at_all, validated_device_with, Messages, ScratchCache, WAIT};
+use super::{
+    at_plan, layer_reported_nothing_at_all, validated_device_with, Messages, ScratchCache, WAIT,
+};
 use crate::air_library::AirLibrary;
 use crate::gpu::TEST_DEVICE;
 use ash::vk;
@@ -95,7 +103,7 @@ use std::process::Command;
 /// The render target's side.
 const SIDE: u64 = 8;
 /// The magic a making's record begins with (`shader_cache/driver.rs`).
-const RECORD_MAGIC: &[u8] = b"M2VPPLC\0";
+const RECORD_MAGIC: &[u8] = b"M2VPPL4\0";
 /// The environment variable that names the cache directory to [`record_maker_process`].
 const MAKER_DIR: &str = "M2V_LANE_PIPELINE_RECORDS_DIR";
 /// The line [`record_maker_process`] reports on.
@@ -103,8 +111,7 @@ const MAKER_REPORT: &str = "PIPELINE-RECORDS-MAKER";
 
 /// The owned fixture's library on `device`.
 fn library(device: &Device) -> Library {
-    let ll =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/public/examples/runtime_examples.ll");
+    let ll = metal2vulkan_devtools::fixtures_dir().join("examples/runtime_examples.ll");
     let bitcode = llvm_assemble(&ll).unwrap();
     device.new_library_with_air(&bitcode).unwrap()
 }
@@ -124,32 +131,42 @@ fn state(device: &Device, library: &Library, format: PixelFormat) -> RenderPipel
 }
 
 /// The driver's makings that keep a record (the module docs): of a state's creation, and of the
-/// points' draw after it.
+/// points' draw after it, with the records the points' makings name that the creation's do not.
 #[derive(Clone, Copy, Debug)]
 struct Makings {
     creation: u64,
     points: u64,
+    points_own: u64,
 }
 
 impl Makings {
     /// Those of `device`, which has made a state: one whole pipeline each where it makes its
-    /// pipelines whole; where it links them from libraries (it linked the state's), the state's
-    /// pre-rasterization and fragment shader libraries, and the points' pre-rasterization one.
+    /// pipelines whole, the points' under a record of its own; where it links them from
+    /// libraries (it linked the state's), the state's pre-rasterization and fragment shader
+    /// libraries, and the points' pre-rasterization one, under the state's pre-rasterization
+    /// record.
     fn of(device: &Device) -> Makings {
         match device.work_counts().pipelines_linked {
             0 => Makings {
                 creation: 1,
                 points: 1,
+                points_own: 1,
             },
             _ => Makings {
                 creation: 2,
                 points: 1,
+                points_own: 0,
             },
         }
     }
+
+    /// The records its makings write: the creation's and the points' own.
+    fn records(&self) -> u64 {
+        self.creation + self.points_own
+    }
 }
 
-/// The records (`M2VPPLC\0`) under `cache`'s layout directory, by their paths under it, with
+/// The records (`M2VPPL4\0`) under `cache`'s layout directory, by their paths under it, with
 /// their bytes.
 fn records(cache: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut found = BTreeMap::new();
@@ -584,33 +601,35 @@ fn changed(before: &BTreeMap<PathBuf, Vec<u8>>, now: &BTreeMap<PathBuf, Vec<u8>>
         .count() as u64
 }
 
-/// Of `statistics` since `since`, the makings that loaded a record: each the driver reports
-/// found there read no data back (as many as its hits), and each other one wrote it again exactly
-/// where the driver's data was no longer the record's, so `changed` records are written, and
-/// every other one read its data unchanged.
+/// Of `statistics` since `since`, `loads` records loaded and `makings` makings handed a cache
+/// loaded from a record (one loaded then, or earlier on the device): each the driver reports
+/// found there read no data back (as many as its hits), and each other one either read its data
+/// unchanged or wrote the record again, where the driver's data was no longer the record's. The
+/// records written again, which the caller holds to the files changed once the device is gone
+/// (the module docs).
 fn assert_loaded(
     which: &str,
     (since, statistics): (&ShaderCacheStatistics, &ShaderCacheStatistics),
-    loads: u64,
-    changed: u64,
-) {
+    (loads, makings): (u64, u64),
+) -> u64 {
     let saves = statistics.driver_saves - since.driver_saves;
     let unchanged = statistics.driver_data_unchanged - since.driver_data_unchanged;
     let found = statistics.driver_data_found - since.driver_data_found;
     assert_eq!(
         (
             statistics.driver_loads - since.driver_loads,
-            saves,
-            unchanged + found
+            saves + unchanged + found
         ),
-        (loads, changed, loads - changed),
-        "{which}: the makings from records, written again exactly where a record changed"
+        (loads, makings),
+        "{which}: the records loaded, and the makings from them, each found, unchanged or written \
+         again"
     );
     assert_eq!(
         found,
         statistics.driver_pipeline_hits - since.driver_pipeline_hits,
         "{which}: every making the driver reports found in its record read no data back"
     );
+    saves
 }
 
 #[test]
@@ -618,34 +637,29 @@ fn a_later_device_makes_every_pipeline_an_earlier_one_made_from_its_records() {
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
     let format = PixelFormat::RGBA8Unorm;
-    // The first device: an empty directory.
-    let (driver, targets, written, makings) = {
+    // The first device: an empty directory. What each phase made is read from the counters, and
+    // the records once the device is gone (the module docs).
+    let (driver, targets, makings) = {
         let _driver_cache = DriverCache::fresh();
-        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |_| {}).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let driver = DriverData::of(&device);
         let library = library(&device);
-        let before = records(cache.path());
         let state = state(&device, &library, format);
         let makings = Makings::of(&device);
         let created = device.shader_cache_statistics();
         report("first device, created", &created);
         let keeps = driver.whole();
         assert_eq!(kept(&created), keeps, "the driver's data: {driver:?}");
-        let made: Vec<_> = records(cache.path())
-            .into_keys()
-            .filter(|path| !before.contains_key(path))
-            .collect();
         if keeps {
             assert_eq!(created.driver_loads, 0, "a load from an empty directory");
             assert_eq!(
-                made.len() as u64,
-                makings.creation,
-                "the creation's makings' records ({makings:?})"
+                created.driver_saves, makings.creation,
+                "the creation's makings wrote their records ({makings:?})"
             );
             // The driver's own cache is fresh: its miss.
             assert_reported("first device, created", &created, (0, makings.creation));
         } else {
-            assert!(made.is_empty(), "a record of a driver that keeps nothing");
+            assert_eq!(created.driver_saves, 0, "a driver that keeps nothing wrote");
         }
         let triangles = draw(&device, &state, (format, PrimitiveType::Triangle));
         // Points: another key of the same stages, made for the draw.
@@ -656,43 +670,58 @@ fn a_later_device_makes_every_pipeline_an_earlier_one_made_from_its_records() {
         );
         let drawn = device.shader_cache_statistics();
         report("first device, drawn", &drawn);
-        let written: Vec<_> = records(cache.path())
-            .into_iter()
-            .filter(|(path, _)| !before.contains_key(path))
-            .collect();
         if keeps {
+            // A making under its own record writes it; one under a record the creation's
+            // makings named is handed the cache they made, which the driver reports it found
+            // there, and reads its data: unchanged, or written again where the driver's data
+            // grew (RADV's does).
+            let saves = drawn.driver_saves - created.driver_saves;
+            let unchanged = drawn.driver_data_unchanged - created.driver_data_unchanged;
             assert_eq!(
-                drawn.driver_saves - created.driver_saves,
-                makings.points,
-                "the points' making wrote its record"
+                (drawn.driver_loads - created.driver_loads, saves + unchanged),
+                (0, makings.points),
+                "the points' makings loaded nothing, and each read its data ({makings:?})"
             );
-            assert_eq!(
-                written.len() as u64,
-                makings.creation + makings.points,
-                "one record per making"
+            assert!(
+                saves >= makings.points_own,
+                "the points' making wrote its own record: {saves} saves ({makings:?})"
             );
-            let bytes: Vec<&[u8]> = written.iter().map(|(_, bytes)| &bytes[..]).collect();
-            driver.assert_records(&bytes);
+            let shared = makings.points - makings.points_own;
             assert_reported(
                 "first device, drawn",
                 &drawn,
-                (0, makings.creation + makings.points),
+                (shared, makings.creation + makings.points_own),
             );
         } else {
-            assert!(written.is_empty());
+            assert_eq!(drawn.driver_saves, 0, "a driver that keeps nothing wrote");
         }
-        (driver, (triangles, points), written, makings)
+        (driver, (triangles, points), makings)
     };
+    // Read once the device is gone, as every file claim below.
+    let written = records(cache.path());
+    if driver.whole() {
+        assert_eq!(
+            written.len() as u64,
+            makings.records(),
+            "one record per record the makings name"
+        );
+        let bytes: Vec<&[u8]> = written.values().map(|bytes| &bytes[..]).collect();
+        driver.assert_records(&bytes);
+    } else {
+        assert!(
+            written.is_empty(),
+            "a record of a driver that keeps nothing"
+        );
+    }
     // The second device: the first one's directory, the driver's own cache fresh again.
-    {
+    let saves = {
         let _driver_cache = DriverCache::fresh();
-        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |_| {}).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let library = library(&device);
         let none = device.shader_cache_statistics();
         let state = state(&device, &library, format);
         let created = device.shader_cache_statistics();
         report("second device, created", &created);
-        let at_creation = records(cache.path());
         assert_eq!(
             draw(&device, &state, (format, PrimitiveType::Triangle)),
             targets.0
@@ -703,20 +732,15 @@ fn a_later_device_makes_every_pipeline_an_earlier_one_made_from_its_records() {
         );
         let drawn = device.shader_cache_statistics();
         report("second device, drawn", &drawn);
-        let now = records(cache.path());
-        let written: BTreeMap<PathBuf, Vec<u8>> = written.into_iter().collect();
         if driver.whole() {
-            assert_loaded(
+            let saves = assert_loaded(
                 "second device, created: the triangles' makings from their records",
                 (&none, &created),
-                makings.creation,
-                changed(&written, &at_creation),
-            );
-            assert_loaded(
-                "second device, drawn: the points' making from its record",
+                (makings.creation, makings.creation),
+            ) + assert_loaded(
+                "second device, drawn: the points' making from its record, or the creation's",
                 (&created, &drawn),
-                makings.points,
-                changed(&at_creation, &now),
+                (makings.points_own, makings.points),
             );
             // Hits where the driver's data holds its pipelines, misses where it holds none; its
             // own cache is fresh, so a hit is the record's.
@@ -730,17 +754,28 @@ fn a_later_device_makes_every_pipeline_an_earlier_one_made_from_its_records() {
                 &drawn,
                 driver.reported_of_records(makings.creation + makings.points),
             );
-            assert_eq!(
-                now.len() as u64,
-                makings.creation + makings.points,
-                "no record but the makings'"
-            );
-            let bytes: Vec<&[u8]> = now.values().map(|bytes| &bytes[..]).collect();
-            driver.assert_records(&bytes);
+            saves
         } else {
             assert_eq!((drawn.driver_loads, drawn.driver_saves), (0, 0));
-            assert!(now.is_empty(), "a record of a driver that keeps nothing");
+            0
         }
+    };
+    let now = records(cache.path());
+    if driver.whole() {
+        assert_eq!(
+            changed(&written, &now),
+            saves,
+            "the second device wrote a record again exactly where it saved one"
+        );
+        assert_eq!(
+            now.len() as u64,
+            makings.records(),
+            "no record but the makings'"
+        );
+        let bytes: Vec<&[u8]> = now.values().map(|bytes| &bytes[..]).collect();
+        driver.assert_records(&bytes);
+    } else {
+        assert!(now.is_empty(), "a record of a driver that keeps nothing");
     }
     layer_reported_nothing_at_all(&messages);
 }
@@ -918,11 +953,14 @@ fn a_record_holding_another_pipeline_s_data_is_written_again() {
         .iter()
         .filter(|rewritten| *rewritten != foreign)
         .count() as u64;
-    assert_loaded(
-        "the compute pipeline's data in its place",
-        (&none, &made),
-        makings.creation,
+    assert_eq!(
+        assert_loaded(
+            "the compute pipeline's data in its place",
+            (&none, &made),
+            (makings.creation, makings.creation),
+        ),
         changed,
+        "the compute pipeline's data in its place: written again exactly where a record changed"
     );
     assert_eq!(
         changed,
@@ -963,11 +1001,14 @@ fn a_record_holding_another_pipeline_s_data_is_written_again() {
         .zip(&rewritten)
         .filter(|(now, rewritten)| now != rewritten)
         .count() as u64;
-    assert_loaded(
-        "written again, a later device",
-        (&none, &made),
-        makings.creation,
+    assert_eq!(
+        assert_loaded(
+            "written again, a later device",
+            (&none, &made),
+            (makings.creation, makings.creation),
+        ),
         changed,
+        "written again, a later device: exactly where a record changed"
     );
     let bytes: Vec<&[u8]> = now.iter().map(|bytes| &bytes[..]).collect();
     driver.assert_records(&bytes);
@@ -1028,22 +1069,20 @@ fn two_processes_making_one_pipeline_leave_one_whole_record() {
             &made,
             driver.reported_of_records(makings.creation),
         );
-        let now = records(cache.path());
-        assert_loaded(
-            "after two makers: the records loaded whole",
-            (&none, &made),
-            makings.creation,
-            changed(&written, &now),
-        );
-        let bytes: Vec<&[u8]> = now.values().map(|bytes| &bytes[..]).collect();
-        driver.assert_records(&bytes);
     } else {
         assert!(
             written.is_empty(),
             "a record of a driver that keeps nothing"
         );
     }
-    let before_draw = records(cache.path());
+    let saves = match driver.whole() {
+        true => assert_loaded(
+            "after two makers: the records loaded whole",
+            (&none, &made),
+            (makings.creation, makings.creation),
+        ),
+        false => 0,
+    };
     draw(&device, &state, (format, PrimitiveType::Triangle));
     let drawn = device.shader_cache_statistics();
     drop(state);
@@ -1052,9 +1091,21 @@ fn two_processes_making_one_pipeline_leave_one_whole_record() {
     assert_eq!(
         (drawn.driver_loads, drawn.driver_saves),
         (made.driver_loads, made.driver_saves),
-        "the draw took the creation's pipeline"
+        "the draw took the creation's pipeline, and wrote nothing"
     );
-    assert_eq!(records(cache.path()), before_draw, "the draw wrote nothing");
+    // Read once the device is gone (the module docs).
+    let now = records(cache.path());
+    assert_eq!(
+        changed(&written, &now),
+        saves,
+        "after two makers: written again exactly where a record changed"
+    );
+    if driver.whole() {
+        let bytes: Vec<&[u8]> = now.values().map(|bytes| &bytes[..]).collect();
+        driver.assert_records(&bytes);
+    } else {
+        assert!(now.is_empty(), "a record of a driver that keeps nothing");
+    }
     layer_reported_nothing_at_all(&messages);
 }
 

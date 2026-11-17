@@ -5,7 +5,10 @@
 //!   "after this encoder's work" in the device's submission order, and a later encoder's
 //!   `wait_for_fence` becomes a barrier from that work's stages, or a wait for its `VkQueue` when
 //!   the update ran on another ([`tracker`](super::tracker)). A fence has no Vulkan object: it is
-//!   an identity the tracker keys on.
+//!   an identity the tracker keys on. So it goes on past the device's recovery as Metal's fence
+//!   does, the recovery carrying its handle of the device alone (`device/carry.rs`'s
+//!   `LineDevice`): an encoder of any generation updates and waits for it, its updates on a lost
+//!   generation gone with that generation's work.
 //! - **Resource barriers** order dispatches of one compute encoder: one global memory barrier,
 //!   as for a scope barrier.
 //! - **A render encoder's** fences order the render stages its calls name, as the M3 Max's do
@@ -41,12 +44,23 @@
 //!   (buffers or textures, which a fragment may write at any address and a draw may read at any
 //!   stage) splits the pass: the next draw records into a new instance, after a barrier from
 //!   everything before to everything after (`render.rs`, the `render-pass-split` degradation).
+//! - **Before the pass's first draw**, a barrier over the render targets (or with them, or over
+//!   an attachment's texture), after the fragment stage and before a stage at or before it, orders
+//!   the pass's load actions, which write its render targets ahead of every draw, before the
+//!   draws after it, as Mac2 GPUs answer (measured: an Intel UHD 630 read the clear after one and
+//!   the texels from before the pass without one, an AMD Radeon Pro 5300M the clear either way):
+//!   a draw after it that samples the texture of a color the pass clears reads a copy cleared to
+//!   the clear before the pass, in the pass's first instance, where it comes before any draw of
+//!   the pass and the copy can be cleared so; else it records into an instance after the pass's
+//!   first, which runs the clear alone, or reads through snapshots (`texture/attached_reads.rs`).
+//!   A pass with no such draw records as with no barrier.
 //! - **Barriers over the render targets on Apple GPUs.** The Metal Feature Set Tables give that
 //!   scope to Mac2 GPUs, not to Apple3 to Apple10 ones: on the M3 Max under macOS 27.0.1 (probe
 //!   `rtbarrier`), a draw after one read its own pixel's texels from before the pass, as with no
 //!   barrier, and (probe `rtb`) a draw after one from the fragment stage to the fragment or the
 //!   vertex stage read other pixels' texels from before the pass too, as an Apple GPU orders none
-//!   of them. The runtime orders what each barrier names, as a Mac2 GPU does.
+//!   of them, nor, after one at the pass's start, its clear: the draw read the texels from before
+//!   the pass. The runtime orders what each barrier names, as a Mac2 GPU does.
 //! - **Barriers after the fragment stage.** On an Apple GPU Metal's validation stops one
 //!   ("afterStages (0x2) can not contain MTLRenderStageTile or MTLRenderStageFragment on this
 //!   device", M4), and Metal without it did not order a fragment's buffer write before the next
@@ -58,17 +72,19 @@
 
 use super::blit::BlitCommandEncoder;
 use super::compute::ComputeCommandEncoder;
+use super::device::carry::LineDevice;
 use super::device::{lock, Device};
 use super::encoder::EncoderCore;
 use super::error::Error;
+use super::live_bind::LiveBind;
 use super::predication::Event;
 use super::render::RenderCall;
 use super::render::RenderCommandEncoder;
 use super::render::RenderLowering;
 use super::render::{FRAGMENT_DRAW_STAGES, GEOMETRY_DRAW_STAGES};
-use super::replay::{BlitCall, ComputeCall, Resource};
+use super::replay::{BlitCall, CallLog, ComputeCall, Resource};
 use super::resource::{ResourceKey, ResourceRef};
-use super::tracker::Barrier;
+use super::work_counts::LoggedCall;
 use ash::vk;
 use metal2vulkan::metal::{BarrierScope, RenderStages};
 use std::sync::{Arc, Mutex};
@@ -79,7 +95,9 @@ use std::sync::{Arc, Mutex};
 pub struct Fence(Arc<FenceShared>);
 
 struct FenceShared {
-    device: Device,
+    /// The device: its root handle, which the encoders' checks match by its line, and the
+    /// generation handle `device` answers.
+    device: LineDevice,
     key: ResourceKey,
     label: Mutex<Option<String>>,
 }
@@ -109,8 +127,14 @@ impl std::hash::Hash for Fence {
 impl Device {
     /// `newFence`.
     pub fn new_fence(&self) -> Fence {
+        self.current().new_fence_now()
+    }
+
+    /// [`Device::new_fence`] on the generation that serves (`device/line.rs`): a fence of the
+    /// device whatever generation serves (the module docs).
+    pub(crate) fn new_fence_now(&self) -> Fence {
         Fence(Arc::new(FenceShared {
-            device: self.clone(),
+            device: LineDevice::new(self),
             key: ResourceKey::new(),
             label: Mutex::new(None),
         }))
@@ -118,9 +142,18 @@ impl Device {
 }
 
 impl Fence {
-    /// `device`.
-    pub fn device(&self) -> &Device {
-        &self.0.device
+    /// `device`: a generation handle of the device, owned, as Metal's `device` answers a retained
+    /// device: of the generation the fence was made on, then of each one the device's recoveries
+    /// carried the fence to. The handle is the caller's: it keeps meaning that generation while
+    /// held, past a recovery that carries the fence on, its raw handles that generation's
+    /// `VkDevice`'s, kept alive while held.
+    pub fn device(&self) -> Device {
+        self.0.device.generation().clone()
+    }
+
+    /// A root handle of the fence's device, which an encoder of any of its generations matches.
+    pub(super) fn root_device(&self) -> &Device {
+        self.0.device.root()
     }
 
     /// `setLabel:`.
@@ -148,7 +181,7 @@ impl EncoderCore {
         fence: &Fence,
         draws: Option<vk::PipelineStageFlags2>,
     ) -> Result<(), Error> {
-        self.check_device(call, fence.device())?;
+        self.check_device(call, fence.root_device())?;
         self.uses().update_fence(fence.0.key, draws);
         Ok(())
     }
@@ -163,7 +196,7 @@ impl EncoderCore {
         fence: &Fence,
         draws: Option<vk::PipelineStageFlags2>,
     ) -> Result<(), Error> {
-        self.check_device(call, fence.device())?;
+        self.check_device(call, fence.root_device())?;
         self.uses().wait_for_fence(fence.0.key, draws);
         // Metal shows the work the wait orders after it the bytes the update's writer left, so
         // no shadowed texture's image is carried on (`shadow::ShadowCarry`).
@@ -175,7 +208,7 @@ impl EncoderCore {
 impl ComputeCommandEncoder {
     /// `memoryBarrierWithResources:count:`: the writes of the encoder's earlier dispatches to
     /// `resources` are visible to its later dispatches. One global memory barrier covers them, as
-    /// a scope barrier does; an empty list records nothing.
+    /// a scope barrier does (`memory_barrier_with_scope`); an empty list records nothing.
     ///
     /// Refused (`Invalid`): a resource of another device.
     pub fn memory_barrier_with_resources(
@@ -191,7 +224,7 @@ impl ComputeCommandEncoder {
                     core.check_device(CALL, resource.device())?;
                 }
                 if !resources.is_empty() {
-                    core.barrier(Barrier::between_dispatches());
+                    core.memory_barrier();
                     this.capture(|| Event::Barrier);
                 }
                 Ok(())
@@ -297,6 +330,13 @@ const UP_TO_FRAGMENT: RenderStages = RenderStages::VERTEX
     .union(RenderStages::MESH)
     .union(RenderStages::FRAGMENT);
 
+/// Whether a barrier after `after_stages` and before `before_stages` orders the fragment stage's
+/// writes before the later draws' fragment stages: after the fragment stage, before a stage at or
+/// before it.
+fn orders_fragments(after_stages: RenderStages, before_stages: RenderStages) -> bool {
+    after_stages.contains(RenderStages::FRAGMENT) && before_stages.intersects(UP_TO_FRAGMENT)
+}
+
 impl RenderLowering {
     /// The lowering of [`RenderCommandEncoder::update_fence`].
     pub(crate) fn update_fence(
@@ -304,7 +344,11 @@ impl RenderLowering {
         fence: &Fence,
         after_stages: RenderStages,
     ) -> Result<(), Error> {
-        self.log(|_| RenderCall::UpdateFence(fence.clone(), after_stages));
+        // An update records nothing into the pass, so the encoder's kept draws are kept
+        // (`render/draw_again.rs`).
+        self.log_across(LoggedCall::Fence, |_| {
+            RenderCall::UpdateFence(fence.clone(), after_stages)
+        });
         // The update follows the encoder's work, its later color groups' passes too, which
         // record in its core after the first group's: their encoders' calls change nothing
         // (`render/color_groups.rs`).
@@ -321,7 +365,15 @@ impl RenderLowering {
         fence: &Fence,
         before_stages: RenderStages,
     ) -> Result<(), Error> {
-        self.log(|_| RenderCall::WaitForFence(fence.clone(), before_stages));
+        // A wait records nothing into the pass, but that the encoder's shadowed textures take
+        // their copies again (`EncoderCore::ordered_other_work`): where the encoder used none,
+        // its kept draws are kept (`render/draw_again.rs`).
+        let call =
+            |_: &mut CallLog<RenderCall>| RenderCall::WaitForFence(fence.clone(), before_stages);
+        match self.core().used_shadows() {
+            true => self.log_letting_go(LoggedCall::Fence, call),
+            false => self.log_across(LoggedCall::Fence, call),
+        }
         // All of the encoder's work waits, its later color groups' passes too
         // (`render/color_groups.rs`).
         if self.later_group_encoder() {
@@ -331,21 +383,43 @@ impl RenderLowering {
             .wait_for_fence("wait_for_fence", fence, before_stages_of(before_stages))
     }
 
-    /// The lowering of [`RenderCommandEncoder::memory_barrier_with_scope`].
+    /// The lowering of [`RenderCommandEncoder::memory_barrier_with_scope`], with the encoder's bind
+    /// state `live`, which holds the kept draws set aside.
     pub(crate) fn memory_barrier_with_scope(
         &mut self,
+        live: &mut LiveBind,
         scope: BarrierScope,
         after_stages: RenderStages,
         before_stages: RenderStages,
     ) {
-        self.log(|_| RenderCall::BarrierWithScope(scope, after_stages, before_stages));
+        let call = |_: &mut CallLog<RenderCall>| {
+            RenderCall::BarrierWithScope(scope, after_stages, before_stages)
+        };
+        // A barrier over the render targets alone records nothing but its barrier inside the
+        // current instance, or nothing, which changes no state its command buffer holds: the
+        // encoder's kept draws are kept but those that read its colors past their own snapshots
+        // (`render/draw_again.rs`). One that puts the pass's colors apart there splits the pass,
+        // as any other scope does: the next draw records into a new instance, and they go.
+        let inside = scope == BarrierScope::RENDER_TARGETS
+            && !(orders_fragments(after_stages, before_stages) && self.reloads_at_barriers());
+        match inside {
+            true => {
+                self.keep_across_barrier(live);
+                self.log_keeping(call);
+            }
+            false => self.log_letting_go(LoggedCall::Barrier, call),
+        }
         if scope.is_empty() || after_stages.is_empty() || before_stages.is_empty() {
             return;
         }
+        // The pass's load actions write its render targets ahead of its first draw.
+        if scope.contains(BarrierScope::RENDER_TARGETS)
+            && orders_fragments(after_stages, before_stages)
+        {
+            self.barrier_orders_loads();
+        }
         if scope == BarrierScope::RENDER_TARGETS {
-            if after_stages.contains(RenderStages::FRAGMENT)
-                && before_stages.intersects(UP_TO_FRAGMENT)
-            {
+            if orders_fragments(after_stages, before_stages) {
                 self.barrier_between_draws();
             }
             return;
@@ -360,7 +434,7 @@ impl RenderLowering {
         after_stages: RenderStages,
         before_stages: RenderStages,
     ) -> Result<(), Error> {
-        self.log(|_| {
+        self.log_letting_go(LoggedCall::Barrier, |_| {
             RenderCall::BarrierWithResources(Resource::all(resources), after_stages, before_stages)
         });
         const CALL: &str = "memory_barrier_with_resources";
@@ -368,6 +442,9 @@ impl RenderLowering {
             self.core().check_device(CALL, resource.device())?;
         }
         if !resources.is_empty() && !after_stages.is_empty() && !before_stages.is_empty() {
+            if orders_fragments(after_stages, before_stages) {
+                self.barrier_orders_loads_of(resources);
+            }
             self.barrier_before_next_draw();
         }
         Ok(())
@@ -421,7 +498,8 @@ impl RenderCommandEncoder {
     ) {
         match self.lowers_at_call() {
             true => self.at_call_unit(|lowering| {
-                lowering.memory_barrier_with_scope(scope, after_stages, before_stages)
+                let (lowering, live) = lowering.parts();
+                lowering.memory_barrier_with_scope(live, scope, after_stages, before_stages)
             }),
             false => self
                 .defer_unit(|_| RenderCall::BarrierWithScope(scope, after_stages, before_stages)),

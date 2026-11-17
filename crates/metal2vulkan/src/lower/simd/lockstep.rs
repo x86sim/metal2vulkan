@@ -23,11 +23,16 @@
 //!
 //! - different objects (root sets), or byte ranges of one object that the bounds of every index
 //!   keep apart (spans: constants, and values bounded by a threadgroup's 1024 threads, a
-//!   simdgroup's 32, masks and shifts, or a loop counter's exit test);
+//!   simdgroup's 32, masks and shifts, a loop counter's exit test, or an unsigned test of a
+//!   branch that dominates the access, `if (t < 4)`);
 //! - disjoint constant ranges off one anchor (the address up to its last non-constant step,
 //!   with a constant that step's index adds folded into the offset where it cannot wrap) that is
 //!   either the same for both threads or differs between them by an amount whose bounds keep the
-//!   ranges apart;
+//!   ranges apart, or by a multiple of a power of two `g` plus at most `l` either way (a lattice:
+//!   the anchor's GEPs down to a uniform base add terms whose low zero bits reach `g`, which
+//!   divides the index width's range so a wrap keeps the multiple, and terms whose ranges span
+//!   `l` bytes in all; a tile's `4 (t & 31) + 32 (t & -32)` is `l = 124`, `g = 1024`) that no
+//!   multiple of `g` puts the ranges together by;
 //! - disjoint ranges into one array row: when the last non-constant index steps through an
 //!   array whose earlier steps are all multiples of its size, and its bounds keep the offset
 //!   inside the array, two addresses meet only where their offsets into it do, whatever the
@@ -35,7 +40,17 @@
 //! - two extended indices of one GEP shape where one is a sum `u + t` that does not wrap, `u`
 //!   uniform in the simdgroup, and the other runs only under a branch that tested it below `u`
 //!   (a tree reduction's `if (t < h) a[t] += a[t + h]`), unsigned for zero-extended indices and
-//!   signed, with `t` not negative, for sign-extended ones.
+//!   signed, with `t` not negative, for sign-extended ones. The test and the index compare
+//!   through the extensions of that order, so a guard on `t` widened once meets an index
+//!   widened from `t` straight to its own width (a `ushort` `t` tested as a `uint`); an
+//!   extension of the other kind does not, its value differing in that order;
+//! - one base in every thread of the simdgroup plus an offset computed from the thread's place
+//!   and constants alone (its index in the threadgroup or the simdgroup, or, where each simdgroup
+//!   lies within one row, the `x` of its position), whose bytes meet at no two lanes of any
+//!   simdgroup: both offsets evaluated at each of a threadgroup's 1024 places, a simdgroup being
+//!   the 32 from a multiple of 32 (`facts::Lanes`). It is exact for strides of any size, where
+//!   the lattice above needs powers of two (`4 (t >> 3) + 144 (t & 7)` against the same plus 64
+//!   bytes takes none, `12 t` against `12 t + 36` keeps its barrier: lanes 3 apart meet).
 //!
 //! An anchor or row index differs between threads when it depends on the thread through
 //! `thread_index_in_simdgroup` or `thread_index_in_threadgroup` and exact additions, scalings,
@@ -43,13 +58,22 @@
 //! threads and a simdgroup's 32 put on the values (two threads of one simdgroup are 1 to 31
 //! apart), or through a loop counter that starts there and steps by more than the starts differ
 //! (every value is the start plus a multiple of the step, so two threads' values differ at
-//! whatever iterations); a counter whose back edge is never taken is its start. A component of
+//! whatever iterations); a counter whose back edge is never taken is its start. A cell
+//! `s + p * n` differs between threads by 1 or more wherever their `p`s do, at whatever
+//! iterations (`out[(y * w + x) * n + s]` over `s < n`): `s` a loop counter below `n` (it starts
+//! below `n`, as the bounds or a branch before the loop show, and the exit test lets a next value
+//! through only below `n`, or stepping by one, unequal to it), `n` one value in every thread of
+//! the simdgroup (uniform, or a texture's size query, a sample count being at most 64) and `p` an
+//! index as above; settled across iterations where `p * n` is. A component of
 //! `thread_position_in_grid` or `thread_position_in_threadgroup` does not differ between every two
 //! threads (two threads of a simdgroup share its `x` in a threadgroup narrower than 32), but it is
 //! the simdgroup's threadgroup origin plus a position below 1024: two threads' are equal or 1 to
 //! 1023 apart, so through the same steps it clears a pair whose bytes are apart both at one anchor
 //! and at anchors that far apart (`out[12 * gid + k]` against `out[12 * gid + j]`, `j != k`), but
-//! never by itself makes one thread at most run an access. Two commutative updates of one class whose
+//! never by itself makes one thread at most run an access. Where each simdgroup lies within one
+//! row of its threadgroup (decided apart, [`Lockstep::rows`]), two of its threads' `x` differ by 1
+//! to 31 and their `y` and `z` are equal, so `y * w + x` differs as `x` does. Two commutative
+//! updates of one class whose
 //! results are unused never conflict, and neither do two stores of one value every thread of the
 //! simdgroup stores alike (to locations equal or apart by their alignment), nor such a store at
 //! one address for the whole simdgroup and a read that follows it in every thread (the read
@@ -95,6 +119,13 @@
 //!   the same path, the threads Apple's simdgroup runs that instruction for. It orders the pair as
 //!   lockstep does, so the kernel keeps the tier its class gives.
 //!
+//! A threadgroup barrier stands for pairs the same detection clears where each simdgroup lies
+//! within one row of its threadgroup (`Lockstep::rows`'s facts) only when no other pair wants it
+//! there; otherwise it orders only pairs whose threads meet where a simdgroup spans two rows, and
+//! runs only in a threadgroup whose local size lets one (more than one row, of a width not a
+//! multiple of 32: [`Lockstep::across_rows`], a test of specialization constants a driver folds).
+//! The kernel's one-row variant leaves such barriers out.
+//!
 //! Each pair names an interval of positions in one block where its barrier may stand; one
 //! barrier at a position of the most intervals serves them all (interval stabbing, threadgroup
 //! barriers first). It stands at the latest position its intervals share, right before the `b`
@@ -110,12 +141,13 @@
 //! Vulkan orders nothing (NVIDIA's independent thread scheduling and its compiler's reordering of
 //! accesses it proves apart within one thread included). The analysis runs a second pass over
 //! device memory ([`facts::Space::Device`]): its objects are the buffer parameters, device globals,
-//! and the buffer a pointer loaded from memory names (two loads of one argument-buffer member name
-//! one), its intervals end at the barriers that order device or threadgroup memory, and every
-//! barrier it inserts carries `mem_device` beside `mem_threadgroup` where the threadgroup pass
-//! needed one too, so one barrier serves both. Two bindings of one buffer, or a binding and a
-//! pointer loaded into it, are taken as distinct objects: a pair that meets only through such an
-//! overlap is not ordered. `constant` memory is never written; texture memory (`mem_texture`) is
+//! and the buffer a pointer loaded from buffer memory names (two loads of one argument-buffer
+//! member name one; a pointer loaded from thread, threadgroup or payload memory is a copy and names
+//! no object of its own, so it meets every object), its intervals end at the barriers that order
+//! device or threadgroup memory, and every barrier it inserts carries `mem_device` beside
+//! `mem_threadgroup` where the threadgroup pass needed one too, so one barrier serves both. Two
+//! bindings of one buffer, or a binding and a pointer loaded from buffer memory into it, are taken
+//! as distinct objects: a pair that meets only through such an overlap is not ordered. `constant` memory is never written; texture memory (`mem_texture`) is
 //! not ordered.
 //!
 //! **Residue.** Lockstep also fixes which thread's store wins when threads of one simdgroup
@@ -123,10 +155,14 @@
 //! a branch its threads diverge on; neither is visible in the IR, and Metal defines neither.
 //!
 //! The analysis is metered: work per instruction, per block reached, and per pair, and its tables
-//! are charged while they live.
+//! are charged while they live. The pair search ([`search`]) does not try a pair whose barrier is
+//! already wanted, and stops walking where every pair beyond has its barrier, so a long
+//! barrier-free body whose pairs conflict costs about linear work in its blocks.
 
 mod facts;
+mod search;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::air::abi::Stage as AbiStage;
@@ -147,6 +183,7 @@ use crate::pipeline::sym::Stage;
 
 use super::uniform::{Among, Uniformity};
 use facts::{Access, Accesses, Addr, AddrFacts, Row, Space, Spread};
+use search::Search;
 
 fn invariant(what: &'static str) -> Error {
     Error::Internal(InternalError::new(InternalKind::Invariant, what))
@@ -157,6 +194,10 @@ fn invariant(what: &'static str) -> Error {
 enum Order {
     /// `threadgroup_barrier(mem_threadgroup)`.
     Threadgroup,
+    /// `threadgroup_barrier(mem_threadgroup)` that orders only pairs whose threads meet where a
+    /// simdgroup spans two rows of its threadgroup: it runs only in such a threadgroup
+    /// (`air::Lockstep::across_rows`).
+    Rows,
     /// `simdgroup_barrier(mem_threadgroup)`, exact where it stands.
     Simdgroup,
     /// `simdgroup_barrier(mem_threadgroup)`, exact on emulated simdgroups only.
@@ -190,6 +231,8 @@ struct Shape<'a> {
     us: &'a Uniformity,
     pdom: &'a PostDomTree<BlockId>,
     loops: &'a LoopForest<BlockId>,
+    /// The lane pairs `facts::Lanes::apart` compared since the search last charged them.
+    lanes_work: Cell<u64>,
 }
 
 impl Shape<'_> {
@@ -429,6 +472,17 @@ impl Shape<'_> {
                 return false;
             }
         }
+        // Each lane of every simdgroup at its address: from one base, no two lanes' bytes meet.
+        if let (Some(la), Some(lb), Some(sa), Some(sb)) = (&fa.lanes, &fb.lanes, a.size, b.size) {
+            let settled_base = |h: Option<BlockId>| !cross || h.is_none_or(invariant);
+            let mut work = 0;
+            let apart = la.apart(sa, lb, sb, &mut work);
+            self.lanes_work
+                .set(self.lanes_work.get().saturating_add(work));
+            if settled_base(la.base_home) && settled_base(lb.base_home) && apart {
+                return false;
+            }
+        }
         !self.one_value((a, fa), b, cross, &invariant)
     }
 
@@ -497,115 +551,17 @@ fn apart(
                 && (-lo <= down || -hi >= up)
                 && (!same || 0 >= up || 0 <= down)
         }
+        // A difference `n * g + e`, `|e| <= l`, lies between `down` and `up` (both excluded)
+        // only for a multiple `n * g` strictly between `down - l` and `up + l`: none where the
+        // first multiple above `down - l` is at least `up + l`. Each fact holds, so either
+        // keeps the bytes apart.
+        (Some(Spread::Lattice { facts }), Some(t)) if xa == Some(t) => {
+            facts.iter().any(|&(low, granule)| {
+                let (l, g) = (i128::from(low), i128::from(granule));
+                g > 0 && ((down - l).div_euclid(g) + 1) * g >= up + l
+            })
+        }
         _ => false,
-    }
-}
-
-/// The blocks reachable from the end of each block on barrier-free paths, with how
-/// ([`via`]), computed on demand and kept for the blocks whose accesses reach their end; or,
-/// walked back (`back`), the blocks whose end reaches the start of each block so.
-struct Reach {
-    /// By block: the reached blocks, or `None` before it is computed.
-    from_end: Vec<Option<Vec<(BlockId, u8)>>>,
-    /// Scratch: by block, the states reached in the current walk.
-    seen: Vec<u8>,
-    /// The walk follows edges back, from a block's start to the blocks whose end reaches it.
-    back: bool,
-}
-
-impl Reach {
-    fn new(nb: usize, back: bool, m: &mut Meter) -> Result<Reach, Error> {
-        let mut from_end = Vec::new();
-        m.reserve(&mut from_end, nb)?;
-        from_end.resize(nb, None);
-        let mut seen = Vec::new();
-        m.reserve(&mut seen, nb)?;
-        seen.resize(nb, 0u8);
-        Ok(Reach {
-            from_end,
-            seen,
-            back,
-        })
-    }
-
-    /// The blocks reached from the end of `x`; walked back, the blocks whose end reaches the
-    /// start of `x`.
-    fn of(&mut self, x: BlockId, s: &Shape<'_>, m: &mut Meter) -> Result<&[(BlockId, u8)], Error> {
-        let computed = self.from_end.get(x.index()).is_some_and(Option::is_some);
-        if !computed {
-            let list = self.walk(x, s, m)?;
-            if let Some(slot) = self.from_end.get_mut(x.index()) {
-                *slot = Some(list);
-            }
-        }
-        Ok(self
-            .from_end
-            .get(x.index())
-            .and_then(Option::as_deref)
-            .unwrap_or(&[]))
-    }
-
-    fn walk(
-        &mut self,
-        x: BlockId,
-        s: &Shape<'_>,
-        m: &mut Meter,
-    ) -> Result<Vec<(BlockId, u8)>, Error> {
-        let cfg = &s.e.cfg;
-        let back = self.back;
-        // A state is a block and whether the path to it crossed a retreating edge ([`via`]).
-        let flag = |cross: bool| if cross { via::CROSS } else { via::SAME };
-        let mut stack: Vec<(BlockId, bool)> = Vec::new();
-        let mut touched: Vec<BlockId> = Vec::new();
-        let degree = |at: BlockId| {
-            if back {
-                cfg.predecessors(at).len()
-            } else {
-                cfg.successors(at).len()
-            }
-        };
-        let edges = |at: BlockId, cross: bool, stack: &mut Vec<_>| {
-            if back {
-                for from in cfg.predecessors(at) {
-                    stack.push((from, cross || cfg.is_retreating(from, at)));
-                }
-            } else {
-                for to in cfg.successors(at) {
-                    stack.push((to, cross || cfg.is_retreating(at, to)));
-                }
-            }
-        };
-        m.grow(&mut stack, degree(x))?;
-        edges(x, false, &mut stack);
-        while let Some((y, cross)) = stack.pop() {
-            m.tick(1)?;
-            let Some(seen) = self.seen.get_mut(y.index()) else {
-                continue;
-            };
-            let f = flag(cross);
-            if *seen & f != 0 {
-                continue;
-            }
-            if *seen == 0 {
-                m.grow(&mut touched, 1)?;
-                touched.push(y);
-            }
-            *seen |= f;
-            if !s.acc.has_barrier(y) {
-                m.grow(&mut stack, degree(y))?;
-                edges(y, cross, &mut stack);
-            }
-        }
-        let mut out = Vec::new();
-        m.reserve(&mut out, touched.len())?;
-        for y in touched {
-            if let Some(seen) = self.seen.get_mut(y.index()) {
-                out.push((y, *seen));
-                *seen = 0;
-            }
-        }
-        m.release(crate::budget::vec_bytes(&stack));
-        Ok(out)
     }
 }
 
@@ -667,10 +623,17 @@ struct Decision {
 }
 
 /// Order the threadgroup-memory and device-memory accesses of kernel `e` that only Apple's
-/// simdgroup lockstep orders, by inserting barriers into its body (see the module documentation), for a device of
-/// profile `p`. An entry of another stage, or a kernel without such a pair, is returned
-/// unchanged.
-pub fn order(mut e: Entry, p: &DeviceProfile, m: &mut Meter) -> Result<Entry, Error> {
+/// simdgroup lockstep orders, by inserting barriers into its body (see the module
+/// documentation), for a device of profile `p`. Where `one_row` (the kernel's one-row variant,
+/// `LoweringInputs::one_row`) and each simdgroup lying within one row orders no pair a
+/// simdgroup barrier would ([`Lockstep::rows`]), only the threadgroup barriers are inserted.
+/// An entry of another stage, or a kernel without such a pair, is returned unchanged.
+pub fn order(
+    mut e: Entry,
+    p: &DeviceProfile,
+    one_row: bool,
+    m: &mut Meter,
+) -> Result<Entry, Error> {
     if !matches!(e.ep.stage, AbiStage::Kernel { .. }) {
         return Ok(e);
     }
@@ -689,10 +652,10 @@ pub fn order(mut e: Entry, p: &DeviceProfile, m: &mut Meter) -> Result<Entry, Er
             Ok(Tier::Direct | Tier::Cluster32)
         );
     let before = m.ledger();
-    let decided = decide(&e, (device, tangle), m);
+    let decided = decide(&e, (device, tangle), one_row, m);
     let spent = usize::try_from(m.ledger().saturating_sub(before)).unwrap_or(usize::MAX);
     m.release(spent);
-    let Some(d) = decided? else {
+    let Some((d, rows)) = decided? else {
         return Ok(e);
     };
     let barriers = if d.inserts.is_empty() {
@@ -703,22 +666,35 @@ pub fn order(mut e: Entry, p: &DeviceProfile, m: &mut Meter) -> Result<Entry, Er
         e.module = Module::new(parts, m)?;
         barriers
     };
+    let mut across_rows = Vec::new();
+    m.reserve(&mut across_rows, barriers.len())?;
+    across_rows.extend(
+        d.inserts
+            .iter()
+            .zip(&barriers)
+            .filter(|((_, _, o), _)| *o == Order::Rows)
+            .map(|(_, &id)| id),
+    );
     e.lockstep = Lockstep {
         barriers,
         emulated: d.emulated,
         device: d.device,
+        rows,
+        across_rows,
     };
     Ok(e)
 }
 
-/// The barriers kernel `e` needs, or `None` when it needs none; `device`: the device runs a
-/// simdgroup in lockstep; `tangle`: a subgroup barrier in divergent flow orders the threads that
-/// run it together (maximal reconvergence on 32-lane subgroups).
+/// The barriers kernel `e` needs, or `None` when it needs none, and whether none is needed where
+/// each simdgroup lies within one row of its threadgroup ([`Lockstep::rows`]); `device`: the
+/// device runs a simdgroup in lockstep; `tangle`: a subgroup barrier in divergent flow orders the
+/// threads that run it together (maximal reconvergence on 32-lane subgroups).
 fn decide(
     e: &Entry,
     (device, tangle): (bool, bool),
+    one_row: bool,
     m: &mut Meter,
-) -> Result<Option<Decision>, Error> {
+) -> Result<Option<(Decision, bool)>, Error> {
     let Some(body) = e.module.func(e.func).and_then(|f| f.body.as_ref()) else {
         return Ok(None);
     };
@@ -738,7 +714,7 @@ fn decide(
     let u = Uniformity::under_barriers(e, body, Among::Workgroup, &loops, m)?;
     let us = Uniformity::under_barriers(e, body, Among::Simdgroup, &loops, m)?;
     let pdom = PostDomTree::compute(&e.cfg, m)?;
-    let mut af = AddrFacts::new(e, body, &layouts, &us, m)?;
+    let mut af = AddrFacts::new(e, body, &layouts, &us, false, m)?;
     let mut wants: BTreeSet<Want> = BTreeSet::new();
     let mut flags = MemFlags::default();
     for (space, acc) in &spaces {
@@ -758,14 +734,61 @@ fn decide(
     if wants.is_empty() {
         return Ok(None);
     }
+    // The same pairs where each simdgroup lies within one row of its threadgroup, so that two of
+    // its threads' positions differ in `x` and are equal in `y` and `z` (`AddrFacts::new`'s
+    // `rows`). A threadgroup barrier none of them wants orders only pairs that meet where a
+    // simdgroup spans two rows, so it runs only in such a threadgroup (`Order::Rows`). And where
+    // none of them wants more than a threadgroup barrier, a dispatch of such threadgroups needs
+    // none of the simdgroup barriers; only a kernel whose subgroup barriers keep a 32-lane tier
+    // asks that (`tangle`, without the device's own lockstep).
+    drop(af);
+    let mut in_rows: BTreeSet<Want> = BTreeSet::new();
+    if (tangle && !device) || wants.iter().any(|w| w.order == Order::Threadgroup) {
+        let mut rows_af = AddrFacts::new(e, body, &layouts, &us, true, m)?;
+        for (_, acc) in &spaces {
+            pairs(
+                e,
+                acc,
+                (&u, &us),
+                (&pdom, &loops),
+                &mut rows_af,
+                &mut in_rows,
+                m,
+            )?;
+        }
+    }
+    let rows = tangle && !device && in_rows.iter().all(|w| w.order == Order::Threadgroup);
+    let mut wants: BTreeSet<Want> = wants
+        .into_iter()
+        .map(
+            |w| match w.order == Order::Threadgroup && !in_rows.contains(&w) {
+                true => Want {
+                    order: Order::Rows,
+                    ..w
+                },
+                false => w,
+            },
+        )
+        .collect();
+    // The one-row variant keeps the threadgroup barriers alone: in a threadgroup whose simdgroups
+    // each lie within one row, no pair a simdgroup barrier or an `Order::Rows` one orders meets.
+    if one_row && rows {
+        wants.retain(|w| w.order == Order::Threadgroup);
+        if wants.is_empty() {
+            return Ok(None);
+        }
+    }
     let term = spaces
         .first()
         .map_or(&[][..], |(_, acc)| acc.term.as_slice());
-    Ok(Some(stab(&wants, flags, (device, tangle), term, m)?))
+    Ok(Some((
+        stab(&wants, flags, (device, tangle), term, m)?,
+        rows,
+    )))
 }
 
 /// Collect into `wants` where barriers must order the conflicting pairs of `acc`, the accesses of
-/// one memory space: each pair is searched within that space's barrier intervals.
+/// one memory space: each pair is searched within that space's barrier intervals ([`search`]).
 fn pairs<'a>(
     e: &'a Entry,
     acc: &'a Accesses,
@@ -789,36 +812,13 @@ fn pairs<'a>(
         us,
         pdom,
         loops,
+        lanes_work: Cell::new(0),
     };
-    let mut reach = Reach::new(acc.range.len(), false, m)?;
-    let mut back = Reach::new(acc.range.len(), true, m)?;
-    let mut avoid = Avoid {
-        memo: BTreeMap::new(),
-    };
-    let want_bytes = tree_bytes(1, std::mem::size_of::<Want>());
-    let empty = Addr::default();
-    let mut consider = |(ai, bi): (usize, usize), inb: bool, flags: u8, m: &mut Meter| {
-        m.tick(1)?;
-        let (Some(a), Some(b)) = (acc.list.get(ai), acc.list.get(bi)) else {
-            return Ok::<(), Error>(());
-        };
-        let (fa, fb) = (
-            addrs.get(ai).unwrap_or(&empty),
-            addrs.get(bi).unwrap_or(&empty),
-        );
-        if !shape.conflict((a, fa), (b, fb), flags & via::CROSS != 0) {
-            return Ok(());
-        }
-        let w = shape.place((a, b), inb, &mut avoid, m)?;
-        if wants.insert(w) {
-            m.charge(want_bytes)?;
-        }
-        Ok(())
-    };
+    let mut s = Search::new(&shape, &addrs, wants, m)?;
     // Two reads never conflict, so a pair holds a write: a write's pairs are searched from it
     // forward, and a read's from the writes it reaches, walked back from their blocks. A body of
-    // many reads and few writes costs walks from the writes' blocks alone, linear in the body
-    // (the contract, which the device pass's reads of every buffer access keep).
+    // many reads and few writes costs walks from the writes' blocks alone (the contract, which
+    // the device pass's reads of every buffer access keep).
     let mut writes: Vec<u32> = Vec::new();
     for (i, a) in acc.list.iter().enumerate() {
         if a.write {
@@ -832,45 +832,28 @@ fn pairs<'a>(
         let hi = writes.partition_point(|&i| i < e);
         writes.get(lo..hi).unwrap_or(&[])
     };
+    // The pairs inside a block: an access and the later ones before its next barrier, and those
+    // reached around a loop into the block's start (`around`: how the block's end reaches its
+    // start).
     for (ai, a) in acc.list.iter().enumerate() {
         let next = acc.barrier_after(a.block, a.pos);
         let escapes = next.is_none();
         let start = acc.range.get(a.block.index()).map_or(0, |r| r.0 as usize);
         let first_bar = acc.first_barrier(a.block);
-        // Accesses of `a`'s block: later ones before its next barrier, and those reached around
-        // a loop into the block's start (`around`: how the block's end reaches its start).
         let in_block = |b: &Access, self_flags: u8| {
             let inb = b.pos > a.pos && next.is_none_or(|p| b.pos < p);
             let around = self_flags != 0 && first_bar.is_none_or(|p| b.pos < p);
             (inb || around).then_some((inb, if around { self_flags } else { 0 }))
         };
         if a.write {
-            let reached: Vec<(BlockId, u8)> = if escapes {
-                reach.of(a.block, &shape, m)?.to_vec()
+            let self_flags = if escapes {
+                s.self_flags(a.block, m)?
             } else {
-                Vec::new()
+                0
             };
-            m.charge(crate::budget::vec_bytes(&reached))?;
-            let self_flags = reached
-                .iter()
-                .find(|&&(y, _)| y == a.block)
-                .map_or(0, |&(_, f)| f);
             for (k, b) in acc.in_block(a.block).iter().enumerate() {
                 if let Some((inb, flags)) = in_block(b, self_flags) {
-                    consider((ai, start + k), inb, flags, m)?;
-                }
-            }
-            for &(y, flags) in &reached {
-                if y == a.block {
-                    continue;
-                }
-                let start = acc.range.get(y.index()).map_or(0, |r| r.0 as usize);
-                let first_bar = acc.first_barrier(y);
-                for (k, b) in acc.in_block(y).iter().enumerate() {
-                    if first_bar.is_some_and(|p| b.pos >= p) {
-                        break;
-                    }
-                    consider((ai, start + k), false, flags, m)?;
+                    s.consider((ai, start + k), inb, flags, m)?;
                 }
             }
         } else {
@@ -880,10 +863,7 @@ fn pairs<'a>(
                 continue;
             }
             let self_flags = if escapes {
-                back.of(a.block, &shape, m)?
-                    .iter()
-                    .find(|&&(x, _)| x == a.block)
-                    .map_or(0, |&(_, f)| f)
+                s.self_flags(a.block, m)?
             } else {
                 0
             };
@@ -892,59 +872,53 @@ fn pairs<'a>(
                     continue;
                 };
                 if let Some((inb, flags)) = in_block(b, self_flags) {
-                    consider((ai, bi as usize), inb, flags, m)?;
+                    s.consider((ai, bi as usize), inb, flags, m)?;
                 }
             }
         }
     }
-    // A read in another block than a write it reaches: from each block's writes before its first
-    // barrier, back to the blocks whose end reaches its start, and their reads after their last.
-    let mut done: Option<BlockId> = None;
-    for &wi in &writes {
-        let Some(y) = acc.list.get(wi as usize).map(|w| w.block) else {
-            continue;
-        };
-        if done == Some(y) {
-            continue;
-        }
-        done = Some(y);
-        let first_bar = acc.first_barrier(y);
-        let ws: Vec<usize> = writes_of(y)
-            .iter()
-            .map(|&i| i as usize)
-            .filter(|&i| {
-                acc.list
-                    .get(i)
-                    .is_some_and(|w| first_bar.is_none_or(|p| w.pos < p))
-            })
-            .collect();
-        m.charge(crate::budget::vec_bytes(&ws))?;
-        if ws.is_empty() {
-            continue;
-        }
-        let from = back.of(y, &shape, m)?.to_vec();
-        m.charge(crate::budget::vec_bytes(&from))?;
-        for &(x, flags) in &from {
-            if x == y {
+    // Across blocks: from each block's writes after its last barrier forward, and from each
+    // block's writes before its first barrier back to the reads that reach them.
+    let blocks = u32::try_from(acc.range.len()).unwrap_or(u32::MAX);
+    let mut ends: Vec<u32> = Vec::new();
+    for ahead in [true, false] {
+        for raw in 0..blocks {
+            let x = BlockId::new(raw);
+            let bar = if ahead { None } else { acc.first_barrier(x) };
+            ends.clear();
+            for &i in writes_of(x) {
+                let Some(w) = acc.list.get(i as usize) else {
+                    continue;
+                };
+                let open = if ahead {
+                    acc.barrier_after(x, w.pos).is_none()
+                } else {
+                    bar.is_none_or(|p| w.pos < p)
+                };
+                if open {
+                    m.grow(&mut ends, 1)?;
+                    ends.push(i);
+                }
+            }
+            if ends.is_empty() {
                 continue;
             }
-            let start = acc.range.get(x.index()).map_or(0, |r| r.0 as usize);
-            let last_bar = acc.barriers.get(x.index()).and_then(|v| v.last().copied());
-            for (k, a) in acc.in_block(x).iter().enumerate() {
-                if a.write || last_bar.is_some_and(|p| a.pos < p) {
-                    continue;
-                }
-                for &bi in &ws {
-                    consider((start + k, bi), false, flags, m)?;
-                }
+            if ahead {
+                s.ahead(x, &ends, m)?;
+            } else {
+                s.behind(x, &ends, m)?;
             }
         }
     }
+    m.release(crate::budget::vec_bytes(&ends));
+    s.finish(m);
     Ok(())
 }
 
 /// One barrier at a position of as many intervals as it can serve ([`points`]): threadgroup
-/// barriers first, then simdgroup barriers for the intervals no threadgroup barrier serves. On a
+/// barriers first, then `Order::Rows` ones for the intervals of pairs that meet only across rows
+/// no threadgroup barrier serves, then simdgroup barriers for the intervals no threadgroup barrier
+/// that always runs serves. On a
 /// device that runs a simdgroup in lockstep (`device`), the places only emulated simdgroups
 /// would make exact are counted rather than given a barrier; where a subgroup barrier orders the
 /// threads that run it together (`tangle`), they take a simdgroup barrier and leave the tier to
@@ -973,9 +947,19 @@ fn stab(
             .range((w.block, w.lo, Order::Threadgroup)..=(w.block, w.hi, Order::Threadgroup))
             .any(|&(_, _, o)| o == Order::Threadgroup)
     };
+    let rows: Vec<Want> = wants
+        .iter()
+        .filter(|w| w.order == Order::Rows && !served(&placed, w))
+        .copied()
+        .collect();
+    m.charge(crate::budget::vec_bytes(&rows))?;
+    for (w, at) in points(rows, term, m)? {
+        m.charge(bytes)?;
+        placed.insert((w.block, at, Order::Rows));
+    }
     let rest: Vec<Want> = wants
         .iter()
-        .filter(|w| w.order != Order::Threadgroup && !served(&placed, w))
+        .filter(|w| !matches!(w.order, Order::Threadgroup | Order::Rows) && !served(&placed, w))
         .copied()
         .collect();
     m.charge(crate::budget::vec_bytes(&rest))?;
@@ -1151,12 +1135,18 @@ fn insert(
     let mem = int32(parts, bits, m)?;
     let wg_scope = int32(parts, 1, m)?;
     let sg_scope = int32(parts, 4, m)?;
-    let wg = if inserts.iter().any(|&(_, _, o)| o == Order::Threadgroup) {
+    let wg = if inserts
+        .iter()
+        .any(|&(_, _, o)| matches!(o, Order::Threadgroup | Order::Rows))
+    {
         Some(declaration(parts, b"air.wg.barrier", m)?)
     } else {
         None
     };
-    let sg = if inserts.iter().any(|&(_, _, o)| o != Order::Threadgroup) {
+    let sg = if inserts
+        .iter()
+        .any(|&(_, _, o)| matches!(o, Order::Simdgroup | Order::Emulated))
+    {
         Some(declaration(parts, b"air.simdgroup.barrier", m)?)
     } else {
         None
@@ -1169,7 +1159,7 @@ fn insert(
     };
     let call = |o: Order| -> Result<Inst, Error> {
         let (decl, name, scope, arg) = match o {
-            Order::Threadgroup => (
+            Order::Threadgroup | Order::Rows => (
                 wg,
                 BarrierName::Threadgroup,
                 ThreadScope::Threadgroup,

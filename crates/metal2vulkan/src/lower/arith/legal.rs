@@ -7,9 +7,14 @@
 //! - `i1` is `bool`; every other integer is held **zero-extended** in an unsigned 32-bit
 //!   container (`i2`..`i32`) or 64-bit container (`i33`..`i64`), or, without `shaderInt64`, as
 //!   two `u32` words ([`Held::Wide`], [`widen`], `super::wide`). The bits above the AIR width are
-//!   always zero, so an operation that can set them (add, sub, mul, shl, signed results) masks
-//!   its result, and a signed operation sign-extends its operands first. `i8`/`i16` therefore
-//!   never need `Int8`/`Int16`.
+//!   zero in every value that is not poison, so an operation that can set them (add, sub, mul,
+//!   shl, signed results) masks its result, and a signed operation sign-extends its operands
+//!   first. An add, sub, mul or shl the AIR marks `nuw` in a container is not masked: its only
+//!   results that would set them are poison (`super::ops::int_binary`; a loop counter's
+//!   increment is one, and a masked latch hides the loop's trip count from the driver). Where a
+//!   value must be defined although its operand is poison, it is masked: `freeze`, the bytes a
+//!   store writes (`memory::leaf`), a narrow atomic's operand, and a bitcast's packed lanes. The
+//!   two-word form keeps its masks. `i8`/`i16` therefore never need `Int8`/`Int16`.
 //! - `float` is `f32` and `double` is `f64` (needs `shaderFloat64`, else refused). `half` and
 //!   `bfloat` are **held widened** in an `f32` that is always exactly a value of the narrow format,
 //!   on every profile ([`super::narrow`]): no profile needs `shaderFloat16`, and a constant
@@ -131,9 +136,13 @@ impl FloatFmt {
         }
     }
 
-    /// The container bits of this format's bits `b` (exact: the same value).
+    /// The container bits of this format's bits `b` (exact: the same value, and a NaN its sign
+    /// and payload, a signalling one not quieted).
     pub fn widen_bits(self, b: u64) -> u64 {
         match self {
+            FloatFmt::Half if b & 0x7C00 == 0x7C00 && b & 0x3FF != 0 => {
+                ((b & 0x8000) << 16) | 0x7F80_0000 | ((b & 0x3FF) << 13)
+            }
             FloatFmt::Half => u64::from((f16_to_f64(b as u16) as f32).to_bits()),
             FloatFmt::BFloat => (b & 0xFFFF) << 16,
             _ => b,

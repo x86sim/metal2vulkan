@@ -75,7 +75,6 @@ fn modules() -> Vec<Build> {
         tiled_texels_module,
         two_plane_texels_module,
         visibility_combine_module,
-        visibility_resolve_module,
         ycbcr_refresh_module,
         ycbcr_write_module,
     );
@@ -135,6 +134,12 @@ fn modules() -> Vec<Build> {
         push(
             format!("ycbcr_convert_floats_module({conversion:?})"),
             Box::new(move |d| Ok(bind::ycbcr_convert_floats_module(d, conversion)?.spirv)),
+        );
+    }
+    for copy in bind::PagesCopy::ALL {
+        push(
+            format!("pages_copy_module({copy:?})"),
+            Box::new(move |d| Ok(bind::pages_copy_module(d, copy)?.spirv)),
         );
     }
     for copy in PlanesCopy::ALL {

@@ -59,7 +59,7 @@ use super::chroma_pairs::{is_four_two_two, TEXEL_BYTES};
 use super::host_bytes::HostBytes;
 use super::pvrtc::{is_pvrtc, BLOCK_BYTES};
 use super::view_plan::ViewRecord;
-use metal2vulkan::bind::YCbCrCodes;
+use metal2vulkan::bind::{AstcDecode, YCbCrCodes};
 use metal2vulkan::error::{Feature, Unsupported};
 use metal2vulkan::metal::format::{
     aspects, byte_format, is_depth_stencil, ycbcr_format, FormatMapping,
@@ -111,15 +111,16 @@ pub enum CopyProblem {
     /// not measured).
     Offset,
     /// A `bytesPerRow` that is not a multiple of the copy unit, or that does not cover a row,
-    /// where plain Metal's answer is undefined or not measured: a blit out of a texture whose
-    /// rows overlap (Metal's writes race), Metal's aligned path into a texture at a pitch below a
-    /// row (it reads garbage at 0) or from an offset of 16 or more, a depth or stencil format
-    /// other than `Depth32Float`, a texture over a buffer, and a CPU copy of a texture over a
+    /// where plain Metal's answer is undefined or not measured: Metal's aligned path into a
+    /// texture at a pitch of 0 (it reads garbage) or from an offset of 16 or more, a depth or
+    /// stencil format other than `Depth32Float` or a texture over a buffer at a pitch off the
+    /// copy unit or of 0 for more than one row, a multisampled texture's copy out at a pitch
+    /// below a row (where its rows lie is not measured), and a CPU copy of a texture over a
     /// buffer or of a pitch of 0 for more than one row and image (other layouts copy where plain
-    /// Metal places the rows).
+    /// Metal places the rows, a blit's rows out of a texture that overlap in turn, the later
+    /// row's bytes standing).
     ///
-    /// Basis: unknown (undefined or unmeasured by the shapes listed above — Metal's writes race
-    /// where the rows overlap — and no run on record names a device or release).
+    /// Basis: unknown (undefined or unmeasured by the shapes listed above).
     BytesPerRow,
     /// Bytes past the end of the buffer: of a no-copy buffer read from, past the end of its
     /// host pages, which plain Metal reads up to. Past that, and past another buffer's length,
@@ -204,11 +205,17 @@ pub(super) struct CopyUnit {
 pub(super) use metal2vulkan::metal::format::block_extent;
 
 /// The bytes of a block (a texel, uncompressed) of the colour format `pf`: its byte format's
-/// (`metal::format::byte_format`, the format whose image holds Metal's bytes), and a PVRTC
-/// block's 8, which the device may hold in a carrier of no PVRTC format (`pvrtc.rs`).
+/// (`metal::format::byte_format`, the format whose image holds Metal's bytes), a PVRTC block's 8
+/// and an ASTC block's 16, which the device may hold in a carrier of no PVRTC or ASTC format
+/// (`pvrtc.rs`, `astc.rs`).
 pub(super) fn block_bytes(pf: PixelFormat) -> Option<u32> {
     if is_pvrtc(pf) {
         return Some(BLOCK_BYTES);
+    }
+    // An ASTC block is 16 bytes at every footprint, Apple's 4x2 and 8x4 among them, which no
+    // Vulkan format holds (their carrier does, `astc.rs`).
+    if AstcDecode::of(pf).is_some() {
+        return Some(AstcDecode::BLOCK_BYTES);
     }
     // Plain Metal copies a 4:2:2 texture's 2-byte texels at any x, width, offset and pitch (its
     // validation asks for 2 x 1 blocks of 4 bytes), which its carrier holds
@@ -456,6 +463,16 @@ impl HostLayout {
     /// The bytes of the tightly packed staging layout.
     pub(super) fn packed_len(&self) -> u64 {
         self.row_bytes * self.rows * self.images
+    }
+
+    /// The tightly packed layout of the same rows and images: host bytes
+    /// [`pack`](Self::pack) wrote, read as the host buffer.
+    pub(super) fn packed(&self) -> HostLayout {
+        HostLayout {
+            bytes_per_row: self.row_bytes,
+            bytes_per_image: self.row_bytes * self.rows,
+            ..*self
+        }
     }
 
     /// Whether the host buffer's layout is the tightly packed one: each row at its packed

@@ -44,8 +44,8 @@ use crate::indirect_commands::{
 };
 use crate::library_facts::{FunctionDescriptorSpec, LibraryFacts};
 use crate::mesh_descriptors::{
-    DescriptorSpec as MeshDescriptorSpec, MeshDescriptorFacts, SuppliedLists as MeshSuppliedLists,
-    AWAY as MESH_AWAY,
+    DescriptorLimits as MeshDescriptorLimits, DescriptorSpec as MeshDescriptorSpec,
+    MeshDescriptorFacts, SuppliedLists as MeshSuppliedLists, AWAY as MESH_AWAY,
 };
 use crate::pass_descriptors::{
     AttachmentFacts, Indices, Numbers, PassDescriptorFacts, PassSpec, Reads, Row, Shape,
@@ -56,6 +56,9 @@ use crate::pipeline_functions::{FunctionsDescriptorFacts, FunctionsDescriptorSpe
 use crate::pipeline_handlers::{
     BothPaths, Delivered, Form as PipelineForm, Handled, StateFacts,
     IMAGEBLOCK as HANDLER_IMAGEBLOCK, WAIT as HANDLER_WAIT,
+};
+use crate::pipeline_limits::{
+    floored, ComputeLimitsSpec, ComputeStateLimits, Creation, MeshLimitsSpec, MeshStateLimits,
 };
 use crate::pipeline_option_reflection::UnderOptions;
 use crate::pipeline_options::{OptionOutcome, FRAGMENT_STAGE, KERNEL_STAGE, VERTEX_STAGE};
@@ -93,7 +96,7 @@ use metal2vulkan::metal::{
     ArgumentBuffersTier, BindingAccess, BindingType, FunctionOptions, FunctionType, PatchType,
     PixelFormat, ReadWriteTextureTier, RenderStages,
 };
-use metal2vulkan_runtime::{PurgeableState, SparsePageSize};
+use metal2vulkan_runtime::{PurgeableState, SparsePageSize, VisibilityResultType};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, ClassType};
@@ -101,6 +104,7 @@ use objc2_foundation::{
     NSArray, NSDictionary, NSError, NSObjectProtocol, NSRange, NSString, NSUInteger, NSURL,
 };
 use objc2_metal::MTLBlitOption;
+use objc2_metal::MTLGPUFamily;
 use objc2_metal::{
     MTLArgumentDescriptor, MTLArgumentEncoder, MTLArrayType, MTLAttribute, MTLAttributeFormat,
     MTLBarrierScope, MTLBinaryArchive, MTLBinaryArchiveDescriptor, MTLBinding, MTLBindingAccess,
@@ -143,8 +147,8 @@ use objc2_metal::{
     MTLTriangleFillMode, MTLVertexAttribute, MTLVertexAttributeDescriptor,
     MTLVertexAttributeDescriptorArray, MTLVertexBufferLayoutDescriptor,
     MTLVertexBufferLayoutDescriptorArray, MTLVertexDescriptor, MTLVertexFormat,
-    MTLVertexStepFunction, MTLViewport, MTLVisibilityResultMode, MTLVisibleFunctionTable,
-    MTLVisibleFunctionTableDescriptor, MTLWinding,
+    MTLVertexStepFunction, MTLViewport, MTLVisibilityResultMode, MTLVisibilityResultType,
+    MTLVisibleFunctionTable, MTLVisibleFunctionTableDescriptor, MTLWinding,
 };
 
 /// Native Metal, with the objects the case has made.
@@ -1869,6 +1873,32 @@ fn state_mesh_descriptor(descriptor: &Retained<MTLMeshRenderPipelineDescriptor>)
         MESH_AWAY.stencil_format.as_raw() as usize
     ));
     descriptor.setSupportIndirectCommandBuffers(MESH_AWAY.support_indirect_command_buffers);
+    let limits = MESH_AWAY.limits;
+    descriptor.setMaxTotalThreadsPerObjectThreadgroup(
+        limits.max_total_threads_per_object_threadgroup as usize,
+    );
+    descriptor.setMaxTotalThreadsPerMeshThreadgroup(
+        limits.max_total_threads_per_mesh_threadgroup as usize,
+    );
+    descriptor.setObjectThreadgroupSizeIsMultipleOfThreadExecutionWidth(
+        limits.object_threadgroup_size_is_multiple_of_thread_execution_width,
+    );
+    descriptor.setMeshThreadgroupSizeIsMultipleOfThreadExecutionWidth(
+        limits.mesh_threadgroup_size_is_multiple_of_thread_execution_width,
+    );
+    descriptor.setPayloadMemoryLength(limits.payload_memory_length as usize);
+    descriptor
+        .setMaxTotalThreadgroupsPerMeshGrid(limits.max_total_threadgroups_per_mesh_grid as usize);
+    // SAFETY: the count is the stated table's own 2, and nothing of this family compiles the
+    // descriptor.
+    unsafe {
+        descriptor.setMaxVertexAmplificationCount(limits.max_vertex_amplification_count as usize)
+    };
+    descriptor.setRequiredThreadsPerObjectThreadgroup(size(
+        limits.required_threads_per_object_threadgroup,
+    ));
+    descriptor
+        .setRequiredThreadsPerMeshThreadgroup(size(limits.required_threads_per_mesh_threadgroup));
     let colors: Retained<MTLRenderPipelineColorAttachmentDescriptorArray> =
         descriptor.colorAttachments();
     for color in MESH_AWAY.colors {
@@ -1912,7 +1942,32 @@ fn read_mesh_descriptor(
         stencil_attachment_pixel_format: descriptor.stencilAttachmentPixelFormat().0 as u32,
         support_indirect_command_buffers: descriptor.supportIndirectCommandBuffers(),
         binary_archives: archives.map_or(0, |held| held.len() as u64),
+        limits: read_mesh_limits(descriptor),
         supplied: supplied.then(|| read_mesh_supplied(descriptor)),
+    }
+}
+
+/// A mesh descriptor's limit fields, as its getters answer them.
+fn read_mesh_limits(
+    descriptor: &Retained<MTLMeshRenderPipelineDescriptor>,
+) -> MeshDescriptorLimits {
+    let axes = |held: MTLSize| [held.width as u32, held.height as u32, held.depth as u32];
+    MeshDescriptorLimits {
+        max_total_threads_per_object_threadgroup: descriptor.maxTotalThreadsPerObjectThreadgroup()
+            as u32,
+        max_total_threads_per_mesh_threadgroup: descriptor.maxTotalThreadsPerMeshThreadgroup()
+            as u32,
+        object_threadgroup_size_is_multiple_of_thread_execution_width: descriptor
+            .objectThreadgroupSizeIsMultipleOfThreadExecutionWidth(),
+        mesh_threadgroup_size_is_multiple_of_thread_execution_width: descriptor
+            .meshThreadgroupSizeIsMultipleOfThreadExecutionWidth(),
+        payload_memory_length: descriptor.payloadMemoryLength() as u32,
+        max_total_threadgroups_per_mesh_grid: descriptor.maxTotalThreadgroupsPerMeshGrid() as u32,
+        max_vertex_amplification_count: descriptor.maxVertexAmplificationCount() as u32,
+        required_threads_per_object_threadgroup: axes(
+            descriptor.requiredThreadsPerObjectThreadgroup(),
+        ),
+        required_threads_per_mesh_threadgroup: axes(descriptor.requiredThreadsPerMeshThreadgroup()),
     }
 }
 
@@ -2182,6 +2237,10 @@ impl Side for MetalSide {
             device: self.device.name().to_string(),
             driver: "Metal".to_owned(),
             api: "Metal".to_owned(),
+            // An Apple GPU keeps textures losslessly compressed; a Mac's Intel or AMD GPU, which
+            // supports no Apple family, keeps none (the consumer's AMD 5300M and Intel 630).
+            lossless_compression: self.device.supportsFamily(MTLGPUFamily::Apple1),
+            host: None,
         }
     }
 
@@ -2835,6 +2894,7 @@ impl Side for MetalSide {
         descriptor.setReductionMode(MTLSamplerReductionMode(
             spec.reduction_mode.as_raw() as usize
         ));
+        descriptor.setLodBias(spec.lod_bias);
         descriptor.setSupportArgumentBuffers(spec.support_argument_buffers);
         let sampler = self
             .device
@@ -3717,6 +3777,99 @@ impl Side for MetalSide {
             stages(&descriptor)?;
         }
         Ok(read_mesh_descriptor(&descriptor, !spec.shape.resets()))
+    }
+
+    fn mesh_pipeline_limits(
+        &mut self,
+        library: Handle,
+        spec: &MeshLimitsSpec<'_>,
+    ) -> Answer<Creation<MeshStateLimits>> {
+        let held: &Retained<ProtocolObject<dyn MTLLibrary>> = self
+            .libraries
+            .get(library.0 as usize)
+            .ok_or_else(|| Failure::named("NoSuchHandle", format!("library {}", library.0)))?;
+        let function = |entry: &str| {
+            held.newFunctionWithName(&NSString::from_str(entry))
+                .ok_or_else(|| Failure::named("NoSuchFunction", entry.to_owned()))
+        };
+        let descriptor = MTLMeshRenderPipelineDescriptor::new();
+        // SAFETY: each function is of this library, the descriptor is this call's own, and the
+        // amplification count is a case's own, one `mesh_pipeline_limits.m` measured Metal
+        // answering for rather than ending the process.
+        unsafe {
+            descriptor.setMeshFunction(Some(&*function(spec.mesh)?));
+            if let Some(object) = spec.object {
+                descriptor.setObjectFunction(Some(&*function(object)?));
+            }
+            descriptor.setMaxVertexAmplificationCount(spec.amplification as usize);
+        }
+        descriptor.setRasterizationEnabled(false);
+        descriptor.setMaxTotalThreadsPerObjectThreadgroup(spec.max_object as usize);
+        descriptor.setMaxTotalThreadsPerMeshThreadgroup(spec.max_mesh as usize);
+        descriptor.setMaxTotalThreadgroupsPerMeshGrid(spec.max_grid as usize);
+        descriptor.setPayloadMemoryLength(spec.payload as usize);
+        let made = self
+            .device
+            .newRenderPipelineStateWithMeshDescriptor_options_reflection_error(
+                &descriptor,
+                MTLPipelineOption::None,
+                None,
+            );
+        let Ok(state) = made else {
+            return Ok(Creation::refused());
+        };
+        // Declared, so the coverage derivation types the receiver.
+        let state: Retained<ProtocolObject<dyn MTLRenderPipelineState>> = state;
+        let axes = |held: MTLSize| [held.width as u64, held.height as u64, held.depth as u64];
+        let object = spec.object.is_some();
+        Ok(Creation::made(MeshStateLimits {
+            max_total_threads_per_object_threadgroup: object
+                .then(|| floored(state.maxTotalThreadsPerObjectThreadgroup() as u64)),
+            max_total_threads_per_mesh_threadgroup: floored(
+                state.maxTotalThreadsPerMeshThreadgroup() as u64,
+            ),
+            object_thread_execution_width: object
+                .then(|| state.objectThreadExecutionWidth() as u64),
+            mesh_thread_execution_width: state.meshThreadExecutionWidth() as u64,
+            max_total_threadgroups_per_mesh_grid: state.maxTotalThreadgroupsPerMeshGrid() as u64,
+            required_threads_per_object_threadgroup: axes(
+                state.requiredThreadsPerObjectThreadgroup(),
+            ),
+            required_threads_per_mesh_threadgroup: axes(state.requiredThreadsPerMeshThreadgroup()),
+            max_total_threads_per_threadgroup: state.maxTotalThreadsPerThreadgroup() as u64,
+        }))
+    }
+
+    fn compute_pipeline_limits(
+        &mut self,
+        library: Handle,
+        spec: &ComputeLimitsSpec<'_>,
+    ) -> Answer<Creation<ComputeStateLimits>> {
+        let held: &Retained<ProtocolObject<dyn MTLLibrary>> = self
+            .libraries
+            .get(library.0 as usize)
+            .ok_or_else(|| Failure::named("NoSuchHandle", format!("library {}", library.0)))?;
+        let function = held
+            .newFunctionWithName(&NSString::from_str(spec.entry))
+            .ok_or_else(|| Failure::named("NoSuchFunction", spec.entry.to_owned()))?;
+        let descriptor = MTLComputePipelineDescriptor::new();
+        descriptor.setComputeFunction(Some(&function));
+        descriptor.setMaxTotalThreadsPerThreadgroup(spec.max_total_threads as usize);
+        let made = self
+            .device
+            .newComputePipelineStateWithDescriptor_options_reflection_error(
+                &descriptor,
+                MTLPipelineOption::None,
+                None,
+            );
+        let Ok(state) = made else {
+            return Ok(Creation::refused());
+        };
+        // Declared, so the coverage derivation types the receiver.
+        let state: Retained<ProtocolObject<dyn MTLComputePipelineState>> = state;
+        Ok(Creation::made(ComputeStateLimits {
+            max_total_threads_per_threadgroup: floored(state.maxTotalThreadsPerThreadgroup() as u64),
+        }))
     }
 
     fn pass_descriptor_facts(&mut self, spec: &PassSpec) -> Answer<PassDescriptorFacts> {
@@ -5766,6 +5919,146 @@ impl Side for MetalSide {
         })
     }
 
+    fn event_wait_behind_a_running_signal(
+        &mut self,
+        shared: bool,
+    ) -> Answer<crate::event_orders::WaitBehindRunningSignal> {
+        use crate::event_orders::{
+            Status, WaitBehindRunningSignal, COMPLETED, COMPLETION, LONG_FILLS, LONG_FILL_BYTES,
+            RUNNING_WINDOW, SCHEDULED, SCRATCH, WAITING_BYTE,
+        };
+        objc2::rc::autoreleasepool(|_| {
+            let queue = || {
+                self.device
+                    .newCommandQueue()
+                    .ok_or_else(|| Failure::named("NewCommandQueue", "returned nil"))
+            };
+            let (signalling_queue, waiting_queue) = (queue()?, queue()?);
+            // One event of the row's kind, and the `MTLEvent` both kinds are to the encoders.
+            let shared_event = match shared {
+                true => Some(
+                    self.device
+                        .newSharedEvent()
+                        .ok_or_else(|| Failure::named("NewSharedEvent", "returned nil"))?,
+                ),
+                false => None,
+            };
+            let plain_event = match &shared_event {
+                Some(_) => None,
+                None => Some(
+                    self.device
+                        .newEvent()
+                        .ok_or_else(|| Failure::named("NewEvent", "returned nil"))?,
+                ),
+            };
+            let as_event: &ProtocolObject<dyn MTLEvent> = match (&shared_event, &plain_event) {
+                (Some(event), _) => ProtocolObject::from_ref(&**event),
+                (None, Some(event)) => event,
+                (None, None) => unreachable!("one of the two kinds is made"),
+            };
+            // The companion the signaller signals just before the event: still 0 when read, last,
+            // it says the event's signal had not landed when the rest was read.
+            let landed = self
+                .device
+                .newSharedEvent()
+                .ok_or_else(|| Failure::named("NewSharedEvent", "returned nil"))?;
+            let long = self
+                .device
+                .newBufferWithLength_options(
+                    LONG_FILL_BYTES as usize,
+                    MTLResourceOptions::StorageModePrivate,
+                )
+                .ok_or_else(|| Failure::named("NewBuffer", "returned nil"))?;
+            let scratch = self
+                .device
+                .newBufferWithLength_options(
+                    SCRATCH as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .ok_or_else(|| Failure::named("NewBuffer", "returned nil"))?;
+            // The long job: fills alone, ahead of the signal.
+            let signalling = signalling_queue
+                .commandBuffer()
+                .ok_or_else(|| Failure::named("CommandBuffer", "returned nil"))?;
+            let encoder = signalling
+                .blitCommandEncoder()
+                .ok_or_else(|| Failure::named("BlitCommandEncoder", "returned nil"))?;
+            for fill in 0..LONG_FILLS {
+                encoder.fillBuffer_range_value(
+                    &long,
+                    objc2_foundation::NSRange::new(0, LONG_FILL_BYTES as usize),
+                    fill as u8,
+                );
+            }
+            encoder.endEncoding();
+            signalling.encodeSignalEvent_value(ProtocolObject::from_ref(&*landed), 1);
+            signalling.encodeSignalEvent_value(as_event, 1);
+            let signalling_done = completion_channel(&signalling);
+            let waiting = waiting_queue
+                .commandBuffer()
+                .ok_or_else(|| Failure::named("CommandBuffer", "returned nil"))?;
+            waiting.encodeWaitForEvent_value(as_event, 1);
+            let encoder = waiting
+                .blitCommandEncoder()
+                .ok_or_else(|| Failure::named("BlitCommandEncoder", "returned nil"))?;
+            encoder.fillBuffer_range_value(
+                &scratch,
+                objc2_foundation::NSRange::new(0, SCRATCH as usize),
+                WAITING_BYTE,
+            );
+            encoder.endEncoding();
+            let mut log = HandlerLog::new();
+            // SAFETY: each block is a valid heap block the log keeps alive for as long as this
+            // probe runs, which outlives every call Metal makes of it.
+            log.add(SCHEDULED, |block| unsafe {
+                waiting.addScheduledHandler(block)
+            });
+            log.add(COMPLETED, |block| unsafe {
+                waiting.addCompletedHandler(block)
+            });
+            // The signaller first, so its signal is submitted ahead of the wait.
+            signalling.commit();
+            waiting.commit();
+            std::thread::sleep(RUNNING_WINDOW);
+            let waiting_while_it_runs = Status::read(status_word(waiting.status()));
+            let waiting_handlers_while_it_runs = log.names();
+            let value_while_it_runs = shared_event.as_ref().map(|event| event.signaledValue());
+            let signalling_while_it_runs = Status::read(status_word(signalling.status()));
+            // Last: 0 says nothing above was read after the event's signal landed.
+            let landed_before_the_reading = landed.signaledValue() != 0;
+            log.wait_for(COMPLETED, COMPLETION);
+            let waiting_handlers_at_the_end = log.names();
+            let waiting_at_the_end = if waiting_handlers_at_the_end
+                .iter()
+                .any(|name| name == COMPLETED)
+            {
+                Status::read(status_word(waiting.status()))
+            } else {
+                Status::NeverSettled
+            };
+            let signalling_at_the_end = settled(&signalling_done, &signalling);
+            // SAFETY: `SCRATCH` bytes of the shared buffer, whose writer has completed.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    scratch.contents().as_ptr().cast::<u8>(),
+                    SCRATCH as usize,
+                )
+            }
+            .to_vec();
+            Ok(WaitBehindRunningSignal {
+                landed_before_the_reading,
+                waiting_while_it_runs,
+                waiting_handlers_while_it_runs,
+                value_while_it_runs,
+                signalling_while_it_runs,
+                waiting_handlers_at_the_end,
+                waiting_at_the_end,
+                signalling_at_the_end,
+                bytes,
+            })
+        })
+    }
+
     fn signal_before_a_wait(&mut self) -> Answer<crate::event_orders::SignalBeforeWait> {
         use crate::event_orders::{Status, HELD_FOR, SCRATCH, SIGNAL_WAIT};
         objc2::rc::autoreleasepool(|_| {
@@ -6798,6 +7091,131 @@ impl Side for MetalSide {
             state_encoder_status,
         ))
     }
+
+    fn empty_command_buffers(
+        &mut self,
+    ) -> Answer<crate::empty_command_buffers::EmptyCommandBuffers> {
+        use crate::empty_command_buffers::{
+            Alone, Behind, EmptyCommandBuffers, ARRIVAL, EMPTY, FILL, FILL_BYTES,
+        };
+        use crate::event_orders::Status;
+        use std::sync::{mpsc, Arc, Mutex};
+        type Block =
+            block2::RcBlock<dyn Fn(std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>)>;
+        // A block that sends the status its command buffer reads inside it, and records `name`
+        // in `order` where one is given.
+        let sender = |name: Option<&'static str>, order: &Arc<Mutex<Vec<String>>>| {
+            let (sent, received) = mpsc::channel();
+            let order = Arc::clone(order);
+            let block: Block = block2::RcBlock::new(
+                move |own: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                    if let (Some(name), Ok(mut order)) = (name, order.lock()) {
+                        order.push(name.to_owned());
+                    }
+                    // SAFETY: Metal hands the handler its own command buffer, alive for the call.
+                    let status = unsafe { own.as_ref() }.status();
+                    let _ = sent.send(status_word(status).to_owned());
+                },
+            );
+            (block, received)
+        };
+        let settled = |received: &mpsc::Receiver<String>| match received.recv_timeout(ARRIVAL) {
+            Ok(word) => Status::read(word),
+            Err(_) => Status::NeverSettled,
+        };
+        objc2::rc::autoreleasepool(|_| {
+            let queue = self
+                .device
+                .newCommandQueue()
+                .ok_or_else(|| Failure::named("NewCommandQueue", "returned nil"))?;
+            let order: Arc<Mutex<Vec<String>>> = Arc::default();
+            // Alone on an idle queue.
+            let alone: Retained<ProtocolObject<dyn MTLCommandBuffer>> = queue
+                .commandBuffer()
+                .ok_or_else(|| Failure::named("CommandBuffer", "returned nil"))?;
+            let (scheduled, in_scheduled) = sender(None, &order);
+            let (completed, in_completed) = sender(None, &order);
+            // SAFETY: both blocks are valid heap blocks held for the rest of this probe, which
+            // does not return before both handlers ran or their bounds ran out.
+            unsafe {
+                alone.addScheduledHandler(block2::RcBlock::as_ptr(&scheduled));
+                alone.addCompletedHandler(block2::RcBlock::as_ptr(&completed));
+            }
+            let kernel_before = [alone.kernelStartTime(), alone.kernelEndTime()];
+            let gpu_before = [alone.GPUStartTime(), alone.GPUEndTime()];
+            alone.commit();
+            alone.waitUntilCompleted();
+            let after_the_wait = Status::read(status_word(alone.status()));
+            let statuses = [
+                settled(&in_scheduled),
+                settled(&in_completed),
+                after_the_wait,
+            ];
+            let kernel_after = [alone.kernelStartTime(), alone.kernelEndTime()];
+            let gpu_after = [alone.GPUStartTime(), alone.GPUEndTime()];
+            let alone = Alone::new(
+                statuses,
+                (kernel_before, kernel_after),
+                Ok((gpu_before, gpu_after)),
+            );
+            // Behind a fill of the same queue.
+            let target = self
+                .device
+                .newBufferWithLength_options(
+                    FILL_BYTES as usize,
+                    MTLResourceOptions::StorageModePrivate,
+                )
+                .ok_or_else(|| Failure::named("NewBuffer", "returned nil"))?;
+            let fill: Retained<ProtocolObject<dyn MTLCommandBuffer>> = queue
+                .commandBuffer()
+                .ok_or_else(|| Failure::named("CommandBuffer", "returned nil"))?;
+            let encoder = fill
+                .blitCommandEncoder()
+                .ok_or_else(|| Failure::named("BlitCommandEncoder", "returned nil"))?;
+            encoder.fillBuffer_range_value(&target, NSRange::new(0, FILL_BYTES as usize), 0x5a);
+            encoder.endEncoding();
+            let (filled, _) = sender(Some(FILL), &order);
+            let empty: Retained<ProtocolObject<dyn MTLCommandBuffer>> = queue
+                .commandBuffer()
+                .ok_or_else(|| Failure::named("CommandBuffer", "returned nil"))?;
+            // The empty one's completed handler records itself and reads the fill's status.
+            let (fills_status, fill_read) = mpsc::channel();
+            let emptied: Block = {
+                let order = Arc::clone(&order);
+                let fill = fill.clone();
+                block2::RcBlock::new(
+                    move |_: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                        if let Ok(mut order) = order.lock() {
+                            order.push(EMPTY.to_owned());
+                        }
+                        let _ = fills_status.send(status_word(fill.status()).to_owned());
+                    },
+                )
+            };
+            // SAFETY: as above.
+            unsafe {
+                fill.addCompletedHandler(block2::RcBlock::as_ptr(&filled));
+                empty.addCompletedHandler(block2::RcBlock::as_ptr(&emptied));
+            }
+            fill.commit();
+            empty.commit();
+            empty.waitUntilCompleted();
+            let after_the_wait = Status::read(status_word(empty.status()));
+            let fills_status = settled(&fill_read);
+            fill.waitUntilCompleted();
+            let handler_order = order.lock().map(|order| order.clone()).unwrap_or_default();
+            let behind = Behind::new(
+                handler_order,
+                [fills_status, after_the_wait],
+                (empty.kernelStartTime(), fill.kernelEndTime()),
+                Ok((
+                    [fill.GPUStartTime(), fill.GPUEndTime()],
+                    [empty.GPUStartTime(), empty.GPUEndTime()],
+                )),
+            );
+            Ok(EmptyCommandBuffers { alone, behind })
+        })
+    }
 }
 
 /// Metal's `MTLHeapType` for a case's heap type, by its raw value, so the two spellings cannot
@@ -6871,6 +7289,7 @@ fn sparse_texture_descriptor(spec: &SparseTextureSpec) -> Retained<MTLTextureDes
     };
     descriptor.setUsage(usage);
     descriptor.setStorageMode(MTLStorageMode::Private);
+    descriptor.setAllowGPUOptimizedContents(spec.gpu_optimized);
     descriptor
 }
 
@@ -7728,9 +8147,8 @@ impl MetalSide {
                     .setPixelFormat(MTLPixelFormat(format.as_raw() as usize));
             }
         }
-        if let Some(limit) = spec.max_total_threads_per_threadgroup {
-            descriptor.setMaxTotalThreadsPerThreadgroup(limit as usize);
-        }
+        descriptor
+            .setMaxTotalThreadsPerThreadgroup(spec.max_total_threads_per_threadgroup as usize);
         descriptor.setThreadgroupSizeMatchesTileSize(spec.threadgroup_size_matches_tile_size);
         Ok(descriptor)
     }
@@ -8213,6 +8631,12 @@ impl MetalSide {
         }
         if let Some(buffer) = pass.visibility {
             descriptor.setVisibilityResultBuffer(Some(self.held(buffer)?));
+        }
+        // Written only where the pass accumulates, so every other pass is the descriptor it was.
+        if pass.visibility_type != VisibilityResultType::Reset {
+            descriptor.setVisibilityResultType(MTLVisibilityResultType(
+                pass.visibility_type.raw() as isize
+            ));
         }
         // Written whatever it is, since 0 is Metal's own default and the property takes it.
         descriptor.setRenderTargetArrayLength(pass.array_length as usize);
@@ -8937,6 +9361,44 @@ impl MetalSide {
                         *control_point_index_offset as usize,
                         *instances as usize,
                         *base_instance as usize,
+                    );
+                }
+            }
+            RenderStep::VertexBufferWithStride {
+                buffer,
+                offset,
+                stride,
+                index,
+            } => {
+                let held = self.held(*buffer)?;
+                // SAFETY: the buffer is this side's own and the encoder outlives the call; the
+                // stride is a number Metal reads, and what a draw fetches at it is the case's
+                // measurement.
+                unsafe {
+                    encoder.setVertexBuffer_offset_attributeStride_atIndex(
+                        Some(held),
+                        *offset as usize,
+                        *stride as usize,
+                        *index as usize,
+                    );
+                }
+            }
+            RenderStep::VertexBytesWithStride {
+                bytes,
+                stride,
+                index,
+            } => {
+                let pointer =
+                    std::ptr::NonNull::new(bytes.as_ptr().cast::<std::ffi::c_void>().cast_mut())
+                        .ok_or_else(|| Failure::named("NoBytes", "an empty inline binding"))?;
+                // SAFETY: `bytes` lives for the call, which copies them; the stride is a number
+                // Metal reads, and what a draw fetches at it is the case's measurement.
+                unsafe {
+                    encoder.setVertexBytes_length_attributeStride_atIndex(
+                        pointer,
+                        bytes.len(),
+                        *stride as usize,
+                        *index as usize,
                     );
                 }
             }

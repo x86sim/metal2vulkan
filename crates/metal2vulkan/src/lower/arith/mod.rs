@@ -23,10 +23,11 @@
 //! and `double` are native (`f64` needs `shaderFloat64`), and `half` and `bfloat` are held widened
 //! in an `f32` that is always a value of the narrow format ([`narrow`]): each operation rounds its
 //! `f32` result back to the format, so no profile needs `shaderFloat16`; where the device's 16-bit
-//! `+ - *` is Metal's `half` arithmetic and the profile has `shaderFloat16`, a `half` `+ - *` is
-//! that instruction, kept apart, between exact conversions instead ([`ArithStrategy::F16`]): where
+//! `+ - *`, kept apart, is Metal's `half` arithmetic and the profile has `shaderFloat16`, a `half`
+//! `+ - *` is that instruction between exact conversions instead ([`ArithStrategy::F16`]): where
 //! it is measured to be, and where the 16-bit float controls the module then declares make it so
-//! by the Vulkan spec ([`narrow::controlled_modes`]).
+//! by the Vulkan spec ([`narrow::controlled_modes`]). Its contraction is the AIR's own, as
+//! `float`'s is: kept apart unless its flags carry both `contract` and `reassoc`.
 //!
 //! Precision: a `half` rounding keeps half denormals, as Metal does; a `float` or `half` fused
 //! multiply-add (`air.fma`, `llvm.fma`, and `llvm.fmuladd`, which Metal fuses) rounds once where
@@ -95,7 +96,7 @@ use crate::air::intrinsics::{
 use crate::air::intrinsics::{Elem, Math};
 use crate::air::ir::{
     BinOp as AirBin, BlockId, CastOp, Const, FastMath, FloatPredicate, Inst, InstId, InstKind,
-    IntPredicate, Type, TypeId as AirTypeId, Value, ValueId,
+    IntFlags, IntPredicate, Type, TypeId as AirTypeId, Value, ValueId,
 };
 use crate::air::Entry;
 use crate::budget::Meter;
@@ -178,9 +179,11 @@ pub fn materialize(fb: &mut FunctionBuilder<'_>, k: &LoweredConst) -> BResult<Op
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ArithStrategy {
-    /// An integer binary operator on held integers.
+    /// An integer binary operator on held integers, with the instruction's wrap flags
+    /// ([`ops::int_binary`]).
     Int {
         op: AirBin,
+        flags: IntFlags,
         form: Form,
     },
     /// A binary operator on `i1` values.
@@ -198,10 +201,13 @@ pub enum ArithStrategy {
     /// A `half` `fadd`, `fsub` or `fmul` on lanes of `form` by the device's 16-bit arithmetic,
     /// Metal's own in the forms that keep it apart (measured, `DriverDeviation::MetalHalfArithmetic`,
     /// or by the Vulkan spec under the 16-bit float controls, [`ops::f16_binary`]): the operands
-    /// narrowed to 16 bits, exactly, the instruction kept apart, and its result widened, exactly.
+    /// narrowed to 16 bits, exactly, the instruction, and its result widened, exactly. `contract`
+    /// is the AIR's own, as for [`ArithStrategy::Float`] ([`contraction`]): `Allowed` leaves the
+    /// instruction to the device's compiler, `Forbidden` keeps it apart.
     F16 {
         op: AirBin,
         form: Form,
+        contract: Contraction,
     },
     /// `fneg` on floats of `form`: the device's `OpFNegate`.
     FNeg {
@@ -232,6 +238,10 @@ pub enum ArithStrategy {
     Select,
     /// The first operand itself (`freeze` of a value, unsigned `abs`).
     Copy,
+    /// `freeze` of a held integer narrower than its container: the operand masked to its width
+    /// ([`ops::mask`]). A poison operand (a `nuw` operation's, [`ops::int_binary`]) may carry
+    /// bits above the width; the frozen value is one value of the type.
+    Freeze(Form),
     /// The zero of the result's representation (`freeze` of `undef`/`poison`).
     Zero(DemoteTy),
     /// `OpUndef` of the result's representation (an element index known out of range).
@@ -290,8 +300,9 @@ pub enum ArithStrategy {
         contract: Contraction,
     },
     /// Metal's precise division on `float` or `half` lanes (an `fdiv` without `arcp` on `float`,
-    /// any `fdiv` on `half`): the device's `OpFDiv`, its divisor kept in Vulkan's range
-    /// ([`divide::native`], `PrecisionNote::NativeDivision`).
+    /// any `fdiv` on `half`): the device's `OpFDiv`, its divisor kept in Vulkan's range, a `half`
+    /// one's 16 bits wide under the 16-bit float controls ([`divide::native`],
+    /// `PrecisionNote::NativeDivision`).
     NativeDivide {
         form: Form,
     },
@@ -426,6 +437,7 @@ impl FamilyStrategy for ArithStrategy {
             S::Bitcast { .. } => "arith.bitcast",
             S::Select => "arith.select",
             S::Copy | S::Zero(_) | S::Undef(_) => "arith.copy",
+            S::Freeze(_) => "arith.int.legalized",
             S::ExtractConst(_)
             | S::ExtractDynamic { .. }
             | S::InsertConst(_)
@@ -445,9 +457,26 @@ impl FamilyStrategy for ArithStrategy {
             S::Fma(f) => f.name(),
             S::FastFmod { .. } => FAST_FMOD,
             S::Convert {
+                kind: ConvertKind::ToInt { round: Some(_), .. },
+                ..
+            } => "arith.convert.saturating.rounded",
+            S::Convert {
                 kind: ConvertKind::ToInt { .. },
                 ..
             } => "arith.convert.saturating",
+            S::Convert {
+                kind:
+                    ConvertKind::ToFloat {
+                        directed: Some(_), ..
+                    },
+                ..
+            } => "arith.convert.directed",
+            S::Convert {
+                kind: ConvertKind::Int {
+                    saturate: Some(_), ..
+                },
+                ..
+            } => "arith.convert.clamped",
             S::Convert {
                 kind: ConvertKind::FromFp8(_),
                 ..
@@ -488,6 +517,8 @@ impl FamilyStrategy for ArithStrategy {
             // Two operand conversions (a shift pair or a select each) and the operation.
             S::IndexWord(_) => 32,
             S::Copy => 4,
+            // The mask and its constant.
+            S::Freeze(_) => 16,
             S::Zero(d) | S::Undef(d) | S::Null(d) => {
                 8u32.saturating_add(8u32.saturating_mul(leaves(d)))
             }
@@ -536,7 +567,9 @@ impl FamilyStrategy for ArithStrategy {
                 from,
                 to,
             } => 320 + 160 + conversion_words(from.with(Held::Float(FloatFmt::F32)), *to),
-            S::Convert { from, to, .. } => 160 + conversion_words(*from, *to),
+            S::Convert { kind, from, to } => {
+                160 + conversion_words(*from, *to) + suffix_words(*kind, *from)
+            }
             S::Pack {
                 dir,
                 format,
@@ -581,6 +614,22 @@ impl FamilyStrategy for ArithStrategy {
     /// An aggregate that holds a pointer has no value.
     fn yields_value(&self) -> bool {
         !matches!(self, ArithStrategy::PointerAggregate)
+    }
+}
+
+/// The words a conversion's honored suffix adds ([`honored`]): the rounding to an integral value;
+/// the conversion back, its comparisons and the step of a directed one; the two clamps of `.sat`.
+fn suffix_words(kind: ConvertKind, from: Form) -> u32 {
+    let lanes = u32::from(from.lanes);
+    match kind {
+        ConvertKind::ToInt { round: Some(_), .. } => 8,
+        ConvertKind::ToFloat {
+            directed: Some(_), ..
+        } => 160 + 128 + 16 * lanes,
+        ConvertKind::Int {
+            saturate: Some(_), ..
+        } => 64 + 16 * lanes,
+        _ => 0,
     }
 }
 
@@ -670,7 +719,9 @@ pub struct ArithPlan {
     /// the same fact as [`ArithPlan::metal_functions`]: a device whose `float` functions are
     /// Metal's reaches Metal through SPIRV-Cross, which loses a `-0` product of a `NoContraction`
     /// `OpFMul`, so it takes `Fma(a, b, -0.0)`; any other device takes the `OpFMul`, which has no
-    /// `-0.0` addend for it to answer.
+    /// `-0.0` addend for it to answer, with a constant factor's `-0.0` components multiplied as
+    /// `+0.0` and negated on a driver that keeps one multiply for products of one value by zeros of
+    /// opposite sign (`DriverWorkaround::OppositeZeroProductsMerged`).
     pub product: ProductForm,
     /// How the module clears the bits above a narrow integer's width in a 32-bit container
     /// ([`ops::mask`]), decided by [`finish`] from the profile's driver workarounds:
@@ -686,8 +737,15 @@ pub struct ArithPlan {
     pub f16_fma: bool,
     /// Whether a `float` operation leaves its `f32` denormals to the device because the device
     /// reads them as Metal does ([`denormal::device_flushes`]), recorded at selection: the module
-    /// then requires `VkProperty::MetalFloatDenormals`.
+    /// then requires `VkProperty::MetalFloatDenormals`, or, where its entry declares the 16-bit
+    /// float controls on a driver measured to keep `f32` denormals there
+    /// (`DriverWorkaround::FloatDenormalsKeptUnderHalfControls`), records
+    /// `PrecisionNote::DeviceDenormals` (`pipeline::compile`).
     pub device_denormals: bool,
+    /// Whether a `float` negation, absolute value, floor or ceiling leaves its `f32` denormals to
+    /// the device because the device reads them as Metal does ([`denormal::unary_kept`]),
+    /// recorded at selection: the module then requires `VkProperty::MetalUnaryDenormals`.
+    pub unary_denormals: bool,
     /// How the module rounds an `f32` to `half` ([`narrow::round`]), decided by [`finish`] from
     /// the profile ([`narrow::quantize_form`]): the device's conversion to 16 bits and its
     /// widening under the float controls that make it Metal's, else that conversion as it is
@@ -703,6 +761,11 @@ pub struct ArithPlan {
     /// texel takes the rounding's NaN (`narrow::round_texel`). Decided by [`finish`], on every
     /// profile that rounds so.
     pub native_half_nans: bool,
+    /// Whether the module computes `half` under the 16-bit float controls
+    /// ([`narrow::half_controls`]), decided by [`finish`] from the profile: its `half` `/` and
+    /// `sqrt` are the device's 16-bit instructions and it holds its `half` values at 16 bits
+    /// (`spirv::half_hold`), whatever [`ArithPlan::quantize`] is.
+    pub controls: bool,
     /// Whether Metal's `fmin`, `fmax`, `min3`, `max3`, `clamp` or `saturate` on `float` or `half`
     /// takes the device's `NMin`, `NMax` or `NClamp` measured to be Metal's
     /// (`DriverDeviation::MetalMinMax`), recorded at selection: the module then requires
@@ -713,6 +776,21 @@ pub struct ArithPlan {
     /// ([`ArithStrategy::F16`]), measured to be Metal's (`DriverDeviation::MetalHalfArithmetic`),
     /// recorded at selection: the module then requires `VkProperty::MetalHalfArithmetic`.
     pub f16_arith: bool,
+    /// Whether the NaN a `float` `fneg` or `fabs` moves is left to the device because it is
+    /// measured to answer Metal's (`DriverDeviation::MetalNanMoves`, [`nan::moves_answered`]),
+    /// recorded at selection: the module then requires `VkProperty::MetalNanMoves`.
+    pub nan_moves: bool,
+    /// Whether the NaN of a `half` held widened that a widening to `float` or a `half` `fabs`
+    /// moves is left to the device because it is measured to answer Metal's
+    /// ([`nan::moves_answered`]), recorded at selection: the module then requires
+    /// `VkProperty::MetalNanMoves`, but where it holds a `half` the device's conversions did not
+    /// make ([`narrow::moves_unfolded`]), where it records `PrecisionNote::NativeNanEncoding`.
+    pub held_nan_moves: bool,
+    /// Whether an `air.pack` or `air.unpack` takes the device's conversion with no note because
+    /// its form is measured to answer Metal's (`DriverDeviation::MetalPackConversions`,
+    /// [`pack::measured`]), recorded at selection: the module then requires
+    /// `VkProperty::MetalPackConversions`.
+    pub metal_packs: bool,
     /// The precision notes the plan's operations record unless their entry's quotient and
     /// functions are Metal's own (the profile's `float` functions are Metal's and Metal compiles
     /// the entry with fast math), recorded at selection ([`OpNotes::unless_metal_fast`]);
@@ -760,14 +838,15 @@ pub const FAST_DIVIDE: &str = "arith.fdiv.fast";
 /// entry Metal compiles with precise functions, [`libm::module_mode`]), record the notes of the
 /// operations that are Metal's own in a fast-math entry only where it is not
 /// ([`ArithPlan::unless_metal_fast`]), and choose the form of a multiply the device must round on
-/// its own by the same fact ([`ArithPlan::product`]) and the form of a narrow integer's mask by the
-/// driver's workarounds ([`ArithPlan::mask`]).
+/// its own by the same fact and the driver's workarounds ([`ArithPlan::product`]), and the form of
+/// a narrow integer's mask by the driver's workarounds ([`ArithPlan::mask`]).
 pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     cx.families.arith.wide = legal::holds_wide(cx.profile);
     cx.families.arith.quantize = narrow::quantize_form(cx.profile);
     cx.families.arith.native_half = narrow::native_rounding(cx.families.arith.quantize).is_some();
     // Under the float controls a `half`'s NaN is the device's conversion's.
     cx.families.arith.native_half_nans = cx.families.arith.quantize == QuantizeForm::Controlled;
+    cx.families.arith.controls = narrow::half_controls(cx.profile);
     // An extended-range, padded or bfloat texel's conversion is the device's arithmetic.
     if cx.families.arith.extended_range {
         cx.precision.insert(PrecisionNote::DevicePackConversion);
@@ -807,9 +886,18 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         cx.precision.insert(PrecisionNote::NativeFma);
     }
     let metal = arith.metal_functions;
-    // The same fact decides the multiply's form.
+    // The same fact decides the multiply's form, and on a driver that keeps one multiply for
+    // products by zeros of opposite sign, a constant `-0.0` factor's.
     arith.product = match metal {
         Some(_) => ProductForm::NegativeZeroFma,
+        None if cx
+            .profile
+            .fields()
+            .workarounds
+            .contains(&DriverWorkaround::OppositeZeroProductsMerged) =>
+        {
+            ProductForm::PositiveZeroFactors
+        }
         None => ProductForm::Multiply,
     };
     // Precise `fmod` takes its routine but where the device's `OpFRem` is Metal's `fmod`.
@@ -1138,8 +1226,10 @@ fn record(cx: &mut SelectCx<'_>, notes: OpNotes) {
 /// fast-math flag is the device's `OpFRem`, `x - y · trunc(x / y)` at its precision, as Metal
 /// computes it of its precise quotient. Beside these, an addition, subtraction, or multiply whose
 /// flags let the device fuse or regroup it with an operand's definition records
-/// `FastMathRewrites`, which the operands decide (`note_rewrites`). `None` for an integer
-/// operator.
+/// `FastMathRewrites`, which the operands decide (`note_rewrites`); a `half` one whose flags
+/// allow contraction records it whatever its operands where the profile takes
+/// `DriverDeviation::MetalHalfArithmetic` (MoltenVK), whose compiler answers the device's 16-bit
+/// instruction left undecorated as the unrounded `float` result. `None` for an integer operator.
 ///
 /// [`select`] records exactly these for such an operator (a `half` result's rounding is noted from
 /// the emitted module); validation reads them to tell which operations the product computes as a
@@ -1201,6 +1291,17 @@ pub fn float_binop_notes(
         notes.insert(PrecisionNote::DeviceArithmetic);
     }
     notes.extend(native_nan(answer.is_some()));
+    // The device's 16-bit `half` `+ - *` left to its compiler on the measured basis: Metal's fast
+    // compile folds its conversions away and answers the `float` result unrounded ([`select`]).
+    let lane = Form {
+        held: Held::Float(fmt),
+        lanes: 1,
+    };
+    if contraction(fmf) == Contraction::Allowed
+        && f16_arithmetic(p, op, lane) == Some(F16Basis::Measured)
+    {
+        notes.insert(PrecisionNote::FastMathRewrites);
+    }
     Some(OpNotes::everywhere(notes))
 }
 
@@ -1226,6 +1327,26 @@ fn with_nan(
     s
 }
 
+/// `answer`, the NaN Metal answers for an operation that moves a NaN (a `half`'s widening to
+/// `float`, a `float` `fneg`), where the device is not measured to answer it: `None` on a profile
+/// whose device's moves are measured to be Metal's ([`nan::moves_answered`]), which the plan
+/// records ([`ArithPlan::held_nan_moves`] for a `half` held widened, else
+/// [`ArithPlan::nan_moves`]).
+fn moved_nan(
+    cx: &mut SelectCx<'_>,
+    answer: Option<nan::NanAnswer>,
+    held: bool,
+) -> Option<nan::NanAnswer> {
+    if answer.is_some() && nan::moves_answered(cx.profile) {
+        match held {
+            true => cx.families.arith.held_nan_moves = true,
+            false => cx.families.arith.nan_moves = true,
+        }
+        return None;
+    }
+    answer
+}
+
 /// Record `NativeNanEncoding` where Metal answers a NaN (`answer`) the device is not measured to
 /// answer ([`nan::NanAnswer::device_answers`]).
 fn note_native_nan(cx: &mut SelectCx<'_>, answer: Option<nan::NanAnswer>) {
@@ -1236,18 +1357,25 @@ fn note_native_nan(cx: &mut SelectCx<'_>, answer: Option<nan::NanAnswer>) {
 
 /// Leave an operation's `f32` denormals (on `float` lanes of form `f`) to the device: where the
 /// device is measured to read them as Metal does and the operation is one the measured deviation
-/// covers (`covered`, [`denormal::device_flushes`]), the module requires the property; elsewhere
-/// they are the device's own, noted `DeviceDenormals` (as the operation's notes record it).
+/// covers (`covered`: [`denormal::device_flushes`], or [`denormal::unary_kept`] for a negation, a
+/// floor and a ceiling), the module requires the deviation's property; elsewhere they are the
+/// device's own, noted `DeviceDenormals` (as the operation's notes record it).
 /// Another format leaves nothing: a `half` is held widened, never an `f32` denormal, and Metal's
 /// `bfloat` and `double` environments are not measured.
 pub(super) fn leave_denormals(cx: &mut SelectCx<'_>, f: Form, covered: denormal::Covered) {
     if f.float_fmt() != Some(FloatFmt::F32) {
         return;
     }
-    if covered == denormal::Covered::Deviation && denormal::device_flushes(cx.profile) {
-        cx.families.arith.device_denormals = true;
-    } else {
-        cx.precision.insert(PrecisionNote::DeviceDenormals);
+    match covered {
+        denormal::Covered::Deviation if denormal::device_flushes(cx.profile) => {
+            cx.families.arith.device_denormals = true;
+        }
+        denormal::Covered::Unary if denormal::unary_kept(cx.profile) => {
+            cx.families.arith.unary_denormals = true;
+        }
+        _ => {
+            cx.precision.insert(PrecisionNote::DeviceDenormals);
+        }
     }
 }
 
@@ -1299,6 +1427,27 @@ fn form_in(cx: &SelectCx<'_>, v: Value, chunk: Option<u8>) -> Result<Form, Error
     chunk_form(cx, t, chunk)
 }
 
+/// The form of `v` when it is an integer (or integer vector) held narrower than its container
+/// ([`Form::legalized`]).
+fn padded_int(cx: &SelectCx<'_>, v: Value, chunk: Option<u8>) -> Result<Option<Form>, Error> {
+    let t = ty_of(cx, v)?;
+    let types = cx.entry.module.types();
+    let elem = match types.get(t) {
+        Some(Type::Vector { elem, .. }) => *elem,
+        _ => t,
+    };
+    if !matches!(types.get(elem), Some(Type::Int(w)) if *w != 1) {
+        return Ok(None);
+    }
+    // A chunked vector frozen whole holds its lanes whole: `chunk::select` freezes one of padded
+    // lanes per chunk.
+    if chunk.is_none() && legal::chunked(types, t).is_some() {
+        return Ok(None);
+    }
+    let f = chunk_form(cx, t, chunk)?;
+    Ok(f.legalized().then_some(f))
+}
+
 /// [`form_in`] of the instruction's result.
 fn result_form_in(cx: &SelectCx<'_>, inst: &Inst, chunk: Option<u8>) -> Result<Form, Error> {
     chunk_form(cx, inst.ty, chunk)
@@ -1338,11 +1487,21 @@ fn select_in(
     // The result is a value of a lowered type (or the operation is refused).
     let result = cx.lowered_repr(Value::Inst(at), inst.ty)?;
     Ok(match &inst.kind {
-        InstKind::BinOp { op, a, b, fmf, .. } => {
+        InstKind::BinOp {
+            op,
+            flags,
+            a,
+            b,
+            fmf,
+        } => {
             let f = form_in(cx, *a, chunk)?;
             match f.held {
                 Held::Bool if !op.is_float() => S::Bool { op: *op, form: f },
-                Held::Int { .. } if !op.is_float() => S::Int { op: *op, form: f },
+                Held::Int { .. } if !op.is_float() => S::Int {
+                    op: *op,
+                    flags: *flags,
+                    form: f,
+                },
                 // LLVM's `frem` on `float` is Metal's (measured on the M3 Max): with every
                 // fast-math flag its `fast::fmod`, as `air.fast_fmod` is lowered; otherwise
                 // `x - y * trunc(x / y)` of its precise quotient, which the device's `OpFRem` is at
@@ -1386,12 +1545,22 @@ fn select_in(
                         let s = S::FastDivide { form: f, contract };
                         with_nan(cx, s, Some(nan::NanAnswer::Canonical))
                     } else if let Some(basis) = f16_arithmetic(cx.profile, *op, f) {
-                        // The device's own `half` arithmetic, Metal's in the forms that keep it
-                        // apart, which the AIR's flags allow whatever they are. Only the measured
-                        // basis is a property the module requires; the float controls are modes
-                        // its entry declares.
-                        cx.families.arith.f16_arith |= basis == F16Basis::Measured;
-                        let s = S::F16 { op: *op, form: f };
+                        // The device's own `half` arithmetic, its contraction the AIR's own as
+                        // `float`'s is. Kept apart, it is Metal's: measured, a property the
+                        // module requires, or under the float controls its entry declares.
+                        // Left to the device's compiler on MoltenVK, Metal's fast compile folds
+                        // its conversions away and answers the `float` result unrounded
+                        // (measured with `DriverDeviation::MetalHalfArithmetic`), noted.
+                        let kept = contract == Contraction::Forbidden;
+                        cx.families.arith.f16_arith |= basis == F16Basis::Measured && kept;
+                        if basis == F16Basis::Measured && !kept {
+                            cx.precision.insert(PrecisionNote::FastMathRewrites);
+                        }
+                        let s = S::F16 {
+                            op: *op,
+                            form: f,
+                            contract,
+                        };
                         with_nan(cx, s, nan::binary_answer(*op, fmt))
                     } else {
                         // A `half` chain's operation held at `float` precision: its operands,
@@ -1425,11 +1594,18 @@ fn select_in(
             let f = form_in(cx, *v, chunk)?;
             // The device's sign flip: it makes no NaN. Metal's `float` `fneg` flips the sign bit
             // alone, keeping a NaN's payload and a denormal, whatever the flags; Vulkan lets
-            // `OpFNegate` flush a denormal (`DeviceDenormals`), and states no NaN's bits, noted
+            // `OpFNegate` flush a denormal (`DeviceDenormals` but where the device is measured to
+            // keep it, [`denormal::Covered::Unary`]), and states no NaN's bits, noted
             // `NativeNanEncoding` where Metal answers one ([`nan::fneg_answer`]).
-            device_float(cx, f, true, false);
+            leave_denormals(cx, f, denormal::Covered::Unary);
             fp_env(cx, *fmf, f);
             let nan = f.float_fmt().and_then(nan::fneg_answer);
+            // A `float` one's NaN is Metal's where the device's negation is measured to be
+            // ([`moved_nan`]); a `half` one's held result keeps the flipped sign, noted.
+            let nan = match f.float_fmt() {
+                Some(FloatFmt::F32) => moved_nan(cx, nan, false),
+                _ => nan,
+            };
             with_nan(cx, S::FNeg { form: f }, nan)
         }
         InstKind::ICmp { pred, a, .. } => {
@@ -1457,7 +1633,10 @@ fn select_in(
         InstKind::Select { .. } => S::Select,
         InstKind::Freeze(v) => match cx.constant(*v) {
             Some(LoweredConst::Undef(_)) => S::Zero(result),
-            _ => S::Copy,
+            _ => match padded_int(cx, *v, chunk)? {
+                Some(f) => S::Freeze(f),
+                None => S::Copy,
+            },
         },
         // A constant index out of range (or `undef`) gives poison.
         InstKind::ExtractElement { vec, idx } => match (idx, const_int(cx, *idx)) {
@@ -1540,8 +1719,13 @@ fn select_cast(
                 from,
                 to,
             };
-            // A `float` narrowed to `half` answers Metal's canonical `half` NaN.
+            // A `float` narrowed to `half` answers Metal's canonical `half` NaN; a `half` widened
+            // to `float` is the widening it was read with ([`moved_nan`]).
             let answer = match (from.float_fmt(), to.float_fmt()) {
+                (Some(FloatFmt::Half), Some(FloatFmt::F32)) => {
+                    let answer = nan::cast_answer(op, FloatFmt::Half, FloatFmt::F32);
+                    moved_nan(cx, answer, true)
+                }
                 (Some(a), Some(b)) => nan::cast_answer(op, a, b),
                 _ => None,
             };
@@ -1642,6 +1826,7 @@ fn air_math(f: MathFn) -> Result<Fun, Error> {
         M::IClamp(s) => Fun::Int(IntFn::Clamp(sign(s))),
         M::IMin3(s) => Fun::Int(IntFn::Min3(sign(s))),
         M::IMax3(s) => Fun::Int(IntFn::Max3(sign(s))),
+        M::IMedian3(s) => Fun::Int(IntFn::Median3(sign(s))),
         M::MulHi(s) => Fun::Int(IntFn::MulHi(sign(s))),
         M::MadHi(s) => Fun::Int(IntFn::MadHi(sign(s))),
         M::MadSat(s) => Fun::Int(IntFn::MadSat(sign(s))),
@@ -1692,6 +1877,7 @@ fn llvm_math(op: &LlvmIntrinsic) -> Result<Fun, Error> {
             LlvmIntOp::Fshl => IntFn::Fshl,
             LlvmIntOp::Fshr => IntFn::Fshr,
             LlvmIntOp::Bswap => IntFn::Bswap,
+            LlvmIntOp::BitReverse => IntFn::ReverseBits,
             LlvmIntOp::Ctpop => IntFn::Popcount,
             LlvmIntOp::UAddSat => IntFn::AddSat(Sign::Unsigned),
             LlvmIntOp::USubSat => IntFn::SubSat(Sign::Unsigned),
@@ -1701,7 +1887,9 @@ fn llvm_math(op: &LlvmIntrinsic) -> Result<Fun, Error> {
         LlvmIntrinsic::Abs { .. } => Fun::Int(IntFn::Abs),
         LlvmIntrinsic::Cttz { .. } => Fun::Int(IntFn::Ctz),
         LlvmIntrinsic::Ctlz { .. } => Fun::Int(IntFn::Clz),
-        LlvmIntrinsic::Memset { .. }
+        // An operation on a narrow integer that constant propagation did not fold.
+        LlvmIntrinsic::NarrowInt { .. }
+        | LlvmIntrinsic::Memset { .. }
         | LlvmIntrinsic::Memcpy { .. }
         | LlvmIntrinsic::Memmove { .. }
         | LlvmIntrinsic::Agx(_) => return Err(not_lowered()),
@@ -1725,7 +1913,8 @@ fn llvm_math(op: &LlvmIntrinsic) -> Result<Fun, Error> {
 ///   ([`FloatFn::FastAcosh`]), the device's `Acosh`;
 /// - `air.fast_fract` is not bounded below one, and with every flag is the canonical NaN at an
 ///   infinity ([`FloatFn::FastFract`]);
-/// - `air.fast_fmedian3` answers `b` for two NaN first operands ([`FloatFn::FastMedian3`]);
+/// - `air.fast_fmedian3` answers `b` for two NaN first operands beside a number, where precise
+///   `median3` answers the number ([`FloatFn::FastMedian3`]);
 /// - `air.fast_pow`'s magnitude is `exp2(y · log2|x|)` ([`FloatFn::FastPow`]);
 /// - `air.fast_atan2` is `atan(y / x)` turned by `±π`, NaN at `0 / 0` and `inf / inf`
 ///   ([`FloatFn::FastAtan2`]);
@@ -1905,6 +2094,17 @@ fn select_float_fn(
         let arith = &mut cx.families.arith;
         arith.fmod_uses |= fmod;
         arith.device_min_max |= device_min_max(cx.profile, op, f);
+        // `fabs` keeps a denormal as Metal's does where the device is measured to
+        // ([`denormal::moves_sign`]): its notes leave it out ([`float_call_of`]).
+        arith.unary_denormals |= facts.unary_denormals
+            && denormal::moves_sign(op)
+            && f.float_fmt() == Some(FloatFmt::F32);
+    }
+    if facts.nan_moves && moves_nan(lowered.how, f) {
+        match f.float_fmt() {
+            Some(FloatFmt::Half) => cx.families.arith.held_nan_moves = true,
+            _ => cx.families.arith.nan_moves = true,
+        }
     }
     if let FloatLowering::Fma(fma) | FloatLowering::FastFmod(fma) = lowered.how {
         cx.families.arith.take_fma(fma);
@@ -1950,11 +2150,12 @@ fn call_coverage(how: FloatLowering, facts: FloatFacts) -> Option<denormal::Cove
 
 /// Whether the device leaves a call lowered as `how` (on lanes of form `f`) its `f32` denormals
 /// on a profile with float facts `facts`, as [`leave_denormals`] notes them: where its reading is
-/// covered ([`call_coverage`]) but not by the profile's deviation (`facts.device_denormals`).
+/// covered ([`call_coverage`]) but not by the profile's deviation (`facts.device_denormals`, or
+/// `facts.unary_denormals` for a floor and a ceiling).
 fn coverage_left(how: FloatLowering, f: Form, facts: FloatFacts) -> bool {
     f.float_fmt() == Some(FloatFmt::F32)
         && call_coverage(how, facts)
-            .is_some_and(|c| !(c == denormal::Covered::Deviation && facts.device_denormals))
+            .is_some_and(|c| !c.holds(facts.device_denormals, facts.unary_denormals))
 }
 
 /// Whether Metal's minimum and maximum function `op` on lanes of form `f` takes the device's
@@ -1990,9 +2191,10 @@ fn min_max_family(op: FloatFn) -> bool {
 /// (`native_min_max`, [`FloatFacts::native_min_max`]), `saturate` on every other float format,
 /// which no device is measured to answer as Metal's `clamp(x, +0, 1)`, and `median3` and
 /// `fast::median3` on every device: `min(max(c, min(a, b)), max(a, b))` of the device's `NMin` and
-/// `NMax` (`math::median3`), Metal's answer but where two operands are NaN, whose pick is the
-/// device's (Metal's `fast::median3` answers `b` for two NaN first operands), and an `f32`
-/// denormal, which Metal compares as a zero.
+/// `NMax` (`math::median3`), Metal's answer but of two NaNs, whose NaN is the device's, of
+/// `fast::median3`'s two NaN first operands beside a number, which it answers as precise `median3`
+/// does where Metal's fast form answers `b` (undefined under fast math, MSL section 8.1), and of an
+/// `f32` denormal, which Metal compares as a zero.
 fn native_min_max(op: FloatFn, f: Form, native_min_max: bool) -> bool {
     let picks = math::metal_picks(f.float_fmt());
     (min_max_family(op) && ((picks && native_min_max) || (op == FloatFn::Saturate && !picks)))
@@ -2005,22 +2207,24 @@ enum F16Basis {
     /// Measured (`DriverDeviation::MetalHalfArithmetic`): the module requires
     /// `VkProperty::MetalHalfArithmetic`.
     Measured,
-    /// The 16-bit float controls the module's `half` roundings take ([`QuantizeForm::Controlled`],
-    /// [`narrow::controlled_modes`]), which its entry then declares ([`narrow::computes_in_16_bits`]):
-    /// no fact.
+    /// The 16-bit float controls ([`narrow::half_controls`]), which its entry then declares
+    /// ([`narrow::computes_in_16_bits`]): no fact. Its `half` roundings take them too
+    /// ([`QuantizeForm::Controlled`]) but on a driver that folds the conversion's round trip
+    /// (`DriverWorkaround::HalfConversionPairFolded`), which leaves a 16-bit instruction's
+    /// rounding as it is.
     Controlled,
 }
 
 /// Whether the float binary operator `op` on lanes of form `f` takes the device's 16-bit
 /// arithmetic ([`ArithStrategy::F16`]), and on what basis: a `half` `fadd`, `fsub` or `fmul`, on
 /// one to four lanes (a chunk's own form), where profile `p` has `shaderFloat16` and takes
-/// `DriverDeviation::MetalHalfArithmetic` ([`F16Basis::Measured`]) or rounds to `half` under the
-/// 16-bit float controls ([`F16Basis::Controlled`]). Under those controls the instruction is Metal's
-/// by the Vulkan spec ([`ops::f16_binary`]). A `half` `fdiv` is the device's `float` quotient of
-/// the widened operands, rounded to `half`: Metal's fast and relaxed compiles answer the device's
-/// 16-bit quotient of widened operands as a `float` one, it has no form that keeps it apart, and
-/// Vulkan's precision table does not make a 16-bit quotient correctly rounded. A `half` `frem` is
-/// not measured.
+/// `DriverDeviation::MetalHalfArithmetic` ([`F16Basis::Measured`]) or computes under the 16-bit
+/// float controls ([`F16Basis::Controlled`]). Under those controls the instruction is Metal's
+/// by the Vulkan spec ([`ops::f16_binary`]). A `half` `fdiv` is Metal's precise division
+/// ([`divide::native`]): under those controls the device's 16-bit `OpFDiv`, its native form, and
+/// elsewhere the device's `float` quotient of the widened operands rounded to `half`, as Metal's
+/// fast and relaxed compiles answer the device's 16-bit quotient of widened operands as a `float`
+/// one and it has no form that keeps it apart. A `half` `frem` is not measured.
 fn f16_arithmetic(p: &DeviceProfile, op: AirBin, f: Form) -> Option<F16Basis> {
     use crate::error::DriverDeviation;
     let applies = matches!(op, AirBin::FAdd | AirBin::FSub | AirBin::FMul)
@@ -2031,7 +2235,7 @@ fn f16_arithmetic(p: &DeviceProfile, op: AirBin, f: Form) -> Option<F16Basis> {
         None
     } else if p.takes_driver_deviation(DriverDeviation::MetalHalfArithmetic) {
         Some(F16Basis::Measured)
-    } else if narrow::quantize_form(p) == QuantizeForm::Controlled {
+    } else if narrow::half_controls(p) {
         Some(F16Basis::Controlled)
     } else {
         None
@@ -2066,11 +2270,17 @@ struct FloatFacts {
     metal_functions: bool,
     /// Whether the device reads `f32` denormals as Metal does ([`denormal::device_flushes`]).
     device_denormals: bool,
+    /// Whether the device's negation, absolute value, floor and ceiling read `f32` denormals as
+    /// Metal's do ([`denormal::unary_kept`]).
+    unary_denormals: bool,
     /// Which NaN the device's arithmetic answers ([`nan::encoding`]).
     nans: NanEncoding,
     /// Whether Metal's minimum and maximum functions are the device's not measured to be Metal's:
     /// the profile does not take `DriverDeviation::MetalMinMax` ([`native_min_max`]).
     native_min_max: bool,
+    /// Whether the device's `fabs` answers Metal's NaN, `float` and `half`
+    /// ([`nan::moves_answered`]).
+    nan_moves: bool,
 }
 
 impl FloatFacts {
@@ -2080,8 +2290,10 @@ impl FloatFacts {
             routes: fma::routes(p),
             metal_functions: p.fields().float_functions == FloatFunctions::Metal,
             device_denormals: denormal::device_flushes(p),
+            unary_denormals: denormal::unary_kept(p),
             nans: nan::encoding(p),
             native_min_max: !p.takes_driver_deviation(crate::error::DriverDeviation::MetalMinMax),
+            nan_moves: nan::moves_answered(p),
         }
     }
 }
@@ -2223,6 +2435,10 @@ fn float_call(
     facts: FloatFacts,
 ) -> Option<FloatCall> {
     let mut call = float_call_of(op, fast, fmf, f, facts)?;
+    // The device's `fabs` moves the NaN Metal's does where that is measured ([`moves_nan`]).
+    if facts.nan_moves && moves_nan(call.how, f) {
+        call.nan = None;
+    }
     let mut native = BTreeSet::new();
     if call.nan.is_some_and(|a| !a.device_answers(facts.nans)) {
         native.insert(PrecisionNote::NativeNanEncoding);
@@ -2239,6 +2455,14 @@ fn float_call(
     }
     call.notes = call.notes.with(OpNotes::everywhere(native));
     Some(call)
+}
+
+/// Whether a float call lowered as `how` on form `f` moves its operand's NaN rather than computes
+/// one, so that a device measured to move it as Metal does answers Metal's NaN
+/// ([`nan::moves_answered`]): `fabs` on `float` and `half`.
+fn moves_nan(how: FloatLowering, f: Form) -> bool {
+    matches!(how, FloatLowering::Fn(FloatFn::Abs))
+        && matches!(f.float_fmt(), Some(FloatFmt::F32 | FloatFmt::Half))
 }
 
 /// [`float_call`] before the device's NaN and minimum and maximum notes.
@@ -2289,8 +2513,9 @@ fn float_call_of(
     // `dot(float2(a, b), float2(b, c))`), noted `NativeMix` and `NativeDot`, Vulkan's bounds
     // inherited from `x * (1 - a) + y * a` and the sum of products. Where the profile's `float`
     // functions are Metal's, a `float` one reaches Metal's own `mix` and `dot`; a `half` one is
-    // the instruction on its `float` container, rounded once, noted. Their NaN is the device's,
-    // noted as for any function.
+    // the instruction on its `float` container, rounded once, or the 16-bit instruction where the
+    // module holds its operands at 16 bits (`spirv::half_hold`), noted. Their NaN is the
+    // device's, noted as for any function.
     if matches!(op, FloatFn::Mix | FloatFn::Dot) {
         let fmt = f.float_fmt()?;
         let own = metal_functions && fmt == FloatFmt::F32;
@@ -2352,7 +2577,10 @@ fn float_call_of(
         f,
         metal_functions,
         (
-            !op.metal_denormals() && denormal::coverage(op).is_none() && !fast_pi,
+            !op.metal_denormals()
+                && denormal::coverage(op).is_none()
+                && !fast_pi
+                && !(facts.unary_denormals && denormal::moves_sign(op)),
             !metal_nans && answer.is_none(),
         ),
     );
@@ -2556,11 +2784,21 @@ fn select_pack(
     // The device's conversion: GLSL.std.450's instruction for the format, or its multiply,
     // `RoundEven` and clamp, whose rounding Vulkan leaves to the device (`DevicePackConversion`).
     // Where the profile's `float` functions are Metal's, a `float` one of the four formats
-    // GLSL.std.450 names reaches Metal's own `pack_float_to_*` or `unpack_*_to_float`.
+    // GLSL.std.450 names reaches Metal's own `pack_float_to_*` or `unpack_*_to_float`. Where the
+    // profile takes `MetalPackConversions`, the forms measured to be Metal's (`pack::measured`)
+    // are, and the module requires that property.
+    let fmt = floats.float_fmt();
     let own = FloatFacts::on(cx.profile).metal_functions
-        && floats.float_fmt() == Some(FloatFmt::F32)
+        && fmt == Some(FloatFmt::F32)
         && pack::instruction(p.format, p.dir).is_some();
-    if !own {
+    let measured = !own
+        && cx
+            .profile
+            .takes_driver_deviation(crate::error::DriverDeviation::MetalPackConversions)
+        && fmt.is_some_and(|f| pack::measured(p.format, p.dir, f));
+    if measured {
+        cx.families.arith.metal_packs = true;
+    } else if !own {
         cx.precision.insert(PrecisionNote::DevicePackConversion);
     }
     Ok(ArithStrategy::Pack {
@@ -2568,6 +2806,21 @@ fn select_pack(
         format: p.format,
         floats,
     })
+}
+
+/// Record that a tensor's 8-bit float (`Fp8::TensorE4M3`, `Fp8::TensorE5M2`), whose Metal answers
+/// are measured, widens through the device's own type (`layout.native`), whose answers differ
+/// from them where its encoding does (`PrecisionNote::NativeFloat8`). Another format's widening
+/// has no Metal answer to differ from: Metal on Apple M3 does not compile it.
+pub(crate) fn native_float8(
+    cx: &mut SelectCx<'_>,
+    fmt: crate::air::intrinsics::Fp8,
+    layout: narrow::Fp8Layout,
+) {
+    use crate::air::intrinsics::Fp8;
+    if layout.native.is_some() && matches!(fmt, Fp8::TensorE4M3 | Fp8::TensorE5M2) {
+        cx.precision.insert(PrecisionNote::NativeFloat8);
+    }
 }
 
 fn select_convert(
@@ -2609,7 +2862,8 @@ fn select_convert(
         });
     }
     if let Some(fmt) = c.src_fp8 {
-        let fp8 = narrow::Fp8Layout::of(fmt);
+        let fp8 = narrow::Fp8Layout::on(fmt, cx.profile);
+        native_float8(cx, fmt, fp8);
         let to_int = c.dst_kind != NumKind::Float && to.is_int();
         if from.bits() != 8 || !(to.is_float() || to_int) || from.lanes != to.lanes {
             return Err(cx.invariant("an 8-bit float air.convert whose types disagree"));
@@ -2630,14 +2884,18 @@ fn select_convert(
         (NumKind::Float, NumKind::Float) => ConvertKind::Float,
         (NumKind::Float, s) => ConvertKind::ToFloat {
             signed: s == NumKind::Signed,
+            directed: None,
         },
         (d, NumKind::Float) => ConvertKind::ToInt {
             signed: d == NumKind::Signed,
+            round: None,
         },
         (_, s) => ConvertKind::Int {
             signed: s == NumKind::Signed,
+            saturate: None,
         },
     };
+    let kind = honored(cx.inputs.open_cl_mode, c, kind, from, to);
     let consistent = match kind {
         ConvertKind::Float => from.is_float() && to.is_float(),
         ConvertKind::ToFloat { .. } => !from.is_float() && to.is_float(),
@@ -2652,12 +2910,55 @@ fn select_convert(
         return Err(cx.invariant("an air.convert whose kinds disagree with its types"));
     }
     let s = ArithStrategy::Convert { kind, from, to };
-    // Metal's widening of a `half` NaN, as `fpext`'s.
+    // Metal's widening of a `half` NaN, as `fpext`'s ([`moved_nan`]).
     let nan = match (kind, from.float_fmt(), to.float_fmt()) {
+        (ConvertKind::Float, Some(FloatFmt::Half), Some(FloatFmt::F32)) => {
+            let answer = nan::convert_answer(FloatFmt::Half, FloatFmt::F32);
+            moved_nan(cx, answer, true)
+        }
         (ConvertKind::Float, Some(a), Some(b)) => nan::convert_answer(a, b),
         _ => None,
     };
     Ok(with_nan(cx, s, nan))
+}
+
+/// `kind`, the conversion `c`'s types name, with the suffix `c` spells where the pipeline honors
+/// it: in a compute pipeline of OpenCL mode (`open_cl_mode`), as Metal's does there, an integer
+/// to `float` by `.rtz`, `.rtp` or `.rtn`, a `float` to an integer by `.rte`, `.rtp` or `.rtn`, and
+/// an integer to an integer by `.sat` (measured on a Radeon Pro 5300M and a UHD Graphics 630:
+/// docs/API.md, "Conversions"). Elsewhere, and where a side is a `half` (Metal creates no pipeline
+/// for one in OpenCL mode), the conversion its types name.
+pub(super) fn honored(
+    open_cl_mode: bool,
+    c: &Convert,
+    kind: ConvertKind,
+    from: Form,
+    to: Form,
+) -> ConvertKind {
+    use crate::air::intrinsics::Rounding;
+    if !open_cl_mode {
+        return kind;
+    }
+    let f32_lanes = |f: Form| f.float_fmt() == Some(FloatFmt::F32);
+    match kind {
+        ConvertKind::ToFloat { signed, .. } if f32_lanes(to) => ConvertKind::ToFloat {
+            signed,
+            directed: c.rounding.filter(|r| *r != Rounding::Even),
+        },
+        ConvertKind::ToInt { signed, .. } if f32_lanes(from) => ConvertKind::ToInt {
+            signed,
+            round: c.rounding.filter(|r| *r != Rounding::Zero),
+        },
+        ConvertKind::Int { signed, .. } if c.saturate => ConvertKind::Int {
+            signed,
+            saturate: Some(if c.dst_kind == NumKind::Signed {
+                math::Sign::Signed
+            } else {
+                math::Sign::Unsigned
+            }),
+        },
+        kind => kind,
+    }
 }
 
 // ---- Emission ----
@@ -2756,6 +3057,7 @@ fn arity(s: &ArithStrategy) -> Option<usize> {
         S::FloatFn { f, .. } => Some(f.arity()),
         // A constant element index is a literal, never materialized.
         S::Copy
+        | S::Freeze(_)
         | S::Convert { .. }
         | S::Pack { .. }
         | S::ExtractConst(_)
@@ -2829,9 +3131,9 @@ fn value(
             let p = nth(cx, xs, 0)?;
             chunk::bitcast(fb, *from, *to, p)?
         }
-        S::Int { op, form } => {
+        S::Int { op, flags, form } => {
             let (p, q) = (a(cx, 0)?, a(cx, 1)?);
-            ops::int_binary(fb, *op, *form, p, q)?
+            ops::int_binary(fb, *op, *flags, *form, p, q)?
         }
         S::Bool { op, form } => {
             let (p, q) = (a(cx, 0)?, a(cx, 1)?);
@@ -2841,9 +3143,9 @@ fn value(
             let (p, q) = (a(cx, 0)?, a(cx, 1)?);
             ops::float_binary(fb, *op, *form, *contract, p, q)?
         }
-        S::F16 { op, form } => {
+        S::F16 { op, form, contract } => {
             let (p, q) = (a(cx, 0)?, a(cx, 1)?);
-            ops::f16_binary(fb, *op, form.lanes, p, q)?
+            ops::f16_binary(fb, *op, form.lanes, *contract, p, q)?
         }
         S::FastDivide { contract, .. } => {
             let (p, q) = (a(cx, 0)?, a(cx, 1)?);
@@ -2882,6 +3184,10 @@ fn value(
             fb.select(c, t, f)?
         }
         S::Copy => a(cx, 0)?,
+        S::Freeze(f) => {
+            let p = a(cx, 0)?;
+            ops::mask(fb, *f, p)?
+        }
         S::Zero(d) => match legal::zero(d) {
             Some(k) => match legal::materialize(fb, &k)? {
                 Some(x) => x,

@@ -6,6 +6,9 @@
 pub(super) enum Key {
     // ---- Roles: resources ----
     Buffer,
+    /// `air.constant`: an argument Apple's OpenCL compiler passes by value, read from a constant
+    /// buffer at its location (kernels only).
+    Constant,
     IndirectBuffer,
     Texture,
     Sampler,
@@ -100,6 +103,9 @@ pub(super) enum Key {
     Perspective,
     NoPerspective,
     Flat,
+    /// `air.interpolation_function`: a fragment input that is an `interpolant`, read only through
+    /// Metal's interpolation functions.
+    InterpolationFunction,
     ImageblockDataSize,
     ImageblockMaster,
     AliasImplicitImageblock,
@@ -153,6 +159,7 @@ pub(super) const BUFFER_ACCESS: &str = "air.read|air.write|air.read_write";
 #[cfg(test)]
 const KEYS: &[(&str, Key)] = &[
     ("air.buffer", Key::Buffer),
+    ("air.constant", Key::Constant),
     ("air.payload", Key::Payload),
     ("air.mesh_grid_properties", Key::MeshGridProperties),
     ("air.mesh", Key::Mesh),
@@ -280,6 +287,7 @@ const KEYS: &[(&str, Key)] = &[
     ("air.perspective", Key::Perspective),
     ("air.no_perspective", Key::NoPerspective),
     ("air.flat", Key::Flat),
+    ("air.interpolation_function", Key::InterpolationFunction),
     ("air.imageblock_data_size", Key::ImageblockDataSize),
     ("air.imageblock_master", Key::ImageblockMaster),
     (
@@ -313,7 +321,7 @@ const KEYS: &[(&str, Key)] = &[
 impl Key {
     /// The key spelled `bytes`, if it is one.
     ///
-    /// A `match` on the spellings rather than a scan of [`KEYS`]: rustc compiles it to a switch on
+    /// A `match` on the spellings rather than a scan of `KEYS`: rustc compiles it to a switch on
     /// the length and a comparison tree, where the scan compared up to 114 strings. Both are read
     /// once per attribute of every node of every entry point, so the scans dominated the metadata
     /// decoder (488,125 calls over 1,267 entry points of the public fixtures, 35.1 million table
@@ -322,6 +330,7 @@ impl Key {
     pub(super) fn parse(bytes: &[u8]) -> Option<Key> {
         let key = match bytes {
             b"air.buffer" => Key::Buffer,
+            b"air.constant" => Key::Constant,
             b"air.payload" => Key::Payload,
             b"air.mesh_grid_properties" => Key::MeshGridProperties,
             b"air.mesh" => Key::Mesh,
@@ -413,6 +422,7 @@ impl Key {
             b"air.perspective" => Key::Perspective,
             b"air.no_perspective" => Key::NoPerspective,
             b"air.flat" => Key::Flat,
+            b"air.interpolation_function" => Key::InterpolationFunction,
             b"air.imageblock_data_size" => Key::ImageblockDataSize,
             b"air.imageblock_master" => Key::ImageblockMaster,
             b"air.alias_implicit_imageblock" => Key::AliasImplicitImageblock,
@@ -451,6 +461,7 @@ impl Key {
     pub(super) fn name(self) -> &'static str {
         match self {
             Key::Buffer => "air.buffer",
+            Key::Constant => "air.constant",
             Key::IndirectBuffer => "air.indirect_buffer",
             Key::Texture => "air.texture",
             Key::Sampler => "air.sampler",
@@ -535,6 +546,7 @@ impl Key {
             Key::Perspective => "air.perspective",
             Key::NoPerspective => "air.no_perspective",
             Key::Flat => "air.flat",
+            Key::InterpolationFunction => "air.interpolation_function",
             Key::ImageblockDataSize => "air.imageblock_data_size",
             Key::ImageblockMaster => "air.imageblock_master",
             Key::AliasImplicitImageblock => "air.alias_implicit_imageblock",

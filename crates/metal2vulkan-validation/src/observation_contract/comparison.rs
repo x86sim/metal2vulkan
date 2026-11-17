@@ -181,8 +181,9 @@ impl UlpTable {
 /// - `SparseResidency`: unbounded: the sparse form's residency and unmapped texels are the
 ///   device's, which no Metal reading has compared; another residency answer flips a whole status
 ///   word, and an unmapped texel can read anything where the device is not strict.
-/// - `RestrictedDepthRange`: unbounded: a depth texel outside `[0, 1]` uploaded without
-///   `VK_EXT_depth_range_unrestricted` is undefined, read back clamped (RADV) or kept.
+/// - `RestrictedDepthRange`: unbounded: without `VK_EXT_depth_range_unrestricted` a depth image
+///   takes no texel outside `[0, 1]`, so a comparison of one Metal holds there can answer
+///   otherwise.
 /// - `CubeGradientFootprint`: unbounded: Apple's approximate length and truncated level against the
 ///   device's can select another level or filter near a boundary, which changes whole texels, not
 ///   lanes.
@@ -207,6 +208,9 @@ impl UlpTable {
 ///   about `3e-4` off Metal's on the probes (more where the varying's range is wider), and the
 ///   interpolated value is ordinary data later words use, so no word's difference is bounded by
 ///   it.
+/// - `ExtrapolatedInterpolation`: unbounded: the device's read of a perspective input at a sample
+///   or an offset is first-order, off by the input's curvature across the distance (up to about
+///   1.0 on the pull-model lane's geometry), and the value is ordinary data later words use.
 /// - `QuadsSplitByClipping`: unbounded: a quad a clipping seam crosses runs once per piece, which
 ///   moves a count, a ballot, or a reduction by whole lanes.
 /// - `VertexSimdgroupGrouping`: unbounded: a vertex function's simdgroup holds the device's group
@@ -214,7 +218,8 @@ impl UlpTable {
 ///   a sum, a ballot, or a shuffle by whole vertices.
 /// - `FragmentSimdgroupGrouping`: unbounded: a fragment function's simdgroup holds the pixels the
 ///   device's rasterizer packs together, not Apple's, which moves a sum, a ballot, or a shuffle by
-///   whole pixels.
+///   whole pixels; and a quad of a function that discards holds every covered pixel where Apple's
+///   GPU may run some as helpers, which moves a ballot of a helper query by whole lanes.
 /// - `BlendedWriteRounding`: unbounded: a blended half-float channel under
 ///   `textureWriteRoundingMode` 2 stores the device's rounding of the blend's result, which no
 ///   Vulkan blend states, where Metal rounds it to nearest even.
@@ -239,13 +244,17 @@ impl UlpTable {
 ///   parent's base level reads otherwise than Metal, which no authored case binds: a difference is
 ///   a mismatch for review.
 /// - `DeviceColorConversion`: [`Allowance::Recorded`]. A color channel left to the device's
-///   conversion may store the neighbouring code near a tie; a difference is a mismatch for review,
-///   never accepted or explained by the note.
+///   conversion may store the neighbouring code near a tie, and a blend further (RADV's into
+///   `RGB9E5Float`, of a source taken as halves, up to 33 units of a mantissa's last bit); a
+///   difference is a mismatch for review, never accepted or explained by the note.
 /// - `LinkedSamplerNumbering`: [`Allowance::Recorded`]. Only sampler resource IDs may differ, no
 ///   shader value; a difference is a mismatch for review.
 /// - `ColorAttachmentGroups`: [`Allowance::Recorded`]. Only a group past the first may differ, at
 ///   a discard or depth edge where the driver compiled the groups' variants apart; a difference is
 ///   a mismatch for review.
+/// - `DeviceInterpolationOffset`: [`Allowance::Recorded`]. Recorded at every read at an offset,
+///   where only an offset past the device's range or off its grid reads otherwise than Metal; a
+///   difference is a mismatch for review, never accepted or explained by the note.
 /// - Every other note, and any note this table does not know, bounds nothing on the stored
 ///   value: Vulkan's transcendental and arithmetic precision is stated per operation and input
 ///   range (absolute error for `sin`/`cos`, inherited bounds for `pow` and an unfused `Fma`, where
@@ -265,6 +274,7 @@ pub fn allowance(note: PrecisionNote) -> Allowance {
         | N::ViewBaseTexelOffset => Allowance::Recorded,
         N::DeviceColorConversion => Allowance::Recorded,
         N::LinkedSamplerNumbering | N::ColorAttachmentGroups => Allowance::Recorded,
+        N::DeviceInterpolationOffset => Allowance::Recorded,
         N::GradFromBias
         | N::DeviceTranscendentals
         | N::PixelSamplerScaling
@@ -295,6 +305,7 @@ pub fn allowance(note: PrecisionNote) -> Allowance {
         | N::FloatSampleFilter
         | N::QuadsCountedBeforeDiscard
         | N::DeviceInterpolation
+        | N::ExtrapolatedInterpolation
         | N::ComputedSampleDepth
         | N::QuadsSplitByClipping
         | N::VertexSimdgroupGrouping
@@ -326,7 +337,10 @@ pub fn allowance(note: PrecisionNote) -> Allowance {
         | N::NativeMix
         | N::DevicePackConversion
         | N::DiscardDropsSimdgroupStores
-        | N::HelperBranchDropsSimdgroupStores => Allowance::Unbounded,
+        | N::HelperBranchDropsSimdgroupStores
+        | N::UnorderedFetchWithinDraw
+        | N::NativeLogicOperation
+        | N::NativeFloat8 => Allowance::Unbounded,
     }
 }
 

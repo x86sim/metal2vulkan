@@ -105,6 +105,7 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         RuntimeFact::TileAttachmentFormat { .. } => Mechanism::KeyProjection,
         // The binder specializes the alpha from the bound texture's pixel format.
         RuntimeFact::OutOfBoundsAlpha { .. } => Mechanism::Specialization,
+        RuntimeFact::BorderTexels { .. } => Mechanism::Specialization,
         // The bound format's treatment is specialized; the planner refuses an unmeasured
         // format.
         RuntimeFact::BicubicTexels { .. } => Mechanism::Specialization,
@@ -150,8 +151,19 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         // The depth a kernel's call stack was sized for: the compile layer checks it against the
         // pipeline's; nothing on the device reads it.
         RuntimeFact::CallStackDepth { .. } => Mechanism::None,
+        // The mode a kernel was compiled in: the compile layer checks it against the pipeline's;
+        // nothing on the device reads it.
+        RuntimeFact::OpenClMode => Mechanism::None,
+        // The binder's local-size rules read it: a one-row region of the planned pipeline.
+        RuntimeFact::RowLockstep => Mechanism::PlanTimeCheck,
+        // A pipeline compiled under the one-row variant; its plans state it.
+        RuntimeFact::OneRow => Mechanism::Variant,
+        // The relief a consumer reads to ask for the unit-axes variant, or the axes the variant
+        // was compiled under; its plans state them.
+        RuntimeFact::UnitAxes { .. } => Mechanism::Variant,
         // A pipeline compiled under the flat-grid variant; its plans state it.
         RuntimeFact::FlatGrid => Mechanism::Variant,
+        RuntimeFact::CallThreadgroups => Mechanism::Variant,
         // A sparse texture's writes are dropped under the slot's `SparseTexture` specialization;
         // at a slot updated atomically the planner refuses one.
         RuntimeFact::SparseTextureWrites { atomic: false, .. } => Mechanism::Specialization,
@@ -180,9 +192,14 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         RuntimeFact::MergedDraws => Mechanism::Variant,
         RuntimeFact::QuadPrimitiveIds => Mechanism::Variant,
         RuntimeFact::PrivateList => Mechanism::Variant,
+        RuntimeFact::RegionViewports => Mechanism::Variant,
+        // A kernel compiled under the partial-threadgroups variant; its plans state it.
+        RuntimeFact::PartialThreadgroups => Mechanism::Variant,
         // Keyed by the slots bound to a texture whose planes are read in place, on a profile that
         // reads them so (`ProfileFields::ycbcr_in_place`).
         RuntimeFact::YCbCrInPlace { .. } => Mechanism::Variant,
+        // Keyed by the slots bound to a texture whose rows are read and written in place.
+        RuntimeFact::TexelRows { .. } => Mechanism::Variant,
         // The function marks the `ExecutionStatus` buffer its `ExecutionStatus` fact binds; the
         // consumer reads the bit after the command buffer.
         RuntimeFact::AbsentArgumentRead { .. } => Mechanism::None,
@@ -195,6 +212,8 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         RuntimeFact::RotatedWeights => Mechanism::Variant,
         // A separate link of the mesh pipeline's synthesized vertex stage.
         RuntimeFact::MeshLastFirst => Mechanism::Variant,
+        // The binder's region flags a draw whose last object threadgroup along an axis is partial.
+        RuntimeFact::PartialObjectThreadgroups => Mechanism::RegionSelected,
         // The binder specializes the lanes from the bound texture's pixel format and swizzle.
         RuntimeFact::ConstantLanes { .. } => Mechanism::Specialization,
         // A separate compile that reads the tables' words through their device addresses, which
@@ -228,6 +247,9 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         // Link gives the attachment no Vulkan blend and its input attachment, which the consumer
         // binds as `GraphicsState::input_attachments` states.
         RuntimeFact::ExtendedRangeInputBlend { .. } => Mechanism::RenderPassContract,
+        // Link gives the rotated attachment no Vulkan blend and its input attachment, which the
+        // consumer binds as `GraphicsState::input_attachments` states.
+        RuntimeFact::RotatedInputBlend { .. } => Mechanism::RenderPassContract,
         // Link writes the whole word and gives the attachment its input attachment, which the
         // consumer binds as `GraphicsState::input_attachments` states.
         RuntimeFact::WordInputMerge { .. } => Mechanism::RenderPassContract,
@@ -242,6 +264,11 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         }
         // The planner reports a member of another numeric class the stage reaches in the class.
         RuntimeFact::HeapCrossClassNeutral { .. } => Mechanism::PlanTimeCheck,
+        // The planner refuses a sparse texture the stage's handle tables reach.
+        RuntimeFact::HeapResidency { .. } => Mechanism::PlanTimeCheck,
+        // The planner refuses a texture of a dropped or shadowed write the stage reaches in a
+        // storage class it reads.
+        RuntimeFact::HeapStorageReads { .. } => Mechanism::PlanTimeCheck,
         // Keyed by the slots bound to a sampler whose word states anisotropy, where the
         // function's samples take Metal's anisotropic filter, emulated.
         RuntimeFact::AnisotropicSampler { .. } => Mechanism::Variant,

@@ -5,7 +5,9 @@
 //! times; then drains the state, committing and waiting where the calls encoded work. Three
 //! warm windows run first, and every pipeline state, library and texture the groups bind is made
 //! before any of them, so no making falls inside a timed window (the `variant_pipelines_made`
-//! count a group reports is the proof).
+//! count a group reports is the proof); and the runtime's device's own checks answered before
+//! any workload (`runtime.rs`'s `Runtime::settle_checks`), so none of their work, which the
+//! device counts as its own, falls inside one either.
 //!
 //! Per call a group reports
 //!
@@ -29,11 +31,14 @@
 //! calls, because the thread and process CPU clocks answer in microseconds.
 //!
 //! The counts are also the table's **gate**: [`HELD`] holds named calls to what they were
-//! measured making, and the run fails where one makes more. A count is deterministic, so it holds
-//! in CI under any load, where none of the times above can.
+//! measured making ([`HELD_ON_PATH`] a call on a path of its own that inherently makes more), and
+//! the run fails where one makes more: after its last group, naming every
+//! call that did, so a call over its bound leaves none of the groups after it unmeasured. A count
+//! is deterministic, so it holds in CI under any load, where none of the times above can.
 
 use crate::gpu::{Format, Gpu};
 use crate::workloads::{emit, host_pages, process_cpu, thread_cpu, Scene, Sizes, TARGET_SIDE};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// The windows a group runs before the measured ones.
@@ -52,10 +57,11 @@ fn counted(name: &str) -> bool {
 /// (a driver call of `vkfloor.rs`, whose name starts with `vk_`, is no Metal call and is
 /// exempt), and `scripts/api-cost-coverage` reads it to say how much of the public surface the
 /// table times and how much is still untimed.
-pub const TIMED: [(&str, &str); 60] = [
+pub const TIMED: [(&str, &str); 61] = [
     ("command_buffer", "CommandQueue::command_buffer"),
     ("commit_empty", "CommandBuffer::commit"),
     ("commit_one_dispatch", "CommandBuffer::commit"),
+    ("commit_no_copy_dispatch", "CommandBuffer::commit"),
     ("on_completed", "CommandBuffer::add_completed_handler"),
     ("status_completed", "CommandBuffer::status"),
     (
@@ -380,30 +386,47 @@ pub fn group<G: Gpu, S>(
     }
 }
 
-/// What a call must have made, per call: the group, the count under the name the table prints
-/// (`allocs`, or `rt_<count>_at_call` and `rt_<count>_at_commit` for the runtime's own counts),
-/// and the most a call of it may make. A count a group never moved is not printed, and reads as
-/// zero here, so a row of `0.0` holds a call to making none of that work at all.
+/// What a call may make, per call: the group, the count under the name the table prints
+/// (`allocs`, or `rt_<count>_at_call`, `rt_<count>_at_commit` and `rt_<count>` for the runtime's
+/// own counts), and the most a call of it may make. A count a group never moved is not printed,
+/// and reads as zero here, so a row of `0.0` holds a call to making none of that work at all.
 ///
 /// These are the gate on the cost half. A count is the same under any load and on any host, so a
 /// regression reads "this call now makes two allocations where it made none" and fails the run,
 /// where a 12% change in a time would not. Each row is a fact measured on this M3 Max that the
 /// runtime should not quietly lose: an upper bound, so a call that does *less* work passes and the
-/// row is then tightened.
-const HELD: [(&str, &str, f64); 43] = [
-    // A draw records exactly one draw command and makes no driver object: the cost it pays at the
-    // call is planning, which is settled work and nothing a driver charges for.
-    ("draw_strip", "rt_draws_at_commit", 1.0),
-    ("draw_strip", "rt_draws_at_call", 0.0),
-    ("draw_strip", "rt_vk_images_made_at_call", 0.0),
-    ("draw_strip", "rt_vk_buffers_made_at_call", 0.0),
-    ("draw_strip", "rt_vk_memory_allocations_at_call", 0.0),
-    ("draw_triangles", "rt_draws_at_commit", 1.0),
+/// row is then tightened. The bound holds on every device: where a call takes another path there,
+/// the row holds that path's count too, and a count the path does not move reads zero. A `Shared`
+/// texture's image, for one, is made at the call where the device copies its texels on the host
+/// (`texture/host_copy.rs`: the M3 Max), and taken from the parked images the textures of an
+/// earlier window left where it copies them on the staging queue (`texture/staging_copy.rs`:
+/// NVIDIA's copy engine), which makes no image, binds none and starts none on the host. A call's
+/// allocations are the runtime's own on the calling thread, a few more or fewer where its path
+/// differs: a heap texture made 12.25 a call under lavapipe, and as many on an RTX 5080, where
+/// its image is linear because the device's optimal image takes none of the heap's memory types;
+/// on macOS the first lock of each of its mutexes allocates too (std's). A path that inherently
+/// makes more of a count is held to its own measure there ([`HELD_ON_PATH`]).
+///
+/// A driver making (`rt_vk_<count>_this_thread`) is held as the calling thread's: what the call
+/// made, and a block of the runtime's memory pool it waited for, which the pool's thread made
+/// (`ObjectChurn`'s `_this_thread` counts). A block that thread makes ahead while no call waits
+/// for it is no call's making: it waits for a pause in the device's queue uses, at most 50 ms
+/// (`memory/ready.rs`), and lands in whichever group's window runs then, where the process's
+/// count (`rt_vk_<count>`) shows it.
+const HELD: [(&str, &str, f64); 47] = [
+    // A draw records exactly one draw command, at the call, and makes no driver object: the cost
+    // it pays there is planning and recording, which is settled work and nothing a driver
+    // charges for.
+    ("draw_strip", "rt_draws_at_call", 1.0),
+    ("draw_strip", "rt_vk_images_made_this_thread_at_call", 0.0),
+    ("draw_strip", "rt_vk_buffers_made_this_thread_at_call", 0.0),
     (
-        "draw_indexed",
-        "rt_recorded_cmd_draw_indexed_at_commit",
-        1.0,
+        "draw_strip",
+        "rt_vk_memory_allocations_this_thread_at_call",
+        0.0,
     ),
+    ("draw_triangles", "rt_draws_at_call", 1.0),
+    ("draw_indexed", "rt_recorded_cmd_draw_indexed_at_call", 1.0),
     // And it allocates about once in twenty draws (0.049 measured), nothing a draw of its own.
     ("draw_strip", "allocs", 0.2),
     ("draw_triangles", "allocs", 0.2),
@@ -413,27 +436,51 @@ const HELD: [(&str, &str, f64); 43] = [
     ("draw_strip", "rt_draw_shapes_made_at_call", 0.0),
     ("draw_strip", "rt_sampler_sets_made_at_call", 0.0),
     ("draw_strip", "rt_live_tables_uploaded_at_call", 0.0),
-    // The render pass is begun at the commit, never at the call, and ending the encoding makes no
-    // driver object. Its 25 allocations are the largest counted quantity on the path.
-    ("end_render", "rt_render_passes_begun_at_call", 0.0),
-    ("end_render", "rt_vk_images_made_at_call", 0.0),
-    ("end_render", "allocs", 25.0),
+    // Ending the encoding begins its render pass once, at the call, and makes no driver object.
+    // Its 24 allocations are the largest counted quantity on the path.
+    ("end_render", "rt_render_passes_begun_at_call", 1.0),
+    ("end_render", "rt_vk_images_made_this_thread_at_call", 0.0),
+    ("end_render", "allocs", 24.0),
     ("end_compute", "allocs", 7.0),
     ("end_blit", "allocs", 7.0),
-    ("dispatch", "rt_dispatches_at_commit", 1.0),
-    ("dispatch", "allocs", 19.0),
+    // A dispatch records one dispatch command, at the call (6.13 allocations measured): its uses
+    // over the last dispatch's storage, and no group counts outside a predication unit.
+    ("dispatch", "rt_dispatches_at_call", 1.0),
+    ("dispatch", "allocs", 6.2),
     // A heap texture's image takes its storage from the heap: one image and one binding, and no
     // allocation of memory of its own.
-    ("heap_texture_256", "rt_vk_images_made_at_call", 1.0),
-    ("heap_texture_256", "rt_vk_image_bindings_at_call", 1.0),
-    ("heap_texture_256", "rt_vk_memory_allocations_at_call", 0.0),
-    ("heap_texture_256", "allocs", 19.0),
-    // A Shared texture likewise, and it starts its image on the host once.
-    ("texture_256_shared", "rt_vk_images_made_at_call", 1.0),
-    ("texture_256_shared", "rt_vk_image_bindings_at_call", 1.0),
+    (
+        "heap_texture_256",
+        "rt_vk_images_made_this_thread_at_call",
+        1.0,
+    ),
+    (
+        "heap_texture_256",
+        "rt_vk_image_bindings_this_thread_at_call",
+        1.0,
+    ),
+    (
+        "heap_texture_256",
+        "rt_vk_memory_allocations_this_thread_at_call",
+        0.0,
+    ),
+    ("heap_texture_256", "allocs", 17.25),
+    // A Shared texture likewise, and it starts its image on the host once; or it takes one parked
+    // image, made and bound before, where the device stages its copies.
     (
         "texture_256_shared",
-        "rt_vk_memory_allocations_at_call",
+        "rt_vk_images_made_this_thread_at_call",
+        1.0,
+    ),
+    ("texture_256_shared", "rt_images_recycled_at_call", 1.0),
+    (
+        "texture_256_shared",
+        "rt_vk_image_bindings_this_thread_at_call",
+        1.0,
+    ),
+    (
+        "texture_256_shared",
+        "rt_vk_memory_allocations_this_thread_at_call",
         0.0,
     ),
     (
@@ -445,59 +492,191 @@ const HELD: [(&str, &str, f64); 43] = [
     // A render target of a shape the runtime has seen takes a parked image: it makes no image at
     // all, which is why it costs what Metal's does. Losing the recycler here would cost 20 us a
     // call and this row is what would say so.
-    ("texture_1024_target", "rt_vk_images_made_at_call", 0.0),
     (
         "texture_1024_target",
-        "rt_vk_memory_allocations_at_call",
+        "rt_vk_images_made_this_thread_at_call",
         0.0,
     ),
-    // A texture over a buffer's bytes takes a parked image too, and makes one view of it.
-    ("buffer_texture_256", "rt_vk_images_made_at_call", 0.0),
-    ("buffer_texture_256", "rt_vk_image_views_made_at_call", 1.0),
+    (
+        "texture_1024_target",
+        "rt_vk_memory_allocations_this_thread_at_call",
+        0.0,
+    ),
+    // A texture over a buffer's bytes makes its image at the call, bound in the buffer's memory:
+    // one image and one binding, no memory of its own, and no view at the call.
+    (
+        "buffer_texture_256",
+        "rt_vk_images_made_this_thread_at_call",
+        1.0,
+    ),
+    (
+        "buffer_texture_256",
+        "rt_vk_image_bindings_this_thread_at_call",
+        1.0,
+    ),
+    (
+        "buffer_texture_256",
+        "rt_vk_memory_allocations_this_thread_at_call",
+        0.0,
+    ),
+    (
+        "buffer_texture_256",
+        "rt_vk_image_views_made_this_thread_at_call",
+        0.0,
+    ),
     // A buffer comes out of the runtime's memory pool: no `vkCreateBuffer`, no `vkAllocateMemory`.
-    ("buffer_4k", "rt_vk_buffers_made_at_call", 0.0),
-    ("buffer_4k", "rt_vk_memory_allocations_at_call", 0.0),
-    ("buffer_1m", "rt_vk_buffers_made_at_call", 0.0),
-    ("buffer_1m", "rt_vk_memory_allocations_at_call", 0.0),
+    ("buffer_4k", "rt_vk_buffers_made_this_thread_at_call", 0.0),
+    (
+        "buffer_4k",
+        "rt_vk_memory_allocations_this_thread_at_call",
+        0.0,
+    ),
+    ("buffer_1m", "rt_vk_buffers_made_this_thread_at_call", 0.0),
+    (
+        "buffer_1m",
+        "rt_vk_memory_allocations_this_thread_at_call",
+        0.0,
+    ),
     // A no-copy buffer imports its pages once: one buffer, one import, one binding. A walk of the
     // memory types that tried several would read as more than one allocation here.
-    ("buffer_no_copy_1m", "rt_vk_buffers_made_at_call", 1.0),
-    ("buffer_no_copy_1m", "rt_vk_memory_allocations_at_call", 1.0),
-    ("buffer_no_copy_1m", "rt_vk_buffer_bindings_at_call", 1.0),
-    // Residency is our own bookkeeping: no driver call, and the allocation a resource the standing
-    // cost of 256 of them.
-    ("use_resources_read_256", "rt_vk_buffers_made_at_call", 0.0),
-    ("use_resources_read_256", "allocs", 277.0),
+    (
+        "buffer_no_copy_1m",
+        "rt_vk_buffers_made_this_thread_at_call",
+        1.0,
+    ),
+    (
+        "buffer_no_copy_1m",
+        "rt_vk_memory_allocations_this_thread_at_call",
+        1.0,
+    ),
+    (
+        "buffer_no_copy_1m",
+        "rt_vk_buffer_bindings_this_thread_at_call",
+        1.0,
+    ),
+    // Residency is our own bookkeeping: no driver call, and no allocation a resource (16 for 256
+    // of them).
+    (
+        "use_resources_read_256",
+        "rt_vk_buffers_made_this_thread_at_call",
+        0.0,
+    ),
+    ("use_resources_read_256", "allocs", 16.0),
     // One Metal command buffer carrying one dispatch is submitted as two of Vulkan's.
     (
         "commit_one_dispatch",
         "rt_vk_command_buffers_submitted",
         2.0,
     ),
+    // Its commit makes four allocations, and five more where its buffers lie over host pages;
+    // counting the host imports they lie in makes none (`Buffer::distinct_host_imports`).
+    ("commit_one_dispatch", "allocs", 4.0),
+    ("commit_no_copy_dispatch", "allocs", 9.0),
 ];
 
-/// Fail where a group's call made more work than [`HELD`] allows it, naming the call, the count,
-/// what it made and what it is held to.
-///
-/// A count a group never moved is not printed, so a row that names one reads zero and would pass
-/// whatever the call did: a row holding a call to *some* work must therefore name a count the
-/// group moved, or it is a misspelling that holds nothing, and that fails too.
+/// What a call may make on a path of its own that inherently makes more of a count than
+/// [`HELD`]'s row of it holds on every other path, per call: the group, the count whose moving
+/// marks the path (as [`HELD`] names its counts), the count held, and the most a call of that path
+/// may make. Where the call moved its mark, the row holds the count in place of [`HELD`]'s row of
+/// it; where it did not, [`HELD`]'s row holds it.
+const HELD_ON_PATH: [(&str, &str, &str, f64); 1] = [
+    // A heap texture the device holds as a shadow of Metal's tiles (`texture/heap_tiled.rs`,
+    // counted as `heap_textures_tiled`): where its image does not fit Metal's answer, which the
+    // program places it by, Metal's bytes stay in the heap and the image lies in memory of its
+    // own. On the Radeon 780M (RADV PHOENIX) the group's optimal 256x256 BGRA8 image takes 262144
+    // bytes at an alignment of 65536, where Metal answers 262144 at 128. There it makes 28.25
+    // allocations a call: 11.25 for its plan and its texture object, and 17 for the route: its
+    // moves' planes and levels (2), the image (1), one staging buffer for the texture's bytes,
+    // the image's elements and the kernel's shapes (3) and its copies back (1), the kernel's two
+    // descriptor sets from a pool of their own (5), its copies into the image (1), and the
+    // shadow's state (4).
+    (
+        "heap_texture_256",
+        "rt_heap_textures_tiled_at_call",
+        "allocs",
+        28.25,
+    ),
+];
+
+/// The calls the groups run so far made more work than [`HELD`] or [`HELD_ON_PATH`] allows them,
+/// as [`hold`] words each; [`percall`] fails on them all after its last group.
+static BREACHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Note, for [`percall`] to fail on, where a group's call made more work than [`HELD`] allows it,
+/// or [`HELD_ON_PATH`] on a path whose mark it moved, naming the call, the count, what it made and
+/// what it is held to. A count the group never moved reads zero: the call made none of it on this
+/// device, where it may take another path than on the M3 Max ([`HELD`]).
 fn hold(name: &str, measured: &[(String, f64)]) {
-    for (group, what, most) in HELD {
-        if group != name {
-            continue;
-        }
+    let made = |what: &str| {
         let made = measured.iter().find(|(counted, _)| counted == what);
+        made.map_or(0.0, |(_, value)| *value)
+    };
+    // The rows of the paths this group's call took.
+    let taken = (HELD_ON_PATH.iter())
+        .filter(|&&(group, mark, ..)| group == name && made(mark) > 0.0)
+        .map(|&(_, mark, what, most)| (mark, what, most));
+    let mut breached = vec![];
+    for (group, what, most) in HELD {
+        let on_path = taken.clone().any(|(_, counted, _)| counted == what);
+        if group == name && !on_path && made(what) > most {
+            breached.push(format!(
+                "{name}: {what} is {} a call, where it is held to at most {most}",
+                made(what)
+            ));
+        }
+    }
+    for (mark, what, most) in taken {
+        if made(what) > most {
+            breached.push(format!(
+                "{name}: {what} is {} a call on the path {mark} marks, where it is held to at \
+                 most {most}",
+                made(what)
+            ));
+        }
+    }
+    let mut noted = BREACHED.lock().unwrap_or_else(PoisonError::into_inner);
+    noted.extend(breached);
+}
+
+/// Fail where a row of [`HELD`] or [`HELD_ON_PATH`] could hold nothing on any device: its group
+/// has no entry in [`TIMED`], or a count it names is none the table prints, `allocs` or one of the
+/// side's own counts `kept` ([`Gpu::work_counts`], every one whatever its value) under `rt_`, with
+/// `_at_call` or `_at_commit` after it or nothing. A count that moved nowhere is not printed and
+/// reads zero ([`hold`]), so a misspelled one would pass whatever the call made, and a misspelled
+/// mark would hold no call to its path: checked by name, before any group runs, on every device,
+/// whichever path its calls take.
+fn check_held(kept: &[(&'static str, f64)]) {
+    let keeps = |count: &str| counted(count) && kept.iter().any(|(name, _)| *name == count);
+    let printed = |what: &str| {
+        what == "allocs"
+            || what.strip_prefix("rt_").is_some_and(|rest| {
+                keeps(rest)
+                    || [
+                        rest.strip_suffix("_at_call"),
+                        rest.strip_suffix("_at_commit"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(keeps)
+            })
+    };
+    let check = |group: &str, what: &str| {
         assert!(
-            most <= 0.0 || made.is_some(),
-            "{name}: {what} is held to at most {most}, but the group moved no such count, so the \
-             row holds nothing"
+            TIMED.iter().any(|(timed, _)| *timed == group),
+            "HELD holds {group}, a group TIMED does not name"
         );
-        let made = made.map_or(0.0, |(_, value)| *value);
         assert!(
-            made <= most,
-            "{name}: {what} is {made} a call, where it is held to at most {most}"
+            printed(what),
+            "{group}: HELD names {what}, which names no count the side keeps, so the row holds \
+             nothing"
         );
+    };
+    for (group, what, _) in HELD {
+        check(group, what);
+    }
+    for (group, mark, what, _) in HELD_ON_PATH {
+        check(group, mark);
+        check(group, what);
     }
 }
 
@@ -623,6 +802,10 @@ pub fn percall<G: Gpu>(g: &G, s: &Scene<G>, library: &G::Library, sizes: &Sizes)
     // counts steps in 41.67 ns, so a call of a few tens of nanoseconds needs many of them.
     let lone = w * 6;
     let made_before = g.work_counts();
+    // The side that keeps no counts of its own is Metal's, which [`HELD`] does not hold.
+    if !made_before.is_empty() {
+        check_held(&made_before);
+    }
 
     // The command buffer: made, committed empty, committed with one encoder's work, and the
     // status, times and completed wait a frame's end reads.
@@ -662,6 +845,39 @@ pub fn percall<G: Gpu>(g: &G, s: &Scene<G>, library: &G::Library, sizes: &Sizes)
         },
         |held: &mut Vec<G::CommandBuffer>, i| g.commit(&held[i]),
         |held| held.iter().for_each(|cb| g.wait(cb)),
+    );
+    // And one whose dispatch binds two no-copy buffers, whose host imports the commit counts
+    // (`WorkCounts::host_imports_used`): made in its window over the no-copy pages and gone with
+    // it, so no other group's calls meet live buffers over host pages.
+    group(
+        g,
+        "commit_no_copy_dispatch",
+        (16, w),
+        || {
+            // SAFETY: the pages are page-aligned read-write memory of this many bytes, and they
+            // outlive every buffer made over them (`Objects::pages`).
+            let buffers: Vec<G::Buffer> = (0..2)
+                .map(|i| unsafe { g.buffer_no_copy(o.pages.add(i * NO_COPY_EACH), NO_COPY_EACH) })
+                .collect();
+            let held = (0..16)
+                .map(|_| {
+                    let cb = g.command_buffer();
+                    let mut e = g.compute_encoder(&cb);
+                    g.set_compute_pipeline(&mut e, &s.tiny[0]);
+                    g.set_buffer(&mut e, &buffers[0], 0, 0);
+                    g.set_buffer(&mut e, &buffers[1], 0, 1);
+                    g.dispatch(&mut e, 1, 64);
+                    g.end_compute(e);
+                    cb
+                })
+                .collect::<Vec<_>>();
+            (buffers, held)
+        },
+        |(_, held): &mut (Vec<G::Buffer>, Vec<G::CommandBuffer>), i| g.commit(&held[i]),
+        |(buffers, held)| {
+            held.iter().for_each(|cb| g.wait(cb));
+            drop((held, buffers));
+        },
     );
     group(
         g,
@@ -1231,4 +1447,12 @@ pub fn percall<G: Gpu>(g: &G, s: &Scene<G>, library: &G::Library, sizes: &Sizes)
             &mut [now - before],
         );
     }
+    // Every group ran, measured whatever an earlier one made: the gate's verdict on them all.
+    let breached = BREACHED.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        breached.is_empty(),
+        "{} of the gate's checks failed:\n{}",
+        breached.len(),
+        breached.join("\n")
+    );
 }

@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use super::{AccessClass, BoundKind, ByteRange, PlannedBuffer, ResourceUse, UseTarget};
-use crate::bind::state::{BindShape, BufferShape, TextureShape, UsedClass, UsedShape};
+use crate::bind::state::{BindShape, BoundBuffer, BufferShape, TextureShape, UsedClass, UsedShape};
 use crate::device::profile::Limits;
 use crate::device::requirements::VkFeature;
 use crate::device::{mechanism, DeviceProfile};
@@ -87,17 +87,37 @@ impl BoundKind {
             Some(BufferShape::Bytes { .. }) => BoundKind::Bytes,
         }
     }
+
+    /// What `bound` binds at a buffer slot: [`of`](Self::of) its shape, which no offset class
+    /// changes, read without making the shape.
+    pub(crate) fn of_bound(bound: Option<&BoundBuffer>) -> BoundKind {
+        match bound {
+            None => BoundKind::Unbound,
+            Some(&BoundBuffer::Buffer {
+                length,
+                device_address,
+                ..
+            }) => BoundKind::Buffer {
+                device_address: device_address.is_some(),
+                length_class: crate::bind::state::length_class(length),
+            },
+            Some(BoundBuffer::Bytes { .. }) => BoundKind::Bytes,
+        }
+    }
 }
 
 /// The plan of buffer slot `slot` with interface `b` and what the shape binds there: its descriptor
 /// binding (descriptor forms), the view's descriptor base alignment and range limit, and a
-/// `MissingDeviceAddress` refusal for a device-address slot bound without an address. The base
-/// alignment is `max(min*BufferOffsetAlignment, 16)` (`views::base_alignment`): a descriptor byte
-/// is then congruent to its Metal address modulo 16, which a `uvec4` view of the slot relies on.
+/// `MissingDeviceAddress` refusal for a device-address slot bound without an address: a buffer
+/// without one, or inline bytes, but in a pipeline compiled for a replay's bindings (`replayed`,
+/// `RuntimeFact::ReplayBindings`), which reads every buffer through the slot table the replay's
+/// preprocess writes, inline bytes the encoder bound at the consumer's upload of them
+/// (`DrawReplayPreprocess::inherited_bytes`). The base alignment is
+/// `max(min*BufferOffsetAlignment, 16)` (`views::base_alignment`): a descriptor byte is then
+/// congruent to its Metal address modulo 16, which a `uvec4` view of the slot relies on.
 pub(crate) fn plan_buffer(
-    slot: SlotRef,
-    b: &BufferSlot,
-    shape: Option<&BufferShape>,
+    (slot, b, shape): (SlotRef, &BufferSlot, Option<&BufferShape>),
+    replayed: bool,
     limits: &Limits,
     bindings: &BTreeMap<BindingSource, (u32, u32)>,
 ) -> Result<PlannedBuffer, BindError> {
@@ -122,14 +142,12 @@ pub(crate) fn plan_buffer(
                 .ok_or_else(|| internal(format!("descriptor slot {slot:?} has no binding")))?,
         ),
         BufferForm::Psb => {
-            if matches!(
-                bound,
-                BoundKind::Bytes
-                    | BoundKind::Buffer {
-                        device_address: false,
-                        ..
-                    }
-            ) {
+            let unaddressed = match bound {
+                BoundKind::Bytes => !replayed,
+                BoundKind::Buffer { device_address, .. } => !device_address,
+                BoundKind::Unbound => false,
+            };
+            if unaddressed {
                 return Err(BindError::MissingDeviceAddress { slot });
             }
             None
@@ -182,8 +200,9 @@ pub(crate) fn range_at_bind_offset(
 /// The value of `key` for a draw or dispatch of `shape`, whose resources `resources` plans, where
 /// the bound resources decide it: a slot's presence, a bound sampler's words, a bound texture's
 /// class, swizzle, sparseness and view axes. It is what a specialization constant of `key` is set
-/// to, the one place a plan computes it. `None` for a key the bound resources do not decide (a
-/// threadgroup's, a tile's, a pass's).
+/// to, the one place a plan computes it, and the bound sampler's whole word a specialized note's
+/// test alone reads (`SpecKey::BoundSamplerWord`). `None` for a key the bound resources do not
+/// decide (a threadgroup's, a tile's, a pass's).
 pub(crate) fn bound_value(
     key: SpecKey,
     shape: &BindShape,
@@ -194,11 +213,18 @@ pub(crate) fn bound_value(
         SpecKey::SamplerState { slot, fields } => resources.sampler_state(slot, fields),
         SpecKey::SamplerMinLevel(slot) => resources.sampler_min_level(slot),
         SpecKey::SamplerAnisotropy(slot) => resources.sampler_anisotropy(slot),
+        SpecKey::NearestPixelSampler(slot) => resources.nearest_pixel_sampler(slot),
+        SpecKey::BoundSamplerWord(slot) => {
+            resources.sampler_state(slot, metal::sampler::SamplerWord::FIELDS)
+        }
         // An unbound slot, or one bound to a placeholder format, reads its neutral: its
         // out-of-bounds texel is all zero.
         SpecKey::OutOfBoundsAlpha(slot) => bound_texture(shape, slot)
             .and_then(TextureShape::out_of_bounds_alpha)
             .unwrap_or(0),
+        SpecKey::BorderTexels(slot) => bound_texture(shape, slot)
+            .and_then(TextureShape::border_texels)
+            .unwrap_or(u64::from(metal::sampler::NEUTRAL_BORDER_TEXELS)),
         SpecKey::BicubicTexels(slot) => resources.bicubic_texels(slot)?,
         SpecKey::TexelFormat(slot) => resources.texel_format(slot),
         SpecKey::UnmeasuredTexels(slot) => resources.unmeasured_texels(slot),
@@ -243,6 +269,158 @@ pub(crate) fn record_specialized(
         }
     }
     Ok(())
+}
+
+/// Record in `resources`' template the value of each key a specialized note of `stages` tests that
+/// no push carries but the bound resources decide (`SpecKey::BoundSamplerWord`),
+/// or what the command's handles can name (`SpecKey::HeapYCbCrTextures`,
+/// `SpecKey::HeapRawTextures` and `SpecKey::HeapNanFamilies`, through `reach`, the stages a used resource's render stages reach,
+/// as for the heap's members; `SpecKey::FilteringArgumentSampler`), which
+/// `BindingPlan::specialized_value` gives the runtime at
+/// each draw or dispatch, where it reads such a note (`StageModule::note_clauses_bound`). Nothing
+/// pushes it: instantiation writes only the keys its push fields name.
+pub(crate) fn record_noted<'a>(
+    stages: impl IntoIterator<Item = &'a crate::pipeline::StageModule>,
+    shape: &BindShape,
+    resources: &mut ResourcePlanner<'_>,
+    reach: &dyn Fn(metal::RenderStages) -> Vec<Stage>,
+) -> Result<(), BindError> {
+    let tested: Vec<SpecKey> = stages
+        .into_iter()
+        .flat_map(|stage| &stage.specialized_notes)
+        .flat_map(|note| &note.when)
+        .flat_map(|clause| &clause.all)
+        .map(|test| test.key)
+        .filter(|key| {
+            matches!(
+                key,
+                SpecKey::BoundSamplerWord(_)
+                    | SpecKey::HeapYCbCrTextures(_)
+                    | SpecKey::HeapRawTextures(_)
+                    | SpecKey::HeapNanFamilies(_)
+                    | SpecKey::FilteringArgumentSampler
+            )
+        })
+        .collect();
+    for key in tested {
+        if resources
+            .template
+            .specialized
+            .iter()
+            .any(|(k, _)| *k == key)
+        {
+            continue;
+        }
+        let value = match key {
+            SpecKey::HeapYCbCrTextures(stage) => u64::from(heap_ycbcr(shape, stage, reach)),
+            SpecKey::HeapRawTextures(stage) => u64::from(heap_raw(shape, stage, reach)),
+            SpecKey::HeapNanFamilies(stage) => u64::from(heap_nan_families(shape, stage, reach)),
+            // A sampler state of any listed shape may be the one an argument buffer names.
+            SpecKey::FilteringArgumentSampler => u64::from(
+                (shape.argument_samplers.shapes.iter())
+                    .any(|s| s.linear || s.anisotropic || s.cubic),
+            ),
+            key => bound_value(key, shape, resources)?.ok_or_else(|| {
+                internal(format!("a noted {key:?}, which no bound resource decides"))
+            })?,
+        };
+        let value = u32::try_from(value)
+            .map_err(|_| internal(format!("a noted {key:?} of {value}, past a word")))?;
+        resources.template.specialized.push((key, value));
+    }
+    Ok(())
+}
+
+/// Whether a heap member of `shape` that reaches `stage` (`bind::heap`'s members: a texture the
+/// command makes resident, its render stages through `reach`, or binds at a texture slot of the
+/// stage) is of a two-plane YCbCr class (`TexelFormat::two_plane_ycbcr`).
+fn heap_ycbcr(
+    shape: &BindShape,
+    stage: Stage,
+    reach: &dyn Fn(metal::RenderStages) -> Vec<Stage>,
+) -> bool {
+    crate::bind::heap::members(shape, &[stage], reach)
+        .iter()
+        .any(|m| match m.shape {
+            TextureShape::Texture { pixel_format, .. } => {
+                crate::metal::texel_format::texel_format(pixel_format).two_plane_ycbcr()
+            }
+            _ => false,
+        })
+}
+
+/// The `SpecKey::HeapYCbCrWrites` of `stage` for `shape`: whether a heap member of `shape` that
+/// reaches `stage` (as for [`heap_ycbcr`]) is a 4:4:4 two-plane YCbCr texture whose writes Metal
+/// stores into its planes (`metal::format::ycbcr_writes_stored`) whose usage a storage class takes
+/// (`ShaderWrite`, or `BlockWritesOnly`, as `bind::heap::fit` takes it): its write shadow is the
+/// element a heap write marks. The stage's constant, under which its handle-table search carries
+/// the entry's `FLAG_YCBCR_WRITES`: a command that names no such texture runs a pipeline without
+/// the test.
+pub(crate) fn heap_ycbcr_writes(
+    shape: &BindShape,
+    stage: Stage,
+    reach: &dyn Fn(metal::RenderStages) -> Vec<Stage>,
+) -> bool {
+    let writes = metal::TextureUsage::SHADER_WRITE | metal::TextureUsage::BLOCK_WRITES_ONLY;
+    crate::bind::heap::members(shape, &[stage], reach)
+        .iter()
+        .any(|m| match m.shape {
+            TextureShape::Texture {
+                pixel_format,
+                usage,
+                ..
+            } => {
+                crate::metal::format::ycbcr_writes_stored(pixel_format) && usage.intersects(writes)
+            }
+            _ => false,
+        })
+}
+
+/// The `SpecKey::HeapRawTextures` of `stage` for `shape`: of the heap members of `shape` that reach
+/// `stage` (as for [`heap_ycbcr`]), the bit `bind::heap::HELD` where one is a texture a heap holds
+/// by its raw texels alone (`bind::heap::heap_raw_form`), which the stage's `float` read, sample or
+/// gather decodes by the device's arithmetic, and the bit `bind::heap::FILTERED` where one such is
+/// of a form whose sample the function filters (not a bfloat one). Both the notes' value and the
+/// stage's constant, whose `HELD` bit gates its raw arms (`lower::texture::heap_raw_form`).
+pub(crate) fn heap_raw(
+    shape: &BindShape,
+    stage: Stage,
+    reach: &dyn Fn(metal::RenderStages) -> Vec<Stage>,
+) -> u32 {
+    use crate::bind::heap::{FILTERED, HELD};
+    let mut bits = 0;
+    for m in crate::bind::heap::members(shape, &[stage], reach) {
+        let TextureShape::Texture { pixel_format, .. } = m.shape else {
+            continue;
+        };
+        if !crate::bind::heap::raw_held(&m.shape) {
+            continue;
+        }
+        bits |= HELD;
+        if crate::metal::format::ExtendedRange::of(pixel_format).is_some_and(|f| !f.bfloat()) {
+            bits |= FILTERED;
+        }
+    }
+    bits
+}
+
+/// The `SpecKey::HeapNanFamilies` of `stage` for `shape`: the bit of each family
+/// (`bind::heap::nan_family`) of the heap members of `shape` that reach `stage` (as for
+/// [`heap_ycbcr`]), whose texels a stage's `half` or `float` write may store a NaN in.
+fn heap_nan_families(
+    shape: &BindShape,
+    stage: Stage,
+    reach: &dyn Fn(metal::RenderStages) -> Vec<Stage>,
+) -> u32 {
+    crate::bind::heap::members(shape, &[stage], reach)
+        .iter()
+        .map(|m| match m.shape {
+            TextureShape::Texture { pixel_format, .. } => {
+                crate::bind::heap::nan_family(pixel_format)
+            }
+            TextureShape::Buffer { .. } => 0,
+        })
+        .fold(0, |bits, family| bits | family)
 }
 
 /// Whether `shape` binds anything at `slot`.

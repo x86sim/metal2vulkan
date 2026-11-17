@@ -107,7 +107,8 @@
 use super::super::event::{EventShared, SharedEvent};
 use super::super::exit_guard;
 use super::super::gpu_time;
-use super::super::{CommandQueue, Device, Error};
+use super::super::queue::QueueGen;
+use super::super::{Device, Error};
 use super::recovery::Recovery;
 use super::{lock, CommandBufferShared, CommitFailure, FailedEncoders, Item, State};
 use std::collections::VecDeque;
@@ -182,7 +183,7 @@ impl Verdict {
 
     /// Whether the command buffer runs nothing, as its first batch is about to be submitted on
     /// `queue`: as decided, or where undecided, whether a hang of the queue is in flight now.
-    pub(super) fn discards(&self, queue: &CommandQueue) -> bool {
+    pub(super) fn discards(&self, queue: &QueueGen) -> bool {
         match self.0.load(Ordering::SeqCst) {
             Verdict::DISCARDED => true,
             Verdict::RUNS => false,
@@ -336,7 +337,8 @@ pub(super) struct Hang {
     held: Held,
 }
 
-/// A command buffer's transition to `Scheduled` around a hang of its queue (the module docs).
+/// A command buffer's transition to `Scheduled` made apart from its last batch: around a hang of
+/// its queue (the module docs), or early behind a host step of its queue's ([`Scheduling::Early`]).
 pub(super) enum Scheduling {
     /// The hold's own: its thread makes it once the batch before its wait (`batch`,
     /// [`Hang::batch`]) was taken, submitted or held in a group (`group.rs`), a hang's no sooner
@@ -345,6 +347,13 @@ pub(super) enum Scheduling {
     /// One committed while a hang of its queue was in flight: the hang's thread makes it early,
     /// or its last batch does, whichever comes first.
     Behind { made: bool },
+    /// Made `Scheduled` before its last batch was taken, by the scheduler's thread: its remaining
+    /// batches waited only for a host step of its queue's head behind work already submitted,
+    /// every earlier command buffer of its queue `Scheduled` (`CommandBufferShared::schedule_early`,
+    /// `scheduler/mod.rs`, **Scheduled**), as a hang's thread makes the queue's command buffers
+    /// behind a hang `Scheduled` ([`Scheduling::Behind`]). No batch of it makes it again, and its
+    /// submission handlers, if any, run in that pass's turn, not with its last batch.
+    Early,
 }
 
 impl Hang {
@@ -363,7 +372,7 @@ impl Hang {
         held: Held,
     ) -> Result<Hang, Error> {
         Ok(Hang {
-            event: device.new_shared_event()?,
+            event: device.new_shared_event_now()?,
             batch,
             encoder,
             held,
@@ -586,7 +595,8 @@ fn let_go(buffer: Arc<CommandBufferShared>) {
 
 /// Whether batch `index` of a command buffer, its last where `last`, makes it `Scheduled` as it
 /// is submitted or held in a group ([`Scheduling`]): its last, but where its hang's thread makes
-/// it or the hang's thread made it early; and whether it is the hang's batch before its wait,
+/// it, the hang's thread made it early, or the scheduler's thread did behind a host step
+/// ([`Scheduling::Early`]); and whether it is the hang's batch before its wait,
 /// taken now, which the hang's thread waits for (on the command buffer's `changed`).
 pub(super) fn schedules(
     scheduling: &mut Option<Scheduling>,
@@ -605,7 +615,15 @@ pub(super) fn schedules(
             *made |= makes;
             (makes, false)
         }
+        Some(Scheduling::Early) => (false, false),
     }
+}
+
+/// Whether a command buffer of `scheduling` was made `Scheduled` early by the scheduler's thread
+/// ([`Scheduling::Early`]): its submission handlers ran or run in that pass's turn, so a batch of
+/// it taken since leaves its flag for them as it is.
+pub(super) fn scheduled_early(scheduling: &Option<Scheduling>) -> bool {
+    matches!(scheduling, Some(Scheduling::Early))
 }
 
 /// The command buffer `buffer`, of state `state`, committed on its queue while a hang of it is in
@@ -635,20 +653,20 @@ pub(super) fn join(
 }
 
 /// Whether a hang of `queue` is in flight (the module docs).
-pub(super) fn in_flight(queue: &CommandQueue) -> bool {
+pub(super) fn in_flight(queue: &QueueGen) -> bool {
     queue.hangs().in_flight.load(Ordering::SeqCst) > 0
 }
 
 /// Whether a fault's hold of `queue` is in flight (the module docs): a command buffer committed
 /// on it now reads `Scheduled` early, and runs.
-pub(super) fn holding(queue: &CommandQueue) -> bool {
+pub(super) fn holding(queue: &QueueGen) -> bool {
     queue.hangs().holding.load(Ordering::SeqCst) > 0
 }
 
 /// The verdict of a command buffer committed on `queue` with the event waits `waits` gives,
 /// listed for the hang's decision where a hang of the queue is in flight; `None` where none is
 /// (the module docs).
-pub(super) fn behind(queue: &CommandQueue, waits: &[(Arc<EventShared>, u64)]) -> Option<Verdict> {
+pub(super) fn behind(queue: &QueueGen, waits: &[(Arc<EventShared>, u64)]) -> Option<Verdict> {
     if !in_flight(queue) {
         return None;
     }
@@ -664,7 +682,7 @@ pub(super) fn behind(queue: &CommandQueue, waits: &[(Arc<EventShared>, u64)]) ->
 /// where a hang of the queue is in flight: it runs nothing and completes with no error, its
 /// signals firing (the module docs). `None` where none is, or where it waits for an event, which
 /// its first batch's submission decides.
-pub(super) fn discarded(queue: &CommandQueue, event_waits: usize) -> Option<CommitFailure> {
+pub(super) fn discarded(queue: &QueueGen, event_waits: usize) -> Option<CommitFailure> {
     (in_flight(queue) && event_waits == 0).then_some(CommitFailure {
         code: 0,
         encoders: FailedEncoders::From(0),

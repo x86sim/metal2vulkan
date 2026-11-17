@@ -10,26 +10,29 @@ use super::address::{
     AddressPlacement, AddressRange, GpuAddress, Held, Place, PlacementConflict, RangeToken,
 };
 use super::address_pool::AddressPool;
+use super::buffer::{
+    usage, Buffer, BufferParts, HostCell, HostImport, HostPages, Lying, Modes, Naming, Owner,
+    ReadApart, Replaces,
+};
 #[cfg(unix)]
-use super::buffer::Pages;
-use super::buffer::{usage, Buffer, BufferParts, HostCell, Lying, Modes, Owner, ReadApart};
+use super::buffer::{ImportPages, Pages};
 use super::copied::NotCopied;
-use super::degradation::Degradation;
 use super::device::lock;
 use super::dirty_pages::{DirtySource, PagesLog};
 use super::error::MemoryKind;
 use super::error::{internal, invalid, nil, vulkan, Error, Problem, RuntimeGap};
 use super::heap::{Heap, HeapProblem};
+use super::host_aliases::{Kind, Within};
 use super::host_bytes::HostBytes;
 use super::host_memory::{
     based_size, binds_in, buffer_base, import_refused, import_window, not_importable,
     refuse_unwritable, refused, unpinnable, Deallocator, HostMemory, HostParts, HostRelease,
-    ImportRequest, ImportWindow, Importer, KeepAlive, Source,
+    ImportRequest, ImportWindow, Importer, KeepAlive, PointerImport, Release, Source,
 };
 use super::host_ram::{RamOnDevice, Routed};
 #[cfg(unix)]
 use super::host_residency::Again;
-use super::memory::{ImportFailure, MemoryClass, Placement};
+use super::memory::{BoundMemory, ImportFailure, Mapped, MemoryClass, Placement};
 use super::read_only_view::ReadOnlyView;
 use super::rebind::RebindProblem;
 use super::texture::stand_in::TextureImages;
@@ -39,6 +42,7 @@ use super::work_counts::{CopiedBecause, Counters};
 use super::Device;
 use crate::release;
 use ash::vk;
+use metal2vulkan::error::RuntimeDriverDefect;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -92,6 +96,42 @@ impl std::fmt::Debug for BufferContents<'_> {
     }
 }
 
+/// The handle type a buffer's memory is exported as, for another API to import it (a runtime
+/// extension: Metal exports no buffer's memory): `BufferDescriptor::exported_as`
+/// (`exported_memory.rs`).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryExport {
+    /// An opaque file descriptor (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`), which CUDA and
+    /// another `VkDevice` of the same driver import: `Buffer::export_memory_fd`.
+    OpaqueFd,
+    /// A dma-buf (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT`), which VA-API's `DRM_PRIME_2`
+    /// surfaces and any other driver's dma-buf imports take: `Buffer::export_memory_dma_buf`.
+    DmaBuf,
+}
+
+impl MemoryExport {
+    /// What a device that does not export a buffer's memory as it refuses the making with.
+    pub(super) fn gap(self) -> RuntimeGap {
+        match self {
+            MemoryExport::OpaqueFd => RuntimeGap::ExportableMemory,
+            MemoryExport::DmaBuf => RuntimeGap::DmaBufExport,
+        }
+    }
+}
+
+/// How a buffer of the runtime's own memory a descriptor asks for is made: at `place` in the
+/// address space, its byte `aligned` (where given) on a multiple of 256 bytes of its memory, in
+/// memory exportable as `export` (where given), and where `buffer.rs`'s `NewBufferOf::Unobserved`
+/// says where `padding_unobserved` (`BufferDescriptor::padding_unobserved`).
+#[derive(Clone, Copy)]
+struct Made {
+    place: Place,
+    aligned: Option<u64>,
+    export: Option<MemoryExport>,
+    padding_unobserved: bool,
+}
+
 /// `MTLBufferDescriptor` (Apple's private class, a runtime extension): a buffer's length, resource
 /// options, contents, and address. Its default is Metal's: length 0, options 0, zero contents, an
 /// address the runtime picks (`pinnedGPUAddress` 0).
@@ -120,6 +160,65 @@ pub struct BufferDescriptor<'a> {
     /// of the pool; `None` for a range of the space. A runtime extension: Metal places a buffer
     /// shorter than a page in a slot of a pool of its own, which its API does not name.
     pub pool_slot: Option<(&'a AddressPool, u64)>,
+    /// The maker declares that nothing reads the bytes between the rows of a texture over the
+    /// buffer, nor between its slices: each row's bytes after its last texel to its pitch, the
+    /// last row's included, and the bytes from a slice's last row's pitch to the next slice. A
+    /// texture over the buffer whose rows (or slices) lie apart is then a linear image aliasing
+    /// the buffer's memory where the device lays one out at its pitches, as one whose rows lie one
+    /// after another is, or else a `DRM_FORMAT_MOD_LINEAR` image at them where the device makes
+    /// such images and its in-place check passed for its pooled memory
+    /// (`WorkCounts::pooled_pitched_images`), not a shadow: its image holds those bytes, and Vulkan lets the image's
+    /// layout moves and a render pass's load and store operations write them, so they may change
+    /// to any value whenever the texture is made or used. No other byte changes: one past the
+    /// image's subresources is reached by no operation on it, and a texel's bytes are the
+    /// texture's. A texture of an IOSurface plane over the buffer
+    /// (`Buffer::new_texture_with_iosurface_plane`) takes the declaration too: Metal keeps a
+    /// plane's padding, but bytes nothing reads cannot tell keeping from changing. Only for a
+    /// buffer of the runtime's own memory (`Zero`, `Copy` or `CopyHost` contents); refused
+    /// (`Invalid`, `PaddingUnobservedNoCopy`) with `NoCopy` contents. A buffer
+    /// the runtime lays in fresh pages it imports (a long one on a device whose pointer imports
+    /// cost submissions nothing, `WorkCounts::fresh_page_buffers_made`) takes its textures in place
+    /// where the device's check of such pages passed: there the declaration lets a render pass's
+    /// load and store change those bytes of a texture whose rows, each to its pitch, share no line
+    /// of the device's memory with bytes past them, and nothing more. On a unified-memory device
+    /// whose other buffers lie in blocks allocated exportable (docs/FAST-PATHS.md, the `Private`
+    /// row) such a buffer lies in blocks of its own, allocated exportable as an opaque file
+    /// descriptor and a dma-buf where the device's buffer query takes both, in which no image is
+    /// bound: a texture over it takes a `DRM_FORMAT_MOD_LINEAR` image at Metal's pitch bound to a
+    /// dedicated import of its block's dma-buf (`WorkCounts::exported_dma_buf_images`); elsewhere
+    /// in a plain block, whose making holds the process's submissions on RADV
+    /// (`WorkCounts::plain_buffer_blocks_made`). A
+    /// runtime extension with no Metal counterpart, for a consumer that owns every read of the
+    /// buffer's bytes; `false` by default, as Metal keeps every byte.
+    pub padding_unobserved: bool,
+    /// A byte of the buffer the runtime lays on a multiple of 256 bytes of its memory, the largest
+    /// linear-image alignment measured (RADV's; the device's own is
+    /// `Device::minimum_linear_texture_alignment_for_pixel_format`'s answer): a texture over the
+    /// buffer whose texels start there (and at any multiple of 256 bytes past it) is then the
+    /// linear image aliasing the buffer's memory where the device lays one out at its pitch, not a
+    /// shadow, as one at offset 0 is. For a consumer whose textures start at an offset that is no
+    /// multiple of the alignment, as CoreVideo lays a frame's planes 32 bytes into their surface.
+    /// The buffer's memory starts that byte's remainder short of the next multiple, at most 255
+    /// more bytes of it taken, and its contents (`contents`) with it: where Metal's buffers start
+    /// on a page, this one's contents start that remainder short of a multiple of 256 (`0xE0` past
+    /// one for byte `0x20`). Its length, its `gpuAddress` (the runtime's address space's) and
+    /// Metal's rules of a texture's offset in it (`newTextureWithDescriptor:offset:bytesPerRow:`)
+    /// are Metal's. Such a buffer is never parked for another making nor laid in fresh pages.
+    /// Only for a buffer of the runtime's own memory (`Zero`, `Copy` or `CopyHost` contents);
+    /// refused (`Invalid`, `AlignedByteNoCopy`) with `NoCopy` contents, whose first byte is the
+    /// caller's. A runtime extension with no Metal counterpart; `None` by default, Metal's
+    /// placement.
+    pub aligned_byte: Option<u64>,
+    /// The handle type its memory is exported as, for another API to import it
+    /// (`Buffer::export_memory_fd`, `Buffer::export_memory_dma_buf`): the buffer lies in memory
+    /// allocated exportable as it, as `Device::new_exportable_buffer` lays an opaque file
+    /// descriptor's (`exported_memory.rs`), with the other fields' effects (an aligned byte lies on
+    /// a multiple of 256 bytes of that memory). Only for a buffer of the runtime's own memory
+    /// (`Zero`, `Copy` or `CopyHost` contents); refused (`Invalid`, `ExportedNoCopy`) with `NoCopy`
+    /// contents, and `NotImplemented` on a device that does not export its memory so
+    /// (`RuntimeGap::ExportableMemory`, `RuntimeGap::DmaBufExport`). A runtime extension with no
+    /// Metal counterpart; `None` by default, memory no other API imports.
+    pub exported_as: Option<MemoryExport>,
 }
 
 impl<'a> BufferDescriptor<'a> {
@@ -137,6 +236,9 @@ impl<'a> BufferDescriptor<'a> {
             range_token: None,
             range_of: None,
             pool_slot: None,
+            padding_unobserved: false,
+            aligned_byte: None,
+            exported_as: None,
         }
     }
 
@@ -168,6 +270,32 @@ impl<'a> BufferDescriptor<'a> {
             ..self
         }
     }
+
+    /// This descriptor declaring the bytes between a texture's rows and slices over the buffer
+    /// unobserved (`padding_unobserved`).
+    pub fn with_padding_unobserved(self) -> BufferDescriptor<'a> {
+        BufferDescriptor {
+            padding_unobserved: true,
+            ..self
+        }
+    }
+
+    /// This descriptor laying byte `byte` of the buffer on a multiple of 256 bytes of its memory
+    /// (`aligned_byte`).
+    pub fn with_aligned_byte(self, byte: u64) -> BufferDescriptor<'a> {
+        BufferDescriptor {
+            aligned_byte: Some(byte),
+            ..self
+        }
+    }
+
+    /// This descriptor's buffer with its memory exportable as `export` (`exported_as`).
+    pub fn with_exported_as(self, export: MemoryExport) -> BufferDescriptor<'a> {
+        BufferDescriptor {
+            exported_as: Some(export),
+            ..self
+        }
+    }
 }
 
 impl Device {
@@ -194,7 +322,29 @@ impl Device {
     /// `PlacementConflict::OffSlot` for an offset that is not a multiple of 256 or a placement
     /// other than `Any` or that address; `OutsidePool` for bytes past the pool's end; `Held` for
     /// bytes a live buffer in the pool holds; `Unshared` with `range_of`.
+    ///
+    /// With `padding_unobserved`, a texture over the buffer may hold the bytes between its rows
+    /// and slices in its image (the field's docs). Refused: `Invalid` (`PaddingUnobservedNoCopy`)
+    /// with `NoCopy` contents.
+    ///
+    /// With `aligned_byte`, that byte of the buffer lies on a multiple of 256 bytes of its memory
+    /// (the field's docs). Refused: `Invalid` (`AlignedByteNoCopy`) with `NoCopy` contents.
+    ///
+    /// With `exported_as`, the buffer's memory is exportable as that handle type (the field's
+    /// docs). Refused: `Invalid` (`ExportedNoCopy`) with `NoCopy` contents; `NotImplemented`
+    /// ([`RuntimeGap::ExportableMemory`], [`RuntimeGap::DmaBufExport`]) on a device that does not
+    /// export such memory.
     pub fn new_buffer_with_descriptor(
+        &self,
+        descriptor: BufferDescriptor<'_>,
+    ) -> Result<Buffer, Error> {
+        self.at_serving_taking(descriptor, |device, descriptor| {
+            device.new_buffer_with_descriptor_now(descriptor)
+        })
+    }
+
+    /// [`Device::new_buffer_with_descriptor`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn new_buffer_with_descriptor_now(
         &self,
         descriptor: BufferDescriptor<'_>,
     ) -> Result<Buffer, Error> {
@@ -208,15 +358,27 @@ impl Device {
             range_token,
             range_of,
             pool_slot,
+            padding_unobserved,
+            aligned_byte,
+            exported_as,
         } = descriptor;
+        if padding_unobserved && matches!(contents, BufferContents::NoCopy { .. }) {
+            return Err(invalid(CALL, Problem::PaddingUnobservedNoCopy));
+        }
+        if aligned_byte.is_some() && matches!(contents, BufferContents::NoCopy { .. }) {
+            return Err(invalid(CALL, Problem::AlignedByteNoCopy));
+        }
+        if exported_as.is_some() && matches!(contents, BufferContents::NoCopy { .. }) {
+            return Err(invalid(CALL, Problem::ExportedNoCopy));
+        }
         let place = match (range_of, pool_slot) {
             (Some(other), slot) => {
                 let in_pool = slot.is_some();
                 self.shared_place(CALL, other, &contents, length, placement, in_pool)?
             }
             (None, Some((pool, offset))) => {
-                if !pool.device().same(self) {
-                    return Err(invalid(CALL, Problem::ForeignObject));
+                if !pool.root_device().same(self) {
+                    return Err(pool.root_device().foreign(CALL, self));
                 }
                 Place::InPool {
                     pool: pool.gpu_address().0,
@@ -227,23 +389,29 @@ impl Device {
             (None, None) => Place::At(placement),
         };
         let (resource_options, drops_writes) = match contents {
-            BufferContents::NoCopy { .. } => self.no_copy_options(CALL, resource_options),
+            BufferContents::NoCopy { .. } => no_copy_options(resource_options),
             _ => (self.own_memory_options(CALL, resource_options)?, false),
         };
+        let made = Made {
+            place,
+            aligned: aligned_byte,
+            export: exported_as,
+            padding_unobserved,
+        };
         let buffer = match contents {
-            BufferContents::Zero => self.zero_buffer(CALL, length, resource_options, place),
+            BufferContents::Zero => self.zero_buffer(CALL, length, resource_options, made),
             BufferContents::Copy(bytes) => {
                 if bytes.len() as u64 != length {
                     return Err(invalid(CALL, Problem::LengthMismatch));
                 }
                 let bytes = HostBytes::from_slice(bytes);
-                self.buffer_with_bytes(CALL, bytes, resource_options, place)
+                self.buffer_with_bytes(CALL, bytes, resource_options, made)
             }
             BufferContents::CopyHost(bytes) => {
                 if bytes.len() as u64 != length {
                     return Err(invalid(CALL, Problem::LengthMismatch));
                 }
-                self.buffer_with_bytes(CALL, bytes, resource_options, place)
+                self.buffer_with_bytes(CALL, bytes, resource_options, made)
             }
             // SAFETY: the `HostMemory` constructor's caller vouched for `length` bytes at the
             // pointer.
@@ -267,6 +435,9 @@ impl Device {
         if let Some(token) = range_token {
             buffer.keep_range_token(token)?;
         }
+        if padding_unobserved {
+            buffer.declare_padding_unobserved();
+        }
         Ok(self.visible(buffer))
     }
 
@@ -278,11 +449,26 @@ impl Device {
         bytes: &[u8],
         options: ResourceOptions,
     ) -> Result<Buffer, Error> {
+        self.at_serving(|device| device.new_buffer_with_bytes_now(bytes, options))
+    }
+
+    /// [`Device::new_buffer_with_bytes`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn new_buffer_with_bytes_now(
+        &self,
+        bytes: &[u8],
+        options: ResourceOptions,
+    ) -> Result<Buffer, Error> {
         const CALL: &str = "new_buffer_with_bytes";
         self.keep_room();
         let options = self.own_memory_options(CALL, options)?;
         let bytes = HostBytes::from_slice(bytes);
-        let buffer = self.buffer_with_bytes(CALL, bytes, options, AddressPlacement::Any)?;
+        let made = Made {
+            place: AddressPlacement::Any.into(),
+            aligned: None,
+            export: None,
+            padding_unobserved: false,
+        };
+        let buffer = self.buffer_with_bytes(CALL, bytes, options, made)?;
         Ok(self.visible(buffer))
     }
 
@@ -294,19 +480,33 @@ impl Device {
     /// a wait in it for that command buffer returns at once, as Metal's does. A refused call never
     /// runs it.
     ///
+    /// Where the device's recovery makes it a new `VkDevice` (`Degradation::DeviceRecovered`), the
+    /// buffer goes on there, as Metal's goes on across its GPU's recovery: made again over the
+    /// same pages, as this call or its last rebind made it (the caller's gate, resolver and
+    /// dma-buf source asked again), its `contents` pointer and its bytes as they were. Its
+    /// deallocator then runs at its release once no `VkDevice`'s import of the pages is left. A
+    /// buffer detached at the recovery stays the lost device's, refused where it meets the new one
+    /// (`RuntimeGap::MadeBeforeRecovery`).
+    ///
     /// The pages are imported here, as Metal wires them when it makes the buffer: the GPU uses
     /// the pages mapped at the pointer now, and memory the device cannot import is refused here,
     /// as Metal answers nil. The import costs work per page here (on macOS about 11 to 20 ms per
     /// GiB measured on an M4 and an M3 Max), where Metal makes the buffer at once and pays at the
-    /// first command using it (24 to 88 ms per GiB). Where the device refuses the pointer and
-    /// `memory` carries a dma-buf source ([`HostMemory::with_dma_buf`]), the dma-bufs it makes of
-    /// the pages are imported instead. With Metal's private option bit 24
+    /// first command using it (24 to 88 ms per GiB). Where the device refuses the pointer, or
+    /// imports none (it enables no `VK_EXT_external_memory_host`), and `memory` carries a dma-buf
+    /// source ([`HostMemory::with_dma_buf`]), the dma-bufs it makes of the pages are imported
+    /// instead. With Metal's private option bit 24
     /// ([`ResourceOptions::PRIVATE_BIT`]), the GPU's writes to the pages are dropped, as Metal's
     /// are: on macOS the pages are imported through a read-only view of them, by their pointer
-    /// alone; elsewhere the GPU's writes reach them, announced (`private-resource-option`).
+    /// alone; elsewhere the buffer is made over a copy of them whose GPU writes are dropped,
+    /// announced (`copied-host-pages`): each commit copies in the bytes the CPU changed, the
+    /// command buffers already submitted read what the GPU wrote, and each batch's completion
+    /// puts the copy back to the caller's bytes, which the GPU never writes.
     ///
-    /// Where the caller's gate refuses the import ([`HostMemory::with_import_gate`]), or the import
-    /// the device and the gate admitted fails (out of memory, another Vulkan error), of the pointer
+    /// Where the caller's gate refuses the import ([`HostMemory::with_import_gate`]), where the
+    /// device refuses the pointer or imports none and no dma-buf of the pages serves (no source
+    /// given, or one that failed or whose dma-bufs the device refused), or where the import the
+    /// device and the gate admitted fails (out of memory, another Vulkan error), of the pointer
     /// or of the dma-bufs, the buffer is made over a copy of the bytes in memory of the device's
     /// own instead, its `contents` still the pointer, announced (`copied-host-pages`): each commit
     /// copies in the bytes the CPU changed, and each batch's completion merges back the bytes the
@@ -314,13 +514,26 @@ impl Device {
     /// instead, as Metal drops them, and writes nothing to the pages. Pages the process cannot read
     /// are never copied, and keep the import's refusal.
     ///
+    /// On a device without unified memory
+    /// ([`DeviceProperties::has_unified_memory`](crate::DeviceProperties::has_unified_memory)) a
+    /// buffer of `Managed` storage (without bit 24) is two copies, as Metal keeps a managed
+    /// resource on a Mac with a discrete GPU ([`HostBacking::DeviceCopy`](crate::HostBacking)):
+    /// the GPU's own in device-local memory, which every command reads and writes, and the
+    /// caller's pages, its `contents`, copied in now (before any command of a command buffer
+    /// committed after the call) and by [`did_modify_range`](Buffer::did_modify_range), and copied
+    /// out by a blit's `synchronize_resource`. The pages are imported as above to be the copies'
+    /// source and target, but never copied: where the import is not made, the copies go through
+    /// staging buffers. A CPU write no `did_modify_range` names is not seen by the GPU. Where no
+    /// device-local memory has room for the GPU's copy, the buffer lies in the pages as a `Shared`
+    /// one does, announced (`device-memory-overflow`).
+    ///
     /// Refused: a length of 0 or past `max_buffer_length` (`Nil`, as plain Metal answers nil);
-    /// `Private` or `Memoryless` storage, as Metal stops them, and an undefined
-    /// option (`Invalid`); a device
-    /// without `VK_EXT_external_memory_host` (`Unsupported`, naming it); memory this device
-    /// cannot import exactly, by its pointer or by its dma-bufs (`Unsupported`, `HostMemory`),
-    /// among it on Linux a page this process cannot write ([`HostMemory::new`]); dma-bufs that
-    /// break the source's contract (`Invalid`, `Problem::DmaBuf`); pages past the
+    /// `Private` or `Memoryless` storage, as Metal stops them, and an undefined option
+    /// (`Invalid`); on a device that imports neither pointers (`VK_EXT_external_memory_host`) nor
+    /// dma-bufs, every memory (`Unsupported`, naming the extension); memory this device cannot
+    /// import exactly, by its pointer or by its dma-bufs (`Unsupported`, `HostMemory`), among it
+    /// on Linux a page this process cannot write ([`HostMemory::new`]);
+    /// dma-bufs that break the source's contract (`Invalid`, `Problem::DmaBuf`); pages past the
     /// device's allocation size (`OutOfMemory`). Pages not mapped, or mapped without access, which
     /// Metal makes no buffer over (nil), are refused here too, typed as the check or the import
     /// answers, though such memory breaks [`HostMemory::new`]'s contract.
@@ -336,8 +549,24 @@ impl Device {
         options: ResourceOptions,
         deallocator: Option<Deallocator>,
     ) -> Result<Buffer, Error> {
+        self.at_serving_taking((memory, deallocator), |device, (memory, deallocator)| {
+            // SAFETY: the caller's contract.
+            unsafe {
+                device.new_buffer_with_bytes_no_copy_now(memory, length, options, deallocator)
+            }
+        })
+    }
+
+    /// [`Device::new_buffer_with_bytes_no_copy`] on the generation that serves (`device/line.rs`).
+    pub(crate) unsafe fn new_buffer_with_bytes_no_copy_now(
+        &self,
+        memory: HostMemory,
+        length: u64,
+        options: ResourceOptions,
+        deallocator: Option<Deallocator>,
+    ) -> Result<Buffer, Error> {
         const CALL: &str = "new_buffer_with_bytes_no_copy";
-        let (options, drops_writes) = self.no_copy_options(CALL, options);
+        let (options, drops_writes) = no_copy_options(options);
         // SAFETY: the caller's contract.
         let buffer = unsafe {
             self.buffer_over_host_memory(
@@ -361,13 +590,14 @@ impl Device {
     /// made. Without the call, a no-copy buffer made over exactly the bytes a live one was made
     /// over, of its memory class, lies in that one's import (`host_aliases.rs`), and so over the
     /// pages that were there when that one was made. Buffers made before the call keep their own
-    /// imports, and stay ordered with each other as before. Their pages are those their imports
-    /// read: an import of dma-bufs keeps the pages it was made over, as Metal's buffer does, and so
-    /// does an import of the pointer on a driver that keeps them; on a driver whose pointer imports
-    /// follow their address (`DriverFact::PointerImportsFollowTheirAddress`: ANV on i915, RADV,
-    /// lavapipe), an import of the pointer reads the pages mapped there at each submission, the new
-    /// ones from the remap on (`docs/FAST-PATHS.md`, known gaps). Not a Metal call: Metal needs
-    /// none. A `length` of 0 tells nothing.
+    /// imports, and stay ordered with each other as before. A remap under a live buffer breaks
+    /// [`HostMemory::new`]'s contract, and under a live import of the pointer
+    /// `VK_EXT_external_memory_host`'s too, which leaves undefined whether the import holds a
+    /// reference to its pages: what such a buffer's later commands read and write is then
+    /// unspecified (`docs/FAST-PATHS.md`, known gaps), and this call does not mend it. The pages
+    /// are replaced or unmapped once every buffer over them signalled that its import went (its
+    /// keep-alive dropped, or its deallocator ran; docs/HOWTO.md, "Unmapping host memory"). Not a
+    /// Metal call: Metal needs none. A `length` of 0 tells nothing.
     ///
     /// The call may come at the unmap or after the new map, but before a buffer is made over the
     /// new pages: a buffer made over those bytes while it runs may lie in either pages. The bytes
@@ -378,34 +608,50 @@ impl Device {
     /// once, and otherwise it finds the buffers over the range by address, whether the range
     /// covers none of them or many, never reading them all.
     pub fn host_range_remapped(&self, bytes: NonNull<u8>, length: u64) {
+        self.current().host_range_remapped_now(bytes, length)
+    }
+
+    /// [`Device::host_range_remapped`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn host_range_remapped_now(&self, bytes: NonNull<u8>, length: u64) {
         let start = bytes.as_ptr() as u64;
         let shared = self.shared();
         // The unit an import's pages round out to: an import by pointer over a page the call
         // covers is taken anew at its next submission.
-        let unit = (shared.host_import.as_ref())
-            .map_or(1, |importer| importer.page.max(importer.alignment));
+        let unit = (shared.host_import.as_ref()).map_or(1, Importer::unit);
         let imports = (shared.aliases).remapped(start, start.saturating_add(length), unit);
         shared.counts.host_range_remapped(imports);
     }
 
-    /// A buffer of `length` zero bytes at `placement`, for `call`: refused as
-    /// [`Device::new_buffer`] is, and for a pin the address space cannot honour; announced as
-    /// `new_buffer` announces it.
+    /// A buffer of `length` zero bytes made as `made` says, for `call`: refused as
+    /// [`Device::new_buffer`] is, for a pin the address space cannot honour, and for an export the
+    /// device does not make; announced as `new_buffer` announces it.
     fn zero_buffer(
         &self,
         call: &'static str,
         length: u64,
         options: ResourceOptions,
-        placement: impl Into<Place>,
+        made: Made,
     ) -> Result<Buffer, Error> {
-        let (buffer, class) = self.buffer_of_length(call, length, options, placement)?;
-        self.degrade_system_memory(&buffer, class, || {
-            format!("a `Shared` buffer of {length} bytes")
-        });
+        let Made {
+            place,
+            aligned,
+            export,
+            padding_unobserved,
+        } = made;
+        if let Some(export) = export {
+            #[cfg(unix)]
+            return self.exportable_buffer(call, length, options, (place, aligned), export);
+            #[cfg(not(unix))]
+            return Err(Error::NotImplemented(export.gap()));
+        }
+        let placed = (place, aligned);
+        let (buffer, class) =
+            self.buffer_of_length(call, length, options, placed, padding_unobserved)?;
+        self.degrade_system_memory(&buffer, class, || format!("buffer of {length} bytes"));
         Ok(buffer)
     }
 
-    /// A buffer holding a copy of `bytes` at `placement`, for `call`: written through its
+    /// A buffer holding a copy of `bytes`, made as `made` says, for `call`: written through its
     /// mapping, and from there to a `Managed` buffer's own bytes where it has a host copy
     /// (`Buffer::upload`), or for `Private` storage copied from a staging buffer by the device's
     /// next submission, before any of its commands, which the call does not wait for
@@ -415,14 +661,14 @@ impl Device {
         call: &'static str,
         bytes: HostBytes<'_>,
         options: ResourceOptions,
-        placement: impl Into<Place>,
+        made: Made,
     ) -> Result<Buffer, Error> {
         let length = bytes.len() as u64;
-        let buffer = self.zero_buffer(call, length, options, placement)?;
+        let buffer = self.zero_buffer(call, length, options, made)?;
         // The bytes, read once, through their pointer, into the buffer's memory.
         let fill = |target: &Buffer| {
             let contents = target
-                .contents()
+                .mapped_contents()
                 .ok_or_else(|| internal("a host-visible buffer without contents"))?;
             // SAFETY: the buffer holds `length` bytes at `contents`, memory of the runtime's own
             // that no command uses yet and nothing else reaches.
@@ -432,7 +678,7 @@ impl Device {
         };
         if buffer.storage_mode() != StorageMode::Private {
             fill(&buffer)?;
-            buffer.upload(0..length)?;
+            buffer.upload(0..length, Replaces::Unread)?;
             return Ok(buffer);
         }
         let staging = self.own_buffer(length, ResourceOptions::shared())?;
@@ -447,9 +693,11 @@ impl Device {
     /// must start at a multiple of the import's unit, the larger of the host page and the
     /// device's `minImportedHostPointerAlignment`, so that the heap's offsets are its memory's
     /// (`Invalid`, `HeapProblem::HostMemoryAlignment`, elsewhere). Where `drops_writes` (Metal's
-    /// private option bit 24, [`Device::no_copy_options`]), the pages are imported through a
-    /// read-only view of them, which drops the GPU's writes (`read_only_view.rs`): an import of
-    /// its own, which no other buffer lies in or joins, and which the device keeps imported.
+    /// private option bit 24, [`no_copy_options`]), the pages are imported through a read-only
+    /// view of them, which drops the GPU's writes (`read_only_view.rs`): an import of its own,
+    /// which no other buffer lies in or joins, and which the device keeps imported. Where the
+    /// system maps no such view, the buffer is a copy of the pages whose GPU writes are dropped
+    /// instead (`copied.rs`), placed but joined by no other buffer.
     ///
     /// # Safety
     ///
@@ -465,6 +713,67 @@ impl Device {
         of_heap: bool,
         drops_writes: bool,
     ) -> Result<Buffer, Error> {
+        let parts = memory.into_parts();
+        let release = release.of(parts.pointer, length);
+        let made = (call, length, options, placement);
+        // SAFETY: the caller's contract.
+        unsafe {
+            self.buffer_over_host_parts(made, parts, release, of_heap, drops_writes, Naming::New)
+        }
+    }
+
+    /// [`Device::buffer_over_host_memory`] of the caller's memory's `parts`, `made` (for its call,
+    /// of its length and options, at its placement) as the buffer `naming` names, given back to
+    /// `release`: a new buffer, or one its device's recovery carries to this generation
+    /// (`Buffer::carry`). A buffer's pages, a heap's own buffer's among them, keep what they were
+    /// made of, which a recovery makes the buffer again of ([`HostPages::made_of`]). A new `Managed` one on a
+    /// device without unified memory is two copies (`managed_copy.rs`).
+    ///
+    /// # Safety
+    ///
+    /// The memory of `parts` meets [`HostMemory::new`]'s contract for `length` bytes.
+    pub(super) unsafe fn buffer_over_host_parts(
+        &self,
+        made: (&'static str, u64, ResourceOptions, Place),
+        parts: HostParts,
+        release: Option<Release>,
+        of_heap: bool,
+        drops_writes: bool,
+        naming: Naming,
+    ) -> Result<Buffer, Error> {
+        let (call, length, options, _) = made;
+        let modes = Modes::of(options)?;
+        if matches!(naming, Naming::New) && self.two_copies(modes.storage, of_heap, drops_writes) {
+            if length == 0 || length > self.properties().max_buffer_length {
+                return Err(nil(call, Problem::BufferLength { length }));
+            }
+            if self.is_lost() {
+                return Err(self.lost_refusal());
+            }
+            // SAFETY: the caller's contract.
+            return unsafe { self.two_copy_buffer(made, parts, release, naming) };
+        }
+        // SAFETY: the caller's contract.
+        unsafe { self.one_copy_buffer(made, parts, release, of_heap, drops_writes, naming) }
+    }
+
+    /// [`Device::buffer_over_host_parts`] of a buffer that lies in the caller's pages (or a copy
+    /// of them), never two copies: for a buffer made as [`Naming::HostCopy`] (a two-copy
+    /// buffer's host copy, `managed_copy.rs`) it is never a copy of them, refused
+    /// (`managed_copy::uncopied`) where it would be one.
+    ///
+    /// # Safety
+    ///
+    /// The memory of `parts` meets [`HostMemory::new`]'s contract for `length` bytes.
+    pub(super) unsafe fn one_copy_buffer(
+        &self,
+        (call, length, options, placement): (&'static str, u64, ResourceOptions, Place),
+        parts: HostParts,
+        release: Option<Release>,
+        of_heap: bool,
+        drops_writes: bool,
+        naming: Naming,
+    ) -> Result<Buffer, Error> {
         let modes = Modes::of(options)?;
         let class = match modes.storage {
             StorageMode::Shared => MemoryClass::Shared,
@@ -477,13 +786,16 @@ impl Device {
             return Err(nil(call, Problem::BufferLength { length }));
         }
         if self.is_lost() {
-            return Err(Error::DeviceLost);
+            return Err(self.lost_refusal());
         }
         let shared = self.shared();
         let importer = shared
             .host_import
             .as_ref()
             .map_err(|unsupported| Error::Unsupported(unsupported.clone()))?;
+        // What the buffer is made of stays with its pages, a heap's own buffer's too, given them
+        // with the rest below, from the one look at them.
+        let made_of = parts.clone();
         let HostParts {
             pointer,
             source,
@@ -491,52 +803,99 @@ impl Device {
             dirty,
             gate,
             runs,
-        } = memory.into_parts();
+            dma_buf_only,
+        } = parts;
+        let source = (source, dma_buf_only);
         let host = host_window(call, importer, pointer, length, source, drops_writes)?;
+        // Pages with no route of their own are refused here, but where their runs may lie in a
+        // guest RAM's chunk (below), refused there where they do not; on a device that imports no
+        // pointer, they are a copy instead (below), as where a device refuses their pointer.
+        let no_route = match (host.no_route(importer).filter(|_| !host.pointerless), &runs) {
+            (Some(refusal), None) => return Err(refusal),
+            (no_route, _) => no_route,
+        };
         let window = host.window;
         if of_heap && window.offset != 0 {
-            let alignment = importer.page.max(importer.alignment);
+            let alignment = importer.unit();
             let problem = HeapProblem::HostMemoryAlignment { alignment };
             return Err(invalid(call, Problem::Heap(problem)));
         }
         // A buffer over the bytes a live no-copy buffer was made over, of its memory class, lies
-        // in its import (`host_aliases.rs`), its dma-buf source dropped uncalled; a heap's own
-        // buffer imports its own, as does one whose GPU writes are dropped.
+        // in its import, and a buffer of either class in its copy where it is a copied host
+        // buffer and no import of the class lives (`host_aliases.rs`, `copied.rs`): one
+        // `VkBuffer`, one snapshot and one key, its dma-buf source dropped uncalled and the gate
+        // unasked, as no page is mapped for it. A heap's own buffer lies so in a live import of
+        // the same bytes, joining no key (`host_aliases.rs`, "One page, one import"), and copies
+        // its own; one whose GPU writes are dropped imports or copies its own (its import is a
+        // read-only view of the pages, or its copy drops them).
         let made_over = (pointer.as_ptr() as u64, length);
-        let release = release.of(pointer, length);
-        let shares = (!of_heap && !drops_writes)
+        // A two-copy buffer's host copy lies in no copy of the pages (`managed_copy.rs`), nor
+        // does a read twin (`read_twin.rs`).
+        let shares = (!drops_writes)
             .then(|| shared.aliases.import(made_over, class))
-            .flatten();
-        if shares.is_none() && !of_heap && shared.aliases.inside_live(made_over, class) {
-            shared.counts.churn.import_inside_live();
-        }
+            .flatten()
+            .filter(|import| {
+                !(matches!(naming, Naming::HostCopy | Naming::ReadTwin) && import.copied())
+            })
+            .filter(|import| !(of_heap && import.copied()));
         if let Some(import) = shares {
             let address = self.place_window(placement, &window, length)?;
-            let buffer =
-                self.buffer_in_import(Arc::clone(&import), length, modes, address, release);
+            let kind = match import.copied() {
+                true => Kind::Copy,
+                false => Kind::Import(class),
+            };
+            let made = (length, modes, of_heap);
+            let buffer = self.buffer_in_import(Arc::clone(&import), made, address, release, naming);
+            let key = buffer.identity().key;
             // The GPU's writes through it are reported to the import's logs, as through the
-            // buffer it was made for, over the same bytes (`dirty_pages.rs`).
+            // buffer it was made for, over the same bytes (`dirty_pages.rs`), and merged back
+            // from the copy where it lies in one. Its pages keep what it was made of
+            // ([`HostPages::made_of`]).
             if let Some(pages) = buffer.host_pages() {
-                pages.logged_as(buffer.identity().key);
+                pages.logged_as(key);
+                pages.copied_as(key);
+                pages.keep_made_of(made_of);
             }
-            shared
-                .aliases
-                .join(buffer.identity().key, made_over, class, &import);
-            shared.aliases.place(buffer.identity().key, made_over);
+            if kind == Kind::Copy {
+                shared.counts.copied_host_buffer_shared();
+                self.degrade_copied_shared(call, pointer, length, import.copy_drops_writes());
+            }
+            if of_heap {
+                shared.aliases.hold(key, made_over, kind, &import);
+            } else {
+                shared.aliases.join(key, made_over, kind, &import);
+            }
+            shared.aliases.place(key, made_over);
             return Ok(buffer);
         }
+        // A copied host buffer made below joins the memory as an import does, so that a later
+        // buffer over the same bytes lies in its copy; a heap's own copy is placed, joining none.
+        let noted = |buffer: Buffer| {
+            let key = buffer.identity().key;
+            if let (false, Some(pages)) = (of_heap, buffer.host_pages()) {
+                shared
+                    .aliases
+                    .join(key, made_over, Kind::Copy, pages.import());
+            }
+            shared.aliases.place(key, made_over);
+            buffer
+        };
         // Pages the caller resolves to runs of a guest RAM the device uses (`host_ram.rs`): asked
         // once, here, holding no lock of the runtime's, before the gate. One run inside one chunk
         // is bound in the chunk's import, with no import of its own: no pin, no kernel mapping,
         // no gate. Others take the paths below, the runs kept with the buffer. A buffer whose GPU
-        // writes are dropped is never routed: it imports a read-only view of its pages.
-        let routed = match (&runs, drops_writes) {
-            (Some(resolver), false) => self.route_runs(call, importer, resolver, &window)?,
+        // writes are dropped is never bound in a chunk: it imports a read-only view of its pages,
+        // or is a copy of them, whose runs are asked all the same, so that the copy's commits
+        // copy in only the pages the RAM's log reports written ([`routes_runs`]).
+        let routed = match &runs {
+            Some(resolver) if routes_runs(drops_writes) => {
+                self.route_runs(call, importer, resolver, &window)?
+            }
             _ => None,
         };
         // SAFETY: the window's pages are the bytes of the run in the RAM (the resolver's
         // contract, `HostMemory::with_runs`).
-        let in_chunk = (routed.as_ref())
+        let in_chunk = (routed.as_ref().filter(|_| !drops_writes))
             .and_then(|routed| unsafe { self.bind_in_chunk(importer, routed, &window, length) });
         let kept_runs = routed.as_ref().map(Routed::kept);
         // The logs of the writes to the pages, where their memory came with one or their guest
@@ -547,16 +906,100 @@ impl Device {
             kept_runs.as_ref(),
             window.offset,
         );
-        let (buffer, memory, again, unwritable) = match in_chunk {
-            Some((buffer, memory)) => (buffer, memory, None, false),
-            None => {
+        // One page, one import (`host_aliases.rs`): a buffer (not a heap's own) whose pages a
+        // live import of another buffer's or heap's holds all of is bound inside that import's
+        // memory, with no import of its own, no pin and no gate; pages a live import holds some
+        // of, and not all, and a heap's pages one holds more of, are a copy below, never imported
+        // again, but where they and every live import that holds some of them are dma-bufs
+        // ([`Device::imports_beside`]), which import their own. A buffer whose GPU writes are
+        // dropped imports a read-only view of its own.
+        let within = match (&in_chunk, drops_writes) {
+            (None, false) => (shared.aliases).within((window.start, window.size), importer.unit()),
+            _ => Within::Free,
+        };
+        let inside = match &within {
+            // SAFETY: the window's pages are the caller's at the addresses the import's pages
+            // were imported from, which hold all of them (`HostAliases::within`).
+            Within::Inside(import) if !of_heap => unsafe {
+                self.bind_in_import(import, &window, length)
+            },
+            _ => None,
+        };
+        let held = inside.is_none() && !matches!(within, Within::Free);
+        let beside = held && self.imports_beside(&within, &host);
+        let over_import = held && !beside;
+        // Imported beside dma-bufs as dma-bufs alone: never by the pointer, nor the gate asked. So
+        // are pages a guest RAM routes that no chunk binds the buffer in, where the RAM's chunks
+        // may be imported beside them (`Routed::own_dma_bufs`).
+        let ram_beside = in_chunk.is_none()
+            && inside.is_none()
+            && (routed.as_ref()).is_some_and(|routed| routed.own_dma_bufs(self));
+        let dma_bufs_alone = beside || (ram_beside && host.source.is_some());
+        let host = HostWindow {
+            by_pointer: host.by_pointer && !dma_bufs_alone,
+            ..host
+        };
+        // Pages a guest RAM's chunk import, made or in flight, holds some of, at the RAM's own
+        // addresses, that no chunk binds the buffer in (its bytes cross a chunk's end, or no run
+        // resolver routed them): a copy too, never a second import of them (`host_ram.rs`).
+        // Others the buffer's own import may take are claimed until it is noted below, so that
+        // no chunk's import takes them meanwhile (`Device::claim_ram_pages`).
+        let claim = (in_chunk.is_none() && inside.is_none() && !drops_writes)
+            .then(|| self.claim_ram_pages(window.start..window.start + window.size));
+        let over_chunk = matches!(claim, Some(None));
+        let (buffer, memory, again) = match (in_chunk, inside) {
+            // Bound in a chunk's import, or inside a live import: neither is released while the
+            // buffer lies there.
+            (Some((buffer, memory)), _) | (None, Some((buffer, memory))) => (buffer, memory, None),
+            (None, None) => {
+                if let Some(refusal) = no_route {
+                    return Err(refusal);
+                }
                 // A no-copy buffer or heap whose pointer the device would import (not one whose GPU
                 // writes are dropped) may be a copy instead (`copied.rs`): where the caller's gate
                 // refuses the import, asked here with the pages it would map, holding no lock of
                 // the runtime's, before their write permission is asked (a copy pins no page, and
-                // drops the GPU's writes to pages the process cannot write); or where the import it
-                // admitted fails, of the pointer or of the caller's dma-bufs.
+                // drops the GPU's writes to pages the process cannot write); where the process
+                // cannot write them; or where the import it admitted fails, of the pointer or of
+                // the caller's dma-bufs.
                 let copyable = !drops_writes;
+                let copy = (call, pointer, length, modes, placement, of_heap);
+                // Memory whose GPU writes Metal's private option bit 24 drops, where the system
+                // maps no read-only view of the pages (`read_only_view.rs`): a copy of them whose
+                // GPU writes are dropped, the gate unasked and no page pinned. It joins no other
+                // buffer over the bytes, nor does one lie in it.
+                // A new one that is no heap's own takes a read twin besides where it can: the
+                // runtime's buffer over the pages in place, which the commands that cannot write
+                // it read instead of the copy (`read_twin.rs`).
+                if drops_writes && !crate::read_only_view::VIEWS_DROP_WRITES {
+                    let twin = (!of_heap && matches!(naming, Naming::New)).then(|| made_of.clone());
+                    // SAFETY: the caller's contract.
+                    let copied = unsafe {
+                        self.copied_buffer(copy, release, dirty, CopiedFor::ReadOnly, naming)
+                    }?;
+                    let buffer = kept(copied, log, kept_runs, made_of);
+                    if let Some(parts) = twin {
+                        // SAFETY: the parts are the caller's, for the same bytes (the caller's
+                        // contract).
+                        unsafe { self.make_read_twin(&buffer, (call, length, options), parts) };
+                    }
+                    // Placed after its twin, so that the twin's key is its bytes' (the first
+                    // placed there, `host_aliases.rs`'s `Placements`): a command that reads
+                    // through the twin alone names no use of the copy, whose commit then
+                    // compares none of it, while the copy's uses order against the twin's.
+                    shared.aliases.place(buffer.identity().key, made_over);
+                    return Ok(buffer);
+                }
+                // Pages a live import holds some of: a copy, the gate unasked and no page pinned.
+                if over_import || over_chunk {
+                    let why = match over_import {
+                        true => CopiedFor::OverImport,
+                        false => CopiedFor::OverRamChunk,
+                    };
+                    // SAFETY: the caller's contract.
+                    let copied = unsafe { self.copied_buffer(copy, release, dirty, why, naming) };
+                    return copied.map(|buffer| noted(kept(buffer, log, kept_runs, made_of)));
+                }
                 let refused_by_host = copyable
                     && host.by_pointer
                     && gate.as_ref().is_some_and(|gate| {
@@ -566,25 +1009,41 @@ impl Device {
                         };
                         !gate(request)
                     });
-                let copy = (call, pointer, length, modes, placement, of_heap);
                 if refused_by_host {
-                    shared.counts.host_import_refused_by_host();
+                    // A read twin's refusal makes no copy, and counts as the twin not made alone
+                    // (`WorkCounts::read_twins_unimported`).
+                    if !matches!(naming, Naming::ReadTwin) {
+                        shared.counts.host_import_refused_by_host();
+                    }
                     // SAFETY: the caller's contract.
-                    let copied = unsafe { self.copied_buffer(copy, release, dirty, None) };
-                    return copied.map(|buffer| kept_with(kept_log(buffer, log), kept_runs));
+                    let copied = unsafe {
+                        self.copied_buffer(copy, release, dirty, CopiedFor::Refused, naming)
+                    };
+                    return copied.map(|buffer| noted(kept(buffer, log, kept_runs, made_of)));
                 }
                 // Only a buffer that imports its pages pins them, and so has their writability
                 // asked: one that lies in a live import pins none, that import's making asked for
                 // the same window, and the pages stay writable while imported (`HostMemory::new`).
-                let host = writability_settled(host, writable, &shared.counts)?;
-                let unwritable = host.unwritable;
+                // Pages the process cannot write are a copy whose GPU writes are dropped, as
+                // Metal drops them, their source never called ([`unwritable_pages`]).
+                if unwritable_pages(&host, writable, &shared.counts)? {
+                    // SAFETY: the caller's contract.
+                    let copied = unsafe {
+                        self.copied_buffer(copy, release, dirty, CopiedFor::Unwritable, naming)
+                    };
+                    return copied.map(|buffer| noted(kept(buffer, log, kept_runs, made_of)));
+                }
                 // SAFETY: the window lies in the pages of the caller's bytes, which stay mapped
                 // (`HostMemory::new`), and the source's pieces hold them
                 // (`HostMemory::with_dma_buf`). No lock of the runtime's is held. A no-copy
                 // buffer's own import of dma-bufs keeps them, so the device may release it while
                 // idle and import them again (`host_residency.rs`), as it may its own import of the
-                // pointer where the driver's pointer imports follow their address; a heap's import
+                // pointer where a held pointer import costs every submission; a heap's import
                 // stays, as does an import of a read-only view.
+                // Whether the device was asked the pointer, or imports none, whose refusal a
+                // failed source leaves standing (the window takes it, and the memory is no
+                // dma-buf-only memory).
+                let pointer_refused = host.by_pointer || host.pointerless;
                 let imported =
                     match unsafe { self.import_by_pointer(importer, pointer, length, host, class) }
                     {
@@ -597,40 +1056,87 @@ impl Device {
                             let again = None;
                             Ok((buffer, memory, again))
                         }
+                        // A heap's import is dedicated to nothing, as textures placed in the
+                        // heap may be bound in its memory (`texture/heap.rs`); a buffer's own
+                        // binds the buffer alone, its textures in place bound in imports of their
+                        // own (`Device::dma_buf_image`).
                         // SAFETY: as above.
                         Ok(Err((source, refusal))) => unsafe {
-                            let keep = !of_heap;
+                            let kept = (!of_heap, !of_heap);
                             let window = &window;
                             self.import_from_source(
-                                call, importer, pointer, length, window, source, class, keep,
+                                call, importer, pointer, length, window, source, class, kept,
                             )
                         }
-                        .map_err(|failed| source_failure(failed, refusal)),
-                        Err(error) => Err(error),
+                        .map_err(|failed| {
+                            // No dma-buf of the pages served either (the source failed, or the
+                            // device refused its dma-bufs): the device's refusal of the pointer,
+                            // as where no source is given.
+                            let by_device =
+                                pointer_refused && refused(&failed) && refusal == not_importable();
+                            let error = source_failure(failed, refusal);
+                            (
+                                FailedImport {
+                                    error,
+                                    sourced: true,
+                                },
+                                by_device,
+                            )
+                        }),
+                        // The device's refusal of the pointer, with no source of dma-bufs of the
+                        // pages to take instead.
+                        Err(error) => {
+                            let by_device = error == not_importable();
+                            let sourced = false;
+                            Err((FailedImport { error, sourced }, by_device))
+                        }
                     };
                 let (buffer, memory, again) = match imported {
-                    Ok(imported) => imported,
+                    Ok(imported) => {
+                        let unit = importer.unit();
+                        self.count_import_over_live(&window, unit, routed.as_ref(), beside);
+                        imported
+                    }
                     // An import the device and the gate admitted that then failed, or pages the
-                    // runtime refused for the driver that no dma-buf of them served: a copy,
-                    // announced.
-                    Err(error) if copyable && copies_after(&error) => {
+                    // runtime refused for the driver that no dma-buf of them served, or any failed
+                    // import of dma-bufs alone (beside live ones, or a RAM's chunks: pages a copy
+                    // where none is tried): a copy, announced with the failure.
+                    Err((failed, _))
+                        if copyable && (dma_bufs_alone || copies_after(&failed.error)) =>
+                    {
+                        // SAFETY: the caller's contract.
+                        let copied = unsafe {
+                            self.copied_buffer(
+                                copy,
+                                release,
+                                dirty,
+                                CopiedFor::Failed(failed),
+                                naming,
+                            )
+                        };
+                        return copied.map(|buffer| noted(kept(buffer, log, kept_runs, made_of)));
+                    }
+                    // Pages whose pointer the device refuses (RADV refuses shared memory, a
+                    // `memfd` mapping among it; a device without `VK_EXT_external_memory_host`
+                    // every pointer), with no dma-buf of them served (no source given, a source
+                    // that failed, dma-bufs the device refused): a copy, announced, as Metal makes
+                    // a no-copy buffer over any page.
+                    Err((_, true)) if copyable => {
+                        let why = CopiedFor::DeviceRefused;
                         // SAFETY: the caller's contract.
                         let copied =
-                            unsafe { self.copied_buffer(copy, release, dirty, Some(error)) };
-                        return copied.map(|buffer| kept_with(kept_log(buffer, log), kept_runs));
+                            unsafe { self.copied_buffer(copy, release, dirty, why, naming) };
+                        return copied.map(|buffer| noted(kept(buffer, log, kept_runs, made_of)));
                     }
-                    Err(error) => return Err(error),
+                    Err((failed, _)) => return Err(failed.error),
                 };
-                (buffer, memory, again, unwritable)
+                (buffer, memory, again)
             }
         };
-        if unwritable {
-            self.degrade_read_only_pages(call, pointer, length);
-        }
         let (address, reserved) = match self.place_window(placement, &window, length) {
             Ok(held) => held,
             Err(error) => {
-                self.discard_import(buffer, memory);
+                self.discard_import(buffer.raw, memory);
                 return Err(error);
             }
         };
@@ -647,26 +1153,33 @@ impl Device {
             owner: Owner::Caller,
             release,
             of_heap,
+            drops_writes,
             mirror: None,
             #[cfg(unix)]
             again,
+            naming,
         });
-        // The caller's log of the pages' writes stays with them (`dirty_pages.rs`). The pages are
-        // looked at (their lock, `WorkCounts::no_copy_lies_read`) only for memory that carries one.
-        if let Some(dirty) = dirty {
-            if let Some(pages) = buffer.host_pages() {
+        // A buffer just made lies in its pages (`HostCell::current`), looked at once (their lock,
+        // `WorkCounts::no_copy_lies_read`) for everything below.
+        let current = buffer.host_cell().and_then(|cell| cell.current());
+        if let Some(pages) = &current {
+            // The caller's log of the pages' writes stays with them (`dirty_pages.rs`).
+            if let Some(dirty) = dirty {
                 pages.keep_dirty(dirty);
             }
+            keep_in(pages, &buffer, log, kept_runs, made_of);
         }
-        let buffer = kept_with(kept_log(buffer, log), kept_runs);
         // A buffer over the bytes another no-copy buffer covers joins it (`host_aliases.rs`), and
-        // a later one lies in its import; one whose GPU writes are dropped joins none.
-        // A buffer just made lies in its pages (`HostCell::current`).
-        let current = buffer.host_cell().and_then(|cell| cell.current());
-        if let (false, false, Some(current)) = (of_heap, drops_writes, current) {
-            shared
-                .aliases
-                .join(buffer.identity().key, made_over, class, current.import());
+        // a later one lies in its import, or inside it over part of them; a heap's own import is
+        // noted so, joining no key; one whose GPU writes are dropped joins none.
+        if let (false, Some(current)) = (drops_writes, current) {
+            let (key, kind) = (buffer.identity().key, Kind::Import(class));
+            match of_heap {
+                true => (shared.aliases).hold(key, made_over, kind, current.import()),
+                false => {
+                    (shared.aliases).join(key, made_over, kind, current.import());
+                }
+            }
         }
         // Its uses order against every other key's over bytes they meet, a heap's own buffer's
         // too (`host_aliases.rs`).
@@ -704,7 +1217,7 @@ impl Device {
         };
         let length = buffer.length();
         if self.is_lost() {
-            return Err(Error::DeviceLost);
+            return Err(self.lost_refusal());
         }
         // The render encoders' calls and ends that their calls left to the device's lowering
         // thread, as the rebind finds them where each call lowers itself (`render/deferral.rs`).
@@ -719,6 +1232,10 @@ impl Device {
             .host_import
             .as_ref()
             .map_err(|unsupported| Error::Unsupported(unsupported.clone()))?;
+        let parts = memory.into_parts();
+        // What a recovery makes the buffer, or the heap, again of over its new pages
+        // (`HostPages::made_of`).
+        let made_of = parts.clone();
         let HostParts {
             pointer,
             source,
@@ -726,13 +1243,20 @@ impl Device {
             dirty,
             gate,
             runs,
-        } = memory.into_parts();
+            dma_buf_only,
+        } = parts;
         // A buffer whose GPU writes are dropped keeps them dropped over its new pages.
         let drops_writes = cell.drops_writes();
+        let source = (source, dma_buf_only);
         let host = host_window(call, importer, pointer, length, source, drops_writes)?;
+        // As at the buffer's making: refused here, but where the runs may lie in a chunk.
+        let no_route = match (host.no_route(importer), &runs) {
+            (Some(refusal), None) => return Err(refusal),
+            (no_route, _) => no_route,
+        };
         let window = host.window;
         if heap.is_some() && window.offset != 0 {
-            let alignment = importer.page.max(importer.alignment);
+            let alignment = importer.unit();
             let problem = HeapProblem::HostMemoryAlignment { alignment };
             return Err(invalid(call, Problem::Heap(problem)));
         }
@@ -741,15 +1265,18 @@ impl Device {
         // where Metal lays their texels out, which keeps their alignment only at that offset. New
         // bytes at another offset in their page are given a copy of them laid out at the old
         // offset (`copied.rs`), as no import lays them there: the gate is not asked, as nothing is
-        // imported. A buffer whose GPU writes are dropped is never a copy, and is refused so.
+        // imported. A buffer whose GPU writes are dropped is a copy of the new pages where the
+        // system maps no read-only view of them (`read_only_view.rs`), as at its making, and is
+        // never one where it imports such a view, which refuses bytes that moved.
         let texels = cell.texels();
         let in_place = cell.in_place_images();
-        let copyable = !drops_writes;
+        let read_only_copy = drops_writes && !crate::read_only_view::VIEWS_DROP_WRITES;
+        let copyable = !drops_writes || read_only_copy;
         let moved = (!texels.is_empty() || !in_place.is_empty()) && window.offset != cell.offset();
         if moved && !copyable {
             return Err(Error::NotImplemented(RuntimeGap::RebindTextures));
         }
-        let unit = importer.page.max(importer.alignment);
+        let unit = importer.unit();
         let copy_window = match moved {
             true => ImportWindow {
                 start: (pointer.as_ptr() as u64).wrapping_sub(cell.offset()),
@@ -770,17 +1297,38 @@ impl Device {
             false => None,
         };
         // Bytes a live no-copy buffer was made over, of its memory class, are given the pages of
-        // its import, as a buffer made over them lies in it (`host_aliases.rs`), the dma-buf source
-        // dropped uncalled: they pin no page, that import's making asked about the same window,
-        // and the pages stay writable while imported (`HostMemory::new`). A heap's own buffer
-        // imports its own, whose images bound to its bytes are made again over the new import's
-        // memory or its dma-bufs, as does a buffer whose GPU writes are dropped.
+        // its import, or of its copy where it is a copied host buffer and no import of the class
+        // lives, as a buffer made over them lies in it (`host_aliases.rs`), the dma-buf source
+        // dropped uncalled and the gate unasked: they pin no page, that import's making asked
+        // about the same window, and the pages stay writable while imported (`HostMemory::new`).
+        // An import lays the bytes at their offset in their page, so it serves textures planned
+        // at the old offset only where the bytes did not move in it; a copy lays them from its
+        // first byte, so it serves textures planned there, and no image in place, whose own copy
+        // lies in fresh pages it rides on. A heap's own buffer imports its own, whose images
+        // bound to its bytes are made again over the new import's memory or its dma-bufs, as does
+        // a buffer whose GPU writes are dropped.
         let made_over = (pointer.as_ptr() as u64, length);
-        let shares = (heap.is_none() && !drops_writes && !moved)
+        let shares = (heap.is_none() && !drops_writes)
             .then(|| shared.aliases.import(made_over, class))
-            .flatten();
-        let (pages, remade) = match shares {
-            Some(import) => (self.pages_in_import(import), Remade::default()),
+            .flatten()
+            .filter(|import| match import.copied() {
+                false => !moved,
+                true => {
+                    in_place.is_empty() && (texels.is_empty() || import.offset() == cell.offset())
+                }
+            });
+        // The new pages, what was made again over them, whether they are an import to note over
+        // the bytes (one of its own, or the live one it lies in), and its claim of them where
+        // they are a guest RAM's (`host_ram.rs`), held until that import is noted below.
+        let (pages, remade, noted, claim) = match shares {
+            Some(import) => {
+                let noted = !import.copied();
+                if import.copied() {
+                    shared.counts.copied_host_buffer_shared();
+                    self.degrade_copied_shared(call, pointer, length, import.copy_drops_writes());
+                }
+                (self.pages_in_import(import), Remade::default(), noted, None)
+            }
             None => {
                 // Pages the caller resolves to runs of a guest RAM the device uses
                 // (`host_ram.rs`), as at the buffer's making: asked once, here, holding no lock of
@@ -789,9 +1337,10 @@ impl Device {
                 // the chunk's import, with no import of its own, no pin and no gate, unless the
                 // bytes moved in their page, which take the copy laid out at the old offset.
                 // Others take the paths below, the runs kept with the new pages. A buffer whose
-                // GPU writes are dropped is never routed.
-                let routed = match (&runs, drops_writes) {
-                    (Some(resolver), false) => {
+                // GPU writes are dropped is never bound in a chunk, but its copy's runs are asked
+                // for the RAM's log ([`routes_runs`]).
+                let routed = match &runs {
+                    Some(resolver) if routes_runs(drops_writes) => {
                         let was_settled = settled.take().is_some();
                         let routed = self.route_runs(call, importer, resolver, &window);
                         if was_settled {
@@ -803,9 +1352,47 @@ impl Device {
                 };
                 // SAFETY: the window's pages are the bytes of the run in the RAM (the resolver's
                 // contract, `HostMemory::with_runs`).
-                let in_chunk = (routed.as_ref().filter(|_| !moved)).and_then(|routed| unsafe {
-                    self.bind_in_chunk(importer, routed, &window, length)
-                });
+                let in_chunk = (routed.as_ref().filter(|_| !moved && !drops_writes)).and_then(
+                    |routed| unsafe { self.bind_in_chunk(importer, routed, &window, length) },
+                );
+                // One page, one import (`host_aliases.rs`), as at a buffer's making: new pages a
+                // live import holds all of are bound inside it (a buffer's, not a heap's own),
+                // and pages one holds some of, or a heap's it holds all of, are a copy, the gate
+                // unasked, but where they and every live import that holds some of them are
+                // dma-bufs ([`Device::imports_beside`]), which import their own.
+                let within = match (&in_chunk, moved || drops_writes) {
+                    (None, false) => (shared.aliases).within((window.start, window.size), unit),
+                    _ => Within::Free,
+                };
+                let inside = match &within {
+                    // SAFETY: the window's pages are the caller's at the addresses the import's
+                    // pages were imported from, which hold all of them.
+                    Within::Inside(import) if heap.is_none() => unsafe {
+                        self.bind_in_import(import, &window, length)
+                    },
+                    _ => None,
+                };
+                // And new pages a guest RAM's chunk import, made or in flight, holds some of at
+                // the RAM's own addresses, which no chunk binds (`host_ram.rs`), as at a buffer's
+                // making; others claimed through their import, made below.
+                let claim = (in_chunk.is_none() && inside.is_none() && !moved && !drops_writes)
+                    .then(|| self.claim_ram_pages(window.start..window.start + window.size));
+                let over_chunk = matches!(claim, Some(None));
+                let held = inside.is_none() && !matches!(within, Within::Free);
+                let beside = held && self.imports_beside(&within, &host);
+                let over_import = held && !beside;
+                // Imported beside dma-bufs as dma-bufs alone, as at a buffer's making; so are
+                // pages a guest RAM routes that no chunk binds them in, where its chunks may be
+                // imported beside them (`Routed::own_dma_bufs`).
+                let ram_beside = in_chunk.is_none()
+                    && inside.is_none()
+                    && (routed.as_ref()).is_some_and(|routed| routed.own_dma_bufs(self));
+                let dma_bufs_alone = beside || (ram_beside && host.source.is_some());
+                let host = HostWindow {
+                    by_pointer: host.by_pointer && !dma_bufs_alone,
+                    ..host
+                };
+                let in_chunk = in_chunk.or(inside);
                 let chunk_bound = in_chunk.is_some();
                 let kept_runs = routed.as_ref().map(Routed::kept);
                 // Whether an import alive now holds every page of them: counted once the import
@@ -819,7 +1406,15 @@ impl Device {
                 // permission is asked (a copy pins no page, and drops the GPU's writes to pages the
                 // process cannot write); or where the import it admitted fails, of the pointer or
                 // of the caller's dma-bufs. Bytes moved in their page are a copy, the gate unasked.
-                let gate = gate.filter(|_| copyable && host.by_pointer && !moved && !chunk_bound);
+                let gate = gate.filter(|_| {
+                    copyable
+                        && !read_only_copy
+                        && host.by_pointer
+                        && !moved
+                        && !chunk_bound
+                        && !over_import
+                        && !over_chunk
+                });
                 let refused_by_host = match gate {
                     Some(gate) => {
                         // Asked with no lock of the runtime's held: the textures over detached
@@ -840,86 +1435,134 @@ impl Device {
                 if refused_by_host {
                     shared.counts.host_import_refused_by_host();
                 }
-                // Only pages imported here are pinned, and so have their writability asked.
-                let imports = !chunk_bound && !refused_by_host && !moved;
-                let host = match imports {
-                    true => writability_settled(host, writable, &shared.counts)?,
-                    false => host,
-                };
-                let unwritable = imports && host.unwritable;
+                // Only pages imported here are pinned, and so have their writability asked; pages
+                // the process cannot write are a copy whose GPU writes are dropped
+                // ([`unwritable_pages`]).
+                let imports = !chunk_bound
+                    && !refused_by_host
+                    && !moved
+                    && !read_only_copy
+                    && !over_import
+                    && !over_chunk;
+                let unwritable = imports && unwritable_pages(&host, writable, &shared.counts)?;
+                let imports = imports && !unwritable;
                 // The heap's images bound to its bytes, and the images in place over the bytes,
                 // are made again over the copy (`Device::rebound_heap_images`,
                 // `Device::rebound_in_place_images`): its memory holds whole pages from a multiple
                 // of the import's unit.
                 let images = (heap.is_some() || !in_place.is_empty()).then_some(unit);
-                let own_pages = !in_place.is_empty();
-                let copy = |failed: Option<Error>| {
+                let own_pages = !in_place.is_empty() && self.fresh_pages_take_images(&in_place);
+                let copy = |failed: Option<&FailedImport>| {
                     let window = &copy_window;
                     // SAFETY: the caller's contract.
-                    unsafe { self.copied_pages(pointer, length, window, images, own_pages, failed) }
+                    unsafe {
+                        self.copied_pages(
+                            pointer,
+                            length,
+                            window,
+                            (images, own_pages),
+                            failed.map(|failed| &failed.error),
+                            read_only_copy,
+                        )
+                    }
                 };
                 let imported = match (in_chunk, imports) {
                     (Some(bound), _) => Ok(Ok(bound)),
                     (None, false) => Err(None),
-                    // SAFETY: the window lies in the pages of the caller's bytes, which stay
-                    // mapped (`HostMemory::new`, `HostMemory::with_dma_buf`).
-                    (None, true) => match unsafe {
-                        self.import_by_pointer(importer, pointer, length, host, class)
-                    } {
-                        Ok(imported) => Ok(imported),
-                        Err(error) if copyable && copies_after(&error) => Err(Some(error)),
-                        Err(error) => return Err(error),
+                    // Pages with no route of their own that lie in no chunk (above).
+                    (None, true) => match no_route {
+                        Some(refusal) => return Err(refusal),
+                        // SAFETY: the window lies in the pages of the caller's bytes, which stay
+                        // mapped (`HostMemory::new`, `HostMemory::with_dma_buf`).
+                        None => match unsafe {
+                            self.import_by_pointer(importer, pointer, length, host, class)
+                        } {
+                            Ok(imported) => Ok(imported),
+                            Err(error) if copyable && copies_after(&error) => {
+                                Err(Some(FailedImport {
+                                    error,
+                                    sourced: false,
+                                }))
+                            }
+                            Err(error) => return Err(error),
+                        },
                     },
                 };
+                // The heap's images bound to its bytes, and the images in place over them, made
+                // over dma-bufs of their own pages where the new pages lie in imports of
+                // dma-bufs, each of which their source makes: with no lock held.
+                let images_again = |placement: &Placement| {
+                    let mut remade = match heap {
+                        Some(heap) => self.dma_buf_images_again(heap, placement, pointer)?,
+                        None => Remade::default(),
+                    };
+                    self.dma_buf_in_place_again(&in_place, placement, pointer, &mut remade)?;
+                    Ok::<_, Error>(remade)
+                };
                 let imported = match imported {
+                    // Bound in a guest RAM's chunk imported as a dma-buf (`host_ram.rs`): the
+                    // images made again from the RAM's source, with no lock of the runtime's
+                    // held, the textures over detached bytes settled again after it.
+                    Ok(Ok((host, placement))) if placement.over_dma_buf() => {
+                        let was_settled = settled.take().is_some();
+                        let remade = match images_again(&placement) {
+                            Ok(remade) => remade,
+                            Err(error) => {
+                                self.discard_import(host.raw, placement);
+                                return Err(error);
+                            }
+                        };
+                        if was_settled {
+                            match cell.settled() {
+                                Some(again) => settled = Some(again),
+                                None => {
+                                    drop(remade);
+                                    self.discard_import(host.raw, placement);
+                                    return Err(detached_textures());
+                                }
+                            }
+                        }
+                        Ok((host, placement, remade))
+                    }
                     Ok(Ok((host, placement))) => Ok((host, placement, Remade::default())),
                     // The source is called with no lock of the runtime's held (`dma_buf.rs`):
                     // the textures over detached bytes are let go of meanwhile, and must be
                     // settled again after it.
                     Ok(Err((source, refusal))) => {
                         let was_settled = settled.take().is_some();
+                        // Kept by no descriptor; dedicated as a no-copy buffer's own import is
+                        // where the buffer is no heap's (`Device::buffer_over_host_parts`).
                         // SAFETY: as above, and the source's pieces hold the pages
                         // (`HostMemory::with_dma_buf`).
                         let from_source = unsafe {
                             let window = &window;
+                            let kept = (false, heap.is_none());
                             self.import_from_source(
-                                call, importer, pointer, length, window, source, class, false,
+                                call, importer, pointer, length, window, source, class, kept,
                             )
                         }
                         .map_err(|failed| source_failure(failed, refusal));
                         let made = match from_source {
                             Ok((host, placement, _)) => {
-                                // The heap's images bound to its bytes, and the images in place
-                                // over them, made over dma-bufs of their own pages, each of which
-                                // the source makes: still with no lock held.
-                                let again = match heap {
-                                    Some(heap) => {
-                                        self.dma_buf_images_again(heap, &placement, pointer)
-                                    }
-                                    None => Ok(Remade::default()),
-                                };
-                                let again = again.and_then(|mut remade| {
-                                    let watches = &in_place;
-                                    self.dma_buf_in_place_again(
-                                        watches,
-                                        &placement,
-                                        pointer,
-                                        &mut remade,
-                                    )?;
-                                    Ok(remade)
-                                });
-                                match again {
+                                // Still with no lock held.
+                                match images_again(&placement) {
                                     Ok(remade) => Ok((host, placement, remade)),
                                     Err(error) => {
-                                        self.discard_import(host, placement);
+                                        self.discard_import(host.raw, placement);
                                         return Err(error);
                                     }
                                 }
                             }
                             // An import of the caller's dma-bufs the gate admitted that then
-                            // failed, or that served pages the runtime refused for the driver: a
-                            // copy, as where the pointer's fails.
-                            Err(error) if copyable && copies_after(&error) => Err(Some(error)),
+                            // failed, or that served pages the runtime refused for the driver, or
+                            // any failed import of dma-bufs alone (beside live ones, or a RAM's
+                            // chunks): a copy, as where the pointer's fails.
+                            Err(error) if copyable && (dma_bufs_alone || copies_after(&error)) => {
+                                Err(Some(FailedImport {
+                                    error,
+                                    sourced: true,
+                                }))
+                            }
                             Err(error) => return Err(error),
                         };
                         if was_settled {
@@ -928,7 +1571,7 @@ impl Device {
                                 None => {
                                     if let Ok((host, placement, remade)) = made {
                                         drop(remade);
-                                        self.discard_import(host, placement);
+                                        self.discard_import(host.raw, placement);
                                     }
                                     return Err(detached_textures());
                                 }
@@ -944,14 +1587,19 @@ impl Device {
                         let cause = match (moved, &failed) {
                             (true, _) => CopiedBecause::Moved,
                             (false, Some(_)) => CopiedBecause::Failed,
+                            (false, None) if read_only_copy => CopiedBecause::ReadOnly,
+                            (false, None) if unwritable => CopiedBecause::Unwritable,
+                            (false, None) if over_import => CopiedBecause::OverImport,
+                            (false, None) if over_chunk => CopiedBecause::OverRamChunk,
                             (false, None) => CopiedBecause::Refused,
                         };
-                        let (host, placement, copied) = copy(failed)?;
-                        (host, placement, Remade::default(), Some((copied, cause)))
+                        let (host, placement, copied) = copy(failed.as_ref())?;
+                        let copied = (copied, cause, failed);
+                        (host, placement, Remade::default(), Some(copied))
                     }
                 };
-                if unwritable && copied.is_none() {
-                    self.degrade_read_only_pages(call, pointer, length);
+                if !chunk_bound && copied.is_none() {
+                    self.count_import_over_live(&window, unit, routed.as_ref(), beside);
                 }
                 // A copy lies at the offset it was laid out at: the old one where the bytes moved.
                 let offset = match copied {
@@ -965,13 +1613,16 @@ impl Device {
                     host.base,
                     host.size - host.base,
                 );
+                // An import of the new pages of its own, noted below.
+                let noted = copied.is_none() && !chunk_bound && !drops_writes;
                 match copied {
-                    Some((copied, cause)) => {
+                    Some((copied, cause, failed)) => {
                         let drops = copied.drops_writes();
                         pages.set_copied(copied);
                         shared.counts.copied_host_buffer_made(cause);
                         shared.counts.copied_rebind_pages_made();
-                        self.degrade_copied(call, pointer, length, (cause, drops));
+                        let why = (cause, drops, failed.as_ref());
+                        self.degrade_copied(call, pointer, length, why);
                     }
                     None if chunk_bound => {}
                     None => shared.counts.host_rebind_import_made(covered),
@@ -990,7 +1641,7 @@ impl Device {
                 if let Some(runs) = kept_runs {
                     pages.keep_runs(runs);
                 }
-                (pages, remade)
+                (pages, remade, noted, claim)
             }
         };
         // The heap's images bound to its bytes, made again over the new pages. A refusal drops
@@ -1013,25 +1664,37 @@ impl Device {
         // merged back from a copy of them.
         pages.logged_as(key);
         pages.copied_as(key);
-        let (old, again) = shared
+        let (old, twins, again) = shared
             .rebinds
             .replace(key, cell, Arc::clone(&pages))
             .map_err(|_| encoded())?;
+        // Its read twins over the old pages go, the rebinds' lock let go of (`LeftTwins`).
+        drop(twins);
         // The buffer, or the heap's buffers, are reached unnamed again only once a command buffer
         // uses it after the rebind, over the new pages.
         shared.live_buffers.rebound(buffer, heap);
         // Later buffers over the memory it was made over no longer join it.
         shared.aliases.leave(key);
+        // The import its new pages are, its own or the live one it lies in, is noted over them
+        // as a heap's own import is, joining no key (`host_aliases.rs`, "Not joined"): a page it
+        // holds is not imported again while it lives (a later buffer over exactly the bytes lies
+        // in it, and a guest RAM's chunk holding some of them waits, `host_ram.rs`). Its claim
+        // of them goes once it is noted.
+        if noted {
+            (shared.aliases).hold(key, made_over, Kind::Import(class), pages.import());
+        }
+        drop(claim);
         // Its uses from now on order against the keys over the new bytes.
         shared.aliases.place(key, (pointer.as_ptr() as u64, length));
         if let Some(release) = release.of(pointer, length) {
             pages.release_to(release);
         }
+        pages.keep_made_of(made_of);
         // What lay in the old pages goes with them: the images swapped out, and the texel views.
         // A detached buffer lay in none: what took its stand-in goes with the new pages.
         let keeper = match &old {
             Lying::In(old) => Arc::clone(old),
-            Lying::Detached(_) => Arc::clone(&pages),
+            Lying::Detached(_) | Lying::Gone(_) => Arc::clone(&pages),
         };
         let rebound = !swaps.is_empty() || !texels.is_empty();
         // The textures that presented stand-ins while the bytes were detached present their own
@@ -1085,7 +1748,8 @@ impl Device {
     }
 
     /// The `VkBuffer` of a no-copy buffer of `length` bytes at `window.offset` in its window,
-    /// made for host allocations, whose bytes start [`buffer_base`] bytes into it. The memory
+    /// made for memory of `handle` (host allocations, or dma-bufs for a guest RAM's chunk imported
+    /// as one, `host_ram.rs`), whose bytes start [`buffer_base`] bytes into it. The memory
     /// alignment is a buffer's whatever its size, so the buffer is made first for bytes at 0,
     /// and again, at its own size, where its alignment misses the bytes.
     ///
@@ -1097,12 +1761,12 @@ impl Device {
         &self,
         window: &ImportWindow,
         length: u64,
+        handle: vk::ExternalMemoryHandleTypeFlags,
     ) -> Result<HostBuffer, Error> {
         let shared = self.shared();
         let raw_device = shared.vk();
         let make_sized = |base: u64, size: u64| {
-            let mut external = vk::ExternalMemoryBufferCreateInfo::default()
-                .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+            let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle);
             let info = shared.sharing().buffer(
                 vk::BufferCreateInfo::default()
                     .size(size)
@@ -1176,24 +1840,161 @@ impl Device {
             window,
             by_pointer,
             source,
-            unwritable: _,
             drops_writes,
+            pointerless: _,
         } = host;
-        let refusal = match by_pointer {
+        let refusal = match (by_pointer, importer.pointers()) {
             // SAFETY: the caller's.
-            true => match unsafe {
-                self.import_pointer(importer, pointer, length, &window, class, drops_writes)
+            (true, Some(pointers)) => match unsafe {
+                self.import_pointer(pointers, pointer, length, &window, class, drops_writes)
             } {
                 Ok(imported) => return Ok(Ok(imported)),
                 Err(error) if refused(&error) => error,
                 Err(error) => return Err(error),
             },
-            false => not_importable(),
+            _ => not_importable(),
         };
         match source {
             Some(source) => Ok(Err((source, refusal))),
             None => Err(refusal),
         }
+    }
+
+    /// Count a no-copy buffer's or heap's own import of `window`'s pages, just made (in `unit`s),
+    /// where a live import held some of them all the same: another buffer's or heap's, made at
+    /// once and noted after this one looked, or a guest RAM's chunk's at the same addresses
+    /// (`ObjectChurn::imports_inside_live`), but where it was made of dma-bufs beside live imports
+    /// of dma-bufs, as `beside` says ([`Device::imports_beside`],
+    /// `ObjectChurn::dma_buf_imports_beside_live`). And, as evidence, where the object's pages
+    /// are a guest RAM's at other addresses (`routed`), some of which a live chunk import holds
+    /// (`ObjectChurn::imports_over_ram_chunk_pages`).
+    fn count_import_over_live(
+        &self,
+        window: &ImportWindow,
+        unit: u64,
+        routed: Option<&Routed>,
+        beside: bool,
+    ) {
+        let shared = self.shared();
+        let at_ram = self.ram_chunks_hold_any(window.start..window.start + window.size);
+        let found = (shared.aliases).within((window.start, window.size), unit);
+        match (at_ram, matches!(found, Within::Free), beside) {
+            (true, _, _) | (false, false, false) => shared.counts.churn.import_inside_live(),
+            (false, false, true) => shared.counts.churn.dma_buf_import_beside_live(),
+            (false, true, _) => {}
+        }
+        if !at_ram && routed.is_some_and(|routed| routed.chunks_hold_any(window.size)) {
+            shared.counts.churn.import_over_ram_chunk_pages();
+        }
+    }
+
+    /// Whether pages that live imports hold some of (`within`: not all, or a heap's) take an
+    /// import of their own all the same: where every one of those imports is of dma-bufs, the
+    /// new pages come with a source of dma-bufs the device imports (`host`), and the device's
+    /// barriers order blits through two imports of the same pages (no
+    /// `RuntimeDriverDefect::AliasedImportBlitsUnordered`). They are then imported from that
+    /// source alone, never by their pointer. Elsewhere they are a copy (`CopiedBecause::OverImport`).
+    ///
+    /// `VK_EXT_external_memory_host`'s undefined double import is of a host pointer: "Some
+    /// platforms do not allow locking the same physical pages for device access multiple times"
+    /// (its issue 6), so no page an import of its pointer holds is imported again, and no page a
+    /// live import holds is imported by its pointer. Two imports of dma-bufs of the same pages
+    /// are no such lock: each is a `VkDeviceMemory` aliasing memory "by binding the memory to
+    /// resources in multiple Vulkan instances or external APIs using external memory handle
+    /// export and import mechanisms", whose aliases "interpret the contents of the memory in
+    /// consistent ways, and data written to one alias can be read by the other alias", where "use
+    /// of an overlapping range by two aliases must be separated by a memory dependency" (Vulkan
+    /// 1.4, 12.11 Memory Aliasing). `VK_EXT_external_memory_dma_buf` adds no rule against
+    /// importing two dma-bufs of the same pages. The tracker orders every use of a buffer's bytes
+    /// against those of every key over bytes they meet, whichever import each lies in
+    /// (`host_aliases.rs`, "Ordered by the bytes they lie over now"), with global memory
+    /// barriers, which hold every range; a guest RAM's run imported beside its chunk's
+    /// (`host_ram.rs`) is the same two dma-bufs of the same pages.
+    fn imports_beside(&self, within: &Within<HostImport>, host: &HostWindow) -> bool {
+        let unordered = RuntimeDriverDefect::AliasedImportBlitsUnordered;
+        host.source.is_some()
+            && within.held_by().iter().all(|import| import.over_dma_buf())
+            && !self.properties().driver_defects.contains(&unordered)
+    }
+
+    /// The `VkBuffer` of a no-copy buffer of `length` bytes over `window`, whose pages all lie
+    /// inside those of `import`, a live import of the caller's pages (`host_aliases.rs`, "One
+    /// page, one import"), bound inside that import's memory where they lie, and its placement,
+    /// which holds the import: no import of its own, no pin and no gate. The import is kept
+    /// imported for good from now on (another buffer lies in its memory, `host_residency.rs`).
+    /// `None` where the buffer cannot be bound there exactly (its alignment, its memory types,
+    /// the imports of a buffer's own dma-bufs, whose memory is that buffer's alone, or the device
+    /// lost): the pages are then a copy, never a second import.
+    ///
+    /// # Safety
+    ///
+    /// The window's pages are host memory of this process at the host addresses `import`'s pages
+    /// were imported from, which hold all of them.
+    pub(super) unsafe fn bind_in_import(
+        &self,
+        import: &Arc<HostImport>,
+        window: &ImportWindow,
+        length: u64,
+    ) -> Option<(HostBuffer, Placement)> {
+        let shared = self.shared();
+        let raw_device = shared.vk();
+        let pages = import.pages(ReadApart::Inside);
+        #[cfg(unix)]
+        if matches!(pages, ImportPages::StandIn(_)) {
+            return None;
+        }
+        let within = pages.placement();
+        // One dma-buf a buffer's own import made is dedicated to its `VkBuffer`
+        // (`VUID-vkBindBufferMemory-memory-01508`); a guest RAM chunk's import of one is not.
+        let dedicated = within.over_dma_buf() && !within.over_ram_chunk();
+        let mapped = within.mapped.map(|mapped| mapped.as_ptr() as u64);
+        let (false, false, Some(mapped)) =
+            (dedicated, within.memory == vk::DeviceMemory::null(), mapped)
+        else {
+            return None;
+        };
+        let handle = match lock(&shared.memory).bound_memory(within) {
+            BoundMemory::External(handle) => handle,
+            _ => return None,
+        };
+        // Where the window starts in the import's placement.
+        let into = window.start.checked_sub(mapped)?;
+        if into.checked_add(window.size)? > within.size() {
+            return None;
+        }
+        let buffer = self.host_buffer(window, length, handle).ok()?;
+        let requirements = buffer.requirements;
+        let bound_at = binds_in(window, buffer.base, buffer.size, &requirements)
+            .ok()
+            .map(|at| within.offset + into + at)
+            .filter(|at| at.is_multiple_of(requirements.alignment.max(1)))
+            .filter(|_| requirements.memory_type_bits & (1 << within.type_index()) != 0);
+        let start = NonNull::new(window.start as *mut u8);
+        let (Some(bound_at), Some(start)) = (bound_at, start) else {
+            // SAFETY: the buffer is unused.
+            unsafe { release::object(raw_device, buffer.raw) };
+            return None;
+        };
+        // SAFETY: the buffer is unbound and made for the import's handle type, and the import's
+        // memory holds its size and requirements from `bound_at` (`binds_in` against the window,
+        // which lies in the import's placement).
+        let bound = unsafe {
+            crate::creation::bind_buffer(raw_device, buffer.raw, within.memory, bound_at)
+        };
+        if bound.is_err() {
+            // SAFETY: the buffer is unused.
+            unsafe { release::object(raw_device, buffer.raw) };
+            return None;
+        }
+        let placement = Placement::in_import(
+            Arc::clone(import),
+            (within, handle),
+            within.offset + into,
+            window.size,
+            Mapped::of_caller(start),
+        );
+        shared.counts.churn.buffer_bound_in_import();
+        Some((buffer, placement))
     }
 
     /// The `VkBuffer` of a no-copy buffer of `length` bytes at `pointer`, made for host
@@ -1208,19 +2009,20 @@ impl Device {
     /// placement is freed.
     pub(super) unsafe fn import_pointer(
         &self,
-        importer: &Importer,
+        pointers: &PointerImport,
         pointer: NonNull<u8>,
         length: u64,
         window: &ImportWindow,
         class: MemoryClass,
         drops_writes: bool,
     ) -> Result<(HostBuffer, Placement), Error> {
-        let buffer = self.host_buffer(window, length)?;
+        let host = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+        let buffer = self.host_buffer(window, length, host)?;
         // The window starts `window.offset` bytes before the pointer, in the pages it touches.
         let start = pointer.as_ptr().wrapping_sub(window.offset as usize);
         let class = (class, drops_writes);
         // SAFETY: the caller's, and the buffer is a new one of this device.
-        match unsafe { self.import_backing(importer, &buffer, start, window, class) } {
+        match unsafe { self.import_backing(pointers, &buffer, start, window, class) } {
             Ok(placement) => Ok((buffer, placement)),
             Err(error) => {
                 // SAFETY: the buffer is unused.
@@ -1231,11 +2033,11 @@ impl Device {
     }
 
     /// The pages of a released import of the window's pages at `pointer`, made again there as
-    /// `again` made it (`host_residency.rs`), on a driver whose pointer imports follow their
-    /// address (`DriverFact::PointerImportsFollowTheirAddress`): a new `VkBuffer` made and bound
-    /// as the first was, over an import of the pages mapped at the pointer now, which the kept
-    /// import would read too. Refused as the first import may be, typed as the import answers
-    /// (out of memory among them), or with the device lost.
+    /// `again` made it (`host_residency.rs`), on a device whose held pointer imports cost every
+    /// submission (`Device::pointer_imports_tax_submissions`): a new `VkBuffer` made and bound as
+    /// the first was, over an import of the pages mapped at the pointer, the kept import's under
+    /// `HostMemory::new`'s contract. Refused as the first import may be, typed as the import
+    /// answers (out of memory among them), or with the device lost.
     #[cfg(unix)]
     pub(super) fn import_pointer_again(
         &self,
@@ -1243,20 +2045,19 @@ impl Device {
         again: &Again,
     ) -> Result<Pages, Error> {
         if self.is_lost() {
-            return Err(Error::DeviceLost);
+            return Err(self.lost_refusal());
         }
         let shared = self.shared();
-        let importer = shared
-            .host_import
-            .as_ref()
-            .map_err(|_| internal("a pointer import made again on a device that imports none"))?;
+        let pointers = (shared.host_import.as_ref().ok())
+            .and_then(Importer::pointers)
+            .ok_or_else(|| internal("a pointer import made again on a device that imports none"))?;
         let window = &again.window;
         // SAFETY: the caller's pages stay mapped at the pointer while the buffer lives
         // (`HostMemory::new`), and the buffer outlives the placement: the import holds it, and a
         // command buffer that reads it holds the buffer too. An import of a read-only view is
         // never made again (`Device::buffer_over_host_memory`).
         let (buffer, placement) = unsafe {
-            self.import_pointer(importer, pointer, again.length, window, again.class, false)
+            self.import_pointer(pointers, pointer, again.length, window, again.class, false)
         }?;
         Ok(self.pages_of(
             buffer.raw,
@@ -1287,34 +2088,21 @@ impl Device {
         match source {}
     }
 
-    /// Announce that `call` made the `length` bytes at `pointer`, over pages the process maps
-    /// read-only, from the caller's dma-buf source, whose memory the GPU writes
-    /// (`Degradation::ReadOnlyPagesWritten`).
-    fn degrade_read_only_pages(&self, call: &'static str, pointer: NonNull<u8>, length: u64) {
-        self.degrade(Degradation::ReadOnlyPagesWritten, || {
-            (
-                format!("{call} over {length:#x} bytes at {pointer:p}"),
-                "the process maps some of their pages read-only, which Linux drivers do not \
-                 import by pointer, so they are imported as dma-bufs of their pages from the \
-                 caller's source"
-                    .to_owned(),
-            )
-        });
-    }
-
-    /// A copy of the `length` bytes at `pointer` for a rebind's new pages (`copied.rs`), laid
-    /// out as their import of `window` would be: a `VkBuffer` from the window's first page, the
-    /// bytes `window.offset` into it, in host-visible memory of the device's own, so the texel
-    /// views planned at the bytes' offset lie where they lay. Its memory's host address is the
-    /// window's, so the buffer's `contents` stays the pointer. Where images will be bound in it
-    /// (`images`, the import's unit: a heap's textures bound to its bytes, images in place over the
-    /// buffer's), its memory holds the window's whole pages from a multiple of that unit, as the
-    /// import's did, so each image's texels lie at the offset from an aligned start they had there.
-    /// Where images in place ride on it (`own_pages`), the copy is fresh pages the runtime maps and
-    /// imports by their pointer where the device takes them ([`Device::fresh_page_buffer`]), so
-    /// each image is made for host allocations, as over the caller's pages, under the device's
-    /// check for fresh pages (`in_place.rs`); else memory the device allocates. Refused as
-    /// [`Device::copied_buffer`] refuses its copy.
+    /// A copy of the `length` bytes at `pointer` for a rebind's new pages (`copied.rs`), laid out
+    /// as their import of `window` would be: a `VkBuffer` from the window's first page, the bytes
+    /// `window.offset` into it, in host-visible memory of the device's own, so the texel views
+    /// planned at the bytes' offset lie where they lay. Its memory's host address is the window's,
+    /// so the buffer's `contents` stays the pointer. Where images will be bound in it (`images`,
+    /// the import's unit: a heap's textures bound to its bytes, images in place over the buffer's),
+    /// its memory holds the window's whole pages from a multiple of that unit, as the import's did,
+    /// so each image's texels lie at the offset from an aligned start they had there. Where images
+    /// in place ride on it and the device's check passed for fresh pages and their accesses
+    /// (`own_pages`, `Device::fresh_pages_take_images`), the copy is fresh pages the runtime maps
+    /// and imports by their pointer where the device takes them ([`Device::fresh_page_buffer`]), so
+    /// each image is made for host allocations, as over the caller's pages; else memory the device
+    /// allocates, each image a linear image of its own. The GPU's writes to the copy are dropped
+    /// where `read_only` (Metal's private option bit 24). Refused as [`Device::copied_buffer`]
+    /// refuses its copy.
     ///
     /// # Safety
     ///
@@ -1324,9 +2112,9 @@ impl Device {
         pointer: NonNull<u8>,
         length: u64,
         window: &ImportWindow,
-        images: Option<u64>,
-        own_pages: bool,
-        failed: Option<Error>,
+        (images, own_pages): (Option<u64>, bool),
+        failed: Option<&Error>,
+        read_only: bool,
     ) -> Result<(HostBuffer, Placement, crate::copied::Copied), Error> {
         let shared = self.shared();
         let raw_device = shared.vk();
@@ -1335,6 +2123,21 @@ impl Device {
         let size = (window.offset.checked_add(length))
             .and_then(|end| end.checked_next_multiple_of(16))
             .ok_or(Error::OutOfMemory(MemoryKind::Device))?;
+        // The caller's pages are read before the copy's memory is made, so no mapping made for the
+        // copy is among them as they are read (`CopiedBuffers::read`).
+        // SAFETY: the caller's bytes (the caller's contract).
+        let first = match unsafe { crate::copied::CopiedBuffers::read(pointer, bytes, read_only) } {
+            Ok(first) => first,
+            Err(why) => {
+                return Err(match why {
+                    NotCopied::Unreadable => failed
+                        .filter(|failed| !refused(failed))
+                        .cloned()
+                        .unwrap_or_else(not_importable),
+                    NotCopied::OutOfHostMemory => Error::OutOfMemory(MemoryKind::Host),
+                });
+            }
+        };
         let fresh = match own_pages {
             true => self.fresh_page_buffer(window.size.max(size), MemoryClass::Shared)?,
             false => None,
@@ -1363,19 +2166,8 @@ impl Device {
         };
         // SAFETY: the copy is the placement's `length` bytes past the window's offset, mapped,
         // which nothing uses yet and which stay mapped while the import holds them; the caller's
-        // bytes stay mapped as long (the caller's contract).
-        let copied = match unsafe { shared.copied.add(pointer, copy, bytes) } {
-            Ok(copied) => copied,
-            Err(why) => {
-                discard(&memory);
-                return Err(match why {
-                    NotCopied::Unreadable => failed
-                        .filter(|failed| !refused(failed))
-                        .unwrap_or_else(not_importable),
-                    NotCopied::OutOfHostMemory => Error::OutOfMemory(MemoryKind::Host),
-                });
-            }
-        };
+        // bytes, which `first` read, stay mapped as long (the caller's contract).
+        let copied = unsafe { shared.copied.add(first, pointer, copy) };
         // The host address of the window's first byte, as an import's: `contents` is the
         // pointer, `window.offset` past it.
         let start = NonNull::new(pointer.as_ptr().wrapping_sub(window.offset as usize));
@@ -1448,33 +2240,73 @@ impl Device {
     }
 
     /// Announce that `call` made the `length` bytes at `pointer` a copy of the caller's pages
-    /// (`Degradation::CopiedHostPages`), for `cause`; one that `drops` the GPU's writes, as the
-    /// process cannot write the pages, says so.
+    /// (`Degradation::CopiedHostPages`), for `cause`, once per cause; one that `drops` the GPU's
+    /// writes, as the process cannot write the pages, says so; one made as their import `failed`
+    /// names the failure ([`FailedImport::cause`]).
     fn degrade_copied(
         &self,
         call: &'static str,
         pointer: NonNull<u8>,
         length: u64,
-        (cause, drops): (CopiedBecause, bool),
+        (cause, drops, failed): (CopiedBecause, bool, Option<&FailedImport>),
     ) {
-        self.degrade(Degradation::CopiedHostPages, || {
-            let why = match cause {
+        self.degrade_copied_pages(Some(cause), || {
+            let failure;
+            let why: &str = match cause {
                 CopiedBecause::Refused => {
                     "the caller's import gate (HostMemory::with_import_gate) refused their \
                           import"
                 }
-                CopiedBecause::Failed => "their import failed",
+                CopiedBecause::DeviceRefused => {
+                    "the device refused their pointer's import (VK_EXT_external_memory_host), as \
+                     RADV refuses shared memory, or imports no pointer (it enables no \
+                     VK_EXT_external_memory_host), and no dma-buf of them served it: no source of \
+                     them was given (HostMemory::with_dma_buf), or it failed, or the device \
+                     refused its dma-bufs"
+                }
+                CopiedBecause::Failed => match failed {
+                    Some(failed) => {
+                        failure = failed.cause();
+                        failure.as_str()
+                    }
+                    None => "their import failed",
+                },
                 CopiedBecause::Moved => {
                     "they lie at another offset in their page than the buffer's old bytes, \
                      where a texture over the buffer was planned, which no import lays them at"
                 }
+                CopiedBecause::ReadOnly => {
+                    "Metal's private option bit 24 (0x1000000) makes them memory the GPU's \
+                     writes do not reach, and no import of them here keeps the GPU's writes out"
+                }
+                CopiedBecause::Unwritable => {
+                    "the process maps some of them read-only, which Linux drivers pin no pointer \
+                     of, and whose dma-bufs would take the GPU's writes, which Metal drops"
+                }
+                CopiedBecause::OverImport => {
+                    "a live import of another no-copy buffer's or heap's pages holds some of \
+                     their pages and not all (or more than a heap's own bytes), and a second \
+                     import of a page is undefined where either is of a host pointer \
+                     (VK_EXT_external_memory_host), and unordered by this device's barriers \
+                     where both are dma-bufs"
+                }
+                CopiedBecause::OverRamChunk => {
+                    "an import of a guest RAM's chunk, made or in flight, holds some of their \
+                     pages at the RAM's own addresses, and no chunk binds them (they cross a \
+                     chunk's end, or no run resolver routed them), and \
+                     VK_EXT_external_memory_host leaves pages imported twice undefined"
+                }
             };
-            let dropped = match drops {
-                true => {
+            let dropped = match (drops, cause) {
+                (true, CopiedBecause::ReadOnly | CopiedBecause::Unwritable) => {
+                    ", whose GPU writes are dropped, as Metal drops them, and never written to \
+                     the pages"
+                }
+                (true, _) => {
                     ", whose GPU writes are dropped, as Metal drops them, since the process maps \
                      some of their pages read-only"
                 }
-                false => "",
+                (false, _) => "",
             };
             (
                 format!("{call} over {length:#x} bytes at {pointer:p}"),
@@ -1485,13 +2317,44 @@ impl Device {
         });
     }
 
+    /// Announce `copied-host-pages` for `call` over the `length` bytes at `pointer`, a no-copy
+    /// buffer or rebind that lies in the live copy of the same bytes another buffer was made over
+    /// (`host_aliases.rs`), whose GPU writes are dropped where `drops`: it makes no copy of its
+    /// own, but the GPU uses that copy for it, as for the buffer it was made for. Once, a reason
+    /// of its own beside each copy's cause.
+    fn degrade_copied_shared(
+        &self,
+        call: &'static str,
+        pointer: NonNull<u8>,
+        length: u64,
+        drops: bool,
+    ) {
+        self.degrade_copied_pages(None, || {
+            let dropped = match drops {
+                true => {
+                    ", whose GPU writes are dropped, as Metal drops them, since the process maps \
+                     some of their pages read-only"
+                }
+                false => "",
+            };
+            (
+                format!("{call} over {length:#x} bytes at {pointer:p}"),
+                format!(
+                    "they are the bytes a live copied host buffer was made over, so the GPU uses \
+                     its copy of them in memory of the device's own{dropped}, as one memory with it"
+                ),
+            )
+        });
+    }
+
     /// A copied host buffer over the `length` bytes at `pointer` (`copied.rs`), of `modes`, at
     /// `placement`, for `call`, a heap's own buffer where `of_heap` (laid where the heap's
     /// textures could lie, its hazard identity a heap's), given back to `release`, its caller's
-    /// log `dirty` kept with it:
-    /// made where the caller's gate refused the pointer's import (`failed` is `None`), or where
-    /// the import the gate and the device admitted failed with `failed`. Announced
-    /// (`copied-host-pages`) and counted either way. Refused where its own memory cannot be had
+    /// log `dirty` kept with it, made `why` says: where the caller's gate refused the pointer's
+    /// import, where the import the gate and the device admitted failed, or for memory whose GPU
+    /// writes Metal's private option bit 24 drops where the system maps no read-only view of the
+    /// pages (`read_only_view.rs`), whose GPU writes the copy drops. Announced
+    /// (`copied-host-pages`) and counted each way. Refused where its own memory cannot be had
     /// (typed as the allocation answers), and where the process cannot read every page (memory
     /// Metal makes no buffer over): with the import's failure where there was one, else as not
     /// importable.
@@ -1509,16 +2372,49 @@ impl Device {
             Place,
             bool,
         ),
-        release: Option<super::host_memory::Release>,
+        release: Option<Release>,
         dirty: Option<Arc<super::dirty_pages::DirtySource>>,
-        failed: Option<Error>,
+        why: CopiedFor,
+        naming: Naming,
     ) -> Result<Buffer, Error> {
+        let read_only = matches!(why, CopiedFor::ReadOnly);
+        // A read twin is an import of the pages in place or nothing (`read_twin.rs`).
+        if let Naming::ReadTwin = naming {
+            return Err(crate::read_twin::uncopied());
+        }
+        // A two-copy buffer's host copy is the pages alone instead (`managed_copy.rs`).
+        if let Naming::HostCopy = naming {
+            let drops = read_only || matches!(why, CopiedFor::Unwritable);
+            let alone = match &why {
+                CopiedFor::Refused | CopiedFor::DeviceRefused | CopiedFor::Failed(_) => {
+                    crate::managed_copy::AloneBecause::Refused
+                }
+                CopiedFor::OverImport | CopiedFor::OverRamChunk => {
+                    crate::managed_copy::AloneBecause::OverImports
+                }
+                CopiedFor::ReadOnly | CopiedFor::Unwritable => {
+                    crate::managed_copy::AloneBecause::Unwritable
+                }
+            };
+            self.shared().counts.managed_pages_alone(alone);
+            return Err(crate::managed_copy::uncopied(drops));
+        }
+        let (cause, failed): (_, Option<FailedImport>) = match why {
+            CopiedFor::Refused => (CopiedBecause::Refused, None),
+            CopiedFor::DeviceRefused => (CopiedBecause::DeviceRefused, None),
+            CopiedFor::Failed(failed) => (CopiedBecause::Failed, Some(failed)),
+            CopiedFor::ReadOnly => (CopiedBecause::ReadOnly, None),
+            CopiedFor::Unwritable => (CopiedBecause::Unwritable, None),
+            CopiedFor::OverImport => (CopiedBecause::OverImport, None),
+            CopiedFor::OverRamChunk => (CopiedBecause::OverRamChunk, None),
+        };
         let shared = self.shared();
         let raw_device = shared.vk();
         // The pages' refusal where they cannot be copied: the import's failure, or a refusal of
         // them.
-        let unreadable = |failed: Option<Error>| {
+        let unreadable = |failed: Option<FailedImport>| {
             failed
+                .map(|failed| failed.error)
                 .filter(|failed| !refused(failed))
                 .unwrap_or_else(not_importable)
         };
@@ -1527,6 +2423,18 @@ impl Device {
         let size = length
             .checked_next_multiple_of(16)
             .ok_or_else(|| nil(call, Problem::BufferLength { length }))?;
+        // The caller's pages are read before the copy's memory is made, so no mapping made for the
+        // copy is among them as they are read (`CopiedBuffers::read`).
+        // SAFETY: the caller's bytes (the caller's contract).
+        let first = match unsafe { crate::copied::CopiedBuffers::read(pointer, bytes, read_only) } {
+            Ok(first) => first,
+            Err(why) => {
+                return Err(match why {
+                    NotCopied::Unreadable => unreadable(failed),
+                    NotCopied::OutOfHostMemory => Error::OutOfMemory(MemoryKind::Host),
+                });
+            }
+        };
         let info = shared.sharing().buffer(
             vk::BufferCreateInfo::default()
                 .size(size)
@@ -1566,18 +2474,9 @@ impl Device {
             ));
         };
         // SAFETY: the copy is the placement's `length` bytes, mapped, which nothing uses yet and
-        // which stay mapped while the import holds them; the caller's bytes stay mapped as long
-        // (the caller's contract).
-        let copied = match unsafe { shared.copied.add(pointer, copy, bytes) } {
-            Ok(copied) => copied,
-            Err(why) => {
-                discard(&memory);
-                return Err(match why {
-                    NotCopied::Unreadable => unreadable(failed),
-                    NotCopied::OutOfHostMemory => Error::OutOfMemory(MemoryKind::Host),
-                });
-            }
-        };
+        // which stay mapped while the import holds them; the caller's bytes, which `first` read,
+        // stay mapped as long (the caller's contract).
+        let copied = unsafe { shared.copied.add(first, pointer, copy) };
         // Its `contents` is the caller's pointer, as a no-copy buffer's is.
         memory.mapped = Some(super::memory::Mapped::of_caller(pointer));
         let buffer = self.buffer_of(BufferParts {
@@ -1593,9 +2492,11 @@ impl Device {
             owner: Owner::Caller,
             release,
             of_heap,
+            drops_writes: read_only,
             mirror: None,
             #[cfg(unix)]
             again: None,
+            naming,
         });
         let drops = copied.drops_writes();
         if let Some(pages) = buffer.host_pages() {
@@ -1605,38 +2506,35 @@ impl Device {
                 pages.keep_dirty(dirty);
             }
         }
-        let cause = match failed {
-            Some(_) => CopiedBecause::Failed,
-            None => CopiedBecause::Refused,
-        };
         shared.counts.copied_host_buffer_made(cause);
         if of_heap {
             shared.counts.copied_heap_made();
         }
-        self.degrade_copied(call, pointer, length, (cause, drops));
+        self.degrade_copied(call, pointer, length, (cause, drops, failed.as_ref()));
         Ok(buffer)
     }
 
-    /// Release `buffer` and its `placement`, an import made for a buffer or rebind that is not
-    /// made after all: the `VkBuffer` first, once its sparse binding completed.
-    pub(super) fn discard_import(&self, buffer: HostBuffer, placement: Placement) {
+    /// Release the `VkBuffer` `raw` and its `placement`, an import made for a buffer or rebind
+    /// that is not made after all, or one made to ask the driver (`host_shared_pointers.rs`,
+    /// `Device::ram_takes_dma_bufs`): the `VkBuffer` first, once its sparse binding completed.
+    pub(super) fn discard_import(&self, raw: vk::Buffer, placement: Placement) {
         let shared = self.shared();
         placement.settle();
         // SAFETY: the buffer is unused, and its binding completed.
-        unsafe { release::object(shared.vk(), buffer.raw) };
+        unsafe { release::object(shared.vk(), raw) };
         lock(&shared.memory).free(shared.vk(), &placement);
     }
 
     /// The Metal addresses of a no-copy buffer of `length` bytes `window.offset` bytes into
     /// `window`, placed as `address` asks: the window's pages where the program names no address,
     /// so that the buffer's address keeps its pointer's offset in its page.
-    fn place_window(
+    pub(super) fn place_window(
         &self,
         address: Place,
         window: &ImportWindow,
         length: u64,
     ) -> Result<(GpuAddress, Held), Error> {
-        let mut addresses = lock(&self.shared().addresses);
+        let mut addresses = self.address_space_for(address);
         match address {
             Place::At(AddressPlacement::Any | AddressPlacement::Outside) => addresses
                 .place(address, window.size)
@@ -1657,11 +2555,11 @@ impl Device {
         placement: AddressPlacement,
         in_pool: bool,
     ) -> Result<Place, Error> {
-        if !other.device().same(self) {
-            return Err(invalid(call, Problem::ForeignObject));
+        if !other.generation().same(self) {
+            return Err(other.generation().foreign(call, self));
         }
         let unshared = || {
-            let address = other.exposed_address(ReadApart::SecondBuffer);
+            let address = other.exposed_address(ReadApart::SharedRange);
             let held = AddressRange::of(address.0, other.length());
             Error::PlacementConflict(PlacementConflict::Unshared { held })
         };
@@ -1691,7 +2589,7 @@ impl Device {
     /// allocations.
     unsafe fn import_backing(
         &self,
-        importer: &Importer,
+        pointers: &PointerImport,
         buffer: &HostBuffer,
         start: *mut u8,
         window: &ImportWindow,
@@ -1718,7 +2616,7 @@ impl Device {
         // SAFETY: the imported pages are host memory aligned to the import alignment (the
         // window's).
         let types =
-            unsafe { importer.memory_types(raw_device, imported) }.map_err(import_refused)?;
+            unsafe { pointers.memory_types(raw_device, imported) }.map_err(import_refused)?;
         let allowed = types & requirements.memory_type_bits;
         // An allocation past the device's, refused before the driver sees it.
         let largest = self
@@ -1757,19 +2655,20 @@ impl Device {
         {
             use std::sync::atomic::Ordering;
             let failing = &shared.failing_host_imports;
-            if (failing.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)))
+            if (failing.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)))
                 .is_ok()
             {
                 return Err(Error::OutOfMemory(MemoryKind::Device));
             }
         }
         // SAFETY: the caller's contract keeps the pages mapped until the placement is freed.
-        let placement =
-            unsafe { lock(&shared.memory).import_host(raw_device, pages, size, allowed, class) }
-                .map_err(|failure| match failure {
-                    ImportFailure::NoMemoryType => not_importable(),
-                    ImportFailure::Vulkan(error) => import_refused(error),
-                })?;
+        let placement = unsafe {
+            super::memory::import_host(&shared.memory, raw_device, pages, size, allowed, class)
+        }
+        .map_err(|failure| match failure {
+            ImportFailure::NoMemoryType => not_importable(),
+            ImportFailure::Vulkan(error) => import_refused(error),
+        })?;
         // SAFETY: the placement is the pages' memory, the buffer's size and requirements of it
         // available from `at` (the caller's), and the buffer is unbound.
         let bound = unsafe {
@@ -1789,19 +2688,43 @@ impl Device {
 }
 
 /// `buffer`, the logs of the writes to its pages kept with them (`dirty_pages::PagesLog`), where
-/// there are any, which hear of the GPU's writes through it where it lies in them in place; and
-/// where its pages are a copy, its key named to the copy, whose merges back compare it where a
-/// batch wrote that key (`copied.rs`).
-fn kept_log(buffer: Buffer, log: Option<Arc<PagesLog>>) -> Buffer {
+/// there are any, which hear of the GPU's writes through it where it lies in them in place; where
+/// its pages are a copy, its key named to the copy, whose merges back compare it where a batch
+/// wrote that key (`copied.rs`); and the guest RAM and runs its caller resolved its pages to
+/// (`host_ram.rs`) kept with them. Its pages are looked at once (their lock,
+/// `WorkCounts::no_copy_lies_read`).
+fn kept(
+    buffer: Buffer,
+    log: Option<Arc<PagesLog>>,
+    runs: Option<(Arc<RamOnDevice>, Box<[std::ops::Range<u64>]>)>,
+    made_of: HostParts,
+) -> Buffer {
     if let Some(pages) = buffer.host_pages() {
-        let key = buffer.identity().key;
-        if let Some(log) = log {
-            pages.keep_log(log);
-            pages.logged_as(key);
-        }
-        pages.copied_as(key);
+        keep_in(&pages, &buffer, log, runs, made_of);
     }
     buffer
+}
+
+/// Give `pages`, the pages `buffer` was just made in, `log`, `runs` and what it was `made_of` to
+/// keep ([`HostPages::made_of`]), and name the buffer to their copy where they are one
+/// ([`kept`]).
+fn keep_in(
+    pages: &HostPages,
+    buffer: &Buffer,
+    log: Option<Arc<PagesLog>>,
+    runs: Option<(Arc<RamOnDevice>, Box<[std::ops::Range<u64>]>)>,
+    made_of: HostParts,
+) {
+    let key = buffer.identity().key;
+    if let Some(log) = log {
+        pages.keep_log(log);
+        pages.logged_as(key);
+    }
+    pages.copied_as(key);
+    if let Some(runs) = runs {
+        pages.keep_runs(runs);
+    }
+    pages.keep_made_of(made_of);
 }
 
 /// The logs of the writes to the `length` bytes at `pointer` (`dirty_pages::PagesLog`): their
@@ -1817,26 +2740,12 @@ fn pages_log(
     PagesLog::new((pointer.as_ptr() as u64, length), dirty, ram)
 }
 
-/// `buffer`, the guest RAM and runs its caller resolved its pages to (`host_ram.rs`) kept with
-/// its pages, where there are any.
-fn kept_with(
-    buffer: Buffer,
-    runs: Option<(
-        Arc<super::host_ram::RamOnDevice>,
-        Box<[std::ops::Range<u64>]>,
-    )>,
-) -> Buffer {
-    if let (Some(runs), Some(pages)) = (runs, buffer.host_pages()) {
-        pages.keep_runs(runs);
-    }
-    buffer
-}
-
 /// The host pages a no-copy buffer (or a heap's own buffer) of some length imports
 /// ([`host_window`]).
 struct HostWindow {
     /// The GPU's writes to them are dropped: they are imported through a read-only view of them
-    /// (`read_only_view.rs`), by their pointer alone.
+    /// (`read_only_view.rs`), by their pointer alone, or where the system maps no such view, they
+    /// are copied (`copied.rs`).
     drops_writes: bool,
     /// The pages: the range rounded out to the host page.
     window: ImportWindow,
@@ -1845,36 +2754,122 @@ struct HostWindow {
     by_pointer: bool,
     /// The caller's dma-buf source, where it gave one and the device imports dma-bufs.
     source: Option<Source>,
-    /// The process cannot write every page, so they go to the source alone
-    /// ([`writability_settled`]).
-    unwritable: bool,
+    /// The device imports no pointer (it enables no `VK_EXT_external_memory_host`), and the pages
+    /// are not the source's dma-bufs alone (`HostMemory::dma_buf_only`): where no dma-buf of them
+    /// serves, a no-copy buffer or heap over them is a copy (`copied.rs`), as where a device
+    /// refuses their pointer.
+    pointerless: bool,
 }
 
-/// `host`, its pages' write permission settled, for a call that imports them itself (not a
-/// buffer that lies in a live import of them): Linux drivers pin a pointer's imported pages for
-/// writing, so where the process cannot write one of them ([`refuse_unwritable`]) the pointer is
-/// not imported, and the pages go to the caller's dma-buf source where it gave one the device can
-/// use (a dma-buf of the pages pins nothing of the process's mapping, and the GPU's writes reach
-/// the pages: `unwritable`, announced), else are refused. Pages whose write permission the caller
-/// vouched for (`vouched`, `HostMemory::assume_writable`) are not asked about.
-fn writability_settled(
-    host: HostWindow,
-    vouched: bool,
-    counts: &Counters,
-) -> Result<HostWindow, Error> {
+/// Whether a no-copy buffer, heap or rebind whose pages the caller resolves to runs of a guest RAM
+/// (`HostMemory::with_runs`) has them asked, where its GPU writes are dropped where `drops_writes`:
+/// every one but memory whose GPU writes Metal's private option bit 24 drops on macOS, which
+/// imports a read-only view of its pages (`read_only_view.rs`). Elsewhere such memory is a copy
+/// of its pages (`copied.rs`), never bound in the RAM's chunk, whose runs give it the RAM's log of
+/// the writes to them (`dirty_pages::PagesLog`), so its commits copy in only the pages the log
+/// reports written, as a writable copy's do, where they compared every byte.
+fn routes_runs(drops_writes: bool) -> bool {
+    !drops_writes || !crate::read_only_view::VIEWS_DROP_WRITES
+}
+
+/// Whether the process cannot write some of `host`'s pages, asked by a call that imports them
+/// itself (not a buffer that lies in a live import of them): such pages are a copy whose GPU
+/// writes are dropped (`copied.rs`), on every device, never imported and their dma-buf source
+/// never called. Linux drivers pin a pointer's imported pages for writing (RADV refused such a
+/// page, NVIDIA failed it as out of device memory, ANV imported it and lost the device at the
+/// GPU's first read), and a dma-buf of them would take the GPU's writes, where Metal's leave the
+/// CPU's view of them as it was (an M3 Max under macOS 27.0.1, private and shared memory alike).
+/// Pages whose write permission the caller vouched for (`vouched`, `HostMemory::assume_writable`)
+/// are not asked about. Refused where the process's mappings cannot be asked
+/// ([`refuse_unwritable`]); off Linux nothing is asked.
+fn unwritable_pages(host: &HostWindow, vouched: bool, counts: &Counters) -> Result<bool, Error> {
     if vouched {
-        return Ok(host);
+        return Ok(false);
     }
     match refuse_unwritable(&host.window, counts) {
-        Ok(()) => Ok(host),
-        Err(error) if refused(&error) && host.source.is_some() => Ok(HostWindow {
-            by_pointer: false,
-            unwritable: true,
-            ..host
-        }),
+        Ok(()) => Ok(false),
+        Err(error) if refused(&error) => Ok(true),
         Err(error) => Err(error),
     }
 }
+
+/// `options` of a no-copy buffer or heap over the caller's bytes without
+/// [`ResourceOptions::PRIVATE_BIT`] and [`ResourceOptions::BIT_20`], and whether its memory drops the GPU's writes, as Metal's does
+/// where the options set the bit: on macOS the runtime imports the pages through a read-only view
+/// of them (`read_only_view.rs`); elsewhere it makes the object over a copy of them whose GPU
+/// writes it never writes back (`copied.rs`, announced as `copied-host-pages`).
+pub(super) fn no_copy_options(options: ResourceOptions) -> (ResourceOptions, bool) {
+    options.without_bit_20().without_private_bit()
+}
+
+/// Why a no-copy buffer or heap is made over a copy of the caller's pages (`Device::copied_buffer`).
+enum CopiedFor {
+    /// The caller's gate refused their import (`HostMemory::with_import_gate`).
+    Refused,
+    /// The device refused their pointer's import, or imports no pointer (it enables no
+    /// `VK_EXT_external_memory_host`), and no dma-buf of them served it: the caller gave no
+    /// source of them (`HostMemory::with_dma_buf`), or its source failed, or the device refused
+    /// its dma-bufs.
+    DeviceRefused,
+    /// The import the device and the gate admitted failed, as this says.
+    Failed(FailedImport),
+    /// Metal's private option bit 24 drops the GPU's writes to the memory, and the system maps
+    /// no read-only view of the pages (`read_only_view.rs`): the copy drops them.
+    ReadOnly,
+    /// The process cannot write every page ([`unwritable_pages`]): the copy drops the GPU's
+    /// writes, as Metal drops them.
+    Unwritable,
+    /// A live import of another buffer's or heap's pages holds some of them and not all, or more
+    /// than a heap's own bytes (`host_aliases.rs`, "One page, one import"), and no import of
+    /// dma-bufs of them beside it is made ([`Device::imports_beside`]): no page is imported twice.
+    OverImport,
+    /// An import of a guest RAM's chunk, made or in flight, holds some of them, at the RAM's own
+    /// addresses, and no chunk binds the buffer: its bytes cross a chunk's end (the chunks on both
+    /// sides imported),
+    /// or no run resolver routed them (`host_ram.rs`). No page is imported twice.
+    OverRamChunk,
+}
+
+/// An import of a no-copy object's pages that the device and the gate admitted and that failed
+/// ([`copies_after`]), leaving the object a copy of them (`CopiedFor::Failed`).
+pub(super) struct FailedImport {
+    /// The failure: out of memory, another Vulkan error, or the runtime's refusal of pages the
+    /// kernel cannot pin ([`unpinnable`]).
+    pub(super) error: Error,
+    /// Whether the caller's dma-bufs of the pages were imported after their pointer was refused
+    /// (`HostMemory::with_dma_buf`, [`source_failure`]).
+    pub(super) sourced: bool,
+}
+
+impl FailedImport {
+    /// The cause the copy's announcement names (`copied-host-pages`): the pages the runtime kept
+    /// from the driver and why no dma-buf of them served, or the import that failed and its error.
+    pub(super) fn cause(&self) -> String {
+        let FailedImport { error, sourced } = self;
+        match (*error == unpinnable(), *sourced) {
+            (true, true) => format!(
+                "{UNPINNABLE}, and no dma-buf of them served: the caller's source \
+                 (HostMemory::with_dma_buf) made none of them, or the device refused its dma-bufs"
+            ),
+            (true, false) => format!(
+                "{UNPINNABLE}, and no source of dma-bufs of them was asked: the caller gave none \
+                 (HostMemory::with_dma_buf), or the device imports no dma-buf"
+            ),
+            (false, true) => format!(
+                "the device refused their pointer's import, or the runtime kept their pointer \
+                 from the driver, and the import of the caller's dma-bufs of them \
+                 (HostMemory::with_dma_buf) failed: {error}"
+            ),
+            (false, false) => format!("their pointer's import failed: {error}"),
+        }
+    }
+}
+
+/// Why the runtime keeps pages from the driver ([`unpinnable`]), in a copy's announcement.
+const UNPINNABLE: &str = "the kernel cannot pin some of them (a mapping over them is a dma-buf's, \
+     VM_PFNMAP, or could not be asked about), and the driver's later allocations fail once it \
+     fails to import such a pointer (RuntimeDriverDefect::UnpinnablePagesBreakHostMemory), so the \
+     runtime kept their pointer from it";
 
 /// Whether `error`, an import's failure that is not the device's refusal of the pages, leaves the
 /// no-copy buffer a copy of them (`copied.rs`): out of memory, another Vulkan error, or the
@@ -1899,34 +2894,58 @@ fn source_failure(failed: Error, refusal: Error) -> Error {
 
 /// The host pages a no-copy object of `length` bytes at `pointer` imports on the device of
 /// `importer`, for `call`: the pages the range touches ([`import_window`]), imported by their
-/// pointer where the device's import alignment covers them, else only as a dma-buf where the
-/// caller gave a source the device can use. A source the device cannot use is dropped uncalled,
-/// as is any where `drops_writes` (imported through a read-only view, `read_only_view.rs`).
-/// Refused: memory past the address space's end (`Nil`, as Metal makes no buffer over it); a
-/// range the import alignment cannot cover, with no usable source (`Unsupported`, `HostMemory`).
+/// pointer where the device imports pointers and its import alignment covers them (but where
+/// `dma_buf_only`, `HostMemory::dma_buf_only`), else only as a dma-buf where the caller gave a
+/// source the device can use. A source the device cannot use is dropped uncalled, as is any where
+/// `drops_writes` (imported through a read-only view, `read_only_view.rs`, or a copy where the
+/// system maps none). Refused: memory past the address space's end (`Nil`, as Metal makes no
+/// buffer over it). Pages with no route of their own are the caller's to refuse
+/// ([`HostWindow::no_route`]).
 fn host_window(
     call: &'static str,
     importer: &Importer,
     pointer: NonNull<u8>,
     length: u64,
-    source: Option<Source>,
+    (source, dma_buf_only): (Option<Source>, bool),
     drops_writes: bool,
 ) -> Result<HostWindow, Error> {
     let source = source.filter(|_| importer.imports_dma_bufs() && !drops_writes);
     let at = pointer.as_ptr() as u64;
     let window = import_window(at, length, importer.page, 1)
         .map_err(|_| nil(call, Problem::BufferLength { length }))?;
-    let by_pointer = import_window(at, length, importer.page, importer.alignment).is_ok();
-    if !by_pointer && source.is_none() {
-        return Err(not_importable());
-    }
+    let by_pointer = !dma_buf_only
+        && (importer.pointers()).is_some_and(|pointers| {
+            import_window(at, length, importer.page, pointers.alignment).is_ok()
+        });
+    let pointerless = !dma_buf_only && importer.pointers().is_none();
     Ok(HostWindow {
         drops_writes,
         window,
         by_pointer,
         source,
-        unwritable: false,
+        pointerless,
     })
+}
+
+impl HostWindow {
+    /// The refusal of pages with no route of their own: not imported by their pointer, with no
+    /// usable source, and no copy (memory whose GPU writes are dropped is one where the system
+    /// maps no read-only view of the pages, `copied.rs`). On a device without
+    /// `VK_EXT_external_memory_host`, `Unsupported` naming it; elsewhere a range the import
+    /// alignment cannot cover, or memory imported only as dma-bufs (`Unsupported`, `HostMemory`).
+    /// `None` where they have a route. Such pages may still lie in a guest RAM's chunk
+    /// (`HostMemory::with_runs`), which takes no import of their own. A rebind to them takes this
+    /// refusal; a no-copy buffer or heap over them is a copy instead where the device imports no
+    /// pointer ([`HostWindow::pointerless`]).
+    fn no_route(&self, importer: &Importer) -> Option<Error> {
+        let copied = self.drops_writes && !crate::read_only_view::VIEWS_DROP_WRITES;
+        (!self.by_pointer && self.source.is_none() && !copied).then(|| {
+            match importer.pointer_import() {
+                Ok(_) => not_importable(),
+                Err(refusal) => refusal,
+            }
+        })
+    }
 }
 
 /// A no-copy buffer's unbound `VkBuffer` (`Device::host_buffer`): `size` bytes, its bytes from

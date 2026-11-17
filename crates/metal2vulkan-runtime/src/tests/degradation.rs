@@ -21,6 +21,16 @@ fn each_kind_is_announced_once() {
     assert!(other.now(Degradation::CopiedDrawBytes));
 }
 
+/// `CpuBlockDecode`'s cost says what `replace_region` waits for: no GPU work, only room under the
+/// decode queue's bound (`texture/twin_decode.rs`), which it states as the queue holds it.
+#[test]
+fn the_cpu_block_decode_cost_states_the_calls_only_wait() {
+    let cost = Degradation::CpuBlockDecode.cost();
+    let bound = crate::texture::twin_decode::QUEUED_BYTES >> 20;
+    let wait = format!("the call waits only for room, while {bound} MiB of written blocks wait");
+    assert!(cost.contains(&wait), "{cost}");
+}
+
 /// A kind the device's options ask for at each occurrence is announced at every one; every other
 /// kind once, as without them.
 #[test]
@@ -36,6 +46,32 @@ fn a_kind_asked_for_at_each_occurrence_is_announced_at_each() {
         assert_eq!(announced.now(kind), asked, "{kind:?}, second");
         assert_eq!(announced.now(kind), asked, "{kind:?}, third");
     }
+}
+
+/// `host-replayed-indirect-commands` is announced once per cause (`Device::degrade_host_step`),
+/// so a walk sees why each GPU-driven pass steps: a second step of one render rule announces
+/// nothing, another rule's does, a draw replay rule by its variant whatever its bits, and a
+/// compute execution's is a cause of its own; the kind counts as announced after the first.
+/// Asked for at each occurrence, every one is announced.
+#[test]
+fn a_host_step_is_announced_once_per_cause() {
+    use crate::degradation::HostStepKey;
+    use metal2vulkan::bind::DrawReplayRule;
+    let kind = Degradation::HostReplayedIndirectCommands;
+    let announced = Announced::new(&BTreeSet::new());
+    let rule = HostStepKey::Rule("the encoder counts visibility results");
+    let replay = |rule: DrawReplayRule| HostStepKey::Replay(std::mem::discriminant(&rule));
+    assert!(announced.host_step_now(rule, false));
+    assert!(!announced.host_step_now(rule, false));
+    assert!(!announced.now(kind), "the kind counts as announced");
+    assert!(announced.host_step_now(replay(DrawReplayRule::Operations(1)), false));
+    assert!(!announced.host_step_now(replay(DrawReplayRule::Operations(2)), false));
+    assert!(announced.host_step_now(replay(DrawReplayRule::CommandTypes), false));
+    assert!(announced.host_step_now(HostStepKey::Compute, false));
+    assert!(!announced.host_step_now(HostStepKey::Compute, true));
+    let each = Announced::new(&BTreeSet::from([kind]));
+    assert!(each.host_step_now(HostStepKey::Compute, false));
+    assert!(each.host_step_now(HostStepKey::Compute, false));
 }
 
 #[test]
@@ -56,6 +92,15 @@ fn codes_are_distinct_and_decode() {
         assert_eq!(seen.insert(code, kind), None, "{code} names two kinds");
         assert_eq!(Degradation::from_code(code), Some(kind));
         assert!(!kind.cost().is_empty(), "{kind:?}");
+        // Its name, code and cost read with single spaces: a string literal continued onto the
+        // next line without a `\` keeps the line's break and indent, which every relayed notice
+        // line would carry.
+        for text in [format!("{kind:?}"), code.to_owned(), kind.cost().to_owned()] {
+            assert!(
+                !text.contains("  ") && !text.contains(['\n', '\t']),
+                "{kind:?}: {text:?} holds two spaces, a newline or a tab"
+            );
+        }
     }
     assert_eq!(Degradation::from_code("metal2vulkan-degrade-"), None);
 }
@@ -102,7 +147,7 @@ fn notices_are_warnings_named_by_code() {
 /// docs/API.md's catalogue lists every kind's code once, with its category, and no other code.
 #[test]
 fn the_catalogue_lists_every_kind_and_only_them() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/API.md");
+    let path = metal2vulkan_devtools::workspace_dir().join("docs/API.md");
     let guide = std::fs::read_to_string(path).unwrap();
     let mut listed = BTreeMap::new();
     for line in guide.lines() {

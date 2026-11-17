@@ -12,13 +12,38 @@ use crate::{PrivateAnswer, PrivateCount, PrivateFlag, PrivateProperties};
 use metal2vulkan::device::{Device, DevicePolicy};
 use metal2vulkan::metal::TextureType;
 
-/// The answers on the committed profile `stem`, as `Device::private_properties` reads them.
+/// The device linear texture alignment [`answers`] reads from on the committed profile `stem`
+/// (`Device::device_linear_texture_alignment`, which only a device answers): MoltenVK's 16, Metal's
+/// own, as the M3 Max's answers (its linear images lay rows at the packed row rounded up to 16 and
+/// align their memory to 16), and 256 elsewhere, as a device whose images need more answers.
+fn linear(stem: &str) -> u64 {
+    match stem.starts_with("moltenvk-") {
+        true => 16,
+        false => 256,
+    }
+}
+
+/// The answers on the committed profile `stem`, as `Device::private_properties` reads them, its
+/// linear texture alignment [`linear`]'s.
 fn answers(stem: &str, desc: &metal2vulkan::device::DeviceDescription) -> PrivateProperties {
     let (enabled, properties) = created(stem, desc);
     let compile = Device::new(enabled.clone(), DevicePolicy::UNTRUSTED).unwrap();
     let rows = all_audits(stem, desc).remove(&MEASURED_FAMILY).unwrap();
     let formats = |pf| format_capabilities(&enabled, &compile, pf);
-    PrivateProperties::of(&properties, compile.metal_properties(), &rows, &formats)
+    PrivateProperties::of(
+        &properties,
+        compile.metal_properties(),
+        &rows,
+        (&formats, linear(stem)),
+        no_copy(desc),
+    )
+}
+
+/// Whether a device of the committed profile `desc` makes no-copy buffers: one that enables
+/// `VK_EXT_external_memory_host` where it lists it does (a profile names no dma-buf route, which is
+/// outside the vocabulary).
+fn no_copy(desc: &metal2vulkan::device::DeviceDescription) -> bool {
+    (desc.extensions).contains(&metal2vulkan::device::VkExtension::ExtExternalMemoryHost)
 }
 
 /// `ALL` lists each property once, in declaration order, under a selector of its own.
@@ -233,7 +258,13 @@ fn the_core_count_and_fp16_are_the_devices() {
         let rows = all_audits(&stem, &desc).remove(&MEASURED_FAMILY).unwrap();
         let formats = |pf| format_capabilities(&enabled, &compile, pf);
         let of = |properties: &DeviceProperties| {
-            PrivateProperties::of(properties, compile.metal_properties(), &rows, &formats)
+            PrivateProperties::of(
+                properties,
+                compile.metal_properties(),
+                &rows,
+                (&formats, linear(&stem)),
+                no_copy(&desc),
+            )
         };
         let unknown = of(&properties).count(PrivateCount::GpuCoreCount);
         assert_eq!(unknown.value(), None, "{stem}");
@@ -255,9 +286,9 @@ fn the_core_count_and_fp16_are_the_devices() {
     }
 }
 
-/// The answers read from the device: the texture alignments are the 16 bytes the runtime takes a
-/// linear texture and an IOSurface plane at; ordered atomics follow the Vulkan memory model at
-/// device scope; the XR10 formats and framebuffer reads follow their family rows (reads yes on
+/// The answers read from the device: the linear texture alignments and the IOSurface ones are the
+/// device's (`Device::device_linear_texture_alignment`); ordered atomics follow the Vulkan memory
+/// model at device scope; the XR10 formats and framebuffer reads follow their family rows (reads yes on
 /// MoltenVK and RADV); a half-float texture is filtered
 /// bicubically everywhere; and `RGB10A2Unorm_sRGB`, held as its raw word and filtered by the
 /// function (`ExtendedRange::Rgb10A2Srgb`), is filtered everywhere.
@@ -279,7 +310,7 @@ fn the_alignments_atomics_and_formats_are_the_devices() {
             assert_eq!(
                 p.count(c),
                 PrivateAnswer::Device {
-                    answer: crate::linear_plan::LINEAR_ALIGNMENT,
+                    answer: linear(&stem),
                     metal: 16
                 },
                 "{stem} {c:?}"

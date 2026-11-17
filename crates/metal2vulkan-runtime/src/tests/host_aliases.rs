@@ -1,6 +1,6 @@
 //! No-copy buffers over the same host memory (`host_aliases.rs`).
 
-use super::super::host_aliases::{Alias, HostAliases, Memories};
+use super::super::host_aliases::{Alias, HostAliases, Kind, Memories, Quiet, Within};
 use super::super::memory::MemoryClass;
 use super::super::resource::ResourceKey;
 use super::super::tracker::{Access, Use, UseRange};
@@ -13,7 +13,7 @@ type Aliases = HostAliases<u32>;
 
 /// Note `key` over `memory`, lying in a new import of `Shared` memory, which is dropped at once.
 fn join(aliases: &Aliases, key: ResourceKey, memory: (u64, u64)) -> Option<Alias> {
-    aliases.join(key, memory, MemoryClass::Shared, &Arc::new(0))
+    aliases.join(key, memory, Kind::Import(MemoryClass::Shared), &Arc::new(0))
 }
 
 fn copy() -> Access {
@@ -104,7 +104,7 @@ fn a_buffer_over_the_bytes_another_covers_lies_in_its_import() {
     let (first, second, managed) = (ResourceKey::new(), ResourceKey::new(), ResourceKey::new());
     assert!(aliases.import(memory, MemoryClass::Shared).is_none());
     let import = Arc::new(1);
-    aliases.join(first, memory, MemoryClass::Shared, &import);
+    aliases.join(first, memory, Kind::Import(MemoryClass::Shared), &import);
     let shared = aliases.import(memory, MemoryClass::Shared).unwrap();
     assert!(Arc::ptr_eq(&shared, &import));
     // Other bytes, or another class, share nothing.
@@ -114,14 +114,14 @@ fn a_buffer_over_the_bytes_another_covers_lies_in_its_import() {
     assert!(aliases.import(memory, MemoryClass::Managed).is_none());
     // A second over the memory lies in it, and the first import stays the memory's.
     let again = Arc::new(2);
-    aliases.join(second, memory, MemoryClass::Shared, &again);
+    aliases.join(second, memory, Kind::Import(MemoryClass::Shared), &again);
     assert!(Arc::ptr_eq(
         &aliases.import(memory, MemoryClass::Shared).unwrap(),
         &import
     ));
     // A managed buffer's import is the memory's for its class.
     let own = Arc::new(3);
-    aliases.join(managed, memory, MemoryClass::Managed, &own);
+    aliases.join(managed, memory, Kind::Import(MemoryClass::Managed), &own);
     assert!(Arc::ptr_eq(
         &aliases.import(memory, MemoryClass::Managed).unwrap(),
         &own
@@ -130,7 +130,7 @@ fn a_buffer_over_the_bytes_another_covers_lies_in_its_import() {
     drop((import, shared));
     assert!(aliases.import(memory, MemoryClass::Shared).is_none());
     let third = ResourceKey::new();
-    aliases.join(third, memory, MemoryClass::Shared, &again);
+    aliases.join(third, memory, Kind::Import(MemoryClass::Shared), &again);
     assert!(Arc::ptr_eq(
         &aliases.import(memory, MemoryClass::Shared).unwrap(),
         &again
@@ -144,8 +144,163 @@ fn a_buffer_over_the_bytes_another_covers_lies_in_its_import() {
     drop((again, own));
 }
 
+/// A buffer over the bytes a live copy was made over (`copied.rs`) lies in the copy, of either
+/// memory class, while no import of its class lives; a copy is not an import a buffer over part
+/// of the bytes counts as inside, and once every buffer over the memory is gone it is not shared.
+#[test]
+fn a_buffer_over_the_bytes_a_copy_covers_lies_in_the_copy() {
+    let aliases = Aliases::default();
+    let memory = (0x40000, 0x4000);
+    let (first, second, third) = (ResourceKey::new(), ResourceKey::new(), ResourceKey::new());
+    let copy = Arc::new(1);
+    assert_eq!(aliases.join(first, memory, Kind::Copy, &copy), None);
+    for class in [MemoryClass::Shared, MemoryClass::Managed] {
+        assert!(Arc::ptr_eq(&aliases.import(memory, class).unwrap(), &copy));
+    }
+    // Other bytes share nothing, and the copy is no live import around part of them.
+    assert!(aliases
+        .import((0x40000, 0x2000), MemoryClass::Shared)
+        .is_none());
+    assert!(matches!(
+        aliases.within((0x40000, 0x2000), PAGE),
+        Within::Free
+    ));
+    // A buffer that lies in it joins the memory's key.
+    assert_eq!(
+        aliases.join(second, memory, Kind::Copy, &copy),
+        Some(Alias { key: first })
+    );
+    // An import of a class noted over the same bytes (two buffers made at once) is its class's.
+    let import = Arc::new(2);
+    aliases.join(third, memory, Kind::Import(MemoryClass::Managed), &import);
+    assert!(Arc::ptr_eq(
+        &aliases.import(memory, MemoryClass::Managed).unwrap(),
+        &import
+    ));
+    assert!(Arc::ptr_eq(
+        &aliases.import(memory, MemoryClass::Shared).unwrap(),
+        &copy
+    ));
+    for key in [first, second, third] {
+        aliases.forget(key);
+    }
+    assert!(aliases.import(memory, MemoryClass::Shared).is_none());
+    drop((copy, import));
+}
+
 /// The host page of the tests that name none of their own: an import's unit.
 const PAGE: u64 = 0x1000;
+
+/// The live import, if any, a new import of `window` would lie inside, else whether one meets it.
+fn within(aliases: &Aliases, window: (u64, u64)) -> Option<Option<u32>> {
+    match aliases.within(window, PAGE) {
+        Within::Free => None,
+        Within::Inside(import) => Some(Some(*import)),
+        Within::Meets(_) => Some(None),
+    }
+}
+
+/// One live import of a page (`VK_EXT_external_memory_host` leaves pages imported twice
+/// undefined): a heap's own import is held, joining no key, and a later buffer over its exact
+/// bytes lies in it and is the memory's key; pages a live import (a heap's or a buffer's) holds
+/// all of lie inside it, at any offset, whatever its class; pages one holds some of meet it,
+/// rounded out to the import's unit; a copy is no import, and imports that went hold nothing.
+#[test]
+fn a_page_a_live_import_holds_is_never_imported_again() {
+    let aliases = Aliases::default();
+    let heap_bytes = (0x100000, 0x200000);
+    let (heap, exact, inside, apart) = (
+        ResourceKey::new(),
+        ResourceKey::new(),
+        ResourceKey::new(),
+        ResourceKey::new(),
+    );
+    assert_eq!(within(&aliases, (0x100000, 0x1000)), None);
+    let heap_import = Arc::new(7);
+    aliases.hold(
+        heap,
+        heap_bytes,
+        Kind::Import(MemoryClass::Shared),
+        &heap_import,
+    );
+    // The heap's import is found for its exact bytes and inside them, its key joined by none.
+    assert!(Arc::ptr_eq(
+        &aliases.import(heap_bytes, MemoryClass::Shared).unwrap(),
+        &heap_import
+    ));
+    assert_eq!(aliases.of(heap), None);
+    for window in [
+        heap_bytes,
+        (0x100000, 0x1000),
+        (0x2ff000, 0x1000),
+        (0x180000, 0x8000),
+    ] {
+        assert_eq!(within(&aliases, window), Some(Some(7)), "{window:x?}");
+    }
+    // Across either edge, or around it whole: it meets, and no new import is made.
+    for window in [(0xff000, 0x2000), (0x2ff000, 0x2000), (0xf0000, 0x300000)] {
+        assert_eq!(within(&aliases, window), Some(None), "{window:x?}");
+        // Naming the live import that meets it, whose kind decides a new import beside it.
+        let met = aliases.within(window, PAGE);
+        let met: Vec<u32> = met.held_by().iter().map(|import| **import).collect();
+        assert_eq!(met, [7], "{window:x?}");
+    }
+    // Beside it: free.
+    assert_eq!(within(&aliases, (0x300000, 0x1000)), None);
+    assert_eq!(within(&aliases, (0xff000, 0x1000)), None);
+    // A buffer over its exact bytes lies in its import and becomes the memory's key; a second
+    // joins that key, not the heap's.
+    assert_eq!(
+        aliases.join(
+            exact,
+            heap_bytes,
+            Kind::Import(MemoryClass::Shared),
+            &heap_import
+        ),
+        None
+    );
+    let second = ResourceKey::new();
+    assert_eq!(
+        aliases.join(
+            second,
+            heap_bytes,
+            Kind::Import(MemoryClass::Shared),
+            &heap_import
+        ),
+        Some(Alias { key: exact })
+    );
+    // A buffer bound inside it, over bytes that miss the page's start, is an import of its own
+    // bytes too: a later buffer inside those lies inside either, never beside both.
+    let bound = Arc::new(8);
+    aliases.join(
+        inside,
+        (0x180010, 0x3000),
+        Kind::Import(MemoryClass::Managed),
+        &bound,
+    );
+    assert!(matches!(
+        within(&aliases, (0x181000, 0x1000)),
+        Some(Some(7 | 8))
+    ));
+    // Across the bound buffer's edge but inside the heap's: inside the heap's.
+    assert_eq!(within(&aliases, (0x182000, 0x4000)), Some(Some(7)));
+    // A copy over other bytes is no import: free.
+    aliases.join(apart, (0x400000, 0x4000), Kind::Copy, &Arc::new(9));
+    assert_eq!(within(&aliases, (0x400000, 0x4000)), None);
+    // Every buffer over the heap's bytes gone, the bound one's still over its own: the heap's
+    // pages are free but those, which its import holds.
+    for key in [heap, exact, second] {
+        aliases.forget(key);
+    }
+    assert_eq!(within(&aliases, (0x100000, 0x1000)), None);
+    assert_eq!(within(&aliases, (0x180000, 0x1000)), Some(Some(8)));
+    // Its import gone, though it is still noted: free.
+    drop(bound);
+    assert_eq!(within(&aliases, (0x180000, 0x1000)), None);
+    aliases.forget(inside);
+    aliases.forget(apart);
+    drop(heap_import);
+}
 
 /// A reported remap counts the ranges placed buffers lie over that have a page among its bytes
 /// rounded out to the import's unit, with or without memories noted: none for bytes beside
@@ -203,11 +358,11 @@ fn a_reported_remap_ends_the_sharing_of_imports_made_before() {
     let (first, second, after) = (ResourceKey::new(), ResourceKey::new(), ResourceKey::new());
     let import = Arc::new(1);
     assert_eq!(
-        aliases.join(first, memory, MemoryClass::Shared, &import),
+        aliases.join(first, memory, Kind::Import(MemoryClass::Shared), &import),
         None
     );
     assert_eq!(
-        aliases.join(second, memory, MemoryClass::Shared, &import),
+        aliases.join(second, memory, Kind::Import(MemoryClass::Shared), &import),
         Some(Alias { key: first })
     );
     // Bytes next to the memory, on either side: nothing changes.
@@ -220,7 +375,7 @@ fn a_reported_remap_ends_the_sharing_of_imports_made_before() {
     // A buffer made after imports anew and joins nothing; the second keeps the key it joined.
     let fresh = Arc::new(2);
     assert_eq!(
-        aliases.join(after, memory, MemoryClass::Shared, &fresh),
+        aliases.join(after, memory, Kind::Import(MemoryClass::Shared), &fresh),
         None
     );
     assert_eq!(aliases.of(second), Some(Alias { key: first }));
@@ -370,11 +525,11 @@ fn remaps_from_any_thread_keep_the_notes_whole() {
                         let memory = memory(round + worker);
                         let import = Arc::new(worker as u32);
                         let (first, second) = (ResourceKey::new(), ResourceKey::new());
-                        aliases.join(first, memory, MemoryClass::Shared, &import);
+                        aliases.join(first, memory, Kind::Import(MemoryClass::Shared), &import);
                         let shared = aliases
                             .import(memory, MemoryClass::Shared)
                             .unwrap_or_else(|| Arc::clone(&import));
-                        aliases.join(second, memory, MemoryClass::Shared, &shared);
+                        aliases.join(second, memory, Kind::Import(MemoryClass::Shared), &shared);
                         aliases.forget(first);
                         aliases.forget(second);
                         assert_eq!(aliases.of(second), None);
@@ -505,8 +660,7 @@ fn a_sample_through_a_second_key_waits_for_a_render_through_the_first() {
     let summary = |uses: &[Use<ResourceKey>]| {
         let mut encoder = EncoderUses::new(true);
         let uses = aliases.augment(uses).unwrap_or_else(|| uses.to_vec());
-        let barrier = encoder.barrier(&uses, Reach::Unnamed);
-        encoder.record(vk::PipelineStageFlags2::NONE, &uses, barrier);
+        encoder.order(vk::PipelineStageFlags2::NONE, &uses, Reach::Unnamed);
         encoder.finish()
     };
     let render = Use::writes(
@@ -746,4 +900,225 @@ fn the_version_counts_each_change_augment_reads() {
     changed("unplaced");
     aliases.forget(second);
     changed("forgotten");
+}
+
+/// An encoder's commands whose uses of bytes name only keys an earlier one found look nothing up
+/// (`host_aliases::Quiet`, `WorkCounts::host_alias_lookups`), a key that takes no other use and
+/// one that takes some alike; a buffer placed over bytes a quiet key lies over, or a quiet key
+/// joining another's memory, between two commands makes the second carry the use it takes now.
+#[test]
+fn a_quiet_key_is_looked_up_again_once_a_buffer_moves_or_joins() {
+    let aliases = Aliases::default();
+    let mut quiet = Quiet::default();
+    let mut all = Vec::new();
+    let mut augment =
+        |uses: &[Use<ResourceKey>]| match aliases.augment_into(uses, &mut all, Some(&mut quiet)) {
+            true => Some(all.clone()),
+            false => None,
+        };
+    let (first, second, alone, moved) = (
+        ResourceKey::new(),
+        ResourceKey::new(),
+        ResourceKey::new(),
+        ResourceKey::new(),
+    );
+    // Two keys over one range crowd the device's placements; a third lies alone.
+    aliases.place(first, (0x10_0000, 0x1000));
+    aliases.place(second, (0x10_0000, 0x1000));
+    aliases.place(alone, (0x40_0000, 0x1000));
+    let used = [write(alone, 0x800..0x840)];
+    for _ in 0..3 {
+        assert_eq!(augment(&used), None);
+    }
+    assert_eq!(aliases.lookups(), 1, "a quiet key is looked up once");
+    // A key that takes a use is looked up once too, and its uses at other bytes take the same
+    // key's, at their own bytes, from what the encoder kept of it.
+    for bytes in [0..0x40, 0x40..0x80, 0..0x40] {
+        let crowded = [write(second, bytes.clone())];
+        assert_eq!(
+            augment(&crowded),
+            Some(vec![crowded[0].clone(), write(first, bytes)])
+        );
+    }
+    assert_eq!(
+        aliases.lookups(),
+        2,
+        "a key that takes a use is looked up once"
+    );
+    // A buffer placed over the second half of the lone key's bytes.
+    aliases.place(moved, (0x40_0800, 0x1000));
+    assert_eq!(
+        augment(&used),
+        Some(vec![used[0].clone(), write(moved, 0..0x40)])
+    );
+    // A key found quiet, then joining a live buffer's memory.
+    let (owner, joining) = (ResourceKey::new(), ResourceKey::new());
+    assert_eq!(join(&aliases, owner, (0x80_0000, 0x1000)), None);
+    let joined = [write(joining, 0..0x40)];
+    assert_eq!(augment(&joined), None);
+    assert_eq!(
+        join(&aliases, joining, (0x80_0000, 0x1000)),
+        Some(Alias { key: owner })
+    );
+    assert_eq!(
+        augment(&joined),
+        Some(vec![joined[0].clone(), write(owner, 0..0x40)])
+    );
+}
+
+/// The keys an ended encoder found go to the device's next encoder (`HostAliases::quiet`): one
+/// that opens while nothing changed looks none of them up again, and takes what they took; one
+/// that opens after a change looks its keys up again, and takes what they take now.
+#[test]
+fn an_ended_encoder_s_keys_go_to_the_next_while_nothing_changes() {
+    let aliases = Aliases::default();
+    let mut all = Vec::new();
+    let (first, second, alone) = (ResourceKey::new(), ResourceKey::new(), ResourceKey::new());
+    // Two keys over one range crowd the device's placements; a third lies alone.
+    aliases.place(first, (0x10_0000, 0x1000));
+    aliases.place(second, (0x10_0000, 0x1000));
+    aliases.place(alone, (0x40_0000, 0x1000));
+    let (quiet_use, crowded_use) = ([write(alone, 0x800..0x840)], [write(second, 0x80..0xc0)]);
+    let crowded_takes = vec![crowded_use[0].clone(), write(first, 0x80..0xc0)];
+    // An encoder with nothing given back looks its two keys up, once each.
+    let mut encoder = aliases.quiet();
+    assert!(!aliases.augment_into(&quiet_use, &mut all, Some(&mut encoder)));
+    assert!(aliases.augment_into(&crowded_use, &mut all, Some(&mut encoder)));
+    assert_eq!(all, crowded_takes);
+    assert_eq!(aliases.lookups(), 2);
+    aliases.give_quiet(encoder);
+    // The next looks up neither, and its crowded key's use takes what it took.
+    for _ in 0..3 {
+        let mut encoder = aliases.quiet();
+        assert!(!aliases.augment_into(&quiet_use, &mut all, Some(&mut encoder)));
+        assert!(aliases.augment_into(&crowded_use, &mut all, Some(&mut encoder)));
+        assert_eq!(all, crowded_takes);
+        aliases.give_quiet(encoder);
+    }
+    assert_eq!(
+        aliases.lookups(),
+        2,
+        "keys given back are not looked up again"
+    );
+    // A buffer placed over the second half of the lone key's bytes: the next encoder looks the
+    // key up again, and its use takes the new key's.
+    let moved = ResourceKey::new();
+    aliases.place(moved, (0x40_0800, 0x1000));
+    let mut encoder = aliases.quiet();
+    assert!(aliases.augment_into(&quiet_use, &mut all, Some(&mut encoder)));
+    assert_eq!(all, vec![quiet_use[0].clone(), write(moved, 0..0x40)]);
+    assert_eq!(
+        aliases.lookups(),
+        3,
+        "keys given back are looked up again after a change"
+    );
+}
+
+/// Keys placed, rebound, removed and joined at random, and uses of random bytes of them: an
+/// encoder that keeps what it found of each key (`host_aliases::Quiet`) carries exactly the uses
+/// a lookup of every use under the lock gives (`HostAliases::augment`), and looks a command up
+/// again only once something changed since or a key is new to it, or its range is met by more
+/// ranges than it keeps.
+#[test]
+fn what_an_encoder_keeps_of_a_key_takes_what_a_lookup_takes() {
+    const PAGE: u64 = 0x1000;
+    const BASE: u64 = 0x7000_0000_0000;
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move |below: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % below
+    };
+    let aliases = Aliases::default();
+    let keys: Vec<ResourceKey> = (0..24).map(|_| ResourceKey::new()).collect();
+    let mut at: Vec<Option<(u64, u64)>> = vec![None; keys.len()];
+    let mut quiet = Quiet::default();
+    let mut all = Vec::new();
+    let (mut kept, mut found) = (0, 0);
+    for round in 0..6000 {
+        let index = next(keys.len() as u64) as usize;
+        let key = keys[index];
+        match next(16) {
+            0 => {
+                at[index] = None;
+                aliases.unplace(key);
+            }
+            1 => {
+                let class = next(6);
+                let length = (1 + next(1 << class)) * PAGE;
+                let place = (BASE + next(96) * PAGE, length);
+                at[index] = Some(place);
+                aliases.place(key, place);
+            }
+            2 => {
+                // Over the same bytes as another live key's: it joins that one's memory.
+                let other = next(keys.len() as u64) as usize;
+                if let Some(memory) = at[other] {
+                    join(&aliases, key, memory);
+                }
+            }
+            _ => {}
+        }
+        // A command of one or two uses, of keys placed or not.
+        let mut uses = Vec::new();
+        for _ in 0..1 + next(2) {
+            let index = next(keys.len() as u64) as usize;
+            let length = at[index].map_or(PAGE, |at| at.1);
+            let start = next(length + PAGE);
+            let bytes = start..start + 1 + next(length + PAGE);
+            uses.push(match next(2) {
+                0 => write(keys[index], bytes),
+                _ => sample(keys[index], bytes),
+            });
+        }
+        let looked = aliases.augment(&uses);
+        let before = aliases.lookups();
+        let took = aliases
+            .augment_into(&uses, &mut all, Some(&mut quiet))
+            .then(|| all.clone());
+        assert_eq!(took, looked, "round {round}: {uses:?}");
+        match aliases.lookups() - before {
+            0 => kept += 1,
+            _ => found += 1,
+        }
+    }
+    assert!(kept > 1000 && found > 1000, "kept {kept}, found {found}");
+}
+
+/// A staged copy's question (`host_ram/copy.rs`): a key over a byte of the range answers yes,
+/// unless it lies alone over its range and the caller calls it quiet; a range only meeting the
+/// bytes' end, or one gone, answers nothing.
+#[test]
+fn others_over_finds_every_key_but_a_quiet_one_alone() {
+    let aliases = Aliases::default();
+    assert!(
+        !aliases.others_over(0x10000, 0x20000, |_| false),
+        "none placed"
+    );
+    let (chunk, buffer, second) = (ResourceKey::new(), ResourceKey::new(), ResourceKey::new());
+    aliases.place(chunk, (0x10000, 0x10000));
+    let quiet = |key: ResourceKey| key == chunk;
+    assert!(aliases.others_over(0x18000, 0x19000, |_| false));
+    assert!(
+        !aliases.others_over(0x18000, 0x19000, quiet),
+        "the quiet key alone"
+    );
+    assert!(
+        !aliases.others_over(0x20000, 0x30000, |_| false),
+        "past the range's end"
+    );
+    // A buffer over some of the chunk's bytes: found where the bytes meet it, not elsewhere.
+    aliases.place(buffer, (0x14000, 0x1000));
+    assert!(aliases.others_over(0x14800, 0x16000, quiet));
+    assert!(!aliases.others_over(0x16000, 0x17000, quiet));
+    // A second key over the quiet key's very range: it is not alone there.
+    aliases.place(second, (0x10000, 0x10000));
+    assert!(aliases.others_over(0x16000, 0x17000, quiet));
+    aliases.forget(second);
+    aliases.forget(buffer);
+    assert!(
+        !aliases.others_over(0x10000, 0x20000, quiet),
+        "the others gone"
+    );
 }

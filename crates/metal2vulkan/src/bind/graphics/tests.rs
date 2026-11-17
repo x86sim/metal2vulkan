@@ -20,12 +20,22 @@ fn instantiate(
     draw: &DrawCall,
 ) -> Result<DrawCommands, BindError> {
     let mut fresh = DrawCommands::default();
-    let made = super::instantiate(t, state, draw, &mut fresh).map(|()| fresh);
+    let made = super::instantiate(t, state, draw, &mut fresh, Heap::Written).map(|()| fresh);
     KEPT.with(|kept| {
         let mut kept = kept.borrow_mut();
-        let over = super::instantiate(t, state, draw, &mut kept).map(|()| kept.clone());
+        let over =
+            super::instantiate(t, state, draw, &mut kept, Heap::Written).map(|()| kept.clone());
         assert_eq!(over, made, "the commands written over those before");
     });
+    // Apart from the heap tables (`BindingPlan::instantiate_draw_apart_into`), the same commands
+    // but for those, which follow the stage tables.
+    if let Ok(made) = &made {
+        let mut apart = DrawCommands::default();
+        super::instantiate(t, state, draw, &mut apart, Heap::Apart).expect("the commands apart");
+        let heap = crate::bind::heap::table_bytes(&t.resources, state).expect("the heap tables");
+        apart.descriptor_bytes.extend(heap);
+        assert_eq!(&apart, made, "the commands apart from their heap tables");
+    }
     made
 }
 
@@ -111,12 +121,27 @@ fn draws_map_to_the_vulkan_draw_of_the_same_arguments() {
 
 /// A render plan names only vertex and fragment stages; a tessellation pipeline's vertex
 /// function is its evaluation stage, and its synthesized vertex and control stages are none, as
-/// are the geometry stages of barycentric weights read as varyings.
+/// are the geometry stages of barycentric weights read as varyings and a band's control and
+/// evaluation stages.
 #[test]
 fn only_vertex_and_fragment_stages_are_render_stages() {
     use vk::ShaderStage as S;
-    let stages =
-        |modules: &[S], tessellated| metal_stages(modules.iter().copied(), tessellated, false);
+    let stages = |modules: &[S], tessellated| {
+        metal_stages(modules.iter().copied(), (tessellated, false), false)
+    };
+    let tessellation = [
+        S::VERTEX,
+        S::TESSELLATION_CONTROL,
+        S::TESSELLATION_EVALUATION,
+        S::FRAGMENT,
+    ];
+    assert_eq!(
+        metal_stages(tessellation.iter().copied(), (false, true), false),
+        Ok(vec![
+            (Stage::Vertex, S::VERTEX),
+            (Stage::Fragment, S::FRAGMENT)
+        ])
+    );
     assert_eq!(
         stages(&[S::VERTEX, S::FRAGMENT], false),
         Ok(vec![
@@ -607,6 +632,8 @@ fn instantiation_bounds_a_draw_by_its_index_buffer() {
         deindexed: None,
         private_list: false,
         storage_kept: 0,
+        line_band: None,
+        region_probe: None,
     };
     let state = BindState::default();
     let past = indexed_in(vk::IndexType::UINT32, 40, 8, 10);
@@ -655,6 +682,8 @@ fn a_draw_of_no_index_binds_inside_the_buffer() {
         deindexed: None,
         private_list: false,
         storage_kept: 0,
+        line_band: None,
+        region_probe: None,
     };
     let state = BindState::default();
     let bound = |cmds: &DrawCommands| match cmds.draw {
@@ -738,6 +767,8 @@ fn an_unbounded_indexed_indirect_draw_reads_its_arguments() {
         deindexed: None,
         private_list: false,
         storage_kept: 0,
+        line_band: None,
+        region_probe: None,
     };
     let state = BindState::default();
     for robust in [false, true] {
@@ -795,6 +826,8 @@ fn draws_bind_vertex_buffers_at_aligned_offsets_with_their_windows() {
         deindexed: None,
         private_list: false,
         storage_kept: 0,
+        line_band: None,
+        region_probe: None,
     };
     let state = |offsets: (u64, u64), stride| {
         let buffer = |offset, attribute_stride| BoundBuffer::Buffer {
@@ -859,11 +892,203 @@ fn draws_bind_vertex_buffers_at_aligned_offsets_with_their_windows() {
     assert!(instantiate(&t, &state((64, 6), 12), &draw).is_ok());
 }
 
+/// The commands of `draw` that [`redraw_with`] writes over the commands of `from` (each
+/// [`super::instantiate`]'s apart from the heap tables): `None` where it answers `Ok(false)`,
+/// else the commands, which must be `draw`'s own (and an error the one `draw`'s answers).
+fn redrawn(
+    t: &GraphicsTemplate,
+    state: &BindState,
+    (from, draw): (&DrawCall, &DrawCall),
+) -> Result<Option<DrawCommands>, BindError> {
+    let mut commands = DrawCommands::default();
+    super::instantiate(t, state, from, &mut commands, Heap::Apart).expect("the first draw");
+    let own = || {
+        let mut own = DrawCommands::default();
+        super::instantiate(t, state, draw, &mut own, Heap::Apart).map(|()| own)
+    };
+    match redraw_with(t, state, (from, draw), &mut commands) {
+        Ok(true) => {
+            let own = own().expect("the draw's own commands");
+            assert_eq!(commands, own, "{draw:?} redrawn over {from:?}");
+            Ok(Some(commands))
+        }
+        Ok(false) => Ok(None),
+        Err(error) => {
+            assert_eq!(own().err(), Some(error.clone()), "{draw:?}'s error");
+            Err(error)
+        }
+    }
+}
+
+/// A draw that differs from the one before only in its arguments, redrawn over that one's
+/// commands, writes the commands every step writes for it: its Vulkan draw, its overrun, its
+/// `BaseVertexInstance` field and its index buffer's use; and none where a fixed-function vertex
+/// buffer's fetch window moves with them (a draw's vertices, a per-instance buffer's instances),
+/// where the plan reads them some other way (a de-indexed draw, a vertices-per-primitive field of
+/// a draw with indices and one without). Another index type or buffer, or indices read or not, is
+/// redrawn. Past a multiview plan's instance limit it answers every step's error.
+#[test]
+fn draws_of_other_arguments_redraw_what_every_step_writes() {
+    use crate::pipeline::interface::PlacedField;
+    let template = |vertex_buffers| GraphicsTemplate {
+        buffers: Vec::new(),
+        stages: vec![StageTemplate {
+            stage: Stage::Vertex,
+            flags: vk::ShaderStageFlags::VERTEX,
+            fields: vec![PlacedField {
+                field: PushField::BaseVertexInstance,
+                loc: PushLoc::Push { offset: 8 },
+                size: 8,
+            }],
+            push_range: Some((0, 16)),
+            table: None,
+            table_size: 0,
+            root_first: None,
+        }],
+        vertex_buffers,
+        pulled_strides: Vec::new(),
+        resources: ResourceTemplate::default(),
+        vertex_strides: rules(None, true),
+        multiview_instance_limit: None,
+        other_layer_variant: false,
+        amplifications: Vec::new(),
+        tessellation: None,
+        indirect_first_instance_missing: false,
+        robust_index_fetch: true,
+        shadow_stencil: None,
+        mesh: None,
+        shader_tests: None,
+        deindexed: None,
+        private_list: false,
+        storage_kept: 0,
+        line_band: None,
+        region_probe: None,
+    };
+    let state = {
+        let buffer = |attribute_stride| BoundBuffer::Buffer {
+            length: 4096,
+            offset: 64,
+            gpu_address: 0x1_0000,
+            device_address: None,
+            attribute_stride,
+        };
+        let mut t = StageTable::default();
+        t.buffers.insert(1, buffer(None));
+        t.buffers.insert(2, buffer(Some(8)));
+        let mut s = BindState::default();
+        s.stages.insert(Stage::Vertex, t);
+        s
+    };
+    let indexed =
+        |index_count, index_offset, base_vertex, instances: (u32, u32)| DrawCall::Indexed {
+            index_type: vk::IndexType::UINT16,
+            index_buffer: IndexBufferRef::new(7, 4096),
+            index_count,
+            index_offset,
+            instance_count: instances.1,
+            base_vertex,
+            base_instance: instances.0,
+        };
+    let t = template(vertex_buffers());
+    let first = indexed(6, 64, 5, (1, 5));
+    // Another first index, count and base vertex: the per-vertex buffer's window is the whole
+    // buffer for both, the per-instance one's the same instances'.
+    for draw in [
+        indexed(6, 128, 5, (1, 5)),
+        indexed(9, 0, -3, (1, 5)),
+        // Indices past the buffer's end, which the robust fetch draws.
+        indexed(12, 4090, 5, (1, 5)),
+    ] {
+        let commands = redrawn(&t, &state, (&first, &draw)).expect("redrawn");
+        assert!(commands.is_some(), "{draw:?} redrawn");
+    }
+    let base = redrawn(&t, &state, (&first, &indexed(6, 128, 9, (1, 5))))
+        .expect("redrawn")
+        .expect("redrawn at another base vertex");
+    assert_eq!(base.push_constants[0].bytes[8..12], 9u32.to_le_bytes());
+    // Other instances move the per-instance buffer's window, and so do vertices without indices
+    // after indices, whose per-vertex window is the whole buffer; another index type or index
+    // buffer is redrawn.
+    let moved = indexed(6, 64, 5, (2, 5));
+    assert_eq!(redrawn(&t, &state, (&first, &moved)), Ok(None));
+    let wide = DrawCall::Indexed {
+        index_type: vk::IndexType::UINT32,
+        index_buffer: IndexBufferRef::new(7, 4096),
+        index_count: 6,
+        index_offset: 64,
+        instance_count: 5,
+        base_vertex: 5,
+        base_instance: 1,
+    };
+    let other_buffer = DrawCall::Indexed {
+        index_type: vk::IndexType::UINT16,
+        index_buffer: IndexBufferRef::new(8, 4096),
+        index_count: 6,
+        index_offset: 64,
+        instance_count: 5,
+        base_vertex: 5,
+        base_instance: 1,
+    };
+    for draw in [wide, other_buffer] {
+        let commands = redrawn(&t, &state, (&first, &draw)).expect("redrawn");
+        assert!(commands.is_some(), "{draw:?} redrawn");
+    }
+    let unindexed = primitives(0, 6, (1, 5));
+    assert_eq!(redrawn(&t, &state, (&first, &unindexed)), Ok(None));
+    // With no fixed-function vertex buffer, a draw without indices after one with them, and the
+    // other way, is redrawn, its index use gone or made; but not where a vertex function divides
+    // by the vertices per primitive, which a draw with indices and one without set apart.
+    let pulled = template(Vec::new());
+    for (from, draw) in [(&first, &unindexed), (&unindexed, &first)] {
+        let commands = redrawn(&pulled, &state, (from, draw)).expect("redrawn");
+        let uses = commands.map(|commands| commands.uses.len());
+        assert_eq!(uses, Some(usize::from(draw == &first)), "{draw:?} redrawn");
+    }
+    let mut per_primitive = template(Vec::new());
+    per_primitive.stages[0].fields.push(PlacedField {
+        field: PushField::VerticesPerPrimitive,
+        loc: PushLoc::Push { offset: 0 },
+        size: 4,
+    });
+    let mut triangles = state.clone();
+    triangles.primitive_type = Some(metal::PrimitiveType::Triangle);
+    let kinds = (&unindexed, &first);
+    assert_eq!(redrawn(&per_primitive, &triangles, kinds), Ok(None));
+    let more = (&unindexed, &primitives(3, 6, (1, 5)));
+    let commands = redrawn(&per_primitive, &triangles, more).expect("redrawn");
+    assert!(commands.is_some(), "more vertices redrawn");
+    // Draws without indices of other vertices move the per-vertex buffer's window; with no
+    // fixed-function vertex buffer, every argument is the commands' alone.
+    let vertices = primitives(2, 3, (1, 5));
+    assert_eq!(
+        redrawn(&t, &state, (&vertices, &primitives(4, 3, (1, 5)))),
+        Ok(None)
+    );
+    let pulled = template(Vec::new());
+    for draw in [primitives(4, 3, (1, 5)), primitives(0, 30, (3, 2))] {
+        let commands = redrawn(&pulled, &state, (&vertices, &draw)).expect("redrawn");
+        assert!(commands.is_some(), "{draw:?} redrawn");
+    }
+    // A de-indexed draw reads its indices and layout itself.
+    let mut deindexed = template(Vec::new());
+    deindexed.deindexed = Some(metal::IndexType::UInt16);
+    let mut primitive = state.clone();
+    primitive.primitive_type = Some(metal::PrimitiveType::Triangle);
+    let indices = (&first, &indexed(6, 128, 5, (1, 5)));
+    assert_eq!(redrawn(&deindexed, &primitive, indices), Ok(None));
+    // Instances past a multiview plan's limit: every step's error.
+    let mut multiview = template(Vec::new());
+    multiview.multiview_instance_limit = Some(4);
+    let past = primitives(2, 3, (1, 5));
+    let redrawn_past = redrawn(&multiview, &state, (&primitives(2, 3, (0, 1)), &past));
+    assert!(redrawn_past.is_err(), "{redrawn_past:?}");
+}
+
 /// Inline vertex bytes at a per-bind layout read at their bind's stride, 0 without one, as plain
 /// Metal reads them (`setVertexBytes:length:atIndex:` read vertex 0 for every
-/// vertex, the stride form at 0, 4 and 8 its stride); at `MTLAttributeStrideStatic`
-/// (`u32::MAX`), which an M4 read as element 0 and zeros past it, they are refused
-/// `MissingVertexStride`; and a stride fixed function cannot fetch is the plan's pulled variant.
+/// vertex, the stride form at 0, 4 and 8 its stride); and a stride fixed function cannot fetch is
+/// the plan's pulled variant, `MTLAttributeStrideStatic`'s (`u32::MAX`) among them, which the
+/// pulled fetch reads as element 0 and zeros past it, as an M4 read them.
 #[test]
 fn inline_vertex_bytes_bind_the_strides_a_dynamic_layout_reads() {
     let mut template = GraphicsTemplate {
@@ -885,6 +1110,8 @@ fn inline_vertex_bytes_bind_the_strides_a_dynamic_layout_reads() {
         deindexed: None,
         private_list: false,
         storage_kept: 0,
+        line_band: None,
+        region_probe: None,
     };
     let state = |attribute_stride| {
         let mut t = StageTable::default();
@@ -913,14 +1140,15 @@ fn inline_vertex_bytes_bind_the_strides_a_dynamic_layout_reads() {
         // Dynamic strides list every binding's, the static one included (`pStrides`).
         assert_eq!(cmds.vertex_strides, vec![(0, 24), (1, read)], "{stride:?}");
     }
-    assert_eq!(
-        instantiate(&template, &state(Some(u32::MAX)), &draw).err(),
-        Some(BindError::MissingVertexStride { slot: vslot(2) })
-    );
-    // A stride fixed function cannot fetch (past the attributes' alignment, or below the bytes
-    // an element reads) is the plan's pulled variant: a draw of this plan with it is an internal
-    // error.
+    // A stride fixed function cannot fetch (past the attributes' alignment, below the bytes an
+    // element reads, or past `maxVertexInputBindingStride`) is the plan's pulled variant: a draw of
+    // this plan with it is an internal error.
     let pulled = |r: Result<DrawCommands, BindError>| matches!(r, Err(BindError::Internal(_)));
+    assert!(pulled(instantiate(
+        &template,
+        &state(Some(u32::MAX)),
+        &draw
+    )));
     assert!(pulled(instantiate(&template, &state(Some(7)), &draw)));
     assert!(pulled(instantiate(&template, &state(Some(6)), &draw)));
     template.vertex_strides = rules(None, false);
@@ -1513,12 +1741,15 @@ fn mesh_template(flat: bool, multiples: Vec<u32>) -> GraphicsTemplate {
             },
             object: None,
             folded: false,
+            partial_groups: false,
             records: None,
         }),
         shader_tests: None,
         deindexed: None,
         private_list: false,
         storage_kept: 0,
+        line_band: None,
+        region_probe: None,
     }
 }
 
@@ -1580,7 +1811,10 @@ fn object_template() -> GraphicsTemplate {
 /// stage's threadgroup size under its own keys and writing each stage's `DispatchRegion` (the
 /// object stage's grid; the mesh stage's grid is the object function's to set); a `drawMeshThreads`
 /// whose threads fill whole object threadgroups launches them, and one that leaves a partial object
-/// threadgroup is not implemented; an object threadgroup Metal draws nothing for launches nothing;
+/// threadgroup launches the threadgroups its threads fill, rounded up, under `MultiRegion` 1 with
+/// Metal's threads and the region flagged `NONUNIFORM`, where the object function runs partial
+/// threadgroups (`RuntimeFact::PartialObjectThreadgroups`), and is not implemented where it does
+/// not; an object threadgroup Metal draws nothing for launches nothing;
 /// and each stage's threadgroup, and the object grid, are checked against the device's limits for
 /// its stage.
 #[test]
@@ -1644,15 +1878,62 @@ fn object_draws_specialize_each_stage_within_its_limits() {
             },
         ]
     );
-    // `drawMeshThreads`: whole object threadgroups only (a probe measured partial ones).
+    // `drawMeshThreads` of whole object threadgroups: `MultiRegion` 0, the region unflagged.
     let cmds = instantiate(&t, &state, &threads([8, 4, 1], [4, 2, 1])).expect("whole");
     assert_eq!(cmds.draw, tasks(2, 2, 1));
-    for partial in [threads([6, 1, 1], [4, 1, 1]), threads([5, 3, 1], [4, 2, 1])] {
+    let multi_region = |c: &DrawCommands| {
+        values(c.specialization.as_ref().expect("a mesh draw's key"))
+            .into_iter()
+            .find(|&(id, _)| id == 8)
+            .map(|(_, v)| v)
+    };
+    assert_eq!(multi_region(&cmds), Some(0));
+    assert_eq!(cmds.push_constants[0].bytes, region([8, 4, 1], [4, 2, 1]));
+    // One that leaves a partial object threadgroup, where the object function runs one: the
+    // threadgroups the threads fill, rounded up, Metal's threads, the region flagged.
+    let mut partial_template = t.clone();
+    if let Some(m) = partial_template.mesh.as_mut() {
+        m.partial_groups = true;
+    }
+    for (draw, groups, grid, lo) in [
+        (
+            threads([6, 1, 1], [4, 1, 1]),
+            [2, 1, 1],
+            [6, 1, 1],
+            [4, 1, 1],
+        ),
+        (
+            threads([5, 3, 1], [4, 2, 1]),
+            [2, 2, 1],
+            [5, 3, 1],
+            [4, 2, 1],
+        ),
+    ] {
+        let cmds = instantiate(&partial_template, &state, &draw).expect("a partial draw");
         assert_eq!(
-            instantiate(&t, &state, &partial).err(),
-            Some(not_implemented(Feature::MeshShading)),
-            "{partial:?}"
+            cmds.draw,
+            tasks(groups[0], groups[1], groups[2]),
+            "{draw:?}"
         );
+        assert_eq!(multi_region(&cmds), Some(1), "{draw:?}");
+        let flagged = crate::lower::dispatch::partial_region_bytes(grid, lo).expect("region");
+        assert_eq!(cmds.push_constants[0].bytes, flagged.to_vec(), "{draw:?}");
+        assert_eq!(
+            &flagged[28..],
+            &crate::lower::dispatch::NONUNIFORM.to_le_bytes(),
+            "{draw:?}"
+        );
+        // Where it does not (a body that holds a workgroup barrier): not implemented.
+        assert_eq!(
+            instantiate(&t, &state, &draw).err(),
+            Some(not_implemented(Feature::MeshShading)),
+            "{draw:?}"
+        );
+    }
+    // A partial draw with an axis of no thread draws nothing, as Metal does, either way.
+    for template in [&t, &partial_template] {
+        let cmds = instantiate(template, &state, &threads([6, 0, 1], [4, 1, 1])).expect("nothing");
+        assert_eq!(cmds.draw, tasks(0, 0, 0));
     }
     // Metal draws nothing: an object threadgroup of no thread or past 1024, as a mesh one.
     for draw in [

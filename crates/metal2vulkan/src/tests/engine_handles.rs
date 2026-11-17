@@ -54,10 +54,11 @@ use crate::pipeline::testing::{
     storage_buffers, typed_module, AssembleError, StatusReach,
 };
 use crate::pipeline::{
-    ComputePipelineDescriptor, FunctionDescriptor, RenderPipelineDescriptor, StageSource,
+    heap_sampler_capacity, ComputePipelineDescriptor, FunctionDescriptor, RenderPipelineDescriptor,
+    StageSource,
 };
 use crate::spirv::interp::{run_with_images, Buffer, Config, Image, Resources};
-use crate::spirv::testing::committed_profiles;
+use crate::spirv::testing::{committed_descriptions, committed_profiles};
 use crate::vk;
 
 const DATALAYOUT: &str = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32";
@@ -776,15 +777,9 @@ declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
     );
 }
 
-/// Two `read_write` argument-buffer textures of one heap class are one array, so a read through one
-/// member and a write through the other may meet at one element out of bounds. Where the device is
-/// left both (`robustImageAccess2`), the class's array is `Volatile` and every group of it says so;
-/// where the shader checks reads and guards writes, none is, and the module passes L3 either way.
-#[test]
-fn a_heap_class_read_and_written_through_two_members_is_volatile() {
-    let Some(bc) = assemble(
-        "heap_rw",
-        r#"%struct.T = type { ptr addrspace(1) }
+/// A kernel reading texel `gid` of one `read_write` argument-buffer texture and writing zero to
+/// the same texel of another, of one heap class.
+const HEAP_RW: &str = r#"%struct.T = type { ptr addrspace(1) }
 %struct.R = type { %struct.T, %struct.T }
 define void @heap_rw(ptr addrspace(2) %r, ptr addrspace(1) %out, i32 %gid) {
   %pa = getelementptr inbounds %struct.R, ptr addrspace(2) %r, i64 0, i32 0, i32 0
@@ -818,8 +813,15 @@ declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float
 !8 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
 !9 = !{i32 2, i32 8, i32 0}
 !10 = !{!"Metal", i32 4, i32 0, i32 0}
-"#,
-    ) else {
+"#;
+
+/// Two `read_write` argument-buffer textures of one heap class are one array, so a read through one
+/// member and a write through the other may meet at one element out of bounds. Where the device is
+/// left both (`robustImageAccess2`), the class's array is `Volatile` and every group of it says so;
+/// where the shader checks reads and guards writes, none is, and the module passes L3 either way.
+#[test]
+fn a_heap_class_read_and_written_through_two_members_is_volatile() {
+    let Some(bc) = assemble("heap_rw", HEAP_RW) else {
         return;
     };
     for (p, volatile) in [(m3(), true), (without_robust_images("moltenvk-m3"), false)] {
@@ -842,6 +844,31 @@ declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float
         assert_eq!(arrays.len(), 1, "one class, one array");
         let want = if volatile { arrays } else { Vec::new() };
         assert_eq!(volatile_ids, want, "{volatile}");
+    }
+}
+
+/// A `read_write` argument-buffer texture's float read and write convert a member the heap views
+/// through its storage choice's alias (`bind::heap::storage_conversions`): on lavapipe, which
+/// stores no 8-bit sRGB format and no `A2R10G10B10`, the search carries each handle's red-blue
+/// order beside its class, and the read's decode of an sRGB member's codes notes
+/// `SrgbTexelDecode` and the write's encode `DevicePackConversion`; on the M3 Max's MoltenVK, which
+/// stores each such format itself, the module converts nothing and notes neither. Each validates.
+#[test]
+fn a_heap_storage_access_converts_the_members_its_heap_views_through_an_alias() {
+    let Some(bc) = assemble("heap_rw", HEAP_RW) else {
+        return;
+    };
+    for (stem, converts) in [("lavapipe", true), ("moltenvk-m3", false)] {
+        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let (plan, _) = typed_module(&bc, "heap_rw", &p).expect("heap_rw");
+        assert_eq!(plan.families.access.heap_red_blue, converts, "{stem}");
+        let a = ok(&bc, "heap_rw", &p);
+        for note in [
+            PrecisionNote::SrgbTexelDecode,
+            PrecisionNote::DevicePackConversion,
+        ] {
+            assert_eq!(a.precision.contains(&note), converts, "{stem} {note:?}");
+        }
     }
 }
 
@@ -1663,11 +1690,35 @@ declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
                 // conversion.
                 let a8 = crate::metal::format::alpha_in_red(crate::metal::PixelFormat::A8Unorm, &p);
                 let alpha = if a8 { 100 } else { 0 };
-                let bound = alpha + if p.fields().leaf.int64 { 1_600 } else { 2_300 };
+                // And a member the heap views through its storage choice's alias converted
+                // (`bind::heap::storage_conversions`): an sRGB member's encode, the device's
+                // conversion, noted, and a blue-first member's exchange.
+                let conversions = crate::bind::heap::storage_conversions(&p);
+                let srgb = conversions.iter().any(|c| {
+                    matches!(
+                        c.class,
+                        crate::pipeline::lower_inputs::StorageImageClass::SrgbEncode
+                            | crate::pipeline::lower_inputs::StorageImageClass::SrgbEncodeBgra
+                    )
+                });
+                assert_eq!(
+                    a.precision
+                        .contains(&crate::pipeline::PrecisionNote::DevicePackConversion),
+                    srgb,
+                    "{stem}"
+                );
+                let converted = if conversions.is_empty() { 0 } else { 700 };
+                // And a 4:4:4 two-plane YCbCr member's write shadow marked under the stage's
+                // `SpecKey::HeapYCbCrWrites` (`memory::handles::FLAG_YCBCR_WRITES`): the flag's
+                // carry and element mask by the constant, and the write's test and select.
+                let ycbcr = 100;
+                let bound =
+                    alpha + converted + ycbcr + if p.fields().leaf.int64 { 1_600 } else { 2_300 };
                 assert!(
                     a.module.words.len() <= bound,
-                    "{stem}: {} words over {bound} (alpha in red {a8})",
-                    a.module.words.len()
+                    "{stem}: {} words over {bound} (alpha in red {a8}, {} conversions)",
+                    a.module.words.len(),
+                    conversions.len()
                 );
                 assert_eq!(uses(&a, "texture.write.heap"), 1, "{stem}");
                 assert_eq!(uses(&a, "texture.query.heap"), 1, "{stem}");
@@ -1727,7 +1778,15 @@ declare void @air.write_texture_2d.{elem}(ptr addrspace(1), <2 x i32>, {ty}, i32
 /// A `half` (or `float`) texel written through an argument buffer's texture is the device's write
 /// on every committed profile: the module declares the one formatless float storage class, and
 /// records `PrecisionNote::DeviceNanEncoding`, since the heap may hold a half-float, 32-bit or
-/// packed small float texture, whose stored NaN is the device's.
+/// packed small float texture, whose stored NaN is the device's; but for a `float` texel on a
+/// profile whose stores of a `float` NaN into the half-float and the packed small float formats
+/// are measured to be Metal's (`DriverDeviation::MetalHalfStorageNans` and
+/// `DriverDeviation::MetalSmallFloatNans`: MoltenVK on the M3 Max's identity). Either texel's note
+/// holds under the families the heap can name (`SpecKey::HeapNanFamilies`; a `half` texel's held
+/// in `tests::engine_extended_range::heap`), never whatever the heap holds: a `float` texel's under
+/// a 16-bit float texture's where the profile lacks `MetalHalfStorageNans` and a packed small
+/// float one's where it lacks `MetalSmallFloatNans`. Either texel requires
+/// `VkProperty::MetalSmallFloatNans` where the profile takes `DriverDeviation::MetalSmallFloatNans`.
 #[test]
 fn a_heap_texel_write_is_the_devices_write() {
     for float in [false, true] {
@@ -1751,10 +1810,48 @@ fn a_heap_texel_write_is_the_devices_write() {
             assert_eq!(classes.len(), 1, "{what}: {classes:?}");
             assert_eq!(classes[0].access, ImageAccess::Storage, "{what}");
             assert_eq!(classes[0].sampled_type, SampledType::Float, "{what}");
-            assert!(
+            let takes = |d| p.takes_driver_deviation(d);
+            let small = takes(crate::error::DriverDeviation::MetalSmallFloatNans);
+            let metal_s =
+                float && small && takes(crate::error::DriverDeviation::MetalHalfStorageNans);
+            assert_eq!(
                 a.precision.contains(&PrecisionNote::DeviceNanEncoding),
+                !metal_s,
                 "{what}: {:?}",
                 a.precision
+            );
+            if float && !metal_s {
+                use crate::bind::heap::{NAN_SIXTEEN, NAN_SMALL};
+                let halves = !takes(crate::error::DriverDeviation::MetalHalfStorageNans);
+                let mut families: Vec<u32> = a
+                    .specialized
+                    .iter()
+                    .filter(|n| n.note == PrecisionNote::DeviceNanEncoding)
+                    .flat_map(|n| &n.when)
+                    .map(|c| match c.all.as_slice() {
+                        [t] if t.key
+                            == crate::pipeline::sym::SpecKey::HeapNanFamilies(Stage::Kernel)
+                            && t.equal
+                            && t.bits == t.mask =>
+                        {
+                            t.mask
+                        }
+                        other => panic!("{what}: a clause of the heap's NaN note: {other:?}"),
+                    })
+                    .collect();
+                families.sort_unstable();
+                let mut want = Vec::new();
+                want.extend(halves.then_some(NAN_SIXTEEN));
+                want.extend((!small).then_some(NAN_SMALL));
+                want.sort_unstable();
+                assert_eq!(families, want, "{what}: {:?}", a.specialized);
+            }
+            assert_eq!(
+                a.requirements
+                    .properties
+                    .contains(&crate::device::requirements::VkProperty::MetalSmallFloatNans),
+                small,
+                "{what}"
             );
             compiled += 1;
         }
@@ -2319,9 +2416,11 @@ declare { <4 x float>, i8 } @air.sample_texture_cube_grad.v4f32(ptr addrspace(1)
     assert!(compiled > 0, "no committed profile has the sampled heap");
 }
 
-/// Several sampler candidates beside a heap texture are not built: a typed refusal.
+/// Several sampler candidates beside a heap texture are a switch-at-use over them, one arm per
+/// runtime sampler slot, each the heap element through that slot's heap sampler binding: the
+/// module compiles and passes L3.
 #[test]
-fn a_selected_sampler_beside_a_heap_texture_is_not_implemented() {
+fn a_selected_sampler_beside_a_heap_texture_is_a_switch() {
     let Some(bc) = assemble(
         "heap_selected_sampler",
         r#"%struct.T = type { ptr addrspace(1) }
@@ -2358,9 +2457,141 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
     ) else {
         return;
     };
-    let u = unsupported(compile(&bc, "heap_selected_sampler", &m3()).expect_err("refused"));
-    assert_eq!(u.feature, Feature::ArgumentBufferTextures);
-    assert_eq!(u.needs, Needs::NotImplemented);
+    let p = m3();
+    let a = compile(&bc, "heap_selected_sampler", &p).unwrap_or_else(|e| panic!("{e}"));
+    link_and_validate(&a, &p).unwrap_or_else(|e| panic!("L3: {e}"));
+}
+
+/// The words of a constexpr sampler in normalized coordinates, every axis addressed by `address`
+/// (1 clamp to edge, 2 repeat, 3 mirrored repeat), minification and magnification `filter` (0
+/// nearest, 1 linear), no mip filter, with the fields Apple's compiler writes for the rest (as
+/// `LINEAR_EDGE`'s).
+pub(super) const fn chosen_sampler(address: u64, filter: u64) -> u64 {
+    0x007b_ff00_0008_0000 | address | address << 3 | address << 6 | filter << 9 | filter << 11
+}
+
+/// The constexpr samplers [`chosen_sampler_kernel`] lists, in order: nearest clamped to the edge,
+/// nearest repeating, and linear mirrored (whose sample reads one texel where the others' do not).
+pub(super) const CHOSEN_SAMPLERS: [u64; 3] = [
+    chosen_sampler(1, 0),
+    chosen_sampler(2, 0),
+    chosen_sampler(3, 1),
+];
+
+/// A kernel `chosen` that samples the `texture2d<float>` its argument buffer (buffer 0) holds at
+/// level 0 and `(1.375, 0.5)` through the constexpr sampler its lane `gid` chooses,
+/// `pick[gid % pick.len()]` (indices of [`CHOSEN_SAMPLERS`], each a constexpr sampler of the
+/// module, listed in order), adds the sample through sampler `direct` alone where it names one, and
+/// writes the sum to buffer 1's lane `gid` (a `float4`).
+pub(super) fn chosen_sampler_kernel(pick: &[usize], direct: Option<usize>) -> String {
+    let call = |s: &str| {
+        format!(
+            "call {{ <4 x float>, i8 }} @air.sample_texture_2d.v4f32(ptr addrspace(1) %t, ptr addrspace(2) {s}, <2 x float> <float 1.375, float 0.5>, i1 true, <2 x i32> zeroinitializer, i1 true, float 0.0, float 0.0, i32 0)"
+        )
+    };
+    let n = pick.len();
+    let mut choose = format!("  %sel = urem i32 %gid, {n}\n");
+    let mut chosen = format!("@s{}", pick[n - 1]);
+    for (k, s) in pick[..n - 1].iter().enumerate().rev() {
+        choose += &format!(
+            "  %c{k} = icmp eq i32 %sel, {k}\n  %p{k} = select i1 %c{k}, ptr addrspace(2) @s{s}, ptr addrspace(2) {chosen}\n"
+        );
+        chosen = format!("%p{k}");
+    }
+    let sum = match direct {
+        Some(d) => format!(
+            "  %dr = {}\n  %dv = extractvalue {{ <4 x float>, i8 }} %dr, 0\n  %y = fadd <4 x float> %v, %dv\n",
+            call(&format!("@s{d}"))
+        ),
+        None => "  %y = fadd <4 x float> %v, zeroinitializer\n".to_string(),
+    };
+    let globals: String = (CHOSEN_SAMPLERS.iter().enumerate())
+        .map(|(i, w)| {
+            format!("@s{i} = internal addrspace(2) constant [2 x i64] [i64 {w}, i64 0], align 8\n")
+        })
+        .collect();
+    let states: String = (0..CHOSEN_SAMPLERS.len())
+        .map(|i| {
+            format!(
+                "!{} = !{{!\"air.sampler_state\", ptr addrspace(2) @s{i}}}\n",
+                20 + i
+            )
+        })
+        .collect();
+    format!(
+        r#"%struct.M = type {{ ptr addrspace(1) }}
+{globals}
+define void @chosen(ptr addrspace(2) %m, ptr addrspace(1) %out, i32 %gid) {{
+  %pt = getelementptr inbounds %struct.M, ptr addrspace(2) %m, i64 0, i32 0
+  %t = load ptr addrspace(1), ptr addrspace(2) %pt, align 8
+{choose}  %r = {}
+  %v = extractvalue {{ <4 x float>, i8 }} %r, 0
+{sum}  %o = getelementptr inbounds <4 x float>, ptr addrspace(1) %out, i32 %gid
+  store <4 x float> %y, ptr addrspace(1) %o, align 16
+  ret void
+}}
+declare {{ <4 x float>, i8 }} @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+!air.kernel = !{{!0}}
+!air.version = !{{!11}}
+!air.language_version = !{{!12}}
+!air.sampler_states = !{{!20, !21, !22}}
+!0 = !{{ptr @chosen, !1, !2}}
+!1 = !{{}}
+!2 = !{{!3, !6, !8}}
+!3 = !{{i32 0, !"air.indirect_buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !4, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"M", !"air.arg_name", !"m"}}
+!4 = !{{i32 0, i32 8, i32 0, !"texture2d<float, sample>", !"t", !"air.indirect_argument", !5}}
+!5 = !{{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t"}}
+!6 = !{{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}}
+!8 = !{{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}}
+!11 = !{{i32 2, i32 8, i32 0}}
+!12 = !{{!"Metal", i32 4, i32 0, i32 0}}
+{states}"#,
+        call(&chosen)
+    )
+}
+
+/// Constexpr samplers of consecutive handles that a lane chooses among beside a heap texture, nearest
+/// and linear, are one sampling through a set-0 array of their samplers
+/// (`ResourceKind::SamplerArray`, one element per candidate), indexed by the handle: one sampled
+/// image, where a switch over them makes one per candidate. Where the handles are not consecutive (a constexpr sampler between them sampled
+/// through apart), the switch stays: a sampled image per candidate and one for the sample apart.
+/// Every profile with the sampled heap compiles both and passes L3.
+#[test]
+fn chosen_constexpr_samplers_beside_a_heap_texture_are_one_sampler_array() {
+    let (Some(array), Some(apart)) = (
+        assemble("chosen_samplers", &chosen_sampler_kernel(&[0, 1, 2], None)),
+        assemble(
+            "chosen_samplers_apart",
+            &chosen_sampler_kernel(&[0, 2], Some(1)),
+        ),
+    ) else {
+        return;
+    };
+    let arrays = |a: &FunctionArtifact| -> Vec<u32> {
+        (a.interface.descriptors.iter())
+            .filter(|d| matches!(d.slot.kind, ResourceKind::SamplerArray { .. }))
+            .map(|d| d.count)
+            .collect()
+    };
+    let mut compiled = 0;
+    for (stem, p) in committed_profiles().expect("profiles") {
+        if !has_sampled_heap(&p) {
+            continue;
+        }
+        let a = compile(&array, "chosen", &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
+        link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem}: L3: {e}"));
+        assert_eq!(arrays(&a), vec![3], "{stem}");
+        assert_eq!(uses(&a, "sampler.sampler_array.sample"), 1, "{stem}");
+        assert_eq!(count(&a, OP_SAMPLED_IMAGE), 1, "{stem}");
+        assert!(heap_samplers(&a).is_empty(), "{stem}");
+        let b = compile(&apart, "chosen", &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
+        link_and_validate(&b, &p).unwrap_or_else(|e| panic!("{stem}: L3: {e}"));
+        assert!(arrays(&b).is_empty(), "{stem}");
+        assert_eq!(uses(&b, "sampler.sampler_array.sample"), 0, "{stem}");
+        assert_eq!(count(&b, OP_SAMPLED_IMAGE), 3, "{stem}");
+        compiled += 1;
+    }
+    assert!(compiled > 0, "no committed profile has the sampled heap");
 }
 
 /// A kernel that writes a slice of its explicit imageblock (one `elem` field per cell, `lanes`
@@ -2779,9 +3010,12 @@ define void @k(ptr addrspace(2) %m, ptr addrspace(1) %out{param}, i32 %gid) {{
 }
 
 /// A heap texture's linear sample, through a constexpr sampler of linear filters (2D and 3D), a
-/// runtime sampler slot, or the sampler its argument buffer holds, is the device's sample, with no
-/// filter note; the census names the sample by its source, and the module states no `TexelFormat`
-/// specialization. A 2D sample through a constexpr or runtime sampler also emulates a raw-held
+/// runtime sampler slot, or the sampler its argument buffer holds, is the device's sample; the
+/// census names the sample by its source, and the module states no `TexelFormat`
+/// specialization. On a profile that samples through Metal's own sampler a 2D sample records the
+/// filter note only under what the command's handles can name (a two-plane YCbCr texture,
+/// `SpecKey::HeapYCbCrTextures`), never outright; a 3D one, whose class holds no two-plane
+/// texture, records none. A 2D sample through a constexpr or runtime sampler also emulates a raw-held
 /// texture's, in a branch on the class the handle carries (the search's flagged form, whose masks
 /// and table the census counts under `HEAP_CLASS_CENSUS`). Each validates; a profile without the
 /// sampled heap refuses each. (The interpreter models no sample; the runtime lane
@@ -2817,16 +3051,12 @@ fn heap_linear_samples_are_the_device_s() {
             };
             link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
             assert_eq!(count(&a, OP_IMAGE_SAMPLE_EXPLICIT_LOD), 1, "{what}");
-            // An argument buffer's sampler also fetches the texel where its word states an exact
-            // fetch.
+            // An argument buffer's sampler's sample reads its texel's centre where its word states
+            // a nearest pixel sampler: no fetch.
             let argument = matches!(through, CompareThrough::Argument);
             // The raw-held emulation: four filtered taps and a nearest one from the twin.
             let raw = !three && !argument;
-            assert_eq!(
-                count(&a, OP_IMAGE_FETCH),
-                usize::from(argument) + 5 * usize::from(raw),
-                "{what}"
-            );
+            assert_eq!(count(&a, OP_IMAGE_FETCH), 5 * usize::from(raw), "{what}");
             assert_eq!(count(&a, OP_SAMPLED_IMAGE), 1, "{what}");
             assert_eq!(
                 a.strategies.entries.contains_key(HEAP_CLASS_CENSUS),
@@ -2843,10 +3073,21 @@ fn heap_linear_samples_are_the_device_s() {
                 raw,
                 "{what}"
             );
-            assert!(
-                !a.precision.contains(&PrecisionNote::FloatSampleFilter),
+            let filter = PrecisionNote::FloatSampleFilter;
+            assert_eq!(
+                a.precision.contains(&filter),
+                !three && metal_sampler(&p),
                 "{what}"
             );
+            let clauses: Vec<_> = (a.specialized.iter())
+                .filter(|s| s.note == filter)
+                .flat_map(|s| &s.when)
+                .collect();
+            assert_eq!(clauses.is_empty(), three || !metal_sampler(&p), "{what}");
+            for c in clauses {
+                let heap = SpecKey::HeapYCbCrTextures(crate::pipeline::sym::Stage::Kernel);
+                assert!(c.all.iter().any(|t| t.key == heap), "{what}: {c:?}");
+            }
             assert!(
                 !a.interface
                     .read_keys()
@@ -2969,8 +3210,9 @@ fn heap_half_texels_convert_by_the_handle_s_class() {
 }
 
 /// A heap texture's plain gather, and its nearest sample through a constexpr sampler, a runtime
-/// sampler or an argument buffer's sampler, are the device's access, made once; an argument
-/// buffer's sampler's sample keeps its fetch. Through a constexpr or runtime sampler the raw-held
+/// sampler or an argument buffer's sampler, are the device's access, made once, with no fetch of
+/// their own (an argument buffer's sampler's sample reads its texel's centre where its word states
+/// a nearest pixel sampler). Through a constexpr or runtime sampler the raw-held
 /// emulation fetches from the twin in a branch on the class the handle carries. The module states
 /// no `TexelFormat` specialization.
 #[test]
@@ -3012,8 +3254,6 @@ fn heap_gathers_and_nearest_samples_are_the_device_s() {
                 OP_IMAGE_SAMPLE_EXPLICIT_LOD
             };
             assert_eq!(count(&a, device), 1, "{what}");
-            // The fetch of an argument buffer's sampler's sample.
-            let exact = usize::from(argument && !gather);
             // Through a constexpr or runtime sampler, the raw-held emulation's fetches from the
             // twin: a gather's four, a nearest sample's one, a runtime sampler's four filtered and
             // one nearest.
@@ -3024,7 +3264,7 @@ fn heap_gathers_and_nearest_samples_are_the_device_s() {
                 (true, false, false) => 1,
                 (true, false, true) => 5,
             };
-            assert_eq!(count(&a, OP_IMAGE_FETCH), exact + twin, "{what}");
+            assert_eq!(count(&a, OP_IMAGE_FETCH), twin, "{what}");
             assert_eq!(count(&a, OP_SAMPLED_IMAGE), 1, "{what}");
             assert_eq!(
                 a.strategies.entries.contains_key(HEAP_CLASS_CENSUS),
@@ -3688,8 +3928,8 @@ fn an_indirect_command_object_members_bytes_are_never_data() {
 /// first run-time dereference is `ArgumentBufferObjects`, not implemented, on every committed
 /// profile: the escaped address read back through `inttoptr` or through memory, and every
 /// dereference of the loaded pointer member (a word of its object, the handle at its field, and its
-/// data alike). A pointer kept in a forwarding cell keeps its root, so its access is refused by the
-/// rule itself. The other five compiled on the nine profiles with device addresses before this
+/// data alike). A pointer kept in a forwarding cell (written twice: one store's value is read
+/// directly, `canon::forward`) keeps its root, so its access is refused by the rule itself. The other five compiled on the nine profiles with device addresses before this
 /// rule.
 #[test]
 fn an_object_buffers_address_as_data_refuses_every_run_time_dereference() {
@@ -3697,7 +3937,7 @@ fn an_object_buffers_address_as_data_refuses_every_run_time_dereference() {
     let escaped = [
         ("round_trip", format!("  %a = ptrtoint ptr addrspace(1) %ab to i64\n  %b = add i64 %a, 8\n  %p = inttoptr i64 %b to ptr addrspace(1)\n  %w = load i64, ptr addrspace(1) %p, align 8\n{word_out}"), 3),
         ("through_memory", format!("  %o1 = getelementptr inbounds i64, ptr addrspace(1) %out, i64 1\n  store ptr addrspace(1) %ab, ptr addrspace(1) %o1, align 8\n  %q = load ptr addrspace(1), ptr addrspace(1) %o1, align 8\n  %pp = getelementptr inbounds i8, ptr addrspace(1) %q, i64 8\n  %w = load i64, ptr addrspace(1) %pp, align 8\n{word_out}"), 4),
-        ("through_cell", format!("  %cell = alloca ptr addrspace(1), align 8\n  store ptr addrspace(1) %ab, ptr %cell, align 8\n  %q = load ptr addrspace(1), ptr %cell, align 8\n  %pp = getelementptr inbounds i8, ptr addrspace(1) %q, i64 8\n  %w = load i64, ptr addrspace(1) %pp, align 8\n{word_out}"), 4),
+        ("through_cell", format!("  %cell = alloca ptr addrspace(1), align 8\n  store ptr addrspace(1) %ab, ptr %cell, align 8\n  store ptr addrspace(1) %ab, ptr %cell, align 8\n  %q = load ptr addrspace(1), ptr %cell, align 8\n  %pp = getelementptr inbounds i8, ptr addrspace(1) %q, i64 8\n  %w = load i64, ptr addrspace(1) %pp, align 8\n{word_out}"), 5),
     ];
     for (entry, body, at) in escaped {
         let Some(bc) = assemble(entry, &pipeline_members_kernel(entry, 1, &body, "")) else {
@@ -4239,10 +4479,11 @@ fn is_sampler_table(k: &ResourceKind) -> bool {
 /// its use; every access in the sampler's coordinates carries the argument buffer's
 /// pixel-coordinate near-equivalent (`ArgumentPixelSamplerScaling`; never `PixelSamplerScaling`),
 /// a comparison or an integer texel samples through its own use, and a fragment samples at its
-/// implicit level. A sample without comparison also fetches the texel the rule names, which the
-/// sampler's word selects; no access reads a texel's centre (no test of the word's filters beside
-/// its coordinates, `SamplerWord::PIXEL_COORDINATES | SamplerWord::MIN_LINEAR |
-/// SamplerWord::MAG_LINEAR`). A profile without the heap's features refuses each naming them.
+/// implicit level. Each sample reads its texel's centre where the sampler's word states a nearest
+/// pixel sampler of one isotropic level (its test of the word's coordinates, filters, mip filter
+/// and anisotropy, `SamplerWord::nearest_pixel`; an integer texel's leaves out the filters, which
+/// it reads nearest whatever they say) and fetches nothing. A profile without the heap's features
+/// refuses each naming them.
 #[test]
 fn argument_buffer_samplers_are_heap_lookups() {
     let Some(bc) = argument_samplers_fixture() else {
@@ -4306,7 +4547,6 @@ fn argument_buffer_samplers_are_heap_lookups() {
             );
             assert!(texture_slots(&a).is_empty(), "{stem} {entry}");
             assert!(heap_samplers(&a).is_empty(), "{stem} {entry}");
-            let compare = use_.0;
             assert_eq!(sampler_arrays(&a), [use_], "{stem} {entry}");
             let tables = bindings_of(&t, is_sampler_table);
             assert_eq!(tables.len(), 1, "{stem} {entry}");
@@ -4329,14 +4569,9 @@ fn argument_buffer_samplers_are_heap_lookups() {
             );
             assert_eq!(count(&a, OP_SWITCH), 0, "{stem} {entry}");
             // Non-uniform: the image's element and the sampler's (chain and load each), their
-            // sampled image, the image the pixel-coordinate scaling queries, and (without
-            // comparison) the image the flagged fetch reads.
-            assert_eq!(
-                count(&a, OP_IMAGE_FETCH),
-                usize::from(!compare),
-                "{stem} {entry}"
-            );
-            assert_eq!(non_uniform(&a), 6 + usize::from(!compare), "{stem} {entry}");
+            // sampled image, and the image the pixel-coordinate scaling queries.
+            assert_eq!(count(&a, OP_IMAGE_FETCH), 0, "{stem} {entry}");
+            assert_eq!(non_uniform(&a), 6, "{stem} {entry}");
             assert!(
                 a.precision
                     .contains(&PrecisionNote::ArgumentPixelSamplerScaling),
@@ -4346,16 +4581,92 @@ fn argument_buffer_samplers_are_heap_lookups() {
                 !a.precision.contains(&PrecisionNote::PixelSamplerScaling),
                 "{stem} {entry}"
             );
-            // No texel centre: no mask of the word's coordinates and filters.
-            let centre =
-                SamplerWord::PIXEL_COORDINATES | SamplerWord::MIN_LINEAR | SamplerWord::MAG_LINEAR;
+            // The texel centre's test of the word's nearest pixel sampler.
+            let centre = SamplerWord::nearest_pixel(use_.1);
             assert!(
-                !u32_constants(&a).contains(&centre),
-                "{stem} {entry}: a test of the word's nearest pixel sampler"
+                u32_constants(&a).contains(&centre),
+                "{stem} {entry}: no test of the word's nearest pixel sampler"
             );
             compiled += 1;
         }
         assert!(compiled > 0, "{entry}: no committed profile has its heap");
+    }
+}
+
+/// A kernel reading a texture and its sampler from an argument buffer has one set-1 sampler
+/// array, of `heap_sampler_capacity` elements, on every committed profile that compiles it: the
+/// handle table's 65536 where the update-after-bind sampler limits pass it (MoltenVK's 500000,
+/// lavapipe's, NVIDIA's), the per-stage limit's 16 on the desktop baseline. On the M3's profile
+/// with its per-stage update-after-bind sampler limit lowered to 100, or its set's to 200, the
+/// array and the answer follow it. A profile that refuses the kernel answers 0, and so does the
+/// M3's without `descriptorBindingPartiallyBound` or `shaderSampledImageArrayNonUniformIndexing`,
+/// which refuses it.
+#[test]
+fn an_argument_sampler_array_has_the_heap_sampler_capacity() {
+    let Some(bc) = argument_samplers_fixture() else {
+        return;
+    };
+    let library = Library::from_air(&bc).expect("library");
+    // The answer on `desc`, and the element count of the kernel's set-1 sampler array or the
+    // kernel's refusal.
+    let array = |desc: DeviceDescription| -> (u32, Result<u32, Error>) {
+        let dev = Device::new(desc, DevicePolicy::default()).expect("device");
+        let f = library.function("argument_sampler_sample").expect("entry");
+        let d = ComputePipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(f)));
+        let count = dev
+            .compile_compute_pipeline(&d, &Budget::standard())
+            .map(|pipe| {
+                let samplers: Vec<u32> = (pipe.layout.sets.iter())
+                    .filter(|set| set.set == 1)
+                    .flat_map(|set| &set.bindings)
+                    .filter(|b| b.ty == vk::DescriptorType::SAMPLER)
+                    .map(|b| b.count)
+                    .collect();
+                assert_eq!(samplers.len(), 1, "one set-1 sampler array: {samplers:?}");
+                samplers[0]
+            });
+        (heap_sampler_capacity(dev.profile()), count)
+    };
+    let mut compiled = Vec::new();
+    for (stem, desc) in committed_descriptions().expect("descriptions") {
+        match array(desc.clone()) {
+            (capacity, Ok(count)) => {
+                assert_eq!(count, capacity, "{stem}");
+                compiled.push((stem.as_str(), count));
+            }
+            (capacity, Err(e)) => assert_eq!(capacity, 0, "{stem}: refused ({e})"),
+        }
+    }
+    eprintln!("set-1 sampler arrays: {compiled:?}");
+    for stem in ["moltenvk-m3", "lavapipe", "nvidia-rtx5080-laptop"] {
+        assert!(compiled.contains(&(stem, 65536)), "{stem}: {compiled:?}");
+    }
+    assert!(compiled.contains(&("lunarg-desktop-baseline-2023", 16)));
+    let m3 = || {
+        (committed_descriptions().expect("descriptions").iter())
+            .find(|(stem, _)| stem == "moltenvk-m3")
+            .map(|(_, desc)| desc.clone())
+            .expect("moltenvk-m3")
+    };
+    let mut stage = m3();
+    stage
+        .limits
+        .max_per_stage_descriptor_update_after_bind_samplers = 100;
+    let (capacity, count) = array(stage);
+    assert_eq!((capacity, count.ok()), (100, Some(100)), "per stage");
+    let mut set = m3();
+    set.limits.max_descriptor_set_update_after_bind_samplers = 200;
+    let (capacity, count) = array(set);
+    assert_eq!((capacity, count.ok()), (200, Some(200)), "per set");
+    for lacking in [
+        VkFeature::DescriptorBindingPartiallyBound,
+        VkFeature::ShaderSampledImageArrayNonUniformIndexing,
+    ] {
+        let mut desc = m3();
+        desc.features.remove(&lacking);
+        let (capacity, count) = array(desc);
+        assert_eq!(capacity, 0, "{lacking:?}");
+        assert!(count.is_err(), "{lacking:?}: {count:?}");
     }
 }
 

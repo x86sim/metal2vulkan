@@ -225,6 +225,7 @@ fn derive_fields(
         zero_initialize_workgroup_memory: has(VkFeature::ShaderZeroInitializeWorkgroupMemory),
         fma32: has(VkFeature::ShaderFmaFloat32),
         fma16: has(VkFeature::ShaderFmaFloat16),
+        float8: has(VkFeature::ShaderFloat8),
     };
     let images = ImageCaps {
         storage_read_without_format: has(VkFeature::ShaderStorageImageReadWithoutFormat),
@@ -259,6 +260,12 @@ fn derive_fields(
         ),
         update_after_bind_storage_buffer: has(
             VkFeature::DescriptorBindingStorageBufferUpdateAfterBind,
+        ),
+        update_after_bind_uniform_texel_buffer: has(
+            VkFeature::DescriptorBindingUniformTexelBufferUpdateAfterBind,
+        ),
+        update_after_bind_storage_texel_buffer: has(
+            VkFeature::DescriptorBindingStorageTexelBufferUpdateAfterBind,
         ),
         update_unused_while_pending: has(VkFeature::DescriptorBindingUpdateUnusedWhilePending),
         non_uniform_sampled_image: has(VkFeature::ShaderSampledImageArrayNonUniformIndexing),
@@ -346,6 +353,7 @@ fn derive_fields(
             desc.device_type,
             Some(vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::CPU)
         ),
+        ycbcr_in_place_reads: policy.ycbcr_in_place_reads,
         // The device's measured value, keyed on its identity as the workarounds are, or the floor.
         function_storage: function_storage::of(desc),
         // The measured deviations, one per pipeline kind; unmeasured, Vulkan's rule, the device's
@@ -406,11 +414,19 @@ fn by_identity(desc: &DeviceDescription) -> Vec<DriverWorkaround> {
             }
             found
         }
-        // A register allocator that faults compiling a module past a word bound, on every GPU it
+        // An `f32` operation fused into the conversion of its result to `half`, on every GPU it
         // drives.
-        Some(vk::DriverId::INTEL_OPEN_SOURCE_MESA) => {
-            vec![DriverWorkaround::RegisterAllocatorOverflowsLargeModules]
-        }
+        Some(vk::DriverId::MESA_RADV) => vec![DriverWorkaround::HalfConversionFusedWithArithmetic],
+        // A register allocator that faults compiling a module past a word bound, products of one
+        // value by zeros of opposite sign kept as one, a stage past 2^20 objects of its
+        // serialized form corrupted, and a compiler whose memory outgrows the stage, on every GPU
+        // it drives.
+        Some(vk::DriverId::INTEL_OPEN_SOURCE_MESA) => vec![
+            DriverWorkaround::RegisterAllocatorOverflowsLargeModules,
+            DriverWorkaround::OppositeZeroProductsMerged,
+            DriverWorkaround::SerializedStageWrapsLargeModules,
+            DriverWorkaround::CompilerMemoryGrowsWithStageSize,
+        ],
         _ => Vec::new(),
     }
 }
@@ -661,6 +677,9 @@ fn enabled_caps(desc: &DeviceDescription, deviations: &BTreeSet<DriverDeviation>
             properties.insert(VkProperty::RequiredSubgroupSizeStage(stage));
         }
     }
+    if sg.supported_stages.contains(vk::ShaderStageFlags::GEOMETRY) {
+        properties.insert(VkProperty::SubgroupGeometryStage);
+    }
     for op in SUBGROUP_OPS {
         if OpBits(sg.supported_operations.as_raw()).contains(OpBits::of(op)) {
             properties.insert(VkProperty::SubgroupOperation(op));
@@ -722,6 +741,8 @@ fn enabled_caps(desc: &DeviceDescription, deviations: &BTreeSet<DriverDeviation>
     // Where `InterpolateAtOffset` reads, and the measured deviations.
     if desc.interpolates_at_offset_centered() {
         properties.insert(VkProperty::InterpolateAtOffsetCentered);
+    } else {
+        properties.insert(VkProperty::InterpolateAtOffsetFromSevenSixteenths);
     }
     if deviations.contains(&DriverDeviation::SimdgroupLockstep) {
         properties.insert(VkProperty::SimdgroupLockstep);
@@ -737,9 +758,6 @@ fn enabled_caps(desc: &DeviceDescription, deviations: &BTreeSet<DriverDeviation>
     }
     if deviations.contains(&DriverDeviation::MetalFloatColorNans) {
         properties.insert(VkProperty::MetalFloatColorNans);
-    }
-    if deviations.contains(&DriverDeviation::MetalHalfColorNans) {
-        properties.insert(VkProperty::MetalHalfColorNans);
     }
     if deviations.contains(&DriverDeviation::MetalHalfFma) {
         properties.insert(VkProperty::MetalHalfFma);
@@ -807,11 +825,20 @@ fn enabled_caps(desc: &DeviceDescription, deviations: &BTreeSet<DriverDeviation>
     if deviations.contains(&DriverDeviation::MetalAlphaCoverage) {
         properties.insert(VkProperty::MetalAlphaCoverage);
     }
-    if desc
-        .driver_facts()
-        .contains(&crate::device::DriverFact::DepthImageKeepsValuesOutsideUnitRange)
-    {
-        properties.insert(VkProperty::DepthImageKeepsValuesOutsideUnitRange);
+    if deviations.contains(&DriverDeviation::MetalNanMoves) {
+        properties.insert(VkProperty::MetalNanMoves);
+    }
+    if deviations.contains(&DriverDeviation::MetalPackConversions) {
+        properties.insert(VkProperty::MetalPackConversions);
+    }
+    if deviations.contains(&DriverDeviation::MetalHalfConversion) {
+        properties.insert(VkProperty::MetalHalfConversion);
+    }
+    if deviations.contains(&DriverDeviation::MetalSmallFloatNans) {
+        properties.insert(VkProperty::MetalSmallFloatNans);
+    }
+    if deviations.contains(&DriverDeviation::MetalUnaryDenormals) {
+        properties.insert(VkProperty::MetalUnaryDenormals);
     }
     let l = &desc.limits;
     let sample_counts: [(vk::SampleCountFlags, fn(u32) -> VkProperty); 6] = [

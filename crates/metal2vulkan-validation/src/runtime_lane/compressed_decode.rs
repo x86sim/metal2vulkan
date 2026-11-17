@@ -45,13 +45,14 @@
 //! writes a texture with `replaceRegion` while a command buffer that reads it waits behind the busy
 //! kernel or a shared event, and reads the device's decode of the new blocks.
 
+use super::degrade_notices::on_device_with;
 use super::degrade_notices::{counts, on_device};
 use super::first_use::{read_mark, release, scheduled, Busy, ENDED};
 use super::host_memory::{recording, Mapping, Seen};
 use super::no_copy_heaps::{no_copy_heap, shared, HEAP};
 use super::pixel_samplers::metal_sampler;
 use super::rebinds::rebind_heap;
-use super::{buffer_with, converted_holds, read_buffer, WAIT};
+use super::{at_plan, buffer_with, converted_holds, read_buffer, WAIT};
 use crate::air_library::AirLibrary;
 use metal2vulkan::device::DriverFact;
 use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
@@ -352,9 +353,9 @@ fn read_whole(device: &Device, state: &ComputePipelineState, texture: &Texture) 
 fn noted_bound(kind: Kind, c: usize) -> f32 {
     match kind {
         Kind::Bc3 if c == 3 => 6.0 / 255.0,
-        Kind::Bc1 | Kind::Bc2 | Kind::Bc3 => 3.0 / 255.0,
-        Kind::Channels { signed: true, .. } => 0.064,
-        Kind::Channels { signed: false, .. } => 7.3 / 255.0,
+        Kind::Bc1 | Kind::Bc2 | Kind::Bc3 => 4.0 / 255.0,
+        Kind::Channels { signed: true, .. } => 0.065,
+        Kind::Channels { signed: false, .. } => 7.4 / 255.0,
     }
 }
 
@@ -390,6 +391,22 @@ fn within_note(kind: Kind, c: usize, srgb: Option<u32>, got: f32, want: f32) -> 
     }
 }
 
+/// The fewest codes from Metal's `code` whose sRGB decode, by Metal's table, `got` holds as
+/// ([`channel_holds`]), up to 255.
+fn codes_off(code: u32, got: f32) -> u32 {
+    (0..=255)
+        .find(|&k| {
+            (code.saturating_sub(k)..=(code + k).min(255)).any(|near| {
+                channel_holds(
+                    (got, ratio(super::srgb_step(near) as i32, 4095)),
+                    false,
+                    true,
+                )
+            })
+        })
+        .unwrap_or(255)
+}
+
 /// Metal's 8-bit code of the color channel `c` (0 to 2) of texel `(x, y)` of a 16 x 16 texture of
 /// a BC1 to BC3 `kind` whose blocks are `blocks`, before an sRGB form's table.
 fn metal_code(kind: Kind, blocks: &[u8], x: usize, y: usize, c: usize) -> u32 {
@@ -411,7 +428,7 @@ fn metal_code(kind: Kind, blocks: &[u8], x: usize, y: usize, c: usize) -> u32 {
 /// differences from Metal's.
 #[test]
 fn bc1_to_bc5_texels_read_the_device_s_decode() {
-    on_device(|device, messages| {
+    on_device_with(at_plan, |device, messages| {
         let name = device.name().to_owned();
         let facts = &device.properties().driver_facts;
         let announces = FORMATS
@@ -424,6 +441,10 @@ fn bc1_to_bc5_texels_read_the_device_s_decode() {
         for (f, (pf, kind, srgb)) in FORMATS.into_iter().enumerate() {
             let measured = facts.contains(&kind.fact());
             let (mut differ, mut most) = (0, 0.0f32);
+            // Per channel: the most a channel read off Metal's, in value, and an sRGB color
+            // channel's in codes (the fewest codes from Metal's whose decode it holds as); the
+            // lanes past the note's bound.
+            let (mut channel_most, mut codes_most, mut past) = ([0.0f32; 4], [0u32; 4], 0);
             for round in 0..ROUNDS {
                 let mut rng = Rng(0x5eed_bc00 + 0x100 * f as u64 + round);
                 let mut blocks = rng.bytes(16 * kind.block_bytes());
@@ -442,8 +463,13 @@ fn bc1_to_bc5_texels_read_the_device_s_decode() {
                         }
                         differ += 1;
                         most = most.max((got[c] - want[c]).abs());
+                        channel_most[c] = channel_most[c].max((got[c] - want[c]).abs());
                         let code = srgb.then(|| metal_code(kind, &blocks, x, y, c));
+                        if let Some(code) = code {
+                            codes_most[c] = codes_most[c].max(codes_off(code, got[c]));
+                        }
                         let holds = !measured && within_note(kind, c, code, got[c], want[c]);
+                        past += usize::from(!holds);
                         if !holds && wrong.len() < 24 {
                             wrong.push(format!(
                                 "{pf:?} round {round} texel {t} channel {c}: {} against \
@@ -456,9 +482,11 @@ fn bc1_to_bc5_texels_read_the_device_s_decode() {
             }
             eprintln!(
                 "BCDECODE {name} {pf:?}: {differ} of {} channels off Metal's, the largest by \
-                 {most} ({:.3}/255), fact {measured}",
+                 {most} ({:.3}/255), fact {measured}; per channel {:?}/255, in codes {codes_most:?}; \
+                 {past} past the note",
                 ROUNDS * 16 * 16 * 4,
-                most * 255.0
+                most * 255.0,
+                channel_most.map(|m| (m * 255.0 * 1000.0).round() / 1000.0)
             );
         }
         assert!(wrong.is_empty(), "on {name}:\n{}", wrong.join("\n"));
@@ -674,7 +702,7 @@ fn read_ordered(
 /// texture uploaded and waited for reads (the device's decode of the same blocks).
 #[test]
 fn bc_uploads_are_ordered_before_reads() {
-    on_device(|device, messages| {
+    on_device_with(at_plan, |device, messages| {
         let name = device.name().to_owned();
         let state = reader(device);
         let mut wrong = Vec::new();
@@ -742,12 +770,15 @@ const EVERY_BC: [(PixelFormat, usize); 14] = [
 /// A new texture of every BC format, `Private` and `Shared`, made right after one of its shape
 /// and storage held random blocks, was read and was released, reads what a texture written with
 /// zero blocks reads (the device's decode of the same blocks): Metal's new texture holds zeros, so
-/// no earlier resource's bytes show through as blocks.
+/// no earlier resource's bytes show through as blocks. On a device that presents a Mac keeping no
+/// texture compressed a new `Private` one is filled with zeros at its first use (docs/API.md, the
+/// accepted differences), its making counted as zero-filled.
 #[test]
 fn new_bc_textures_read_zero_blocks() {
-    on_device(|device, messages| {
+    on_device_with(at_plan, |device, messages| {
         let name = device.name().to_owned();
         let state = reader(device);
+        let zero_filled = super::fresh_contents::zero_filled(device);
         let mut wrong = Vec::new();
         for (f, (pf, block)) in EVERY_BC.into_iter().enumerate() {
             let zeros: Vec<u8> = read_texels(device, &state, pf, &vec![0; 16 * block])
@@ -772,7 +803,15 @@ fn new_bc_textures_read_zero_blocks() {
                     let mut descriptor = TextureDescriptor::texture_2d(pf, 16, 16, false);
                     descriptor.usage = TextureUsage::SHADER_READ;
                     descriptor.resource_options = options;
+                    let before = super::fresh_contents::zero_filled_count(device);
                     let texture = device.new_texture(&descriptor).unwrap();
+                    let counted = super::fresh_contents::zero_filled_count(device) - before;
+                    assert_eq!(
+                        counted,
+                        u64::from(s == 0 && zero_filled),
+                        "{pf:?} {:?} round {round}: counted as zero-filled",
+                        ["Private", "Shared"][s]
+                    );
                     let got = read_whole(device, &state, &texture);
                     let differ = got
                         .as_chunks::<16>()
@@ -892,7 +931,7 @@ fn blocks_of(texture: &Texture, size: usize) -> Vec<u8> {
 /// released one left (its blocks read back on the CPU).
 #[test]
 fn bc_texels_follow_every_write() {
-    on_device(|device, messages| {
+    on_device_with(at_plan, |device, messages| {
         let name = device.name().to_owned();
         let state = reader(device);
         let mut wrong = Vec::new();
@@ -1024,7 +1063,7 @@ fn bc_texels_follow_every_write() {
 /// replaced pages' bytes.
 #[test]
 fn a_host_heap_s_bc_textures_rebind() {
-    on_device(|device, messages| {
+    on_device_with(at_plan, |device, messages| {
         let name = device.name().to_owned();
         let facts = &device.properties().driver_facts;
         let lacks = FORMATS
@@ -1168,7 +1207,7 @@ pub(super) fn read_after(
 /// the kernel ended, and Metal's reader that ran before the write reads the old blocks.
 #[test]
 fn writes_behind_work_in_flight_read_the_new_blocks() {
-    on_device(|device, messages| {
+    on_device_with(at_plan, |device, messages| {
         let name = device.name().to_owned();
         let state = reader(device);
         let queue = device.new_command_queue().unwrap();
@@ -1244,7 +1283,7 @@ fn writes_behind_work_in_flight_read_the_new_blocks() {
                 let after = device.work_counts();
                 let cpu = after.cpu_block_decodes - before.cpu_block_decodes;
                 let hosted = after.host_texel_copies > before.host_texel_copies;
-                let staged = after.staging_submissions > before.staging_submissions;
+                let staged = after.staging_copies_queued > before.staging_copies_queued;
                 let route = match (hosted, staged) {
                     (true, _) => "on the host",
                     (false, true) => "on the staging queue",

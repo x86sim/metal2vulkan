@@ -18,7 +18,10 @@
 //!   start another pin either. A pin whose first page is not a 32-KiB granule's (`OffGranule`),
 //!   whose span meets bytes another resource holds, or that leaves the space, is refused
 //!   ([`PlacementConflict`]); Metal answers nil for each and aliases nothing. A released pin frees
-//!   its whole span, as Metal's does. Metal's own process layout refused some ranges inside the
+//!   its whole span, as Metal's does, before a later making takes a range, whichever thread let
+//!   go of the pinned resource last: a making in the Metal space waits for the runtime's passing
+//!   holds of the program's textures, one of which may hold the last handle of a texture over the
+//!   resource (`Device::address_space_for`; `resource_ids.rs`, **Passing holds**). Metal's own process layout refused some ranges inside the
 //!   space (below 2^36, 2^39, just below 2^40, 2^42 and above); that is no contract, and the
 //!   runtime pins any free range of the space.
 //! - **A shared range** (the consumer's ask C3): a no-copy buffer made over the same first byte of
@@ -42,9 +45,18 @@
 //!   buffer in its slots is gone. Which slot a buffer takes, and when a pool is needed or goes, is
 //!   the caller's to model, as are Metal's own allocations in its pools.
 //! - **Outside the space**: the runtime's own buffers (the index buffers it generates, staging for
-//!   fills, uploads and copies, scratch, tile memory, shadows) take ranges of a second space above
-//!   it, `[2^47, 2^48)`, so a program's buffer addresses never depend on when the runtime's own
-//!   work completes, as Metal's own allocations never move a program's.
+//!   fills, uploads and copies, scratch, tile memory, shadows, and the buffers of the device's
+//!   in-place check, `in_place_check.rs`, which runs on a thread of its own while the program makes
+//!   its resources) take ranges of a second space above it, `[2^47, 2^48)`, so a program's buffer
+//!   addresses never depend on whether or when the runtime's own work runs or completes, as
+//!   Metal's own allocations never move a program's, and no pin of the program's meets them. So
+//!   does the storage of a program's object whose address Metal shows no program: a texture
+//!   buffer's texels the device makes (`newTextureWithDescriptor:`,
+//!   `newSharedTextureWithDescriptor:`) and a visible function table's words, each reached
+//!   through its binding or its `gpuResourceID`, never at an address of the space, as a texture
+//!   of its own memory takes none of it. The space holds only what Metal gives an address (a
+//!   buffer's `gpuAddress`; a heap's range, which its resources lie in) and the pools a caller
+//!   reserves.
 //!   [`AddressPlacement::Outside`], a runtime extension, puts a caller's helper buffer there too. A
 //!   pin never reaches it.
 //! - **Indirect command buffers' records**: an indirect command buffer's ID is the one Metal's pool
@@ -66,7 +78,7 @@
 //!   buffer is gone the ID reaches none, even while an earlier buffer with it lives
 //!   ([`AddressSpace::holds_records_slot`]).
 
-use super::device::lock;
+use super::device::{lock, Device};
 use super::error::{internal, Error, MemoryKind};
 use super::exit_guard;
 use super::program_objects::ProgramObject;
@@ -76,7 +88,7 @@ use metal2vulkan::bind::indirect_commands::{records_address, RECORDS_ID_LIMIT};
 use std::collections::BTreeMap;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 /// A Metal GPU address: what `gpuAddress` answers and what a kernel's pointers hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -140,6 +152,37 @@ impl From<AddressPlacement> for Place {
     }
 }
 
+impl Place {
+    /// Whether a resource placed here takes bytes of the Metal space: a range the runtime picks
+    /// there, a pin, a pool's slot. A shared range is its live holder's, which the caller holds;
+    /// records and the space outside take none.
+    fn takes_metal_bytes(self) -> bool {
+        matches!(
+            self,
+            Place::At(AddressPlacement::Any | AddressPlacement::At(_)) | Place::InPool { .. }
+        )
+    }
+}
+
+impl Device {
+    /// The device's address space, locked, for a placement at `place` (a resource's range, or a
+    /// pool's span). Where it takes bytes of the Metal space, once every passing hold of the
+    /// device ended (`resource_ids.rs`, **Passing holds**): the bytes a resource the program
+    /// released held are free by then, whichever thread let go of it last, as Metal's release
+    /// freed them, so a pin or a pool's slot where they lay is made, and a range the runtime
+    /// picks does not depend on when the runtime's own work let go. A making waits holding none
+    /// of the runtime's locks, and on a thread inside a passing hold not at all.
+    pub(super) fn address_space_for(
+        &self,
+        place: impl Into<Place>,
+    ) -> MutexGuard<'_, AddressSpace> {
+        if place.into().takes_metal_bytes() {
+            self.shared().passing_holds.wait();
+        }
+        lock(&self.shared().addresses)
+    }
+}
+
 /// A caller's token for a resource's range of the Metal address space (a runtime extension, no
 /// Metal counterpart): `BufferDescriptor::range_token`, `Device::new_heap_with_range_token`,
 /// `Device::new_heap_with_bytes_no_copy_and_range_token`, and
@@ -189,6 +232,15 @@ impl KeptToken {
         Ok(())
     }
 
+    /// Hand the token kept, if any, to `to`, which keeps none: a buffer carried to its device's
+    /// next generation (`device/carry.rs`), whose parts there hold the buffer's range last.
+    pub(super) fn hand_to(&self, to: &KeptToken) {
+        let token = lock(&self.0).take();
+        if let Some(token) = token {
+            *lock(&to.0) = Some(token);
+        }
+    }
+
     /// Drop the token kept, if any: the resource's range is free, outside its teardown's exit
     /// section and with no runtime lock held, so a creation at the range from its drop on
     /// succeeds. Its drop is the program's code, which a runtime thread (a command buffer's
@@ -223,9 +275,21 @@ impl ObjectsToken {
         self.objects.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// How many texture objects are over the image or texels now.
+    pub(super) fn count(&self) -> usize {
+        self.objects.load(Ordering::Relaxed)
+    }
+
     /// Keep `token`, as [`KeptToken::keep`].
     pub(super) fn keep(&self, token: RangeToken) -> Result<(), Error> {
         self.token.keep(token)
+    }
+
+    /// Hand the token kept, if any, to `to`, as [`KeptToken::hand_to`]: a texture's parts on a lost
+    /// generation going at its rest, its parts on the next holding its range last
+    /// (`texture/carry.rs`).
+    pub(super) fn hand_token_to(&self, to: &ObjectsToken) {
+        self.token.hand_to(&to.token);
     }
 
     /// A texture object over the image or texels went, its teardown done and no lock held: the

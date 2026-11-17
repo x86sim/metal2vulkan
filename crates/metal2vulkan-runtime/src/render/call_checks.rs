@@ -30,7 +30,7 @@
 //!   variant, its instance or its resources; out of memory; a Vulkan error) fails the command
 //!   buffer, naming the call (`CommandBufferError::CallRefused`), the end's as `endEncoding`.
 
-use super::draw_shape::ShapeInputs;
+use super::draw_shape::{LayoutView, ShapeInputs};
 use super::replay::{DrawIndexed, Table};
 use super::table_facts::{check_samplers, check_textures, TableFacts};
 use super::{check_arguments, drawn_as, drawn_by, Assembly, RenderCall, RenderLowering};
@@ -256,16 +256,17 @@ impl CallChecks {
                     .set_viewports("set_viewports", viewports, refused))
                 .map(logged)
             }
+            // Checked alone: no later check reads the rectangles.
             C::ScissorRect(rect) => {
                 let rects = std::slice::from_ref(rect);
                 self.state
-                    .set_scissors("set_scissor_rect", rects)
-                    .map(logged)
+                    .scissor_rects("set_scissor_rect", rects)
+                    .map(|_| Checked::Logged)
             }
             C::ScissorRects(rects) => self
                 .state
-                .set_scissors("set_scissor_rects", rects)
-                .map(logged),
+                .scissor_rects("set_scissor_rects", rects)
+                .map(|_| Checked::Logged),
             C::CullMode(mode) => {
                 self.state.set_cull_mode(*mode);
                 Ok(Checked::Logged)
@@ -277,7 +278,7 @@ impl CallChecks {
             C::DepthStencilState(held) => {
                 let state = held.map(|held| log.depth_stencil(held));
                 if let Some(state) = state {
-                    check_device(device, "set_depth_stencil_state", state.device())?;
+                    check_device(device, "set_depth_stencil_state", state.root_device())?;
                 }
                 self.state.set_depth_stencil(state);
                 Ok(Checked::Logged)
@@ -307,7 +308,11 @@ impl CallChecks {
             }
             C::TessellationFactorBuffer(buffer, ..) => {
                 if let Some(buffer) = buffer {
-                    check_device(device, "set_tessellation_factor_buffer", buffer.device())?;
+                    check_device(
+                        device,
+                        "set_tessellation_factor_buffer",
+                        buffer.generation(),
+                    )?;
                 }
                 Ok(Checked::Logged)
             }
@@ -328,20 +333,20 @@ impl CallChecks {
                     .get(*at as usize)
                     .ok_or_else(|| crate::error::internal("a logged draw without its arguments"))?;
                 let call = "draw_indexed_primitives";
-                check_device(device, call, log.buffer(draw.index_buffer).device())?;
+                check_device(device, call, log.buffer(draw.index_buffer).generation())?;
                 let empty = draw.index_count == 0 || draw.instance_count == 0;
                 self.draw(device, call, Assembly::of(draw.primitive_type), empty)
             }
             C::DrawPrimitivesIndirect(primitive, buffer, offset) => {
                 let call = "draw_primitives_indirect";
-                check_device(device, call, buffer.device())?;
+                check_device(device, call, buffer.generation())?;
                 check_arguments(call, buffer.length(), *offset, 16)?;
                 self.draw(device, call, Assembly::of(*primitive), false)
             }
             C::DrawIndexedPrimitivesIndirect(draw) => {
                 let call = "draw_indexed_primitives_indirect";
-                check_device(device, call, draw.index_buffer.device())?;
-                check_device(device, call, draw.indirect_buffer.device())?;
+                check_device(device, call, draw.index_buffer.generation())?;
+                check_device(device, call, draw.indirect_buffer.generation())?;
                 let indirect = &draw.indirect_buffer;
                 check_arguments(call, indirect.length(), draw.indirect_buffer_offset, 20)?;
                 self.draw(device, call, Assembly::of(draw.primitive_type), false)
@@ -357,12 +362,12 @@ impl CallChecks {
                 Ok(Checked::Logged)
             }
             C::UseHeap(heap, _) => {
-                check_device(device, "use_heap", heap.device())?;
+                check_device(device, "use_heap", heap.generation())?;
                 Ok(Checked::Logged)
             }
             C::UseHeaps(heaps, _) => {
                 for heap in heaps.iter() {
-                    check_device(device, "use_heaps", heap.device())?;
+                    check_device(device, "use_heaps", heap.generation())?;
                 }
                 Ok(Checked::Logged)
             }
@@ -418,12 +423,13 @@ impl CallChecks {
     fn shape_inputs<'a>(&'a self, device: &'a Device) -> ShapeInputs<'a> {
         ShapeInputs {
             device,
-            layout: &self.layout,
+            layout: LayoutView::of(&self.layout),
             state: &self.state,
             amplification: &self.amplification,
             // Which reads no refusal: `ShapeInputs::settings` reads it after its last.
             counts_visibility: false,
             rate_map: self.rate_map.as_ref(),
+            executes: false,
             routed: None,
             versions: [0, self.state.version(), self.amplification.version()],
         }
@@ -437,7 +443,7 @@ impl CallChecks {
         state: &RenderPipelineState,
     ) -> Result<Checked, Error> {
         const CALL: &str = "set_render_pipeline_state";
-        check_device(device, CALL, state.device())?;
+        check_device(device, CALL, state.bound_device()?)?;
         let RenderStateKind::Graphics(graphics) = state.kind() else {
             return FROM_NOW;
         };
@@ -453,7 +459,7 @@ impl CallChecks {
             return FROM_NOW;
         }
         let drawn = drawn_as(self.layout.samples, state)?;
-        self.shape_inputs(device).check_pipeline(CALL, &drawn)?;
+        (self.shape_inputs(device)).check_pipeline(CALL, &drawn, &self.layout)?;
         self.pipeline = Some(drawn);
         Ok(Checked::Logged)
     }
@@ -514,8 +520,15 @@ impl CallChecks {
             .is_some_and(|(kept, kept_assembly, kept_versions)| {
                 kept.same(&pipeline) && *kept_assembly == assembly && *kept_versions == versions
             });
+        // Its count changes how it draws its lines alone, which refuses nothing
+        // (`render/line_width.rs`).
         if !settled {
-            (self.shape_inputs(device)).settings(call, (&pipeline, assembly), false, false)?;
+            (self.shape_inputs(device)).settings(
+                call,
+                (&pipeline, assembly, true),
+                false,
+                false,
+            )?;
             self.settled = Some((pipeline, assembly, versions));
         }
         Ok(Checked::Logged)

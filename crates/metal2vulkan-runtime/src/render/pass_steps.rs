@@ -18,7 +18,9 @@
 //!   (`render/extended_shadow.rs`); the steps its draws take before their pass that read what an
 //!   earlier instance wrote (`Before`); the copies into the stand-ins of the colors it renders in
 //!   other formats (`render.rs`'s `Reformat`); and, where the pass has custom sample positions, its
-//!   first draw's pipeline bound before each of its begins (`sample_positions.rs`).
+//!   first draw's pipeline bound before each of its begins (`sample_positions.rs`); and last, where
+//!   its first draw's snapshots lead it, their render pass instance between barriers from
+//!   everything before and to everything after ([`PassSteps::lead`]).
 //! - **After each instance**: the copies back from those stand-ins; the shadow's copy back into
 //!   the stencil where its draws test it in the shader, and the stand-in's into the depth where
 //!   they test that; then the tile dispatches that follow it,
@@ -39,6 +41,7 @@ use crate::attachment_stand_in::StandInCopies;
 use crate::depth_stand_in::StandInCopies as DepthStandInCopies;
 use crate::device::functions::Vk;
 use crate::device::lock;
+use crate::linear_merge::LinearMerge;
 use crate::owned_kernel::OwnedSets;
 use crate::pipeline::RawPipeline;
 use crate::render_target::{self, ClearValues, FramebufferObject, MovedImage, RenderPassObject};
@@ -78,6 +81,9 @@ pub(super) struct InstanceSteps {
     /// (`render_target::depth_layout`), moved there just before it begins and back just after it
     /// ends (`render_target::moved_barriers`). Empty for every other instance.
     pub(super) moved: Vec<MovedImage>,
+    /// Where its first draw's snapshots lead it (`render/snapshot.rs`, leading snapshots): their
+    /// pass (`render_target::leading_pass`), and their secondary command buffer.
+    pub(super) leading: Option<(RenderPassObject, super::snapshot::Leading)>,
 }
 
 /// A tile dispatch, ready to record after the instance before it: its staged attachments'
@@ -133,6 +139,19 @@ pub(super) struct PassSteps {
     pub(super) clear_values: ClearValues,
     pub(super) render_area: vk::Rect2D,
     pub(super) staged_rows: StagedRows,
+    /// Where a draw pinned the pass's colors to their own images and stand-ins arrived after
+    /// it (`render/snapshot.rs`): what goes after the last pinned instance.
+    pub(super) after_pins: Option<AfterPins>,
+}
+
+/// The steps after a pass's last pinned instance (`render/snapshot.rs`): the stand-ins' copies
+/// of their attachments' texels, which the pinned instances rendered, and then the keeps of those
+/// merged back into a buffer's bytes (`linear_merge.rs`).
+pub(super) struct AfterPins {
+    /// The last pinned instance.
+    pub(super) at: usize,
+    pub(super) copies: Option<StandInCopies>,
+    pub(super) keeps: Vec<Arc<LinearMerge>>,
 }
 
 impl PassSteps {
@@ -181,6 +200,54 @@ impl PassSteps {
                     copies.record_in(raw, command_buffer);
                 }
             }
+        }
+    }
+
+    /// The secondary command buffer of the snapshots that lead instance `index`, where they do.
+    pub(super) fn leading(&self, index: usize) -> Option<super::snapshot::Leading> {
+        let instance = self.instances.get(index)?;
+        instance.leading.as_ref().map(|&(_, leading)| leading)
+    }
+
+    /// Record the snapshots that lead instance `index` (`render/snapshot.rs`, leading
+    /// snapshots), `draws` their secondary command buffer, recorded and ended: their render pass
+    /// instance of their own pass over the instance's `framebuffer`, at the pass's render area
+    /// (no attachment clears), between a barrier from everything before (the instance before's
+    /// color writes and stores, the steps before this one) and one to everything after (its
+    /// sampled reads of the colors before the instance's color writes of them, and its writes of
+    /// the snapshots before the instance's reads of them). Nothing where the instance has none.
+    ///
+    /// # Safety
+    ///
+    /// As for [`PassSteps::before`], after it; `framebuffer` is the instance's, and `draws` was
+    /// recorded against a pass compatible with its own.
+    pub(super) unsafe fn lead(
+        &self,
+        raw: &Vk,
+        command_buffer: vk::CommandBuffer,
+        index: usize,
+        framebuffer: vk::Framebuffer,
+        draws: vk::CommandBuffer,
+    ) {
+        let Some((pass, _)) = (self.instances.get(index)).and_then(|i| i.leading.as_ref()) else {
+            return;
+        };
+        let begin = vk::RenderPassBeginInfo::default()
+            .render_pass(pass.raw)
+            .framebuffer(framebuffer)
+            .render_area(self.render_area);
+        // SAFETY: the caller's contract; every image rests in `GENERAL`, the layout the pass
+        // holds each color in, and no load operation clears.
+        unsafe {
+            Barrier::everything().record(raw, command_buffer);
+            raw.cmd_begin_render_pass(
+                command_buffer,
+                &begin,
+                vk::SubpassContents::SECONDARY_COMMAND_BUFFERS,
+            );
+            raw.cmd_execute_commands(command_buffer, &[draws]);
+            raw.cmd_end_render_pass(command_buffer);
+            Barrier::everything().record(raw, command_buffer);
         }
     }
 
@@ -294,6 +361,14 @@ impl PassSteps {
             let tests = self.instances.get(index).is_some_and(|i| i.shader_tests);
             if let Some(copies) = self.stand_in_copies.as_ref().filter(|_| tests) {
                 copies.record_out(raw, command_buffer);
+            }
+            if let Some(pins) = self.after_pins.as_ref().filter(|pins| pins.at == index) {
+                if let Some(copies) = &pins.copies {
+                    copies.record_in(raw, command_buffer);
+                }
+                for merge in &pins.keeps {
+                    merge.keep_in_pass(raw, command_buffer);
+                }
             }
         }
     }

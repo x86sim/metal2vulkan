@@ -1,5 +1,5 @@
 //! The sizes of the draws that read their pass's texture through a snapshot or take the split by
-//! the area rule (`render/snapshot.rs`'s `RenderCommandEncoder::snapshot_cheaper`), counted for a
+//! the area rule (`render/snapshot.rs`'s `RenderCommandEncoder::weigh_snapshot`), counted for a
 //! diagnostic line where `METAL2VULKAN_LOG_PIPELINES` is set: how many such draws weigh which share
 //! of their colors' pixels, at which texel bytes, on which side of the rule. A device counts them
 //! only while the log is on, writes the line after 64 of them and after each power of two past
@@ -8,9 +8,9 @@
 //! A draw's share is its scissors' pixels for each color it reads so, over the pixels of those
 //! colors' levels, in steps of 0.5% (one step at 100% and above); its texel bytes are those
 //! colors' bytes over their pixels, rounded down: a color's own format's bytes for a draw that
-//! reads one color, or colors of one width. The rule takes the snapshot where the share times
-//! the snapshot's cost per pixel is at most the texel bytes, so the line shows how many draws lie
-//! near the rule's bound for each width.
+//! reads one color, or colors of one width. The rule's bound on the share
+//! (`render/snapshot.rs`'s area rule) turns on the texel bytes and on the colors' size, so the
+//! line shows how many draws lie near it for each width.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;

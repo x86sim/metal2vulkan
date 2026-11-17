@@ -747,7 +747,7 @@ impl RenderLowering {
             _ => RenderStages::empty(),
         };
         self.dispatch_tiles_resident(call, threads, region)?;
-        self.core.device().shared().counts.tile_dispatch_recorded();
+        self.core.counts().tile_dispatch_recorded();
         self.tile_dispatch_calls += 1;
         self.command_encoded(reads);
         Ok(())
@@ -852,11 +852,14 @@ impl RenderLowering {
             let mut bind = BindState::default();
             bind.stages.insert(Stage::Kernel, stage_table.clone());
             bind.view_base_alignment = views.alignment();
+            bind.uniform_views_at_residual = views.at_residual();
             bind.imageblock_size = ImageblockSize::new(tile[0], tile[1]);
             bind.render_area = area;
             // The planner refuses a layered pass's dispatch (`NotImplemented(TileShading)`).
             bind.render_target_array_length = self.render_target_array_length;
             bind.used_resources = used_resources.clone();
+            bind.used_in_token_order = true;
+            bind.resident_apart = true;
             bind.argument_samplers = heap_sets::listed(argument_samplers);
             bind.function_tables = function_tables
                 .iter()
@@ -974,6 +977,8 @@ impl RenderLowering {
             &variant.pipeline().layout,
             &variant.pipeline().dependencies,
         )?;
+        (variant.objects())
+            .bind_sampler_tables(&variant.pipeline().layout, &variant.pipeline().dependencies);
         if commands.regions.is_empty() {
             self.core.executed(|| {
                 Execution::new(
@@ -1046,12 +1051,15 @@ impl RenderLowering {
         let pipeline_stage = &variant.pipeline().stage;
         let command = binding::Command {
             descriptor_bytes: &commands.descriptor_bytes,
+            heap_tables: &[],
             descriptor_ranges: &commands.descriptor_ranges,
             root_tables: commands
                 .root_table
                 .iter()
                 .map(|table| (metal2vulkan::vk::ShaderStageFlags::COMPUTE, table))
                 .collect(),
+            // A tile function's artifact states no proof that it stores nothing.
+            root_writes: true,
             push_holes: &commands.push_holes,
             uses: &commands.uses,
             blobs: pipeline_stage
@@ -1061,6 +1069,7 @@ impl RenderLowering {
                 .collect(),
             mesh: None,
             tessellation: None,
+            fan_out: None,
         };
         let stages = [(Stage::Kernel, &self.tile)];
         let mut tables = binding::Tables::new(&stages)
@@ -1189,13 +1198,16 @@ impl RenderLowering {
         self.unordered.add(&uses);
         self.unordered_dispatches.add(&uses);
         let heap_set = match heap {
-            Some(_) => Some(heap_sets::bind(
-                &device,
-                &objects,
-                &mut self.core.command_buffer().state().heaps,
-                heap_writes,
-                &uses,
-            )?),
+            Some(_) => Some(
+                heap_sets::bind(
+                    &device,
+                    &objects,
+                    &mut self.core.command_buffer().state().heaps,
+                    heap_writes,
+                    &uses,
+                )?
+                .set,
+            ),
             None => None,
         };
         // Recording starts here: nothing below can be refused.

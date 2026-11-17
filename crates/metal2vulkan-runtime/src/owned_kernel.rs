@@ -2,7 +2,9 @@
 //! (`bind`'s resolve and prepass modules) the runtime dispatches for Metal commands that have no
 //! single Vulkan command.
 //!
-//! - **Kernels.** Each [`OwnedModule`] is made once per device, when a command first needs it:
+//! - **Kernels.** Each [`OwnedModule`] is made once per device, when a command first needs it
+//!   (but a render execution's draw replay's, which the creation of a state that supports
+//!   indirect command buffers begins on the device's pool, [`Device::begin_draw_replay_kernels`]):
 //!   its shader module, a set layout of set 0 (sampled images first, at bindings `0..i`, where
 //!   the module has them, then storage images, then storage buffers), a pipeline layout with its
 //!   push range, and the compute pipeline. The device keeps them
@@ -33,6 +35,7 @@ use super::texture::decoded_twin::TwinDecode;
 use super::ycbcr_device::YCbCrSampler;
 use super::Device;
 use crate::device::functions::Vk;
+use crate::device::holds::Holder;
 use crate::shader_cache::driver::Making;
 use ash::vk;
 use metal2vulkan::bind::{
@@ -45,11 +48,8 @@ use std::collections::HashMap;
 /// A crate-owned module the runtime dispatches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OwnedModule {
-    /// `bind::visibility_resolve_module`: a pass's `Boolean` visibility results, made Metal's 1
-    /// or 0 in place.
-    VisibilityResolve,
-    /// `bind::visibility_combine_module`: a split pass's continuation queries, ORed into their
-    /// results.
+    /// `bind::visibility_combine_module`: a split pass's continuation queries, summed or ORed
+    /// into their results.
     VisibilityCombine,
     /// `bind::index_bounds_plan_module`: an indexed indirect draw's index bounds plan
     /// (`index_bounds.rs`).
@@ -93,6 +93,22 @@ pub(super) enum OwnedModule {
     /// `bind::rows_copy_module`: many equal rows of words copied from one buffer into another by
     /// a dispatch, in place of a copy's region per row (`row_copies.rs`).
     RowsCopy,
+    /// `bind::icb_reset_module`: a run of indirect commands reset, only the records whose written
+    /// flag is set written, each flag cleared (`blit_indirect.rs`).
+    IcbReset,
+    /// `bind::pages_copy_module` of one direction: runs of words, up to a 4 KiB page each, copied
+    /// between imports of a guest RAM (an array of the device's `PagesCopyModule::imports` of
+    /// them, its first binding) and a buffer by a table of them, a gather or a scatter
+    /// (`host_ram/copy.rs`).
+    PagesCopy(metal2vulkan::bind::PagesCopy),
+    /// `bind::extended_canonical_module`: Metal's canonical encoding of `BGRA10_XR` texels
+    /// written in place over a buffer's words, after a blit through a texture Metal keeps
+    /// losslessly compressed (`extended_canonical.rs`).
+    ExtendedCanonical,
+    /// `bind::depth_clamp_module`: 32-bit float depths clamped into `[0, 1]` in place over a
+    /// buffer's words, before a copy takes them into a depth image of a device that takes no
+    /// other (`depth_clamp.rs`).
+    DepthClamp,
     /// `bind::shadow_merge_image_module` of one read of a texel (`ShadowMergeRead`): a shadowed
     /// texture's writes merged into its buffer's bytes, reading its shadow's texels through its
     /// unsigned-integer view or its own 8-bit unsigned normalized view, its sampled image
@@ -205,19 +221,37 @@ impl OwnedModule {
     }
 
     /// Whether the module's set 0 is pushed on `device` ([`OwnedKernel::pushed`]): the rows
-    /// copy's and a shadowed texture's copies' and merges', on a device with
-    /// `VK_KHR_push_descriptor`, so their commands make no pool on the encoding thread
-    /// (`row_copies.rs`, `shadow_copy_back.rs`, `shadow_copy_in.rs`, `shadow_merge.rs`).
+    /// copy's, an indirect command buffer's reset's, a guest RAM's pages copy's and a shadowed
+    /// texture's copies' and merges', on a device with `VK_KHR_push_descriptor` whose pushed sets
+    /// hold their buffers' sizes (not MoltenVK's, `RuntimeDriverDefect::PushedBufferSizesUnset`),
+    /// so their commands make no pool on the encoding thread (`row_copies.rs`,
+    /// `blit_indirect.rs`, `host_ram/copy.rs`, `shadow_copy_back.rs`, `shadow_copy_in.rs`,
+    /// `shadow_merge.rs`).
     fn pushed(self, device: &Device) -> bool {
         matches!(
             self,
             OwnedModule::RowsCopy
+                | OwnedModule::IcbReset
+                | OwnedModule::PagesCopy(_)
                 | OwnedModule::ShadowCopyBack(_)
                 | OwnedModule::ShadowCopyIn(_)
                 | OwnedModule::ShadowMerge(_)
                 | OwnedModule::ShadowMergeImage(..)
                 | OwnedModule::ShadowMergeKeptImage(..)
         ) && device.shared().vk().push_descriptor().is_some()
+            && crate::pipeline::objects::pushed_sets_hold_lengths(device)
+    }
+
+    /// The descriptors of the module's first storage-buffer binding on `device`: the pages copy's
+    /// array of imports (`PagesCopyModule::imports`, as its module declares it), 1 for every
+    /// other module.
+    fn first_buffers(self, device: &Device) -> u32 {
+        match self {
+            OwnedModule::PagesCopy(_) => {
+                metal2vulkan::bind::PagesCopyModule::imports(device.compile_device())
+            }
+            _ => 1,
+        }
     }
 
     /// The module's storage-image bindings, which come after its sampled images.
@@ -236,11 +270,6 @@ impl OwnedModule {
     /// [`images`](Self::images)), and its push bytes.
     fn build(self, device: &Device) -> Result<(Vec<u32>, u32, u32), Error> {
         match self {
-            OwnedModule::VisibilityResolve => {
-                let module = metal2vulkan::bind::visibility_resolve_module(device.compile_device())
-                    .map_err(Error::Compile)?;
-                Ok((module.spirv.to_vec(), 2, 0))
-            }
             OwnedModule::VisibilityCombine => {
                 let module = metal2vulkan::bind::visibility_combine_module(device.compile_device())
                     .map_err(Error::Compile)?;
@@ -330,6 +359,30 @@ impl OwnedModule {
                     .map_err(Error::Compile)?;
                 let push_bytes = metal2vulkan::bind::RowsCopyModule::PUSH_BYTES;
                 Ok((module.spirv.to_vec(), 2, push_bytes))
+            }
+            OwnedModule::IcbReset => {
+                let module = metal2vulkan::bind::icb_reset_module(device.compile_device())
+                    .map_err(Error::Compile)?;
+                let push_bytes = metal2vulkan::bind::IcbResetModule::PUSH_BYTES;
+                Ok((module.spirv.to_vec(), 2, push_bytes))
+            }
+            OwnedModule::PagesCopy(copy) => {
+                let module = metal2vulkan::bind::pages_copy_module(device.compile_device(), copy)
+                    .map_err(Error::Compile)?;
+                let push_bytes = metal2vulkan::bind::PagesCopyModule::PUSH_BYTES;
+                Ok((module.spirv.to_vec(), 3, push_bytes))
+            }
+            OwnedModule::DepthClamp => {
+                let module = metal2vulkan::bind::depth_clamp_module(device.compile_device())
+                    .map_err(Error::Compile)?;
+                let push_bytes = metal2vulkan::bind::DepthClampModule::PUSH_BYTES;
+                Ok((module.spirv.to_vec(), 1, push_bytes))
+            }
+            OwnedModule::ExtendedCanonical => {
+                let module = metal2vulkan::bind::extended_canonical_module(device.compile_device())
+                    .map_err(Error::Compile)?;
+                let push_bytes = metal2vulkan::bind::ExtendedCanonicalModule::PUSH_BYTES;
+                Ok((module.spirv.to_vec(), 1, push_bytes))
             }
             OwnedModule::ShadowMergeImage(read, stores) => {
                 let module = metal2vulkan::bind::shadow_merge_image_module(
@@ -501,6 +554,8 @@ pub(super) struct OwnedKernel {
     pub(super) storage_images: u32,
     /// Storage-buffer bindings of set 0, after the images.
     pub(super) buffers: u32,
+    /// The descriptors of the first of them: an array's ([`OwnedModule::first_buffers`]), else 1.
+    pub(super) first_buffers: u32,
     /// Whether set 0's layout is a push descriptor set's: its dispatches push their descriptors
     /// (`vkCmdPushDescriptorSetKHR`) in place of a set from a pool.
     pub(super) pushed: bool,
@@ -527,7 +582,6 @@ impl OwnedKernel {
 /// Every kernel one device has made.
 #[derive(Default)]
 pub(super) struct OwnedKernels {
-    visibility_resolve: Option<OwnedKernel>,
     visibility_combine: Option<OwnedKernel>,
     index_bounds_plan: Option<OwnedKernel>,
     index_bounds_fill: Option<OwnedKernel>,
@@ -558,6 +612,11 @@ pub(super) struct OwnedKernels {
     index_rewrite_runs: HashMap<RewriteProgram, OwnedKernel>,
     rotate_texels: Option<OwnedKernel>,
     rows_copy: Option<OwnedKernel>,
+    icb_reset: Option<OwnedKernel>,
+    pages_gather: Option<OwnedKernel>,
+    pages_scatter: Option<OwnedKernel>,
+    extended_canonical: Option<OwnedKernel>,
+    depth_clamp: Option<OwnedKernel>,
     ycbcr_refresh: Option<OwnedKernel>,
     ycbcr_converts: HashMap<(YCbCrConversion, bool), OwnedKernel>,
     ycbcr_samples: HashMap<(YCbCrSampler, YCbCrCodes), OwnedKernel>,
@@ -574,13 +633,23 @@ pub(super) struct OwnedKernels {
     predication_step: Option<OwnedKernel>,
     twin_decodes: HashMap<TwinDecode, OwnedKernel>,
     tessellation_scans: HashMap<TessellationScanKernel, OwnedKernel>,
+    /// A render state's creation began the draw replay's kernels on the device's pool
+    /// ([`Device::begin_draw_replay_kernels`]): no later creation begins them again.
+    draw_replay_begun: bool,
+    /// Every kernel was destroyed: a lost device's once its recovery carried its objects on and
+    /// none of its command buffers records (`device/carry.rs`), before its teardown.
+    destroyed: bool,
 }
 
 impl OwnedKernels {
-    /// Destroy every kernel; the device is idle, and is destroyed next.
-    pub(super) fn destroy(&self, raw: &ash::Device) {
+    /// Destroy every kernel, once; the device is idle, and is destroyed next or makes no work
+    /// again (`device/carry.rs`).
+    pub(super) fn destroy(&mut self, raw: &ash::Device) {
+        if self.destroyed {
+            return;
+        }
+        self.destroyed = true;
         for kernel in [
-            self.visibility_resolve,
             self.visibility_combine,
             self.index_bounds_plan,
             self.index_bounds_fill,
@@ -604,6 +673,11 @@ impl OwnedKernels {
             self.plane_copy,
             self.rotate_texels,
             self.rows_copy,
+            self.icb_reset,
+            self.pages_gather,
+            self.pages_scatter,
+            self.extended_canonical,
+            self.depth_clamp,
             self.ycbcr_refresh,
             self.two_plane_texels,
             self.plane_bytes_copy,
@@ -739,7 +813,6 @@ impl OwnedKernels {
     /// per key).
     fn slot(&mut self, which: OwnedModule) -> Option<&mut Option<OwnedKernel>> {
         Some(match which {
-            OwnedModule::VisibilityResolve => &mut self.visibility_resolve,
             OwnedModule::VisibilityCombine => &mut self.visibility_combine,
             OwnedModule::IndexBoundsPlan => &mut self.index_bounds_plan,
             OwnedModule::IndexBoundsFill => &mut self.index_bounds_fill,
@@ -786,6 +859,13 @@ impl OwnedKernels {
             OwnedModule::PlaneCopy => &mut self.plane_copy,
             OwnedModule::RotateTexels => &mut self.rotate_texels,
             OwnedModule::RowsCopy => &mut self.rows_copy,
+            OwnedModule::IcbReset => &mut self.icb_reset,
+            OwnedModule::PagesCopy(metal2vulkan::bind::PagesCopy::Gather) => &mut self.pages_gather,
+            OwnedModule::PagesCopy(metal2vulkan::bind::PagesCopy::Scatter) => {
+                &mut self.pages_scatter
+            }
+            OwnedModule::ExtendedCanonical => &mut self.extended_canonical,
+            OwnedModule::DepthClamp => &mut self.depth_clamp,
             OwnedModule::YCbCrRefresh => &mut self.ycbcr_refresh,
 
             OwnedModule::TwoPlaneTexels => &mut self.two_plane_texels,
@@ -824,6 +904,54 @@ impl Device {
         Ok(conversion)
     }
 
+    /// Begin making, on the device's pool, the kernels a render execution's draw replay records
+    /// (`render/executions/gpu.rs`): its preprocess and a merged replay's two passes. Once per
+    /// device, at the creation of a render pipeline state that supports indirect command buffers
+    /// (`pipeline/render.rs`), on a device that reaches buffers by device address, the only one
+    /// whose executions take that form: Metal compiles what a state draws with at its creation,
+    /// so an execution's first commit (`gpu.rs`) or host step (`gpu_route.rs`) makes none of
+    /// them (`WorkCounts::host_step_owned_kernels_made`). The creation waits for none. One a
+    /// command asks for while the pool makes it waits for that making under the kernels' lock,
+    /// as for any kernel another thread is making; one the device cannot build fails where a
+    /// command first asks for it, as before.
+    ///
+    /// The piece holds the device as one of the runtime's holders (`device/holds.rs`), for each
+    /// kernel's making and not between them: the program's last drop stops it at its next kernel
+    /// and waits for the one it is making, so the device is torn down on the program's thread
+    /// before that drop returns, never on the pool's after it. A runtime thread's upgrade of the
+    /// weak handle would be the program's: the program's drop of its last handle would return
+    /// with the device live, which an exit then leaves live, and NVIDIA's driver faults in its
+    /// exit handler on a `VkDevice` left so (docs/FAST-PATHS.md, known gaps).
+    pub(crate) fn begin_draw_replay_kernels(&self) {
+        if !self.compile_device().profile().addressed_needs().is_empty() {
+            return;
+        }
+        let mut kernels = lock(&self.shared().owned_kernels);
+        if kernels.draw_replay_begun {
+            return;
+        }
+        kernels.draw_replay_begun = true;
+        drop(kernels);
+        let weak = self.downgrade();
+        let _ = self.shared().pipeline_pool.run(Box::new(move || {
+            for which in [
+                OwnedModule::DrawReplayPreprocess,
+                OwnedModule::DrawMerge(metal2vulkan::bind::MergePhase::Blocks),
+                OwnedModule::DrawMerge(metal2vulkan::bind::MergePhase::Starts),
+            ] {
+                // A holder's handle for this kernel's making alone, let go before the next.
+                let Some(device) = weak.hold() else {
+                    return;
+                };
+                if !device.holds_go_on(Holder::DrawReplayKernels) {
+                    return;
+                }
+                // Refused again, and announced, where a command asks for it.
+                let _ = device.owned_kernel(which);
+            }
+        }));
+    }
+
     /// The kernel of `which`, made on first use.
     pub(super) fn owned_kernel(&self, which: OwnedModule) -> Result<OwnedKernel, Error> {
         // A making's turn before the lock (`budget::helper_turn`): none where it is made.
@@ -835,7 +963,10 @@ impl Device {
             return Ok(kernel);
         }
         let (spirv, buffers, push_bytes) = which.build(self)?;
-        let bindings = (which.images(), which.storage_images(), buffers);
+        let bindings = (
+            (which.images(), which.storage_images()),
+            (buffers, which.first_buffers(self)),
+        );
         let baked = match which {
             OwnedModule::YCbCrSample(sampler, ..) | OwnedModule::ChromaSample(sampler) => {
                 let (_, made) = kernels.ycbcr_sampler(self, sampler)?;
@@ -845,7 +976,7 @@ impl Device {
         };
         let kernel = make(
             self,
-            &spirv,
+            (&spirv, || format!("metal2vulkan: {which:?}")),
             bindings,
             (push_bytes, which.pushed(self)),
             baked,
@@ -858,15 +989,17 @@ impl Device {
     }
 }
 
-/// The objects of a kernel of `spirv` (entry point `main`) with `images` sampled images, then
-/// `storage_images` storage images and then `buffers` storage buffers in set 0, a push descriptor
-/// set's where `pushed`, and `push_bytes` of `COMPUTE` push constants. With `baked`, a sampler
-/// of a Y′CbCr conversion and the descriptors a combined image sampler of it takes, its first
-/// binding is that combined image sampler, the sampler immutable.
+/// The objects of a kernel of `spirv` (entry point `main`), its pipeline named `name`'s answer
+/// (`DeviceShared::name_pipeline`), with `images` sampled images, then `storage_images` storage
+/// images and then `buffers` storage-buffer bindings in set 0, the first an array of
+/// `first_buffers` (one where 1), a push descriptor set's where `pushed`, and `push_bytes` of
+/// `COMPUTE` push constants. With `baked`, a sampler of a Y′CbCr conversion and the descriptors a
+/// combined image sampler of it takes, its first binding is that combined image sampler, the
+/// sampler immutable.
 fn make(
     device: &Device,
-    spirv: &[u32],
-    (images, storage_images, buffers): (u32, u32, u32),
+    (spirv, name): (&[u32], impl FnOnce() -> String),
+    ((images, storage_images), (buffers, first_buffers)): ((u32, u32), (u32, u32)),
     (push_bytes, pushed): (u32, bool),
     baked: Option<(vk::Sampler, u32)>,
 ) -> Result<OwnedKernel, Error> {
@@ -883,6 +1016,7 @@ fn make(
         images,
         storage_images,
         buffers,
+        first_buffers,
         pushed,
         combined,
     };
@@ -894,10 +1028,14 @@ fn make(
         let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> =
             (0..images + storage_images + buffers)
                 .map(|binding| {
+                    let count = match binding == images + storage_images {
+                        true => first_buffers,
+                        false => 1,
+                    };
                     let info = vk::DescriptorSetLayoutBinding::default()
                         .binding(binding)
                         .descriptor_type(kernel.descriptor_type(binding))
-                        .descriptor_count(1)
+                        .descriptor_count(count)
                         .stage_flags(vk::ShaderStageFlags::COMPUTE);
                     match kernel.baked(binding) {
                         true => info.immutable_samplers(&immutable),
@@ -930,26 +1068,17 @@ fn make(
         let info = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(kernel.layout);
-        let created = shared
-            .make_pipelines(
-                Making::new("owned kernel").words(spirv).text(&(
-                    images,
-                    storage_images,
-                    buffers,
-                    push_bytes,
-                    pushed,
-                )),
-                |cache| {
-                    // SAFETY: every pointer in `info` outlives the call; the pipeline cache is the
-                    // making's own (`shader_cache/driver.rs`).
-                    unsafe { raw.create_compute_pipelines(cache, &[info], None) }
-                },
-            )
-            .map_err(|(_, error)| vulkan(error))?;
-        kernel.pipeline = created
-            .first()
-            .copied()
-            .ok_or_else(|| internal("the driver made no pipeline"))?;
+        kernel.pipeline = shared.make_compute_pipeline(
+            Making::new("owned kernel").words(spirv).text(&(
+                images,
+                storage_images,
+                (buffers, first_buffers),
+                push_bytes,
+                pushed,
+            )),
+            name,
+            info,
+        )?;
         Ok(())
     })();
     match made {
@@ -988,10 +1117,30 @@ impl OwnedKernel {
             false => descriptor_type(binding, self.images, self.storage_images),
         }
     }
+
+    /// The storage-buffer descriptors of its set 0, its bindings' together: one a binding, but the
+    /// first's array ([`OwnedKernel::first_buffers`]).
+    fn buffer_descriptors(&self) -> u32 {
+        match self.buffers {
+            0 => 0,
+            buffers => buffers - 1 + self.first_buffers,
+        }
+    }
+
+    /// The binding and array element of its set 0's `n`-th storage-buffer descriptor, in binding
+    /// order: the first binding's elements, then one a binding.
+    fn buffer_place(&self, n: u32) -> (u32, u32) {
+        let first = self.images + self.storage_images;
+        match n.checked_sub(self.first_buffers) {
+            None => (first, n),
+            Some(after) => (first + 1 + after, 0),
+        }
+    }
 }
 
 /// What one set of an [`OwnedKernel`] binds: its sampled images' views, then its storage images'
-/// views, each in the `GENERAL` layout, then its storage buffers' `(buffer, offset, range)`.
+/// views, each in the `GENERAL` layout, then its storage-buffer descriptors' `(buffer, offset,
+/// range)`, the first binding's array elements first ([`OwnedKernel::buffer_place`]).
 pub(super) struct OwnedSet {
     pub(super) images: Vec<vk::ImageView>,
     pub(super) storage_images: Vec<vk::ImageView>,
@@ -1025,7 +1174,10 @@ impl OwnedKernel {
             ),
             (vk::DescriptorType::SAMPLED_IMAGE, self.images - baked),
             (vk::DescriptorType::STORAGE_IMAGE, self.storage_images),
-            (vk::DescriptorType::STORAGE_BUFFER, self.buffers),
+            (
+                vk::DescriptorType::STORAGE_BUFFER,
+                self.buffer_descriptors(),
+            ),
         ];
         SetNeeds {
             counts: (counts.into_iter())
@@ -1038,22 +1190,62 @@ impl OwnedKernel {
 }
 
 impl OwnedSets {
-    /// One set of `kernel` (of storage buffers only) per entry of `ranges`, each binding `i`
-    /// written with the `i`-th `(buffer, offset, range)`.
-    pub(super) fn write(
+    /// No set yet, for `count` sets, from a fitted arena of their own, counted
+    /// (`WorkCounts::owned_descriptor_pools`): refused (internal) for none, and for a kernel whose
+    /// set 0 is pushed, which no set is allocated from (the module docs).
+    fn opened(device: &Device, count: usize, pushed: bool) -> Result<OwnedSets, Error> {
+        if count == 0 || u32::try_from(count).is_err() {
+            return Err(internal("owned sets that do not match their kernel"));
+        }
+        if pushed {
+            return Err(internal("owned sets of a kernel whose set 0 is pushed"));
+        }
+        device.shared().counts.owned_descriptor_pool();
+        Ok(OwnedSets {
+            arena: DescriptorArena::fitted(),
+            sets: Vec::with_capacity(count),
+        })
+    }
+
+    /// One set of `kernel` (of its `N` storage buffers only) per entry of `ranges`, each binding
+    /// `i` written with the `i`-th `(buffer, offset, range)`: each set's buffer infos and writes
+    /// on the stack, and the kernel's needs taken once.
+    pub(super) fn write<const N: usize>(
         device: &Device,
         kernel: &OwnedKernel,
-        ranges: &[Vec<(vk::Buffer, u64, u64)>],
+        ranges: &[[(vk::Buffer, u64, u64); N]],
     ) -> Result<OwnedSets, Error> {
-        let sets: Vec<OwnedSet> = ranges
-            .iter()
-            .map(|buffers| OwnedSet {
-                images: Vec::new(),
-                storage_images: Vec::new(),
-                buffers: buffers.clone(),
-            })
-            .collect();
-        OwnedSets::write_each(device, &vec![*kernel; ranges.len()], &sets)
+        if kernel.images > 0
+            || kernel.storage_images > 0
+            || kernel.buffers as usize != N
+            || kernel.first_buffers != 1
+        {
+            return Err(internal("owned sets that do not match their kernel"));
+        }
+        let mut owned = OwnedSets::opened(device, ranges.len(), kernel.pushed)?;
+        let needs = kernel.set_needs();
+        let raw = device.shared().vk();
+        for set in ranges {
+            let made = (owned.arena).allocate(device, kernel.set_layout, &needs)?;
+            owned.sets.push(made);
+            let infos = set.map(|(buffer, offset, range)| {
+                vk::DescriptorBufferInfo::default()
+                    .buffer(buffer)
+                    .offset(offset)
+                    .range(range)
+            });
+            let writes: [vk::WriteDescriptorSet; N] = std::array::from_fn(|binding| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(made)
+                    .dst_binding(binding as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(&infos[binding]))
+            });
+            // SAFETY: the set was just allocated and no command uses it; every buffer written is
+            // live (the caller's command retains them).
+            unsafe { raw.update_descriptor_sets(&writes, &[]) };
+        }
+        Ok(owned)
     }
 
     /// One set per entry of `sets`, of the kernel at its index in `kernels`, each written with
@@ -1066,25 +1258,17 @@ impl OwnedSets {
         sets: &[OwnedSet],
     ) -> Result<OwnedSets, Error> {
         let raw = device.shared().vk();
-        let count = u32::try_from(sets.len()).map_err(|_| internal("too many owned sets"))?;
         if kernels.len() != sets.len()
             || sets.iter().zip(kernels).any(|(set, kernel)| {
                 set.images.len() != kernel.images as usize
                     || set.storage_images.len() != kernel.storage_images as usize
-                    || set.buffers.len() != kernel.buffers as usize
+                    || set.buffers.len() != kernel.buffer_descriptors() as usize
             })
-            || count == 0
         {
             return Err(internal("owned sets that do not match their kernel"));
         }
-        if kernels.iter().any(|kernel| kernel.pushed) {
-            return Err(internal("owned sets of a kernel whose set 0 is pushed"));
-        }
-        device.shared().counts.owned_descriptor_pool();
-        let mut owned = OwnedSets {
-            arena: DescriptorArena::fitted(),
-            sets: Vec::with_capacity(count as usize),
-        };
+        let pushed = kernels.iter().any(|kernel| kernel.pushed);
+        let mut owned = OwnedSets::opened(device, sets.len(), pushed)?;
         for kernel in kernels {
             let set = (owned.arena).allocate(device, kernel.set_layout, &kernel.set_needs())?;
             owned.sets.push(set);
@@ -1139,11 +1323,13 @@ impl OwnedSets {
                         .image_info(std::slice::from_ref(info)),
                 );
             }
-            for (binding, info) in (images.len() + storage.len()..).zip(buffers) {
+            for (n, info) in (0..).zip(buffers) {
+                let (binding, element) = kernel.buffer_place(n);
                 writes.push(
                     vk::WriteDescriptorSet::default()
                         .dst_set(*set)
-                        .dst_binding(binding as u32)
+                        .dst_binding(binding)
+                        .dst_array_element(element)
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .buffer_info(std::slice::from_ref(info)),
                 );
@@ -1171,7 +1357,8 @@ pub(super) enum OwnedBinds {
 impl OwnedBinds {
     /// The binds of `kernel`'s dispatches on `device`, one per entry of `sets`: each its entry's
     /// sampled images, storage images (each in the `GENERAL` layout) and storage buffers, in
-    /// binding order.
+    /// binding order, the first storage-buffer binding's array elements in order
+    /// ([`OwnedKernel::buffer_place`]).
     pub(super) fn new(
         device: &Device,
         kernel: &OwnedKernel,
@@ -1192,7 +1379,7 @@ impl OwnedBinds {
         for set in sets {
             if set.images.len() != kernel.images as usize
                 || set.storage_images.len() != kernel.storage_images as usize
-                || set.buffers.len() != kernel.buffers as usize
+                || set.buffers.len() != kernel.buffer_descriptors() as usize
             {
                 return Err(internal("owned binds that do not match their kernel"));
             }
@@ -1204,23 +1391,31 @@ impl OwnedBinds {
                 .storage_images
                 .iter()
                 .map(|view| (vk::DescriptorType::STORAGE_IMAGE, image(view)));
-            let buffers = set.buffers.iter().map(|&(buffer, offset, range)| {
-                let info = vk::DescriptorBufferInfo {
-                    buffer,
-                    offset,
-                    range,
-                };
-                (vk::DescriptorType::STORAGE_BUFFER, Info::Buffer(info))
-            });
-            let writes = (0..)
-                .zip(images.chain(storage).chain(buffers))
+            let views = (0..)
+                .zip(images.chain(storage))
                 .map(|(binding, (ty, info))| SetWrite {
                     binding,
                     element: 0,
                     ty,
                     info,
-                })
-                .collect();
+                });
+            let buffers = (0..)
+                .zip(&set.buffers)
+                .map(|(n, &(buffer, offset, range))| {
+                    let (binding, element) = kernel.buffer_place(n);
+                    let info = vk::DescriptorBufferInfo {
+                        buffer,
+                        offset,
+                        range,
+                    };
+                    SetWrite {
+                        binding,
+                        element,
+                        ty: vk::DescriptorType::STORAGE_BUFFER,
+                        info: Info::Buffer(info),
+                    }
+                });
+            let writes = views.chain(buffers).collect();
             pushed.push(writes);
         }
         Ok(OwnedBinds::Pushed(pushed))

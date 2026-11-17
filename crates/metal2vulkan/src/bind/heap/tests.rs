@@ -35,6 +35,7 @@ fn shape(ty: TextureType, pf: PixelFormat, samples: u32, usage: TextureUsage) ->
         offset_base_axes: 0,
         ycbcr_in_place: false,
         ycbcr_planes_sampler: None,
+        texel_rows: false,
         texture_type: ty,
         pixel_format: pf,
         sample_count: samples,
@@ -123,7 +124,7 @@ fn fit_is_shape_samples_numeric_type_usage_and_aspect() {
     // A format the table holds no representation of fits no class: the heap does not know which
     // of its textures the function reads, so a resident one it cannot view is the neutral, and
     // nothing is refused.
-    let unheld = PixelFormat::ASTC4x2HDR;
+    let unheld = PixelFormat::RGB8Unorm;
     assert_eq!(fit(&shape(T::Type2D, unheld, 1, READ), &f2d), Fit::No);
     assert_eq!(
         fit(
@@ -587,15 +588,19 @@ fn resource_id_placement_puts_a_sampler_at_its_element() {
 
 /// A storage member is viewed through its direct format when its storage choice is `Identity`
 /// without an alias, the view the class's formatless declaration serves, or a half-float format's
-/// rounding, which a heap write takes from its handle's class; one needing a conversion view (bgra8
-/// or sRGB where the profile cannot store them directly) is a typed refusal. Both occur on the
-/// committed profiles, and every profile views a half-float member directly. An `A8Unorm` member
-/// held in red (`StorageImageClass::AlphaInRed`) is viewed through its `R8_UNORM` image, whose
-/// texels a heap access converts where the handle carries `A8Unorm`'s class: unswizzled, or
-/// swizzled to read as unswizzled; a swizzle that moves its alpha carries another class and is
-/// refused.
+/// rounding, which a heap write takes from its handle's class. One whose choice is an alias a heap
+/// access converts by (`storage_conversions`: an sRGB format through its UNORM twin where the
+/// profile stores no sRGB format, a blue-first one through its RGBA-order twin where it stores
+/// only that) is viewed through the alias, which the formatless declaration must serve and the
+/// image lists among its view formats, while a swizzle that loses its class is refused; another
+/// alias (`RGB9E5Float`'s word) is a typed refusal. An `A8Unorm` member held in red
+/// (`StorageImageClass::AlphaInRed`) is viewed through its `R8_UNORM` image, whose texels a heap
+/// access converts where the handle carries `A8Unorm`'s class: unswizzled, or swizzled to read as
+/// unswizzled; a swizzle that moves its alpha carries another class and is refused. Each occurs on
+/// the committed profiles; lavapipe views `RGBA8Unorm_sRGB`, `BGRA8Unorm_sRGB` and `BGR10A2Unorm`
+/// members through their aliases, and the M3 Max's MoltenVK, which stores them, directly.
 #[test]
-fn a_storage_member_needing_a_conversion_view_is_refused() {
+fn a_storage_member_is_viewed_through_the_alias_a_heap_access_converts() {
     let s2d = class(
         ImageDim::D2,
         false,
@@ -603,7 +608,8 @@ fn a_storage_member_needing_a_conversion_view_is_refused() {
         SampledType::Float,
         ImageAccess::Storage,
     );
-    let (mut direct, mut refused, mut in_red) = (0, 0, 0);
+    let (mut direct, mut refused, mut in_red, mut converted) = (0, 0, 0, 0);
+    let mut lavapipe = BTreeSet::new();
     for (stem, p) in committed_profiles().expect("profiles") {
         let planner = HeapPlanner {
             profile: &p,
@@ -617,6 +623,7 @@ fn a_storage_member_needing_a_conversion_view_is_refused() {
             sampling: BTreeSet::new(),
             write_rounding: BTreeMap::new(),
             cross_neutral: BTreeMap::new(),
+            storage_reads: BTreeMap::new(),
             sampler_tables: Vec::new(),
             samplers: None,
             directories: Vec::new(),
@@ -629,10 +636,14 @@ fn a_storage_member_needing_a_conversion_view_is_refused() {
             planned_directories: Vec::new(),
             diagnostics: Vec::new(),
         };
+        let conversions = storage_conversions(&p);
         for pf in [
             PixelFormat::RGBA8Unorm,
             PixelFormat::BGRA8Unorm,
             PixelFormat::RGBA8UnormSRGB,
+            PixelFormat::BGRA8UnormSRGB,
+            PixelFormat::BGR10A2Unorm,
+            PixelFormat::RGB9E5Float,
             PixelFormat::R16Float,
             PixelFormat::RGBA16Float,
             PixelFormat::A8Unorm,
@@ -640,7 +651,31 @@ fn a_storage_member_needing_a_conversion_view_is_refused() {
             let m = shape(TextureType::Type2D, pf, 1, WRITE);
             let got = planner.view(&m, &s2d, vk::ImageLayout::GENERAL);
             let half = matches!(pf, PixelFormat::R16Float | PixelFormat::RGBA16Float);
-            match storage_choice(pf, heap_storage_use(&p), &p) {
+            let use_ = heap_storage_use(&p);
+            use crate::metal::TextureSwizzle as S;
+            let swizzled = |swizzle: (S, S, S, S)| {
+                let mut swizzled = m;
+                if let TextureShape::Texture { swizzle: s, .. } = &mut swizzled {
+                    *s = crate::metal::TextureSwizzleChannels::new(
+                        swizzle.0, swizzle.1, swizzle.2, swizzle.3,
+                    );
+                }
+                planner.view(&swizzled, &s2d, vk::ImageLayout::GENERAL)
+            };
+            let not_implemented = Err(BindError::Unsupported(Unsupported::not_implemented(
+                Feature::ArgumentBufferTextures,
+            )));
+            if stem == "moltenvk-m3"
+                && !matches!(pf, PixelFormat::RGB9E5Float | PixelFormat::A8Unorm)
+                && !half
+            {
+                assert!(
+                    got.as_ref()
+                        .is_ok_and(|v| Some(v.format) == crate::metal::format::direct_format(pf)),
+                    "{stem} {pf:?}: viewed directly"
+                );
+            }
+            match storage_choice(pf, use_, &p) {
                 Ok(c) if half => {
                     let v = got.unwrap_or_else(|e| panic!("{stem} {pf:?} ({:?}): {e}", c.class));
                     assert_eq!(Some(v.format), crate::metal::format::direct_format(pf));
@@ -654,43 +689,54 @@ fn a_storage_member_needing_a_conversion_view_is_refused() {
                 Ok(c) if c.class == StorageImageClass::AlphaInRed => {
                     let v = got.unwrap_or_else(|e| panic!("{stem} {pf:?}: {e}"));
                     assert_eq!(v.format, vk::Format::R8_UNORM, "{stem}");
-                    use crate::metal::TextureSwizzle as S;
                     for (swizzle, kept) in [
                         ((S::Zero, S::Zero, S::Zero, S::Alpha), true),
                         ((S::Alpha, S::Zero, S::Zero, S::One), false),
                     ] {
-                        let mut swizzled = m;
-                        if let TextureShape::Texture { swizzle: s, .. } = &mut swizzled {
-                            *s = crate::metal::TextureSwizzleChannels::new(
-                                swizzle.0, swizzle.1, swizzle.2, swizzle.3,
-                            );
-                        }
-                        let got = planner.view(&swizzled, &s2d, vk::ImageLayout::GENERAL);
+                        let got = swizzled(swizzle);
                         match kept {
                             true => assert_eq!(
                                 got.map(|v| v.format),
                                 Ok(vk::Format::R8_UNORM),
                                 "{stem} {swizzle:?}"
                             ),
-                            false => assert_eq!(
-                                got,
-                                Err(BindError::Unsupported(Unsupported::not_implemented(
-                                    Feature::ArgumentBufferTextures
-                                ))),
-                                "{stem} {swizzle:?}"
-                            ),
+                            false => assert_eq!(got, not_implemented, "{stem} {swizzle:?}"),
                         }
                     }
                     in_red += 1;
                 }
+                Ok(c)
+                    if c.alias.is_some()
+                        && conversions.contains(&StorageConversion {
+                            index: crate::metal::texel_format::heap_class_index(
+                                pf,
+                                crate::metal::TextureSwizzleChannels::DEFAULT,
+                            ),
+                            red_blue: crate::metal::format::red_blue_exchanged(pf),
+                            class: c.class,
+                        }) =>
+                {
+                    match without_format_gaps(c.vk_format, use_, &p).is_empty() {
+                        true => {
+                            let v = got.unwrap_or_else(|e| panic!("{stem} {pf:?}: {e}"));
+                            assert_eq!(v.format, c.vk_format, "{stem} {pf:?}");
+                            assert!(crate::metal::format::storage_view_formats(pf, &p)
+                                .contains(&v.format));
+                            assert_eq!(
+                                swizzled((S::Blue, S::Green, S::Red, S::Alpha)),
+                                not_implemented,
+                                "{stem} {pf:?}: a swizzle that loses the class"
+                            );
+                            if stem == "lavapipe" {
+                                lavapipe.insert(pf);
+                            }
+                            converted += 1;
+                        }
+                        false => assert!(got.is_err(), "{stem} {pf:?}"),
+                    }
+                }
                 Ok(_) => {
-                    assert_eq!(
-                        got,
-                        Err(BindError::Unsupported(Unsupported::not_implemented(
-                            Feature::ArgumentBufferTextures
-                        ))),
-                        "{stem} {pf:?}"
-                    );
+                    assert_eq!(got, not_implemented, "{stem} {pf:?}");
                     refused += 1;
                 }
                 Err(_) => assert!(got.is_err(), "{stem} {pf:?}"),
@@ -698,9 +744,69 @@ fn a_storage_member_needing_a_conversion_view_is_refused() {
         }
     }
     assert!(
-        direct > 0 && refused > 0 && in_red > 0,
-        "direct {direct}, refused {refused}, in red {in_red}"
+        direct > 0 && refused > 0 && in_red > 0 && converted > 0,
+        "direct {direct}, refused {refused}, in red {in_red}, converted {converted}"
     );
+    assert_eq!(
+        lavapipe,
+        BTreeSet::from([
+            PixelFormat::RGBA8UnormSRGB,
+            PixelFormat::BGRA8UnormSRGB,
+            PixelFormat::BGR10A2Unorm,
+        ])
+    );
+}
+
+/// On lavapipe a heap's storage conversions are the alias a slot takes for each of the three
+/// formats `read-write-tier-held` sweeps beyond every tier, keyed apart from their red-first and
+/// UNORM kin by class and red-blue order; on the M3 Max's MoltenVK, which stores each format
+/// itself, there are none, so no module there converts or notes a conversion.
+#[test]
+fn a_heap_converts_by_class_and_red_blue_order() {
+    let key = |pf| {
+        (
+            crate::metal::texel_format::heap_class_index(
+                pf,
+                crate::metal::TextureSwizzleChannels::DEFAULT,
+            ),
+            crate::metal::format::red_blue_exchanged(pf),
+        )
+    };
+    for (stem, p) in committed_profiles().expect("profiles") {
+        let got: BTreeMap<(u32, bool), StorageImageClass> = storage_conversions(&p)
+            .into_iter()
+            .map(|c| ((c.index, c.red_blue), c.class))
+            .collect();
+        match stem.as_str() {
+            "lavapipe" => {
+                assert_eq!(
+                    got.get(&key(PixelFormat::RGBA8UnormSRGB)),
+                    Some(&StorageImageClass::SrgbEncode)
+                );
+                assert_eq!(
+                    got.get(&key(PixelFormat::BGRA8UnormSRGB)),
+                    Some(&StorageImageClass::SrgbEncode)
+                );
+                assert_eq!(
+                    got.get(&key(PixelFormat::BGR10A2Unorm)),
+                    Some(&StorageImageClass::SwizzleBgra)
+                );
+                for pf in [
+                    PixelFormat::RGBA8Unorm,
+                    PixelFormat::BGRA8Unorm,
+                    PixelFormat::RGB10A2Unorm,
+                ] {
+                    assert_eq!(got.get(&key(pf)), None, "{pf:?} is stored as it is");
+                }
+                assert_ne!(
+                    key(PixelFormat::BGR10A2Unorm),
+                    key(PixelFormat::RGB10A2Unorm)
+                );
+            }
+            "moltenvk-m3" => assert!(got.is_empty(), "{got:?}"),
+            _ => {}
+        }
+    }
 }
 
 /// One layout per bound texture: a slot whose own write or heap element is a storage image is
@@ -1162,8 +1268,10 @@ fn a_member_s_level_count_is_not_the_plan_s() {
     used.resource_id = Some(42);
     let mut state = BindState::default();
     state.used_resources.push(used);
-    let by_token: UsedByToken<'_> =
-        BTreeMap::from([(7, state.used_resources.iter().collect::<Vec<_>>())]);
+    let by_token = UsedByToken::Gathered(BTreeMap::from([(
+        7,
+        state.used_resources.iter().collect::<Vec<_>>(),
+    )]));
     let member = |shape: TextureShape| HeapMember {
         source: HeapSource::Used(7),
         shape,
@@ -1291,6 +1399,7 @@ fn a_form_a_heap_reads_is_held_raw_in_the_unsigned_class() {
         sampling,
         write_rounding: BTreeMap::new(),
         cross_neutral: BTreeMap::new(),
+        storage_reads: BTreeMap::new(),
         sampler_tables: Vec::new(),
         samplers: None,
         directories: Vec::new(),
@@ -1312,6 +1421,7 @@ fn a_form_a_heap_reads_is_held_raw_in_the_unsigned_class() {
         immutable_sampler: None,
         flags: vk::DescriptorBindingFlags::empty(),
         variables: 1,
+        immutable_samplers: Vec::new(),
     };
     let mut reads = planner(vec![f2d, u2d], BTreeSet::new());
     let float = reads.array(1, &binding(f2d)).expect("float array");
@@ -1363,6 +1473,7 @@ fn a_heap_member_a_mode_two_write_would_round_is_refused() {
         immutable_sampler: None,
         flags: vk::DescriptorBindingFlags::empty(),
         variables: 1,
+        immutable_samplers: Vec::new(),
     };
     let mut checked = 0;
     for (stem, p) in committed_profiles().expect("profiles") {
@@ -1399,6 +1510,7 @@ fn a_heap_member_a_mode_two_write_would_round_is_refused() {
                     sampling: BTreeSet::new(),
                     write_rounding: BTreeMap::from([(stage, halves)]),
                     cross_neutral: BTreeMap::new(),
+                    storage_reads: BTreeMap::new(),
                     sampler_tables: Vec::new(),
                     samplers: None,
                     directories: Vec::new(),
@@ -1424,4 +1536,217 @@ fn a_heap_member_a_mode_two_write_would_round_is_refused() {
         }
     }
     assert!(checked > 0, "no profile holds a format the check refuses");
+}
+
+/// A state listed in token order (`BindState::used_in_token_order`) is searched, not gathered by
+/// token, and gives the same tables and heap elements as the same state listed so without the
+/// flag: among a buffer per token around them, with a member listed twice under one id, and the
+/// same internal errors for a member listed with two ids and a member not listed.
+#[test]
+fn a_state_in_token_order_finds_its_members_by_search() {
+    let t2d = shape(TextureType::Type2D, PixelFormat::RGBA8Unorm, 1, READ);
+    let texture = || {
+        ResourceClass::Texture(TextureFacts::new(
+            TextureType::Type2D,
+            PixelFormat::RGBA8Unorm,
+        ))
+    };
+    let mut state = BindState::default();
+    let mut template = ResourceTemplate::default();
+    for token in 0..200u32 {
+        let member = token % 50 == 7;
+        let class = match member {
+            true => texture(),
+            false => ResourceClass::Buffer,
+        };
+        let mut u = UsedResource::new(class, token);
+        u.resource_id = member.then_some(u64::from(token) + 1);
+        state.used_resources.push(u);
+        if token == 57 {
+            state.used_resources.push(u);
+        }
+        if member {
+            template.heap_members.push(HeapMember {
+                source: HeapSource::Used(token),
+                shape: t2d,
+                stages: vec![Stage::Kernel],
+            });
+        }
+    }
+    state.heap_placement = HeapPlacement::ResourceId;
+    let planned = PlannedHandleTable {
+        set: 0,
+        binding: 4,
+        stage: Stage::Kernel,
+        entries: 8,
+    };
+    let mut ordered = state.clone();
+    ordered.used_in_token_order = true;
+    assert!(matches!(UsedByToken::of(&ordered), UsedByToken::Listed(..)));
+    assert!(matches!(UsedByToken::of(&state), UsedByToken::Gathered(_)));
+    let tables = |state: &BindState| handle_table_bytes(&template.heap_members, &[planned], state);
+    let elements = |state: &BindState| heap_elements(&template, state, 1024);
+    assert_eq!(
+        tables(&ordered).expect("ordered"),
+        tables(&state).expect("any")
+    );
+    assert_eq!(
+        elements(&ordered).expect("ordered"),
+        elements(&state).expect("any")
+    );
+    // Member 107 listed again with another id, beside its first entry.
+    for state in [&state, &ordered] {
+        let mut twice = state.clone();
+        let at = 1 + twice
+            .used_resources
+            .iter()
+            .position(|u| u.token == 107)
+            .unwrap();
+        let mut again = twice.used_resources[at - 1];
+        again.resource_id = Some(999);
+        twice.used_resources.insert(at, again);
+        assert!(matches!(tables(&twice), Err(BindError::Internal(_))));
+        assert!(matches!(elements(&twice), Err(BindError::Internal(_))));
+        let mut missing = state.clone();
+        missing.used_resources.retain(|u| u.token != 157);
+        assert!(matches!(tables(&missing), Err(BindError::Internal(_))));
+        assert!(matches!(elements(&missing), Err(BindError::Internal(_))));
+    }
+}
+
+/// A state listed in token order finds its heap members' entries searching forward from where
+/// the last member's ended, the plan's members ascending by token (`members`): 4096 textures,
+/// each beside a buffer, compare a few entries a member (an upper bound of 8), not the logarithm
+/// of the 8192 listed twice over, for the tables and for the elements; each answering as the same
+/// state in no order does. A member past an out-of-order lookup is searched from the list's start
+/// and found alike.
+#[test]
+fn a_state_in_token_order_finds_its_members_searching_forward() {
+    const MEMBERS: u32 = 4096;
+    let t2d = shape(TextureType::Type2D, PixelFormat::RGBA8Unorm, 1, READ);
+    let mut state = BindState::default();
+    let mut template = ResourceTemplate::default();
+    for member in 0..MEMBERS {
+        let token = 2 * member + 1;
+        state
+            .used_resources
+            .push(UsedResource::new(ResourceClass::Buffer, token - 1));
+        let class = ResourceClass::Texture(TextureFacts::new(
+            TextureType::Type2D,
+            PixelFormat::RGBA8Unorm,
+        ));
+        let mut texture = UsedResource::new(class, token);
+        texture.resource_id = Some(u64::from(token) + 1);
+        state.used_resources.push(texture);
+        template.heap_members.push(HeapMember {
+            source: HeapSource::Used(token),
+            shape: t2d,
+            stages: vec![Stage::Kernel],
+        });
+    }
+    state.heap_placement = HeapPlacement::ResourceId;
+    let planned = PlannedHandleTable {
+        set: 0,
+        binding: 4,
+        stage: Stage::Kernel,
+        entries: 2 * MEMBERS + 8,
+    };
+    let mut ordered = state.clone();
+    ordered.used_in_token_order = true;
+    let looked_at = |work: &dyn Fn()| {
+        LISTED_LOOKED_AT.with(|looked| looked.set(0));
+        work();
+        LISTED_LOOKED_AT.with(Cell::get)
+    };
+    let tables = |state: &BindState| handle_table_bytes(&template.heap_members, &[planned], state);
+    let elements = |state: &BindState| heap_elements(&template, state, 4 * MEMBERS);
+    let bound = 8 * u64::from(MEMBERS);
+    let looked = looked_at(&|| assert_eq!(tables(&ordered).unwrap(), tables(&state).unwrap()));
+    assert!(looked <= bound, "the tables' lookups compared {looked}");
+    let looked = looked_at(&|| assert_eq!(elements(&ordered).unwrap(), elements(&state).unwrap()));
+    assert!(looked <= bound, "the elements' lookups compared {looked}");
+    // The members in another order: each found from the list's start where it lies before the
+    // last, as the same state in no order finds it.
+    let mut shuffled = template.clone();
+    shuffled.heap_members.reverse();
+    let elements = |state: &BindState| heap_elements(&shuffled, state, 4 * MEMBERS);
+    assert_eq!(elements(&ordered).unwrap(), elements(&state).unwrap());
+}
+
+/// A texture buffer fits only a texel-buffer class: the one of its numeric type holds it, where its
+/// usage has the class's access (its facts' usage; a slot's bound texture buffer states none), and
+/// one of another numeric type fits it in everything but that; no image class fits it. On every
+/// committed profile whose uniform texel buffers take `RGBA32Float`, its element in the sampled
+/// float class is a texel view of `R32G32B32A32_SFLOAT`, the neutral in the other numeric classes,
+/// and a swizzled one, whose swizzle a texel view cannot present, is `Unsupported`.
+#[test]
+fn a_texture_buffer_is_held_by_the_texel_buffer_class_of_its_numeric_type() {
+    use ImageAccess::{Sampled, Storage};
+    use SampledType::{Float, Uint};
+    let fb = class(ImageDim::Buffer, false, false, Float, Sampled);
+    let ub = class(ImageDim::Buffer, false, false, Uint, Sampled);
+    let fsb = class(ImageDim::Buffer, false, false, Float, Storage);
+    let f2d = class(ImageDim::D2, false, false, Float, Sampled);
+    let rgba = PixelFormat::RGBA32Float;
+    let bound = TextureShape::Buffer {
+        pixel_format: rgba,
+        swizzle: crate::metal::TextureSwizzleChannels::DEFAULT,
+    };
+    let read = shape(TextureType::TextureBuffer, rgba, 1, READ);
+    let write = shape(TextureType::TextureBuffer, rgba, 1, WRITE);
+    for s in [&bound, &read] {
+        assert_eq!(fit(s, &fb), Fit::Holds);
+        assert_eq!(fit(s, &ub), Fit::NumericType);
+        assert_eq!(fit(s, &f2d), Fit::No);
+    }
+    assert_eq!(fit(&bound, &fsb), Fit::Holds);
+    assert_eq!(fit(&read, &fsb), Fit::No);
+    assert_eq!(fit(&write, &fsb), Fit::Holds);
+    assert_eq!(fit(&write, &fb), Fit::No);
+    assert_eq!(
+        fit(&shape(TextureType::Type2D, rgba, 1, READ), &fb),
+        Fit::No
+    );
+
+    let layout = vk::ImageLayout::GENERAL;
+    let image = HandleClass::Image;
+    let mut held = 0;
+    for (stem, p) in &committed_profiles().expect("profiles") {
+        if !p.supports_format(
+            vk::Format::R32G32B32A32_SFLOAT,
+            FormatUsage::UniformTexelBuffer,
+        ) {
+            continue;
+        }
+        held += 1;
+        let facts = TextureFacts::new(TextureType::TextureBuffer, rgba);
+        assert_eq!(
+            heap_element(p, &image(fb), &facts, layout),
+            Ok(HeapElement::TexelBuffer(vk::Format::R32G32B32A32_SFLOAT)),
+            "{stem}"
+        );
+        assert_eq!(
+            heap_element(p, &image(ub), &facts, layout),
+            Ok(HeapElement::Neutral),
+            "{stem}"
+        );
+        assert_eq!(
+            heap_element(p, &image(f2d), &facts, layout),
+            Ok(HeapElement::Neutral),
+            "{stem}"
+        );
+        let mut swizzled = facts;
+        swizzled.swizzle.red = crate::metal::TextureSwizzle::Zero;
+        assert_eq!(
+            heap_element(p, &image(fb), &swizzled, layout),
+            Err(BindError::Unsupported(Unsupported::not_implemented(
+                Feature::TextureSwizzle
+            ))),
+            "{stem}"
+        );
+    }
+    assert!(
+        held > 0,
+        "no committed profile takes RGBA32Float texel buffers"
+    );
 }

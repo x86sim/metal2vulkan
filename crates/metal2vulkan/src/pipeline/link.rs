@@ -24,7 +24,10 @@
 //!   (`memory::handles::TABLE_CAPACITY`). The binder writes element 0 of each array with its
 //!   class's neutral and every resident texture at its own element. The function tables' array
 //!   (`HandleClass::FunctionTable`) is a storage-buffer array, which needs
-//!   `descriptorBindingStorageBufferUpdateAfterBind` and counts in the storage-buffer limits.
+//!   `descriptorBindingStorageBufferUpdateAfterBind` and counts in the storage-buffer limits. A
+//!   texture buffer class's array is a uniform texel buffer array (sampled) or a storage texel
+//!   buffer array (storage), which needs the type's update-after-bind feature and counts in the
+//!   sampled-image or the storage-image limits, as Vulkan counts texel buffers.
 //! - **Specialization ids** are numbered densely in [`SpecKey`] order over the pipeline; a key two
 //!   stages declare gets one id.
 //! - **Locations** ([`varyings`]) from each stage's stage-IO contract: attributes densely by index,
@@ -47,7 +50,9 @@
 //!   function's pipeline ([`mesh`]) adds a synthesized vertex stage, which reads the mesh
 //!   function's records binding too (its stage flags are both stages').
 
+pub mod band;
 pub mod contract;
+pub mod fan_out;
 pub mod fetch;
 pub mod geometry;
 pub mod graphics;
@@ -79,12 +84,14 @@ use crate::pipeline::descriptor::{
     ColorAttachmentDescriptor, MeshPipelineDescriptor, RenderPipelineDescriptor,
     TessellationDescriptor, VertexDescriptor,
 };
+use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::graphics::GraphicsState;
 use crate::pipeline::interface::{PipelineInterface, StageDescriptor, StageInterface};
 use crate::pipeline::layout::{
     BindingSource, DescriptorBinding, DescriptorSetLayout, PipelineLayout, PushConstantRange,
 };
 use crate::pipeline::lower_inputs::ColorGroup;
+use crate::pipeline::stage_io::StageBuiltin;
 use crate::pipeline::sym::{
     CombinedSampler, HandleClass, ResourceKind, ResourceSlot, SlotClass, SlotRef, SpecKey, Stage,
 };
@@ -155,7 +162,10 @@ impl LinkInputs {
     ) -> LinkInputs {
         let mut r = RenderLinkInputs::from(desc);
         r.pulled_vertex_buffers = variant.pulled_vertex_buffers.clone();
+        r.pull_every = variant.primitive_id_indices.is_some() || variant.private_list;
         r.color_group = group;
+        r.line_band = variant.line_band;
+        r.region_fan_out = variant.region_fan_out;
         LinkInputs::Render(Box::new(r))
     }
 
@@ -182,6 +192,10 @@ pub struct RenderLinkInputs {
     /// The layouts a pulled-vertex-buffer variant pulls (`VariantKey::pulled_vertex_buffers`);
     /// empty on the common path.
     pub pulled_vertex_buffers: BTreeSet<u32>,
+    /// The variant pulls every attribute (`vertex::vertex_fetch_projection_for`'s `pull_every`):
+    /// the de-indexed and private list forms (`VariantKey::primitive_id_indices`,
+    /// `VariantKey::private_list`), whose vertex stage is compiled so.
+    pub pull_every: bool,
     /// `maxVertexAmplificationCount`.
     pub max_vertex_amplification_count: u32,
     /// The descriptor's tessellation state: read when the vertex stage is a post-tessellation
@@ -193,6 +207,14 @@ pub struct RenderLinkInputs {
     /// alone [`color_attachments`](Self::color_attachments) holds, at their locations
     /// (`GraphicsState::color_group`); `None` where each attachment is at its own index.
     pub color_group: Option<ColorGroup>,
+    /// The variant draws its lines, or its triangles' edges, as bands through synthesized
+    /// tessellation stages (`VariantKey::line_band`, [`band`]), each patch one primitive of this
+    /// kind; `None` for every other variant.
+    pub line_band: Option<crate::pipeline::BandPrimitive>,
+    /// The variant draws a rate-mapped pass's triangles once, its triangle class's geometry stage
+    /// fanning each out to its regions (`VariantKey::region_fan_out`, [`fan_out`]); `None` for
+    /// every other variant.
+    pub region_fan_out: Option<crate::pipeline::RegionFanOut>,
 }
 
 impl RenderLinkInputs {
@@ -209,10 +231,13 @@ impl RenderLinkInputs {
             rasterization_enabled: true,
             input_primitive_topology: metal::PrimitiveTopologyClass::Unspecified,
             pulled_vertex_buffers: BTreeSet::new(),
+            pull_every: false,
             max_vertex_amplification_count: 1,
             tessellation: None,
             texture_write_rounding_mode: metal::TextureWriteRoundingMode::TowardZero,
             color_group: None,
+            line_band: None,
+            region_fan_out: None,
         }
     }
 }
@@ -236,10 +261,13 @@ impl From<&RenderPipelineDescriptor> for RenderLinkInputs {
             rasterization_enabled: d.rasterization_enabled,
             input_primitive_topology: d.input_primitive_topology,
             pulled_vertex_buffers: BTreeSet::new(),
+            pull_every: false,
             max_vertex_amplification_count: d.max_vertex_amplification_count,
             tessellation: d.tessellation,
             texture_write_rounding_mode: d.texture_write_rounding_mode,
             color_group: None,
+            line_band: None,
+            region_fan_out: None,
         }
     }
 }
@@ -254,6 +282,7 @@ impl From<&MeshPipelineDescriptor> for RenderLinkInputs {
             alpha_to_coverage: d.alpha_to_coverage,
             alpha_to_one: d.alpha_to_one,
             rasterization_enabled: d.rasterization_enabled,
+            max_vertex_amplification_count: d.max_vertex_amplification_count,
             texture_write_rounding_mode: d.texture_write_rounding_mode,
             ..RenderLinkInputs::new()
         }
@@ -301,6 +330,9 @@ pub struct Linked {
     /// `[[barycentric_coord]]` as varyings, or whose vertex function selects its slice or
     /// viewport through them ([`geometry`]): the compile API builds them.
     pub geometry: Option<geometry::GeometryStages>,
+    /// The synthesized control and evaluation stages of a render pipeline variant that draws its
+    /// lines as bands ([`band`]), with their push range placed: the compile API builds them.
+    pub band: Option<band::LineBand>,
 }
 
 impl SymbolTable for Linked {
@@ -349,6 +381,7 @@ pub fn link(
             r.input_primitive_topology,
             r.max_vertex_amplification_count,
             false,
+            r.region_fan_out,
             p,
         )?,
         LinkInputs::Mesh(r) => geometry::plan(
@@ -356,9 +389,24 @@ pub fn link(
             r.input_primitive_topology,
             r.max_vertex_amplification_count,
             true,
+            r.region_fan_out,
             p,
         )?,
         LinkInputs::Standalone | LinkInputs::Compute => None,
+    };
+    // A variant that draws its lines, or its triangles' edges, as bands draws them through
+    // synthesized tessellation stages.
+    let band = match inputs {
+        LinkInputs::Render(r) => match r.line_band {
+            Some(primitive) => Some(band::plan(
+                &ifaces,
+                (primitive, geometry.is_some()),
+                r.max_vertex_amplification_count,
+                p,
+            )?),
+            None => None,
+        },
+        _ => None,
     };
     // A mesh function reads its payload within its object function's. An emulated mesh
     // function's pipeline draws through a synthesized vertex stage, which reads the records the
@@ -382,11 +430,24 @@ pub fn link(
         synthesized.push((mesh::RECORDS_SLOT, vk::ShaderStageFlags::VERTEX));
         synthesized.push((mesh::WORK_SLOT, vk::ShaderStageFlags::VERTEX));
     }
+    // A fan-out variant's triangle stage reads the region table, and a probe's writes its flags.
+    if let Some(fan) = geometry.as_ref().and_then(|g| g.fan_out) {
+        let stage = vk::ShaderStageFlags::GEOMETRY;
+        synthesized.push((fan_out::REGIONS_SLOT, stage));
+        if fan.mode == crate::pipeline::RegionFanOut::Probe {
+            synthesized.push((fan_out::FLAGS_SLOT, stage));
+        }
+    }
     let mut layout = layout(&ifaces, &synthesized, &mut table, p)?;
     count_variables(&mut layout, stages, &table);
     let control = match plan {
         Some(plan) => {
-            let offset = tessellation::push_offset(&layout.push_constants, p)?;
+            let offset = tessellation::push_offset(
+                &layout.push_constants,
+                (tessellation::control::PUSH_BYTES, 4),
+                Feature::Tessellation,
+                p,
+            )?;
             layout.push_constants.push(PushConstantRange {
                 stages: vk::ShaderStageFlags::TESSELLATION_CONTROL,
                 offset,
@@ -396,9 +457,44 @@ pub fn link(
         }
         None => None,
     };
+    let band = match band {
+        Some(mut b) => {
+            b.push_offset = tessellation::push_offset(
+                &layout.push_constants,
+                (band::LineBand::PUSH_BYTES, band::LineBand::PUSH_BYTES),
+                Feature::WideLines,
+                p,
+            )?;
+            layout.push_constants.push(PushConstantRange {
+                stages: vk::ShaderStageFlags::TESSELLATION_EVALUATION,
+                offset: b.push_offset,
+                size: band::LineBand::PUSH_BYTES,
+            });
+            Some(b)
+        }
+        None => None,
+    };
+    // A fan-out probe's stage pushes the index of its flag.
+    let mut geometry = geometry;
+    if let Some(fan) = geometry.as_mut().and_then(|g| g.fan_out.as_mut()) {
+        if fan.mode == crate::pipeline::RegionFanOut::Probe {
+            let offset = tessellation::push_offset(
+                &layout.push_constants,
+                (fan_out::PUSH_BYTES, 4),
+                Feature::RasterizationRateMap,
+                p,
+            )?;
+            layout.push_constants.push(PushConstantRange {
+                stages: vk::ShaderStageFlags::GEOMETRY,
+                offset,
+                size: fan_out::PUSH_BYTES,
+            });
+            fan.push_offset = offset;
+        }
+    }
     let specialization = specialize(&ifaces, &mut table)?;
     table.locations = varyings::assign(stages, p)?;
-    if let Some(g) = &geometry {
+    if let Some(g) = &mut geometry {
         g.check_limits(&table.locations, p)?;
     }
     let interface = pipeline_interface(&ifaces);
@@ -414,7 +510,7 @@ pub fn link(
                     let vi = vertex::vertex_input_state(
                         vs,
                         r.vertex_descriptor.as_ref(),
-                        &r.pulled_vertex_buffers,
+                        (&r.pulled_vertex_buffers, r.pull_every),
                         &table.locations,
                         p,
                     )?;
@@ -437,6 +533,38 @@ pub fn link(
                 });
                 gs.emulated_tessellation = Some(e);
             }
+            // A band variant draws each primitive as a patch of its vertices, which no draw
+            // changes.
+            if let Some(b) = &band {
+                gs.topology = vk::PrimitiveTopology::PATCH_LIST;
+                gs.dynamic_states.retain(|d| {
+                    !matches!(
+                        *d,
+                        vk::DynamicState::PRIMITIVE_TOPOLOGY
+                            | vk::DynamicState::PRIMITIVE_RESTART_ENABLE
+                    )
+                });
+                gs.line_band = Some(crate::pipeline::graphics::LineBandState {
+                    push_offset: b.push_offset,
+                    primitive: b.primitive,
+                });
+            }
+            if let Some(fan) = geometry.as_ref().and_then(|g| g.fan_out) {
+                gs.region_fan_out = Some(crate::pipeline::graphics::FanOutState {
+                    mode: fan.mode,
+                    copies: fan.copies,
+                    push_offset: fan.push_offset,
+                });
+            }
+            // A region-copy variant draws no geometry stage: its vertex function draws its region's
+            // copy, the box of regions of a recording pushed at its `RegionBox` field.
+            if r.region_fan_out == Some(crate::pipeline::RegionFanOut::RegionCopies) {
+                gs.region_fan_out = Some(crate::pipeline::graphics::FanOutState {
+                    mode: crate::pipeline::RegionFanOut::RegionCopies,
+                    copies: 0,
+                    push_offset: region_box(vs)?,
+                });
+            }
             (vi, Some(gs))
         }
         // The mesh stage stands in the vertex stage's place; the fragment stage follows it.
@@ -448,6 +576,7 @@ pub fn link(
             let vi = VertexInputState::default();
             let fragment = stages.get(at + 1).copied();
             let mut gs = render_state(r, ifaces[at], fragment, &vi, None, p)?;
+            gs.mesh_corners = ifaces[at].mesh_corners;
             // An emulated mesh function's primitives are drawn as a list of their kind.
             if let Some(records) = records {
                 gs.topology = records.topology();
@@ -488,11 +617,28 @@ pub fn link(
         specialization,
         control: control.map(|(plan, offset)| plan.control(offset)),
         geometry,
+        band,
     })
 }
 
 /// The graphics state of a render or mesh render pipeline whose geometry stage (its vertex or
 /// mesh stage) is `geometry`, with its fragment stage's.
+/// The byte offset of the push-constant block a region-copy variant's vertex function `vs` reads
+/// its recording's box of regions at (`PushField::RegionBox`): each recording pushes its own, so
+/// a function that holds it in its `ArgumentTable`, or reads none, is
+/// `NotImplemented(RasterizationRateMap)`.
+fn region_box(vs: &StageInterface) -> Result<u32, Error> {
+    let at = vs
+        .push
+        .fields
+        .iter()
+        .find(|f| f.field == crate::pipeline::sym::PushField::RegionBox);
+    match at.map(|f| f.loc) {
+        Some(crate::pipeline::interface::PushLoc::Push { offset }) => Ok(offset),
+        _ => Err(Unsupported::not_implemented(Feature::RasterizationRateMap).into()),
+    }
+}
+
 fn render_state(
     r: &RenderLinkInputs,
     geometry: &StageInterface,
@@ -515,11 +661,20 @@ fn render_state(
     // The extended-range blends the fragment computes over input attachments, against this
     // pipeline's attachments.
     let input_blends = fetch::input_blends(r, fragment, p)?;
+    // Those of them held with their channels rotated, whose input attachments link admits for
+    // that blend alone.
+    let rotated_inputs: BTreeSet<u32> = (fragment.into_iter().flat_map(|f| &f.facts))
+        .filter_map(|fact| match *fact {
+            RuntimeFact::RotatedInputBlend { color, .. } => Some(color),
+            _ => None,
+        })
+        .collect();
     // The word merges the fragment computes over input attachments, against this pipeline's
     // write masks.
     fetch::word_merges(r, fragment, p)?;
     let fs = fragment.map(|f| &f.interface);
-    let mut gs = graphics::graphics_state(r, (geometry, fs), vi, ts, &input_blends, p)?;
+    let blends = (&input_blends, &rotated_inputs);
+    let mut gs = graphics::graphics_state(r, (geometry, fs), vi, ts, blends, p)?;
     // The color writes the fragment rounds against this pipeline's attachments, once the
     // descriptor's checks of its outputs passed.
     crate::pipeline::color_writes::check(
@@ -577,7 +732,8 @@ fn mismatch(expected: Stage, found: Stage) -> Error {
 
 /// The stages match the pipeline kind: one kernel; a vertex stage and a fragment stage exactly
 /// when rasterization is enabled; an optional object stage, a mesh stage, and a fragment stage
-/// exactly when rasterization is enabled; or any one stage alone.
+/// exactly when rasterization is enabled; or any one stage alone. A rasterizing render
+/// pipeline's vertex stage writes its position (`DescriptorError::RasterizedVoidVertex`).
 fn check_stages(ifaces: &[&StageInterface], inputs: &LinkInputs) -> Result<(), Error> {
     let stages: Vec<Stage> = ifaces.iter().map(|i| i.stage).collect();
     match inputs {
@@ -631,9 +787,19 @@ fn check_stages(ifaces: &[&StageInterface], inputs: &LinkInputs) -> Result<(), E
                     None => return Err(missing_stage(*want)),
                 }
             }
-            match stages.get(expected.len()) {
-                Some(extra) => Err(mismatch(*expected.last().unwrap_or(&Stage::Vertex), *extra)),
-                None => Ok(()),
+            if let Some(extra) = stages.get(expected.len()) {
+                return Err(mismatch(*expected.last().unwrap_or(&Stage::Vertex), *extra));
+            }
+            // Metal refuses a rasterizing pipeline whose vertex function returns `void`, the one
+            // vertex function without a position, which the compile read from its entry.
+            let positioned = |iface: &StageInterface| {
+                (iface.io.builtins.iter()).any(|b| matches!(b, StageBuiltin::Position { .. }))
+            };
+            match ifaces.first() {
+                Some(vertex) if r.rasterization_enabled && !positioned(vertex) => Err(
+                    Error::InvalidDescriptor(DescriptorError::RasterizedVoidVertex),
+                ),
+                _ => Ok(()),
             }
         }
     }
@@ -689,7 +855,52 @@ fn binding_source(slot: ResourceSlot) -> BindingSource {
         ResourceKind::ExtendedShadow(color) => BindingSource::ExtendedShadow(color),
         ResourceKind::SnapshotTexels(texture) => BindingSource::SnapshotTexels(texture),
         ResourceKind::YCbCrPlanes(_) => BindingSource::YCbCrPlanes(metal(SlotClass::Texture)),
+        ResourceKind::SamplerArray { compare, integer } => BindingSource::SamplerArray {
+            stage: slot.stage,
+            compare,
+            integer,
+        },
     }
+}
+
+/// The immutable samplers of constexpr sampler array `slot` (`ResourceKind::SamplerArray`),
+/// whose binding holds `count` of them: each element's constexpr sampler, as its stage's interface
+/// lists them, made for the kind's use. Empty for every other binding.
+fn immutable_samplers(
+    slot: ResourceSlot,
+    count: u32,
+    ifaces: &[&StageInterface],
+    p: &DeviceProfile,
+) -> Result<Vec<vk::SamplerDesc>, Error> {
+    let ResourceKind::SamplerArray { compare, integer } = slot.kind else {
+        return Ok(Vec::new());
+    };
+    let invariant = |detail: &str| {
+        Error::Internal(InternalError::new(
+            InternalKind::Invariant,
+            format!("sampler array {slot:?}: {detail}"),
+        ))
+    };
+    let array = ifaces
+        .iter()
+        .filter(|i| i.stage == slot.stage)
+        .flat_map(|i| &i.sampler_arrays)
+        .find(|a| a.slot == slot)
+        .ok_or_else(|| invariant("not in its stage's interface"))?;
+    if u32::try_from(array.samplers.len()).ok() != Some(count) {
+        return Err(invariant("its samplers do not fill its count"));
+    }
+    let use_ = crate::metal::sampler::SamplerUse::new(compare, integer);
+    array
+        .samplers
+        .iter()
+        .map(|s| match *s {
+            crate::pipeline::sym::SamplerRef::Constexpr(words) => {
+                crate::lower::sampler::constexpr_desc(words, use_, p)
+            }
+            crate::pipeline::sym::SamplerRef::Slot(_) => Err(invariant("a runtime sampler")),
+        })
+        .collect()
 }
 
 /// The immutable sampler of binding `slot`: a combined image sampler's, heap sampler's, or
@@ -887,6 +1098,7 @@ fn layout(
             immutable_sampler: immutable_sampler(slot, p)?,
             flags: vk::DescriptorBindingFlags::empty(),
             variables: 0,
+            immutable_samplers: immutable_samplers(slot, d.count, ifaces, p)?,
         });
     }
     check_set_limits(&bindings, p)?;
@@ -969,48 +1181,24 @@ fn heap_set(
     if heap.is_empty() {
         return Ok(None);
     }
-    let d = &p.fields().descriptors;
     // The layout's own features (the module states its indexing features); `select` refuses a
     // function whose heap the profile cannot hold, so a miss here is a function compiled for
     // another profile.
     let mut missing = Vec::new();
-    let mut need = |has: bool, f: VkFeature| {
-        if !has && !missing.contains(&Capability::Feature(f)) {
-            missing.push(Capability::Feature(f));
-        }
-    };
-    need(
-        d.runtime_descriptor_array,
-        VkFeature::RuntimeDescriptorArray,
-    );
-    need(
-        d.partially_bound,
-        VkFeature::DescriptorBindingPartiallyBound,
-    );
     // The feature a missing capability is refused as: the function tables' where only their array
     // needs it, else the textures'.
     let mut feature = Feature::DynamicCall;
     for h in heap.values() {
-        match h.ty {
-            vk::DescriptorType::SAMPLER | vk::DescriptorType::SAMPLED_IMAGE => {
-                feature = Feature::ArgumentBufferTextures;
-                need(
-                    d.update_after_bind_sampled_image,
-                    VkFeature::DescriptorBindingSampledImageUpdateAfterBind,
-                )
+        if h.ty != vk::DescriptorType::STORAGE_BUFFER {
+            feature = Feature::ArgumentBufferTextures;
+        }
+        let Some(lacks) = heap_layout_lacks(p, h.ty) else {
+            return Err(Unsupported::not_implemented(Feature::ArgumentBufferTextures).into());
+        };
+        for f in lacks {
+            if !missing.contains(&Capability::Feature(f)) {
+                missing.push(Capability::Feature(f));
             }
-            vk::DescriptorType::STORAGE_IMAGE => {
-                feature = Feature::ArgumentBufferTextures;
-                need(
-                    d.update_after_bind_storage_image,
-                    VkFeature::DescriptorBindingStorageImageUpdateAfterBind,
-                )
-            }
-            vk::DescriptorType::STORAGE_BUFFER => need(
-                d.update_after_bind_storage_buffer,
-                VkFeature::DescriptorBindingStorageBufferUpdateAfterBind,
-            ),
-            _ => return Err(Unsupported::not_implemented(Feature::ArgumentBufferTextures).into()),
         }
     }
     if !missing.is_empty() {
@@ -1040,6 +1228,7 @@ fn heap_set(
             immutable_sampler: None,
             flags,
             variables: 0,
+            immutable_samplers: Vec::new(),
         });
     }
     Ok(Some(DescriptorSetLayout {
@@ -1047,6 +1236,83 @@ fn heap_set(
         bindings,
         flags: vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL,
     }))
+}
+
+/// The features a set-1 array of descriptor type `ty` needs in its layout that `p` lacks (the
+/// module docs), in the order they are refused: `runtimeDescriptorArray`,
+/// `descriptorBindingPartiallyBound`, then the type's update-after-bind feature. `None` for a type
+/// no heap array has.
+fn heap_layout_lacks(p: &DeviceProfile, ty: vk::DescriptorType) -> Option<Vec<VkFeature>> {
+    let d = &p.fields().descriptors;
+    let typed = match ty {
+        vk::DescriptorType::SAMPLER | vk::DescriptorType::SAMPLED_IMAGE => (
+            d.update_after_bind_sampled_image,
+            VkFeature::DescriptorBindingSampledImageUpdateAfterBind,
+        ),
+        vk::DescriptorType::STORAGE_IMAGE => (
+            d.update_after_bind_storage_image,
+            VkFeature::DescriptorBindingStorageImageUpdateAfterBind,
+        ),
+        vk::DescriptorType::STORAGE_BUFFER => (
+            d.update_after_bind_storage_buffer,
+            VkFeature::DescriptorBindingStorageBufferUpdateAfterBind,
+        ),
+        vk::DescriptorType::UNIFORM_TEXEL_BUFFER => (
+            d.update_after_bind_uniform_texel_buffer,
+            VkFeature::DescriptorBindingUniformTexelBufferUpdateAfterBind,
+        ),
+        vk::DescriptorType::STORAGE_TEXEL_BUFFER => (
+            d.update_after_bind_storage_texel_buffer,
+            VkFeature::DescriptorBindingStorageTexelBufferUpdateAfterBind,
+        ),
+        _ => return None,
+    };
+    let needs = [
+        (
+            d.runtime_descriptor_array,
+            VkFeature::RuntimeDescriptorArray,
+        ),
+        (
+            d.partially_bound,
+            VkFeature::DescriptorBindingPartiallyBound,
+        ),
+        typed,
+    ];
+    Some(
+        needs
+            .into_iter()
+            .filter(|(has, _)| !has)
+            .map(|(_, f)| f)
+            .collect(),
+    )
+}
+
+/// The most elements a set-1 sampler array has on `p`. Element 0 holds the neutral sampler, so
+/// the array holds at most one sampler state fewer.
+///
+/// It is the heap capacity (the module docs) of a pipeline whose heap is one sampler array and
+/// whose set 0 counts no sampler, which no pipeline's exceeds: the least of the handle table's
+/// reach (`memory::handles::TABLE_CAPACITY`, 65536), `maxDescriptorSetUpdateAfterBindSamplers`
+/// and `maxPerStageDescriptorUpdateAfterBindSamplers`, by the same limits and arithmetic link
+/// sizes every heap array with. A pipeline whose heap has more arrays of a kind, or whose set 0
+/// counts descriptors of a kind its heap has, has fewer elements. 0 where `p` lacks a feature a
+/// function reading a set-1 sampler array needs, so no pipeline has one: the layout's
+/// (`runtimeDescriptorArray`, `descriptorBindingPartiallyBound`,
+/// `descriptorBindingSampledImageUpdateAfterBind`) or the module's, which indexes the array by an
+/// element it loads (`shaderSampledImageArrayNonUniformIndexing`).
+pub fn heap_sampler_capacity(p: &DeviceProfile) -> u32 {
+    let readable = heap_layout_lacks(p, vk::DescriptorType::SAMPLER)
+        .is_some_and(|lacks| lacks.is_empty())
+        && p.fields().descriptors.non_uniform_sampled_image;
+    if !readable {
+        return 0;
+    }
+    let capacity = heap_limits(&p.fields().limits, SAMPLERS)
+        .into_iter()
+        .map(|(_, available)| room(available, 0, 1))
+        .fold(u64::from(crate::memory::handles::TABLE_CAPACITY), u64::min);
+    // At most the table's reach, a `u32`.
+    capacity as u32
 }
 
 /// Whether set 1's heap arrays are `UPDATE_UNUSED_WHILE_PENDING` on `p`: where the profile has
@@ -1066,61 +1332,34 @@ fn heap_capacity(
     p: &DeviceProfile,
 ) -> Result<u32, Error> {
     let l = &p.fields().limits;
+    // As Vulkan counts them ([`kind_counts`]): a uniform texel buffer array is sampled images, a
+    // storage texel buffer array storage images.
     let kind = |ty: vk::DescriptorType| match ty {
         vk::DescriptorType::SAMPLER => SAMPLERS,
-        vk::DescriptorType::STORAGE_IMAGE => IMAGES,
+        vk::DescriptorType::STORAGE_IMAGE | vk::DescriptorType::STORAGE_TEXEL_BUFFER => IMAGES,
         vk::DescriptorType::STORAGE_BUFFER => STORAGE,
         _ => SAMPLED,
     };
-    let kinds = [
-        (
-            SAMPLERS,
-            VkLimit::MaxDescriptorSetUpdateAfterBindSamplers,
-            l.max_descriptor_set_update_after_bind_samplers,
-            VkLimit::MaxPerStageDescriptorUpdateAfterBindSamplers,
-            l.max_per_stage_descriptor_update_after_bind_samplers,
-        ),
-        (
-            SAMPLED,
-            VkLimit::MaxDescriptorSetUpdateAfterBindSampledImages,
-            l.max_descriptor_set_update_after_bind_sampled_images,
-            VkLimit::MaxPerStageDescriptorUpdateAfterBindSampledImages,
-            l.max_per_stage_descriptor_update_after_bind_sampled_images,
-        ),
-        (
-            IMAGES,
-            VkLimit::MaxDescriptorSetUpdateAfterBindStorageImages,
-            l.max_descriptor_set_update_after_bind_storage_images,
-            VkLimit::MaxPerStageDescriptorUpdateAfterBindStorageImages,
-            l.max_per_stage_descriptor_update_after_bind_storage_images,
-        ),
-        (
-            STORAGE,
-            VkLimit::MaxDescriptorSetUpdateAfterBindStorageBuffers,
-            l.max_descriptor_set_update_after_bind_storage_buffers,
-            VkLimit::MaxPerStageDescriptorUpdateAfterBindStorageBuffers,
-            l.max_per_stage_descriptor_update_after_bind_storage_buffers,
-        ),
-    ];
     let mut capacity = u64::from(crate::memory::handles::TABLE_CAPACITY);
-    // `limit` holds `used + arrays · capacity`.
+    // `limit` holds `used + arrays · capacity` ([`room`]).
     let mut bound = |limit: VkLimit, available: u32, used: u64, arrays: u64| -> Result<(), Error> {
         if arrays == 0 {
             return Ok(());
         }
-        let room = u64::from(available).saturating_sub(used) / arrays;
-        if room == 0 {
+        let each = room(available, used, arrays);
+        if each == 0 {
             return Err(limit_error(
                 limit,
                 used.saturating_add(arrays),
                 u64::from(available),
             ));
         }
-        capacity = capacity.min(room);
+        capacity = capacity.min(each);
         Ok(())
     };
     let all = kind_counts(set0.iter())?;
-    for (k, set_limit, set_max, _, _) in kinds {
+    for k in HEAP_KINDS {
+        let [(set_limit, set_max), _] = heap_limits(l, k);
         let arrays = heap.values().filter(|h| kind(h.ty) == k).count() as u64;
         bound(set_limit, set_max, all[k], arrays)?;
     }
@@ -1128,7 +1367,8 @@ fn heap_capacity(
         let flags = i.vk_stage().flags();
         let own = kind_counts(set0.iter().filter(|b| b.stages.contains(flags)))?;
         let in_stage = |h: &&HeapDecl| h.stages.contains(flags);
-        for (k, _, _, stage_limit, stage_max) in kinds {
+        for k in HEAP_KINDS {
+            let [_, (stage_limit, stage_max)] = heap_limits(l, k);
             let arrays = heap
                 .values()
                 .filter(in_stage)
@@ -1165,6 +1405,63 @@ fn heap_capacity(
             "a heap capacity beyond u32",
         ))
     })
+}
+
+/// The kinds of heap arrays, in the order [`heap_capacity`] bounds them.
+const HEAP_KINDS: [usize; 4] = [SAMPLERS, SAMPLED, IMAGES, STORAGE];
+
+/// The update-after-bind limits on `l` of heap arrays of kind `k`, one of [`HEAP_KINDS`]: the
+/// set's (`maxDescriptorSetUpdateAfterBind*`), then a stage's
+/// (`maxPerStageDescriptorUpdateAfterBind*`), each with its value.
+fn heap_limits(l: &crate::device::profile::Limits, k: usize) -> [(VkLimit, u32); 2] {
+    match k {
+        SAMPLERS => [
+            (
+                VkLimit::MaxDescriptorSetUpdateAfterBindSamplers,
+                l.max_descriptor_set_update_after_bind_samplers,
+            ),
+            (
+                VkLimit::MaxPerStageDescriptorUpdateAfterBindSamplers,
+                l.max_per_stage_descriptor_update_after_bind_samplers,
+            ),
+        ],
+        SAMPLED => [
+            (
+                VkLimit::MaxDescriptorSetUpdateAfterBindSampledImages,
+                l.max_descriptor_set_update_after_bind_sampled_images,
+            ),
+            (
+                VkLimit::MaxPerStageDescriptorUpdateAfterBindSampledImages,
+                l.max_per_stage_descriptor_update_after_bind_sampled_images,
+            ),
+        ],
+        IMAGES => [
+            (
+                VkLimit::MaxDescriptorSetUpdateAfterBindStorageImages,
+                l.max_descriptor_set_update_after_bind_storage_images,
+            ),
+            (
+                VkLimit::MaxPerStageDescriptorUpdateAfterBindStorageImages,
+                l.max_per_stage_descriptor_update_after_bind_storage_images,
+            ),
+        ],
+        _ => [
+            (
+                VkLimit::MaxDescriptorSetUpdateAfterBindStorageBuffers,
+                l.max_descriptor_set_update_after_bind_storage_buffers,
+            ),
+            (
+                VkLimit::MaxPerStageDescriptorUpdateAfterBindStorageBuffers,
+                l.max_per_stage_descriptor_update_after_bind_storage_buffers,
+            ),
+        ],
+    }
+}
+
+/// The most elements each of `arrays` heap arrays can have under a limit of `available` that
+/// already counts `used` descriptors: `limit` holds `used + arrays · room`.
+fn room(available: u32, used: u64, arrays: u64) -> u64 {
+    u64::from(available).saturating_sub(used) / arrays
 }
 
 fn limit_error(limit: VkLimit, required: u64, available: u64) -> Error {
@@ -1352,6 +1649,7 @@ fn pipeline_interface(ifaces: &[&StageInterface]) -> PipelineInterface {
         out.numbered_samplers
             .push((i.stage, i.numbered_samplers.clone()));
         out.push.push(i.push.clone());
+        out.stage_in.extend(i.io.stage_in.iter().map(|s| s.fetch));
     }
     out
 }

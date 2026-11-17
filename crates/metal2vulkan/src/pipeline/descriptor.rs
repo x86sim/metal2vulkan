@@ -10,10 +10,13 @@
 
 use std::collections::BTreeMap;
 
+use crate::budget::{Budget, Meter};
+use crate::error::Error;
 use crate::library::compiled::CompiledFunction;
 use crate::library::dynamic::DynamicLibrary;
 use crate::library::function::{Function, FunctionConstantValues};
 use crate::metal;
+use crate::pipeline::compile::StageEntries;
 
 /// A function plus its constant values and the functions its pipeline links
 /// (`MTLFunctionDescriptor` and the stage's `MTLLinkedFunctions`).
@@ -22,6 +25,14 @@ use crate::metal;
 pub struct FunctionDescriptor {
     pub function: Function,
     pub constants: FunctionConstantValues,
+    /// Whether the function is specialized: made with constant values
+    /// (`newFunctionWithName:constantValues:error:`, none among them too) or by
+    /// `newFunctionWithDescriptor:error:`; `false`, the default, for one made by
+    /// `newFunctionWithName:`. A descriptor with `constants` is specialized whatever this says.
+    /// The compile is the same either way, a constant without a value undefined; Metal makes no
+    /// pipeline state of an unspecialized function that declares constants
+    /// ([`FunctionDescriptor::needs_specialization`]).
+    pub specialized: bool,
     /// The functions the stage links: each visible-function reference of `function` (and of each
     /// linked function) calls the linked function of the name it references.
     pub linked: LinkedFunctions,
@@ -36,9 +47,36 @@ impl FunctionDescriptor {
         FunctionDescriptor {
             function,
             constants: FunctionConstantValues::defaults(),
+            specialized: false,
             linked: LinkedFunctions::default(),
             libraries: DynamicLibraries::default(),
         }
+    }
+
+    /// This descriptor with `specialized` as whether its function is specialized
+    /// ([`FunctionDescriptor::specialized`]).
+    pub fn with_specialized(mut self, specialized: bool) -> FunctionDescriptor {
+        self.specialized = specialized;
+        self
+    }
+
+    /// Whether Metal makes no pipeline state of this stage: its function is not specialized
+    /// ([`specialized`](Self::specialized) false, and no `constants`) and declares function
+    /// constants (its [`Function::function_constants_dictionary`] is not empty), whether each is
+    /// required or optional, read or only gating an argument. Plain Metal's creation ends its
+    /// process for one at its descriptor validation, at every pipeline creator ("function ko
+    /// cannot be used to build a pipeline state. Use newFunctionWithName:constantValues:... to get
+    /// the specialized function", an M3 Max under macOS 27.0.1). A module function's constants are
+    /// read of its AIR under `budget` through `entries`' module decodes, which a compile of the
+    /// stage through the same object copies; refused as
+    /// [`Function::function_constants_dictionary`] refuses.
+    pub fn needs_specialization(
+        &self,
+        budget: &Budget,
+        entries: &StageEntries,
+    ) -> Result<bool, Error> {
+        let mut m = Meter::new(budget);
+        crate::pipeline::compile::stage_needs_specialization(self, entries, &mut m)
     }
 
     /// This descriptor with `linked` as its linked functions.
@@ -146,15 +184,34 @@ impl DynamicLibraries {
 ///
 /// A function calls a `[[visible]]` function it does not define through a visible-function
 /// reference (`!air.visible_function_references`), which names it. Compile resolves each
-/// reference against the functions of `functions`, `private_functions`, and `binary_functions`
-/// by [`FunctionInfo::name`](crate::library::FunctionInfo): the named function (a visible
+/// reference against the functions of `functions` and `private_functions`
+/// ([`LinkedList::resolves_references`]) by [`LinkedFunction::name`]: its specialized name where it
+/// has one, else its library function's [`FunctionInfo::name`](crate::library::FunctionInfo). A
+/// function only `binary_functions` lists resolves none, as Metal's creation fails over a
+/// reference only such a function names. The named function (a visible
 /// function of its module, [`FunctionStage::Visible`](crate::library::FunctionStage) in a
 /// bitcode library) is linked statically and inlined, as are the functions it references in
 /// turn. A reference nothing names is `Error::NeedsInput(LinkedFunction)` if a call to it
-/// survives specialization. The functions of `functions` and `binary_functions` are also what a
+/// survives specialization.
+///
+/// A linked function whose module declares function constants (or defines a static initializer)
+/// is specialized with its own constant values before it is linked, as Metal specializes the
+/// `MTLFunction`: its module's static initializer runs over them. A function made specialized
+/// ([`LinkedFunction::specialized`]) then has what they decide folded, and a constant they give
+/// no value reads as an entry's undefined constants read. One made unspecialized
+/// (`newFunctionWithName:`) that reaches a constant refuses the link at a call that survives
+/// specialization (`DescriptorError::LinkedFunction` with
+/// [`LinkProblem::UnresolvedConstant`](crate::error::LinkProblem)), as Metal fails such a
+/// creation ("cannot lower module with unresolved function constants"); one that reaches none
+/// links.
+///
+/// The functions of `functions` and `binary_functions` are also what a
 /// visible-function table can hold: each has a [`FunctionHandle`](crate::pipeline::FunctionHandle)
 /// ([`LinkedFunctions::function_handle`]), and a call through a table compiles to a switch over
-/// those of the call's type. `groups` names the functions a call site through a function pointer
+/// those of the call's type. Two different functions of one name, one in each list, are two
+/// functions with two handles, each calling its own definition, and a reference to the name
+/// resolves to the one of `functions`, as Metal makes such a pipeline (an M3 Max under macOS
+/// 27.0.1, where its API validation layer stops it). `groups` names the functions a call site through a function pointer
 /// may call; the decoder drops the call site's `!air.function_groups`, so no output depends on it.
 /// Every field is part of the compile key.
 #[non_exhaustive]
@@ -165,8 +222,9 @@ pub struct LinkedFunctions {
     pub functions: Vec<LinkedFunction>,
     /// `privateFunctions`: visible functions the pipeline calls only by reference.
     pub private_functions: Vec<LinkedFunction>,
-    /// `binaryFunctions`: visible functions compiled to a binary. The translator links their AIR
-    /// as it links `functions`, and a table can hold them too.
+    /// `binaryFunctions`: visible functions compiled to a binary, which a visible-function table
+    /// can hold (each has a table handle) and no visible-function reference resolves to. The
+    /// translator links their AIR as it links a table's other functions.
     pub binary_functions: Vec<LinkedFunction>,
     /// `groups`: by call-site group name, the functions a call through a function pointer in
     /// that group may call.
@@ -233,20 +291,45 @@ pub enum LinkedList<'a> {
 }
 
 impl LinkedList<'_> {
-    /// Whether a visible-function reference resolves against this list: every list but a group,
-    /// whose functions only a function-pointer call reaches.
+    /// Whether a visible-function reference resolves against this list: `functions` and
+    /// `private_functions`. Not `binary_functions`, whose functions only a table reaches (Metal's
+    /// creation fails over a reference only such a function names, "unresolved visible function
+    /// reference", directly from the stage's function or from a linked function, on an M3 Max
+    /// under macOS 27.0.1, `binary_function_linking.m`), and not a group, whose functions only a
+    /// function-pointer call reaches.
     pub fn resolves_references(self) -> bool {
-        !matches!(self, LinkedList::Group(_))
+        matches!(self, LinkedList::Functions | LinkedList::PrivateFunctions)
     }
 }
 
-/// One function of [`LinkedFunctions`]: a library function and the constant values it was
-/// specialized with (`newFunctionWithDescriptor:`; none for `newFunctionWithName:`).
+/// One function of [`LinkedFunctions`]: a library function, the constant values it was
+/// specialized with (`newFunctionWithDescriptor:`; none for `newFunctionWithName:`), and the name
+/// it was made under.
+///
+/// A visible-function reference resolves against the function's [`name`](LinkedFunction::name):
+/// its specialized name where it has one (`MTLFunctionDescriptor.specializedName`), else its
+/// library function's own, as Metal resolves it (a probe on an M3 Max under macOS 27.0.1: `base_fn`
+/// made with the specialized name `custom_fn` answers `custom_fn` and resolves a reference to
+/// `custom_fn`; made without one, or with another, it resolves no such reference). Its definition
+/// is its library function's, whatever name it links under.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkedFunction {
     pub function: Function,
     pub constants: FunctionConstantValues,
+    /// `MTLFunctionDescriptor.specializedName`: the name the function was made under, which it
+    /// answers and links under in place of its library function's own; `None` (nil) for the
+    /// function's own name. Part of the compile key; a specialized name equal to the function's own
+    /// is no other name.
+    pub specialized_name: Option<String>,
+    /// The function was made specialized: by `newFunctionWithName:constantValues:` or by
+    /// `newFunctionWithDescriptor:` (with constant values or without), as against
+    /// `newFunctionWithName:`. A constant of its module that `constants` gives no value is then
+    /// undefined, and reads as an entry's undefined constants read; in an unspecialized function
+    /// it is unresolved, and the link is refused where the function reaches it
+    /// ([`LinkProblem::UnresolvedConstant`](crate::error::LinkProblem)), as Metal refuses it. A
+    /// function with constant values is specialized whatever this says. Part of the compile key.
+    pub specialized: bool,
     /// The function was made compiled to a binary (`MTLFunctionOptionCompileToBinary`), as
     /// Metal requires of a function in `binary_functions` and of a binary function added to a
     /// made pipeline state; the runtime checks it, refusing one that is not as Metal does. The
@@ -255,18 +338,38 @@ pub struct LinkedFunction {
 }
 
 impl LinkedFunction {
-    /// `function` with no constant values, not compiled to a binary.
+    /// `function` as `newFunctionWithName:` makes it: no constant values, no specialized name,
+    /// unspecialized, not compiled to a binary.
     pub fn new(function: Function) -> LinkedFunction {
         LinkedFunction {
             function,
             constants: FunctionConstantValues::defaults(),
+            specialized_name: None,
+            specialized: false,
             precompiled: false,
         }
     }
 
-    /// This function specialized with `constants`.
+    /// This function specialized with `constants` (`newFunctionWithName:constantValues:`):
+    /// `specialized` too.
     pub fn with_constants(mut self, constants: FunctionConstantValues) -> LinkedFunction {
         self.constants = constants;
+        self.specialized = true;
+        self
+    }
+
+    /// This function made by `newFunctionWithDescriptor:` under the specialized name `name`
+    /// (`specializedName`), which it answers and links under: `specialized` too.
+    pub fn with_specialized_name(mut self, name: impl Into<String>) -> LinkedFunction {
+        self.specialized_name = Some(name.into());
+        self.specialized = true;
+        self
+    }
+
+    /// This function, made specialized when `specialized` (`specialized`): what
+    /// `newFunctionWithDescriptor:` makes without constant values is.
+    pub fn with_specialized(mut self, specialized: bool) -> LinkedFunction {
+        self.specialized = specialized;
         self
     }
 
@@ -274,6 +377,22 @@ impl LinkedFunction {
     pub fn with_precompiled(mut self, precompiled: bool) -> LinkedFunction {
         self.precompiled = precompiled;
         self
+    }
+
+    /// `name`: the specialized name where the function was made with one, else its library
+    /// function's own. A visible-function reference to this name resolves to the function.
+    pub fn name(&self) -> &str {
+        self.specialized_name
+            .as_deref()
+            .unwrap_or(self.function.info().name)
+    }
+
+    /// The specialized name, where it is a name other than the library function's own: what the
+    /// compile key and a function's identity record of it.
+    pub(crate) fn other_name(&self) -> Option<&str> {
+        self.specialized_name
+            .as_deref()
+            .filter(|&n| n != self.function.info().name)
     }
 }
 
@@ -420,6 +539,15 @@ pub struct PrivateRenderState {
     /// pipeline amplifies (Metal there draws one copy's color and counts every copy's samples,
     /// a rule not built).
     pub explicit_visibility_group_id: u32,
+    /// `openGLModeEnabled` (default off): changes nothing Metal draws or reflects, and makes two
+    /// states Metal otherwise refuses (`pipeline::private_state`'s docs): a fragment function
+    /// writing depth without a depth attachment, its depth going nowhere, and a rasterizing state
+    /// whose vertex function returns `void`, which rasterizes nothing. The runtime answers both
+    /// (`metal2vulkan-runtime`'s `new_render_pipeline_state`), the second as the state of the
+    /// descriptor with rasterization disabled; the compile reads it not, and its link refuses a
+    /// rasterizing `void` vertex function whatever the mode
+    /// ([`DescriptorError::RasterizedVoidVertex`](crate::error::DescriptorError::RasterizedVoidVertex)).
+    pub open_gl_mode_enabled: bool,
 }
 
 impl PrivateRenderState {
@@ -444,11 +572,12 @@ impl PrivateRenderState {
             needs_custom_border_color_samplers: false,
             vertex_amplification_mode: 0,
             explicit_visibility_group_id: u32::MAX,
+            open_gl_mode_enabled: false,
         }
     }
 
     /// The fields as plain bits, the coverage by its `f32` bits: what equality compares.
-    fn bits(&self) -> (u64, u32, [bool; 9], [u64; 3], u8, [u32; 3]) {
+    fn bits(&self) -> (u64, u32, [bool; 10], [u64; 3], u8, [u32; 3]) {
         (
             self.sample_mask,
             self.sample_coverage.to_bits(),
@@ -462,6 +591,7 @@ impl PrivateRenderState {
                 self.two_side_enabled,
                 self.depth_stencil_write_disabled,
                 self.needs_custom_border_color_samplers,
+                self.open_gl_mode_enabled,
             ],
             [
                 self.alpha_test_function,
@@ -530,7 +660,9 @@ pub struct ComputePipelineDescriptor {
     /// `stageInputDescriptor`: how the kernel's `[[stage_in]]` attributes are fetched. A kernel
     /// reading a stage-in attribute compiles under it (`LoweringInputs::stage_input`).
     pub stage_input: Option<StageInputDescriptor>,
-    /// `None` for Metal's 0 (the device maximum).
+    /// `None` for Metal's 0 (the device maximum). Refused as Metal refuses it
+    /// ([`ComputePipelineProblem`](crate::error::ComputePipelineProblem)): above 1024, or beside a
+    /// kernel's own `[[max_total_threads_per_threadgroup(n)]]` of other threads.
     pub max_total_threads_per_threadgroup: Option<u32>,
     /// The guest's promise that interior regions' local sizes are multiples of 32.
     pub threadgroup_size_is_multiple_of_execution_width: bool,
@@ -539,10 +671,12 @@ pub struct ComputePipelineDescriptor {
     /// Metal's. The kernel compiles under it (`LoweringInputs::max_call_stack_depth`), which sizes
     /// the call stack of recursion through visible functions.
     pub max_call_stack_depth: u32,
-    /// `requiredThreadsPerThreadgroup`: `None` for Metal's zero size, no requirement. The runtime
-    /// refuses a dispatch of another threadgroup size, as Metal's API validation stops one. The
-    /// pipeline does not depend on it (the state's `maxTotalThreadsPerThreadgroup` stays the
-    /// kernel's, as Metal's does), so it is not part of the key.
+    /// `requiredThreadsPerThreadgroup`: `None` for Metal's zero size, no requirement. A dispatch
+    /// of another threadgroup size runs at the size it gives, as plain Metal runs it (Metal's API
+    /// validation stops it; measured on an M3 Max, `compute_pipeline_limits.m`). The
+    /// compiled pipeline does not depend on it, so it is not part of the key, and its
+    /// `metal_info` answers the kernel's limit. The runtime's state answers the size's threads as
+    /// its `maxTotalThreadsPerThreadgroup`, as Metal's state does.
     pub required_threads_per_threadgroup: Option<[u32; 3]>,
     /// `supportAddingBinaryFunctions`: binary functions may be added to a state made from this
     /// descriptor. Not part of the key.
@@ -555,6 +689,26 @@ pub struct ComputePipelineDescriptor {
     /// `needsCustomBorderColorSamplers` (Apple SPI, default off): changes nothing Metal runs, as
     /// the render descriptor's ([`PrivateRenderState::needs_custom_border_color_samplers`]).
     pub needs_custom_border_color_samplers: bool,
+    /// `openCLModeEnabled` (Apple SPI, `setOpenCLModeEnabled:`, default off): the kernel is a
+    /// kernel of Apple's OpenCL compiler (`__entry_<name>` of a library of `sourceLanguage` 1),
+    /// linked as Metal links it for OpenCL C. Metal binds three hidden buffers ahead of the
+    /// kernel's own: `__global_offset_and_num_dims` at index 0, four `uint`s the dispatcher fills
+    /// with the dispatch's global offset in each of its dimensions and its dimension count;
+    /// `__printf_buffer` at 1; and `__image_order_data_type_table` at 2. Each of the kernel's
+    /// arguments bound at a buffer index sits 3 past its own; threadgroup memory, textures and
+    /// samplers keep theirs. OpenCL C's work-item functions read the dispatch: `get_global_id`
+    /// adds the offset to the thread's position in the grid, `get_global_offset` and
+    /// `get_work_dim` read buffer 0, and a dimension past 2 answers OpenCL's 0 or 1 (where the M3
+    /// Max leaves a store of such a value unwritten). `get_image_channel_order` and
+    /// `get_image_channel_data_type` of the image at texture index `t` read words `2t + 1` and
+    /// `2t` of buffer 2. An `image1d_t` (`texture1d` in the AIR) and an `image1d_array_t`
+    /// (`texture1d_array`) take the 2D texture and the 2D array texture of height 1 that Apple's
+    /// OpenCL binds for them, read and written at row 0. The pipeline's reflection lists the three
+    /// buffers after the kernel's arguments. The kernel compiles under it
+    /// (`LoweringInputs::open_cl_mode`), so it is part of the key. Without it Metal refuses a
+    /// pipeline of such a kernel ("Internal compiler error"); the crate compiles it as the AIR's
+    /// own Metal reading, refusing a read of `get_global_offset` or `get_work_dim`.
+    pub open_cl_mode_enabled: bool,
 }
 
 impl ComputePipelineDescriptor {
@@ -571,6 +725,7 @@ impl ComputePipelineDescriptor {
             support_adding_binary_functions: false,
             buffers: BTreeMap::new(),
             needs_custom_border_color_samplers: false,
+            open_cl_mode_enabled: false,
         }
     }
 }
@@ -599,6 +754,66 @@ pub struct MeshPipelineDescriptor {
     /// `textureWriteRoundingMode` (Apple SPI), as a render pipeline's: the fragment function's
     /// `float` outputs to half-float color attachments round by it.
     pub texture_write_rounding_mode: metal::TextureWriteRoundingMode,
+    /// `maxTotalThreadsPerObjectThreadgroup`: `None` for Metal's 0, the object function's
+    /// `[[max_total_threads_per_threadgroup(n)]]` or else Metal's 1024. The compiled pipeline's
+    /// [`MeshPipelineMetalInfo::max_total_threads_per_object_threadgroup`] answers it within the
+    /// device's limit. Refused as Metal refuses it
+    /// ([`MeshPipelineProblem`](crate::error::MeshPipelineProblem)): above 1024, or beside a
+    /// function's maximum of other threads. A draw is not held to it.
+    ///
+    /// [`MeshPipelineMetalInfo::max_total_threads_per_object_threadgroup`]: crate::pipeline::MeshPipelineMetalInfo::max_total_threads_per_object_threadgroup
+    pub max_total_threads_per_object_threadgroup: Option<u32>,
+    /// `maxTotalThreadsPerMeshThreadgroup`: as
+    /// [`max_total_threads_per_object_threadgroup`](Self::max_total_threads_per_object_threadgroup),
+    /// of the mesh stage, answered as
+    /// [`MeshPipelineMetalInfo::max_total_threads_per_mesh_threadgroup`]; also refused beside a
+    /// required mesh threadgroup size of other threads.
+    ///
+    /// [`MeshPipelineMetalInfo::max_total_threads_per_mesh_threadgroup`]: crate::pipeline::MeshPipelineMetalInfo::max_total_threads_per_mesh_threadgroup
+    pub max_total_threads_per_mesh_threadgroup: Option<u32>,
+    /// `maxTotalThreadgroupsPerMeshGrid`: `None` for Metal's 0, which answers 2^20 whatever the
+    /// object function's `[[max_total_threadgroups_per_mesh_grid(n)]]`. The compiled pipeline's
+    /// [`MeshPipelineMetalInfo::max_total_threadgroups_per_mesh_grid`] answers it, within the
+    /// device's limit where it runs mesh functions natively; Metal takes any count, above the
+    /// object function's attribute too. An object function's grid is not held to it.
+    ///
+    /// [`MeshPipelineMetalInfo::max_total_threadgroups_per_mesh_grid`]: crate::pipeline::MeshPipelineMetalInfo::max_total_threadgroups_per_mesh_grid
+    pub max_total_threadgroups_per_mesh_grid: Option<u32>,
+    /// `objectThreadgroupSizeIsMultipleOfThreadExecutionWidth`: a promise to Metal's optimizer
+    /// that each draw's object threadgroup is a multiple of 32 threads. No compiled module
+    /// depends on it, and a draw is not held to it.
+    pub object_threadgroup_size_is_multiple_of_thread_execution_width: bool,
+    /// `meshThreadgroupSizeIsMultipleOfThreadExecutionWidth`: as
+    /// [`object_threadgroup_size_is_multiple_of_thread_execution_width`](Self::object_threadgroup_size_is_multiple_of_thread_execution_width),
+    /// of each draw's mesh threadgroup.
+    pub mesh_threadgroup_size_is_multiple_of_thread_execution_width: bool,
+    /// `payloadMemoryLength`: `None` for Metal's 0, the size of the payload type the object
+    /// function declares. Bytes past that type widen the object and mesh functions' payload
+    /// arena to it (`LoweringInputs::object_payload`), where the device has room for it; a
+    /// length below the type leaves the type's. Above Metal's 16384 bytes it is refused as
+    /// Metal refuses it ([`MeshPipelineProblem::PayloadOverLimit`]).
+    ///
+    /// [`MeshPipelineProblem::PayloadOverLimit`]: crate::error::MeshPipelineProblem::PayloadOverLimit
+    pub payload_memory_length: Option<u32>,
+    /// `maxVertexAmplificationCount`, 1 by default as Metal's. 0 is refused as Metal's
+    /// descriptor validation ends the process at it
+    /// ([`DescriptorError::VertexAmplificationCount`](crate::error::DescriptorError::VertexAmplificationCount)).
+    /// A count above 1, which Metal makes, is
+    /// `Unsupported{VertexAmplification, NotImplemented}`: a mesh pipeline's vertex amplification
+    /// is not built.
+    pub max_vertex_amplification_count: u32,
+    /// `requiredThreadsPerObjectThreadgroup`: `None` for Metal's zero size, no requirement.
+    /// Refused as Metal's descriptor validation ends the process at it
+    /// ([`MeshPipelineProblem`](crate::error::MeshPipelineProblem)): with an axis of 0, of more
+    /// than 1024 threads or more than the stage's maximum, or without an object function. No
+    /// compiled module and no thread limit the pipeline answers depends on it, and a draw is not
+    /// held to it.
+    pub required_threads_per_object_threadgroup: Option<[u32; 3]>,
+    /// `requiredThreadsPerMeshThreadgroup`: as
+    /// [`required_threads_per_object_threadgroup`](Self::required_threads_per_object_threadgroup),
+    /// of the mesh stage, which a mesh threadgroup maximum of other threads is also refused
+    /// beside.
+    pub required_threads_per_mesh_threadgroup: Option<[u32; 3]>,
 }
 
 impl MeshPipelineDescriptor {
@@ -617,6 +832,15 @@ impl MeshPipelineDescriptor {
             alpha_to_one: false,
             support_indirect_command_buffers: false,
             texture_write_rounding_mode: metal::TextureWriteRoundingMode::TowardZero,
+            max_total_threads_per_object_threadgroup: None,
+            max_total_threads_per_mesh_threadgroup: None,
+            max_total_threadgroups_per_mesh_grid: None,
+            object_threadgroup_size_is_multiple_of_thread_execution_width: false,
+            mesh_threadgroup_size_is_multiple_of_thread_execution_width: false,
+            payload_memory_length: None,
+            max_vertex_amplification_count: 1,
+            required_threads_per_object_threadgroup: None,
+            required_threads_per_mesh_threadgroup: None,
         }
     }
 }
@@ -647,9 +871,11 @@ pub struct TileRenderPipelineDescriptor {
     /// function, 1 by default as Metal's. A `Function` tile function compiles under it, as a
     /// compute pipeline's kernel does.
     pub max_call_stack_depth: u32,
-    /// `requiredThreadsPerThreadgroup`: `None` for Metal's zero size, no requirement. The runtime
-    /// refuses a tile dispatch of another threadgroup size, as Metal's API validation stops one.
-    /// Not part of the key.
+    /// `requiredThreadsPerThreadgroup`: `None` for Metal's zero size, no requirement. A tile
+    /// dispatch of another threadgroup size runs at the size it gives, as plain Metal runs it
+    /// (Metal's API validation stops it). Not part of the key. The runtime's state answers the size's threads as its
+    /// `maxTotalThreadsPerThreadgroup`, as a compute descriptor's
+    /// ([`ComputePipelineDescriptor::required_threads_per_threadgroup`]).
     pub required_threads_per_threadgroup: Option<[u32; 3]>,
     /// `supportAddingBinaryFunctions`: binary functions may be added to the tile stage of a
     /// state made from this descriptor. Not part of the key.

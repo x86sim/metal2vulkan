@@ -2,7 +2,7 @@
 # CoreAnimation, CoreImage or VideoToolbox plausibly reaches it), app (a typical Metal app from
 # public API), rare (specialized public API), none (no public API path). A judgment, kept by hand;
 # refusal_surface.py lists every variant that has none (--missing-reach).
-feature	LibraryKind	none	a metallib that is not an executable library, loaded as one
+feature	LibraryKind	none	a metallib file type Apple's toolchain is not seen to write
 feature	Stage	none	a stage outside AIR's public stages
 feature	AddressSpace	none	Apple's AGX library address spaces
 feature	ModuleRecord	none	LLVM constructs AIR does not emit
@@ -14,6 +14,7 @@ feature	AgxUnmodeled	rare	Apple's own libraries' AGX intrinsics
 feature	StaticInitializer	none	LLVM initializers AIR does not emit
 feature	Recursion	rare	recursion through visible functions
 feature	DynamicCall	rare	function pointers and function tables
+feature	InlineAsm	none	inline assembly other than the empty asm("") decode drops, which MSL refuses to compile
 feature	Linking	rare	dynamic libraries and linked functions
 feature	SimdWidth	app	simdgroup functions on a device whose subgroups cannot run 32 wide for the use
 feature	LocalSize	app	a threadgroup size past a smaller device's limit
@@ -35,6 +36,7 @@ feature	CoherentMemory	rare	coherent(device) accesses
 feature	Int64Atomics	rare	64-bit atomics
 feature	ImageAtomics	rare	texture atomics beyond 32-bit integers
 feature	DescriptorCount	app	many textures or buffers in one stage on a smaller device
+feature	StageSize	rare	a kernel too large for a driver's compiler, on a driver measured to corrupt one past its bound or to outgrow host memory below it
 feature	BufferRange	app	a buffer window past a device's descriptor range
 feature	Int64Arithmetic	rare	64-bit integers on a device without shaderInt64
 feature	Float64Arithmetic	rare	doubles (MSL has none outside Apple's own code)
@@ -64,6 +66,7 @@ feature	DualSourceBlending	rare	dual-source blending on a device without it
 feature	Barycentrics	rare	barycentric coordinates
 feature	StencilExport	rare	stencil from the shader
 feature	SampleRateShading	rare	per-sample shading
+feature	PullModelInterpolation	rare	interpolant inputs read at the centroid, a sample or an offset
 feature	SamplePositions	rare	custom sample positions on a device that takes none at the pass's sample count
 feature	PixelCoverageAtSampleRate	rare	coverage read at sample rate
 feature	InterfaceComponents	rare	too many varyings or attachments for a device
@@ -96,6 +99,7 @@ feature	IntersectionFunctionTable	rare	ray tracing (out of scope by ruling)
 feature	IndependentBlending	rare	per-attachment blending on a device without independentBlend
 feature	RasterSampleCount	app	a sample count a device lacks for the attachments
 feature	TriangleFillLines	app	wireframe on a device without fillModeNonSolid
+feature	TriangleFillPoints	system	Apple's GL renderer's glPolygonMode(GL_POINT) on a device without fillModeNonSolid, or a portability-subset device without pointPolygons (MoltenVK)
 feature	DepthClipClamp	app	depth clamp on a device without depthClamp
 feature	DepthBiasClamp	app	depth bias clamp on a device without depthBiasClamp
 feature	ConstantAlphaBlendFactor	app	blend-alpha factors on a portability-subset device without them
@@ -142,15 +146,22 @@ gap	AccelerationStructures	rare	ray tracing (out of scope by ruling)
 gap	FeatureEnable	none	device creation with a feature the runtime's chain lacks
 gap	ExtensionEnable	none	device creation with an extension under an unknown name
 gap	Render	system	render pass, resolve and attachment forms not built (20 sites: see the appendix)
-gap	TexelsPastBufferLength	rare	a texture over a buffer past its length
+gap	TexelsPastBufferLength	rare	a YCbCr, two-plane, 4:2:2, depth, BC or rotated texture over an IOSurface plane past its surface
 gap	OverlappingSurfaceRows	rare	an IOSurface plane whose rows overlap
 gap	MemorylessSurfacePlane	rare	a memoryless texture over an IOSurface plane
+gap	SurfacePlaneShape	rare	a texture over an IOSurface plane past one 2D image of its rows, or a BC one of 16-byte blocks off 16
 gap	IndirectCommandPastSize	none	an indirect command at or past the buffer's size
 gap	ExecutionRangePastBuffer	rare	an execution range whose 8 bytes run past its buffer
 gap	ExecutionRangeOffFour	rare	an execution range at an offset off 4 bytes
 gap	IndirectCommandUnstridedBuffer	rare	an executed indirect command's buffer bound without the attribute stride the dynamic layout of its pipeline reads, where the pipeline's descriptor turned `support_dynamic_attribute_stride` on (with it off there is no stride word, and the runtime answers the bind at stride 0 as Metal does)
 gap	SamplePositionsAtBegin	rare	custom sample positions Vulkan takes only at begin
+gap	InterpolateAtSampleWithPositions	rare	interpolate_at_sample in a pass at custom sample positions
+gap	ExportableMemory	none	a runtime extension's exportable buffer on a device without the opaque-fd export
+gap	DmaBufExport	none	a runtime extension's dma-buf-exportable buffer on a device without the dma-buf export
+gap	ExportableSemaphore	none	a runtime extension's exportable shared event on a device without the opaque-fd export
+gap	SyncFileExport	none	a runtime extension's completion sync file on a device without the sync-file export
 gap	SharedEventAcrossDevices	rare	a shared event opened on another device
+gap	VkImagePlaneCopy	none	a runtime extension's texture over a plane of the caller's VkImage copied, filled, mipmapped or rendered to
 gap	ViewportDepthRange	rare	viewport depth outside [0, 1] without the device features
 gap	NonFiniteDepthBias	rare	NaN or infinite depth bias
 gap	DepthNeverWithoutAttachment	rare	depth compare Never with no depth attachment
@@ -185,7 +196,6 @@ gap	DecodedHeapTexture	app	an ASTC texture in a heap on a device without ASTC
 gap	VertexFetchPast4GiB	rare	vertex fetch past 4 GiB of a bind offset
 gap	StageInFetchPast4GiB	rare	stage-in fetch past 4 GiB of a bind offset
 apple	ProtectedContent	none	Apple-private (no public header)
-apple	LineWidth	none	Apple-private (no public header)
 apple	ViewportTransformDisabled	none	Apple-private (no public header)
 apple	VertexAmplificationMode	none	Apple-private (no public header)
 apple	DepthCleared	none	Apple-private (no public header)
@@ -231,7 +241,13 @@ gap	SurfaceDepthStencil	rare	a blit of the stencil of a Depth32Float_Stencil8 te
 feature	ExtendedRangeBlend	system	an extended-range (XR10) attachment blended from an output other than four half or float lanes; a 16-bit float attachment's storage-form blend of a second-source factor or a one-color-channel mask under fast math; the consumer's guests blend RGB10A8_2P_XR10 attachments
 feature	CommandPredication	none	Apple-private command predication on a device without buffer device addresses
 feature	ProgramScopeBinding	app	MSL 3.2 program-scope buffer bindings (macOS 15 and later)
+feature	GenericPointer	system	MSL 4.1 generic pointers held in memory or of two spaces (macOS 27 and later)
 feature	SeqCstFence	rare	a seq_cst fence in a vertex or fragment stage without its stores and atomics
 gap	MultisampledBufferCopy	rare	a buffer<->multisampled-texture copy on a device without sample-rate shading, an integer multisample attachment at the count, or the copy format's storage; and, where maintenance8's depth/colour copies are missing or wrong, what the sample-rate draws cannot move: a 16-bit depth on a driver whose codes the fragment-depth draw is not measured to keep, or a depth or stencil texture they cannot sample or render to (emulated elsewhere; the consumer's Maps pans and screensaver make the copy)
 gap	MultisampledBufferLayout	rare	a buffer<->multisampled-texture copy at a bytesPerRow of 0 from an offset that is a multiple of 16, or of pixels of 32 bytes or more at a pitch below a row or off the pixel: Metal copies these by rules not yet reduced, and its API validation rejects them
 gap	ColorAttachmentGroups	app	in a render pass of more color attachments than the device draws at once (five or more on a device of four), or one at an index past them: a pipeline state of other colors, a tile state, an execution of render commands, a draw reading another group's attachment
+gap	MadeBeforeRecovery	app	any object a program made before its device recovered from a lost VkDevice that the recovery does not carry (a pooled Shared or Managed buffer in memory the device allocated, a texture, a pipeline state), used after the recovery
+gap	AdoptedDeviceRecovery	none	the recovery test hook on a device the consumer made itself
+gap	RemadeAfterRecoveryFailed	app	a pipeline state made before its device recovered from a lost VkDevice whose making again on the new one failed, bound after the recovery
+feature	WideLines	none	a line under the Apple-private setLineWidth: at a width other than 1 drawn as the band, whose pipeline form the translator does not build (a selected slice or viewport, barycentric weights, multiview, synthesized geometry, too many stage outputs)
+gap	WideLines	none	under the Apple-private setLineWidth: at a width other than 1, a line strip drawn as the band whose list of segments the runtime cannot draw (past what a u32 counts or one storage range binds, or indices an unordered draw wrote)

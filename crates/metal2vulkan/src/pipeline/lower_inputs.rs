@@ -39,6 +39,14 @@ pub struct LoweringInputs {
     /// kernel has simdgroups this emulates; a vertex or fragment function compiles as without it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub emulated_simdgroups: bool,
+    /// A kernel runs threadgroups whose simdgroups each lie within one row
+    /// (`VariantKey::one_row`): the lockstep barriers it takes are its threadgroup ones alone
+    /// where, so dispatched, no pair a simdgroup barrier orders meets (`air::Lockstep::rows`), and
+    /// with no simdgroup barrier it takes no simd class and pins no subgroup for them. A kernel
+    /// compiled under it depends on `RuntimeFact::OneRow`. Any other function compiles as without
+    /// it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub one_row: bool,
     /// A vertex function does not write its `[[render_target_array_index]]` output
     /// (`VariantKey::dropped_vertex_layer`): the variant a pass of at most one layer runs on, where
     /// every index renders slice 0. A vertex function that writes the output depends on
@@ -108,9 +116,11 @@ pub struct LoweringInputs {
     /// command's, in the slot table at its own stage's `RootTableAddress`. It needs device
     /// addresses (`bufferDeviceAddress` and `shaderInt64`: `GpuEncodedIndirectCommands` names
     /// them otherwise); a tile, object or mesh function, a kernel with a stage-input descriptor,
-    /// and a vertex function that fetches attributes of a vertex descriptor are
+    /// and a vertex function that fetches an attribute in fixed function are
     /// `Unsupported{GpuEncodedIndirectCommands, NotImplemented}` under it (a replayed command is a
-    /// compute dispatch with no stage-in region, or a draw whose buffers no fetch reads).
+    /// compute dispatch with no stage-in region, or a draw whose buffers no fixed-function input
+    /// reads: a pulled attribute reads its slot table, and the replay pulls every layout through
+    /// the pulled-vertex-buffer variant, `bind::draw_replay_vertex_layouts`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub replay_bindings: bool,
     /// With `replay_bindings`, the vertex function of a draw replay merged into one draw
@@ -118,7 +128,8 @@ pub struct LoweringInputs {
     /// at `PushField::MergedDrawAddress` in place of `RootTableAddress`, finds the command its
     /// corner (`InstanceIndex` and `VertexIndex`) falls in, and runs that command's vertex: its
     /// `[[vertex_id]]`, `[[instance_id]]`, `[[base_vertex]]` and `[[base_instance]]` are the
-    /// command's draw's, and its buffers are in the command's vertex slot table. A fragment
+    /// command's draw's, its pulled attributes step by the command's vertex and instance, and its
+    /// buffers are in the command's vertex slot table. A fragment
     /// function under it reads no buffer and no `[[primitive_id]]`, which a merged draw does not
     /// keep per command: one that does is `Unsupported{GpuEncodedIndirectCommands,
     /// NotImplemented}`, and so is a vertex function that writes the primitive ID's varying or
@@ -183,6 +194,13 @@ pub struct LoweringInputs {
         serde(default, with = "crate::pipeline::serde_pairs")
     )]
     pub ycbcr_planes_sampled: BTreeMap<SlotRef, crate::bind::YCbCrPlanesSampler>,
+    /// Texture slots bound to a 2D texture whose rows are read and written in place
+    /// (`VariantKey::texel_rows`, `RuntimeFact::TexelRows`): each is declared as a texel buffer of
+    /// the rows, uniform where the function only reads it and storage where it writes it, its
+    /// reads and writes of texel `(x, y)` addressing the view's `first + y · row + x` and its size
+    /// queries reading the slot's push field (`bind::TexelRows`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub texel_rows: BTreeSet<SlotRef>,
     /// The fragment function's render pipeline has a vertex function that writes
     /// `[[viewport_array_index]]`. That function stores `ViewportIndex` as 0 for an index at or
     /// past the draw's viewport count, where Metal draws through viewport 0 and its fragment
@@ -206,6 +224,16 @@ pub struct LoweringInputs {
     /// `max_fragment_call_stack_depth`. Any other function compiles as without it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub max_call_stack_depth: Option<u32>,
+    /// The kernel is the kernel of a compute pipeline of OpenCL mode
+    /// (`ComputePipelineDescriptor::open_cl_mode_enabled`): it takes Metal's three hidden buffers
+    /// at indices 0 to 2, each of its arguments bound at a buffer index sits 3 past its own, and
+    /// OpenCL C's work-item functions read the dispatch's values (`air::canon::opencl`).
+    /// `Device::compile_compute_pipeline` compiles a `Function` kernel under the pipeline's, and a
+    /// kernel compiled on its own for such a pipeline compiles under it too: the pipeline refuses
+    /// a kernel compiled under the other mode (`InvalidDescriptor(OpenClMode)`). Any other
+    /// function compiles as without it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub open_cl_mode: bool,
     /// The kernel runs its dispatch's grid flat (`VariantKey::flat_grid`): the dispatch is any
     /// number of threadgroups of the variant's local size, whose invocations count the grid's
     /// threads in order (`x` fastest) from the `threads_per_grid` of the 32-byte region record at
@@ -214,7 +242,9 @@ pub struct LoweringInputs {
     /// its pipeline, which only a kernel that does not observe its threadgroup partition
     /// (`KernelFacts::partition_oblivious`) allows: it reads no dispatch builtin but
     /// `thread_position_in_grid` and `threads_per_grid`. Any other function is
-    /// `Unsupported{GpuEncodedIndirectCommands, NotRepresentable}` under it. Under
+    /// `Unsupported{GpuEncodedIndirectCommands, NotRepresentable}` under it, but a kernel that
+    /// observes its partition through its simdgroups alone under
+    /// [`call_threadgroups`](Self::call_threadgroups). Under
     /// `replay_bindings` the replay's preprocess writes the record per command
     /// (`ReplayVariant::flat`); otherwise the kernel binds as any other, and a preprocess writes
     /// the record beside its dispatch's group counts. It needs device addresses, and refuses a
@@ -222,6 +252,23 @@ pub struct LoweringInputs {
     /// (`Unsupported{GpuEncodedIndirectCommands, NotImplemented}`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub flat_grid: bool,
+    /// With [`flat_grid`](Self::flat_grid), the dispatch's threadgroups are the call's
+    /// (`VariantKey::call_threadgroups`): the grid is one row along `x`, in threadgroups of the
+    /// variant's local size, one row along `x` too, so workgroup `w`, counted `x` fastest, is
+    /// Metal's threadgroup `w`, and its invocations count its threads in the order of its
+    /// simdgroups' lanes (`lin`, the flattened tiers' subgroups). A kernel that observes its
+    /// partition through its simdgroups alone (`KernelFacts::partition_simdgroups`) then computes
+    /// what Metal's dispatch computes, and may read `thread_index_in_simdgroup`,
+    /// `thread_index_in_quadgroup` and `threads_per_simdgroup` besides the grid's builtins. The
+    /// invocations past the grid's last thread return before the body, so its simdgroup
+    /// operations and barriers run on the live lanes of the last simdgroup, Metal's partial one;
+    /// a module that would hold a workgroup barrier (a simdgroup barrier or fence emitted at
+    /// workgroup scope, in a tier whose subgroup is not the simdgroup) is
+    /// `Unsupported{GpuEncodedIndirectCommands, NotImplemented}`, and so is the input without
+    /// `flat_grid` or with `replay_bindings`. The caller states the dispatch's shape: nothing in
+    /// the module checks it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub call_threadgroups: bool,
     /// The fragment function's render pipeline has a vertex function that writes
     /// `[[render_target_array_index]]`. That function stores `Layer` as 0 for an index at or past
     /// the render pass's `renderTargetArrayLength`, where Metal renders the pass's first layer, and
@@ -407,6 +454,26 @@ pub struct LoweringInputs {
     /// function compiles as without it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub folded_groups: bool,
+    /// The kernel runs a `dispatchThreads` grid that is not a whole number of threadgroups in the
+    /// threadgroups its threads fill, rounded up, each at the call's threadgroup size `L`
+    /// (`VariantKey::partial_threadgroups`; `lower::dispatch`'s partial threadgroups): where its
+    /// `DispatchRegion` carries `lower::dispatch::NONUNIFORM`, the last threadgroup along an axis
+    /// answers Metal's partial threadgroup, `min(L, threads_per_grid − position · L)` threads per
+    /// axis, as `threads_per_threadgroup`, in its simdgroup and quadgroup counts and in its
+    /// threads' positions, and its invocations past them run none of the body (they return before
+    /// it, or, in a body that holds a workgroup barrier, walk it predicated to each barrier), so
+    /// its simdgroup operations run on the live lanes, Metal's partial simdgroup. Every lane read
+    /// ballots its live lanes (`simd::partly_live`). It declares `MultiRegion` and reads the
+    /// region whatever builtins it reads, and states `RuntimeFact::PartialThreadgroups`. A tile
+    /// function, a stage-input region, compute derivatives, an imageblock slice write every
+    /// invocation shares, emulated simdgroups (the input
+    /// `emulated_simdgroups` or a kernel whose lockstep order needs them), `flat_grid`,
+    /// `folded_groups`, `replay_bindings`, and a body whose uniform barriers' vote word its
+    /// workgroup memory cannot hold, are `Unsupported{GpuEncodedIndirectCommands,
+    /// NotImplemented}`: their dispatches keep the exact split. Any other function compiles as
+    /// without it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub partial_threadgroups: bool,
     /// Texture slots bound in one of Apple's extended-range formats
     /// (`VariantKey::extended_range`): each such slot is declared as an image of the format's raw
     /// unsigned texels (`metal::format::ExtendedRange::raw_format`), whose reads decode Metal's
@@ -449,9 +516,10 @@ pub struct LoweringInputs {
     /// (`VariantKey::zeroed_colors`): plain Metal stores zero bytes into each at every sample a
     /// draw covers (Metal probes). The function writes zero to each, through an output variable of
     /// the format's numeric class at that color, at every return; the pipeline compiled under the
-    /// key gives each attachment that format, written whole and unblended. A function that writes
-    /// or reads such a color itself is `NotImplemented` (unmeasured). Any other function compiles
-    /// as without it.
+    /// key gives each attachment that format, written whole and unblended. What the function
+    /// writes to such a color itself is stored nowhere, as plain Metal stores the zero there all
+    /// the same (a Metal probe); a function that reads such a color is `NotImplemented`
+    /// (unmeasured). Any other function compiles as without it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub zeroed_colors: BTreeMap<u32, metal::PixelFormat>,
     /// Color attachments the fragment function's render pipeline has a pixel format for and the
@@ -554,6 +622,16 @@ pub struct LoweringInputs {
     /// tests nothing. Any other function compiles as without it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub alpha_test: Option<crate::metal::CompareFunction>,
+    /// The render pipeline's private logic operation (`logicOperationEnabled`, `logicOperation`),
+    /// which the fragment function computes itself on a device without Vulkan's `logicOp` that
+    /// orders framebuffer fetch: its first output's write to each normalized or integer attachment
+    /// the operation serves reads the pixel's texel, operates on the codes, and stores the result
+    /// (`StageIo::logic_operation`; `lower::fragment`'s `logic`). `Device::compile_render_pipeline`
+    /// sets it for a `Function` fragment stage of such a pipeline on such a device, for every
+    /// operation but copy and no-op, which the attachments' blends and masks draw. Any other
+    /// function compiles as without it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub logic_operation: Option<vk::LogicOp>,
     /// The render pipeline's private `fragmentDepthCompareClampMask`: a fragment function's depth
     /// comparison through `[[sampler(s)]]` where bit `s` is set, or through a constexpr sampler
     /// where bit 31 is, clamps its reference to `[0, 1]`, a NaN taken as 0, before comparing, as
@@ -681,9 +759,12 @@ pub struct LoweringInputs {
     /// such an attachment as `half` through the pass and rounds it to the codes once at the
     /// store, so a function that reads one in the interlocked storage form reads the shadow's texel
     /// (`ResourceKind::ExtendedShadow`) as the tile value, and a write stores the value it computes
-    /// there as well as the codes. Each is a single-sample attachment the function writes or reads
-    /// in the storage form under `framebuffer_fetch`; any other is
-    /// `NotImplemented(FramebufferFetch)`. Empty for any other function.
+    /// there as well as the codes, at the invocation's own sample in a multisampled pipeline. Each
+    /// is an attachment the function writes or reads in the storage form under
+    /// `framebuffer_fetch`, or on a device that fetches through rasterization-order input
+    /// attachments one it writes through its first output or reads, beside its input attachment
+    /// (`lower::fragment`'s `input_shadow`); any other is `NotImplemented(FramebufferFetch)`.
+    /// Empty for any other function.
     #[cfg_attr(feature = "serde", serde(default))]
     pub extended_shadows: BTreeSet<u32>,
     /// Sampled texture slots bound to a texture whose format's numeric class (`Float`, `Sint` or
@@ -758,17 +839,19 @@ pub struct LoweringInputs {
     /// for a pipeline the device draws in one pass as it is, and for any other function.
     #[cfg_attr(feature = "serde", serde(default))]
     pub color_group: Option<ColorGroup>,
-    /// The payload bytes of the mesh function's mesh render pipeline's object function: the
-    /// object function's payload arena (`StageInterface::payload`), where it is larger than the
-    /// mesh function's own. Metal sizes a pipeline's payload by the type the object function
-    /// declares (`payloadMemoryLength` 0, the descriptor's default), and a mesh function may read
-    /// its payload past the type it declares itself, within that; so the mesh function's payload
-    /// arena holds these bytes, read as its own (`lower::mesh::payload_extent`, measured on the M3
-    /// Max under macOS 27.0.1). `Device::compile_mesh_pipeline` sets it for a `Function` mesh stage
-    /// from the pipeline's object function, and a mesh function compiled on its own for such a
-    /// pipeline compiles under the same bytes: link refuses one whose arena is smaller than its
-    /// object function's as `NeedsInput(ObjectPayload)`. `None` for a mesh function whose own
-    /// arena holds the object function's payload, and for any other function.
+    /// The payload bytes of the object or mesh function's mesh render pipeline: for a mesh
+    /// function, its object function's payload arena (`StageInterface::payload`), where it is
+    /// larger than the mesh function's own; for an object function, and a mesh function without
+    /// one, the descriptor's `payloadMemoryLength`, where it is larger than the function's payload
+    /// type. Metal sizes a pipeline's payload by the type the object function declares
+    /// (`payloadMemoryLength` 0, the descriptor's default) or by that length, and a mesh function
+    /// may read its payload past the type it declares itself, within that; so the function's
+    /// payload arena holds these bytes, read as its own (`lower::mesh::payload_extent`, measured on
+    /// the M3 Max under macOS 27.0.1). `Device::compile_mesh_pipeline` sets it for a `Function`
+    /// object and mesh stage, and a function compiled on its own for such a pipeline compiles
+    /// under the same bytes: link refuses a mesh function whose arena is smaller than its object
+    /// function's as `NeedsInput(ObjectPayload)`. `None` for a function whose own arena holds the
+    /// bytes, and for any other function.
     #[cfg_attr(feature = "serde", serde(default))]
     pub object_payload: Option<u32>,
     /// A post-tessellation vertex function compiled for a device without `tessellationShader`,
@@ -782,6 +865,64 @@ pub struct LoweringInputs {
     /// with `tessellationShader`, compiles as without it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub tessellation: Option<TessellationDescriptor>,
+    /// The function's render pipeline draws a rasterization-rate-mapped pass's regions several
+    /// at a time (`VariantKey::region_viewports`): each region one draw of a
+    /// `vkCmdDrawMultiEXT` or `vkCmdDrawMultiIndexedEXT`, its viewport and scissor at the draw's
+    /// index among the command's (`bind::RasterizationRateMap::regions`). Under it a vertex
+    /// function stores `ViewportIndex` as its `DrawIndex`, "the zero-based index of the draw"
+    /// within such a command (the specification's `DrawIndex`), which selects "the viewport
+    /// transform, scissor rectangle, and exclusive scissor rectangle" (its `ViewportIndex`); the
+    /// index is the same at every vertex of a draw, so of a primitive. It needs the device to
+    /// store `ViewportIndex` from a vertex function (`shaderOutputViewportIndex`), to read
+    /// `DrawIndex` (`shaderDrawParameters`) and to take several viewports (`multiViewport`):
+    /// `Unsupported(RasterizationRateMap)` names them otherwise. A merged draw's vertex function
+    /// (`merged_draws`) takes it too, its corner from its `VertexIndex` and `InstanceIndex` as
+    /// without it, and so does a draw replay's of one draw per command (`replay_bindings`). A
+    /// function that writes its own `[[viewport_array_index]]` or
+    /// `[[render_target_array_index]]`, one compiled under `amplification_draws` or
+    /// `viewport_compensation`, and a post-tessellation vertex function, is
+    /// `NotImplemented(RasterizationRateMap)` under it: the
+    /// runtime draws those region by region. The vertex function states `RuntimeFact::RegionViewports`. A
+    /// fragment function compiled under it (behind such a vertex function, where it reads
+    /// `[[viewport_array_index]]`) reads 0 there, the index Metal's reads behind a vertex
+    /// function that writes none. Any other stage compiles as without it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub region_viewports: bool,
+    /// The function's render pipeline draws a rasterization-rate-mapped pass's regions through
+    /// the target's viewport, each region's copy of each vertex computed in the vertex function
+    /// (`VariantKey::region_fan_out`, `RegionFanOut::RegionCopies`), as a fanned-out copy's is:
+    /// region `first + (DrawIndex / c)·nx + DrawIndex mod c` of the region table
+    /// (`SyntheticBinding::RateMapRegions`, `bind::fan_out`), `[first, c]` its recording's
+    /// `PushField::RegionBox`, `nx` the table's segments of x and `DrawIndex` its draw's among a
+    /// `vkCmdDrawMultiEXT`'s (0 for any other draw). The vertex function stores the position the
+    /// region's line moves (`pipeline::link::fan_out::region_copy`, the emitter the fan-out stage
+    /// shares, its operations `NoContraction`), four clip distances past its own that keep the
+    /// region's pixels, and 0 as `ViewportIndex`: the one viewport the runtime sets is the
+    /// target's and its scissor its box's. It needs the device to store `ViewportIndex` from a
+    /// vertex function (`shaderOutputViewportIndex`), read `DrawIndex` (`shaderDrawParameters`)
+    /// and write clip
+    /// distances (`shaderClipDistance`), four more within `maxClipDistances` and
+    /// `maxCombinedClipAndCullDistances`: `Unsupported(RasterizationRateMap)` names them otherwise.
+    /// A merged draw's vertex function (`merged_draws`) takes it too, its corner from its
+    /// `VertexIndex` and `InstanceIndex` as without it, and so does a draw replay's of one draw
+    /// per command (`replay_bindings`). A function that writes its own
+    /// `[[viewport_array_index]]` or `[[render_target_array_index]]`, one compiled under
+    /// `amplification_draws` or `viewport_compensation`, a post-tessellation vertex function and
+    /// one that returns no outputs are `NotImplemented(RasterizationRateMap)` under it: the runtime draws those region by region
+    /// through each region's viewport. Any other stage compiles as without it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub region_copies: bool,
+    /// The axes along which every threadgroup the kernel runs has one thread
+    /// (`VariantKey::unit_axes`; bit 0 `x`, bit 1 `y`, bit 2 `z`): there every thread's
+    /// `thread_position_in_threadgroup` is 0 and its `thread_position_in_grid` is its
+    /// threadgroup's `threadgroup_position_in_grid`, partial threadgroups included, so the
+    /// workgroup-uniformity analysis takes those lanes of the two builtins as uniform
+    /// (`lower::simd::uniform`, "Unit axes") and a block they alone made divergent is walked as a
+    /// uniform one. A kernel compiled under it states `RuntimeFact::UnitAxes { axes, .. }`, and its
+    /// plans run only dispatches whose threadgroups have one thread along every such axis. Any
+    /// other stage compiles as without it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub unit_axes: u8,
 }
 
 /// One group of a render pipeline's color attachments (`LoweringInputs::color_group`,
@@ -909,16 +1050,18 @@ pub enum FactorLane {
 /// even), a `half` one is taken as it is, and the value is stored as a kernel write stores it.
 /// Under blending Metal first clamps the output to the format's range (each color channel to the
 /// values of codes 0 and 1022 as `half`s, an `_sRGB` color channel of `BGRA10_XR_sRGB` to its
-/// decoded codes 0 and 1022, a NaN to the low end; alpha to `[0, 1]`, a NaN to 0).
+/// decoded codes 0 and 1022, a NaN to the low end; alpha to `[0, 1]`, a NaN to 0); a padded
+/// form's output it blends unclamped.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ExtendedRangeColor {
     /// The attachment's format.
     pub form: metal::format::ExtendedRange,
-    /// The pipeline enables blending at the attachment, with factors one and zero for color and
-    /// alpha and the operation add (any other blend is not built): the output is clamped to the
-    /// format's range first.
+    /// The pipeline enables blending at the attachment: the output is clamped to the format's
+    /// range first, and the fragment function computes the blend over an ordered read of the
+    /// attachment (`lower::fragment`). A blend into a bfloat attachment is Metal's pipeline
+    /// error (`InvalidDescriptor(ColorAttachment)`).
     pub blended: bool,
     /// A bfloat attachment of a pipeline whose `textureWriteRoundingMode` is
     /// `metal::TextureWriteRoundingMode::NearestEven`: a `float` output rounds to `half` to
@@ -930,8 +1073,8 @@ pub struct ExtendedRangeColor {
 }
 
 impl ExtendedRangeColor {
-    /// The write of an attachment of `form`, blended (with factors one and zero) where `blended`,
-    /// at the default `textureWriteRoundingMode`.
+    /// The write of an attachment of `form`, blended where `blended`, at the default
+    /// `textureWriteRoundingMode`.
     pub fn new(form: metal::format::ExtendedRange, blended: bool) -> ExtendedRangeColor {
         ExtendedRangeColor {
             form,

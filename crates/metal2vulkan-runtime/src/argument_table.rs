@@ -29,7 +29,8 @@
 //! M4 where its API validation asserts: it holds a buffer bound past its length, which a dispatch
 //! refuses only where the kernel reads the slot (a read there is past the buffer: memory decides
 //! it). A render stage's table refuses that at the call, as Metal's validation does; plain Metal's
-//! render form is not measured.
+//! render form is not measured. Both tables' stride forms hold a stride as its low 32 bits,
+//! `MTLAttributeStrideStatic`'s included ([`per_bind_stride`]).
 //!
 //! An offset set at an index with no buffer bound is no change in either, as plain Metal's render
 //! and compute encoders both take it ([`ArgumentTable::take_buffer_offset`]).
@@ -43,14 +44,18 @@ use super::encoder::EncoderCore;
 use super::error::{invalid, Error, Problem};
 use super::function_table::{FunctionTableProblem, VisibleFunctionTable};
 use super::live_bind::Reshape;
+use super::residency::whole_use;
 use super::resource::ResourceKey;
 use super::retained::HeldBy;
 use super::sampler::SamplerState;
 use super::texture::Texture;
+use super::tracker::{Access, Use};
 use super::upload::Upload;
+use super::work_counts::{Counting, ReshapedBy};
+use ash::vk;
 use metal2vulkan::bind::{BindState, BoundBuffer, BoundSampler, BoundTexture, StageTable};
 use metal2vulkan::pipeline::{
-    BufferKind, PipelineInterface, SlotClass, SlotInterface, SlotRef, Stage,
+    BufferKind, PipelineInterface, RenderPipeline, SlotClass, SlotInterface, SlotRef, Stage,
 };
 use std::any::Any;
 use std::collections::btree_map::Entry;
@@ -65,9 +70,6 @@ pub(super) const BUFFER_SLOTS: u32 = 31;
 pub(super) const TEXTURE_SLOTS: u32 = 128;
 /// Entries of a sampler table (`setSamplerState:atIndex:` and its stage forms).
 pub(super) const SAMPLER_SLOTS: u32 = 16;
-/// `MTLAttributeStrideStatic`: the stride argument that sets no per-bind stride, so the buffer
-/// is read at its layout's own stride, as by the plain setters.
-pub(super) const ATTRIBUTE_STRIDE_STATIC: u64 = u64::MAX;
 /// The most bytes one `setBytes:length:atIndex:` (or a stage form) takes: Metal's documented
 /// limit for inline bytes, 4 KiB.
 pub(super) const INLINE_BYTES_LIMIT: u64 = 4096;
@@ -94,6 +96,12 @@ pub(crate) struct AtBindViews {
     slots: [AtomicU64; VIEW_STAGES.len()],
     /// The device's view base alignment (`BindState::view_base_alignment_of`).
     alignment: u32,
+    /// Whether the device reads every uniform view at its residual
+    /// (`pipeline::reads_views_at_bind`), which a bind state states
+    /// (`BindState::uniform_views_at_residual`).
+    at_residual: bool,
+    /// The slots of its tables the state's bind state holds ([`ReadSlots`]).
+    read: ReadSlots,
 }
 
 impl AtBindViews {
@@ -101,19 +109,41 @@ impl AtBindViews {
     /// alignment of `device`: on every device, so a command's shape and its plan are the ones the
     /// translator makes of its binds there. On a device that reads every uniform view at its
     /// residual (`pipeline::reads_views_at_bind`) only the key the plan gives takes its residual
-    /// form (`RenderVariant::plan`, `Variant::keyed_regions`).
-    pub(crate) fn new(device: &Device, interface: &PipelineInterface) -> AtBindViews {
+    /// form (`RenderVariant::plan`, `Variant::keyed_regions`). The state's bind state holds the
+    /// slots `read` holds.
+    pub(crate) fn new(
+        device: &Device,
+        interface: &PipelineInterface,
+        read: ReadSlots,
+    ) -> AtBindViews {
         let limits = device.compile_device().profile().limits();
         AtBindViews {
             slots: VIEW_STAGES.map(|stage| AtomicU64::new(interface.uniform_view_buffers(stage))),
             alignment: BindState::view_base_alignment_of(limits),
+            at_residual: !crate::pipeline::reads_views_at_bind(device),
+            read,
         }
+    }
+
+    /// That `variant`, a pipeline a draw of the state settled, reads no slot the state's bind
+    /// state leaves out (`ReadSlots::check_variant`; builds with debug assertions).
+    #[cfg(debug_assertions)]
+    pub(crate) fn check_variant(&self, variant: &RenderPipeline) {
+        self.read.check_variant(variant);
     }
 
     /// The device's view base alignment, which a bind state states
     /// (`BindState::view_base_alignment`).
     pub(crate) fn alignment(&self) -> u32 {
         self.alignment
+    }
+
+    /// Whether the device reads every uniform view at its residual, which a bind state states
+    /// (`BindState::uniform_views_at_residual`): every key its draws and dispatches take is then
+    /// its residual form (`RenderVariant::plan`, `Variant::keyed_regions`), so instantiation may
+    /// bind a uniform view over a range its bind offsets share.
+    pub(crate) fn at_residual(&self) -> bool {
+        self.at_residual
     }
 
     /// Whether `stage`'s slots are `slots` (none for a stage it does not keep): a table read under
@@ -129,6 +159,124 @@ impl AtBindViews {
     fn of(&self, stage: Stage) -> Option<&AtomicU64> {
         let at = VIEW_STAGES.iter().position(|s| *s == stage)?;
         Some(&self.slots[at])
+    }
+}
+
+/// The render stages whose slots [`ReadSlots`] tells apart, in its order.
+const READ_STAGES: [Stage; 4] = [Stage::Vertex, Stage::Fragment, Stage::Object, Stage::Mesh];
+
+/// The texture and sampler slots of one stage's tables a bind state holds ([`ReadSlots`]), bit `i`
+/// for index `i` of each table: as wide as Metal's tables ([`TEXTURE_SLOTS`], [`SAMPLER_SLOTS`]).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct StageReads {
+    textures: u128,
+    samplers: u16,
+}
+
+impl StageReads {
+    /// Hold `class`'s slot `index`: whether it lies inside the class's table. A buffer slot is
+    /// held whatever it reads ([`ReadSlots`]).
+    fn add(&mut self, class: SlotClass, index: u32) -> bool {
+        match class {
+            SlotClass::Buffer => return index < BUFFER_SLOTS,
+            SlotClass::Texture if index < TEXTURE_SLOTS => self.textures |= 1 << index,
+            SlotClass::Sampler if index < SAMPLER_SLOTS => self.samplers |= 1 << index,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Whether it holds `class`'s slot `index`: every buffer slot.
+    fn holds(&self, class: SlotClass, index: u32) -> bool {
+        match class {
+            SlotClass::Buffer => true,
+            SlotClass::Texture => index < TEXTURE_SLOTS && self.textures >> index & 1 != 0,
+            SlotClass::Sampler => index < SAMPLER_SLOTS && self.samplers >> index & 1 != 0,
+        }
+    }
+}
+
+/// The slots of its tables a pipeline state's bind state holds (`ArgumentTable::refresh_reading`,
+/// `refresh_changed`): of a render pipeline state that indirect command buffers may not hold, none
+/// of whose functions resolves texture or sampler handles, translates pointers or reaches an
+/// indirect command buffer (`PipelineInterface::needs_handle_translation`,
+/// `needs_pointer_translation`, `reaches_command_buffers`), every buffer slot and the texture and
+/// sampler slots its functions statically use (`PipelineInterface::slots`), the only texture and
+/// sampler slots a plan of it reads (checked against each variant its draws settle in builds with
+/// debug assertions: [`check_variant`](Self::check_variant)); of any other, every slot. A handle
+/// table holds the textures bound at any slot, so a state whose functions read one holds them all;
+/// so does a state indirect command buffers may hold, whose executions draw through variants of
+/// their own (`LoweringInputs::replay_bindings`). Every buffer slot is held: a variant may read
+/// its buffers through the root table, whose resident set is every bound buffer (`memory/roots.rs`
+/// in the translator), whatever its base reads.
+///
+/// A slot it leaves out is no part of the bind state: a bind there changes neither its shape nor
+/// its plan, as it changes none of the state's commands. So draws of a state whose functions
+/// sample one texture keep their shape and their kept draw (`render/draw_again.rs`) while draws
+/// of another state between them bind other textures at a slot it leaves unread, and its kept
+/// draw carried into the next encoder is not stale for such a slot left unbound there
+/// (`render/carried.rs`).
+pub(crate) struct ReadSlots(Option<[StageReads; READ_STAGES.len()]>);
+
+impl ReadSlots {
+    /// Every slot: a compute state's, whose bind state is read whole.
+    pub(crate) fn every() -> ReadSlots {
+        ReadSlots(None)
+    }
+
+    /// The slots a render pipeline state of `pipeline`, its base, holds, one indirect command
+    /// buffers may hold where `executable` (the type's docs).
+    pub(crate) fn of(pipeline: &RenderPipeline, executable: bool) -> ReadSlots {
+        let interface = &pipeline.interface;
+        if executable
+            || interface.needs_handle_translation
+            || interface.needs_pointer_translation
+            || interface.reaches_command_buffers
+        {
+            return ReadSlots(None);
+        }
+        let mut stages = [StageReads::default(); READ_STAGES.len()];
+        // A slot of another stage, or past its table, is held whole.
+        for slot in interface.slots.keys() {
+            let at = READ_STAGES.iter().position(|stage| *stage == slot.stage);
+            if !at.is_some_and(|at| stages[at].add(slot.class, slot.index)) {
+                return ReadSlots(None);
+            }
+        }
+        ReadSlots(Some(stages))
+    }
+
+    /// Whether the bind state holds `stage`'s slot of `class` at `index`: every slot of a stage
+    /// it does not tell apart.
+    fn reads(&self, stage: Stage, class: SlotClass, index: u32) -> bool {
+        let Some(stages) = &self.0 else {
+            return true;
+        };
+        match READ_STAGES.iter().position(|of| *of == stage) {
+            Some(at) => stages[at].holds(class, index),
+            None => true,
+        }
+    }
+
+    /// That `variant`, a pipeline a draw of the state settled (a variant of its base), reads no
+    /// slot it leaves out (builds with debug assertions): its functions resolve no handle, and
+    /// every texture and sampler slot its interface uses is held.
+    #[cfg(debug_assertions)]
+    fn check_variant(&self, variant: &RenderPipeline) {
+        if self.0.is_none() {
+            return;
+        }
+        let interface = &variant.interface;
+        assert!(
+            !interface.needs_handle_translation,
+            "a variant reads a handle table its base reads none of"
+        );
+        for slot in interface.slots.keys() {
+            assert!(
+                self.reads(slot.stage, slot.class, slot.index),
+                "a variant uses {slot:?}, which its base's bind state leaves out"
+            );
+        }
     }
 }
 
@@ -149,9 +297,9 @@ pub(super) struct ArgumentTable {
     /// Neither `buffers` nor `function_tables` holds them.
     pub(super) null_tables: BTreeSet<u32>,
     /// The per-bind attribute strides of buffers in `buffers`, by index
-    /// (`setBuffer:offset:attributeStride:atIndex:` and its forms): a layout of
-    /// `MTLBufferLayoutStrideDynamic` reads its buffer at this stride. The plain setters bind
-    /// with `MTLAttributeStrideStatic`, which sets none.
+    /// (`setBuffer:offset:attributeStride:atIndex:` and its forms, [`per_bind_stride`]): a layout
+    /// of `MTLBufferLayoutStrideDynamic` reads its buffer at this stride. The plain setters set
+    /// none, which such a layout reads at stride 0.
     pub(super) attribute_strides: BTreeMap<u32, u32>,
     pub(super) textures: BTreeMap<u32, Texture>,
     /// The indices of `textures` that hold a memoryless texture, a texture buffer's too: none,
@@ -185,7 +333,7 @@ impl Clone for ArgumentTable {
             memoryless: self.memoryless.clone(),
             samplers: self.samplers.clone(),
             bytes: self.bytes.clone(),
-            retained: self.retained.clone(),
+            retained: self.retained.unheld(),
             stamp: Stamp::fresh(),
             changes: Changes::default(),
         }
@@ -195,16 +343,44 @@ impl Clone for ArgumentTable {
 /// What an argument table binds, named by a number drawn afresh for each new table (a copy
 /// included) and at each call that may change what it binds, which no other table of the process
 /// takes ([`ArgumentTable::stamp`]): while a table's stamp holds, it binds what it bound, by
-/// identity. A table made for one command (an execution's own buffers) is filled in place before
+/// identity. A call that binds each of its slots as it is bound already (the same object, offset,
+/// per-bind stride and clamps) changes nothing and draws none. A table made for one command (an execution's own buffers) is filled in place before
 /// any command reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Stamp(u64);
 
+/// The stamps a thread takes from the process's at once ([`Stamp::fresh`]).
+const STAMP_BLOCK: u64 = 1 << 16;
+
 impl Stamp {
-    /// A stamp no table took before.
-    fn fresh() -> Stamp {
+    /// A stamp no table took before: the next of the calling thread's block, a range of the
+    /// process's stamps no other thread draws from, its next block taken once it is spent. So a
+    /// call that changes a table writes no memory another thread's calls write: a consumer encodes
+    /// a queue's command buffers on threads of their own, and where each call drew its stamp from
+    /// one counter of the process, each thread's calls waited for that counter's line to come
+    /// back from the others'.
+    pub(super) fn fresh() -> Stamp {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        Stamp(NEXT.fetch_add(1, Ordering::Relaxed))
+        thread_local! {
+            /// The calling thread's next stamp and the end of its block.
+            static BLOCK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+        }
+        BLOCK.with(|block| {
+            let (mut next, mut end) = block.get();
+            if next == end {
+                next = NEXT.fetch_add(STAMP_BLOCK, Ordering::Relaxed);
+                end = next + STAMP_BLOCK;
+            }
+            block.set((next + 1, end));
+            Stamp(next)
+        })
+    }
+
+    /// Its number, which no other stamp has (read by `tests::argument_table`, a debug-build
+    /// test).
+    #[cfg(all(test, debug_assertions))]
+    pub(super) fn raw(self) -> u64 {
+        self.0
     }
 }
 
@@ -214,9 +390,13 @@ impl Default for Stamp {
     }
 }
 
-/// The most slots a table keeps of its last calls' changes ([`Changes`]): a reader that read it
-/// before those reads it whole.
-const CHANGES_KEPT: usize = 16;
+/// The slots of its last calls' changes a table keeps at least, once it noted as many, and the
+/// most slots a call notes ([`Changes`]): it keeps at most twice as many, and a reader that read it
+/// before those it keeps reads it whole. Enough for the binds between a pipeline state's draws
+/// where draws of a few others come between, each binding a few slots: the state's bind state,
+/// set aside meanwhile (`live_bind.rs`), and its kept draw, rebound (`render/draw_again.rs`),
+/// bring in only what changed, found by a scan back from the newest change to their stamp.
+const CHANGES_KEPT: usize = 64;
 
 /// The slots a table's last calls changed (or may have: a refused call's too), each with the
 /// stamp the table took at that call, oldest first, and the stamp before the oldest: a reader that
@@ -226,13 +406,31 @@ const CHANGES_KEPT: usize = 16;
 #[derive(Default)]
 struct Changes {
     since: Option<Stamp>,
-    slots: Vec<(Stamp, SlotClass, u32)>,
+    slots: Vec<Changed>,
+}
+
+/// A slot a call changed, with the stamp the table took at the call: of `class` at `index`, and
+/// whether the call kept the buffer bound there, moving its offset or attribute stride alone
+/// (`offset`).
+#[derive(Clone, Copy)]
+struct Changed {
+    stamp: Stamp,
+    class: SlotClass,
+    index: u32,
+    offset: bool,
 }
 
 impl Changes {
     /// Note a call that took the table from `before` to `after`, changing the slots of `class`
-    /// at `indices`: of more slots than are kept, it leaves none to read from.
-    fn note(&mut self, (before, after): (Stamp, Stamp), class: SlotClass, indices: Range<u32>) {
+    /// at `indices`, their offsets alone where `offset` ([`Changed`]): of more slots than are
+    /// kept, it leaves none to read from.
+    fn note(
+        &mut self,
+        (before, after): (Stamp, Stamp),
+        class: SlotClass,
+        indices: Range<u32>,
+        offset: bool,
+    ) {
         if indices.len() > CHANGES_KEPT {
             self.since = None;
             self.slots.clear();
@@ -241,28 +439,32 @@ impl Changes {
         if self.slots.is_empty() {
             self.since = Some(before);
         }
-        self.slots
-            .extend(indices.map(|index| (after, class, index)));
-        // The oldest calls go whole: a reader under the stamp one of them took saw its slots.
-        while self.slots.len() > CHANGES_KEPT {
-            let oldest = self.slots[0].0;
-            let gone = self.slots.partition_point(|&(stamp, ..)| stamp == oldest);
-            self.slots.drain(..gone);
-            self.since = Some(oldest);
+        self.slots.extend(indices.map(|index| Changed {
+            stamp: after,
+            class,
+            index,
+            offset,
+        }));
+        // Past twice the slots it keeps, the oldest calls go whole, at once, down to the newest
+        // calls of at most `CHANGES_KEPT` slots: a reader under the stamp one of them took saw its
+        // slots. At once, so a note moves the slots it keeps once in `CHANGES_KEPT` calls.
+        if self.slots.len() > 2 * CHANGES_KEPT {
+            let mut cut = self.slots.len() - CHANGES_KEPT;
+            while cut < self.slots.len() && self.slots[cut].stamp == self.slots[cut - 1].stamp {
+                cut += 1;
+            }
+            self.since = Some(self.slots[cut - 1].stamp);
+            self.slots.drain(..cut);
         }
     }
 
     /// The slots changed since the table's stamp was `read`, where it keeps them.
-    fn since(&self, read: Stamp) -> Option<impl Iterator<Item = (SlotClass, u32)> + '_> {
+    fn since(&self, read: Stamp) -> Option<impl Iterator<Item = Changed> + Clone + '_> {
         let from = match self.since == Some(read) {
             true => 0,
-            false => self.slots.iter().rposition(|&(stamp, ..)| stamp == read)? + 1,
+            false => (self.slots.iter()).rposition(|changed| changed.stamp == read)? + 1,
         };
-        Some(
-            self.slots[from..]
-                .iter()
-                .map(|&(_, class, index)| (class, index)),
-        )
+        Some(self.slots[from..].iter().copied())
     }
 }
 
@@ -272,9 +474,14 @@ impl Changes {
 #[derive(Default)]
 struct Retained(Mutex<RetainedBy>);
 
-impl Clone for Retained {
-    fn clone(&self) -> Retained {
-        Retained(Mutex::new(lock(&self.0).clone()))
+impl Retained {
+    /// A copy whose core is to look at every object at its next retain
+    /// ([`RetainedBy::unheld`]): a table's copy, which may be changed in place without its calls
+    /// (`render/pass_start_reads.rs`).
+    fn unheld(&self) -> Retained {
+        let mut copy = lock(&self.0).clone();
+        copy.unheld = true;
+        Retained(Mutex::new(copy))
     }
 }
 
@@ -283,7 +490,50 @@ struct RetainedBy {
     core: Option<u64>,
     /// The table's stamp then: while it holds, the table binds those objects still.
     stamp: Option<Stamp>,
+    /// Whether a call since bound an object that core did not hold then
+    /// ([`ArgumentTable::note_bound`]): until one does, the core holds every object the table
+    /// binds, so a retain looks at none ([`retain_into`]).
+    unheld: bool,
+    /// The objects the core holds of those the table bound since that retain, its own then
+    /// among them, each by the address of its [`HeldBy`] (builds with debug assertions:
+    /// [`check_held`](Self::check_held)). Its storage is kept from retain to retain, so a draw
+    /// allocates as many times with debug assertions as without.
+    #[cfg(debug_assertions)]
+    held: Vec<usize>,
 }
+
+#[cfg(debug_assertions)]
+impl RetainedBy {
+    /// Note the objects `objects` binds now, as the table was just retained: the core holds them
+    /// all.
+    fn note_retained(&mut self, objects: Objects<'_>) {
+        self.held.clear();
+        let (buffers, textures, samplers) = objects;
+        let bound = bound_in(buffers, textures, samplers);
+        (self.held).extend(bound.map(|object| std::ptr::from_ref(object.held_by()).addr()));
+    }
+
+    /// That every object `objects` binds is one the core holds ([`retain_into`]'s premise where
+    /// it looks at none): bound at its last retain, or bound since while the core held it.
+    fn check_held(&self, objects: Objects<'_>) {
+        let (buffers, textures, samplers) = objects;
+        for object in bound_in(buffers, textures, samplers) {
+            let address = std::ptr::from_ref(object.held_by()).addr();
+            assert!(
+                self.held.contains(&address),
+                "an argument table binds an object its core neither retained at its last retain \
+                 nor held as a call bound it, and no call since noted it unheld"
+            );
+        }
+    }
+}
+
+/// What an argument table binds: its buffers, textures and sampler states, by index.
+type Objects<'a> = (
+    &'a BTreeMap<u32, (Buffer, u64)>,
+    &'a BTreeMap<u32, Texture>,
+    &'a BTreeMap<u32, (SamplerState, Option<[f32; 2]>)>,
+);
 
 /// An object an argument table binds, which a command that uses the table holds.
 #[derive(Clone, Copy)]
@@ -317,6 +567,16 @@ impl<'a> Bound<'a> {
             Bound::Buffer(buffer) => buffer.held(),
             Bound::Texture(texture) => texture.held(),
             Bound::Sampler(sampler) => sampler.held(),
+        }
+    }
+
+    /// The address of what [`held`](Self::held) refers to, which a core looks among those it
+    /// holds lately for (`retained.rs`).
+    fn address(self) -> usize {
+        match self {
+            Bound::Buffer(buffer) => buffer.address(),
+            Bound::Texture(texture) => texture.address(),
+            Bound::Sampler(sampler) => sampler.address(),
         }
     }
 }
@@ -368,7 +628,7 @@ pub(super) fn check_bound_buffer(
     (buffer, offset): (&Buffer, u64),
     compute: bool,
 ) -> Result<(), Error> {
-    super::encoder::check_device(device, call, buffer.device())?;
+    super::encoder::check_device(device, call, buffer.generation())?;
     let length = buffer.length();
     if offset > length && !compute {
         return Err(invalid(call, Problem::OffsetOutOfRange { offset, length }));
@@ -376,13 +636,24 @@ pub(super) fn check_bound_buffer(
     Ok(())
 }
 
-/// The per-bind stride `stride` names: none for `MTLAttributeStrideStatic`, else its low 32
-/// bits. Plain Metal reads a stride past 32 bits so, and its validation takes it (an M4 under macOS
-/// 27.0.1 and an M3 Max under 26.7, compute stage-in and vertex fetch, both binding forms: `2^32 +
-/// 8` and `2^63 + 8` read at 8, `2^33 + 4` at 4, `2^32` at 0).
-fn attribute_stride(stride: u64) -> Option<u32> {
+/// The per-bind stride a stride form's `stride` names in a compute table or a render stage's: its
+/// low 32 bits. Plain Metal reads a stride past 32 bits so, and its validation takes it (an M4
+/// under macOS 27.0.1 and an M3 Max under 26.7, compute stage-in and vertex fetch, both binding
+/// forms: `2^32 + 8` and `2^63 + 8` read at 8, `2^33 + 4` at 4, `2^32` at 0).
+///
+/// `MTLAttributeStrideStatic` (`u64::MAX`) is no exception: its low 32 bits, `2^32 - 1`, are the
+/// stride a layout of `MTLBufferLayoutStrideDynamic` reads, a kernel's stage-in layout or a vertex
+/// descriptor's. Plain Metal on an Apple M3 Max under macOS 27.0.1 answered each of the compute
+/// encoder's four stride forms, and the render encoder's `setVertexBuffer:offset:attributeStride:
+/// atIndex:`, bound so with the element at the bind offset for the first element and zero for
+/// every element past it, the bind offset reaching the first (`metal2vulkan-conformance`'s
+/// `attribute-stride-*` recordings, buffers of 512 and 64 bytes), which is a fetch at that stride:
+/// element 1 lies `2^32 - 1` bytes on, past the buffer (an indirect command buffer's command read
+/// the byte there in a buffer that holds it, `indirect_execute::unstrided_stride`).
+/// Metal's API validation stops a draw bound so.
+pub(super) fn per_bind_stride(stride: u64) -> u32 {
     // Truncation is the measured answer.
-    (stride != ATTRIBUTE_STRIDE_STATIC).then_some(stride as u32)
+    stride as u32
 }
 
 /// Bind `value` at `index` of `table`, or unbind the index when `value` is `None`: what was
@@ -440,6 +711,16 @@ fn set_bare_handle<T: Clone + PartialEq>(
     }
 }
 
+/// Whether a setter of `values` from index `first` binds each index as it is bound already, as
+/// `held(at, index, value)` tells of the value at place `at`: such a call changes nothing, and
+/// the table keeps its stamp ([`ArgumentTable::changed`]).
+fn binds_as<T>(values: &[T], first: u32, held: impl Fn(usize, u32, &T) -> bool) -> bool {
+    (values.iter().enumerate()).all(|(at, value)| {
+        let index = u32::try_from(at).ok().and_then(|at| first.checked_add(at));
+        index.is_some_and(|index| held(at, index, value))
+    })
+}
+
 /// `buffer` bound at `offset`, read at `attribute_stride`, as the bind layer reads it
 /// ([`ArgumentTable::stage_table`]), or `None` where it is bound past its length.
 fn bound_buffer(
@@ -486,22 +767,42 @@ fn bound_texture(texture: &Texture) -> BoundTexture {
 
 /// Whether `a` and `b` print alike (`{:?}`), told without printing them
 /// ([`ArgumentTable::check_reading`]): every field as `==` compares it, but the descriptor's LOD
-/// clamps, which print a float's sign (`0.0` and `-0.0` differ, where `==` takes them for equal)
-/// and print every NaN alike (where `==` takes no NaN for equal). `tests/argument_table.rs` fails
-/// when `BoundSampler` or `SamplerDescriptor` gains a field, so a new one is compared here too.
+/// clamps and LOD bias, which print a float's sign (`0.0` and `-0.0` differ, where `==` takes
+/// them for equal) and print every NaN alike (where `==` takes no NaN for equal).
+/// `tests/argument_table.rs` fails when `BoundSampler` or `SamplerDescriptor` gains a field, so a
+/// new one is compared here too.
 #[cfg(debug_assertions)]
 pub(super) fn same_as_printed(a: &BoundSampler, b: &BoundSampler) -> bool {
     let alike = |x: f32, y: f32| x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan());
-    let clamps = alike(a.desc.lod_min_clamp, b.desc.lod_min_clamp)
-        && alike(a.desc.lod_max_clamp, b.desc.lod_max_clamp);
+    let floats = |s: &BoundSampler| [s.desc.lod_min_clamp, s.desc.lod_max_clamp, s.desc.lod_bias];
+    let floats_alike = (floats(a).into_iter())
+        .zip(floats(b))
+        .all(|(x, y)| alike(x, y));
     let [mut a, mut b] = [*a, *b];
     for desc in [&mut a.desc, &mut b.desc] {
-        [desc.lod_min_clamp, desc.lod_max_clamp] = [0.0; 2];
+        [desc.lod_min_clamp, desc.lod_max_clamp, desc.lod_bias] = [0.0; 3];
     }
-    clamps && a == b
+    floats_alike && a == b
 }
 
 impl ArgumentTable {
+    /// What commands that run with this table's bindings, as an indirect command buffer's
+    /// commands inherit the encoder's, may use of them, for the scheduler's order across queues
+    /// (`CommandBufferShared::footprint`): each buffer over all its bytes and each texture over its
+    /// whole image, read and written in every stage, as nothing bounds what their functions do
+    /// there. `None` where it binds a visible-function table, whose functions reach more.
+    pub(super) fn bound_uses(&self) -> Option<Vec<Use<ResourceKey>>> {
+        if !self.function_tables.is_empty() {
+            return None;
+        }
+        let stages = vk::PipelineStageFlags2::ALL_COMMANDS;
+        let read = Access::new(stages, vk::AccessFlags2::MEMORY_READ);
+        let write = Access::new(stages, vk::AccessFlags2::MEMORY_WRITE);
+        let buffers = (self.buffers.values()).map(|(buffer, _)| whole_use(buffer, read, write));
+        let textures = (self.textures.values()).map(|texture| texture.bound_use(read, write));
+        Some(buffers.chain(textures).collect())
+    }
+
     /// A compute encoder's table (the module docs).
     pub(super) fn compute() -> ArgumentTable {
         ArgumentTable {
@@ -517,11 +818,69 @@ impl ArgumentTable {
 
     /// A call that may change the slots of `class` at `indices` (before its checks: a refused one
     /// may have changed nothing, which a reader then reads again): a fresh stamp, and the slots
-    /// noted ([`Changes`]).
+    /// noted ([`Changes`]). A call that binds each slot as it is bound already ([`binds_as`])
+    /// takes none.
     fn changed(&mut self, class: SlotClass, indices: Range<u32>) {
+        self.changed_as(class, indices, false);
+    }
+
+    /// [`changed`](Self::changed), the call's change of the buffer slots at `indices` their
+    /// offsets alone where `offset`: each binds the buffer it bound, and keeps binding it
+    /// whatever the call's checks answer ([`Changed`]).
+    fn changed_as(&mut self, class: SlotClass, indices: Range<u32>, offset: bool) {
         let before = self.stamp;
         self.stamp = Stamp::fresh();
-        self.changes.note((before, self.stamp), class, indices);
+        self.changes
+            .note((before, self.stamp), class, indices, offset);
+    }
+
+    /// Whether buffer slot `index` binds `buffer` now: a buffer's offset moved there is the
+    /// change of an offset alone ([`changed_as`](Self::changed_as)).
+    fn binds_buffer(&self, index: u32, buffer: &Buffer) -> bool {
+        (self.buffers.get(&index)).is_some_and(|(bound, _)| bound == buffer)
+            && !self.function_tables.contains_key(&index)
+    }
+
+    /// Whether buffer slot `index` holds what a buffer setter leaves there binding `buffer` at
+    /// `offset` with the per-bind stride `stride`: that buffer at that offset, or no buffer where
+    /// `buffer` is `None`, that stride, and no function table, null table or bytes. Such a call
+    /// changes nothing.
+    fn holds_buffer(
+        &self,
+        index: u32,
+        (buffer, offset): (Option<&Buffer>, u64),
+        stride: Option<u32>,
+    ) -> bool {
+        let bound = (self.buffers.get(&index)).map(|(bound, at)| (bound, *at));
+        bound == buffer.map(|buffer| (buffer, offset))
+            && self.attribute_strides.get(&index).copied() == stride
+            && !self.function_tables.contains_key(&index)
+            && !self.null_tables.contains(&index)
+            && !self.bytes.contains_key(&index)
+    }
+
+    /// A call through `core` binds `object`: where `core` does not hold it (from a retain of its
+    /// own, `retained::HeldBy`), or is not the core the table was last retained into, the next
+    /// retain looks at every object ([`retain_into`]); else `core` holds it until its command
+    /// buffer completes, and keeps its key.
+    fn note_bound(&mut self, core: &EncoderCore, object: Bound<'_>) {
+        let id = core.id();
+        let retained = self
+            .retained
+            .0
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        let held_here = retained.core == Some(id) && object.held_by().is(id);
+        if !held_here {
+            retained.unheld = true;
+        }
+        #[cfg(debug_assertions)]
+        if held_here {
+            let address = std::ptr::from_ref(object.held_by()).addr();
+            if !retained.held.contains(&address) {
+                retained.held.push(address);
+            }
+        }
     }
 
     /// Refuse `buffer` at `offset` in `call` of an encoder of `core`: a buffer of another device,
@@ -536,9 +895,9 @@ impl ArgumentTable {
         check_bound_buffer(core.device(), call, (buffer, offset), self.compute)
     }
 
-    /// `setBuffer:offset:atIndex:` (`None` unbinds the index) in an encoder of `core`: the
-    /// stride form with `MTLAttributeStrideStatic`. Refused: an index past the table, a buffer of
-    /// another device, and in a render stage's table an offset past the buffer's length.
+    /// `setBuffer:offset:atIndex:` (`None` unbinds the index) in an encoder of `core`, with no
+    /// per-bind stride. Refused: an index past the table, a buffer of another device, and in a
+    /// render stage's table an offset past the buffer's length.
     pub(super) fn set_buffer(
         &mut self,
         core: &mut EncoderCore,
@@ -547,11 +906,11 @@ impl ArgumentTable {
         offset: u64,
         index: u32,
     ) -> Result<(), Error> {
-        self.set_buffer_with_stride(core, call, buffer, offset, ATTRIBUTE_STRIDE_STATIC, index)
+        self.bind_buffer(core, call, buffer, offset, None, index)
     }
 
     /// `setBuffer:offset:attributeStride:atIndex:` (`None` unbinds the index) in an encoder of
-    /// `core`, a stride past 32 bits taken modulo `2^32`. Refused as
+    /// `core`, at the per-bind stride `stride` names ([`per_bind_stride`]). Refused as
     /// [`set_buffer`](Self::set_buffer) is.
     pub(super) fn set_buffer_with_stride(
         &mut self,
@@ -562,11 +921,30 @@ impl ArgumentTable {
         stride: u64,
         index: u32,
     ) -> Result<(), Error> {
-        self.changed(SlotClass::Buffer, index..index.saturating_add(1));
+        let stride = per_bind_stride(stride);
+        self.bind_buffer(core, call, buffer, offset, Some(stride), index)
+    }
+
+    /// [`set_buffer_with_stride`](Self::set_buffer_with_stride) at the per-bind stride `stride`,
+    /// none for the plain setter.
+    fn bind_buffer(
+        &mut self,
+        core: &mut EncoderCore,
+        call: &'static str,
+        buffer: Option<&Buffer>,
+        offset: u64,
+        stride: Option<u32>,
+        index: u32,
+    ) -> Result<(), Error> {
+        // A call that binds the slot as it is bound already changes nothing.
+        if !self.holds_buffer(index, (buffer, offset), stride) {
+            let same = buffer.is_some_and(|buffer| self.binds_buffer(index, buffer));
+            self.changed_as(SlotClass::Buffer, index..index.saturating_add(1), same);
+        }
         check_index(call, index, BUFFER_SLOTS)?;
-        let stride = attribute_stride(stride);
         if let Some(buffer) = buffer {
             self.check_buffer(core, call, buffer, offset)?;
+            self.note_bound(core, Bound::Buffer(buffer));
         }
         let replaced = set_handle(&mut self.buffers, index, buffer, offset);
         set_entry(&mut self.attribute_strides, index, stride);
@@ -580,7 +958,7 @@ impl ArgumentTable {
     }
 
     /// `setBuffers:offsets:withRange:`: `buffers[i]` at offset `offsets[i]` at index `first + i`,
-    /// every stride `MTLAttributeStrideStatic`. Refused as [`set_buffer`](Self::set_buffer) is,
+    /// with no per-bind stride. Refused as [`set_buffer`](Self::set_buffer) is,
     /// and when the slices' lengths differ; a refusal binds none of them.
     pub(super) fn set_buffers(
         &mut self,
@@ -594,8 +972,8 @@ impl ArgumentTable {
     }
 
     /// `setBuffers:offsets:attributeStrides:withRange:`: as [`set_buffers`](Self::set_buffers),
-    /// each buffer at stride `strides[i]` (modulo `2^32`) where `strides` is given. Refused as
-    /// `set_buffers` is.
+    /// each buffer at the per-bind stride `strides[i]` names ([`per_bind_stride`]) where `strides`
+    /// is given. Refused as `set_buffers` is.
     pub(super) fn set_buffers_with_strides(
         &mut self,
         core: &mut EncoderCore,
@@ -605,7 +983,20 @@ impl ArgumentTable {
         strides: Option<&[u64]>,
         first: u32,
     ) -> Result<(), Error> {
-        self.changed(SlotClass::Buffer, span(first, buffers.len()));
+        let held = binds_as(buffers, first, |at, index, buffer| {
+            let offset = offsets.get(at).copied();
+            let stride = strides.map(|strides| strides.get(at).copied().map(per_bind_stride));
+            match (offset, stride) {
+                (Some(offset), None) => self.holds_buffer(index, (*buffer, offset), None),
+                (Some(offset), Some(Some(stride))) => {
+                    self.holds_buffer(index, (*buffer, offset), Some(stride))
+                }
+                _ => false,
+            }
+        });
+        if !held {
+            self.changed(SlotClass::Buffer, span(first, buffers.len()));
+        }
         if buffers.len() != offsets.len() || strides.is_some_and(|s| s.len() != buffers.len()) {
             return Err(invalid(call, Problem::LengthMismatch));
         }
@@ -615,10 +1006,13 @@ impl ArgumentTable {
                 self.check_buffer(core, call, buffer, offset)?;
             }
         }
-        let strides = (0..buffers.len()).map(|i| strides.and_then(|s| attribute_stride(s[i])));
+        let strides = (0..buffers.len()).map(|i| strides.map(|s| per_bind_stride(s[i])));
         for (((buffer, &offset), stride), index) in
             buffers.iter().zip(offsets).zip(strides).zip(first..)
         {
+            if let Some(buffer) = buffer {
+                self.note_bound(core, Bound::Buffer(buffer));
+            }
             let replaced = set_handle(&mut self.buffers, index, *buffer, offset);
             set_entry(&mut self.attribute_strides, index, stride);
             self.function_tables.remove(&index);
@@ -631,8 +1025,9 @@ impl ArgumentTable {
         Ok(())
     }
 
-    /// `setBufferOffset:atIndex:`: the stride form with `MTLAttributeStrideStatic`, so it clears
-    /// the index's stride, as the plain buffer setters do. Measured for the vertex form on an M4:
+    /// `setBufferOffset:atIndex:`: it clears the index's stride, as the plain buffer setters do,
+    /// and as the stride form with `MTLAttributeStrideStatic` does in a render stage's table.
+    /// Measured for the vertex form on an M4:
     /// after a stride form, Metal's validation stops the draw for "providing
     /// `MTLAttributeStrideStatic` to `attributeStride` when stride at buffer-layout index 0 is
     /// dynamic", and Metal without it reads the buffer at stride 0. Every stage's form sets this
@@ -652,12 +1047,11 @@ impl ArgumentTable {
         offset: u64,
         index: u32,
     ) -> Result<(), Error> {
-        self.set_buffer_offset_with_stride(core, call, offset, ATTRIBUTE_STRIDE_STATIC, index)
+        self.move_buffer_offset(core, call, offset, None, index)
     }
 
-    /// `setBufferOffset:attributeStride:atIndex:` with `stride` (`MTLAttributeStrideStatic`
-    /// clears the index's stride; a stride past 32 bits is taken modulo `2^32`). Refused as
-    /// [`set_buffer_offset`](Self::set_buffer_offset) is.
+    /// `setBufferOffset:attributeStride:atIndex:` with the per-bind stride `stride` names
+    /// ([`per_bind_stride`]). Refused as [`set_buffer_offset`](Self::set_buffer_offset) is.
     pub(super) fn set_buffer_offset_with_stride(
         &mut self,
         core: &mut EncoderCore,
@@ -666,9 +1060,27 @@ impl ArgumentTable {
         stride: u64,
         index: u32,
     ) -> Result<(), Error> {
-        self.changed(SlotClass::Buffer, index..index.saturating_add(1));
+        let stride = per_bind_stride(stride);
+        self.move_buffer_offset(core, call, offset, Some(stride), index)
+    }
+
+    /// [`set_buffer_offset_with_stride`](Self::set_buffer_offset_with_stride) at the per-bind
+    /// stride `stride`, none for the plain setter.
+    fn move_buffer_offset(
+        &mut self,
+        core: &mut EncoderCore,
+        call: &'static str,
+        offset: u64,
+        stride: Option<u32>,
+        index: u32,
+    ) -> Result<(), Error> {
+        // A buffer bound there keeps being bound, at another offset; inline bytes and a
+        // visible-function table are another change.
+        let same = !self.bytes.contains_key(&index)
+            && !self.function_tables.contains_key(&index)
+            && self.buffers.contains_key(&index);
+        self.changed_as(SlotClass::Buffer, index..index.saturating_add(1), same);
         check_index(call, index, BUFFER_SLOTS)?;
-        let stride = attribute_stride(stride);
         if let Some(len) = self.bytes.get(&index).map(|bytes| bytes.len) {
             // Inline bytes then read as zeros, at any offset, until the index is bound again:
             // plain Metal on an M4 read 64 zero bytes after `setBytes` of 64 then an offset of
@@ -826,21 +1238,40 @@ impl ArgumentTable {
         textures: &[Option<&Texture>],
         first: u32,
     ) -> Result<(), Error> {
-        self.changed(SlotClass::Texture, span(first, textures.len()));
+        // A call that binds each slot as it is bound already changes nothing.
+        let held = binds_as(textures, first, |_, index, texture| {
+            self.textures.get(&index) == *texture
+        });
+        if !held {
+            self.changed(SlotClass::Texture, span(first, textures.len()));
+        }
         check_range(call, first, textures.len(), TEXTURE_SLOTS)?;
         for texture in textures.iter().flatten() {
-            core.check_device(call, texture.device())?;
+            core.check_device(call, texture.generation())?;
         }
         for (texture, index) in textures.iter().zip(first..) {
             match texture {
                 Some(texture) if texture.is_memoryless() => self.memoryless.insert(index),
                 _ => self.memoryless.remove(&index),
             };
+            if let Some(texture) = texture {
+                self.note_bound(core, Bound::Texture(texture));
+            }
             if let Some(replaced) = set_bare_handle(&mut self.textures, index, *texture) {
                 let_go(core, Bound::Texture(&replaced));
             }
         }
         Ok(())
+    }
+
+    /// Whether it binds nothing: no buffer, function table, null table, texture, sampler or bytes.
+    pub(super) fn binds_nothing(&self) -> bool {
+        self.buffers.is_empty()
+            && self.function_tables.is_empty()
+            && self.null_tables.is_empty()
+            && self.textures.is_empty()
+            && self.samplers.is_empty()
+            && self.bytes.is_empty()
     }
 
     /// Whether a texture slot of `stage` that `interface`'s function statically uses holds a
@@ -871,7 +1302,22 @@ impl ArgumentTable {
         clamps: Option<(&[f32], &[f32])>,
         first: u32,
     ) -> Result<(), Error> {
-        self.changed(SlotClass::Sampler, span(first, samplers.len()));
+        // A call that binds each slot as it is bound already, with the same clamps, changes
+        // nothing.
+        let held = binds_as(samplers, first, |at, index, sampler| {
+            let clamp = match clamps {
+                Some((min, max)) => match (min.get(at), max.get(at)) {
+                    (Some(&min), Some(&max)) => Some([min, max]),
+                    _ => return false,
+                },
+                None => None,
+            };
+            let bound = self.samplers.get(&index);
+            bound.map(|(state, held)| (state, *held)) == sampler.map(|state| (state, clamp))
+        });
+        if !held {
+            self.changed(SlotClass::Sampler, span(first, samplers.len()));
+        }
         if let Some((min, max)) = clamps {
             if min.len() != samplers.len() || max.len() != samplers.len() {
                 return Err(invalid(call, Problem::LengthMismatch));
@@ -879,10 +1325,13 @@ impl ArgumentTable {
         }
         check_range(call, first, samplers.len(), SAMPLER_SLOTS)?;
         for sampler in samplers.iter().flatten() {
-            core.check_device(call, sampler.device())?;
+            core.check_device(call, sampler.generation())?;
         }
         for (i, (sampler, index)) in samplers.iter().zip(first..).enumerate() {
             let clamp = clamps.map(|(min, max)| [min[i], max[i]]);
+            if let Some(sampler) = sampler {
+                self.note_bound(core, Bound::Sampler(sampler));
+            }
             if let Some(replaced) = set_handle(&mut self.samplers, index, *sampler, clamp) {
                 let_go(core, Bound::Sampler(&replaced));
             }
@@ -904,9 +1353,12 @@ impl ArgumentTable {
         self.changed(SlotClass::Buffer, span(first, tables.len()));
         check_range(call, first, tables.len(), BUFFER_SLOTS)?;
         for table in tables.iter().flatten() {
-            core.check_device(call, table.device())?;
+            core.check_device(call, table.generation())?;
         }
         for (table, index) in tables.iter().zip(first..) {
+            if let Some(table) = table {
+                self.note_bound(core, Bound::Buffer(table.words()));
+            }
             let replaced = set_entry(
                 &mut self.buffers,
                 index,
@@ -942,13 +1394,15 @@ impl ArgumentTable {
         stage: Stage,
         interface: &PipelineInterface,
     ) -> Result<(), Error> {
-        for (slot, slot_interface) in &interface.slots {
+        // No slot is refused where the table binds no visible-function table and no offset made
+        // one null: the check below holds for each slot.
+        if self.function_tables.is_empty() && self.null_tables.is_empty() {
+            return Ok(());
+        }
+        for (slot, slot_interface) in interface.slots.range(buffer_slots(stage)) {
             let SlotInterface::Buffer(buffer) = slot_interface else {
                 continue;
             };
-            if slot.stage != stage || slot.class != SlotClass::Buffer {
-                continue;
-            }
             let index = slot.index;
             let table = self.function_tables.contains_key(&index);
             let unmeasured = match buffer.kind {
@@ -977,10 +1431,11 @@ impl ArgumentTable {
         stage: Stage,
         interface: &PipelineInterface,
     ) -> Result<(), Error> {
-        for slot in interface.slots.keys() {
-            if slot.stage != stage || slot.class != SlotClass::Buffer {
-                continue;
-            }
+        for slot in interface
+            .slots
+            .range(buffer_slots(stage))
+            .map(|(slot, _)| slot)
+        {
             if let Some((buffer, offset)) = self.buffers.get(&slot.index) {
                 let (offset, length) = (*offset, buffer.length());
                 if offset > length {
@@ -1036,9 +1491,16 @@ impl ArgumentTable {
     ) -> StageTable {
         let mut table = self.stage_table();
         table.at_bind_views = self.at_bind_views(stage, views);
+        let read = |class, index| views.read.reads(stage, class, index);
         table
             .buffers
             .retain(|&index, _| !self.reads_unbound((stage, interface), index));
+        table
+            .textures
+            .retain(|&index, _| read(SlotClass::Texture, index));
+        table
+            .samplers
+            .retain(|&index, _| read(SlotClass::Sampler, index));
         table
     }
 
@@ -1111,6 +1573,8 @@ impl ArgumentTable {
         // read.
         reshape.field(&mut kept.at_bind_views, self.at_bind_views(stage, views));
         let alignment = views.alignment;
+        // The slots the state holds alone (`ReadSlots`).
+        let held = |class, index| views.read.reads(stage, class, index);
         kept.buffers.retain(|&index, _| {
             let bound = !self.reads_unbound(read, index)
                 && (self.bytes.contains_key(&index)
@@ -1119,7 +1583,7 @@ impl ArgumentTable {
                         .get(&index)
                         .is_some_and(|(buffer, offset)| *offset <= buffer.length()));
             if !bound {
-                reshape.unbound();
+                reshape.unbound(SlotClass::Buffer);
             }
             bound
         });
@@ -1130,38 +1594,53 @@ impl ArgumentTable {
             let stride = self.attribute_strides.get(&index).copied();
             if let Some(bound) = bound_buffer(buffer, *offset, stride) {
                 let a = kept.class_alignment(index, alignment);
-                reshape.slot(&mut kept.buffers, index, bound, |b| b.shape(a));
+                reshape.slot(SlotClass::Buffer, &mut kept.buffers, index, bound, |b| {
+                    b.shape(a)
+                });
             }
         }
         for (&index, bytes) in &self.bytes {
             if !self.reads_unbound(read, index) {
                 let a = kept.class_alignment(index, alignment);
-                reshape.slot(&mut kept.buffers, index, bound_bytes(bytes), |b| b.shape(a));
+                reshape.slot(
+                    SlotClass::Buffer,
+                    &mut kept.buffers,
+                    index,
+                    bound_bytes(bytes),
+                    |b| b.shape(a),
+                );
             }
         }
-        kept.textures.retain(|index, _| {
-            let bound = self.textures.contains_key(index);
+        kept.textures.retain(|&index, _| {
+            let bound = held(SlotClass::Texture, index) && self.textures.contains_key(&index);
             if !bound {
-                reshape.unbound();
+                reshape.unbound(SlotClass::Texture);
             }
             bound
         });
         for (&index, texture) in &self.textures {
+            if !held(SlotClass::Texture, index) {
+                continue;
+            }
             reshape.slot(
+                SlotClass::Texture,
                 &mut kept.textures,
                 index,
                 bound_texture(texture),
                 BoundTexture::shape,
             );
         }
-        kept.samplers.retain(|index, _| {
-            let bound = self.samplers.contains_key(index);
+        kept.samplers.retain(|&index, _| {
+            let bound = held(SlotClass::Sampler, index) && self.samplers.contains_key(&index);
             if !bound {
-                reshape.unbound();
+                reshape.unbound(SlotClass::Sampler);
             }
             bound
         });
         for (&index, (sampler, clamps)) in &self.samplers {
+            if !held(SlotClass::Sampler, index) {
+                continue;
+            }
             let slot = SlotRef {
                 stage,
                 class: SlotClass::Sampler,
@@ -1169,6 +1648,7 @@ impl ArgumentTable {
             };
             let desc = maps.sampler(slot, bound_sampler(sampler, *clamps));
             reshape.slot(
+                SlotClass::Sampler,
                 &mut kept.samplers,
                 index,
                 BoundSampler::new(desc),
@@ -1179,17 +1659,34 @@ impl ArgumentTable {
         self.check_reading(kept, read, (maps, views));
     }
 
+    /// The slots the table's calls changed since its stamp was `read`, where it keeps them
+    /// ([`Changes`]): those [`refresh_changed`](Self::refresh_changed) brings in, each with
+    /// whether the call changed a buffer slot's offset alone, binding the buffer it bound
+    /// ([`changed_as`](Self::changed_as)), once for each call.
+    pub(super) fn changed_since(
+        &self,
+        read: Stamp,
+    ) -> Option<impl Iterator<Item = (SlotClass, u32, bool)> + Clone + '_> {
+        Some(
+            self.changes
+                .since(read)?
+                .map(|changed| (changed.class, changed.index, changed.offset)),
+        )
+    }
+
     /// [`refresh_reading`](Self::refresh_reading) of `kept`, read last under the stamp `read`
     /// through the same interface and maps: only the slots the table's calls changed since, where
     /// it keeps them ([`Changes`]) and its slots that tell the view base alignment apart are as
     /// `kept` holds them, so every other slot's binding and shape are as read then. Whether it
-    /// brought them in; else nothing is changed, and the table is to be read whole.
+    /// brought them in; else nothing is changed, and the table is to be read whole. What it
+    /// counts goes to `counts`, the caller's.
     pub(super) fn refresh_changed(
         &self,
         (kept, read): (&mut StageTable, Stamp),
         (stage, interface): (Stage, &PipelineInterface),
         (maps, views): (&SamplerMaps, &AtBindViews),
         reshape: &mut Reshape,
+        counts: Counting<'_>,
     ) -> bool {
         let Some(changed) = self.changes.since(read) else {
             return false;
@@ -1199,13 +1696,34 @@ impl ArgumentTable {
             return false;
         }
         let alignment = views.alignment;
-        for (class, index) in changed {
+        // The buffer slots some call since changed otherwise than by its offset (indices below
+        // `BUFFER_SLOTS`): each is brought in whole.
+        let bit = |index: u32| 1u64.checked_shl(index).unwrap_or(0);
+        let whole = (changed.clone())
+            .filter(|c| c.class == SlotClass::Buffer && !c.offset)
+            .fold(0u64, |whole, c| whole | bit(c.index));
+        for Changed {
+            class,
+            index,
+            offset,
+            ..
+        } in changed
+        {
+            // A slot the state does not hold, which it never took in (`ReadSlots`).
+            if !views.read.reads(stage, class, index) {
+                continue;
+            }
             match class {
+                SlotClass::Buffer if offset && bit(index) != 0 && whole & bit(index) == 0 => {
+                    let read = (stage, interface);
+                    self.refresh_offset((kept, index), read, (alignment, counts), reshape)
+                }
                 SlotClass::Buffer => {
                     self.refresh_buffer((kept, index), (stage, interface), alignment, reshape)
                 }
                 SlotClass::Texture => match self.textures.get(&index) {
                     Some(texture) => reshape.slot(
+                        SlotClass::Texture,
                         &mut kept.textures,
                         index,
                         bound_texture(texture),
@@ -1213,7 +1731,7 @@ impl ArgumentTable {
                     ),
                     None => {
                         if kept.textures.remove(&index).is_some() {
-                            reshape.unbound();
+                            reshape.unbound(SlotClass::Texture);
                         }
                     }
                 },
@@ -1226,6 +1744,7 @@ impl ArgumentTable {
                         };
                         let desc = maps.sampler(slot, bound_sampler(sampler, *clamps));
                         reshape.slot(
+                            SlotClass::Sampler,
                             &mut kept.samplers,
                             index,
                             BoundSampler::new(desc),
@@ -1234,7 +1753,7 @@ impl ArgumentTable {
                     }
                     None => {
                         if kept.samplers.remove(&index).is_some() {
-                            reshape.unbound();
+                            reshape.unbound(SlotClass::Sampler);
                         }
                     }
                 },
@@ -1243,6 +1762,65 @@ impl ArgumentTable {
         #[cfg(debug_assertions)]
         self.check_reading(kept, (stage, interface), (maps, views));
         true
+    }
+
+    /// Buffer slot `index` of `kept` brought in place where every call since `kept` was read moved
+    /// the offset (or attribute stride) of the buffer it bound alone ([`Changed`]): `kept`'s
+    /// binding of the same buffer, its offset and stride the table's now. The buffer's space and
+    /// addresses are as `kept` read them, as no no-copy buffer moved since (the callers' reads
+    /// stand only while none did: `live_bind::ReadFrom`), so the buffer is not looked at
+    /// (`WorkCounts::bound_offsets_moved`; checked against [`refresh_buffer`](Self::refresh_buffer)'s
+    /// binding in builds with debug assertions), and the length the two bindings share is not
+    /// classed to compare their shapes ([`BoundBuffer::same_shape`]). The function reads the slot
+    /// bound as `kept` was read: a buffer `kept` binds there was read bound, and no call since
+    /// bound a visible-function table there, which changes the slot otherwise than by its offset
+    /// ([`binds_buffer`](Self::binds_buffer)), through the same interface (checked in builds with
+    /// debug assertions). Else as `refresh_buffer`.
+    fn refresh_offset(
+        &self,
+        (kept, index): (&mut StageTable, u32),
+        read: (Stage, &PipelineInterface),
+        (alignment, counts): (u32, Counting<'_>),
+        reshape: &mut Reshape,
+    ) {
+        let a = kept.class_alignment(index, alignment);
+        let held = (self.buffers.get(&index)).filter(|(buffer, offset)| *offset <= buffer.length());
+        let (Some((buffer, offset)), Some(slot)) = (held, kept.buffers.get_mut(&index)) else {
+            return self.refresh_buffer((kept, index), read, alignment, reshape);
+        };
+        let BoundBuffer::Buffer {
+            length,
+            gpu_address,
+            device_address,
+            ..
+        } = *slot
+        else {
+            return self.refresh_buffer((kept, index), read, alignment, reshape);
+        };
+        debug_assert!(
+            !self.reads_unbound(read, index),
+            "a buffer slot whose offset alone moved is read unbound"
+        );
+        let stride = self.attribute_strides.get(&index).copied();
+        // The space's start before the buffer's byte 0, as `bound_buffer` states it.
+        let base = length - buffer.length();
+        let bound = BoundBuffer::Buffer {
+            length,
+            offset: base + offset,
+            gpu_address,
+            device_address,
+            attribute_stride: stride,
+        };
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            Some(bound),
+            bound_buffer(buffer, *offset, stride),
+            "a buffer slot whose offset alone moved brought in otherwise than read whole"
+        );
+        counts.bound_offset_moved();
+        reshape.replace_by(ReshapedBy::BufferOffset, slot, bound, |was, now| {
+            was.same_shape(now, a)
+        });
     }
 
     /// Buffer slot `index` of `kept` brought in place as [`refresh_reading`](Self::refresh_reading)
@@ -1261,17 +1839,25 @@ impl ArgumentTable {
                     .is_some_and(|(buffer, offset)| *offset <= buffer.length()));
         if !bound {
             if kept.buffers.remove(&index).is_some() {
-                reshape.unbound();
+                reshape.unbound(SlotClass::Buffer);
             }
             return;
         }
         let a = kept.class_alignment(index, alignment);
         if let Some(bytes) = self.bytes.get(&index) {
-            reshape.slot(&mut kept.buffers, index, bound_bytes(bytes), |b| b.shape(a));
+            reshape.slot(
+                SlotClass::Buffer,
+                &mut kept.buffers,
+                index,
+                bound_bytes(bytes),
+                |b| b.shape(a),
+            );
         } else if let Some((buffer, offset)) = self.buffers.get(&index) {
             let stride = self.attribute_strides.get(&index).copied();
             if let Some(bound) = bound_buffer(buffer, *offset, stride) {
-                reshape.slot(&mut kept.buffers, index, bound, |b| b.shape(a));
+                reshape.slot(SlotClass::Buffer, &mut kept.buffers, index, bound, |b| {
+                    b.shape(a)
+                });
             }
         }
     }
@@ -1325,6 +1911,7 @@ impl ArgumentTable {
         }
         // A buffer slot as `stage_table_reading` reads it: inline bytes where they are bound,
         // else the buffer within its length, and nothing where the function reads it unbound.
+        let held = |class, index| views.read.reads(stage, class, index);
         let buffer = |index: u32| {
             if self.reads_unbound(read, index) {
                 return None;
@@ -1357,13 +1944,17 @@ impl ArgumentTable {
             );
         }
         for (&index, bound) in &kept.textures {
-            let whole = self.textures.get(&index).map(bound_texture);
+            let whole = (self.textures.get(&index))
+                .filter(|_| held(SlotClass::Texture, index))
+                .map(bound_texture);
             assert!(
                 whole.as_ref() == Some(bound),
                 "{DIFFERS}: {stage:?} texture {index} kept as {bound:?}, read whole as {whole:?}"
             );
         }
-        for (&index, texture) in &self.textures {
+        let held_textures = self.textures.iter();
+        for (&index, texture) in held_textures.filter(|(&index, _)| held(SlotClass::Texture, index))
+        {
             assert!(
                 kept.textures.contains_key(&index),
                 "{DIFFERS}: {stage:?} texture {index} not kept, read whole as {:?}",
@@ -1371,7 +1962,11 @@ impl ArgumentTable {
             );
         }
         let sampler = |index: u32| {
-            self.samplers.get(&index).map(|(sampler, clamps)| {
+            let bound = self
+                .samplers
+                .get(&index)
+                .filter(|_| held(SlotClass::Sampler, index));
+            bound.map(|(sampler, clamps)| {
                 let slot = SlotRef {
                     stage,
                     class: SlotClass::Sampler,
@@ -1389,7 +1984,7 @@ impl ArgumentTable {
                 "{DIFFERS}: {stage:?} sampler {index} kept as {bound:?}, read whole as {whole:?}"
             );
         }
-        for &index in self.samplers.keys() {
+        for &index in (self.samplers.keys()).filter(|&&index| held(SlotClass::Sampler, index)) {
             assert!(
                 kept.samplers.contains_key(&index),
                 "{DIFFERS}: {stage:?} sampler {index} not kept, read whole as {:?}",
@@ -1397,9 +1992,11 @@ impl ArgumentTable {
             );
         }
         // A table read whole binds nothing else (`stage_table` starts from the empty table), but
-        // for the object stage's threadgroup lengths, the encoder's, which the draw writes into
-        // the kept table after the read (`RenderLowering::refresh_bind_state`).
-        let lengths = stage != Stage::Object && !kept.threadgroup_lengths.is_empty();
+        // for the object stage's and the kernel's threadgroup lengths, the encoder's, which the
+        // draw or the dispatch writes into the kept table after the read
+        // (`RenderLowering::refresh_bind_state`, `LiveDispatch::refresh`).
+        let encoders = matches!(stage, Stage::Object | Stage::Kernel);
+        let lengths = !encoders && !kept.threadgroup_lengths.is_empty();
         assert!(
             !lengths && kept.acceleration_structures.is_empty(),
             "{DIFFERS}: {stage:?} keeps threadgroup lengths {:?} and acceleration structures {:?}, \
@@ -1412,11 +2009,12 @@ impl ArgumentTable {
     /// Hold everything bound until `core`'s command buffer completes: a command uses it, and
     /// the command buffer lists it among its used resources (`used_resources.rs`). Once while it
     /// binds the same objects: where `core` retained the table before under its stamp now,
-    /// nothing is retained again. Else each object `core` holds from an earlier retain
+    /// nothing is retained again, nor where `core` retained it last and each object a call bound
+    /// since was one `core` held as it was bound. Else each object `core` holds from an earlier retain
     /// (`retained::HeldBy`) is held and its key kept already, each a function of its object;
     /// `core` keeps the others' keys and takes them, each by another reference to it
-    /// (`retained.rs`): its last first, so they go in the table's order, as one hold of them all
-    /// went.
+    /// (`retained.rs`), but those it or its command buffer held lately, held already: its last
+    /// first, so they go in the table's order, as one hold of them all went.
     pub(super) fn retain(&self, core: &mut EncoderCore) {
         let mut retained = lock(&self.retained.0);
         let objects = (&self.buffers, &self.textures, &self.samplers);
@@ -1477,37 +2075,63 @@ fn let_go(core: &mut EncoderCore, object: Bound<'_>) {
 }
 
 /// [`ArgumentTable::retain`] of a table that binds `objects` (its buffers, textures and sampler
-/// states) under `stamp`, whose record of its last retain is `retained`.
+/// states) under `stamp`, whose record of its last retain is `retained`. Where `core` retained the
+/// table last and no call since bound an object `core` did not hold as it bound it
+/// (`RetainedBy::unheld`), `core` holds every object the table binds, and keeps its key: nothing
+/// is looked at. Else every object bound is.
 fn retain_into(
-    objects: (
-        &BTreeMap<u32, (Buffer, u64)>,
-        &BTreeMap<u32, Texture>,
-        &BTreeMap<u32, (SamplerState, Option<[f32; 2]>)>,
-    ),
+    objects: Objects<'_>,
     stamp: Stamp,
     retained: &mut RetainedBy,
     core: &mut EncoderCore,
 ) {
     let (buffers, textures, samplers) = objects;
-    // No call changed what it binds since: the same objects, by the stamp.
-    if retained.core == Some(core.id()) && retained.stamp == Some(stamp) {
-        return;
-    }
     let id = core.id();
+    if retained.core == Some(id) {
+        // No call changed what it binds since: the same objects, by the stamp.
+        if retained.stamp == Some(stamp) {
+            return;
+        }
+        // Calls changed it, binding only objects `core` held.
+        if !retained.unheld {
+            #[cfg(debug_assertions)]
+            retained.check_held(objects);
+            retained.stamp = Some(stamp);
+            core.counts().argument_table_held_at_bind();
+            return;
+        }
+    }
     let bound = || bound_in(buffers, textures, samplers);
     let fresh = |object: &Bound<'_>| !object.held_by().is(id);
     core.touch_keys(bound().filter(fresh).filter_map(Bound::key));
     let mut taken = 0;
     for object in bound().rev().filter(fresh) {
-        core.retain_shared(object.held());
+        // One its command buffer holds lately is held already: no other reference is taken.
+        if !core.holds_lately(object.address()) {
+            core.retain_shared(object.held());
+        }
         object.held_by().set(id);
         taken += 1;
     }
     retained.core = Some(id);
     retained.stamp = Some(stamp);
+    retained.unheld = false;
+    #[cfg(debug_assertions)]
+    retained.note_retained(objects);
     if taken > 0 {
-        core.device().shared().counts.argument_table_retained(taken);
+        core.counts().argument_table_retained(taken);
     }
+}
+
+/// The buffer slots of `stage`, every index, as an interface's slots order them (by stage, class
+/// and index).
+fn buffer_slots(stage: Stage) -> std::ops::RangeInclusive<SlotRef> {
+    let slot = |index| SlotRef {
+        stage,
+        class: SlotClass::Buffer,
+        index,
+    };
+    slot(0)..=slot(u32::MAX)
 }
 
 /// The `count` indices from `first`, as many as lie below `u32::MAX`.
@@ -1528,4 +2152,40 @@ fn bound_in<'a>(
         .values()
         .map(|(sampler, _)| Bound::Sampler(sampler));
     buffers.chain(textures).chain(samplers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Changes, SlotClass, Stamp, CHANGES_KEPT};
+
+    /// A reader under the stamp before any of the calls the log keeps reads the slots those calls
+    /// changed, in order, with their offset marks; it keeps every call after a stamp whose calls
+    /// since changed at most `CHANGES_KEPT` slots, and never more than twice as many slots.
+    #[test]
+    fn the_changes_log_keeps_the_newest_calls() {
+        let mut changes = Changes::default();
+        // Each call: the stamp before it, and its slots with their offset marks.
+        let mut calls: Vec<(Stamp, Vec<(u32, bool)>)> = Vec::new();
+        let mut stamp = Stamp::fresh();
+        for call in 0..200u32 {
+            let first = call % 29;
+            let indices = first..first + 1 + call % 3;
+            let offset = call % 5 == 0;
+            let after = Stamp::fresh();
+            changes.note((stamp, after), SlotClass::Buffer, indices.clone(), offset);
+            calls.push((stamp, indices.map(|index| (index, offset)).collect()));
+            stamp = after;
+            assert!(changes.slots.len() <= 2 * CHANGES_KEPT, "call {call}");
+            for (at, (read, _)) in calls.iter().enumerate() {
+                let want: Vec<(u32, bool)> = calls[at..].iter().flat_map(|c| c.1.clone()).collect();
+                match changes.since(*read) {
+                    Some(got) => {
+                        let got: Vec<(u32, bool)> = got.map(|c| (c.index, c.offset)).collect();
+                        assert_eq!(got, want, "call {call}, read before call {at}");
+                    }
+                    None => assert!(want.len() > CHANGES_KEPT, "call {call}, read before {at}"),
+                }
+            }
+        }
+    }
 }

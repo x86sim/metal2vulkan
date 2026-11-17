@@ -14,8 +14,12 @@
 //! the one path the constants decide, a callee runs in a new frame, and every value is a
 //! constant, a pointer into a global (`global + byte offset`), or **undefined from an unsupplied
 //! function constant** (the SCCP lattice's `Fc`). What it evaluates: integer arithmetic,
-//! comparisons, and casts ([`Folder`]), `fcmp` on constants, `select`, element and member access,
-//! shuffles, integer-to-float conversions (rounded to nearest even), scalar `fadd`, `fsub`, `fmul`,
+//! comparisons, and casts ([`Folder`]), `fcmp` on constants with no subnormal operand, `select`,
+//! element and member access,
+//! shuffles, `air.convert` of an integer or `bool`, a scalar or each lane of a vector, to another
+//! integer (as C++ converts it) or to `bool` (`x != 0`), and of a scalar one to a float (rounded
+//! to nearest even, as `sitofp` and `uitofp` are), unless it names `.sat` or a rounding to a float
+//! other than `rte` (a compute pipeline of OpenCL mode honors those), scalar `fadd`, `fsub`, `fmul`,
 //! `fdiv`, and `fneg` where every IEEE 754 evaluation agrees (finite normal operands, and a result
 //! that is an exact zero or normal: [`Folder::static_float_binop`]), GEPs with constant indices,
 //! non-volatile loads and stores of globals, `llvm.{s,u}{max,min}` and `llvm.ctpop`, and the two
@@ -23,12 +27,18 @@
 //! operand to 0). Anything else (a loop, a load of an externally initialized global, a store
 //! outside the constant address space, an overlapping access of another type, an alloca, other
 //! float arithmetic, a call to a declaration) is `StaticInitNotEvaluable`. A branch on an
-//! unsupplied constant is `NeedsInput(FunctionConstant)`, a branch on `undef` is `UndefCondition`,
-//! and a call cycle is `Unsupported{Recursion}`.
+//! unsupplied constant takes its false way, a `select` on one is its false arm, and an `and` with
+//! zero, an `or` with all ones and a `mul` by zero are that constant whatever the other operand
+//! holds, as SCCP's are; a branch on `undef` is `UndefCondition`, and a call cycle is
+//! `Unsupported{Recursion}`. A scalar integer division or remainder by zero, whose result the IR
+//! leaves undefined, is undefined the same way ([`Undefined::Ir`]), naming no constant. Metal makes
+//! the pipeline and drops its kernel's stores of the quotient and of a value computed from it,
+//! and every store of a kernel whose loop a quotient computed from it bounds (an Apple M3 Max
+//! under macOS 27.0.1, `static_init_division.m`).
 //!
 //! [`super::static_values`] evaluates under [`Unevaluable::Opaque`]: a pure operation the
-//! interpreter does not evaluate (float arithmetic outside the agreement, a conversion other than
-//! integer to float) yields an opaque value instead of refusing, which taints what it flows into
+//! interpreter does not evaluate (float arithmetic outside the agreement, a conversion from a
+//! float or of a vector to floats) yields an opaque value instead of refusing, which taints what it flows into
 //! like an undefined value and leaves the globals it reaches unknown. Everything else still
 //! refuses, as does a branch on, an address from, or a store through an opaque value.
 //!
@@ -47,24 +57,28 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::budget::Meter;
 use crate::error::{CanonError, DiagName, InputError, InputErrorKind, Location};
-use crate::error::{Error, Feature, MissingInput, Unsupported};
-use crate::intrinsics::{AirIntrinsic, FunctionConstant, LlvmIntOp, LlvmIntrinsic, NumKind};
+use crate::error::{Error, Feature, Unsupported};
+use crate::intrinsics::{
+    AirIntrinsic, Convert, FunctionConstant, LlvmIntrinsic, NumKind, Rounding,
+};
 use crate::ir::layout::Endian;
-use crate::ir::{AddrSpace, Arena, BlockId, Body, Callee, CastOp, Const, ConstExpr, ConstId};
+use crate::ir::ConstId;
+use crate::ir::{AddrSpace, Arena, BinOp, BlockId, Body, Callee, CastOp, Const, ConstExpr};
 use crate::ir::{Constant, FuncId, Function, Global, GlobalId, Idx, InstId, InstKind};
 use crate::ir::{Linkage, ModuleParts, Section, Type, TypeId, TypeLayouts, TypeTable, Value};
 
 use super::fold::Folder;
 use super::rewrite::invariant;
-use super::sccp::FcState;
+use super::sccp::{FcState, Undefined};
 
 /// The most leaves one global may flatten into. A larger global touched by a static initializer
 /// is refused as not evaluable (a precision limit, never a semantic one); the ledger bounds the
 /// total.
 const LEAF_LIMIT: u64 = 1 << 16;
 
-/// Globals whose value now depends on an unsupplied function constant, with its index.
-pub(super) type Derived = Vec<(GlobalId, u32)>;
+/// Globals whose value is now undefined, with what leaves it so: an unsupplied function constant
+/// (the lowest index), or an operation the IR leaves undefined.
+pub(super) type Derived = Vec<(GlobalId, Undefined)>;
 
 /// The new initializer of each written global.
 type Inits = Vec<(GlobalId, ConstId)>;
@@ -73,8 +87,9 @@ type Inits = Vec<(GlobalId, ConstId)>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SVal {
     C(ConstId),
-    /// Undefined: computed from the unsupplied constant with this index.
-    Fc(u32),
+    /// Undefined: computed from the unsupplied constant with this index, or by an operation the
+    /// IR leaves undefined.
+    Fc(Undefined),
     /// The address `global + offset` (bytes).
     Ptr(GlobalId, u64),
     /// Not evaluated: computed by a pure operation the interpreter does not evaluate (float
@@ -96,12 +111,23 @@ pub(super) enum Unevaluable {
 
 /// The outcome of evaluating the static initializers.
 pub(super) struct Evaluated {
-    /// Globals whose value now depends on an unsupplied function constant, with its index.
+    /// Globals whose value is now undefined, with what leaves it so.
     pub derived: Derived,
     /// Globals holding an opaque value: stored from an operation the interpreter does not
     /// evaluate. Their initializers are left as they were. Always empty under
     /// [`Unevaluable::Refuse`].
     pub opaque: Vec<GlobalId>,
+}
+
+/// Whether conversion `c` of an integer names a suffix that a compute pipeline of OpenCL mode
+/// honors and no other pipeline does: `.sat`, or a rounding to a float other than to nearest
+/// even. Its answer depends on the pipeline, so it is not evaluated here.
+fn honored_in_opencl_mode(c: &Convert) -> bool {
+    let directed = matches!(
+        c.rounding,
+        Some(Rounding::Zero | Rounding::Up | Rounding::Down)
+    );
+    c.saturate || (c.dst_kind == NumKind::Float && directed)
 }
 
 fn not_evaluable(at: Location) -> Error {
@@ -515,33 +541,36 @@ impl<'a> Eval<'a> {
                     SVal::C(c.ok_or_else(|| not_evaluable(at.clone()))?)
                 }
                 Callee::Llvm {
-                    op: LlvmIntrinsic::Int { op, .. },
+                    op: LlvmIntrinsic::Int { op, .. } | LlvmIntrinsic::NarrowInt { op, .. },
                     ..
                 } => match &call.args[..] {
                     [a, b] => {
                         let (a, b) = (val(*a)?, val(*b)?);
                         self.pure2(a, b, &at, m, |f, x, y, m| f.int_minmax(op, ty, x, y, m))?
                     }
-                    [x] if op == LlvmIntOp::Ctpop => {
+                    [x] => {
                         let x = val(*x)?;
-                        self.pure2(x, x, &at, m, |f, x, _, m| f.ctpop(ty, x, m))?
+                        self.pure2(x, x, &at, m, |f, x, _, m| f.int_unary(op, ty, x, m))?
                     }
                     _ => return Err(not_evaluable(at)),
                 },
+                // An integer or `bool` source, a scalar or each lane of a vector: to `bool` as
+                // `x != 0`, to another integer as C++ converts it; a scalar to a float rounded to
+                // nearest even.
                 Callee::Air {
                     op: AirIntrinsic::Convert(c),
                     ..
-                } if c.dst_kind == NumKind::Float
-                    && c.src_kind != NumKind::Float
+                } if c.src_kind != NumKind::Float
                     && c.src_fp8.is_none()
-                    && !c.src.is_vector() =>
+                    && (c.dst_kind != NumKind::Float || !c.src.is_vector())
+                    && !honored_in_opencl_mode(&c) =>
                 {
                     let signed = c.src_kind == NumKind::Signed;
                     let x = match call.args.first() {
                         Some(&x) => val(x)?,
                         None => return Err(not_evaluable(at)),
                     };
-                    self.pure2(x, x, &at, m, |f, x, _, m| f.int_to_float(x, signed, ty, m))?
+                    self.pure2(x, x, &at, m, |f, x, _, m| f.convert_int(x, signed, ty, m))?
                 }
                 // Any other conversion is a pure function of its operand.
                 Callee::Air {
@@ -558,7 +587,20 @@ impl<'a> Eval<'a> {
             }
             InstKind::BinOp { op, a, b, .. } => {
                 let (op, a, b) = (*op, val(*a)?, val(*b)?);
-                self.pure2(a, b, &at, m, |f, x, y, m| f.binop(op, ty, x, y, m))?
+                match (a, b) {
+                    (SVal::Fc(_), SVal::C(k)) | (SVal::C(k), SVal::Fc(_))
+                        if self.folder.absorbs(op, k) =>
+                    {
+                        SVal::C(k)
+                    }
+                    (SVal::C(_), SVal::C(d))
+                        if matches!(op, BinOp::UDiv | BinOp::SDiv | BinOp::URem | BinOp::SRem)
+                            && self.folder.int(d) == Some(0) =>
+                    {
+                        SVal::Fc(Undefined::Ir)
+                    }
+                    _ => self.pure2(a, b, &at, m, |f, x, y, m| f.binop(op, ty, x, y, m))?,
+                }
             }
             InstKind::FNeg { v, .. } => {
                 let x = val(*v)?;
@@ -607,7 +649,7 @@ impl<'a> Eval<'a> {
             InstKind::Select { c, t, f, .. } => {
                 let (c, t, f) = (val(*c)?, val(*t)?, val(*f)?);
                 match c {
-                    SVal::Fc(i) => SVal::Fc(i),
+                    SVal::Fc(_) => f,
                     SVal::Opaque => SVal::Opaque,
                     SVal::C(k) => match self.folder.int(k) {
                         Some(0) => f,
@@ -727,10 +769,10 @@ impl<'a> Eval<'a> {
         Ok(Step::Jumped)
     }
 
-    /// The integer a branch condition holds.
+    /// The integer a branch condition holds: an undefined one's 0, its false way.
     fn decide(&self, v: SVal, at: &Location) -> Result<u64, Error> {
         match v {
-            SVal::Fc(index) => Err(Error::NeedsInput(MissingInput::FunctionConstant { index })),
+            SVal::Fc(_) => Ok(0),
             SVal::C(c) => match self.folder.int(c) {
                 Some(x) => Ok(x),
                 None => match self.folder.consts.get(c).map(|k| &k.value) {

@@ -7,7 +7,8 @@
 //!   the attachments' texels packed, or the aliased layout's size whatever the formats pack to; its
 //!   memory length for a tile is that times the tile's cells, unrounded; it supports no indirect
 //!   command buffers and echoes the descriptor's `threadgroupSizeMatchesTileSize`. Its thread limit
-//!   is Metal's 1024 where the device runs it, lowered by the descriptor's.
+//!   is Metal's 1024 where the device runs it, lowered by the descriptor's. Where the descriptor
+//!   requires a threadgroup size, the limit is that size's threads.
 //! - Creation refuses what Metal's does: a function reaching an attachment the descriptor gives
 //!   no format.
 //! - A binary archive holds a tile pipeline it was given (`add_tile_render_pipeline_functions`),
@@ -17,13 +18,14 @@
 //!   a draw with a tile state set.
 
 use super::render_state::texture;
-use super::{layer_reported_nothing_at_all, validated_device, Messages, ScratchCache};
+use super::{layer_reported_nothing_at_all, validated_device_with, Messages, ScratchCache};
 use crate::air_library::AirLibrary;
 use crate::gpu::TEST_DEVICE;
-use metal2vulkan::error::DescriptorError;
+use metal2vulkan::error::{DescriptorError, MetalAnswer};
 use metal2vulkan::metal::{PixelFormat, PrimitiveType};
 use metal2vulkan::pipeline::{StageSource, TileRenderPipelineDescriptor};
 use metal2vulkan_devtools::{engine_dir, llvm_assemble};
+use metal2vulkan_runtime::DeviceOptions;
 use metal2vulkan_runtime::{
     ArchivedPipeline, Attachment, BinaryArchiveDescriptor, BinaryArchiveMiss, Device, DrawProblem,
     Error, Invalid, Library, PipelineOption, PipelineOptions, Problem, RenderPassDescriptor,
@@ -47,10 +49,16 @@ const ALIASED: [PixelFormat; 4] = [
 
 /// Run `test` on a validated device of the lane, then fail on any validation message.
 pub(super) fn on_device(test: impl FnOnce(&Device)) {
+    on_device_with(|_| {}, test)
+}
+
+/// [`on_device`], `adjust` applied to the options of each device it makes (`at_plan` gives them
+/// their queue plan).
+pub(super) fn on_device_with(adjust: fn(&mut DeviceOptions), test: impl FnOnce(&Device)) {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), adjust).unwrap();
         test(&device);
     }
     layer_reported_nothing_at_all(&messages);
@@ -136,6 +144,39 @@ fn a_tile_state_answers_metals_queries() {
     });
 }
 
+/// A tile state whose descriptor requires a threadgroup size answers that size's threads as its
+/// `maxTotalThreadsPerThreadgroup`, as Metal's tile state does where Metal compiles it for the
+/// first time (an M3 Max, macOS 27.0.1: 64 for 8x8 and 256 for 16x16). It answers 1 for 1x1,
+/// where Metal rounds the threads down to a multiple of 4 and answers 0 (docs/API.md, accepted
+/// differences). Where the device holds fewer threads than the size, the answer is the device's
+/// limit. The same descriptor with no size keeps today's answer.
+#[test]
+fn a_tile_state_with_a_required_size_answers_its_threads() {
+    on_device(|device| {
+        let mut grid = descriptor(device, "k10ts_tile_grid", &GRID);
+        let unrequired = state(device, &grid)
+            .unwrap()
+            .max_total_threads_per_threadgroup();
+        assert!((1..=1024).contains(&unrequired), "{unrequired}");
+        for (required, threads) in [([1, 1, 1], 1), ([8, 8, 1], 64), ([16, 16, 1], 256)] {
+            grid.required_threads_per_threadgroup = Some(required);
+            let made = state(device, &grid).unwrap();
+            assert_eq!(
+                made.max_total_threads_per_threadgroup(),
+                threads.min(unrequired),
+                "{required:?}"
+            );
+        }
+        grid.required_threads_per_threadgroup = None;
+        assert_eq!(
+            state(device, &grid)
+                .unwrap()
+                .max_total_threads_per_threadgroup(),
+            unrequired
+        );
+    });
+}
+
 #[test]
 fn a_tile_state_is_refused_where_metal_refuses_it() {
     on_device(|device| {
@@ -147,7 +188,10 @@ fn a_tile_state_is_refused_where_metal_refuses_it() {
                 state(device, &missing),
                 Err(Error::Compile(
                     metal2vulkan::error::Error::InvalidDescriptor(
-                        DescriptorError::ColorAttachment { index: 0 }
+                        DescriptorError::ColorAttachment {
+                            index: 0,
+                            metal: MetalAnswer::NilWithError,
+                        }
                     )
                 ))
             ),

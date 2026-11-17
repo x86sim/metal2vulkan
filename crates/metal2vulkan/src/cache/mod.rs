@@ -27,9 +27,9 @@
 
 // Key derivation is `pipeline::compile::key`. `CompiledFunction::to_bytes`/`from_bytes` and the
 // `PipelineArtifact` impls frame a canonical body encoding (`codec`) with magic,
-// `ARTIFACT_FORMAT_VERSION`, `SEMANTICS_VERSION`, the key, the profile fingerprint, and a SHA-256
-// checksum (`envelope`). A load is trusted by that identity plus a linear sanity scan of every
-// module (`scan`), not by re-running the owned verifier.
+// `ARTIFACT_FORMAT_VERSION`, `SEMANTICS_VERSION`, the key, the profile fingerprint, and an XXH64
+// checksum (`envelope`, `checksum`). A load is trusted by that identity plus a linear sanity scan
+// of every module (`scan`), not by re-running the owned verifier.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -41,6 +41,7 @@ use crate::pipeline::sym::{SlotRef, SnapshotForm};
 use crate::vk;
 
 mod artifacts;
+mod checksum;
 mod codec;
 // Content digests: `ComputePipeline::content_digest`, `RenderPipeline::content_digest` and
 // `BindingPlan::content_digest`.
@@ -60,7 +61,7 @@ mod tests;
 /// unchanged version, and its bless records the version. Independent of the crate's version and of
 /// [`ARTIFACT_FORMAT_VERSION`]. The commit that bumps it says what changed; this comment keeps no
 /// history.
-pub const SEMANTICS_VERSION: u32 = 1929;
+pub const SEMANTICS_VERSION: u32 = 2122;
 
 /// The byte-layout version of encoded artifacts (`CompiledFunction::to_bytes` and the
 /// [`PipelineArtifact`] encodings). Every encoded artifact carries it, and a decode under another
@@ -70,7 +71,7 @@ pub const SEMANTICS_VERSION: u32 = 1929;
 /// re-typed in an encoded type, its `codec` body or its `envelope`. A variant removed while its tag
 /// stays unused needs no bump: an entry holding it fails to decode, which is a miss. The commit that
 /// bumps it says what changed; this comment keeps no history.
-pub const ARTIFACT_FORMAT_VERSION: u32 = 479;
+pub const ARTIFACT_FORMAT_VERSION: u32 = 523;
 
 /// The version of what this crate's runtime does with a compiled pipeline: instantiating a binding
 /// plan (`BindingPlan::instantiate_*`: descriptor ranges, push bytes, root, argument, and handle
@@ -93,7 +94,7 @@ pub const ARTIFACT_FORMAT_VERSION: u32 = 479;
 /// changes no behaviour, and then updates that hash alone with the commit saying why, or changes
 /// behaviour and also bumps this version. The commit that bumps it says what changed; this comment
 /// keeps no history.
-pub const RUNTIME_VERSION: u32 = 1709;
+pub const RUNTIME_VERSION: u32 = 2342;
 
 /// The digest of the sources this build of the crate was compiled from: SHA-256, as lowercase hex,
 /// of the manifest, the build script, and exactly the files the crate roots' module tree compiles
@@ -167,6 +168,24 @@ pub struct VariantKey {
     /// `BindError::NeedsVariant`), and the plan of a pipeline compiled under it states it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub emulated_simdgroups: bool,
+    /// Every threadgroup of the dispatch is one row, so each of its simdgroups lies within the
+    /// row: a kernel whose lockstep simdgroup barriers order only pairs that meet where a
+    /// simdgroup spans two rows (`RuntimeFact::RowLockstep`) runs without them, keeping its
+    /// threadgroup ones, and without the subgroup size they pinned (`LoweringInputs::one_row`).
+    /// A dispatch whose every region is one row asks for it (`BindingPlan::dispatch_variant`),
+    /// and the plan of a pipeline compiled under it states it and asks another dispatch for the
+    /// variant without it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub one_row: bool,
+    /// The axes along which every threadgroup of the dispatch has one thread (bit 0 `x`, bit 1
+    /// `y`, bit 2 `z`): a kernel whose walk is predicated, where those axes' thread positions
+    /// alone make some of its synchronizations' blocks divergent (`RuntimeFact::UnitAxes`'s
+    /// `relief`), compiles with them uniform (`LoweringInputs::unit_axes`). A consumer asks a
+    /// plan for it (`BindingPlan::unit_axes_variant`), and the plan of a pipeline compiled under
+    /// it states it and asks a dispatch of more threads along such an axis for the variant
+    /// without it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub unit_axes: u8,
     /// The vertex function's `[[render_target_array_index]]` output is not written: in a pass of at
     /// most one layer (`BindShape::render_target_array_length` 0 or 1) every index renders slice 0,
     /// so a pipeline whose vertex function chooses its slice runs on this variant there, and only
@@ -224,6 +243,13 @@ pub struct VariantKey {
         serde(default, with = "crate::pipeline::serde_pairs")
     )]
     pub ycbcr_planes_sampled: BTreeMap<SlotRef, crate::bind::YCbCrPlanesSampler>,
+    /// Texture slots whose function only reads, writes or asks the size of the 2D texture the
+    /// shape binds there, whose rows are read and written in place: every slot of a
+    /// `RuntimeFact::TexelRows` the shape binds such a texture at
+    /// (`TextureShape::Texture::texel_rows`). Each such slot binds a texel buffer over the rows'
+    /// bytes alone (`bind::TexelRows`). The plan of a pipeline compiled under it states it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub texel_rows: BTreeSet<SlotRef>,
     /// Texture slots a constexpr sampler samples, each with the address-mode map of the texture
     /// the shape binds there where it is not the identity: every slot of a
     /// `RuntimeFact::ConstexprSampled` the shape binds such a texture at. The function's constexpr
@@ -240,6 +266,13 @@ pub struct VariantKey {
     /// `PushField::ReplayRegionAddress`. The plan of a pipeline compiled under it states it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub flat_grid: bool,
+    /// With [`flat_grid`](Self::flat_grid), its dispatch's threadgroups are the call's
+    /// (`LoweringInputs::call_threadgroups`): a one-row grid in threadgroups of one row, so a
+    /// kernel that observes its partition through its simdgroups alone
+    /// (`KernelFacts::partition_simdgroups`) runs flat too. The plan of a pipeline compiled under
+    /// it states it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub call_threadgroups: bool,
     /// The kernel, or the render pipeline's vertex and fragment functions, are a device-replay
     /// variant (`LoweringInputs::replay_bindings`): every buffer they read is at its device
     /// address in the slot table a replay's preprocess writes for its command, so
@@ -277,6 +310,14 @@ pub struct VariantKey {
     /// `PushField::ReplayRegionAddress`. The plan of a pipeline compiled under it states it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub folded_groups: bool,
+    /// The kernel runs a ragged `dispatchThreads` grid in the threadgroups its threads fill, at
+    /// the call's threadgroup size, the last along an axis Metal's partial threadgroup
+    /// (`LoweringInputs::partial_threadgroups`): the variant such a dispatch of a kernel that
+    /// observes its threadgroup partition runs on, one `VkPipeline` of the call's size in place of
+    /// an edge region's of each remainder. The plan of a pipeline compiled under it states it,
+    /// and plans such a dispatch so (`BindingPlan::instantiate_dispatch`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub partial_threadgroups: bool,
     /// Texture slots bound in one of Apple's extended-range formats, by the format
     /// (`LoweringInputs::extended_range`): the function reads and writes the bound texture's raw
     /// texels there, decoding and encoding Metal's values. The plan of a pipeline compiled under
@@ -326,6 +367,13 @@ pub struct VariantKey {
     /// (`RuntimeFact::MeshLastFirst`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub mesh_last_first: bool,
+    /// The pipeline draws its lines, or its triangles' edges, as bands of triangles through
+    /// synthesized tessellation stages, each patch one primitive of this kind
+    /// (`BindShape::line_band`, `pipeline::link::band`): the variant a draw of lines, or of
+    /// triangles in fill mode `Lines`, at an Apple `setLineWidth:` width the device's own lines do
+    /// not draw runs. Its graphics state states it (`GraphicsState::line_band`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub line_band: Option<crate::pipeline::BandPrimitive>,
     /// Storage-image texture slots bound to a texture with a swizzle (`MTLTexture.swizzle` other
     /// than the default) whose texels the function reads or writes
     /// (`LoweringInputs::swizzled_storage`): a Vulkan storage view takes no swizzle, so the
@@ -453,6 +501,19 @@ pub struct VariantKey {
     /// from it, the descriptor and the profile.
     #[cfg_attr(feature = "serde", serde(default))]
     pub color_group: u32,
+    /// The render pipeline draws a rasterization-rate-mapped pass's regions several at a time,
+    /// each one draw of a multi-draw whose index selects its viewport and scissor
+    /// (`BindShape::region_viewports`): its vertex function stores `ViewportIndex` as `DrawIndex`
+    /// (`LoweringInputs::region_viewports`). The plan of a pipeline compiled under it states it
+    /// (`RuntimeFact::RegionViewports`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub region_viewports: bool,
+    /// The render pipeline draws a rasterization-rate-mapped pass's triangles once, its
+    /// triangle class's synthesized geometry stage emitting a copy of each per region it touches,
+    /// or probing which draws it cannot (`BindShape::region_fan_out`, `pipeline::link::fan_out`).
+    /// Its graphics state states it (`GraphicsState::region_fan_out`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub region_fan_out: Option<crate::pipeline::RegionFanOut>,
 }
 
 impl VariantKey {
@@ -525,19 +586,24 @@ impl VariantKey {
             && self.psb_slots.is_empty()
             && self.pulled_vertex_buffers.is_empty()
             && !self.emulated_simdgroups
+            && !self.one_row
+            && self.unit_axes == 0
             && !self.dropped_vertex_layer
             && self.storage_view_slots.is_empty()
             && self.srgb_textures.is_empty()
             && self.snapshot_textures.is_empty()
             && self.ycbcr_in_place.is_empty()
             && self.ycbcr_planes_sampled.is_empty()
+            && self.texel_rows.is_empty()
             && self.address_maps.is_empty()
             && !self.flat_grid
+            && !self.call_threadgroups
             && !self.replay_bindings
             && !self.merged_draws
             && self.amplification_draws.is_none()
             && self.viewport_compensation.is_none()
             && !self.folded_groups
+            && !self.partial_threadgroups
             && self.extended_range.is_empty()
             && self.zeroed_colors.is_empty()
             && self.dropped_colors.is_empty()
@@ -545,6 +611,7 @@ impl VariantKey {
             && !self.depth_clamp_range
             && !self.rotated_weights
             && !self.mesh_last_first
+            && self.line_band.is_none()
             && self.swizzled_storage.is_empty()
             && !self.addressed_function_tables
             && self.interlocked_colors.is_empty()
@@ -560,12 +627,14 @@ impl VariantKey {
             && self.cross_class.is_empty()
             && self.anisotropic_samplers.is_empty()
             && self.color_group == 0
+            && !self.region_viewports
+            && self.region_fan_out.is_none()
     }
 
     /// The lowering inputs of the function of `stage` under this key: its storage-image choices,
     /// device-address slots, kept storage views, raw sRGB slots, cubic and anisotropic samplers,
-    /// for the kernel the emulated simdgroups, the flat grid, the folded groups and the replay's
-    /// bindings, for the vertex and fragment functions the draws of one amplification each, for
+    /// for the kernel the emulated simdgroups, the flat grid, the folded groups, the partial
+    /// threadgroups and the replay's bindings, for the vertex and fragment functions the draws of one amplification each, for
     /// the fragment function the colors it writes zero to and those it drops, its depth's clamp
     /// range and whether its draws' tests are read-only, for a tile function the imageblock bytes
     /// its pass keeps, and for the vertex function the
@@ -595,8 +664,17 @@ impl VariantKey {
             .collect();
         out.emulated_simdgroups =
             self.emulated_simdgroups && stage == crate::pipeline::sym::Stage::Kernel;
+        out.one_row = self.one_row && stage == crate::pipeline::sym::Stage::Kernel;
+        out.unit_axes = match stage {
+            crate::pipeline::sym::Stage::Kernel => self.unit_axes,
+            _ => 0,
+        };
         out.flat_grid = self.flat_grid && stage == crate::pipeline::sym::Stage::Kernel;
+        out.call_threadgroups =
+            self.call_threadgroups && stage == crate::pipeline::sym::Stage::Kernel;
         out.folded_groups = self.folded_groups && stage == crate::pipeline::sym::Stage::Kernel;
+        out.partial_threadgroups =
+            self.partial_threadgroups && stage == crate::pipeline::sym::Stage::Kernel;
         out.replay_bindings = self.replay_bindings
             && matches!(
                 stage,
@@ -618,6 +696,11 @@ impl VariantKey {
         out.viewport_compensation = self
             .viewport_compensation
             .filter(|_| stage == crate::pipeline::sym::Stage::Vertex);
+        out.region_viewports =
+            self.region_viewports && stage == crate::pipeline::sym::Stage::Vertex;
+        out.region_copies = self.region_fan_out
+            == Some(crate::pipeline::RegionFanOut::RegionCopies)
+            && stage == crate::pipeline::sym::Stage::Vertex;
         out.storage_view_slots = self
             .storage_view_slots
             .iter()
@@ -647,6 +730,12 @@ impl VariantKey {
             .iter()
             .filter(|(s, _)| s.stage == stage)
             .map(|(s, sampler)| (*s, *sampler))
+            .collect();
+        out.texel_rows = self
+            .texel_rows
+            .iter()
+            .filter(|s| s.stage == stage)
+            .copied()
             .collect();
         out.address_maps = self
             .address_maps

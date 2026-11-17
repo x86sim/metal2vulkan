@@ -43,9 +43,10 @@
 //!   0 that form one image, `ycbcr_device.rs`), the conversion's dispatch copies the staging
 //!   buffer's planes into an image of that format and samples it through the device's
 //!   conversion, once per texel (`bind::ycbcr_sample_module`), into the same image of the
-//!   texture: its texels are the device's answer, not Metal's, announced where the texture is
-//!   made (`ycbcr-filter-not-exact`; `WorkCounts::ycbcr_device_conversions`,
-//!   `ycbcr_device_samples`). A render shadow's load stays Metal's arithmetic, which the store
+//!   texture: its texels are the device's answer, not Metal's, announced at the texture's first
+//!   conversion (`ycbcr-filter-not-exact`; `WorkCounts::ycbcr_device_samples`), so a texture whose
+//!   planes every function reads in place announces nothing; `WorkCounts::ycbcr_device_conversions`
+//!   counts the texture as it is made. A render shadow's load stays Metal's arithmetic, which the store
 //!   inverts (**Passes** below). Metal's fixed-point conversion converts every other texture, and
 //!   every texture of a device without the conversion or with a defect in it (MoltenVK's 4:2:0
 //!   and 4:2:2 formats, `RuntimeDriverDefect::TwoPlaneChromaMisplaced`; lavapipe's, RADV's and
@@ -76,18 +77,23 @@
 //!   whose function only samples it (nearest or linear, no comparison, anisotropy or
 //!   `min_lod_clamp`) or reads its size binds a uniform texel buffer over the planes' bytes,
 //!   `R8G8_UINT` of 8-bit codes and `R16G16_UINT` of 10-bit ones, and the function fetches the codes
-//!   and converts and filters them as Metal does, exactly; the draw or dispatch reads those bytes
-//!   alone, and converts no image (`WorkCounts::ycbcr_textures_in_place`, `ycbcr_planes_bound`).
+//!   and converts and filters them itself (a linear sample by Vulkan's Y′CbCr model by default,
+//!   Metal's exact filter under `YCbCrInPlacePolicy::Exact`: `metal2vulkan::lower::sampler`); the
+//!   draw or dispatch reads those bytes alone, and converts no image
+//!   (`WorkCounts::ycbcr_textures_in_place`, `ycbcr_planes_bound`). The conversion's staging buffer,
+//!   sets and refresh are made at the texture's first conversion, so such a texture holds none.
 //!   Where the device converts the 4:2:0 format as a linear image with Metal's reconstruction and
 //!   the planes lie as that image's would, in memory the runtime allocated, they are also such an
 //!   image (`texture/ycbcr_planes.rs`), and a slot whose every sample the device's sampler takes
 //!   samples it through the device's conversion instead (`WorkCounts::ycbcr_planes_images`,
-//!   `ycbcr_planes_images_bound`); elsewhere the function converts them as Metal does, on a device
-//!   that converts the format itself too, where the texture's image holds the device's conversion.
+//!   `ycbcr_planes_images_bound`); elsewhere the function converts them itself, as above, on a
+//!   device that converts the format itself too, where the texture's image holds the device's
+//!   conversion.
 //!   A read, a gather or any other use binds the image, converted as above. A discrete, virtual or
 //!   other GPU keeps the image alone (`ycbcr_images_kept_device`): it reads the host's planes
 //!   across its bus at every pass, where the image lies in its own memory. Both forms are Metal's
-//!   (but for the image of a device that converts the format itself); the choice is the cheaper one
+//!   (but for the image of a device that converts the format itself, and the in-place form's linear
+//!   sample under the default `YCbCrInPlacePolicy::Model`); the choice is the cheaper one
 //!   by device kind, measured as GPU time of a 3840 x 2160 texture whose
 //!   planes lie in host memory composited into 1680 x 1050 (µs, best of 3 x 40; the image's form
 //!   the refresh's compare and the samples, over unchanged planes; Mesa 26.2.4, MoltenVK 1.4.2):
@@ -130,8 +136,9 @@
 //!   luma codes alone, `(Y, 0, 0, 1)`, or `(0, Y, 0, 1)` of a format read as codes, its linear
 //!   sample the luma of the code-reading format's (the M3 Max under macOS 27.0.1, bit for bit):
 //!   an image of the codes over the same planes read through a swizzle
-//!   (`Texture::luma_view`); an `_sRGB` twin's reads no defined value on Metal and reads as its
-//!   converted format's here.
+//!   (`Texture::luma_view`), whose bindings present the code-reading format, so a filtered
+//!   sample of it announces no filter notice (**Linear filtering** below); an `_sRGB` twin's
+//!   reads no defined value on Metal and reads as its converted format's here.
 //! - **Surfaces** (an Apple M3 Max under macOS 27.0.1; our probe `ycr`: each of the 24 formats
 //!   above over each plane of CoreVideo surfaces of 35 OSTypes, 16 x 8, random bytes, every texel
 //!   of `read()`, 1320 textures; and textures of other sizes and matrices). Metal makes such a
@@ -149,47 +156,62 @@
 //!   runtime reads the same (`surface_planes`): the luma plane the call's, the chroma plane the
 //!   facts' plane 1 under plane 0 of a surface with planes and a row of zeros otherwise, the bytes
 //!   past its buffer zeros the conversion holds; a texture over a P3 surface is an image of the
-//!   codes of the code-reading format, read through a swizzle (`texture/ycbcr_image.rs`).
+//!   codes of the code-reading format, read through a swizzle (`texture/ycbcr_image.rs`). Rows of
+//!   codes wider than a plane's `bytesPerRow` (a texture wider than its plane, a 10-bit format
+//!   over 8-bit rows) overlap the next, and Metal reads them at the plane's rows all the same,
+//!   bit for bit the reads of a texture over the same bytes laid apart
+//!   (`metal2vulkan-conformance/probes/ycbcr_wide_code_rows.m`, `linear_plan.rs`'s **Two-plane
+//!   YCbCr codes**), as the runtime's conversion reads the planes' bytes wherever its rows lie,
+//!   over a plane of a surface with planes.
 //! - **Refused** (`Unsupported`, `NotImplemented`, `Feature::Format`, naming what): a surface of
 //!   a lossless compressed OSType (`&8v0`, `&xv2` and their kin: Metal reads compressed blocks), a
 //!   plane past 0 of a surface without planes, plane 1 at other bytes than the surface's facts
 //!   name, an `_sRGB` twin over a P3 surface (its reads follow no rule found), a load of a pass
 //!   into a P3 texture, a write of one, and a view of one but in its own format and type (none
 //!   measured), planes at offsets or rows off 16 bytes, and planes past one storage range; the
-//!   writes and passes of a texture whose reads reach past its buffer or over plane 1, or whose
-//!   rows of codes overlap; a packed texture's blit with a buffer (above); a copy between two such
+//!   writes and passes of a texture whose reads reach past its buffer or over plane 1; a packed
+//!   texture's blit with a buffer (above); a copy between two such
 //!   textures (Metal copies both planes), a view in another format than the twin (a twin's view
 //!   as its converted format among them, unmeasured), and a pass rendering into one but as
 //!   **Passes** below say (Metal converts back into the planes). The runtime's gaps besides
-//!   (`NotImplemented`, `linear_plan.rs`): luma rows of codes that overlap (a 10-bit format over
-//!   rows under twice its width, `OverlappingSurfaceRows`) and luma rows past the buffer (a
-//!   texture taller than its plane at the surface's end, `TexelsPastBufferLength`). A
+//!   (`NotImplemented`): over rows of codes that overlap (`OverlappingSurfaceRows`), a blit from a
+//!   buffer into the texture (`blit_texture.rs`; Metal's leaves no one row's bytes where rows
+//!   meet), the writes Metal stores and the passes (`texture/ycbcr_image.rs`; not measured
+//!   there), and such a texture over a surface without planes (`linear_plan.rs`; not measured);
+//!   and luma rows past the buffer (a texture taller than its plane at the surface's end,
+//!   `TexelsPastBufferLength`). A
 //!   function's writes to a 4:2:0, 4:2:2 or packed format are dropped, as Metal drops them (the
 //!   packed 4:4:4 ones on the M3 Max under macOS 27.0.1, where an M4 stores them;
-//!   `metal::format::writes_dropped`); a 4:4:4 `_sRGB` twin's are refused (the twins' encoding is
-//!   not found), as are a texture's over plane 1 (not measured) and a slot's that reads the
-//!   texture too.
+//!   `metal::format::writes_dropped`), so a command whose function only writes such a texture
+//!   through an argument buffer uses none of its image and converts none of its planes
+//!   (`binding.rs`); a texture's over plane 1 (not measured) and a slot's that reads the texture
+//!   too are refused.
 //! - **Writes** (on an Apple M4 under macOS 27.0.1, on an Apple M3 Max under macOS 26.7, byte for
-//!   byte alike). Metal stores a function's writes to `YCBCR8_444_2P`, `YCBCR10_444_2P`,
-//!   `RGB8_444_2P` and `RGB10_444_2P` (503, 507, 542, 545) into both planes: each written texel's
+//!   byte alike; the `_sRGB` twins' on an Apple M3 Max under macOS 27.0.1). Metal stores a
+//!   function's writes to `YCBCR8_444_2P`, `YCBCR10_444_2P`, their `_sRGB` twins, `RGB8_444_2P`
+//!   and `RGB10_444_2P` (503, 507, 523, 527, 542, 545) into both planes: each written texel's
 //!   luma code at its place and its Cb and Cr pair at its own, the codes
-//!   `metal2vulkan::bind::ycbcr_write` states (the converted formats' by
-//!   the surface's range and matrix; the code formats' green, blue and red as codes), and leaves
-//!   every other byte. The function writes such a texture through its write shadow (`shadow.rs`,
-//!   `ShadowSource::YCbCrWrite`; `texture/ycbcr_image.rs`): an `RGBA32Uint` image of each written
-//!   texel's bits and a mark, cleared before an encoder's first command that writes it and again
-//!   after the planes' bytes are written another way; its copy back ([`YCbCrWriteBack`]) copies the
-//!   planes' bytes into a staging buffer of the texture's, dispatches the encode kernel
-//!   (`bind::ycbcr_write_module`), which stores the codes of the marked texels, and copies the
-//!   planes' rows of codes back. The texture's converted texels then convert again at their next
-//!   use, as after any write of the planes. Exact, so announced nowhere.
+//!   `metal2vulkan::bind::ycbcr_write` states (the converted formats' by the surface's range and
+//!   matrix, a twin's of each channel through the sRGB curve first; the code formats' green, blue
+//!   and red as codes), and leaves every other byte. The function writes such a texture through its
+//!   write shadow (`shadow.rs`, `ShadowSource::YCbCrWrite`; `texture/ycbcr_image.rs`): an
+//!   `RGBA32Uint` image of each written texel's bits and a mark, cleared before an encoder's first
+//!   command that writes it and again after the planes' bytes are written another way; its copy
+//!   back ([`YCbCrWriteBack`]) copies the planes' bytes into a staging buffer of the texture's,
+//!   dispatches the encode kernel (`bind::ycbcr_write_module`), which stores the codes of the
+//!   marked texels, and copies the planes' rows of codes back. The texture's converted texels then
+//!   convert again at their next use, as after any write of the planes. Exact, so announced nowhere
+//!   (a twin's codes within a code of Metal's where a channel's curve lies by a tie of the 1/2048
+//!   grid, the device's power against Metal's curve, Metal's own spread between its paths).
 //! - **Passes** (on an Apple M4 under macOS 27.0.1, and on an Apple M3 Max under macOS 26.7 and
 //!   27.0.1, byte for byte alike). Metal's tile holds a color attachment of `YCBCR8_420_2P`,
-//!   `YCBCR8_422_2P`, `YCBCR8_444_2P` or their 10-bit formats (500 to 507), or of the code formats
-//!   `RGB8_420_2P` to `RGB10_444_2P` (540 to 545), over plane 0 as halves of red, green and blue,
-//!   and its store converts the tile back into both planes: every texel's
-//!   luma code, drawn or not, and each chroma pair's codes of the block of texels it covers, the
-//!   codes `metal2vulkan::bind::ycbcr_store` states (`metal::format::ycbcr_renders`). The pass
+//!   `YCBCR8_422_2P`, `YCBCR8_444_2P` or their 10-bit formats (500 to 507), of the 4:4:4 `_sRGB`
+//!   twins (523, 527; the M3 Max under 27.0.1, clears), or of the code formats `RGB8_420_2P` to
+//!   `RGB10_444_2P` (540 to 545), over plane 0 as halves of red, green and blue, and its store
+//!   converts the tile back into both planes (a twin's each channel through the sRGB curve
+//!   first): every texel's luma code, drawn or not, and each chroma pair's codes of the block of
+//!   texels it covers, the codes `metal2vulkan::bind::ycbcr_store` states
+//!   (`metal::format::ycbcr_renders`). The pass
 //!   renders into the texture's render shadow (`texture/ycbcr_image.rs`), an
 //!   `R32G32B32A32_SFLOAT` image of the texture's size; its copy back is the write-back above
 //!   storing every texel ([`YCbCrWriteBack`] of a store), and the texture's converted texels
@@ -208,7 +230,10 @@
 //!   or loaded values, exact. A blend blends the shadow's floats where Metal blends its halves (an
 //!   8-bit format's in half arithmetic, a 10-bit one's in `float` rounded toward zero), within a
 //!   code of Metal's, announced at the draw (`ycbcr-blend-rounding`); on a device that does not
-//!   blend `R32G32B32A32_SFLOAT` such a pipeline is refused, naming the need. A resolve is refused
+//!   blend `R32G32B32A32_SFLOAT` such a pipeline is refused, naming the need. A twin's load and
+//!   blend are not measured (whether Metal's tile holds its linear values or their encoding): a
+//!   pass that loads one is refused at its start and a pipeline that blends into one at its
+//!   attachment (`NotImplemented(Format)`). A resolve is refused
 //!   (`NotImplemented(Format)`, naming the format, at the pass), as are a texture over plane 1 and
 //!   one whose size the chroma blocks do not tile, and the other formats' passes. A packed 10-bit
 //!   format's pipeline is made, as Metal makes it, and its pass refused at its start, naming the
@@ -220,7 +245,13 @@
 //!   1/2048 or 1/8192 (`metal2vulkan::metal::texel_format::PackedTexels::YCbCr2048`, `YCbCr8192`),
 //!   announced naming the slot and the format (`ycbcr-filter-not-exact`). A texture whose planes
 //!   are read in place (`TextureFacts::ycbcr_in_place`) is filtered as Metal filters it on that
-//!   grid, each tap computed from the codes, exact. A function that samples
+//!   grid, each tap computed from the codes, exact; the in-place form reads 4:2:0 planes alone, so
+//!   a 4:2:2 or 4:4:4 texture keeps its image (`WorkCounts::ycbcr_images_kept_layout`). A
+//!   texture whose bindings present the code-reading format of its codes (a luma view, a texture
+//!   over a P3 surface: an `RGBA8Unorm` or `RGB10A2Unorm` image of the codes) is filtered as that
+//!   format's texels, which Metal's sampler filters as Metal filters the format, and announces no
+//!   filter notice (Metal's filter of a texture over a P3 surface is not measured:
+//!   docs/FAST-PATHS.md's known gaps). A function that samples
 //!   textures through handles reads its sampler from memory and is refused where it can reach the
 //!   texture (`MappedTextureSampling`, as the texture's address-mode map is).
 
@@ -245,6 +276,7 @@ use metal2vulkan::error::{DiagName, Feature, Unsupported};
 use metal2vulkan::metal::format::ycbcr_format;
 use metal2vulkan::metal::PixelFormat;
 use std::ops::Range;
+use std::sync::{Mutex, OnceLock};
 
 /// The OSTypes of the full-range surfaces (the module docs): a texture over a surface of any other
 /// OSType reads its codes as video range.
@@ -510,11 +542,29 @@ fn planes_end(planes: &YCbCrPlanes) -> u64 {
 }
 
 /// The conversion of a two-plane YCbCr texture's planes into its image (the module docs): the
-/// copy in of its shadow (`ShadowSource::Converted`).
+/// copy in of its shadow (`ShadowSource::Converted`). Its staging buffer, its kernels' sets and its
+/// refresh are made at its first conversion ([`make`](Self::make)): a texture whose planes every
+/// function reads in place (`texture/ycbcr_image.rs`) never converts, and holds none of them.
 pub(super) struct YCbCrConversion {
+    device: Device,
     /// The planes it converts, and the bytes of their buffer they lie in, which a view as the
     /// texture's `_sRGB` twin converts too (`texture/ycbcr_image.rs`).
     source: (YCbCrPlanes, Range<u64>),
+    /// The planes' buffer's `VkBuffer` and where their bytes start in it.
+    from: (vk::Buffer, u64),
+    /// The storage view of the texture's image it writes.
+    view: vk::ImageView,
+    /// The bytes the planes read past their span, zeros: the chroma of a texture whose chroma
+    /// codes are 0, and rows past the end of the buffer.
+    zeros: u64,
+    /// What its conversions record, made at the first ([`make`](Self::make)).
+    made: OnceLock<Made>,
+    /// Held while one thread makes it, so no two make it.
+    making: Mutex<()>,
+}
+
+/// A conversion's staging buffer, its kernels' sets and its refresh ([`YCbCrConversion::make`]).
+struct Made {
     /// The shape at its start, the planes' bytes from `BYTES_AT`; held for the texture's life.
     staging: Buffer,
     /// The staging buffer's identity and its bytes.
@@ -561,6 +611,8 @@ impl Converts {
         // multiple of it (`ycbcr_device.rs`).
         let sampler = YCbCrSampler::of(device, planes, zeros).filter(|_| bytes % 4 == 0);
         if let Some(sampler) = sampler {
+            // Counted as the texture was made (`YCbCrConversion::new`); announced here, at its
+            // first conversion, the first whose texels are the device's.
             let sampling = YCbCrDeviceSampling::new(device, (planes, sampler), view)?;
             let groups = sampling.groups();
             announce_device_conversion(device, planes);
@@ -733,22 +785,55 @@ impl YCbCrRefresh {
 
 impl YCbCrConversion {
     /// The conversion of `planes`, whose bytes lie in `bytes` of their buffer, at `at` of its
-    /// `VkBuffer`, into `view`, a storage view of the texture's image, on `device`. Refused as
-    /// `new_buffer` refuses the staging buffer and as the kernel's objects are refused.
+    /// `VkBuffer`, into `view`, a storage view of the texture's image, on `device`; made at its
+    /// first conversion ([`make`](Self::make)). Where the device converts the planes itself, that
+    /// is counted here, where the texture is made (`WorkCounts::ycbcr_device_conversions`), and
+    /// announced at the first conversion (`Converts::new`), which takes the device's conversion
+    /// on the same terms, the staging copy's planes lying at `BYTES_AT`, a multiple of 4 bytes, of
+    /// the staging buffer's own `VkBuffer`.
     pub(super) fn new(
         device: &Device,
-        (planes, bytes_in): (&YCbCrPlanes, Range<u64>),
+        (planes, bytes): (&YCbCrPlanes, Range<u64>),
         (source, at): (vk::Buffer, u64),
         view: vk::ImageView,
-    ) -> Result<YCbCrConversion, Error> {
+    ) -> YCbCrConversion {
+        let span = (bytes.end - bytes.start).next_multiple_of(4);
+        let zeros = planes_end(planes).saturating_sub(span).next_multiple_of(4);
+        if YCbCrSampler::of(device, planes, zeros > 0).is_some() {
+            device.shared().counts.ycbcr_device_conversion();
+        }
+        YCbCrConversion {
+            device: device.clone(),
+            source: (*planes, bytes),
+            from: (source, at),
+            view,
+            zeros,
+            made: OnceLock::new(),
+            making: Mutex::new(()),
+        }
+    }
+
+    /// Make what its conversions record, where no conversion made it yet: the staging buffer,
+    /// which starts zeroed with no conversion completed, so the first converts every texel, the
+    /// conversion's sets and its refresh. Refused as `new_buffer` refuses the staging buffer and
+    /// as the kernels' objects are refused.
+    pub(super) fn make(&self) -> Result<(), Error> {
+        if self.made.get().is_some() {
+            return Ok(());
+        }
+        let _making = super::device::lock(&self.making);
+        if self.made.get().is_some() {
+            return Ok(());
+        }
+        let device = &self.device;
+        let (planes, bytes_in) = (&self.source.0, &self.source.1);
+        let (source, at) = self.from;
         let span = bytes_in.end - bytes_in.start;
         let bytes = span.next_multiple_of(4);
-        // The bytes the planes read past their span, zeros (the chroma of a texture whose chroma
-        // codes are 0, and rows past the end of the buffer), filled at every conversion.
-        let zeros = planes_end(planes).saturating_sub(bytes).next_multiple_of(4);
+        let zeros = self.zeros;
         let held = bytes + zeros;
         let staging = device.own_buffer(BYTES_AT + held, ResourceOptions::private())?;
-        // One of these a texture, the planes' whole byte range
+        // One of these a texture that converts, the planes' whole byte range
         // (`WorkCounts::ycbcr_conversion_scratch_buffers`).
         device
             .shared()
@@ -762,7 +847,7 @@ impl YCbCrConversion {
             planes,
             (raw, start + BYTES_AT, held),
             (start, zeros > 0),
-            view,
+            self.view,
         )?;
         let limits = &device.properties().description.limits;
         if groups[0] > limits.max_compute_work_group_count[0]
@@ -773,8 +858,7 @@ impl YCbCrConversion {
             ));
         }
         let refresh = YCbCrRefresh::new(device, (source, at, span), (raw, start), groups[0]);
-        Ok(YCbCrConversion {
-            source: (*planes, bytes_in),
+        let made = Made {
             staging_use: (identity.key, range),
             shape_at: start,
             shape,
@@ -788,7 +872,10 @@ impl YCbCrConversion {
             converts,
             groups,
             refresh,
-        })
+        };
+        // Held under `making`: no other thread set it.
+        let _ = self.made.set(made);
+        Ok(())
     }
 
     /// The planes it converts, and the bytes of their buffer they lie in.
@@ -801,31 +888,46 @@ impl YCbCrConversion {
     /// (five words); `None` where the conversion has no refresh.
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     pub(crate) fn refresh_state(&self) -> Option<(&Buffer, u64)> {
-        self.refresh.as_ref().map(|_| (&self.staging, STATE_AT))
+        let made = self.made.get()?;
+        made.refresh.as_ref().map(|_| (&made.staging, STATE_AT))
     }
 
     /// The conversion's workgroups across, which the refresh's indirect arguments take where it
     /// converts.
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     pub(crate) fn groups_across(&self) -> u32 {
-        self.groups[0]
+        self.made.get().map_or(0, |made| made.groups[0])
     }
 
     /// Whether the texture reads zeros the staging buffer holds past the planes' bytes: chroma
     /// codes 0 (over plane 1 of its surface, or a surface without planes), or rows past the end
     /// of its buffer. Its writes and passes, and its retyped views, are refused.
     pub(super) fn reads_zeros(&self) -> bool {
-        self.zeros.1 > 0
+        self.zeros > 0
     }
 
     /// The conversion's uses: `truth`, the read of the planes' bytes, then the staging buffer's
-    /// writes and read, and the write of every texel of the image of `copies`.
+    /// writes and read, and the write of every texel of the image of `copies`. Before it was made
+    /// ([`make`](Self::make)), which every copy in's planning does (`Encoder::plan_shadows`), it
+    /// has no staging buffer to use, and records nothing.
     pub(super) fn uses(
         &self,
         truth: Use<ResourceKey>,
         copies: &ShadowCopies,
     ) -> Vec<Use<ResourceKey>> {
-        let (key, range) = self.staging_use.clone();
+        let image = Use::writes(
+            copies.shadow_key,
+            copies.tracked,
+            copies.shadow_range.clone(),
+            Access::new(
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_STORAGE_WRITE,
+            ),
+        );
+        let Some(made) = self.made.get() else {
+            return vec![truth, image];
+        };
+        let (key, range) = made.staging_use.clone();
         vec![
             truth,
             Use {
@@ -845,15 +947,7 @@ impl YCbCrConversion {
                     vk::AccessFlags2::TRANSFER_WRITE | vk::AccessFlags2::SHADER_STORAGE_WRITE,
                 ),
             },
-            Use::writes(
-                copies.shadow_key,
-                copies.tracked,
-                copies.shadow_range.clone(),
-                Access::new(
-                    vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                ),
-            ),
+            image,
         ]
     }
 
@@ -867,19 +961,24 @@ impl YCbCrConversion {
     /// # Safety
     ///
     /// `command_buffer` is recording, outside a render pass; `source`, the staging buffer and
-    /// the image are live until it completes, and the image is in the `GENERAL` layout.
+    /// the image are live until it completes, and the image is in the `GENERAL` layout; the
+    /// conversion was made ([`make`](Self::make)), as every copy in's planning makes it
+    /// (`Encoder::plan_shadows`).
     pub(super) unsafe fn record(
         &self,
         device: &Vk,
         command_buffer: vk::CommandBuffer,
         source: vk::Buffer,
     ) {
-        let owner = self.staging.device();
-        let staging = self.staging.at(0).0;
-        let state_at = self.shape_at + STATE_AT;
-        let completed_at = self.shape_at + COMPLETED_AT;
+        let Some(made) = self.made.get() else {
+            return;
+        };
+        let owner = made.staging.generation();
+        let staging = made.staging.at(0).0;
+        let state_at = made.shape_at + STATE_AT;
+        let completed_at = made.shape_at + COMPLETED_AT;
         let word = |w: u32| w.to_le_bytes();
-        let refresh = self
+        let refresh = made
             .refresh
             .as_ref()
             .filter(|refresh| refresh.planes == source);
@@ -887,10 +986,10 @@ impl YCbCrConversion {
         // staging buffer, the copy and the planes' words in `source` (checked when the texture was
         // made), and the sets bind them.
         unsafe {
-            device.cmd_update_buffer(command_buffer, staging, self.shape_at, &self.shape);
-            let (zeros_at, zeros) = self.zeros;
+            device.cmd_update_buffer(command_buffer, staging, made.shape_at, &made.shape);
+            let (zeros_at, zeros) = made.zeros;
             crate::word_fill::record(
-                self.staging.device(),
+                made.staging.generation(),
                 command_buffer,
                 staging,
                 zeros_at..zeros_at + zeros,
@@ -901,7 +1000,7 @@ impl YCbCrConversion {
                     // The arguments of no workgroup across, which the refresh raises where it
                     // must; the completed word, kept for the refresh, then cleared.
                     let arguments: Vec<u8> =
-                        [0, self.groups[1], 1].into_iter().flat_map(word).collect();
+                        [0, made.groups[1], 1].into_iter().flat_map(word).collect();
                     device.cmd_update_buffer(command_buffer, staging, state_at, &arguments);
                     let kept = vk::BufferCopy {
                         src_offset: completed_at,
@@ -935,17 +1034,17 @@ impl YCbCrConversion {
                 None => {
                     device.cmd_update_buffer(command_buffer, staging, completed_at, &word(0));
                     Barrier::everything().record(device, command_buffer);
-                    device.cmd_copy_buffer(command_buffer, source, staging, &[self.into]);
+                    device.cmd_copy_buffer(command_buffer, source, staging, &[made.into]);
                     owner.shared().counts.ycbcr_converted_whole();
                 }
             }
             Barrier::everything().record(device, command_buffer);
-            self.converts.record(
+            made.converts.record(
                 device,
                 command_buffer,
-                (staging, self.shape_at + BYTES_AT),
+                (staging, made.shape_at + BYTES_AT),
                 refresh.map(|_| state_at),
-                self.groups,
+                made.groups,
             );
             Barrier::everything().record(device, command_buffer);
             device.cmd_update_buffer(command_buffer, staging, completed_at, &word(1));

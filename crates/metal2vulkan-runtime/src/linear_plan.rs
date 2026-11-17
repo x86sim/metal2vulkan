@@ -17,7 +17,11 @@
 //!   there, not as Metal's refusal. An IOSurface plane of either 4:2:2 format is made (below).
 //! - **Types.** `newTextureWithDescriptor:offset:bytesPerRow:` makes 2D textures and texture
 //!   buffers; the SPI `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` also
-//!   makes 2D arrays. Each has one mip level.
+//!   makes 2D arrays. Each has one mip level. The SPI
+//!   `newTiledTextureWithDescriptor:offset:bytesPerRow:` makes what the first makes, and a 2D
+//!   texture of more levels too, a copy of the buffer's rows at the offset and the `bytesPerRow`
+//!   taken at its first use, its later levels made from them (`Buffer::new_tiled_texture`); its
+//!   other rules are the first's.
 //! - **Options.** The texture's options are the buffer's, whatever the descriptor names (probe
 //!   9d, every pair of six buffer and nine descriptor options): Metal's validation alone stops a
 //!   storage or CPU cache mode other than the buffer's, or a hazard tracking mode other than the
@@ -29,8 +33,8 @@
 //!   buffer's `bytesPerRow` is any length that covers the row. A texture buffer's offset is any:
 //!   Metal's validation alone stops one off 16, and a plain run makes the texture, its functions
 //!   reading and writing from the offset rounded down to 16 and its blits and the CPU at the
-//!   offset (an M4, macOS 27.0.1; `buffer_texture.rs`), so the runtime does too. The SPI's texture
-//!   buffer, unmeasured there, keeps the validated rule. An array's `bytesPerImage` is ignored:
+//!   offset (an M4, macOS 27.0.1; `buffer_texture.rs`), so the runtime does too. The SPIs' texture
+//!   buffers, unmeasured there, keep the validated rule. An array's `bytesPerImage` is ignored:
 //!   each slice starts `bytesPerRow` × `height`, rounded up to 128, after the one before. Metal's
 //!   validation alone asserts that it is a multiple of 128; a plain run makes the array at any (16,
 //!   32, 64, 80 and 192 measured, probe 9b), so the runtime does too.
@@ -43,9 +47,23 @@
 //!   layer off: a 2D texture and a texture buffer over a 4096-byte buffer whose rows end 128 and
 //!   12288 bytes past it are made, as is one over a 20000-byte buffer, `allocatedSize` 32768,
 //!   from offset 20000; the same ending past 32768 is nil, and so is one over a 16384-byte
-//!   buffer, `allocatedSize` 16384, ending at 16640, where one ending at 16384 is made). The
-//!   runtime's buffers have no bytes past the length, so it refuses that texture as not
-//!   implemented ([`BufferRefusal::TexelsPastLength`]) and the nil one as Metal's nil
+//!   buffer, `allocatedSize` 16384, ending at 16640, where one ending at 16384 is made). Every
+//!   path takes those texels as the memory after the buffer's (an M3 Max under macOS 27.0.1, the
+//!   layer off, one shape and one path a process, `probes/texels_past_buffer_length.m`): over a
+//!   4096-byte `Shared` buffer, rows of 256 bytes ending 256 to 2048 bytes past it, a kernel's
+//!   `read()` and `sample()`, a blit into a buffer and `getBytes` read the buffer allocated next
+//!   (at the target's `gpuAddress` plus 4096) there, and a kernel's `write()`, a blit from a
+//!   buffer and `replaceRegion` write it there, which every read then reads; over a 20000-byte
+//!   buffer (`allocatedSize` 32768) the bytes past the length, inside the allocation, read zero,
+//!   and what each path writes there every path reads. The texels inside the length are the
+//!   buffer's bytes on every path. A texture buffer's paths answer alike
+//!   (`probes/texture_buffer_past_length.m`, 64 `RGBA8Unorm` texels ending 128 to 256 bytes past
+//!   a 4096-byte buffer, and 96 past a 20000-byte one), its kernels from its offset rounded down
+//!   to 16 bytes and its blits and `getBytes` from the offset itself, as inside the length. The
+//!   runtime makes such a 2D texture, array or texture buffer as Metal does: its texels inside
+//!   the length are the buffer's bytes, and those past it lie in a tail of the texture's own
+//!   (`buffer_texture.rs`), zero when made, which every path reads and writes alike and which is
+//!   no other allocation's memory; the nil one it answers as Metal's nil
 //!   ([`BufferTextureProblem::PastAllocation`]).
 //!
 //! **IOSurface planes** (`Buffer::new_texture_with_iosurface_plane`, the stand-in for
@@ -98,7 +116,7 @@
 //!   writes meet the bytes they share take whichever of the two rows Metal's command wrote last.
 //!   That order is no one order (an Apple M3 Max under macOS 27.0.1, one case a process,
 //!   `probes/overlapping_plane_row_writes.m`): it follows the command, the GPU pitch and the row
-//!   count, and how far the rows overlap changes none of it. `copyFromBuffer:toTexture:` and
+//!   count, and how far such rows overlap changes none of it. `copyFromBuffer:toTexture:` and
 //!   `copyFromTexture:toTexture:` at a GPU pitch of 16 keep the earlier row's bytes below every
 //!   even row and the later row's below every odd one, alternating over 2 to 12 rows; at a pitch
 //!   of 32 they keep the earlier row's over 4 rows and the later row's over 3, 5 and 6;
@@ -106,31 +124,51 @@
 //!   at all, 23 fresh processes giving three whole-plane outcomes; and a kernel's winner moves
 //!   with the threadgroup shape.
 //!
-//!   A plane's pitch covers its own row, so the overlap is 1 to 15 bytes, a whole number of
-//!   texels, and between consecutive rows alone (`tests::linear_plan`). No image holds rows that
-//!   overlap, so such a plane is a shadow whose copies reproduce the sharing: two regions a slice
-//!   each way, one of every row's shared head and one of the rest of each row going in, and going
-//!   back the second of them for every row beside the head of row 0 alone, which tile the plane's
-//!   bytes exactly once and leave the earlier row's bytes where two rows meet
-//!   (`buffer_texture.rs`, [`plane_copy_regions`](super::buffer_texture::plane_copy_regions)). A
-//!   kernel is the only writer that reaches such a plane, every blit into one being refused
-//!   below, and the earlier row's bytes are one of the rows a kernel of Metal's leaves there,
-//!   announced (`Degradation::CollidingSurfaceRowWrites`).
+//!   Rows wider than a plane's `bytesPerRow` at a multiple of 16 (**Beyond the plane's rows**)
+//!   overlap the rows after them on the GPU and the CPU alike, by any whole number of texels, a
+//!   byte shared by as many rows as reach it. Metal's GPU gives their shared bytes the answers it
+//!   gives the rows of the same GPU pitch and row above (`r8.20x4.w16`, `r8.24x4.w16`,
+//!   `r8.31x4.w16`, `r8.20x8.w16` and `rgba8.5x4.w4` beside their twins at a pitch off 16, three
+//!   processes a case: alike in every case but one of three 32 x 1 kernel runs over 20 x 8),
+//!   though how far wider rows overlap does move a blit's order (at a pitch of 32 over 4 rows the
+//!   earlier row's where they share 1 byte, the later row's where they share 16); its kernel of
+//!   8 x 4 threadgroups keeps the earliest row's within the first threadgroup's rows, where three
+//!   rows share a byte too (`r8.40x4.w16`); and its `replaceRegion` writes the rows in order, the
+//!   latest row's bytes standing wherever rows meet (all nine shapes, three processes each).
+//!
+//!   A plane's pitch off 16 covers its own row, so that overlap is 1 to 15 bytes, a whole number
+//!   of texels, and between consecutive rows alone (`tests::linear_plan`). No image holds rows
+//!   that overlap, so such a plane is a shadow whose copies reproduce the sharing: two regions a
+//!   slice each way, one of every row's shared head (in pieces no wider than the pitch, where it is
+//!   wider) and one of the rest of each row going in, and going back the second of them for every
+//!   row beside the head of row 0 alone, which tile the plane's bytes exactly once and leave the
+//!   earliest row's bytes wherever rows meet (`buffer_texture.rs`,
+//!   [`plane_copy_regions`](super::buffer_texture::plane_copy_regions)). A kernel is the only GPU
+//!   writer that reaches such a plane, every blit into one being refused below, and the earliest
+//!   row's bytes are one of the rows a kernel of Metal's leaves there, announced
+//!   (`Degradation::CollidingSurfaceRowWrites`). The CPU writes a wide plane's rows in order, as
+//!   Metal's `replaceRegion` does.
+//!
+//!   A two-plane YCbCr texture over a plane of a surface with planes is held whatever its rows of
+//!   codes share, and whatever its usage (**Two-plane YCbCr codes** below): its texels are its
+//!   conversion of the planes' bytes, which reads every row of codes at the planes' rows, and no
+//!   shadow copies its rows.
 //!
 //!   Still refused ([`BufferRefusal::OverlappingRows`], `NotImplemented`,
 //!   `RuntimeGap::OverlappingSurfaceRows`): a plane a render pass stores into, where what Metal
-//!   leaves of the shared bytes is not measured; the shapes whose rows of codes or units no row
-//!   rule bounds (a two-plane YCbCr texture's, which overlap by any amount across any number of
-//!   rows, `ycbcr.rs`; a two-plane extended-range one's, a 4:2:2 one's pairs, a depth or stencil
-//!   plane's elements), which two regions do not express; and a blit that would write such a
-//!   plane's rows as bytes (`blit_texture.rs`: a copy into it from a buffer, and one between two
-//!   textures over buffers, whichever side it is on), which writes every shared byte from one
-//!   fixed row where Metal's order is no one order ([`super::blit_plan::RowsCopy`] holds only the
-//!   one overlap that has an order, a buffer's rows whose images meet). A blit out of such a plane
-//!   into a buffer is served instead of refused, its rows being read and not written: each of the
-//!   buffer's rows takes the plane's bytes at its own GPU row, so a byte two rows share is read
-//!   once for each of them, which is what Metal's `copyFromTexture:toBuffer:` reads (an Apple M3
-//!   Max under macOS 27.0.1, one shape a process, `probes/overlapping_plane_row_reads.m`). A read
+//!   leaves of the shared bytes is not measured; a two-plane YCbCr texture over a surface without
+//!   planes, whose rows of codes past the surface's row are not measured; the shapes whose rows of
+//!   units no row rule bounds (a two-plane extended-range texture's, a 4:2:2 one's pairs, a depth
+//!   or stencil plane's elements), which two regions do not express; and a blit that would write
+//!   such a plane's rows as bytes (`blit_texture.rs`: a copy into it from a buffer, and one
+//!   between two textures over buffers, whichever side it is on), which writes every shared byte
+//!   from one fixed row where Metal's order is no one order ([`super::blit_plan::RowsCopy`] holds
+//!   only the one overlap that has an order, a buffer's rows whose images meet). A blit out of
+//!   such a plane into a buffer is served instead of refused, its rows being read and not
+//!   written: each of the buffer's rows takes the plane's bytes at its own GPU row, so a byte two
+//!   rows share is read once for each of them, which is what Metal's `copyFromTexture:toBuffer:`
+//!   reads (an Apple M3 Max under macOS 27.0.1, one shape a process,
+//!   `probes/overlapping_plane_row_reads.m`). A read
 //!   is not the mirror of a write here: a write must settle which row leaves the shared bytes
 //!   behind and Metal settles it no one way, while a read settles nothing. A copy between the
 //!   plane and an image texture is refused either way, its one `bufferRowLength` stating no
@@ -141,9 +179,23 @@
 //! - **Two-plane YCbCr codes** (an M3 Max under macOS 27.0.1; `ycbcr.rs`'s **Surfaces**). Metal
 //!   makes a two-plane YCbCr texture over any plane, its codes at the plane's rows however wide
 //!   they are: a 10-bit format over an 8-bit plane, whose rows of codes overlap where
-//!   `bytesPerRow` is under twice the width, and a texture taller than its plane, whose rows run
-//!   past the surface, where its reads are zeros. The runtime refuses rows that overlap as above,
-//!   and codes past the buffer `NotImplemented` (`TexelsPastBufferLength`).
+//!   `bytesPerRow` is under twice the width, a texture wider than its plane, whose rows of codes
+//!   overlap the next, and a texture taller than its plane, whose rows run past the surface,
+//!   where its reads are zeros. Over rows of codes that overlap, its `read()` and nearest sample
+//!   of every texel are, bit for bit, those of the same texture over a surface whose rows hold
+//!   the same bytes apart, its `getBytes` reads the luma rows at the plane's pitch, and its
+//!   `replaceRegion` writes them in order, the later row's bytes standing where rows meet
+//!   (`probes/ycbcr_wide_code_rows.m`: `YCBCR8_420_2P` 66 x 64 and `YCBCR10_420_2P` 64 x 64 over
+//!   a 64 x 64 `420v` surface whose planes are 64 bytes a row, two processes each). Its
+//!   `copyFromBuffer:toTexture:` of the whole texture completes there and leaves no one row's
+//!   bytes where rows meet: the earlier row's at every shared byte of the 8-bit texture in both
+//!   processes, and of the 10-bit one's 4032 shared bytes the earlier row's at 2047 and 1919, the
+//!   later one's at the rest. The runtime holds such a texture over a plane of a surface with
+//!   planes (`overlap_held`) as Metal reads it, its conversion reading the codes at the planes'
+//!   rows and its CPU calls the rows as above, and refuses the blit into it, as a plain plane's,
+//!   and the writes and passes that would store its codes where rows meet
+//!   (`texture/ycbcr_image.rs`), `NotImplemented` (`OverlappingSurfaceRows`); codes past the
+//!   buffer it refuses `NotImplemented` (`TexelsPastBufferLength`).
 //! - **Depth and stencil over a planar surface** (an M4 under macOS 27.0.1, the format scout's
 //!   cells: TTG2's scout, `scout4-metal-vs.tsv`). Metal makes, samples or reads, and draws a
 //!   `Depth16Unorm`, `Depth32Float`, `Depth32Float_Stencil8`, `Stencil8` or `X32_Stencil8` texture
@@ -158,13 +210,100 @@
 //!   (`texture/surface_depth.rs`, which lists what stays the runtime's gap,
 //!   `NotImplemented(RuntimeGap::SurfaceDepthStencil)`, with a blit of the stencil of
 //!   `Depth32Float_Stencil8`).
+//! - **Block-compressed surfaces** (an AMD Radeon Pro 5300M and an Intel UHD 630 under macOS
+//!   26.7.1, `metal2vulkan-conformance/probes/surface_texture_envelope.m`; the consumer's
+//!   `oracle_surftex` 66, 67, 125, 131 to 135, 147 and 148). The x86 Macs make a BC1 to BC7
+//!   texture over a surface's rows wherever they fit, over a surface with planes or without, in
+//!   `Managed` or `Private` storage; the M3 Max answers nil. Their blits (a `Private`
+//!   texture's too), `getBytes`, the UHD 630's `replaceRegion` and both GPUs' samples take block
+//!   row `j` at the plane's offset + `j` × `bytesPerRow`, the row its blocks' bytes (8 or 16 a
+//!   block, [`surface_blocks`]), a last block of a row or column whole however few of its texels
+//!   the texture covers. Over a surface without planes Metal stops a row of blocks wider than the
+//!   surface's ("Descriptor rowBytes (264) > IOSurface rowBytes (256)": `RowPitch`) and texels
+//!   past the surface's rows, counted in rows of texels ("Descriptor height*arrayLength >
+//!   IOSurface height": `PastBuffer`). The runtime lays such a texture out as those rows of blocks
+//!   (a shadow image, or an aliasing one where the device's linear image holds the format): its
+//!   shadow copies them as the texels they hold (`plane_copy_regions`), and its blits and CPU calls
+//!   count a region in blocks (`blit_plan::texel_rows`, `Texels::region_layout`). Over a plane of
+//!   a surface with planes it holds a 2D one at an offset and `bytesPerRow` that are multiples of
+//!   16, and one of 8-byte blocks (BC1, BC4) at an offset or `bytesPerRow` off 16 that its block's
+//!   bytes divide, at least 16 bytes a row ([`blocks_off_sixteen`]): there both GPUs' blits and
+//!   samples take block row `j` at the plane's offset + `j` × `bytesPerRow`, unrounded
+//!   (`bgraat8.bc1` at offset 8, `bgrarow264.bc1` at 264 bytes a row; BC4 was not measured
+//!   there), and so do the runtime's GPU commands and its CPU calls, as the 5300M's `getBytes`
+//!   does, where the UHD 630's `getBytes` and `replaceRegion` take the plane at offset 8 from
+//!   byte 0. A 2D one of 8-byte blocks whose rows of blocks are wider than the plane's
+//!   `bytesPerRow`, at an offset and `bytesPerRow` that are multiples of 16, keeps each row of
+//!   blocks to the plane's row on both GPUs (`420v.p0.bc1.64x64`, 128 bytes a row of blocks over a
+//!   `420v` surface's luma plane of 64 bytes a row at offset 32): their blits read its first
+//!   `bytesPerRow` bytes at the plane's offset + `j` × `bytesPerRow` and its blocks past them as
+//!   zeros, and write only those first bytes, where the UHD 630's samples of the blocks past them
+//!   decode other memory; the runtime lays it out so ([`blocks_kept_to_row`]), its blocks past the
+//!   plane's row in no byte, reading zero on every path and taking no write. Any other is the
+//!   runtime's gap ([`BufferRefusal::PlaneShape`]): a BC texture of
+//!   16-byte blocks off 16 or wider than the plane's row, and one of 8-byte blocks off them or
+//!   under 16 bytes a row, which no GPU measured. Two answers of the 5300M's are not reproduced: its `replaceRegion` wrote other
+//!   bytes than the texture's past the first row of blocks, and some of its blits into a BC
+//!   texture over a surface, and of its `replaceRegion` calls, ended the process. Every other
+//!   compressed format over a surface is no buffer's (`NotLinear`).
+//! - **Beyond the plane's rows** (the same probe, on those two and the M3 Max under macOS
+//!   27.0.1). Over a plane of a surface with planes Metal makes a texture of any type, extent and
+//!   levels (`oracle_surftex` 17, 21, 42, 116 to 123, 127, 129), but the three GPUs and their CPU
+//!   calls lay out alike only a texture buffer (its texels contiguous from the plane's offset,
+//!   however wide: past the plane's row too on the M3 Max and the 5300M, where the UHD 630's
+//!   kernels read other bytes), a 1D texture whose row fits and a 2D array of one slice, each
+//!   where the 2D texture of its rows lies; the runtime makes those. A texture buffer over a
+//!   plane at an offset or `bytesPerRow` off 16 (`bgraat8.texbuf` and `bgrarow264.texbuf`, the
+//!   M3 Max) is read by its functions from the offset rounded down to 16 and by `getBytes` and
+//!   `replaceRegion` from the offset, as a buffer's texture buffer is: the runtime makes it so.
+//!   Plain Metal asserts on a cube and a cube array over a plane on the M3 Max
+//!   ("carriesComplexTexture || numFaces == 1", the API validation layer off), where the x86
+//!   Macs make them and their GPUs lay face `k` one image on from the plane's offset, `k` times
+//!   its rows times `bytesPerRow`, inside the plane (`bgra1x2.cube.16`, `bgra1x2.cubearray.16`,
+//!   `bgra1x2.cubearray.8.a2`, `420v.p0.cube.8`; their CPU calls lay the faces two other ways):
+//!   the runtime lays them so for the GPU and the CPU alike ([`faces_at_pitch`]), for a colour
+//!   format at an offset and `bytesPerRow` that are multiples of 16. A 2D texture of more than
+//!   one level, a 3D texture and a 2D multisample one lie in no one place on the M3 Max, their
+//!   first level and slice among them (`bgra1x2.mips2`, `bgra1x2.mips7`, `420v.p0.mips2`,
+//!   `bgra1x2.3d.d2`, `420v.p0.3d.d2`, `bgra1x2.2dms4.private`: its blits and kernels read other
+//!   bytes than its blits, `replaceRegion` and `getBytes` put there), where the x86 Macs keep the
+//!   first level and slice over the plane: the runtime makes each of a colour format in memory of
+//!   its own, zero when made, announced (`Degradation::SurfaceTexelsApart`,
+//!   [`apart_from_plane`]). A 2D array of more than one slice keeps its first slice over the plane
+//!   on every path of the M3 Max's and lays its second in no one place (`bgra1x2.2darray.a2`,
+//!   `bgra1x2.2darray.a2.64x64`: its blits and `getBytes` read it at the plane's offset, over the
+//!   first, its kernels one image on, and its writes land at the plane's offset): the runtime
+//!   keeps the first slice in place and the others in a tail of the texture's own
+//!   ([`slices_apart`], [`Placed::kept`]), announced (`Degradation::SurfaceTexelsTail`), for a
+//!   colour format at an offset and `bytesPerRow` that are multiples of 16. A 2D texture whose
+//!   rows are wider than the plane's `bytesPerRow`, and a 1D texture wider than one, lie in one
+//!   place on every path of the M3 Max's (`bgra1x2.65x64`, `bgra1x2.128x32`, `420v.p0.65x64`,
+//!   `420v.p1.33x32`, `bgra1x2.1d.128`): row `y` from the plane's offset plus `y` times
+//!   `bytesPerRow`, the whole row, so a 2D texture's rows overlap. The runtime lays them out so
+//!   for the GPU and the CPU alike ([`wide_rows`]), for a colour format at an offset and
+//!   `bytesPerRow` that are multiples of 16, and holds the 2D texture's rows as every plane's that
+//!   overlap (**Rows that overlap**). Every other shape lies differently on each, or was not
+//!   measured: [`BufferRefusal::PlaneShape`]
+//!   ([`RuntimeGap::SurfacePlaneShape`](crate::RuntimeGap::SurfacePlaneShape), which carries the
+//!   measurements). A texture taller than its plane is held as the M3 Max's GPU and CPU lay it
+//!   out, its rows past the plane at the plane's pitch, inside the surface; the x86 Macs' GPUs
+//!   keep it to the plane (the UHD 630's reads other bytes there and drops the writes, the 5300M's
+//!   reads zeros and its blit into it writes nothing), which the runtime does not, as it is given
+//!   no plane's height. Rows past the surface's end lie in no one place (the M3 Max under macOS
+//!   27.0.1, `probes/surface_texture_envelope.m`'s `bgra1.64x65`, `bgra1.64x128` and
+//!   `420v.p1.32x512`: its blits read zeros there, its kernels zeros and, 32 KiB past the plane,
+//!   the plane's rows again, its `getBytes` zeros and other memory, and its blits' and
+//!   `replaceRegion`'s writes there change no byte of the surface). The runtime keeps those texels
+//!   in a tail of the texture's own, zero when made, which every path reads and writes alike
+//!   (`buffer_texture.rs`'s **Tails**), announced (`Degradation::SurfaceTexelsTail`); the rows
+//!   inside the surface are its bytes, as Metal's are on every path. The shapes it holds no tail
+//!   of are refused there ([`BufferRefusal::TexelsPastLength`], [`tail_held`]).
 //!
 //! The runtime holds both layouts: the GPU's ([`Placed::gpu`]) is the texture's texels for every
 //! command, the copies of its shadow, an aliasing image and their hazards; the CPU's
-//! ([`Placed::cpu`]) is `replace_region`'s and `get_bytes`'s. Both lie in the buffer, else the
-//! texture is refused: a plane past the buffer `NotImplemented` (`TexelsPastBufferLength`;
-//! Metal's lie in the surface's pages past the plane, where it reads zeros), and over a surface
-//! without planes, which plain Metal holds the rows to, `Invalid` (`PastBuffer`).
+//! ([`Placed::cpu`]) is `replace_region`'s and `get_bytes`'s. Both lie in the buffer, or past it
+//! in the texture's tail (a plane of a surface with planes, above), else the texture is refused:
+//! over a surface without planes, which plain Metal holds the rows to, `Invalid` (`PastBuffer`).
 //! A surface without planes starts at a multiple of 16 in the buffer, as a surface's base does
 //! (`OffsetAlignment` otherwise).
 //!
@@ -181,7 +320,7 @@
 
 use super::chroma_pairs::is_four_two_two;
 use super::copy_plan::block_extent;
-use super::image_plan::{compatible, view_formats, ImageFacts, ImagePlan};
+use super::image_plan::{block_family, compatible, ImageFacts, ImagePlan};
 use super::pixel_format_info::pixel_format_info;
 use super::texture_descriptor::TextureLayout;
 use super::two_planes;
@@ -222,16 +361,24 @@ pub enum BufferTextureProblem {
         /// The descriptor's pixel format.
         pixel_format: PixelFormat,
     },
-    /// A texture type the call does not make over a buffer.
+    /// A texture type the call does not make over a buffer, or over an IOSurface without planes.
+    /// Over a plane of a surface with planes Metal makes every type on the x86 Macs, and what the
+    /// runtime does not hold there is its gap
+    /// ([`RuntimeGap::SurfacePlaneShape`](crate::RuntimeGap::SurfacePlaneShape)).
     ///
     /// Basis: metal-measured (an Apple M3 Max, macOS 27.0.1: plain Metal asserts "Linear texture:
     /// must be of type MTLTextureType2D, textureType (MTLTextureType3D) disallowed", and the same
-    /// for a 2D array).
+    /// for a 2D array, the API validation layer off; over a plane of a surface with planes it
+    /// asserts "carriesComplexTexture || numFaces == 1" in
+    /// `-[IOGPUMetalTexture initWithDevice:descriptor:iosurface:plane:field:args:argsSize:]` on a
+    /// cube and a cube array, which an AMD Radeon Pro 5300M and an Intel UHD 630 under macOS
+    /// 26.7.1 make, `metal2vulkan-conformance/probes/surface_texture_envelope.m`).
     TextureType {
         /// The descriptor's texture type.
         texture_type: TextureType,
     },
-    /// More than one mip level.
+    /// More than one mip level, of a texture but a tiled 2D one
+    /// (`Buffer::new_tiled_texture`).
     ///
     /// Basis: metal-measured (an Apple M3 Max, macOS 27.0.1: plain Metal asserts "Linear texture:
     /// cannot be mipmapped, mipmapLevelCount (2) disallowed").
@@ -261,7 +408,7 @@ pub enum BufferTextureProblem {
         alignment: u64,
     },
     /// An offset that is not a multiple of `alignment`: a 2D texture's or array's, an IOSurface
-    /// plane's, or the SPI's texture buffer's (`newTextureWithDescriptor:offset:bytesPerRow:`'s
+    /// plane's, or an SPI's texture buffer's (`newTextureWithDescriptor:offset:bytesPerRow:`'s
     /// texture buffer takes any).
     ///
     /// Basis: metal-measured (an Apple M3 Max, macOS 27.0.1: plain Metal asserts "Linear texture:
@@ -279,11 +426,12 @@ pub enum BufferTextureProblem {
     /// height*arrayLength > IOSurface height": a 16 by 8 and a 16 by 64 descriptor over a 16 by 4
     /// `BGRA` surface, on an M3 Max under macOS 27.0.1, where the 16 by 4 one is made).
     ///
-    /// A *plane* of a surface with planes is not held to it: Metal makes a texture taller than
-    /// the plane and reads zeros past it, which the runtime's buffer has no bytes for
-    /// ([`RuntimeGap::TexelsPastBufferLength`](crate::RuntimeGap::TexelsPastBufferLength)), and a
+    /// A *plane* of a surface with planes is not held to it: Metal makes a texture whose rows
+    /// run past the surface, which the runtime keeps in a tail of the texture's own, or refuses
+    /// for a shape it keeps no tail of
+    /// ([`RuntimeGap::TexelsPastBufferLength`](crate::RuntimeGap::TexelsPastBufferLength)); and a
     /// texture over a buffer past its bytes Metal makes or answers nil for by the buffer's
-    /// allocation alone (the module's **Length**).
+    /// allocation alone (the module's **Length** and **Beyond the plane's rows**).
     ///
     /// Basis: metal-measured (an M3 Max, macOS 27.0.1: plain Metal asserts "Descriptor
     /// height*arrayLength > IOSurface height", the API validation layer off, where the surface-high
@@ -316,6 +464,23 @@ pub(super) fn is_linear(pf: PixelFormat) -> bool {
     pf != P::Invalid && !compressed && !is_depth_stencil(pf)
 }
 
+/// Whether `pf` is of the BC family (BC1 to BC7, their sRGB and signed forms), whose textures
+/// Metal makes over an IOSurface plane's rows, a row of blocks to the plane's `bytesPerRow` (the
+/// module's **Block-compressed surfaces**), where no other buffer backs one.
+pub(super) fn surface_blocks(pf: PixelFormat) -> bool {
+    use PixelFormat as P;
+    matches!(
+        block_family(pf),
+        P::BC1RGBA
+            | P::BC2RGBA
+            | P::BC3RGBA
+            | P::BC4RUnorm
+            | P::BC5RGUnorm
+            | P::BC6HRGBUfloat
+            | P::BC7RGBAUnorm
+    )
+}
+
 /// Whether a buffer can back a texture of `pf` ([`is_linear`]), or why not.
 fn backed(pf: PixelFormat) -> Result<(), BufferTextureProblem> {
     if is_linear(pf) {
@@ -343,6 +508,10 @@ pub(super) fn linear_alignment(pf: PixelFormat) -> Result<u64, BufferTextureProb
 pub(super) enum BufferTextureCall {
     /// `newTextureWithDescriptor:offset:bytesPerRow:`: a 2D texture or a texture buffer.
     Texture,
+    /// The SPI `newTiledTextureWithDescriptor:offset:bytesPerRow:`: as
+    /// [`Texture`](Self::Texture), and a 2D texture of more than one level, its first over the
+    /// buffer's rows.
+    Tiled,
     /// The SPI `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:`, which makes
     /// 2D arrays too. Metal lays an array's slices out itself, whatever `bytesPerImage` is.
     Linear,
@@ -392,13 +561,21 @@ pub(super) struct BufferLayout {
 impl BufferLayout {
     /// The bytes consecutive rows share, where the rows overlap: a row's bytes past the pitch, 0
     /// where each row lies at or past the end of the one above. Only an IOSurface plane's GPU
-    /// layout overlaps ([`iosurface_gpu_layout`]), and then by 1 to 15 bytes, a whole number of
-    /// texels, between consecutive rows alone (`tests::linear_plan`).
+    /// layout overlaps, and a heap's one-plane YCbCr texture's rows (`texture/heap.rs`,
+    /// `one_plane_pitch`): at a pitch rounded down to 16 ([`iosurface_gpu_layout`]) by 1 to 15
+    /// bytes, a whole number of texels, between consecutive rows alone; and where a plane's rows
+    /// are wider than its pitch ([`wide_rows`]), its CPU layout too, by any whole number of
+    /// texels, a byte shared by as many rows as reach it (`tests::linear_plan`).
     pub(super) fn shared_bytes(&self) -> u64 {
         match self.rows > 1 {
             true => self.row_bytes.saturating_sub(self.row_pitch),
             false => 0,
         }
+    }
+
+    /// Whether its rows, or its slices, lie with bytes between them that are not texels.
+    pub(super) fn padded(&self) -> bool {
+        apart(self) != (false, false)
     }
 
     /// One past the texture's last texel byte in the buffer.
@@ -421,6 +598,12 @@ pub(super) struct Placed {
     /// Metal's GPU reads as memory-dependent bytes: the runtime's reads them where its writes put
     /// them (the module's rules).
     pub(super) narrow: bool,
+    /// Where the texels' bytes in place end, for a 2D array of more than one slice over a plane
+    /// of a surface with planes ([`slices_apart`]): its second slice's first byte, or the
+    /// buffer's length where that comes first. Its bytes from here on, its slices past the first,
+    /// lie in a tail of the texture's own (`buffer_texture.rs`'s **Tails**). `None` for every
+    /// other texture, whose texels lie in place up to the buffer's length.
+    pub(super) kept: Option<u64>,
 }
 
 impl Placed {
@@ -431,8 +614,27 @@ impl Placed {
             gpu: layout,
             cpu: layout,
             narrow: false,
+            kept: None,
         }
     }
+}
+
+/// Whether Metal's GPU reads and writes two of a texture's rows over bytes they share, its GPU
+/// layout `gpu` ([`Placed::gpu`]): an IOSurface plane's that it takes at its pitch rounded down
+/// to 16 ([`iosurface_gpu_layout`]) while the plane's own rows, which the CPU takes, lie a row
+/// apart or further (the module's **Rows that overlap**), and a plane's whose rows are wider than
+/// its `bytesPerRow`, which every path takes that far apart ([`wide_rows`]).
+///
+/// Only a plane answers true. A rotated texture's two layouts are one
+/// (`buffer_texture::rotated_rows`) and share no byte at all, its `bytesPerRow` covering its own
+/// row (`buffer_texture::covers_its_row`); and the only plan whose CPU rows share bytes is a wide
+/// plane's, whose GPU rows are the CPU's, every other call but a two-plane YCbCr texture's
+/// holding `bytesPerRow` to the row ([`plan_buffer_texture`]) and that one's GPU rows, at the
+/// CPU's (its planes' offsets and rows are multiples of 16, `ycbcr.rs`), sharing bytes too:
+/// held over a plane of a surface with planes, refused over a surface without
+/// ([`BufferRefusal::OverlappingRows`]).
+pub(super) fn plane_rows_share_bytes(gpu: &BufferLayout) -> bool {
+    gpu.shared_bytes() > 0
 }
 
 /// Where Metal's GPU reads and writes the texels of an IOSurface plane laid out as `cpu` for the
@@ -440,25 +642,11 @@ impl Placed {
 /// apart, or 16 apart where that is 0 (a plane under 16 bytes a row, [`Placed::narrow`]).
 ///
 /// Rows that overlap lie at that pitch itself, which the texture's shadow holds in two copy
-/// regions each way (the module's **Rows that overlap**); every other plane's lie at least a row
-/// apart, so that one region a slice states them and its `bufferRowLength` covers its width. A
-/// plane of one row lies a row apart whatever its pitch: it overlaps nothing, and one region
-/// states it.
-/// Whether Metal's GPU reads and writes two of a texture's rows over bytes they share, because
-/// it takes an IOSurface plane at its pitch rounded down to 16 ([`iosurface_gpu_layout`]) while
-/// the plane's own rows, which the CPU takes, lie a row apart or further (the module's **Rows
-/// that overlap**). `gpu` and `cpu` are one texture's two layouts ([`Placed`]).
-///
-/// Only a plane answers true. A rotated texture's two layouts are one
-/// (`buffer_texture::rotated_rows`) and share no byte at all, its `bytesPerRow` covering its own
-/// row (`buffer_texture::covers_its_row`); and no plan makes a texture whose CPU rows share
-/// bytes, every call but a two-plane YCbCr texture's holding `bytesPerRow` to the row
-/// ([`plan_buffer_texture`]) and that one's GPU rows, which round down to 16 or below the CPU's,
-/// sharing bytes too and so being refused ([`BufferRefusal::OverlappingRows`]).
-pub(super) fn plane_rows_share_bytes(gpu: &BufferLayout, cpu: &BufferLayout) -> bool {
-    gpu.shared_bytes() > 0 && cpu.shared_bytes() == 0
-}
-
+/// regions each way (the module's **Rows that overlap**), a plane's whose rows are wider than its
+/// pitch among them ([`wide_rows`], where that is the CPU's pitch too); every other plane's lie
+/// at least a row apart, so that one region a slice states them and its `bufferRowLength` covers
+/// its width. A plane of one row lies a row apart whatever its pitch: it overlaps nothing, and
+/// one region states it.
 pub(super) fn iosurface_gpu_layout(cpu: &BufferLayout) -> BufferLayout {
     let down = |n: u64| n - n % LINEAR_ALIGNMENT;
     let pitch = down(cpu.row_pitch);
@@ -481,22 +669,228 @@ pub(super) fn iosurface_gpu_layout(cpu: &BufferLayout) -> BufferLayout {
 
 /// Whether the runtime holds an IOSurface plane of `texture` where its GPU rows overlap, its
 /// shadow's two copy regions each way reproducing the sharing (the module's **Rows that
-/// overlap**), or refuses it ([`BufferRefusal::OverlappingRows`]).
+/// overlap**), or its conversion reading every code at the plane's rows (a two-plane YCbCr
+/// texture's, the module's **Two-plane YCbCr codes**), or refuses it
+/// ([`BufferRefusal::OverlappingRows`]).
 ///
-/// A plain plane is held. Refused are a plane a render pass stores into, where what Metal leaves
-/// of the bytes two rows share is not measured, and the shapes whose rows of codes or units no
-/// row rule bounds, which two regions do not express: a two-plane YCbCr texture's (`ycbcr.rs`), a
-/// two-plane extended-range one's (`texture/surface_two_planes.rs`), a 4:2:2 one's pairs
-/// (`chroma_pairs.rs`) and a depth or stencil plane's elements (`texture/surface_depth.rs`). A
-/// rotated plane's `bytesPerRow` is already a multiple of 16, so its GPU rows never overlap
+/// A plain plane is held, and a two-plane YCbCr texture over a plane of a surface with planes,
+/// whatever its usage: its texels are its conversion of the planes' bytes (`ycbcr.rs`), which
+/// reads each row of codes at the plane's rows however far they overlap, as Metal reads them,
+/// and its writes and passes over rows that overlap are refused where they are encoded
+/// (`texture/ycbcr_image.rs`). Refused are a plain plane a render pass stores into, where what
+/// Metal leaves of the bytes two rows share is not measured; a two-plane YCbCr texture over a
+/// surface without planes, whose rows of codes past the surface's row Metal was not measured
+/// over; and the shapes whose rows of units no row rule bounds, which two regions do not
+/// express: a two-plane extended-range texture's (`texture/surface_two_planes.rs`), a 4:2:2 one's
+/// pairs (`chroma_pairs.rs`) and a depth or stencil plane's elements (`texture/surface_depth.rs`).
+/// A rotated plane's `bytesPerRow` is already a multiple of 16, so its GPU rows never overlap
 /// (`buffer_texture::turned_plane`).
 fn overlap_held(texture: &BufferTexture) -> bool {
     let pf = texture.layout.pixel_format;
+    if ycbcr(pf) {
+        return matches!(
+            texture.call,
+            BufferTextureCall::IoSurfacePlane { planar: true }
+        );
+    }
     !texture.usage.contains(TextureUsage::RENDER_TARGET)
-        && !ycbcr(pf)
         && !two_planes::holds_planes(pf)
         && !is_four_two_two(pf)
         && !is_depth_stencil(pf)
+}
+
+/// Whether `texture` is a 2D or 1D texture over a plane of a surface with planes whose rows are
+/// wider than the plane's `bytesPerRow` that the runtime makes, a 2D texture's rows `bytesPerRow`
+/// apart and overlapping, on the GPU and the CPU alike, and a 1D texture's one row from the
+/// plane's offset (the module's **Beyond the plane's rows**): of a colour format a buffer backs
+/// ([`is_linear`]) but a two-plane extended-range one, over a plane whose offset and
+/// `bytesPerRow` are multiples of 16, where the GPU's rows lie where the CPU's do. Metal makes
+/// such a texture, and every path of the M3 Max's reads row `y` from the plane's offset plus `y`
+/// times `bytesPerRow`, the whole row (an Apple M3 Max under macOS 27.0.1,
+/// `probes/surface_texture_envelope.m`'s `bgra1x2.65x64`, `bgra1x2.128x32`, `420v.p0.65x64`,
+/// `420v.p1.33x32` and `bgra1x2.1d.128`), while its writes of the bytes two rows share land in no
+/// one order (the module's **Rows that overlap**). A plane off 16, whose GPU rows would lie at
+/// another pitch or offset than the CPU's, is not measured.
+fn wide_rows(texture: &BufferTexture) -> bool {
+    let layout = &texture.layout;
+    let planar = matches!(
+        texture.call,
+        BufferTextureCall::IoSurfacePlane { planar: true }
+    );
+    let aligned = texture.offset.is_multiple_of(LINEAR_ALIGNMENT)
+        && texture.bytes_per_row.is_multiple_of(LINEAR_ALIGNMENT)
+        && texture.bytes_per_row != 0;
+    let pf = layout.pixel_format;
+    planar
+        && matches!(
+            layout.texture_type,
+            TextureType::Type2D | TextureType::Type1D
+        )
+        && aligned
+        && is_linear(pf)
+        && !two_planes::holds_planes(pf)
+}
+
+/// Whether `texture` is a BC texture of 8-byte blocks (BC1, BC4) over a plane of a surface with
+/// planes at an offset or `bytesPerRow` off 16 that the runtime makes, at the plane's own offset
+/// and `bytesPerRow` for the GPU and the CPU alike (the module's **Block-compressed surfaces**):
+/// one whose block's bytes divide both, its rows at least 16 bytes apart. The x86 Macs make
+/// such a texture, their blits and samples taking block row `j` at the plane's offset plus `j`
+/// times `bytesPerRow`, unrounded (an AMD Radeon Pro 5300M and an Intel UHD 630 under macOS
+/// 26.7.1, `probes/surface_texture_envelope.m`'s `bgraat8.bc1` and `bgrarow264.bc1`; the M3 Max
+/// answers nil for every BC texture). A BC texture of 16-byte blocks off 16, and one under 16
+/// bytes a row, are not measured.
+fn blocks_off_sixteen(texture: &BufferTexture) -> bool {
+    let planar = matches!(
+        texture.call,
+        BufferTextureCall::IoSurfacePlane { planar: true }
+    );
+    let block = texture.texel_bytes;
+    planar
+        && surface_blocks(texture.layout.pixel_format)
+        && block == 8
+        && texture.offset.is_multiple_of(block)
+        && texture.bytes_per_row.is_multiple_of(block)
+        && texture.bytes_per_row >= LINEAR_ALIGNMENT
+}
+
+/// Whether `texture`, whose rows of units are `row_bytes` each, is a 2D BC texture of 8-byte
+/// blocks (BC1, BC4) over a plane of a surface with planes whose rows of blocks are wider than
+/// the plane's `bytesPerRow`, at an offset and `bytesPerRow` that are multiples of 16, which the
+/// runtime makes with each row of blocks kept to the plane's row, for the GPU and the CPU alike
+/// (the module's **Block-compressed surfaces**): row `j`'s first `bytesPerRow` bytes at the
+/// plane's offset plus `j` times `bytesPerRow`, its layouts' rows those bytes alone
+/// (`BufferLayout::row_bytes` is `bytesPerRow`, under the texture's row: `Texels::columns_in_place`);
+/// its blocks past them lie in no byte, reading zero on every path (its shadow image's, which
+/// starts at zero and no copy reaches there) and taking no write (its blits' and
+/// `replace_region`'s columns past them are dropped). The x86 Macs make such a texture, and both
+/// GPUs' blits read the blocks past the plane's row as zeros and write none of them (an AMD Radeon
+/// Pro 5300M and an Intel UHD 630 under macOS 26.7.1, `probes/surface_texture_envelope.m`'s
+/// `420v.p0.bc1.64x64`; the UHD 630's samples of them decode other memory, the 5300M's
+/// `replaceRegion` wrote other bytes and ended the process, and the UHD 630's CPU calls take whole
+/// rows of blocks from the surface's first byte); the M3 Max answers nil. BC4 was not measured,
+/// and holds the same layout as BC1, its blocks as large; a BC texture of 16-byte blocks wider
+/// than the plane's row was not measured.
+fn blocks_kept_to_row(texture: &BufferTexture, row_bytes: u64) -> bool {
+    let planar = matches!(
+        texture.call,
+        BufferTextureCall::IoSurfacePlane { planar: true }
+    );
+    let bytes_per_row = texture.bytes_per_row;
+    planar
+        && surface_blocks(texture.layout.pixel_format)
+        && texture.layout.texture_type == TextureType::Type2D
+        && texture.texel_bytes == 8
+        && texture.offset.is_multiple_of(LINEAR_ALIGNMENT)
+        && bytes_per_row.is_multiple_of(LINEAR_ALIGNMENT)
+        && bytes_per_row != 0
+        && bytes_per_row < row_bytes
+}
+
+/// Whether the runtime keeps the texels of an IOSurface plane of `texture` that lie past the
+/// buffer standing for its surface in a tail of the texture's own, zero when made (the module's
+/// **Beyond the plane's rows**), or refuses them ([`BufferRefusal::TexelsPastLength`]).
+///
+/// A colour plane's are kept, a 2D texture's, a 1D texture's, an array's and a texture buffer's:
+/// the shadow's copies, its blits and its CPU calls reach the tail as they reach a
+/// buffer's texture's (`buffer_texture.rs`'s **Tails**). Refused are the shapes whose texels
+/// another form holds than those copies of their rows: a two-plane YCbCr texture's codes, which
+/// a conversion reads (`ycbcr.rs`); a two-plane extended-range one's, its alpha in the surface's
+/// other plane (`texture/surface_two_planes.rs`); a 4:2:2 one's pairs (`chroma_pairs.rs`); a
+/// depth or stencil plane's elements, which a render pass stores in Metal's tiled layout
+/// (`texture/surface_depth.rs`); and a BC texture's blocks, whose rows past a surface no GPU of
+/// Metal's that makes them was measured at.
+fn tail_held(texture: &BufferTexture) -> bool {
+    let pf = texture.layout.pixel_format;
+    !ycbcr(pf)
+        && !two_planes::holds_planes(pf)
+        && !is_four_two_two(pf)
+        && !is_depth_stencil(pf)
+        && !surface_blocks(pf)
+}
+
+/// Whether the runtime makes the texture of an IOSurface plane of `texture` in memory of its own,
+/// zero when made, rather than over the plane (the module's **Beyond the plane's rows**): a colour
+/// 2D texture of more than one level, a 3D texture or a 2D multisample one over a plane of a
+/// surface with planes. Metal makes each and lays its texels out in no one place, its first
+/// level's and slice's among them (an Apple M3 Max under macOS 27.0.1,
+/// `probes/surface_texture_envelope.m`'s `bgra1x2.mips2`, `bgra1x2.mips7`, `420v.p0.mips2`,
+/// `bgra1x2.3d.d2`, `420v.p0.3d.d2` and `bgra1x2.2dms4.private`): its GPU reads them from other
+/// bytes than its writes and its CPU put them. A colour format is one a buffer backs
+/// ([`is_linear`]) and that keeps a tail past a surface ([`tail_held`]); every other format's
+/// such texture is planned, and refused, as before.
+pub(super) fn apart_from_plane(texture: &BufferTexture) -> bool {
+    use TextureType as T;
+    let planar = matches!(
+        texture.call,
+        BufferTextureCall::IoSurfacePlane { planar: true }
+    );
+    let layout = &texture.layout;
+    let shape = match layout.texture_type {
+        T::Type2D => layout.levels > 1,
+        T::Type3D | T::Type2DMultisample => true,
+        _ => false,
+    };
+    planar && shape && is_linear(layout.pixel_format) && tail_held(texture)
+}
+
+/// Whether `texture` is a 2D array of more than one slice over a plane of a surface with planes
+/// that the runtime makes with its first slice over the plane and its others in a tail of the
+/// texture's own, zero when made (the module's **Beyond the plane's rows**, [`Placed::kept`]):
+/// one of a colour format ([`is_linear`], [`tail_held`]) over a plane whose offset and
+/// `bytesPerRow` are multiples of 16, where the GPU's and the CPU's rows lie alike. Metal makes
+/// such an array and lays its first slice over the plane on every path, and its second in no one
+/// place: its blits and `getBytes` read the second at the plane's offset, over the first, and its
+/// kernels one image on, and its blits' and `replaceRegion`'s writes of it land at the plane's
+/// offset (an Apple M3 Max under macOS 27.0.1, `probes/surface_texture_envelope.m`'s
+/// `bgra1x2.2darray.a2` and `bgra1x2.2darray.a2.64x64`). An array over a plane off 16 is not
+/// measured, and every other format's array is planned, and refused, as before.
+pub(super) fn slices_apart(texture: &BufferTexture) -> bool {
+    let layout = &texture.layout;
+    let planar = matches!(
+        texture.call,
+        BufferTextureCall::IoSurfacePlane { planar: true }
+    );
+    let aligned = texture.offset.is_multiple_of(LINEAR_ALIGNMENT)
+        && texture.bytes_per_row.is_multiple_of(LINEAR_ALIGNMENT);
+    planar
+        && layout.texture_type == TextureType::Type2DArray
+        && layout.layers > 1
+        && aligned
+        && is_linear(layout.pixel_format)
+        && tail_held(texture)
+}
+
+/// Whether `texture` is a cube or a cube array over a plane of a surface with planes that the
+/// runtime makes face after face, face `k` (of every cube's six, one cube after another) at the
+/// plane's offset plus `k` times its rows times `bytesPerRow`, its rows `bytesPerRow` apart, for
+/// the GPU and the CPU alike, its faces past the buffer standing for the surface in a tail of
+/// its own, zero when made (the module's **Beyond the plane's rows**): one of a colour format
+/// ([`is_linear`], [`tail_held`]) over a plane whose offset and `bytesPerRow` are multiples of
+/// 16, its rows inside them. The x86 Macs make such a texture and their GPUs' blits and kernels
+/// lay it out so inside the plane (an AMD Radeon Pro 5300M and an Intel UHD 630 under macOS
+/// 26.7.1, `probes/surface_texture_envelope.m`'s `bgra1x2.cube.16`, `bgra1x2.cubearray.16`,
+/// `bgra1x2.cubearray.8.a2` and `420v.p0.cube.8`), where their CPU calls differ: the 5300M's
+/// `getBytes` reads every face from the first's bytes and its `replaceRegion` writes every face
+/// there, and the UHD 630's take the faces at the GPU's pitch from the surface's first byte. The
+/// M3 Max asserts on it. A cube of another format, over a plane off 16 or of more than one
+/// level is not measured.
+fn faces_at_pitch(texture: &BufferTexture) -> bool {
+    let layout = &texture.layout;
+    let planar = matches!(
+        texture.call,
+        BufferTextureCall::IoSurfacePlane { planar: true }
+    );
+    let aligned = texture.offset.is_multiple_of(LINEAR_ALIGNMENT)
+        && texture.bytes_per_row.is_multiple_of(LINEAR_ALIGNMENT);
+    planar
+        && matches!(
+            layout.texture_type,
+            TextureType::Cube | TextureType::CubeArray
+        )
+        && aligned
+        && is_linear(layout.pixel_format)
+        && tail_held(texture)
 }
 
 /// Why a texture over a buffer is not made.
@@ -505,21 +899,37 @@ pub(super) enum BufferRefusal {
     /// What Metal asserts on or stops under validation (`Invalid`), or answers nil for (`Nil`:
     /// [`BufferTextureProblem::PastAllocation`]).
     Metal(BufferTextureProblem),
-    /// An array whose texels run past the buffer's length, which Metal makes over bytes past
-    /// the length and the runtime has no bytes for (`NotImplemented`).
+    /// An IOSurface plane's GPU or CPU rows past the buffer standing for its surface, which
+    /// Metal makes over bytes past the length, of a shape the runtime keeps no tail of
+    /// ([`tail_held`]: `NotImplemented`). A colour plane keeps those texels in a tail of its own
+    /// instead, as a 2D texture, an array or a texture buffer over a buffer does (the module's
+    /// **Length**).
     TexelsPastLength,
     /// An IOSurface plane whose rows overlap on Metal's GPU that the runtime holds no form of
     /// (`NotImplemented`; the module's **Rows that overlap**): a plane a render pass stores into,
-    /// or one of a format whose rows of codes or units no row rule bounds (a two-plane YCbCr
-    /// texture's, which overlap by any amount across any number of rows, `ycbcr.rs`; a two-plane
-    /// extended-range one's, a 4:2:2 one's pairs, a depth or stencil plane's elements). A plain
-    /// plane, whose pitch covers its row and whose rows share 1 to 15 bytes, is a shadow of two
-    /// copy regions each way instead.
+    /// a two-plane YCbCr texture over a surface without planes, or one of a format whose rows of
+    /// units no row rule bounds (a two-plane extended-range one's, a 4:2:2 one's pairs, a depth
+    /// or stencil plane's elements). A plain plane, whose pitch covers its row and whose rows
+    /// share 1 to 15 bytes, is a shadow of two copy regions each way instead, and a two-plane
+    /// YCbCr texture over a plane of a surface with planes its conversion of the planes.
     OverlappingRows,
     /// An IOSurface plane whose descriptor asks for `Memoryless` storage, which plain Metal makes
     /// and serves on the CPU while every GPU use fails the command buffer (`NotImplemented`; the
     /// module's rules).
     MemorylessPlane,
+    /// A texture over a plane of a surface with planes that Metal makes and lays out no one way
+    /// across its GPUs and its CPU calls (`NotImplemented`; the module's **Beyond the plane's
+    /// rows**), and that the runtime holds neither in memory of its own ([`apart_from_plane`],
+    /// which takes a colour 2D texture of several levels, a 3D and a multisample one before any
+    /// plan is asked) nor with slices in a tail ([`slices_apart`]) nor at overlapping rows
+    /// ([`wide_rows`]): rows wider than the plane's `bytesPerRow`, or a 1D texture wider than the
+    /// plane's row, of a format but a colour one or over a plane off 16 bytes; more than one
+    /// level, a type but 2D, a texture buffer, a 1D texture, a 2D array, a cube and a cube array
+    /// (which [`faces_at_pitch`] does not take, and on which the M3 Max asserts); a
+    /// block-compressed texture over a plane whose offset or `bytesPerRow` is off 16 bytes but
+    /// the 8-byte blocks [`blocks_off_sixteen`] takes; and one whose rows of blocks are wider
+    /// than the plane's but the 8-byte blocks [`blocks_kept_to_row`] takes.
+    PlaneShape,
 }
 
 impl From<BufferTextureProblem> for BufferRefusal {
@@ -542,25 +952,61 @@ pub(super) fn plan_buffer_texture(
     // (`TextureDescriptor::check_made`).
     // Over a plane of a surface with planes Metal makes a depth or stencil texture, laid out as
     // a colour texture's in its one aspect's units (the module docs).
-    let planar_depth = matches!(
+    let planar = matches!(
         texture.call,
         BufferTextureCall::IoSurfacePlane { planar: true }
-    ) && is_depth_stencil(layout.pixel_format);
-    if !(surface && is_four_two_two(layout.pixel_format)) && !planar_depth {
+    );
+    let planar_depth = planar && is_depth_stencil(layout.pixel_format);
+    // Over a surface's rows Metal makes a BC texture, its blocks a row of blocks a row (the
+    // module's **Block-compressed surfaces**).
+    let blocks = surface && surface_blocks(layout.pixel_format);
+    if !(surface && is_four_two_two(layout.pixel_format)) && !planar_depth && !blocks {
         backed(layout.pixel_format)?;
     }
     let texture_type = layout.texture_type;
+    // Over a plane of a surface with planes Metal makes every type, of any levels (the module's
+    // **Beyond the plane's rows**): the runtime holds the ones its texels lie as a 2D texture's
+    // in.
+    let one_slice = texture_type == T::Type2DArray && layout.layers == 1;
+    // A 2D array of more than one slice over a plane keeps its first slice in place and its
+    // others in its tail (the module's **Beyond the plane's rows**, [`slices_apart`]).
+    let sliced = slices_apart(texture);
+    // A cube or a cube array over a plane lies a face an image on ([`faces_at_pitch`]).
+    let faces = faces_at_pitch(texture);
     let made = match texture.call {
-        BufferTextureCall::Texture => matches!(texture_type, T::Type2D | T::TextureBuffer),
+        BufferTextureCall::Texture | BufferTextureCall::Tiled => {
+            matches!(texture_type, T::Type2D | T::TextureBuffer)
+        }
         BufferTextureCall::Linear => {
             matches!(texture_type, T::Type2D | T::TextureBuffer | T::Type2DArray)
         }
-        BufferTextureCall::IoSurfacePlane { .. } => texture_type == T::Type2D,
+        BufferTextureCall::IoSurfacePlane { planar: false } => {
+            matches!(texture_type, T::Type2D | T::TextureBuffer)
+        }
+        BufferTextureCall::IoSurfacePlane { planar: true } => {
+            matches!(texture_type, T::Type2D | T::TextureBuffer | T::Type1D)
+                || one_slice
+                || sliced
+                || faces
+        }
     };
+    if !made && planar {
+        return Err(BufferRefusal::PlaneShape);
+    }
     if !made {
         return Err(P::TextureType { texture_type }.into());
     }
-    if layout.levels != 1 {
+    // A BC texture over a plane is measured 2D alone.
+    if blocks && texture_type != T::Type2D {
+        return Err(BufferRefusal::PlaneShape);
+    }
+    if layout.levels != 1 && planar {
+        return Err(BufferRefusal::PlaneShape);
+    }
+    // A tiled 2D texture takes its levels, its first over the buffer's rows (the module's
+    // **Types**).
+    let tiled = texture.call == BufferTextureCall::Tiled && texture_type == T::Type2D;
+    if layout.levels != 1 && !tiled {
         return Err(P::MipmapLevelCount {
             count: layout.levels,
         }
@@ -571,27 +1017,80 @@ pub(super) fn plan_buffer_texture(
     }
     let [width, height, _] = layout.extent.map(u64::from);
     let (offset, bytes_per_row) = (texture.offset, texture.bytes_per_row);
-    let row_bytes = width.saturating_mul(texture.texel_bytes);
+    // A block-compressed texture's rows are rows of its blocks, `texel_bytes` each.
+    let [across, down] = match blocks {
+        true => units(layout.pixel_format, [width, height]),
+        false => [width, height],
+    };
+    let row_bytes = across.saturating_mul(texture.texel_bytes);
     // A two-plane YCbCr texture reads its codes at the surface plane's rows whatever their width
     // (the module docs): Metal checks no row against them.
     let ycbcr = surface && ycbcr(layout.pixel_format);
-    if bytes_per_row < row_bytes && !ycbcr {
-        return Err(P::RowPitch {
-            bytes_per_row,
-            row_bytes,
-        }
-        .into());
+    // A texture buffer over a plane of a surface with planes is its bytes from the plane's
+    // offset on, however wide, and a 2D or 1D texture's rows wider than the plane's
+    // `bytesPerRow` lie that far apart, a 2D texture's overlapping ([`wide_rows`]; the module's
+    // **Beyond the plane's rows**); one over a surface without planes Metal holds to its row.
+    let texels_run = planar && texture_type == T::TextureBuffer;
+    // A BC texture of 8-byte blocks over a plane keeps each row of blocks to the plane's row
+    // ([`blocks_kept_to_row`]): its rows in place are the plane's.
+    let kept_to_row = blocks && blocks_kept_to_row(texture, row_bytes);
+    if bytes_per_row < row_bytes && !ycbcr && !texels_run && !wide_rows(texture) && !kept_to_row {
+        return Err(match planar {
+            true => BufferRefusal::PlaneShape,
+            false => P::RowPitch {
+                bytes_per_row,
+                row_bytes,
+            }
+            .into(),
+        });
     }
     if let BufferTextureCall::IoSurfacePlane { planar } = texture.call {
+        // A BC texture lies at the plane's own offset and `bytesPerRow` on the GPU and the CPU
+        // alike: over a plane at multiples of 16, and one of 8-byte blocks at multiples of its
+        // block off 16 ([`blocks_off_sixteen`]; the module's **Block-compressed surfaces**). A
+        // texture buffer's functions read a plane from its offset rounded down to 16 and its CPU
+        // calls from the offset, as a buffer's texture buffer's, at any pitch (the module's
+        // **Beyond the plane's rows**).
+        let aligned = offset.is_multiple_of(LINEAR_ALIGNMENT)
+            && bytes_per_row.is_multiple_of(LINEAR_ALIGNMENT);
+        if planar && blocks && !aligned && !blocks_off_sixteen(texture) {
+            return Err(BufferRefusal::PlaneShape);
+        }
         let cpu = BufferLayout {
             offset,
             row_pitch: bytes_per_row,
-            slice_pitch: bytes_per_row.saturating_mul(height),
-            row_bytes,
-            rows: height,
-            slices: 1,
+            slice_pitch: bytes_per_row.saturating_mul(down),
+            row_bytes: match kept_to_row {
+                true => bytes_per_row,
+                false => row_bytes,
+            },
+            rows: down,
+            slices: match sliced || faces {
+                true => u64::from(layout.layers),
+                false => 1,
+            },
         };
-        return plan_iosurface_plane(cpu, planar, buffer.length, overlap_held(texture));
+        // Over a surface without planes Metal holds a BC texture's rows of texels, not of
+        // blocks, to the surface's ("Descriptor height*arrayLength > IOSurface height").
+        if blocks && !planar {
+            let counted = (height - 1)
+                .saturating_mul(bytes_per_row)
+                .saturating_add(row_bytes)
+                .saturating_add(offset);
+            if counted > buffer.length {
+                return Err(P::PastBuffer {
+                    counted,
+                    length: buffer.length,
+                }
+                .into());
+            }
+        }
+        let held = (overlap_held(texture), tail_held(texture));
+        let placed = plan_iosurface_plane(cpu, (planar, blocks), buffer.length, held)?;
+        // A 2D array's slices past its first lie in its tail, from its second slice's first
+        // byte on (one image on from the plane's offset, where Metal's kernels read it).
+        let kept = sliced.then(|| (cpu.offset.saturating_add(cpu.slice_pitch)).min(buffer.length));
+        return Ok(Placed { kept, ..placed });
     }
     let array = texture_type == T::Type2DArray;
     let alignment = if array {
@@ -630,7 +1129,8 @@ pub(super) fn plan_buffer_texture(
     let length = buffer.length;
     // Metal's validation counts the slices' rows as if contiguous against the length and stops
     // the texture there; plain Metal reads the buffer's allocation alone (the module's
-    // **Length**), so the runtime does too.
+    // **Length**), so the runtime does too. A 2D texture, an array or a texture buffer whose
+    // texels run past the length keeps those texels in its tail (`buffer_texture.rs`).
     if placed.end() > length {
         let end = offset.saturating_add(slice_pitch.saturating_mul(slices));
         if length >= METAL_PAGE {
@@ -641,20 +1141,29 @@ pub(super) fn plan_buffer_texture(
                 return Err(P::PastAllocation { end, allocation }.into());
             }
         }
-        return Err(BufferRefusal::TexelsPastLength);
     }
     Ok(Placed::same(placed))
 }
 
+/// The blocks of a block-compressed `pf` a texture of `extent` texels spans across and down,
+/// each side rounded up to whole blocks.
+fn units(pf: PixelFormat, [width, height]: [u64; 2]) -> [u64; 2] {
+    let [w, h] = block_extent(pf).map_or([1, 1], |extent| extent.map(u64::from));
+    [width.div_ceil(w), height.div_ceil(h)]
+}
+
 /// An IOSurface plane laid out as `cpu` in a buffer of `length` bytes, of a planar surface or
 /// not (`planar`), by the module's rules; its type, levels, options and row were checked as
-/// every texture over a buffer's are. `held` says whether the runtime holds the plane where its
-/// GPU rows overlap ([`overlap_held`]), or refuses it there.
+/// every texture over a buffer's are. `blocks` says whether it is a BC texture's rows of blocks,
+/// which the GPU takes where the CPU does (the module's **Block-compressed surfaces**), rather
+/// than at [`iosurface_gpu_layout`]. `held` says whether the runtime holds the plane where its
+/// GPU rows overlap ([`overlap_held`]), or refuses it there; `tail` whether it keeps the plane's
+/// texels past the buffer in a tail of the texture's own ([`tail_held`]), or refuses them.
 fn plan_iosurface_plane(
     cpu: BufferLayout,
-    planar: bool,
+    (planar, blocks): (bool, bool),
     length: u64,
-    held: bool,
+    (held, tail): (bool, bool),
 ) -> Result<Placed, BufferRefusal> {
     use BufferTextureProblem as P;
     let alignment = LINEAR_ALIGNMENT;
@@ -673,29 +1182,32 @@ fn plan_iosurface_plane(
         .into());
     }
     // A surface without planes holds the texture's rows: plain Metal asserts on a descriptor
-    // taller than it (`P::PastBuffer`). Over a plane Metal makes such a texture and reads zeros
-    // past the plane, which the runtime's buffer has no bytes for.
-    if cpu.end() > length {
-        return Err(match planar {
-            true => BufferRefusal::TexelsPastLength,
-            false => P::PastBuffer {
-                counted: cpu.end(),
-                length,
-            }
-            .into(),
-        });
+    // taller than it (`P::PastBuffer`).
+    if cpu.end() > length && !planar {
+        return Err(P::PastBuffer {
+            counted: cpu.end(),
+            length,
+        }
+        .into());
     }
-    let gpu = iosurface_gpu_layout(&cpu);
+    let gpu = match blocks {
+        true => cpu,
+        false => iosurface_gpu_layout(&cpu),
+    };
     if gpu.shared_bytes() != 0 && !held {
         return Err(BufferRefusal::OverlappingRows);
     }
-    if gpu.end() > length {
+    // Over a plane Metal makes a texture whose rows run past the surface and lays those texels
+    // in no one place (the module's **Beyond the plane's rows**): the runtime keeps them in a
+    // tail of the texture's own (`buffer_texture.rs`), or refuses the shapes it holds no tail of.
+    if gpu.end().max(cpu.end()) > length && !tail {
         return Err(BufferRefusal::TexelsPastLength);
     }
     Ok(Placed {
         gpu,
         cpu,
-        narrow: cpu.rows > 1 && cpu.row_pitch < alignment,
+        narrow: !blocks && cpu.rows > 1 && cpu.row_pitch < alignment,
+        kept: None,
     })
 }
 
@@ -791,17 +1303,23 @@ pub(super) fn tiling_lack(
 /// The formats a plan's image may be viewed as: its list, or, where its views may take any
 /// format (a texture of `pixelFormatView` usage: `MUTABLE_FORMAT` without a list), each format
 /// the runtime views a texture of a pixel format as for the plan's usages (`view_formats`) that
-/// is compatible with the image's, of every pixel format.
-pub(super) fn viewed_formats(plan: &ImagePlan, facts: &ImageFacts) -> Vec<Format> {
-    if !plan.flags.contains(ImageCreateFlags::MUTABLE_FORMAT) || !plan.view_formats.is_empty() {
-        return plan.view_formats.clone();
-    }
-    let formats: std::collections::BTreeSet<Format> = PixelFormat::ALL
-        .iter()
-        .flat_map(|&pf| view_formats(pf, plan.usage, facts.profile))
-        .filter(|&format| format != plan.format && compatible(plan.format, format, true))
-        .collect();
-    formats.into_iter().collect()
+/// is compatible with the image's, of every pixel format: the device's own table of those
+/// (`ImageFacts::any_views`), in `Format` order. Read in place, with no list made: a heap
+/// texture's plan asks them at each texture whose image is linear (`texture/heap.rs`).
+pub(super) fn viewed_formats<'a>(
+    plan: &'a ImagePlan,
+    facts: &ImageFacts<'a>,
+) -> impl Iterator<Item = Format> + 'a {
+    let listed =
+        !plan.flags.contains(ImageCreateFlags::MUTABLE_FORMAT) || !plan.view_formats.is_empty();
+    let (list, any): (&[Format], &[Format]) = match listed {
+        true => (&plan.view_formats, &[]),
+        false => (&[], facts.any_views.of(plan.usage, facts.profile)),
+    };
+    let any = any.iter().copied();
+    (list.iter().copied()).chain(
+        any.filter(move |&format| format != plan.format && compatible(plan.format, format, true)),
+    )
 }
 
 /// Whether a linear image of `plan` fits `limits`, the device's image limits for it
@@ -861,22 +1379,55 @@ pub(super) struct LinearImage {
 /// memory block), holds exactly Metal's texels in the `room` bytes from there to the end of the
 /// buffer's memory: the binding is a multiple of the image's alignment, its texels start at the
 /// binding, its row pitch is Metal's and so is its slice pitch where it has several slices, its
-/// subresources hold no byte but the texture's texels ([`texels_alone`]), and its memory stays in
-/// the buffer's. A driver may report a pitch other than the one asked of it (NVIDIA does for
-/// explicit layouts it does not support), so the image's own report decides.
+/// subresources hold no byte but the texture's texels ([`texels_alone`]), or, where `between` (the
+/// image may hold the bytes between rows and slices: [`Between::Unobserved`],
+/// [`Between::Kept`]), none but its texels and those bytes ([`within_padding`]), and its memory
+/// stays in the buffer's. A driver may report a pitch other than the one asked of it (NVIDIA does
+/// for explicit layouts it does not support), so the image's own report decides.
 pub(super) fn aliases(
     layout: &BufferLayout,
     memory_offset: u64,
     room: u64,
     image: &LinearImage,
+    between: bool,
 ) -> bool {
+    let held = match between {
+        true => within_padding(layout, image.subresource, image.array_pitch),
+        false => texels_alone(layout, image.subresource, image.array_pitch),
+    };
     image.alignment != 0
         && memory_offset.is_multiple_of(image.alignment)
         && image.offset == 0
         && image.row_pitch == layout.row_pitch
         && (layout.slices == 1 || image.array_pitch == layout.slice_pitch)
-        && texels_alone(layout, image.subresource, image.array_pitch)
+        && held
         && image.size <= room
+}
+
+/// What an image over a buffer's texels holds besides them, as [`holding`] lets it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Between {
+    /// No byte: the texels' rows (and slices) lie one after another, or there is one of each.
+    Nothing,
+    /// The bytes between their rows and slices, which the buffer declares unobserved
+    /// (`BufferDescriptor::padding_unobserved`): any image over the texels may hold them, and its
+    /// operations change them.
+    Unobserved,
+    /// The bytes between their rows and slices, which only the device's ordered commands write, of
+    /// a texture that renders nothing, or whose renders the device's check found keeping them
+    /// ([`holding`]'s `renders_kept`): the device's linear image made `PREINITIALIZED` holds
+    /// them, its one transition keeping them, or an image of the runtime's own memory made
+    /// `UNDEFINED` (a `DRM_FORMAT_MOD_LINEAR` one, or the device's linear image in a block of the
+    /// runtime's buffers allocated exportable and never exported), whose first move keeps them by
+    /// copies around its transition (`texture/first_move.rs`'s `GpuKeep`).
+    Kept,
+}
+
+impl Between {
+    /// Whether an image may hold the bytes between the texels' rows and slices.
+    pub(crate) fn held(self) -> bool {
+        self != Between::Nothing
+    }
 }
 
 /// Whether an image over `layout`'s texels, for a texture of Metal `usage`, may hold them: where
@@ -905,13 +1456,49 @@ pub(super) fn aliases(
 ///
 /// A copy and a shader's read or write of the image touch its texels alone (the Memory
 /// Model: "A memory operation must not affect memory at a memory location not within its set of
-/// memory locations"). But every image takes a first move, across which the host could keep the
-/// bytes only by reading them before it and writing them back after (`texture/first_move.rs`'s
-/// `Keep`), undoing a CPU write made to them meanwhile, where Metal keeps every one; and lavapipe's
+/// memory locations"). But every image takes a first move, across which the bytes are kept only by
+/// copying them out before it and back after, which undoes a write another agent makes to them
+/// meanwhile (the CPU's, where Metal keeps every one); and lavapipe's
 /// shader writes read the bytes its 4-texel blocks reach past a row's texels and write them back, a
 /// signaling NaN's bits quieted. So such a texture is a shadow, whose copies address its texels
-/// alone.
-pub(super) fn holding(layout: &BufferLayout, usage: TextureUsage) -> Result<(), String> {
+/// alone; but an image over its rows and slices may hold the bytes between them ([`Between`]):
+///
+/// - where `padding_unobserved` (the buffer, of the runtime's own memory, declares that nothing
+///   reads those bytes: `BufferDescriptor::padding_unobserved`), any such image, whose operations
+///   may then change them ([`Between::Unobserved`]);
+/// - where `ordered` (only the device's commands, in the order the runtime records them, write the
+///   bytes the GPU uses: `Buffer::gpu_bytes_ordered`) and the texture renders nothing (or
+///   `renders_kept`, below), the device's linear image made `PREINITIALIZED` alone
+///   ([`Between::Kept`]). Its one transition, its first
+///   move to `GENERAL`, is from the layout it is in, and of such a one the same section says "If
+///   the old layout matches the current layout of the image subresource range, the transition
+///   preserves the contents of that range" (Vulkan 7.1.1), ordered after every write of those
+///   bytes before it and before every one after; and in `GENERAL`, the image and the buffer are
+///   both host-accessible subresources, which "interpret the contents of the memory in
+///   consistent ways, and data written to one alias can be read by the other alias" (12.11, Memory
+///   Aliasing). A shader's writes of the texture may change its rows' padding, as on the x86 Macs
+///   (`in_place::Padding::Free`). A texture that renders is held so too where `renders_kept`: the
+///   device's policy takes images in place and its check of renders over its pooled memory
+///   passed for texels that lie in its lines as these do (`Device::ordered_renders_kept`), the
+///   check that a render pass's load and store and the image's moves leave every byte beside the
+///   texels as it was, the rows' padding among them, while the CPU writes them
+///   (`in_place_check.rs`), a render pass taking the device's one store path for linear images
+///   whatever memory they lie in. An image made `UNDEFINED` for
+///   memory the runtime exported takes none of them: its first move may discard them. A
+///   `DRM_FORMAT_MOD_LINEAR` one of the runtime's own memory, made `UNDEFINED` too
+///   (`PREINITIALIZED` is for linear tiling alone), and the device's linear image in a block of
+///   the runtime's buffers allocated exportable and never exported, made `UNDEFINED` for the
+///   block's handle type (`VUID-VkImageCreateInfo-pNext-01443`), take them where the first move
+///   copies what the image is bound to out before its transition and back after
+///   (`texture/first_move.rs`'s `GpuKeep`): only the device's ordered commands write those bytes,
+///   so no write is undone, and in `GENERAL` such an image is a host-accessible subresource too
+///   (the Glossary's Linear Resource).
+pub(super) fn holding(
+    layout: &BufferLayout,
+    usage: TextureUsage,
+    padding_unobserved: bool,
+    (ordered, renders_kept): (bool, bool),
+) -> Result<Between, String> {
     // An IOSurface plane's rows that overlap: no image holds them, whatever its usage.
     let shared = layout.shared_bytes();
     if shared != 0 {
@@ -922,6 +1509,9 @@ pub(super) fn holding(layout: &BufferLayout, usage: TextureUsage) -> Result<(), 
         ));
     }
     let (rows, slices) = apart(layout);
+    if padding_unobserved {
+        return Ok(Between::Unobserved);
+    }
     let apart = if rows {
         format!(
             "its rows lie {} bytes apart, {} bytes of texels each",
@@ -933,9 +1523,17 @@ pub(super) fn holding(layout: &BufferLayout, usage: TextureUsage) -> Result<(), 
             layout.slice_pitch, layout.rows, layout.row_pitch
         )
     } else {
-        return Ok(());
+        return Ok(Between::Nothing);
     };
-    let writers = if usage.contains(TextureUsage::RENDER_TARGET) {
+    let renders = usage.contains(TextureUsage::RENDER_TARGET);
+    if ordered && (!renders || renders_kept) {
+        return Ok(Between::Kept);
+    }
+    let writers = if renders && ordered {
+        "its layout transitions read and write, and a render pass's load and store operations \
+         write back, and the device's check of renders over its pooled memory has not passed for \
+         texels that lie as these do"
+    } else if renders {
         "its layout transitions read and write, and a render pass's load and store operations \
          write back"
     } else {
@@ -960,6 +1558,22 @@ pub(super) fn texels_alone(layout: &BufferLayout, size: u64, array_pitch: u64) -
     let texels = layout.end() - layout.offset;
     let last = array_pitch.saturating_mul(layout.slices - 1);
     apart(layout) == (false, false) && last.saturating_add(size) <= texels
+}
+
+/// Whether a linear image over `layout`'s texels, whose subresources take `size` bytes each from
+/// the first texel of their slice, `array_pitch` apart, holds no byte but the texture's texels and
+/// the bytes between its rows and its slices, those of a buffer that declares them unobserved
+/// (`BufferDescriptor::padding_unobserved`): its rows share no byte, its slices lie its slice
+/// pitch apart (where it has several), each at or past the end of the one before's last row to
+/// its pitch, and each subresource ends at its slice's last row's pitch or before. Each row's
+/// bytes after its texels to its pitch, the last row's included, are such bytes; a byte past the
+/// last row's pitch is not, so a driver that lays rows out past the texture's (lavapipe rounds the
+/// height up to 4) has the texture refused. A byte of the image's memory past every subresource
+/// is no texel's and no padding's, and no operation on the image reaches it ([`texels_alone`]).
+pub(super) fn within_padding(layout: &BufferLayout, size: u64, array_pitch: u64) -> bool {
+    let rows = layout.row_pitch.saturating_mul(layout.rows);
+    let slices = layout.slices == 1 || (array_pitch == layout.slice_pitch && array_pitch >= rows);
+    layout.shared_bytes() == 0 && slices && size <= rows
 }
 
 /// Whether `layout`'s rows, and its slices, lie with bytes between them that are not texels.

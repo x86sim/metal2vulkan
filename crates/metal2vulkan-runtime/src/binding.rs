@@ -34,11 +34,14 @@
 //! - **The heap** (set 1): the device's heap set of the command's layout, which holds every live
 //!   texture at its resource ID and each array's neutral at element 0 (`heap_sets.rs`), so a heap
 //!   entry writes nothing: the texture it names (made resident, or bound at a slot) is checked as a
-//!   slot's view is. It holds every live sampler state at its element too, so an argument sampler
-//!   writes nothing either. A texture handle table is the device's texture table
+//!   slot's view is, and nor does any other image element (an array's neutral where a member's
+//!   texture does not fit its class). It holds every live sampler state at its element too, so an
+//!   argument sampler writes nothing either. A texture handle table is the device's texture table
 //!   (`heap_sets::texture_table`), and a sampler table the device's sampler table of the layout's
 //!   kind (`heap_sets::sampler_table`), so a handle reaches every live texture and sampler state
-//!   by its ID as the command runs, as Metal's does.
+//!   by its ID as the command runs, as Metal's does. A draw whose caller keeps its heap part
+//!   (`render/heap_part.rs`) writes, after one draw checked each entry, only the plan's writes
+//!   past the heap's entries that draw listed ([`PastHeap`]).
 //! - **Function tables** an argument buffer names: a set-1 element takes a listed table's words
 //!   buffer whole. On a device without the function-table array's features the stage's snapshot
 //!   takes the listed tables' words copied into the arena (`function_table.rs`), which the command
@@ -46,37 +49,44 @@
 //! - Every other write source names a later step's resource and is refused, typed, before
 //!   anything is recorded.
 
+use std::cell::Cell;
+use std::mem::MaybeUninit;
+
 use super::address_map::SamplerMaps;
 use super::argument_table::{ArgumentTable, InlineBytes};
-use super::buffer::Buffer;
-use super::command_buffer::{NotedTable, State};
+use super::buffer::{Buffer, KeptSpaces};
+use super::command_buffer::{CommandBuffer, NotedTable, State};
+use super::degradation::EachWatch;
 use super::device::lock;
 use super::error::{internal, Error, RuntimeGap};
 use super::function_table::{self, TableSnapshot, VisibleFunctionTable};
-use super::heap_sets::{Keeper, SamplerTable, TextureTable, HEAP_SET};
+use super::heap_sets::{self, Keeper, SamplerTable, TextureTable, HEAP_SET};
 use super::key_hash::KeyMap;
 use super::render_pass::{PassLayout, Target};
 use super::render_target;
 use super::residency::{Residency, Used};
 use super::resource::ResourceKey;
-use super::sampler::{OwnedSampler, SamplerState};
+use super::sampler::{HashedDesc, OwnedSampler, SamplerShared, SamplerState};
 use super::texture::{Texture, TextureShared};
 use super::tracker::{Access, Use, UseRange};
 use super::upload::Upload;
 use super::Device;
 use ash::vk;
 use metal2vulkan::bind::{
-    AccessClass, BindingPlan, DescriptorBytes, DescriptorRange, DescriptorWrite,
+    AccessClass, BindingPlan, BufferRange, DescriptorBytes, DescriptorRange, DescriptorWrite,
     FunctionTableWords, HeapElements, HeapSource, ImageSource, ImageViewDesc, IndexBufferRef,
     NeutralResource, PushConstantWrite, PushHole, ResourceUse, RootTable, SamplerDescriptor,
     SamplerSource, UseTarget, ViewSetup, WriteSource,
 };
-use metal2vulkan::metal::sampler::{OpaqueBlackBorder, SamplerUse};
-use metal2vulkan::pipeline::{HandleClass, SlotClass, SlotRef, Stage, StorageAttachmentView};
+use metal2vulkan::metal::format::writes_dropped;
+use metal2vulkan::metal::sampler::{AddressModeMap, OpaqueBlackBorder, SamplerUse};
+use metal2vulkan::pipeline::{
+    HandleClass, ImageAccess, SlotClass, SlotRef, Stage, StorageAttachmentView,
+};
 use std::collections::BTreeSet;
 use std::ops::{Deref, Range};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// What an encoder binds: each stage's argument table.
 pub(super) struct Tables<'a> {
@@ -95,9 +105,9 @@ pub(super) struct Tables<'a> {
     /// Where the plan's heap writes go, when the command writes a heap.
     heap: Option<&'a HeapElements>,
     /// The device's texture table, which the layout's texture handle tables bind.
-    texture_table: Option<&'a TextureTable>,
+    texture_table: Option<&'a TextureTable<'a>>,
     /// The device's sampler table, which the layout's sampler tables bind.
-    sampler_table: Option<&'a SamplerTable>,
+    sampler_table: Option<&'a SamplerTable<'a>>,
     /// The tables the bind state lists as function tables, in its order.
     function_tables: &'a [VisibleFunctionTable],
     /// A tile dispatch's scratch images, by color index, which its storage attachments read and
@@ -143,6 +153,398 @@ pub(super) struct Tables<'a> {
     /// A merged draw replay's header's address (`render/executions/gpu.rs`): its vertex
     /// function's `PushHole::MergedDrawAddress` takes it.
     merged_header: Option<u64>,
+    /// A draw's sampled slots that read the levels of their texture's own image apart from the
+    /// attached ones, in place of its copy (`render/attached_levels.rs`).
+    narrowed: Option<&'a NarrowedSlots>,
+    /// The texture and buffer slots the command reads through read twins, in place of what they
+    /// bind (`read_twin.rs`, [`TwinSlots`]).
+    twins: Option<&'a TwinSlots>,
+}
+
+/// The slots a command reads through read twins (`read_twin.rs`), each bound in place of what
+/// the slot binds where the command only reads it: at a texture slot, the runtime's texture over a
+/// no-copy buffer's pages in place, made for the program's texture over the buffer's copy; at a
+/// buffer slot, the buffer's own read twin, at the slot's offset.
+pub(super) struct TwinSlots {
+    textures: Vec<(SlotRef, Texture)>,
+    buffers: Vec<(SlotRef, (Buffer, u64))>,
+}
+
+impl TwinProofs {
+    /// The slots of `tables` that the command of `plan`, whose proofs these keep, and its own
+    /// uses `command_uses`, which reaches memory through a root table where `roots`, reads
+    /// through read twins, in `command_buffer` (`None` where none is):
+    ///
+    /// - each texture slot whose every use only reads, as a sampled or storage image (proven
+    ///   from lowering: an unknown access is a write), and whose every descriptor is that image,
+    ///   with no element of the heap, texel buffer or plane of it; not read through a snapshot,
+    ///   narrowed to levels, nor presenting an attachment of the draw's instance; whose texture
+    ///   has a read twin that serves each such binding with no shadow of its usage, and whose
+    ///   bytes no earlier command of the command buffer may have written (`Texture::read_twin`);
+    /// - each buffer slot of a command that reaches no memory through a root table (so no address
+    ///   of the slot's buffer reaches its functions), whose every use only reads, as a storage or
+    ///   uniform buffer (proven from lowering, writes through the slot's escaped address among
+    ///   them), and whose every descriptor is that buffer's, none a vertex buffer of it; whose
+    ///   buffer has a read twin at its own base, and whose copy no earlier command of the command
+    ///   buffer may have written (`Buffer::slot_twin`).
+    ///
+    /// A command's own uses name no slot (its index buffer, indirect arguments and the like), so
+    /// the proofs are the plan's alone.
+    pub(super) fn slots(
+        &self,
+        command_buffer: &CommandBuffer,
+        (plan, command_uses, roots): (&BindingPlan, &[ResourceUse], bool),
+        tables: &Tables<'_>,
+    ) -> Option<TwinSlots> {
+        if !crate::read_twin::twinned(command_buffer) {
+            return None;
+        }
+        debug_assert!(
+            !command_uses.iter().any(names_slot),
+            "a command's own use of a slot, which its plan's twin proofs leave out"
+        );
+        let unproven = crate::read_twin::binds_unproven(command_buffer.generation());
+        // A test's device that binds twins at slots it may write: proven so at each command.
+        let fresh;
+        let proven = match unproven {
+            true => {
+                fresh = TwinProofs::proven(plan, true);
+                &fresh[..]
+            }
+            false => self.of(plan),
+        };
+        let mut textures = Vec::new();
+        let mut buffers = Vec::new();
+        for &(slot, proof) in proven {
+            match proof {
+                Proven::Buffer => {
+                    if roots {
+                        continue;
+                    }
+                    let Some((buffer, offset)) = stage_buffer(tables.stages, slot) else {
+                        continue;
+                    };
+                    if let Some(twin) = buffer.slot_twin(command_buffer) {
+                        buffers.push((slot, (twin, *offset)));
+                    }
+                }
+                Proven::Texture(kinds) => {
+                    let Some(texture) = tables
+                        .of(slot.stage)
+                        .and_then(|t| t.textures.get(&slot.index))
+                    else {
+                        continue;
+                    };
+                    let apart = tables.snapshot_slot(slot)
+                        || (tables.narrowed).is_some_and(|n| n.levels(slot).is_some())
+                        || (tables.attached).is_some_and(|instance| texture.attached_in(instance));
+                    if apart {
+                        continue;
+                    }
+                    if let Some(twin) = texture.read_twin(command_buffer, kinds) {
+                        textures.push((slot, twin));
+                    }
+                }
+            }
+        }
+        let any = !textures.is_empty() || !buffers.is_empty();
+        any.then_some(TwinSlots { textures, buffers })
+    }
+}
+
+impl TwinSlots {
+    /// The read twin bound at texture slot `slot`, where the command reads it so.
+    fn texture(&self, slot: SlotRef) -> Option<&Texture> {
+        let found = self.textures.iter().find(|(at, _)| *at == slot);
+        found.map(|(_, twin)| twin)
+    }
+
+    /// The read twin bound at buffer slot `slot`, with the slot's offset, where the command
+    /// reads it so.
+    fn buffer(&self, slot: SlotRef) -> Option<&(Buffer, u64)> {
+        let found = self.buffers.iter().find(|(at, _)| *at == slot);
+        found.map(|(_, twin)| twin)
+    }
+}
+
+/// Whether `used` names a slot: the resource bound there, or its tile map.
+fn names_slot(used: &ResourceUse) -> bool {
+    matches!(used.resource, UseTarget::Slot(_) | UseTarget::TileMap(_))
+}
+
+/// The slots of a plan whose commands may read them through read twins, as
+/// [`slots`](TwinProofs::slots) proves them, each with the kinds of its bindings where it is a
+/// texture's: the plan's alone, as no command's own use names a slot. A plan's uses and
+/// descriptor writes number one for each resource its heap reaches (every texture an encoder made
+/// resident, in each heap array), and the proofs walk them for each slot, so they are worked out
+/// once for the plan, the first time a command of it asks on a device with read twins, and kept
+/// with its other facts: a draw's with its plan's (`render/plan_facts.rs`), a dispatch's with what
+/// it planned (`pipeline::Planned`).
+#[derive(Default)]
+pub(super) struct TwinProofs(OnceLock<Vec<(SlotRef, Proven)>>);
+
+/// A slot [`TwinProofs`] proved a command of its plan only reads.
+#[derive(Clone, Copy)]
+enum Proven {
+    /// A buffer slot, as a storage or uniform buffer.
+    Buffer,
+    /// A texture slot, as images of these kinds.
+    Texture(TwinKinds),
+}
+
+impl TwinProofs {
+    /// The proofs of `plan`, the plan these were kept for: worked out the first time.
+    fn of(&self, plan: &BindingPlan) -> &[(SlotRef, Proven)] {
+        self.0.get_or_init(|| TwinProofs::proven(plan, false))
+    }
+
+    /// The slots of `plan` a command of it only reads, each once, in the order of its uses, as
+    /// [`read_only_buffer_slot`] and [`read_only_slot`] prove them under `unproven`.
+    fn proven(plan: &BindingPlan, unproven: bool) -> Vec<(SlotRef, Proven)> {
+        #[cfg(all(test, debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
+        PLAN_WALKS.with(|walks| walks.set(walks.get() + plan.uses.len() as u64));
+        let mut seen: Vec<SlotRef> = Vec::new();
+        let mut proven = Vec::new();
+        for used in &plan.uses {
+            let UseTarget::Slot(slot) = used.resource else {
+                continue;
+            };
+            if seen.contains(&slot) {
+                continue;
+            }
+            seen.push(slot);
+            let proof = match slot.class {
+                SlotClass::Buffer => {
+                    read_only_buffer_slot(slot, plan, unproven).then_some(Proven::Buffer)
+                }
+                SlotClass::Texture => read_only_slot(slot, plan, unproven).map(Proven::Texture),
+                _ => None,
+            };
+            if let Some(proof) = proof {
+                proven.push((slot, proof));
+            }
+        }
+        proven
+    }
+}
+
+/// Whether every use of buffer slot `slot` by a command of `plan` only reads it, as a storage or
+/// uniform buffer, and every descriptor of the plan that names the slot is its buffer's, none of
+/// it a vertex buffer.
+fn read_only_buffer_slot(slot: SlotRef, plan: &BindingPlan, unproven: bool) -> bool {
+    #[cfg(all(test, debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
+    PLAN_WALKS.with(|walks| {
+        let walked = plan.uses.len() + plan.descriptors.len();
+        walks.set(walks.get() + walked as u64)
+    });
+    let mut read = unproven;
+    for used in &plan.uses {
+        if used.resource != UseTarget::Slot(slot) {
+            continue;
+        }
+        let buffer = matches!(used.class, AccessClass::Storage | AccessClass::Uniform);
+        if (used.access.write && !unproven) || !buffer {
+            return false;
+        }
+        read |= used.access.read;
+    }
+    let vertex = (plan.vertex_buffers.iter())
+        .any(|bind| slot.stage == Stage::Vertex && bind.buffer_index == slot.index);
+    let named = |write: &&DescriptorWrite| match &write.source {
+        WriteSource::Buffer { slot: at } | WriteSource::InlineBytes { slot: at } => *at == slot,
+        _ => false,
+    };
+    let buffers = plan.descriptors.iter().filter(named).all(|write| {
+        let ty: vk::DescriptorType = write.ty.into();
+        matches!(write.source, WriteSource::Buffer { .. })
+            && matches!(
+                ty,
+                vk::DescriptorType::STORAGE_BUFFER
+                    | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+                    | vk::DescriptorType::UNIFORM_BUFFER
+                    | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+            )
+    });
+    read && !vertex && buffers
+}
+
+/// Where every use of texture slot `slot` by a command of `plan` only reads it, as a sampled or
+/// storage image, and every descriptor of the plan that names the slot is that image (a
+/// texture's or a combined image sampler's): the kinds of its bindings, a storage image's and a
+/// sampled one's ([`TwinKinds`]); else `None`.
+fn read_only_slot(slot: SlotRef, plan: &BindingPlan, unproven: bool) -> Option<TwinKinds> {
+    #[cfg(all(test, debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
+    PLAN_WALKS.with(|walks| {
+        let walked = plan.uses.len() + plan.descriptors.len();
+        walks.set(walks.get() + walked as u64)
+    });
+    let mut read = unproven;
+    for used in &plan.uses {
+        let named = match used.resource {
+            UseTarget::Slot(at) | UseTarget::TileMap(at) => at == slot,
+            _ => false,
+        };
+        if !named {
+            continue;
+        }
+        let image = matches!(used.class, AccessClass::Sampled | AccessClass::StorageImage);
+        let writes = used.access.write && !unproven;
+        if writes || !image || matches!(used.resource, UseTarget::TileMap(_)) {
+            return None;
+        }
+        read |= used.access.read;
+    }
+    let mut kinds = TwinKinds::default();
+    for write in &plan.descriptors {
+        // The slot's own descriptors: `Some(true)` an image of it, `Some(false)` any other
+        // binding of it; another slot's, `None`.
+        let named = match &write.source {
+            WriteSource::Texture { slot: at, .. } => (*at == slot).then_some(true),
+            WriteSource::CombinedImageSampler {
+                image: ImageSource::Texture { slot: at, .. },
+                ..
+            } => (*at == slot).then_some(true),
+            WriteSource::YCbCrInPlace { slot: at }
+            | WriteSource::YCbCrPlanesImage { slot: at }
+            | WriteSource::TexelRows { slot: at, .. }
+            | WriteSource::TexelBuffer { slot: at, .. }
+            | WriteSource::HeapEntry {
+                source: HeapSource::Bound(at),
+                ..
+            } => (*at == slot).then_some(false),
+            _ => None,
+        };
+        let ty: vk::DescriptorType = write.ty.into();
+        match named {
+            Some(true) if ty == vk::DescriptorType::STORAGE_IMAGE => kinds.storage = true,
+            Some(true) => kinds.sampled = true,
+            Some(false) => return None,
+            None => {}
+        }
+    }
+    (read && (kinds.storage || kinds.sampled)).then_some(kinds)
+}
+
+#[cfg(all(test, debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
+thread_local! {
+    /// The uses and descriptor writes of plans this thread walked for facts of a plan alone
+    /// ([`binds_own_zeros`], [`TwinProofs`]), in the device tests that read it
+    /// (`tests::resident_uses`).
+    static PLAN_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many uses and descriptor writes of plans this thread walked so far for facts of a plan
+/// alone ([`binds_own_zeros`], [`TwinProofs`]).
+#[cfg(all(test, debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) fn plan_walks() -> u64 {
+    PLAN_WALKS.with(std::cell::Cell::get)
+}
+
+/// The kinds of a texture slot's bindings ([`read_only_slot`]): whether one is a storage image,
+/// and whether one is sampled.
+#[derive(Clone, Copy, Default)]
+pub(super) struct TwinKinds {
+    pub(super) storage: bool,
+    pub(super) sampled: bool,
+}
+
+/// The levels a narrowed slot reads of its texture's own image (`NarrowedSlots`), counted from
+/// the texture's own first level: its view holds `0..view`, and its reads reach `first..view`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct NarrowedLevels {
+    pub(super) first: u32,
+    pub(super) view: u32,
+}
+
+/// The sampled texture slots of a draw narrowed to the levels of their texture's own image apart
+/// from those its render pass instance renders (`render/attached_levels.rs`): each binds the image
+/// through a view of its levels `0..view`, counted from the texture's own first level, and names
+/// the levels its reads reach in its uses, in place of the texture's copy
+/// (`texture/attached_reads.rs`). Once withdrawn, every slot binds as it would without them: its
+/// copy.
+#[derive(Default)]
+pub(super) struct NarrowedSlots {
+    /// Each slot, its levels, its use of them, and the colors of the instance that render levels
+    /// its view holds (bit `i` for color `i`).
+    slots: Vec<(SlotRef, NarrowedLevels, Use<ResourceKey>, u32)>,
+    withdrawn: Cell<bool>,
+}
+
+impl NarrowedSlots {
+    /// Narrow `slot` to its texture's levels `levels`, whose use `used` names those its reads
+    /// reach, past the attached levels of the colors `spanned` where its view holds them.
+    pub(super) fn narrow(
+        &mut self,
+        slot: SlotRef,
+        levels: NarrowedLevels,
+        used: Use<ResourceKey>,
+        spanned: u32,
+    ) {
+        self.slots.push((slot, levels, used, spanned));
+    }
+
+    /// The levels `slot` is narrowed to, where it is and they are not withdrawn.
+    fn levels(&self, slot: SlotRef) -> Option<NarrowedLevels> {
+        if self.withdrawn.get() {
+            return None;
+        }
+        (self.slots.iter())
+            .find(|(narrowed, ..)| *narrowed == slot)
+            .map(|&(_, levels, ..)| levels)
+    }
+
+    /// The colors of the instance whose attached levels the slots' views hold, none once
+    /// withdrawn: the instance must hold them in `GENERAL`, the layout the views' descriptors name
+    /// (`render/attached_levels.rs`).
+    pub(super) fn spanned(&self) -> u32 {
+        match self.withdrawn.get() {
+            true => 0,
+            false => (self.slots.iter()).fold(0, |colors, &(.., spanned)| colors | spanned),
+        }
+    }
+
+    /// How many slots are narrowed to levels before the attached ones, and how many to levels
+    /// past them, withdrawn or not.
+    pub(super) fn kinds(&self) -> (usize, usize) {
+        let past = (self.slots.iter())
+            .filter(|(_, levels, ..)| levels.first > 0)
+            .count();
+        (self.slots.len() - past, past)
+    }
+
+    /// How many slots are narrowed, none once withdrawn.
+    pub(super) fn len(&self) -> usize {
+        match self.withdrawn.get() {
+            true => 0,
+            false => self.slots.len(),
+        }
+    }
+
+    /// The narrowed slots and their levels, in the order they were narrowed; none once withdrawn.
+    pub(super) fn listed(&self) -> impl Iterator<Item = (SlotRef, NarrowedLevels)> + '_ {
+        let withdrawn = self.withdrawn.get();
+        (self.slots.iter())
+            .filter(move |_| !withdrawn)
+            .map(|&(slot, levels, ..)| (slot, levels))
+    }
+
+    /// Whether a write among `uses` meets the levels a narrowed slot reads: their memory
+    /// (`UseRange::shares_memory`, so a write of another texture placed in the same heap apart
+    /// from them meets none).
+    pub(super) fn written_by(&self, uses: &[Use<ResourceKey>]) -> bool {
+        (self.slots.iter()).any(|(.., narrowed, _)| {
+            (uses.iter()).any(|used| {
+                !used.write.is_empty()
+                    && used.key == narrowed.key
+                    && used.range.shares_memory(&narrowed.range)
+            })
+        })
+    }
+
+    /// Bind every slot as it would without these: through its copy.
+    pub(super) fn withdraw(&self) {
+        self.withdrawn.set(true);
+    }
 }
 
 /// The fragment texture slots a draw reads through snapshots, and the storage view of each one's
@@ -150,6 +552,10 @@ pub(super) struct Tables<'a> {
 pub(super) struct SnapshotViews {
     pub(super) slots: BTreeSet<u32>,
     pub(super) views: Vec<(u32, vk::ImageView)>,
+    /// The slots' textures are in the feedback loop layout where the draw reads them; else in
+    /// `GENERAL`, read by snapshots that lead the draw's instance (`render/snapshot.rs`, leading
+    /// snapshots).
+    pub(super) feedback: bool,
 }
 
 impl<'a> Tables<'a> {
@@ -179,6 +585,17 @@ impl<'a> Tables<'a> {
             indices: None,
             snapshots: None,
             merged_header: None,
+            narrowed: None,
+            twins: None,
+        }
+    }
+
+    /// The tables, with the texture slots the command reads through their textures' read twins
+    /// (`read_twin.rs`).
+    pub(super) fn with_twins(self, twins: &'a TwinSlots) -> Tables<'a> {
+        Tables {
+            twins: Some(twins),
+            ..self
         }
     }
 
@@ -191,14 +608,42 @@ impl<'a> Tables<'a> {
         }
     }
 
+    /// The tables, with the draw's slots narrowed to the levels apart from the attached ones
+    /// (`Tables::narrowed`).
+    pub(super) fn with_narrowed(self, narrowed: &'a NarrowedSlots) -> Tables<'a> {
+        Tables {
+            narrowed: Some(narrowed),
+            ..self
+        }
+    }
+
+    /// How a slot binding of `texture` at `slot`, of the kind `storage`, reads it: through a view
+    /// of its own image where the slot is narrowed to levels apart from the attached ones (a
+    /// sampled binding alone), else through its copy where it presents an attachment of the draw's
+    /// instance and the slot reads no snapshot, else its own image.
+    fn slot_read(&self, texture: &Texture, slot: SlotRef, storage: bool) -> SlotRead {
+        let narrowed = (self.narrowed.filter(|_| !storage)).and_then(|n| n.levels(slot));
+        match narrowed {
+            Some(levels) => SlotRead::Levels(levels),
+            None if self.attached(texture, storage) && !self.snapshot_slot(slot) => SlotRead::Copy,
+            None => SlotRead::Own,
+        }
+    }
+
     /// Whether `slot` is one a draw reads through a snapshot: its binding takes the texture
-    /// itself, in the feedback loop layout, never its copy.
+    /// itself, never its copy.
     fn snapshot_slot(&self, slot: SlotRef) -> bool {
         slot.stage == Stage::Fragment
             && slot.class == SlotClass::Texture
             && self
                 .snapshots
                 .is_some_and(|s| s.slots.contains(&slot.index))
+    }
+
+    /// Whether `slot` is one a draw reads through a snapshot whose texture is in the feedback
+    /// loop layout where the draw reads it ([`SnapshotViews::feedback`]).
+    fn feedback_slot(&self, slot: SlotRef) -> bool {
+        self.snapshot_slot(slot) && self.snapshots.is_some_and(|s| s.feedback)
     }
 
     /// The tables, with a merged draw replay's header's address (`Tables::merged_header`).
@@ -342,7 +787,7 @@ impl<'a> Tables<'a> {
     }
 
     /// The tables, with the device's texture table at the layout's texture handle tables.
-    pub(super) fn with_texture_table(self, table: Option<&'a TextureTable>) -> Tables<'a> {
+    pub(super) fn with_texture_table(self, table: Option<&'a TextureTable<'a>>) -> Tables<'a> {
         Tables {
             texture_table: table,
             ..self
@@ -350,7 +795,7 @@ impl<'a> Tables<'a> {
     }
 
     /// The tables, with the device's sampler table at the layout's sampler tables.
-    pub(super) fn with_sampler_table(self, table: Option<&'a SamplerTable>) -> Tables<'a> {
+    pub(super) fn with_sampler_table(self, table: Option<&'a SamplerTable<'a>>) -> Tables<'a> {
         Tables {
             sampler_table: table,
             ..self
@@ -378,10 +823,11 @@ impl<'a> Tables<'a> {
         self.residency?.get(token)
     }
 
-    /// The pixel format of the texture bound at texture slot `slot`, if one is: what a specialized
-    /// notice names (`Device::degrade_specialized`).
+    /// The pixel format the texture bound at texture slot `slot` presents to the slot's binding,
+    /// if one is bound (`Texture::bound_pixel_format`): the format whose texels the slot reads,
+    /// which a specialized notice tests and names (`Device::degrade_specialized`).
     pub(super) fn bound_format(&self, slot: SlotRef) -> Option<metal2vulkan::metal::PixelFormat> {
-        slot_texture(self, slot).map(Texture::pixel_format)
+        slot_texture(self, slot).map(Texture::bound_pixel_format)
     }
 
     /// The table of `stage`, if the encoder has one.
@@ -396,9 +842,17 @@ impl<'a> Tables<'a> {
 /// What one command's instantiation gives the binder, a dispatch's or a draw's alike.
 pub(super) struct Command<'a> {
     pub(super) descriptor_bytes: &'a [DescriptorBytes],
+    /// The plan's heap tables, where its caller keeps them apart from the command's other
+    /// descriptor bytes (`BindingPlan::heap_tables_into`, `render/heap_part.rs`): empty where
+    /// they are among those.
+    pub(super) heap_tables: &'a [DescriptorBytes],
     pub(super) descriptor_ranges: &'a [DescriptorRange],
     /// Each stage's root table, by the stages its push hole names.
     pub(super) root_tables: Vec<(metal2vulkan::vk::ShaderStageFlags, &'a RootTable)>,
+    /// Whether a function that reads one of them may write memory (stores or atomic updates,
+    /// `StageInterface::writes_memory`): where none does, nothing writes memory through them
+    /// (`State::writes_unnamed`).
+    pub(super) root_writes: bool,
     pub(super) push_holes: &'a [PushHole],
     /// The command's own resources beyond the plan's uses (an index buffer, indirect arguments).
     pub(super) uses: &'a [ResourceUse],
@@ -410,6 +864,18 @@ pub(super) struct Command<'a> {
     /// An emulated tessellation draw's work buffer and records, for its `TessellationWork` and
     /// `TessellationRecords` writes.
     pub(super) tessellation: Option<MeshRegions>,
+    /// A fan-out draw's region table and a probe's flags (`render/fan_out.rs`), for its
+    /// `RateMapRegions` and `RateMapFlags` writes.
+    pub(super) fan_out: Option<FanOutBuffers>,
+}
+
+/// Where a fan-out draw's region table and a probe's flags lie (`render/fan_out.rs`), each bound
+/// whole.
+#[derive(Clone, Copy)]
+pub(super) struct FanOutBuffers {
+    pub(super) regions: vk::DescriptorBufferInfo,
+    /// A probe's flags; `None` for a draw.
+    pub(super) flags: Option<vk::DescriptorBufferInfo>,
 }
 
 /// Where an emulated mesh or tessellation draw's work buffer and records lie (`render/mesh.rs`,
@@ -460,17 +926,142 @@ pub(super) fn dynamic_writes(writes: &mut [Write], dynamic: &[u32], offsets: &mu
     if dynamic.is_empty() {
         return;
     }
-    for write in writes.iter_mut().filter(|write| write.set == 0) {
-        let (Ok(at), Info::Buffer(info)) = (dynamic.binary_search(&write.binding), &mut write.info)
-        else {
-            continue;
-        };
-        write.ty = dynamic_type(write.ty);
-        if let Ok(offset) = u32::try_from(info.offset) {
-            offsets[at] = offset;
-            info.offset = 0;
-        }
+    for write in writes.iter_mut() {
+        dynamic_write(write, dynamic, offsets);
     }
+}
+
+/// [`dynamic_writes`]' work on one write, where it is set 0's at a binding `dynamic` numbers:
+/// made dynamic, its offset its binding's in `offsets`.
+fn dynamic_write(write: &mut Write, dynamic: &[u32], offsets: &mut [u32]) {
+    if write.set != 0 {
+        return;
+    }
+    let (Ok(at), Info::Buffer(info)) = (dynamic.binary_search(&write.binding), &mut write.info)
+    else {
+        return;
+    };
+    write.ty = dynamic_type(write.ty);
+    offsets[at] = 0;
+    if let Ok(offset) = u32::try_from(info.offset) {
+        offsets[at] = offset;
+        info.offset = 0;
+    }
+}
+
+/// Write again, over `writes` and `offsets` (a command's set-0 writes and dynamic offsets as
+/// [`bind_into`] and [`dynamic_writes`] made them, for a variant of the dynamic bindings
+/// `dynamic`), the descriptors of the plan's writes from the buffer, texture and sampler slots
+/// `slots`, which the command's tables now bind otherwise (another buffer, offset or bytes, another
+/// texture or sampler state, the shape the same), with `command`'s ranges for the buffers: the
+/// writes and offsets [`bind_into`] and [`dynamic_writes`] make for the tables now, each image
+/// descriptor's sampler kept in `samplers` (emptied first) as [`bind_into`] keeps it, through
+/// `memo` likewise. Its buffers' descriptors take nothing of the command buffer's state
+/// ([`slot_descriptor`]), so it locks none. `Ok(false)` where a write of theirs is not at its
+/// place among `writes` (a heap's, which skips writes), holds a keeper, or reads a changed slot
+/// otherwise (a texel buffer, a YCbCr texture's planes, an argument sampler): the caller binds
+/// whole.
+pub(super) fn rebind_into(
+    call: &'static str,
+    device: &Device,
+    (plan, command, tables): (&BindingPlan, &Command<'_>, &Tables<'_>),
+    slots: &[SlotRef],
+    (writes, dynamic, offsets): (&mut [Write], &[u32], &mut [u32]),
+    (mut memo, samplers): (Option<&mut BindMemo>, &mut Vec<Arc<OwnedSampler>>),
+) -> Result<bool, Error> {
+    samplers.clear();
+    if tables.heap.is_some() || writes.len() != plan.descriptors.len() {
+        return Ok(false);
+    }
+    let changed = |slot: &SlotRef| slots.contains(slot);
+    for (write, planned) in writes.iter_mut().zip(&plan.descriptors) {
+        // Whether its descriptor is a buffer's or an image's of a changed slot.
+        let buffer = match &planned.source {
+            WriteSource::Buffer { slot } | WriteSource::InlineBytes { slot } => {
+                if !changed(slot) {
+                    continue;
+                }
+                true
+            }
+            WriteSource::Texture { slot, .. } | WriteSource::Sampler { slot, .. } => {
+                if !changed(slot) {
+                    continue;
+                }
+                false
+            }
+            // A fragment texture slot read through a snapshot binds its snapshot beside its
+            // texture (`render/snapshot.rs`): the changed texture's, through the tables'
+            // snapshots.
+            &WriteSource::SnapshotTexels { slot } => {
+                let slot = SlotRef {
+                    stage: Stage::Fragment,
+                    class: SlotClass::Texture,
+                    index: slot,
+                };
+                if !changed(&slot) {
+                    continue;
+                }
+                false
+            }
+            WriteSource::CombinedImageSampler { image, sampler } => {
+                let image = match image {
+                    ImageSource::Texture { slot, .. } => changed(slot),
+                    ImageSource::Neutral(_) => false,
+                };
+                let sampler = match sampler {
+                    SamplerSource::Slot { slot, .. } => changed(slot),
+                    SamplerSource::Immutable | SamplerSource::Neutral(_) => false,
+                };
+                if !image && !sampler {
+                    continue;
+                }
+                false
+            }
+            // A slot's other reads: a changed one's are its caller's to bind whole.
+            WriteSource::TexelBuffer { slot, .. }
+            | WriteSource::YCbCrInPlace { slot }
+            | WriteSource::YCbCrPlanesImage { slot }
+            | WriteSource::TexelRows { slot, .. }
+                if changed(slot) =>
+            {
+                return Ok(false)
+            }
+            WriteSource::ArgumentSampler { .. }
+                if slots.iter().any(|slot| slot.class == SlotClass::Sampler) =>
+            {
+                return Ok(false)
+            }
+            _ => continue,
+        };
+        let ty: vk::DescriptorType = planned.ty.into();
+        let place = (write.set, write.binding, write.element);
+        if place != (planned.set, planned.binding, planned.array_element) || write.held.is_some() {
+            return Ok(false);
+        }
+        let info = match buffer {
+            true => {
+                let spaces = memo.as_deref_mut().map(|memo| &mut memo.spaces);
+                match slot_descriptor(command, tables, planned, spaces)? {
+                    Some(info) => Info::Buffer(info),
+                    None => return Err(internal("a slot's buffer write of another source")),
+                }
+            }
+            false => {
+                let kept = (&mut *samplers, memo.as_deref_mut());
+                Info::Image(image_descriptor(call, device, tables, planned, ty, kept)?)
+            }
+        };
+        *write = Write {
+            set: planned.set,
+            binding: planned.binding,
+            element: planned.array_element,
+            ty,
+            info,
+            held: None,
+        };
+        dynamic_write(write, dynamic, offsets);
+    }
+    Ok(true)
 }
 
 /// One descriptor to write: a buffer's or an image's and sampler's.
@@ -485,12 +1076,57 @@ pub(super) struct Write {
     pub(super) held: Option<Keeper>,
 }
 
+impl Write {
+    /// A copy of it, where it holds no keeper.
+    pub(super) fn unheld(&self) -> Option<Write> {
+        self.held.is_none().then_some(Write {
+            set: self.set,
+            binding: self.binding,
+            element: self.element,
+            ty: self.ty,
+            info: self.info,
+            held: None,
+        })
+    }
+}
+
 /// What a descriptor write holds.
 #[derive(Clone, Copy)]
 pub(super) enum Info {
     Buffer(vk::DescriptorBufferInfo),
     Image(vk::DescriptorImageInfo),
     Texel(vk::BufferView),
+}
+
+impl Info {
+    /// `write` with this as its one descriptor: pointing at it where it lies, with no copy.
+    fn written<'a>(&'a self, write: vk::WriteDescriptorSet<'a>) -> vk::WriteDescriptorSet<'a> {
+        match self {
+            Info::Buffer(info) => write.buffer_info(std::slice::from_ref(info)),
+            Info::Image(info) => write.image_info(std::slice::from_ref(info)),
+            Info::Texel(view) => write.texel_buffer_view(std::slice::from_ref(view)),
+        }
+    }
+}
+
+/// What a write holds, as [`SetWrite::same`] compares it: its handles, offset, range and layout,
+/// the layout by its raw value (ash's info structures print nothing).
+impl std::fmt::Debug for Info {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Info::Buffer(info) => (f.debug_tuple("Buffer"))
+                .field(&info.buffer)
+                .field(&info.offset)
+                .field(&info.range)
+                .finish(),
+            Info::Image(info) => (f.debug_tuple("Image"))
+                .field(&info.sampler)
+                .field(&info.image_view)
+                .field(&info.image_layout.as_raw())
+                .finish(),
+            Info::Texel(view) => f.debug_tuple("Texel").field(view).finish(),
+        }
+    }
 }
 
 /// One push-constant write: stages, offset, bytes.
@@ -513,10 +1149,28 @@ pub(super) struct Bound {
     pub(super) samplers: Vec<Arc<OwnedSampler>>,
 }
 
-/// The buffer bound at buffer slot `slot`, if any.
+/// The buffer bound at buffer slot `slot`, if any: its read twin where the command reads it
+/// through that ([`TwinSlots`]).
 fn slot_buffer<'a>(tables: &Tables<'a>, slot: SlotRef) -> Option<&'a (Buffer, u64)> {
+    if let Some(twin) = tables.twins.and_then(|twins| twins.buffer(slot)) {
+        return Some(twin);
+    }
+    stage_buffer(tables.stages, slot)
+}
+
+/// The buffer the table of `stages` of its stage binds at buffer slot `slot`, if any.
+fn stage_buffer<'a>(
+    stages: &[(Stage, &'a ArgumentTable)],
+    slot: SlotRef,
+) -> Option<&'a (Buffer, u64)> {
+    let table = || {
+        stages
+            .iter()
+            .find(|(of, _)| *of == slot.stage)
+            .map(|&(_, table)| table)
+    };
     (slot.class == SlotClass::Buffer)
-        .then(|| tables.of(slot.stage)?.buffers.get(&slot.index))
+        .then(|| table()?.buffers.get(&slot.index))
         .flatten()
 }
 
@@ -527,11 +1181,16 @@ fn slot_bytes<'a>(tables: &Tables<'a>, slot: SlotRef) -> Option<&'a InlineBytes>
         .flatten()
 }
 
-/// The texture bound at texture slot `slot`, if any.
+/// The texture bound at texture slot `slot`, if any: its read twin where the command reads it
+/// through that ([`TwinSlots`]).
 fn slot_texture<'a>(tables: &Tables<'a>, slot: SlotRef) -> Option<&'a Texture> {
-    (slot.class == SlotClass::Texture)
-        .then(|| tables.of(slot.stage)?.textures.get(&slot.index))
-        .flatten()
+    if slot.class != SlotClass::Texture {
+        return None;
+    }
+    if let Some(twin) = tables.twins.and_then(|twins| twins.texture(slot)) {
+        return Some(twin);
+    }
+    tables.of(slot.stage)?.textures.get(&slot.index)
 }
 
 /// The tile map of the sparse texture bound at texture slot `slot`, which the plan reads where
@@ -583,6 +1242,7 @@ pub(super) fn bind(
         state,
         (plan, command, tables),
         (memo, writes, &mut samplers),
+        None,
     )?;
     bound.samplers = samplers;
     Ok(bound)
@@ -590,7 +1250,9 @@ pub(super) fn bind(
 
 /// [`bind`]'s, the samplers the writes name in `samplers`, emptied first (its [`Bound`]'s
 /// `samplers` left empty), so a caller that keeps the vector fills each command's into the last
-/// one's storage (a draw's, `LiveBind::samplers`).
+/// one's storage (a draw's, `LiveBind::samplers`). With `past`, where the command has a heap and
+/// its caller keeps its heap part (`render/heap_part.rs`): the writes it lists, where it lists
+/// them, alone, else every write, listed there (the module docs).
 pub(super) fn bind_into(
     call: &'static str,
     device: &Device,
@@ -601,84 +1263,86 @@ pub(super) fn bind_into(
         &mut Vec<Write>,
         &mut Vec<Arc<OwnedSampler>>,
     ),
+    past: Option<&mut PastHeap>,
 ) -> Result<Bound, Error> {
     writes.clear();
     writes.reserve(plan.descriptors.len());
     samplers.clear();
-    for write in &plan.descriptors {
-        let element = match tables.heap {
-            Some(heap) => match heap.element(write) {
-                Some(element) => element,
-                // No handle reaches it.
-                None => continue,
-            },
-            None => write.array_element,
-        };
-        let ty: vk::DescriptorType = write.ty.into();
-        // The device's heap set holds every texture, every sampler state and the neutrals (the
-        // module docs): a texture the command names is checked as a slot's view, and nothing is
-        // written.
-        if tables.heap.is_some() && write.set == HEAP_SET {
-            if let WriteSource::HeapEntry { source, view, .. } = &write.source {
-                let storage = ty == vk::DescriptorType::STORAGE_IMAGE;
-                heap_texture(tables, *source)?.bound_view(call, view, storage)?;
-                continue;
-            }
-            if let WriteSource::ArgumentSampler { .. } = write.source {
-                continue;
-            }
-            if element == metal2vulkan::bind::NEUTRAL_HEAP_ELEMENT {
-                continue;
-            }
-        }
-        let info = match (&write.source, ty) {
-            (WriteSource::HeapEntry { .. }, _) => {
-                return Err(internal("a heap entry outside the heap set"))
-            }
-            (_, ty) => match ty {
-                vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::STORAGE_BUFFER => {
-                    Info::Buffer(descriptor(device, state, command, tables, write)?)
+    match past.filter(|_| tables.heap.is_some()) {
+        Some(past) if past.listed => {
+            // Checked against the writes listed again, in place: a draw's allocations are
+            // bounded in builds with debug assertions too (`runtime_lane::frame_costs`).
+            #[cfg(debug_assertions)]
+            {
+                let mut kept = past.at.iter();
+                for (at, write) in plan.descriptors.iter().enumerate() {
+                    if written_at(call, tables, write, false)?.is_some() {
+                        assert_eq!(
+                            kept.next(),
+                            Some(&(at as u32)),
+                            "a command's writes past its kept heap that are not its own"
+                        );
+                    }
                 }
-                vk::DescriptorType::UNIFORM_TEXEL_BUFFER
-                | vk::DescriptorType::STORAGE_TEXEL_BUFFER => {
-                    let storage = ty == vk::DescriptorType::STORAGE_TEXEL_BUFFER;
-                    Info::Texel(texel_descriptor(device, command, tables, write, storage)?)
-                }
-                _ => Info::Image(image_descriptor(
+                assert_eq!(
+                    kept.next(),
+                    None,
+                    "a command's writes past its kept heap that are not its own"
+                );
+            }
+            for &at in past.at.iter() {
+                let write = (plan.descriptors.get(at as usize))
+                    .ok_or_else(|| internal("a listed write past the plan's"))?;
+                let element = written_at(call, tables, write, false)?
+                    .ok_or_else(|| internal("a listed write the command does not write"))?;
+                let kept = (&mut *samplers, memo.as_deref_mut());
+                let write = written(
                     call,
                     device,
-                    tables,
-                    write,
-                    ty,
-                    (samplers, memo.as_deref_mut()),
-                )?),
-            },
-        };
-        // What keeps an argument sampler's `VkSampler` or a function table's words while the
-        // heap set holds them.
-        let held: Option<Keeper> = match (&write.source, &info) {
-            (WriteSource::ArgumentSampler { .. }, Info::Image(image)) => samplers
-                .iter()
-                .find(|kept| kept.raw() == image.sampler)
-                .map(|kept| Box::new(Arc::clone(kept)) as Keeper),
-            (WriteSource::FunctionTable { index }, _) => tables
-                .function_tables
-                .get(*index as usize)
-                .map(|table| Box::new(table.words().clone()) as Keeper),
-            _ => None,
-        };
-        writes.push(Write {
-            set: write.set,
-            binding: write.binding,
-            element,
-            ty,
-            info,
-            held,
-        });
+                    state,
+                    (command, tables),
+                    (write, element),
+                    kept,
+                )?;
+                writes.push(write);
+            }
+        }
+        mut past => {
+            // A check that announced a notice its device announces at every occurrence lists
+            // nothing: the next command meets it again.
+            let watch = EachWatch::start();
+            if let Some(past) = &mut past {
+                past.forget();
+            }
+            for (at, write) in plan.descriptors.iter().enumerate() {
+                let Some(element) = written_at(call, tables, write, true)? else {
+                    continue;
+                };
+                if let Some(past) = &mut past {
+                    past.at.push(at as u32);
+                }
+                let kept = (&mut *samplers, memo.as_deref_mut());
+                let write = written(
+                    call,
+                    device,
+                    state,
+                    (command, tables),
+                    (write, element),
+                    kept,
+                )?;
+                writes.push(write);
+            }
+            if let Some(past) = past {
+                past.listed = !watch.met();
+            }
+        }
     }
     let mut roots = Vec::with_capacity(command.root_tables.len());
     for &(stages, table) in &command.root_tables {
-        roots.push((stages, root_table(device, state, table)?));
+        roots.push((
+            stages,
+            root_table(device, state, table, command.root_writes)?,
+        ));
     }
     let mut holes = Vec::with_capacity(command.push_holes.len());
     for hole in command.push_holes {
@@ -743,11 +1407,128 @@ pub(super) fn bind_into(
     })
 }
 
-/// Make the device's neutral images, texel buffers and samplers that [`bind`] may write for
-/// `plan`: at its unbound texture, sampler and texel slots, its heap elements whose texture it
-/// cannot present, and its argument sampler elements past the states listed. So binding a command
-/// of the plan later makes none: a host step runs no submission of its own and makes no neutral,
-/// which it refuses (`neutral.rs`).
+/// The indices of a plan's descriptor writes that a command whose caller keeps its heap part
+/// writes past its heap's entries (`render/heap_part.rs`): listed by [`bind_into`] at a command
+/// that checked each entry and met no notice its device announces at every occurrence, so a
+/// later command of the same plan under the same heap part writes those alone. They are a
+/// function of the plan and of where its heap writes go (`metal2vulkan::bind::HeapElements`),
+/// and an entry's check of its texture and the plan's view, which no call changes.
+#[derive(Default)]
+pub(super) struct PastHeap {
+    /// Whether `at` lists them.
+    listed: bool,
+    /// Their positions among the plan's writes, ascending.
+    at: Vec<u32>,
+}
+
+impl PastHeap {
+    /// List none, keeping the list's storage: a heap part worked out again, or let go of.
+    pub(super) fn forget(&mut self) {
+        self.listed = false;
+        self.at.clear();
+    }
+}
+
+/// Where `write`, one of its plan's descriptor writes, is written for a command over `tables`:
+/// its element, or `None` where the command writes nothing there. A heap's write no handle
+/// reaches is none, and in the device's heap set, which holds every texture, every sampler state
+/// and the neutrals (the module docs), so are a heap entry, its texture checked as a slot's view
+/// is where `check` says so, every other image element (an array's neutral where a member's
+/// texture does not fit its class), an argument sampler, and a neutral element
+/// (`heap_sets::holds_element`).
+fn written_at(
+    call: &'static str,
+    tables: &Tables<'_>,
+    write: &DescriptorWrite,
+    check: bool,
+) -> Result<Option<u32>, Error> {
+    let Some(heap) = tables.heap else {
+        return Ok(Some(write.array_element));
+    };
+    // No handle reaches it.
+    let Some(element) = heap.element(write) else {
+        return Ok(None);
+    };
+    if write.set != HEAP_SET {
+        return Ok(Some(element));
+    }
+    match &write.source {
+        WriteSource::HeapEntry { source, view, .. } => {
+            if check {
+                let ty: vk::DescriptorType = write.ty.into();
+                let storage = ty == vk::DescriptorType::STORAGE_IMAGE;
+                heap_texture(tables, *source)?.bound_view(call, view, storage)?;
+            }
+            Ok(None)
+        }
+        WriteSource::ArgumentSampler { .. } => Ok(None),
+        _ if heap_sets::holds_element(write.ty.into(), element) => Ok(None),
+        _ => Ok(Some(element)),
+    }
+}
+
+/// The write of `write`, one of its plan's descriptor writes, at `element`, for `command` over
+/// `tables` ([`bind_into`]): its image descriptor's sampler kept in `samplers`, through `memo`.
+fn written(
+    call: &'static str,
+    device: &Device,
+    state: &mut State,
+    (command, tables): (&Command<'_>, &Tables<'_>),
+    (write, element): (&DescriptorWrite, u32),
+    (samplers, mut memo): (&mut Vec<Arc<OwnedSampler>>, Option<&mut BindMemo>),
+) -> Result<Write, Error> {
+    let ty: vk::DescriptorType = write.ty.into();
+    let info = match (&write.source, ty) {
+        (WriteSource::HeapEntry { .. }, _) => {
+            return Err(internal("a heap entry outside the heap set"))
+        }
+        (_, ty) => match ty {
+            vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::STORAGE_BUFFER => {
+                let spaces = memo.as_deref_mut().map(|memo| &mut memo.spaces);
+                Info::Buffer(descriptor(device, state, command, tables, (write, spaces))?)
+            }
+            vk::DescriptorType::UNIFORM_TEXEL_BUFFER | vk::DescriptorType::STORAGE_TEXEL_BUFFER => {
+                let storage = ty == vk::DescriptorType::STORAGE_TEXEL_BUFFER;
+                Info::Texel(texel_descriptor(device, command, tables, write, storage)?)
+            }
+            _ => Info::Image(image_descriptor(
+                call,
+                device,
+                tables,
+                write,
+                ty,
+                (samplers, memo),
+            )?),
+        },
+    };
+    // What keeps an argument sampler's `VkSampler` or a function table's words while the
+    // heap set holds them.
+    let held: Option<Keeper> = match (&write.source, &info) {
+        (WriteSource::ArgumentSampler { .. }, Info::Image(image)) => samplers
+            .iter()
+            .find(|kept| kept.raw() == image.sampler)
+            .map(|kept| Box::new(Arc::clone(kept)) as Keeper),
+        (WriteSource::FunctionTable { index }, _) => tables
+            .function_tables
+            .get(*index as usize)
+            .map(|table| Box::new(table.words().clone()) as Keeper),
+        _ => None,
+    };
+    Ok(Write {
+        set: write.set,
+        binding: write.binding,
+        element,
+        ty,
+        info,
+        held,
+    })
+}
+
+/// Make the device's neutral images, texel buffers and samplers that [`bind`] may write or check
+/// for `plan`: at its unbound texture, sampler and texel slots, its heap elements whose texture it
+/// cannot present (which the device's heap sets hold, so [`bind`] writes none), and its argument
+/// sampler elements past the states listed. So binding a command of the plan later makes none: a
+/// host step runs no submission of its own and makes no neutral, which it refuses (`neutral.rs`).
 pub(super) fn make_neutrals(device: &Device, plan: &BindingPlan) -> Result<(), Error> {
     for write in &plan.descriptors {
         let ty: vk::DescriptorType = write.ty.into();
@@ -891,13 +1672,23 @@ impl SetWrite {
     }
 
     /// `write`'s descriptor, without its set number and keeper.
-    fn of(write: &Write) -> SetWrite {
+    pub(super) fn of(write: &Write) -> SetWrite {
         SetWrite {
             binding: write.binding,
             element: write.element,
             ty: write.ty,
             info: write.info,
         }
+    }
+
+    /// Its raw write, of no set (a push's), pointing at its info.
+    pub(super) fn raw(&self) -> vk::WriteDescriptorSet<'_> {
+        self.info.written(
+            vk::WriteDescriptorSet::default()
+                .dst_binding(self.binding)
+                .dst_array_element(self.element)
+                .descriptor_type(self.ty),
+        )
     }
 
     /// Whether it writes what `other` writes.
@@ -951,8 +1742,8 @@ pub(crate) unsafe fn push_descriptor_command(
 }
 
 /// Push `writes` as set 0 of `layout` at `point` into `command_buffer`, in one
-/// `vkCmdPushDescriptorSet` (`push`): their infos on the stack up to [`WRITES_AT_ONCE`], else on
-/// the heap.
+/// `vkCmdPushDescriptorSet` (`push`): each raw write pointing at its write's own info, the raw
+/// writes on the stack up to [`WRITES_AT_ONCE`], else on the heap.
 ///
 /// # Safety
 ///
@@ -965,72 +1756,55 @@ pub(super) unsafe fn push_set(
     layout: vk::PipelineLayout,
     writes: &[SetWrite],
 ) {
-    let count = writes.len();
-    if count <= WRITES_AT_ONCE {
-        let mut buffer_infos = [[vk::DescriptorBufferInfo::default()]; WRITES_AT_ONCE];
-        let mut image_infos = [[vk::DescriptorImageInfo::default()]; WRITES_AT_ONCE];
-        let mut texel_views = [[vk::BufferView::null()]; WRITES_AT_ONCE];
-        let mut raw = [vk::WriteDescriptorSet::default(); WRITES_AT_ONCE];
-        fill_pushed(
-            writes,
-            (&mut buffer_infos, &mut image_infos, &mut texel_views),
-            &mut raw,
-        );
-        // SAFETY: the caller's contract; every array `raw` points at is live for the call.
-        unsafe { push(command_buffer, point, layout, 0, count as u32, raw.as_ptr()) };
+    if writes.len() <= WRITES_AT_ONCE {
+        let mut places = [const { MaybeUninit::uninit() }; WRITES_AT_ONCE];
+        let raw = fill_raw(writes.iter().map(SetWrite::raw), &mut places);
+        // SAFETY: the caller's contract; every info `raw` points at is `writes`', live for the
+        // call.
+        unsafe {
+            push(
+                command_buffer,
+                point,
+                layout,
+                0,
+                raw.len() as u32,
+                raw.as_ptr(),
+            )
+        };
     } else {
-        let mut buffer_infos = vec![[vk::DescriptorBufferInfo::default()]; count];
-        let mut image_infos = vec![[vk::DescriptorImageInfo::default()]; count];
-        let mut texel_views = vec![[vk::BufferView::null()]; count];
-        let mut raw = vec![vk::WriteDescriptorSet::default(); count];
-        fill_pushed(
-            writes,
-            (&mut buffer_infos, &mut image_infos, &mut texel_views),
-            &mut raw,
-        );
+        let raw: Vec<_> = writes.iter().map(SetWrite::raw).collect();
         // SAFETY: as above.
-        unsafe { push(command_buffer, point, layout, 0, count as u32, raw.as_ptr()) };
-    }
-}
-
-/// The infos of a push's `writes` into `infos`, one place each, and its writes into `raw`, each
-/// pointing at its info.
-fn fill_pushed<'a>(
-    writes: &[SetWrite],
-    infos: (
-        &'a mut [[vk::DescriptorBufferInfo; 1]],
-        &'a mut [[vk::DescriptorImageInfo; 1]],
-        &'a mut [[vk::BufferView; 1]],
-    ),
-    raw: &mut [vk::WriteDescriptorSet<'a>],
-) {
-    let (buffer_infos, image_infos, texel_views) = infos;
-    for (i, write) in writes.iter().enumerate() {
-        match write.info {
-            Info::Buffer(info) => buffer_infos[i] = [info],
-            Info::Image(info) => image_infos[i] = [info],
-            Info::Texel(view) => texel_views[i] = [view],
-        }
-    }
-    let infos = buffer_infos
-        .iter()
-        .zip(image_infos.iter())
-        .zip(texel_views.iter());
-    for ((write, ((buffer, image), texel)), raw) in writes.iter().zip(infos).zip(raw) {
-        let set = vk::WriteDescriptorSet::default()
-            .dst_binding(write.binding)
-            .dst_array_element(write.element)
-            .descriptor_type(write.ty);
-        *raw = match write.info {
-            Info::Buffer(_) => set.buffer_info(buffer),
-            Info::Image(_) => set.image_info(image),
-            Info::Texel(_) => set.texel_buffer_view(texel),
+        unsafe {
+            push(
+                command_buffer,
+                point,
+                layout,
+                0,
+                raw.len() as u32,
+                raw.as_ptr(),
+            )
         };
     }
 }
 
-/// The descriptor writes [`write_sets`] hands the driver in one call: their infos sit on the stack.
-const WRITES_AT_ONCE: usize = 16;
+/// `raw` written into `places`' first places, as many as fit: those places, which nothing else
+/// writes or zeroes.
+pub(super) fn fill_raw<'a, 'p>(
+    raw: impl Iterator<Item = vk::WriteDescriptorSet<'a>>,
+    places: &'p mut [MaybeUninit<vk::WriteDescriptorSet<'a>>; WRITES_AT_ONCE],
+) -> &'p [vk::WriteDescriptorSet<'a>] {
+    let mut count = 0;
+    for (place, write) in places.iter_mut().zip(raw) {
+        place.write(write);
+        count += 1;
+    }
+    // SAFETY: the first `count` places were written above, and a `MaybeUninit<T>` has `T`'s
+    // layout.
+    unsafe { std::slice::from_raw_parts(places.as_ptr().cast(), count) }
+}
+
+/// The descriptor writes [`push_set`] and [`write_sets`] hand the driver from the stack in one call.
+pub(super) const WRITES_AT_ONCE: usize = 16;
 
 /// Write `writes` into `sets`, the descriptor sets of their layout by set number: in order,
 /// [`WRITES_AT_ONCE`] at a time.
@@ -1048,36 +1822,20 @@ pub(super) unsafe fn write_sets(
         return Err(internal("a descriptor write to a set the layout lacks"));
     }
     for writes in writes.chunks(WRITES_AT_ONCE) {
-        let mut buffer_infos = [[vk::DescriptorBufferInfo::default()]; WRITES_AT_ONCE];
-        let mut image_infos = [[vk::DescriptorImageInfo::default()]; WRITES_AT_ONCE];
-        let mut texel_views = [[vk::BufferView::null()]; WRITES_AT_ONCE];
-        for (i, write) in writes.iter().enumerate() {
-            match write.info {
-                Info::Buffer(info) => buffer_infos[i] = [info],
-                Info::Image(info) => image_infos[i] = [info],
-                Info::Texel(view) => texel_views[i] = [view],
-            }
-        }
-        let mut raw = [vk::WriteDescriptorSet::default(); WRITES_AT_ONCE];
-        for (i, write) in writes.iter().enumerate() {
-            let set = vk::WriteDescriptorSet::default()
-                .dst_set(sets[write.set as usize])
-                .dst_binding(write.binding)
-                .dst_array_element(write.element)
-                .descriptor_type(write.ty);
-            raw[i] = match write.info {
-                Info::Buffer(_) => set.buffer_info(&buffer_infos[i]),
-                Info::Image(_) => set.image_info(&image_infos[i]),
-                Info::Texel(_) => set.texel_buffer_view(&texel_views[i]),
-            };
-        }
-        // SAFETY: the caller's contract; every array `raw` points at is live for the call.
-        unsafe {
-            device
-                .shared()
-                .vk()
-                .update_descriptor_sets(&raw[..writes.len()], &[])
-        };
+        let raw = writes.iter().map(|write| {
+            write.info.written(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(sets[write.set as usize])
+                    .dst_binding(write.binding)
+                    .dst_array_element(write.element)
+                    .descriptor_type(write.ty),
+            )
+        });
+        let mut places = [const { MaybeUninit::uninit() }; WRITES_AT_ONCE];
+        let raw = fill_raw(raw, &mut places);
+        // SAFETY: the caller's contract; every info `raw` points at is `writes`', live for the
+        // call.
+        unsafe { device.shared().vk().update_descriptor_sets(raw, &[]) };
     }
     Ok(())
 }
@@ -1353,8 +2111,16 @@ fn texel_descriptor(
         WriteSource::YCbCrInPlace { slot } => {
             let texture = slot_texture(tables, *slot)
                 .ok_or_else(|| internal("the plan binds an unbound texture slot's planes"))?;
-            device.shared().counts.ycbcr_planes_bound();
+            device.shared().counts.thread().ycbcr_planes_bound();
             texture.planes_view()
+        }
+        // The rows of a shadowed 2D texture read and written in place
+        // (`texture/texel_rows.rs`).
+        WriteSource::TexelRows { slot, format } => {
+            let texture = slot_texture(tables, *slot)
+                .ok_or_else(|| internal("the plan binds an unbound texture slot's rows"))?;
+            device.shared().counts.thread().texel_rows_bound();
+            texture.rows_view(*format, storage)
         }
         other => Err(unexpected(other)),
     }
@@ -1368,42 +2134,77 @@ const KEPT: usize = 8;
 /// holds (a page's tiles) finds every one it bound before.
 const KEPT_VIEWS: usize = 256;
 
-/// The image views and samplers render encoders' last binds made or found
+/// The image views and samplers render and compute encoders' last binds made or found
 /// ([`image_descriptor`]), kept by everything each is a function of, so that a bind of the same
-/// takes them again without working them out. An encoder that ends gives its memo to its device
-/// ([`SpareBindMemos`]), and the next render encoder opened takes it, so a pass that binds the
-/// textures and samplers the one before it bound works none out. A memo holds its textures
-/// weakly, so it keeps none alive:
+/// takes them again without working them out. A render encoder that ends gives its memo to its
+/// device ([`SpareBindMemos`]), and the next render encoder opened takes it, so a pass that binds
+/// the textures and samplers the one before it bound works none out; a compute encoder's goes on
+/// with its kept bind state to the next compute encoder (`compute/live.rs`). Every other command
+/// (an indirect command buffer's, a host step's, a tile dispatch's) binds with none. A memo holds
+/// its textures, sampler states and host cells weakly, so it keeps none alive:
 ///
 /// - **A view** of a texture slot is a function of the texture (its storage, image, decoded and
-///   twin and record are fixed as it is made; its usage shadow is made once and kept), the
+///   twin and record are fixed as it is made, but for a shadow over host pages that moves in
+///   place once, `texture/storage_form.rs`; its usage shadow is made once and kept), the face
+///   it presents where it has two (`texture/faces.rs`, a key of its own each), the
 ///   view's description, whether the binding is a storage one, and its images' views, which an
 ///   image keeps once made until it lets them all go under its views lock (a rebind's or a
-///   storage form's new `VkImage`, a detach's stand-in, a reattach). Each letting go counts in
+///   storage form's new `VkImage`, a detach's stand-in, a reattach, a shadow's move in place,
+///   after which its views go with it). Each letting go counts in
 ///   `DeviceShared::views_epoch`: the views are kept while it holds, and all dropped once it
 ///   moves. A view is kept by its texture's address ([`KeptView`]), which stays the texture's
 ///   while the memo keeps the view: a texture found there is the one the view is of.
 /// - **A sampler's description** (`sampler_desc`'s answer) for a sampler slot is a function of
-///   the descriptor the bind maps the slot's state to (its LOD clamps and the address modes its
-///   textures map), the facts `sampler_desc` takes beside the device (the use: a comparison, an
-///   integer texture, a cube's explicit gradients; the opaque black border; the image's format)
-///   and the device. The bind still asks the
-///   state for its `VkSampler` of the description (`SamplerState::vk_sampler`), so the state keeps
-///   and forgets its samplers as before.
-///
-/// A sampler's descriptor is compared exactly, a float field by its bits.
+///   the state bound (its descriptor and its LOD bias, fixed as it is made), the bind's LOD
+///   clamps, the address-mode map the slot's textures give it, the facts `sampler_desc` takes
+///   beside the device (the use: a comparison, an integer texture, a cube's explicit gradients;
+///   the opaque black border; the image's format) and the device. It is kept by the state's
+///   address ([`KeptSampler`]), which stays the state's while the memo keeps it, the clamps by
+///   their bits, the map and the facts; and kept hashed (`sampler::HashedDesc`). The bind still
+///   asks the state for its `VkSampler` of the description (`SamplerState::vk_sampler`), so the
+///   state keeps and forgets its samplers as before.
 #[derive(Default)]
 pub(super) struct BindMemo {
     /// The views epoch the views were kept under.
     epoch: u64,
     views: KeyMap<ViewKey, KeptView>,
     samplers: Vec<KeptSampler>,
+    /// Where the buffers over host pages its binds' buffer descriptors named lay
+    /// (`buffer::KeptSpaces`).
+    spaces: KeptSpaces,
 }
 
 /// What a view a bind made or found is a function of ([`BindMemo`]): a binding of the texture at
-/// the address as the view, a storage one where the first flag is set, of a texture the draw's
-/// instance renders where the second is (`Tables::attached`).
-type ViewKey = (usize, ImageViewDesc, bool, bool);
+/// the address as the view, a storage one where the flag is set, read as [`SlotRead`] says, of the
+/// face it presents (`texture/faces.rs`: 0 for a texture without faces).
+type ViewKey = (usize, ImageViewDesc, bool, SlotRead, u8);
+
+/// How a slot binding reads its texture (`Tables::slot_read`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SlotRead {
+    /// Its own image, or its shadow beyond its usage (`texture/usage_shadow.rs`).
+    Own,
+    /// Its copy, as it presents an attachment of the draw's instance (`texture/attached_reads.rs`).
+    Copy,
+    /// Its own image's levels apart from the attached ones (`render/attached_levels.rs`).
+    Levels(NarrowedLevels),
+}
+
+impl SlotRead {
+    /// The view a binding `view` of `texture` by `call`, of the kind `storage`, reads so.
+    fn view(
+        self,
+        texture: &Texture,
+        call: &'static str,
+        view: &ImageViewDesc,
+        storage: bool,
+    ) -> Result<vk::ImageView, Error> {
+        match self {
+            SlotRead::Levels(levels) => texture.levels_view(call, view, levels.view),
+            read => texture.slot_view(call, view, storage, read == SlotRead::Copy),
+        }
+    }
+}
 
 /// A view a [`BindMemo`] keeps, and its texture, held weakly: a texture that goes leaves its
 /// allocation, and so its address, to its weak handles, so no other texture is at the address
@@ -1439,11 +2240,17 @@ impl SpareBindMemos {
     }
 }
 
-/// A sampler description a bind worked out ([`BindMemo`]): `descriptor`'s under `facts`.
+/// A sampler description a bind worked out ([`BindMemo`]): `state`'s, bound with `clamps`
+/// through `map` under `facts`. The state is held weakly: a state that goes leaves its
+/// allocation, and so its address, to its weak handles, so no other state is at the address while
+/// the description is kept.
 struct KeptSampler {
-    descriptor: SamplerDescriptor,
+    state: Weak<SamplerShared>,
+    /// The bind's LOD clamps, by their bits.
+    clamps: Option<[u32; 2]>,
+    map: Option<AddressModeMap>,
     facts: SamplerFacts,
-    desc: metal2vulkan::vk::SamplerDesc,
+    desc: HashedDesc,
 }
 
 /// What `sampler_desc` takes of a binding beside its descriptor and the device.
@@ -1452,13 +2259,6 @@ struct SamplerFacts {
     use_: SamplerUse,
     opaque_black: OpaqueBlackBorder,
     format: Option<metal2vulkan::vk::Format>,
-}
-
-/// Whether `a` and `b` are the same descriptor: every field equal, the floats by their bits.
-fn same_descriptor(a: &SamplerDescriptor, b: &SamplerDescriptor) -> bool {
-    a == b
-        && a.lod_min_clamp.to_bits() == b.lod_min_clamp.to_bits()
-        && a.lod_max_clamp.to_bits() == b.lod_max_clamp.to_bits()
 }
 
 /// Keep `entry` at the front of `kept`, at most [`KEPT`] entries.
@@ -1489,9 +2289,10 @@ fn image_descriptor(
     // instance's color attachment holds in the feedback loop layout, the layout its accesses
     // there name (`render_target::moved_barriers`; "This layout is valid only for image
     // subresources of images created with the VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT
-    // usage flag set", which `Texture::snapshot_color` checked).
+    // usage flag set", which `Texture::snapshot_color` checked); one whose snapshots lead its
+    // instance, in `GENERAL`, the leading instance's and its own.
     let in_feedback =
-        |slot: SlotRef, info: vk::DescriptorImageInfo| match tables.snapshot_slot(slot) {
+        |slot: SlotRef, info: vk::DescriptorImageInfo| match tables.feedback_slot(slot) {
             true => info.image_layout(vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT),
             false => info,
         };
@@ -1512,17 +2313,18 @@ fn image_descriptor(
     let mut texture_view = |slot: SlotRef, view: &ImageViewDesc, storage: bool| {
         let texture = slot_texture(tables, slot)
             .ok_or_else(|| internal("the plan binds an unbound texture slot"))?;
-        let attached = tables.attached(texture, storage) && !tables.snapshot_slot(slot);
+        let read = tables.slot_read(texture, slot, storage);
         let Some(kept_views) = kept_views.as_deref_mut() else {
-            return texture.slot_view(call, view, storage, attached);
+            device.shared().counts.thread().bind_view_worked_out();
+            return read.view(texture, call, view, storage);
         };
-        let key = (texture.address(), *view, storage, attached);
+        let key = (texture.address(), *view, storage, read, texture.face());
         if let Some(kept) = kept_views.get(&key) {
             debug_assert_eq!(kept.texture.as_ptr() as usize, key.0);
             return Ok(kept.raw);
         }
-        device.shared().counts.bind_view_worked_out();
-        let raw = texture.slot_view(call, view, storage, attached)?;
+        device.shared().counts.thread().bind_view_worked_out();
+        let raw = read.view(texture, call, view, storage)?;
         if kept_views.len() == KEPT_VIEWS {
             kept_views.clear();
         }
@@ -1534,32 +2336,45 @@ fn image_descriptor(
         let (state, clamps) = slot_sampler(tables, slot)
             .ok_or_else(|| internal("the plan binds an unbound sampler slot"))?;
         // Its address modes as the textures it samples map them.
-        let descriptor = tables
-            .sampler_maps
-            .sampler(slot, bound_sampler(state, *clamps));
+        let map = tables.sampler_maps.map(slot);
         let facts = SamplerFacts {
             use_,
             opaque_black,
             format,
         };
+        let bits = clamps.map(|clamps| clamps.map(f32::to_bits));
         let kept = kept_samplers.as_deref().and_then(|kept| {
-            kept.iter()
-                .find(|k| same_descriptor(&k.descriptor, &descriptor) && k.facts == facts)
+            kept.iter().find(|k| {
+                state.is(&k.state) && k.clamps == bits && k.map == map && k.facts == facts
+            })
         });
+        let work_out = || {
+            let bound = bound_sampler(state, *clamps);
+            let descriptor = map.map_or(bound, |map| map.sampler(bound));
+            let desc = metal2vulkan::bind::sampler_desc(
+                device.compile_device(),
+                &descriptor,
+                state.bound_use(use_),
+                opaque_black,
+                format,
+            )
+            .map_err(Error::Bind)?;
+            Ok::<_, Error>(HashedDesc::new(desc))
+        };
         let desc = match kept {
-            Some(kept) => kept.desc,
+            Some(kept) => {
+                // The kept description is the one the bind works out.
+                debug_assert_eq!(work_out().ok(), Some(kept.desc));
+                kept.desc
+            }
             None => {
-                let desc = metal2vulkan::bind::sampler_desc(
-                    device.compile_device(),
-                    &descriptor,
-                    use_,
-                    opaque_black,
-                    format,
-                )
-                .map_err(Error::Bind)?;
+                device.shared().counts.thread().bind_sampler_worked_out();
+                let desc = work_out()?;
                 if let Some(kept) = kept_samplers.as_deref_mut() {
                     let entry = KeptSampler {
-                        descriptor,
+                        state: state.downgrade(),
+                        clamps: bits,
+                        map,
                         facts,
                         desc,
                     };
@@ -1568,7 +2383,11 @@ fn image_descriptor(
                 desc
             }
         };
-        let owned = state.vk_sampler(&desc)?;
+        // A state its device's recovery carried past this generation: the neutral
+        // (`sampler.rs`).
+        let Some(owned) = state.vk_sampler(device, &desc)? else {
+            return device.neutral_sampler(use_.compare);
+        };
         let raw = owned.raw();
         samplers.push(owned);
         Ok::<_, Error>(raw)
@@ -1756,14 +2575,21 @@ fn image_descriptor(
                 let desc = metal2vulkan::bind::sampler_desc(
                     device.compile_device(),
                     state.descriptor(),
-                    SamplerUse::new(*compare, *integer),
+                    state.bound_use(SamplerUse::new(*compare, *integer)),
                     OpaqueBlackBorder::Stated,
                     None,
                 )
                 .map_err(Error::Bind)?;
-                let owned = state.vk_sampler(&desc)?;
-                let raw = owned.raw();
-                samplers.push(owned);
+                let raw = match state.vk_sampler(device, &HashedDesc::new(desc))? {
+                    Some(owned) => {
+                        let raw = owned.raw();
+                        samplers.push(owned);
+                        raw
+                    }
+                    // A state its device's recovery carried past this generation
+                    // (`sampler.rs`).
+                    None => device.neutral_sampler(*compare)?,
+                };
                 vk::DescriptorImageInfo::default().sampler(raw)
             }
             // An element past the listed states: no handle names it.
@@ -1777,7 +2603,7 @@ fn image_descriptor(
             let texture = slot_texture(tables, *slot)
                 .ok_or_else(|| internal("the plan binds an unbound texture slot's planes image"))?;
             let view = texture.planes_image_view()?;
-            device.shared().counts.ycbcr_planes_image_bound();
+            device.shared().counts.thread().ycbcr_planes_image_bound();
             image(view)
         }
         _ => return Err(unexpected(&write.source)),
@@ -1817,19 +2643,99 @@ fn read_only_buffer(ty: vk::DescriptorType) -> bool {
     )
 }
 
+/// Whether `plan` binds a zero region of each command's own: at a writable buffer binding that
+/// nothing is bound to ([`read_only_buffer`]), a fresh region of the command buffer's upload
+/// arena at every draw (`write_info`). A draw drawn again as it was kept, or rebound, keeps the
+/// kept draw's set-0 writes at every slot but those that changed (`rebind_into`), so it would
+/// bind the kept draw's region, which that draw may have written: such a draw is not kept
+/// (`render/draw_again.rs`), counted as one that may write (`WorkCounts::draws_unkept_writing`).
+/// It walks every write of the plan, one for each resource its heap reaches in each heap array,
+/// so a draw asks its plan's facts (`render/plan_facts.rs`), which hold the answer.
+pub(super) fn binds_own_zeros(plan: &BindingPlan) -> bool {
+    #[cfg(all(test, debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
+    PLAN_WALKS.with(|walks| walks.set(walks.get() + plan.descriptors.len() as u64));
+    plan.descriptors.iter().any(|write| {
+        let neutral = matches!(
+            write.source,
+            WriteSource::Neutral(NeutralResource::ZeroBuffer { .. } | NeutralResource::Sink { .. })
+        );
+        neutral && !read_only_buffer(write.ty.into())
+    })
+}
+
+/// The range `command` plans for its buffer write at `key` (set and binding).
+fn planned_range(command: &Command<'_>, key: (u32, u32)) -> Result<BufferRange, Error> {
+    (command.descriptor_ranges.iter())
+        .find(|r| (r.set, r.binding) == key)
+        .map(|r| r.range)
+        .ok_or_else(|| internal("a buffer write without its range"))
+}
+
+/// The descriptor of `range` of `buffer`, where it lies read through `spaces` where given
+/// (`buffer::KeptSpaces`), else read now (`Buffer::space_read`). A buffer's range is in the
+/// buffer's space, which the bind state states it in (`ArgumentTable::stage_table`,
+/// `tessellation.rs`): a heap buffer's starts at its offset in the heap's `VkBuffer`.
+fn in_space(
+    buffer: &Buffer,
+    range: BufferRange,
+    spaces: Option<&mut KeptSpaces>,
+) -> vk::DescriptorBufferInfo {
+    let (raw, start) = match spaces {
+        Some(spaces) => buffer.space_kept(spaces),
+        None => buffer.space_read(),
+    };
+    vk::DescriptorBufferInfo::default()
+        .buffer(raw)
+        .offset(start + range.offset)
+        .range(range.range)
+}
+
+/// The buffer descriptor of `write` where its source is a slot's: the buffer it binds, where it
+/// lies read through `spaces` where given (`buffer::KeptSpaces`), or the call's copy of the bytes
+/// it sets (whose planned range counts from the region's start), at the range `command` plans;
+/// `None` for any other source. It takes nothing of the command buffer's state, so a draw rebound
+/// at buffer slots locks none (`binding::rebind_into`).
+fn slot_descriptor(
+    command: &Command<'_>,
+    tables: &Tables<'_>,
+    write: &DescriptorWrite,
+    spaces: Option<&mut KeptSpaces>,
+) -> Result<Option<vk::DescriptorBufferInfo>, Error> {
+    let range = || planned_range(command, (write.set, write.binding));
+    Ok(Some(match &write.source {
+        WriteSource::Buffer { slot } => {
+            let (buffer, _) = slot_buffer(tables, *slot)
+                .ok_or_else(|| internal("the plan binds an unbound buffer slot"))?;
+            in_space(buffer, range()?, spaces)
+        }
+        WriteSource::InlineBytes { slot } => {
+            let bytes = slot_bytes(tables, *slot)
+                .ok_or_else(|| internal("the plan binds inline bytes the slot does not hold"))?;
+            let range = range()?;
+            if range.offset + range.range > bytes.region.len() {
+                return Err(internal("an inline-bytes range past the call's region"));
+            }
+            vk::DescriptorBufferInfo::default()
+                .buffer(bytes.region.raw())
+                .offset(bytes.region.offset() + range.offset)
+                .range(range.range)
+        }
+        _ => return Ok(None),
+    }))
+}
+
 fn descriptor(
     device: &Device,
     state: &mut State,
     command: &Command<'_>,
     tables: &Tables<'_>,
-    write: &DescriptorWrite,
+    (write, spaces): (&DescriptorWrite, Option<&mut KeptSpaces>),
 ) -> Result<vk::DescriptorBufferInfo, Error> {
     let key = (write.set, write.binding);
     let ty: vk::DescriptorType = write.ty.into();
     let bytes = || {
-        command
-            .descriptor_bytes
-            .iter()
+        (command.descriptor_bytes.iter())
+            .chain(command.heap_tables)
             .find(|d| (d.set, d.binding) == key)
             .map(|d| d.bytes.as_slice())
             .ok_or_else(|| internal("a table write without its bytes"))
@@ -1840,47 +2746,13 @@ fn descriptor(
             .offset(upload.offset())
             .range(upload.len())
     };
-    // A buffer's range is in the buffer's space, which the bind state states it in
-    // (`ArgumentTable::stage_table`, `tessellation.rs`): a heap buffer's starts at its offset in
-    // the heap's `VkBuffer`.
-    let planned_range = || {
-        command
-            .descriptor_ranges
-            .iter()
-            .find(|r| (r.set, r.binding) == key)
-            .map(|r| r.range)
-            .ok_or_else(|| internal("a buffer write without its range"))
-    };
-    let ranged = |buffer: &Buffer| {
-        let range = planned_range()?;
-        let (raw, start) = buffer.space();
-        Ok::<_, Error>(
-            vk::DescriptorBufferInfo::default()
-                .buffer(raw)
-                .offset(start + range.offset)
-                .range(range.range),
-        )
-    };
+    if let Some(info) = slot_descriptor(command, tables, write, spaces)? {
+        return Ok(info);
+    }
+    let ranged =
+        |buffer: &Buffer| Ok::<_, Error>(in_space(buffer, planned_range(command, key)?, None));
     let mut upload = |bytes: &[u8], len: u64| state.uploads.upload(device, bytes, len);
     Ok(match &write.source {
-        WriteSource::Buffer { slot } => {
-            let (buffer, _) = slot_buffer(tables, *slot)
-                .ok_or_else(|| internal("the plan binds an unbound buffer slot"))?;
-            ranged(buffer)?
-        }
-        // The call's copy of its bytes: the plan's range counts from the region's start.
-        WriteSource::InlineBytes { slot } => {
-            let bytes = slot_bytes(tables, *slot)
-                .ok_or_else(|| internal("the plan binds inline bytes the slot does not hold"))?;
-            let range = planned_range()?;
-            if range.offset + range.range > bytes.region.len() {
-                return Err(internal("an inline-bytes range past the call's region"));
-            }
-            vk::DescriptorBufferInfo::default()
-                .buffer(bytes.region.raw())
-                .offset(bytes.region.offset() + range.offset)
-                .range(range.range)
-        }
         WriteSource::TessellationFactors => {
             let (buffer, _) = tables
                 .factors
@@ -1920,6 +2792,17 @@ fn descriptor(
                 .ok_or_else(|| internal("a tessellation work write without the draw's scan"))?
                 .work
         }
+        // A fan-out draw's region table, and a probe's flags (`render/fan_out.rs`).
+        WriteSource::RateMapRegions => {
+            command
+                .fan_out
+                .ok_or_else(|| internal("a region table write without the draw's fan-out"))?
+                .regions
+        }
+        WriteSource::RateMapFlags => command
+            .fan_out
+            .and_then(|fan| fan.flags)
+            .ok_or_else(|| internal("a probe's flags write without the probe's"))?,
         // An indexed patch draw's control-point index buffer.
         WriteSource::ControlPointIndices => {
             let (buffer, _) = tables.control_point_indices.ok_or_else(|| {
@@ -2065,9 +2948,14 @@ fn descriptor(
 }
 
 /// Upload `table` with a fresh sink's device address in its sink entry, at a 32-byte-aligned
-/// device address, noted for its command buffer's resident set (`live_buffers.rs`); its device
-/// address.
-fn root_table(device: &Device, state: &mut State, table: &RootTable) -> Result<u64, Error> {
+/// device address, noted for its command buffer's resident set (`live_buffers.rs`), read by
+/// functions that may write memory where `writes`; its device address.
+fn root_table(
+    device: &Device,
+    state: &mut State,
+    table: &RootTable,
+    writes: bool,
+) -> Result<u64, Error> {
     let no_address = || internal("a root table on a device without device addresses");
     let sink = state
         .uploads
@@ -2088,7 +2976,7 @@ fn root_table(device: &Device, state: &mut State, table: &RootTable) -> Result<u
         upload: uploaded,
         address,
     };
-    state.root_table(device, noted, table.resident_ranges())?;
+    state.root_table(device, noted, table.resident_ranges(), writes)?;
     Ok(address)
 }
 
@@ -2099,7 +2987,8 @@ fn root_table(device: &Device, state: &mut State, table: &RootTable) -> Result<u
 /// to where Metal's fetch stops reading it at most, `IndexBufferRef::fetch_end`: positions past
 /// there read a zero-padded copy), in the stages the plan names and with the access types of its
 /// class. The command's own uploads and the device's neutrals are fresh or never read back, so
-/// nothing orders against them; a sampler is no resource.
+/// nothing orders against them; a sampler is no resource. The uses of what the encoder made
+/// resident (`UseTarget::Used`) come first.
 pub(super) fn command_uses(
     call: &'static str,
     plan: &BindingPlan,
@@ -2109,34 +2998,236 @@ pub(super) fn command_uses(
     indirect: Option<(&Buffer, u64)>,
 ) -> Result<CommandUses, Error> {
     let mut uses = CommandUses::default();
-    command_uses_into(call, (plan, command, tables), (index, indirect), &mut uses)?;
+    uses_into(
+        call,
+        (plan, None, command, tables),
+        (index, indirect),
+        &mut uses,
+    )?;
     Ok(uses)
 }
 
-/// [`command_uses`] in `into`, emptied first: over the last draw's storage, where the caller keeps
-/// it (`LiveBind::uses`).
+/// [`command_uses`] in `into`, over the last command's storage, where the caller keeps it
+/// (`LiveBind::uses`): its uses of what the encoder made resident, and the keys they reach, kept
+/// from the last command where that command's plan was `plan`, or a plan that lists the same uses
+/// (as a pipeline state's plans for draws of different primitive types may), and its residency
+/// of the generation `tables`' is. They are a function of those alone: each use's resource is the
+/// residency's under its token, whose contents a generation names (`residency.rs`), its access
+/// and stages the plan's, and its key and range the resource's own, which no call changes (a
+/// resource's identity and length, a texture's levels and slices; `WorkCounts::resident_uses_made`
+/// counts those made). Builds with debug assertions check those kept against the uses
+/// [`command_uses`] makes whole.
 pub(super) fn command_uses_into(
     call: &'static str,
-    (plan, command, tables): (&BindingPlan, &Command<'_>, &Tables<'_>),
+    (plan, command, tables): (&Arc<BindingPlan>, &Command<'_>, &Tables<'_>),
     (index, indirect): (Option<(&Buffer, u64)>, Option<(&Buffer, u64)>),
     into: &mut CommandUses,
 ) -> Result<(), Error> {
-    let CommandUses { uses, resident } = into;
-    uses.clear();
-    resident.clear();
-    // One use at most a resource use of the plan's or the command's: room for them all at once.
-    uses.reserve(plan.uses.len() + command.uses.len());
-    // The keys of the buffers made resident the command reaches through the resident set, by
-    // address; every other use names its resource (a descriptor, a root table's static, a view).
-    // Those it names are gathered once it reaches one so: until then each use names its key.
-    let mut reached = BTreeSet::new();
-    let mut named = BTreeSet::new();
-    let name = |named: &mut BTreeSet<ResourceKey>, reached: &BTreeSet<ResourceKey>, key| {
-        if !reached.is_empty() {
-            named.insert(key);
+    let kept = (&**plan, Some(plan), command, tables);
+    let keeps = uses_into(call, kept, (index, indirect), into)?;
+    if cfg!(debug_assertions) && keeps {
+        // Made whole over the last check's storage: a draw's allocations are bounded in builds
+        // with debug assertions too (`runtime_lane::frame_costs`). None past the thread's
+        // thread-locals' end (a program's exit handler, `this_thread.rs`).
+        let checked = WHOLE_USES.try_with(|whole| {
+            let whole = &mut *whole.borrow_mut();
+            let made = (&**plan, None, command, tables);
+            uses_into(call, made, (index, indirect), whole)?;
+            let same = (into.uses == whole.uses && into.sources == whole.sources)
+                && (into.used == whole.used && into.resident == whole.resident);
+            assert!(
+                same,
+                "a command kept uses of what the encoder made resident not its own"
+            );
+            Ok::<_, Error>(())
+        });
+        if let Ok(checked) = checked {
+            checked?;
+            KEPT_RESIDENT_CHECKS.with(|checks| checks.set(checks.get() + 1));
         }
-    };
-    for resource in plan.uses.iter().chain(command.uses) {
+    }
+    Ok(())
+}
+
+thread_local! {
+    /// The commands whose uses of what the encoder made resident this thread kept (none, where
+    /// their plan lists none) and checked against those made whole ([`command_uses_into`]), in builds with debug assertions.
+    static KEPT_RESIDENT_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The uses [`command_uses_into`]'s check last made whole on this thread, whose storage its
+    /// next check makes them in ([`command_uses`]'s, as each is made for no kept plan).
+    static WHOLE_USES: std::cell::RefCell<CommandUses> =
+        std::cell::RefCell::new(CommandUses::default());
+}
+
+/// How many commands' kept uses of what the encoder made resident this thread checked so far
+/// ([`command_uses_into`]).
+#[cfg(all(test, debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) fn kept_resident_checks() -> u64 {
+    KEPT_RESIDENT_CHECKS.with(std::cell::Cell::get)
+}
+
+/// What the uses of what an encoder made resident at the start of a [`CommandUses`] were made
+/// for (`command_uses_into`): the plan (held weakly, so its allocation names no other plan while
+/// this lives) and the residency's generation; and the other plans found to list the plan's
+/// uses, or not to, held weakly likewise.
+#[derive(Clone)]
+struct ResidentOf {
+    plan: Weak<BindingPlan>,
+    generation: Option<u64>,
+    /// Held in place, so a command that switches plan allocates nothing for them: one whose
+    /// plan lists other uses makes its uses again, and its own `ResidentOf`.
+    compared: [Option<(Weak<BindingPlan>, bool)>; COMPARED_PLANS],
+}
+
+/// The most plans a [`ResidentOf`] keeps compared with its own: draws of one pipeline state whose
+/// primitive types take plans of their own (Metal's five, `MTLPrimitiveType`) find each compared
+/// once.
+const COMPARED_PLANS: usize = 5;
+
+impl ResidentOf {
+    /// Whether its uses are those `plan` makes under `generation`: made for it, or, where they
+    /// hold some uses of what the encoder made resident (`resident`), for a plan that lists the
+    /// same uses (`BindingPlan::uses`, which with the residency decide them alone,
+    /// [`resident_uses_into`]), found once by comparing them. Where they hold none, making them
+    /// again for another plan walks its uses once, which costs less than that comparison: draws
+    /// that switch between pipeline states of no resident uses at every few draws compare none.
+    /// The plans are compared by address, which takes no count of their references.
+    fn holds(&mut self, plan: &Arc<BindingPlan>, generation: Option<u64>, resident: bool) -> bool {
+        let at = Arc::as_ptr(plan);
+        if self.generation != generation {
+            return false;
+        }
+        if self.plan.as_ptr() == at {
+            return true;
+        }
+        if !resident {
+            return false;
+        }
+        let found = (self.compared.iter().flatten()).find(|(of, _)| of.as_ptr() == at);
+        if let Some(&(_, alike)) = found {
+            return alike;
+        }
+        let alike = (self.plan.upgrade()).is_some_and(|made| made.uses == plan.uses);
+        if let Some(free) = self.compared.iter_mut().find(|slot| slot.is_none()) {
+            *free = Some((Arc::downgrade(plan), alike));
+        }
+        alike
+    }
+}
+
+/// [`command_uses`]' work in `into`: `kept` the plan's `Arc`, where `into` keeps the uses of
+/// what the encoder made resident from one command to the next (`command_uses_into`). Whether it
+/// kept them.
+fn uses_into(
+    call: &'static str,
+    (plan, kept, command, tables): (
+        &BindingPlan,
+        Option<&Arc<BindingPlan>>,
+        &Command<'_>,
+        &Tables<'_>,
+    ),
+    (index, indirect): (Option<(&Buffer, u64)>, Option<(&Buffer, u64)>),
+    into: &mut CommandUses,
+) -> Result<bool, Error> {
+    // One use at most a resource use of the plan's or the command's.
+    let resources = plan.uses.len() + command.uses.len();
+    if u32::try_from(resources).is_err() {
+        return Err(internal("a command of 2^32 uses"));
+    }
+    let generation = tables.residency.map(Residency::generation);
+    let resident = into.used > 0;
+    let holds = |of: &mut ResidentOf| kept.is_some_and(|plan| of.holds(plan, generation, resident));
+    into.made = 0;
+    let keeps = into.of.as_mut().is_some_and(holds);
+    match keeps {
+        true => {
+            into.uses.truncate(into.used);
+            into.sources.truncate(into.used);
+        }
+        false => {
+            into.of = None;
+            resident_uses_into(plan, tables, into)?;
+            into.of = kept.map(|plan| ResidentOf {
+                plan: Arc::downgrade(plan),
+                generation,
+                compared: Default::default(),
+            });
+            // Kept from one command to the next alone, so the identity of those kept alone
+            // (none where there are none: `prefix` reads it only where there are some).
+            if into.used > 0 {
+                into.prefix = match kept {
+                    Some(_) => identity(),
+                    None => 0,
+                };
+            }
+        }
+    }
+    let CommandUses {
+        uses,
+        sources,
+        slots,
+        slots_listed,
+        others,
+        reaching,
+        named_now,
+        ..
+    } = into;
+    uses.reserve(others.len() + command.uses.len());
+    // Listed by the first patch that asks (`patch_buffer_uses`).
+    slots.clear();
+    *slots_listed = false;
+    // Every use but those names its resource (a descriptor, a root table's static, a view):
+    // the keys of `reaching` named are gathered.
+    named_now.clear();
+    let plan_others = others.iter().map(|&at| (at, &plan.uses[at as usize]));
+    let commands = (command.uses.iter().enumerate())
+        .map(|(at, resource)| ((plan.uses.len() + at) as u32, resource));
+    for (source, resource) in plan_others.chain(commands) {
+        let Some(used) = other_use(call, resource, (index, indirect), tables)? else {
+            continue;
+        };
+        if !reaching.is_empty() && reaching.contains(&used.key) {
+            named_now.push(used.key);
+        }
+        uses.push(used);
+        sources.push(source);
+    }
+    named_now.sort_unstable();
+    named_now.dedup();
+    into.settled = into.settle_resident(!keeps);
+    Ok(keeps)
+}
+
+/// Make the uses of what the encoder made resident `plan` lists, as `tables` hold it, first in
+/// `into`'s, emptied: their count, `made`, and of the buffers among them (reached by address)
+/// the keys no texture use of them names, `reaching`; their stages, `prefix_stages`; and the
+/// positions of the plan's other uses, `others`.
+fn resident_uses_into(
+    plan: &BindingPlan,
+    tables: &Tables<'_>,
+    into: &mut CommandUses,
+) -> Result<(), Error> {
+    let CommandUses {
+        uses,
+        sources,
+        used,
+        made,
+        others,
+        reaching,
+        prefix_stages,
+        ..
+    } = into;
+    uses.clear();
+    sources.clear();
+    others.clear();
+    reaching.clear();
+    *used = 0;
+    let mut named = BTreeSet::new();
+    for (at, resource) in plan.uses.iter().enumerate() {
+        let UseTarget::Used(token) = resource.resource else {
+            others.push(at as u32);
+            continue;
+        };
         if !resource.access.read && !resource.access.write {
             continue;
         }
@@ -2144,141 +3235,621 @@ pub(super) fn command_uses_into(
         if stages.is_empty() {
             return Err(internal("a command's resource use in no stage"));
         }
-        let access = |flags: vk::AccessFlags2, used: bool| {
-            if used {
-                Access::new(stages, flags)
-            } else {
-                Access::NONE
-            }
+        let access = |flags: vk::AccessFlags2, used: bool| match used {
+            true => Access::new(stages, flags),
+            false => Access::NONE,
         };
-        let (buffer, offset) = match resource.resource {
-            UseTarget::Slot(slot) => match slot.class {
-                SlotClass::Buffer => match slot_buffer(tables, slot) {
-                    Some((buffer, offset)) => (buffer, *offset),
-                    // An unbound slot reads a neutral, fresh for the command.
-                    None => continue,
-                },
-                SlotClass::Texture => {
-                    // An unbound slot takes a neutral image; a texture whose image and usage
-                    // lack the binding's usage, its shadow (`texture/usage_shadow.rs`), as does
-                    // a draw's sampled one its instance renders (`texture/attached_reads.rs`).
-                    // A two-plane YCbCr texture's planes read in place: their bytes, not the
-                    // image, which converts for no such read (`texture/ycbcr_image.rs`).
-                    if let (Some(texture), AccessClass::YCbCrPlanes) =
-                        (slot_texture(tables, slot), resource.class)
-                    {
-                        let read = vk::AccessFlags2::SHADER_SAMPLED_READ;
-                        let used = texture.planes_use(access(read, resource.access.read))?;
-                        name(&mut named, &reached, used.key);
-                        uses.push(used);
+        let buffer = match tables.used(token) {
+            Some(Used::Buffer(buffer)) => buffer,
+            Some(Used::Heap { bytes, .. }) => bytes,
+            Some(Used::IndirectCommandBuffer(icb)) => icb.storage(),
+            Some(Used::Texture(texture)) => {
+                // A texture whose writes Metal drops (`metal::format::writes_dropped`: the 4:2:2
+                // formats, the subsampled and packed two-plane YCbCr ones) is its neutral in every
+                // heap storage array (`bind::heap`), which a function's writes through its handle
+                // reach, as a slot that only writes it takes its neutral. A command whose heap
+                // holds it at no element, no sampled array either, reaches none of its image and
+                // names no use of it: a kernel that only writes a two-plane YCbCr texture through
+                // an argument buffer converts none of its planes, and so announces no conversion
+                // of them (`ycbcr.rs`, `ycbcr-filter-not-exact`).
+                if writes_dropped(texture.pixel_format()) && !heap_holds(plan, token, None) {
+                    continue;
+                }
+                let (read, write) = image_access(resource.class)?;
+                let (read, write) = (
+                    access(read, resource.access.read),
+                    access(write, resource.access.write),
+                );
+                // A 4:4:4 two-plane YCbCr texture a heap's float storage array holds through its
+                // write shadow (`bind::heap`), written: the shadow, whose copies clear its marks
+                // and encode the marked texels into the planes, and the texture's own image where
+                // the command reads it too.
+                let shadowed = resource.class == AccessClass::StorageImage
+                    && resource.access.write
+                    && texture.takes_ycbcr_writes(true)
+                    && heap_holds(plan, token, Some(ImageAccess::Storage));
+                if shadowed {
+                    let used = texture.ycbcr_write_use("useResource:usage:", write)?;
+                    named.insert(used.key);
+                    uses.push(used);
+                    sources.push(at as u32);
+                    if read.is_empty() {
                         continue;
                     }
-                    if let Some(texture) = slot_texture(tables, slot) {
-                        let (read, write) = image_access(resource.class)?;
-                        let storage = resource.class == AccessClass::StorageImage;
-                        let attached =
-                            tables.attached(texture, storage) && !tables.snapshot_slot(slot);
-                        let used = texture.slot_use(
-                            call,
-                            storage,
-                            attached,
-                            (
-                                access(read, resource.access.read),
-                                access(write, resource.access.write),
-                            ),
-                        )?;
-                        name(&mut named, &reached, used.key);
-                        uses.push(used);
-                    }
-                    continue;
                 }
-                SlotClass::Sampler => continue,
-            },
-            UseTarget::IndexBuffer => {
-                index.ok_or_else(|| internal("an index buffer use of a draw without one"))?
+                let used = match shadowed {
+                    true => texture.bound_use(read, Access::NONE),
+                    false => texture.bound_use(read, write),
+                };
+                named.insert(used.key);
+                uses.push(used);
+                sources.push(at as u32);
+                continue;
             }
-            UseTarget::Indirect => indirect
-                .ok_or_else(|| internal("an indirect use of a command without arguments"))?,
-            UseTarget::TileMap(slot) => (slot_tile_map(tables, slot)?, 0),
-            UseTarget::Used(token) => match tables.used(token) {
-                Some(Used::Buffer(buffer)) => (buffer, 0),
-                Some(Used::Heap { bytes, .. }) => (bytes, 0),
-                Some(Used::IndirectCommandBuffer(icb)) => (icb.storage(), 0),
-                Some(Used::Texture(texture)) => {
-                    let (read, write) = image_access(resource.class)?;
-                    let used = texture.bound_use(
-                        access(read, resource.access.read),
-                        access(write, resource.access.write),
-                    );
-                    name(&mut named, &reached, used.key);
-                    uses.push(used);
-                    continue;
-                }
-                None => return Err(internal("a use of a resource the encoder did not use")),
-            },
-            UseTarget::TessellationFactors => tables
-                .factors
-                .ok_or_else(|| internal("a tessellation factor use without a factor buffer"))?,
-            UseTarget::PatchIndices => tables
-                .patch_indices
-                .ok_or_else(|| internal("a patch index use of a draw without a buffer"))?,
-            UseTarget::ControlPointIndices => tables
-                .control_point_indices
-                .ok_or_else(|| internal("a control-point index use of a draw without a buffer"))?,
-        };
-        let range = match resource.range {
-            Some(range) => {
-                let start = offset.saturating_add(range.offset);
-                start..start.saturating_add(range.len)
-            }
-            None => offset..buffer.length().max(offset),
-        };
-        let range = match resource.resource {
-            UseTarget::IndexBuffer => {
-                let end = IndexBufferRef::new(0, buffer.length()).fetch_end(range.start);
-                range.start..range.end.min(end).max(range.start)
-            }
-            _ => range,
+            None => return Err(internal("a use of a resource the encoder did not use")),
         };
         let (read, write) = buffer_access(resource.class)?;
-        let (identity, range) = buffer.tracked(range);
-        match resource.resource {
-            UseTarget::Used(_) => {
-                // The first reached: every use before it named its key.
-                if reached.is_empty() {
-                    named.extend(uses.iter().map(|used: &Use<ResourceKey>| used.key));
+        let accesses = (
+            access(read, resource.access.read),
+            access(write, resource.access.write),
+        );
+        let used = bytes_use(resource, buffer, 0, accesses);
+        reaching.insert(used.key);
+        uses.push(used);
+        sources.push(at as u32);
+    }
+    reaching.retain(|key| !named.contains(key));
+    *used = uses.len();
+    *made += uses.len();
+    *prefix_stages = (uses.iter()).fold(vk::PipelineStageFlags2::empty(), |all, used| {
+        all | used.read.stages | used.write.stages
+    });
+    Ok(())
+}
+
+/// Whether `plan` holds the texture it makes resident as token `token` at an element of a heap
+/// array of `access` (a `WriteSource::HeapEntry` of such a class), or of any class where `None`.
+/// In a storage array a 4:4:4 two-plane YCbCr texture is its write shadow's view (`bind::heap`),
+/// which a stage of the plan writes.
+fn heap_holds(plan: &BindingPlan, token: u32, access: Option<ImageAccess>) -> bool {
+    plan.descriptors.iter().any(|d| {
+        matches!(
+            d.source,
+            WriteSource::HeapEntry {
+                class: HandleClass::Image(class),
+                source: HeapSource::Used(used),
+                ..
+            } if used == token && access.is_none_or(|access| class.access == access)
+        )
+    })
+}
+
+/// The use `resource`, a use of the plan's or the command's other than of a resource made
+/// resident, makes as `tables` bind it, a draw's index buffer `index` and argument buffer
+/// `indirect` (each with its offset): `None` for an unbound slot (a neutral, fresh for the
+/// command), a sampler, or a use that neither reads nor writes.
+fn other_use(
+    call: &'static str,
+    resource: &ResourceUse,
+    (index, indirect): (Option<(&Buffer, u64)>, Option<(&Buffer, u64)>),
+    tables: &Tables<'_>,
+) -> Result<Option<Use<ResourceKey>>, Error> {
+    if !resource.access.read && !resource.access.write {
+        return Ok(None);
+    }
+    let stages: vk::PipelineStageFlags2 = resource.stages.into();
+    if stages.is_empty() {
+        return Err(internal("a command's resource use in no stage"));
+    }
+    let access = |flags: vk::AccessFlags2, used: bool| match used {
+        true => Access::new(stages, flags),
+        false => Access::NONE,
+    };
+    let (buffer, offset) = match resource.resource {
+        UseTarget::Slot(slot) => match slot.class {
+            SlotClass::Buffer => match slot_buffer(tables, slot) {
+                Some((buffer, offset)) => (buffer, *offset),
+                // An unbound slot reads a neutral, fresh for the command.
+                None => return Ok(None),
+            },
+            SlotClass::Texture => {
+                // An unbound slot takes a neutral image; a texture whose image and usage lack
+                // the binding's usage, its shadow (`texture/usage_shadow.rs`), as does a draw's
+                // sampled one its instance renders (`texture/attached_reads.rs`). A two-plane
+                // YCbCr texture's planes read in place: their bytes, not the image, which
+                // converts for no such read (`texture/ycbcr_image.rs`).
+                let Some(texture) = slot_texture(tables, slot) else {
+                    return Ok(None);
+                };
+                if resource.class == AccessClass::YCbCrPlanes {
+                    let read = vk::AccessFlags2::SHADER_SAMPLED_READ;
+                    return texture
+                        .planes_use(access(read, resource.access.read))
+                        .map(Some);
                 }
-                reached.insert(identity.key);
+                // A shadowed texture's rows read and written in place: their bytes, through a
+                // uniform or a storage texel buffer, not the shadow (`texture/texel_rows.rs`).
+                if resource.class == AccessClass::TexelRows {
+                    use vk::AccessFlags2 as A;
+                    let read = A::SHADER_SAMPLED_READ | A::SHADER_STORAGE_READ;
+                    let write = A::SHADER_STORAGE_WRITE;
+                    let read = access(read, resource.access.read);
+                    let write = access(write, resource.access.write);
+                    return texture.rows_use(read, write).map(Some);
+                }
+                // Any other slot binds the texture's image: a shadow left unmade is made here,
+                // before the command's copies are planned from its uses
+                // (`texture/lazy_shadow.rs`).
+                texture.made_for_use()?;
+                let (read, write) = image_access(resource.class)?;
+                let storage = resource.class == AccessClass::StorageImage;
+                let accesses = (
+                    access(read, resource.access.read),
+                    access(write, resource.access.write),
+                );
+                return match tables.slot_read(texture, slot, storage) {
+                    SlotRead::Levels(levels) => {
+                        let levels = levels.first..levels.view;
+                        Ok(Some(texture.levels_use(levels, accesses)))
+                    }
+                    read => (texture.slot_use(call, storage, read == SlotRead::Copy, accesses))
+                        .map(Some),
+                };
             }
-            _ => name(&mut named, &reached, identity.key),
+            SlotClass::Sampler => return Ok(None),
+        },
+        UseTarget::IndexBuffer => {
+            index.ok_or_else(|| internal("an index buffer use of a draw without one"))?
         }
-        uses.push(Use {
-            key: identity.key,
-            tracked: identity.tracked,
-            range: UseRange::Bytes(range),
-            read: access(read, resource.access.read),
-            write: access(write, resource.access.write),
+        UseTarget::Indirect => {
+            indirect.ok_or_else(|| internal("an indirect use of a command without arguments"))?
+        }
+        UseTarget::TileMap(slot) => (slot_tile_map(tables, slot)?, 0),
+        // Only a plan lists one (`resident_uses_into`).
+        UseTarget::Used(_) => {
+            return Err(internal("a command's own use of a resource made resident"))
+        }
+        UseTarget::TessellationFactors => tables
+            .factors
+            .ok_or_else(|| internal("a tessellation factor use without a factor buffer"))?,
+        UseTarget::PatchIndices => tables
+            .patch_indices
+            .ok_or_else(|| internal("a patch index use of a draw without a buffer"))?,
+        UseTarget::ControlPointIndices => tables
+            .control_point_indices
+            .ok_or_else(|| internal("a control-point index use of a draw without a buffer"))?,
+    };
+    let (read, write) = buffer_access(resource.class)?;
+    let accesses = (
+        access(read, resource.access.read),
+        access(write, resource.access.write),
+    );
+    Ok(Some(bytes_use(resource, buffer, offset, accesses)))
+}
+
+/// The use `resource` makes of `buffer`'s bytes bound at `offset`, reading and writing as
+/// `(read, write)`: its range from the offset (the buffer's rest where it states none; an index
+/// buffer's up to its last whole index), as the buffer tracks it (`Buffer::tracked`).
+#[inline]
+fn bytes_use(
+    resource: &ResourceUse,
+    buffer: &Buffer,
+    offset: u64,
+    (read, write): (Access, Access),
+) -> Use<ResourceKey> {
+    let range = match resource.range {
+        Some(range) => {
+            let start = offset.saturating_add(range.offset);
+            start..start.saturating_add(range.len)
+        }
+        None => offset..buffer.length().max(offset),
+    };
+    let range = match resource.resource {
+        UseTarget::IndexBuffer => {
+            let end = IndexBufferRef::new(0, buffer.length()).fetch_end(range.start);
+            range.start..range.end.min(end).max(range.start)
+        }
+        _ => range,
+    };
+    let (identity, range) = buffer.tracked(range);
+    Use {
+        key: identity.key,
+        tracked: identity.tracked,
+        range: UseRange::Bytes(range),
+        read,
+        write,
+    }
+}
+
+/// Patch in `into`, as [`command_uses_into`] made it of `plan`'s and `command`'s uses, the uses
+/// of the buffer slots `changed`, as the `stages`' tables now bind them, found by `into`'s list of
+/// its uses of buffer slots (`CommandUses::slots`), looking at no other use, their positions into
+/// `moved.0` and the uses into `moved.1`, both emptied first, in the list's order (every use a call
+/// that changed those slots changed): whether it did, which it does
+/// where each such slot binds the buffer it bound (its offset may have moved) and `into` holds the
+/// uses that function made alone. Its uses are then those `command_uses_into` makes: every other
+/// use is of a slot, buffer or texture no call changed, and the keys, so the resident ones, are
+/// the same (`render/draw_again/rebound.rs`). The first patch after the uses were made lists them
+/// ([`list_slot_uses`]); the patches after it, until they are made again, read that list. Builds
+/// with debug assertions check the list against the uses, and count the uses it looked at
+/// (`patched_slot_uses`). Where it patched, whether each use it patched in lies inside the bytes
+/// of the use it replaced (`Use::covers`, or equals it), as a buffer offset moving along a buffer
+/// reads; `None` where it did not.
+pub(super) fn patch_buffer_uses(
+    (plan, command, stages): (&BindingPlan, &Command<'_>, &[(Stage, &ArgumentTable)]),
+    changed: &[SlotRef],
+    into: &mut CommandUses,
+    (moved_at, moved): (&mut Vec<usize>, &mut Vec<Use<ResourceKey>>),
+) -> Result<Option<bool>, Error> {
+    moved_at.clear();
+    moved.clear();
+    if into.sources.len() != into.uses.len() {
+        return Ok(None);
+    }
+    if !into.slots_listed {
+        list_slot_uses((plan, command), into);
+    }
+    #[cfg(debug_assertions)]
+    {
+        slot_uses_listed((plan, command), into);
+        let looked = into.slots.len() as u64;
+        PATCHED_SLOT_USES.with(|patched| {
+            let (calls, walked) = patched.get();
+            patched.set((calls + 1, walked + looked));
         });
     }
-    resident.extend(reached.difference(&named).copied());
-    Ok(())
+    let CommandUses {
+        uses,
+        sources,
+        slots,
+        ..
+    } = into;
+    let mut inside = true;
+    for &(slot, at) in slots.iter() {
+        if !changed.contains(&slot) {
+            continue;
+        }
+        let at = at as usize;
+        let (Some(used), Some(&source)) = (uses.get_mut(at), sources.get(at)) else {
+            return Err(internal("a use of a buffer slot past the command's uses"));
+        };
+        let source = source as usize;
+        let resource = match source.checked_sub(plan.uses.len()) {
+            None => plan.uses.get(source),
+            Some(at) => command.uses.get(at),
+        };
+        let resource = resource.ok_or_else(|| internal("a use of a resource use since gone"))?;
+        let Some((buffer, offset)) = stage_buffer(stages, slot) else {
+            return Ok(None);
+        };
+        // Its reads and writes are its resource use's, as the use made of it holds them.
+        let now = bytes_use(resource, buffer, *offset, (used.read, used.write));
+        if now.key != used.key {
+            return Ok(None);
+        }
+        inside &= *used == now || used.covers(&now);
+        moved_at.push(at);
+        moved.push(now.clone());
+        *used = now;
+    }
+    Ok(Some(inside))
+}
+
+/// Patch in `into`, as [`command_uses_into`] made it of `plan`'s uses and a command's of the same
+/// kind, the uses made of the command's own (`Command::uses`: a draw's index buffer's), as
+/// `command`'s and the draw's index buffer `index` (with its offset) now make them, their
+/// positions and uses pushed onto `moved.0` and `moved.1` (in their order, after what those
+/// hold): whether each lies inside the use it replaced (`Use::covers`), or `None` where they are
+/// not those `command_uses_into` would make in their place (another count of them, another
+/// resource or key), and the caller makes them whole. Every other use is the plan's, of slots,
+/// buffers and textures no call changed, and the keys the same, so the resident ones are
+/// (`render/draw_again/rebound.rs`).
+pub(super) fn patch_command_uses(
+    (plan, command): (&BindingPlan, &Command<'_>),
+    index: Option<(&Buffer, u64)>,
+    into: &mut CommandUses,
+    (moved_at, moved): (&mut Vec<usize>, &mut Vec<Use<ResourceKey>>),
+) -> Result<Option<bool>, Error> {
+    let CommandUses { uses, sources, .. } = into;
+    if sources.len() != uses.len() {
+        return Ok(None);
+    }
+    // The command's uses come last, each made of one of its own (`uses_into`), which each read.
+    let own = plan.uses.len();
+    let made = (sources.iter().rev()).take_while(|&&source| source as usize >= own);
+    let first = sources.len() - made.count();
+    if sources.len() - first != command.uses.len() {
+        return Ok(None);
+    }
+    let mut inside = true;
+    for (at, (used, resource)) in (uses[first..].iter_mut()).zip(command.uses).enumerate() {
+        let (UseTarget::IndexBuffer, Some((buffer, offset))) = (resource.resource, index) else {
+            return Ok(None);
+        };
+        if sources[first + at] as usize != own + at {
+            return Ok(None);
+        }
+        // Its reads and writes are its resource use's, as the use made of it holds them.
+        let now = bytes_use(resource, buffer, offset, (used.read, used.write));
+        if now.key != used.key {
+            return Ok(None);
+        }
+        inside &= *used == now || used.covers(&now);
+        moved_at.push(first + at);
+        moved.push(now.clone());
+        *used = now;
+    }
+    Ok(Some(inside))
+}
+
+/// List in `into`, as [`command_uses_into`] made it of `plan`'s and `command`'s uses, each of its
+/// uses of a buffer slot and its position (`CommandUses::slots`): every use past those of what the
+/// encoder made resident (of no slot) of a resource use of a buffer slot. Listed at the first
+/// patch ([`patch_buffer_uses`]) rather than as the uses are made: a draw whose uses are made
+/// again at each draw, as one that binds another texture each time, lists none. Builds with debug
+/// assertions count the uses it looked at (`listed_slot_uses`).
+fn list_slot_uses((plan, command): (&BindingPlan, &Command<'_>), into: &mut CommandUses) {
+    let CommandUses {
+        sources,
+        slots,
+        slots_listed,
+        used,
+        ..
+    } = into;
+    slots.clear();
+    // As many sources as uses (`patch_buffer_uses` checks).
+    for (at, &source) in sources.iter().enumerate().skip(*used) {
+        let source = source as usize;
+        let resource = match source.checked_sub(plan.uses.len()) {
+            None => plan.uses.get(source),
+            Some(at) => command.uses.get(at),
+        };
+        let Some(resource) = resource else {
+            continue;
+        };
+        if let UseTarget::Slot(slot) = resource.resource {
+            if slot.class == SlotClass::Buffer {
+                slots.push((slot, at as u32));
+            }
+        }
+    }
+    *slots_listed = true;
+    #[cfg(debug_assertions)]
+    LISTED_SLOT_USES.with(|listed| {
+        let (calls, walked) = listed.get();
+        listed.set((calls + 1, walked + (sources.len() - *used) as u64));
+    });
+}
+
+/// Check that `into`, as [`command_uses_into`] made it of `plan`'s and `command`'s uses, lists
+/// each of its uses of a buffer slot at its position (`CommandUses::slots`): every use past those
+/// of what the encoder made resident (of no slot) of a resource use of a buffer slot. In builds
+/// with debug assertions.
+#[cfg(debug_assertions)]
+fn slot_uses_listed((plan, command): (&BindingPlan, &Command<'_>), into: &CommandUses) {
+    let source = |at: usize| {
+        let source = into.sources[at] as usize;
+        match source.checked_sub(plan.uses.len()) {
+            None => plan.uses.get(source),
+            Some(at) => command.uses.get(at),
+        }
+    };
+    let listed = (into.used..into.uses.len()).filter_map(|at| match source(at)?.resource {
+        UseTarget::Slot(slot) if slot.class == SlotClass::Buffer => Some((slot, at as u32)),
+        _ => None,
+    });
+    assert!(
+        listed.eq(into.slots.iter().copied()),
+        "a command's uses of buffer slots other than it lists"
+    );
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// The calls of [`patch_buffer_uses`] that reached its uses on this thread, and the uses of
+    /// buffer slots they looked at, in builds with debug assertions.
+    static PATCHED_SLOT_USES: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    /// The calls of [`list_slot_uses`] on this thread, and the uses they looked at, in builds
+    /// with debug assertions.
+    static LISTED_SLOT_USES: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// How many calls of [`patch_buffer_uses`] reached their uses on this thread so far, and how
+/// many uses of buffer slots they looked at.
+#[cfg(all(test, debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) fn patched_slot_uses() -> (u64, u64) {
+    PATCHED_SLOT_USES.with(std::cell::Cell::get)
+}
+
+/// How many calls of [`list_slot_uses`] this thread made so far, and how many uses they looked
+/// at.
+#[cfg(all(test, debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) fn listed_slot_uses() -> (u64, u64) {
+    LISTED_SLOT_USES.with(std::cell::Cell::get)
 }
 
 /// A dispatch's or draw's uses (`command_uses`), for the tracker, and the keys among them that
 /// the command reaches through its root tables' resident set alone: buffers and heaps an encoder
 /// made resident, which no use of the command names. The encoder's core takes both
-/// (`EncoderCore::command_reaching`, `note_reaching`); a use added later names its key.
+/// (`EncoderCore::command_reaching`, `note_reaching`); a use added later names its key. The uses
+/// of what the encoder made resident come first, kept from one draw to the next while their
+/// inputs are the same (`command_uses_into`).
 #[derive(Clone, Default)]
 pub(super) struct CommandUses {
     uses: Vec<Use<ResourceKey>>,
     resident: BTreeSet<ResourceKey>,
+    /// Of each use [`command_uses_into`] made, in order, the index among its plan's and command's
+    /// resource uses of the one it was made of: what [`patch_buffer_uses`] patches by.
+    sources: Vec<u32>,
+    /// Of each of those uses of a buffer slot, in order, the slot and the use's position, where
+    /// `slots_listed`: where [`patch_buffer_uses`] finds the uses of the slots a call changed,
+    /// looking at no other. Listed by the first patch after the uses were made
+    /// ([`list_slot_uses`]), so uses nothing patches, as those [`command_uses`] makes, list none.
+    slots: Vec<(SlotRef, u32)>,
+    /// Whether `slots` lists the uses' buffer slots: `false` once the uses are made again.
+    slots_listed: bool,
+    /// How many of `uses` and `sources`, first, are of what the encoder made resident, made for
+    /// `of` (`command_uses_into`); and how many of those the last call made (0 where it kept
+    /// them: `WorkCounts::resident_uses_made`).
+    used: usize,
+    made: usize,
+    /// The keys the last call moved into or out of `resident`
+    /// ([`settle_resident`](Self::settle_resident)).
+    settled: usize,
+    of: Option<ResidentOf>,
+    /// The positions among the plan's uses of those of anything but what the encoder made
+    /// resident, ascending.
+    others: Vec<u32>,
+    /// The keys of the buffers among those uses (reached by address) that none of them names:
+    /// `resident` is these but those the command's other uses name, `named`, as the last call
+    /// left them (sorted, each once), `named_now` this call's.
+    reaching: BTreeSet<ResourceKey>,
+    named: Vec<ResourceKey>,
+    named_now: Vec<ResourceKey>,
+    /// The keys a use added since the last call ([`push`](Self::push)) took out of `resident`,
+    /// which is `reaching` less `named` and these.
+    taken: Vec<ResourceKey>,
+    /// The identity of the uses of what the encoder made resident ([`ResidentPrefix`]), 0 where
+    /// they have none: given where [`command_uses_into`] made them, from [`IDENTITIES`].
+    prefix: u64,
+    /// The identity and count of the uses of what the encoder made resident found to share no
+    /// memory with an attachment of a render pass of the layout of the version beside them
+    /// ([`apart_from`](Self::apart_from)).
+    apart: Option<(u64, usize, u64)>,
+    /// The identity of `resident` while the uses of what the encoder made resident have one
+    /// ([`ReachingPrefix`]): given where it was worked out again, from [`IDENTITIES`].
+    resident_at: u64,
+    /// The pipeline stages of the uses of what the encoder made resident.
+    prefix_stages: vk::PipelineStageFlags2,
+}
+
+/// The identities given to [`CommandUses`]' uses of what an encoder made resident, from 1: one of
+/// the process's, whose uses no other has.
+static IDENTITIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A new one of [`IDENTITIES`].
+fn identity() -> u64 {
+    IDENTITIES.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The uses of what an encoder made resident that come first among a draw's
+/// ([`CommandUses::prefix`]), by identity: two draws' uses of the same identity begin with the same
+/// `len` uses. What takes a draw's uses may take those of the last one's identity once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ResidentPrefix {
+    pub(super) id: u64,
+    pub(super) len: usize,
+}
+
+/// A draw's [`ResidentPrefix`], with the identity of the keys it reaches through the resident set
+/// alone (`resident`) and the stages of those uses ([`CommandUses::reaching_prefix`]): two draws'
+/// of the same identities begin with the same uses and reach the same keys so.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReachingPrefix {
+    pub(super) prefix: ResidentPrefix,
+    pub(super) resident: u64,
+    pub(super) stages: vk::PipelineStageFlags2,
 }
 
 impl CommandUses {
     /// Add `used`, which names its key.
     pub(super) fn push(&mut self, used: Use<ResourceKey>) {
-        self.resident.remove(&used.key);
+        if self.resident.remove(&used.key) {
+            self.taken.push(used.key);
+        }
         self.uses.push(used);
+    }
+
+    /// The uses of what the encoder made resident at its start, by identity; `None` where there
+    /// are none, or they have no identity (made by [`command_uses`]).
+    pub(super) fn prefix(&self) -> Option<ResidentPrefix> {
+        let prefix = ResidentPrefix {
+            id: self.prefix,
+            len: self.used,
+        };
+        (prefix.len > 0 && prefix.id != 0).then_some(prefix)
+    }
+
+    /// [`prefix`](Self::prefix), with the identity of the keys the uses reach through the resident
+    /// set alone and the prefix's stages (`ReachingPrefix`); `None` also where a use added since
+    /// those keys were worked out took one of them ([`push`](Self::push)).
+    pub(super) fn reaching_prefix(&self) -> Option<ReachingPrefix> {
+        let prefix = self.prefix()?;
+        let resident = self.resident_at;
+        let stages = self.prefix_stages;
+        (resident != 0 && self.taken.is_empty()).then_some(ReachingPrefix {
+            prefix,
+            resident,
+            stages,
+        })
+    }
+
+    /// How many uses at its start, of what the encoder made resident, were found to share no
+    /// memory with an attachment of a render pass of the layout of `version`
+    /// (`EncoderCore::degrade_attachment_reads`): its count of them where they are those of the
+    /// identity found ([`prefix`](Self::prefix)), else 0.
+    pub(super) fn apart(&self, version: u64) -> usize {
+        match (self.prefix(), self.apart) {
+            (Some(prefix), Some(apart)) if apart == (prefix.id, prefix.len, version) => prefix.len,
+            _ => 0,
+        }
+    }
+
+    /// Note that its uses of what the encoder made resident share no memory with an attachment
+    /// of a render pass of the layout of `version` ([`apart`](Self::apart)).
+    pub(super) fn apart_from(&mut self, version: u64) {
+        self.apart = (self.prefix()).map(|prefix| (prefix.id, prefix.len, version));
+    }
+
+    /// How many uses of resources the encoder made resident the last call made: 0 where it kept
+    /// the last command's (`command_uses_into`).
+    pub(super) fn made(&self) -> usize {
+        self.made
+    }
+
+    /// How many keys the last call moved into or out of those the command reaches through the
+    /// resident set alone ([`resident`](Self::resident)): 0 where they are the last command's.
+    pub(super) fn settled(&self) -> usize {
+        self.settled
+    }
+
+    /// Set `resident` to `reaching` less `named_now`, which becomes `named`: worked out again
+    /// only where one of those changed (`made_again`: the uses of what the encoder made resident
+    /// were), or a use added since took a key out of it. Made whole from `reaching` only where it
+    /// is new; else only the keys that changed move, so a draw that names other keys of a large
+    /// resident set than the last one costs the keys named, not the set
+    /// (`WorkCounts::resident_keys_settled` counts the keys each way moves).
+    fn settle_resident(&mut self, made_again: bool) -> usize {
+        if !made_again && self.taken.is_empty() && self.named == self.named_now {
+            return 0;
+        }
+        let moved = match made_again {
+            true => {
+                self.resident.clone_from(&self.reaching);
+                self.taken.clear();
+                self.reaching.len()
+            }
+            // `reaching` is the last call's: the keys the last call's other uses named, and those
+            // a use added since took, are each one of it, back in `resident`.
+            false => {
+                let back = self.named.len() + self.taken.len();
+                self.resident.extend(self.named.iter().copied());
+                self.resident.extend(self.taken.drain(..));
+                back
+            }
+        };
+        for key in &self.named_now {
+            self.resident.remove(key);
+        }
+        self.named.clone_from(&self.named_now);
+        // Their identity, where the uses of what the encoder made resident have one.
+        if self.used > 0 {
+            self.resident_at = match self.prefix {
+                0 => 0,
+                _ => identity(),
+            };
+        }
+        moved + self.named_now.len()
     }
 
     /// Add each of `uses`, which name their keys.

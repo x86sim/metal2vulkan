@@ -1,10 +1,9 @@
 //! A command buffer's batches (`command_buffer/batches.rs`): where event waits and signals, and
-//! binary semaphore waits and signals, split its encoders; which drivers' batches may wait in
-//! a group (`command_buffer/group.rs`); and which drivers' queue failures are relayed
-//! (`device/relay.rs`).
+//! binary semaphore waits and signals, split its encoders; and which drivers' queue failures are
+//! relayed (`device/relay.rs`). Which devices' batches may wait in a group is their check's
+//! (`tests/submit_check.rs`).
 
 use crate::command_buffer::batches::{Batch, Batches};
-use crate::command_buffer::merges_submissions;
 use metal2vulkan::device::{DeviceDescription, DriverFact};
 use metal2vulkan::vk::DriverId;
 
@@ -84,6 +83,27 @@ fn an_encoder_after_a_signal_starts_a_batch() {
         batches.all(),
         [batch(&[], 1, &[('a', 1)]), batch(&[], 2, &[])]
     );
+}
+
+/// The next encoder starts a batch of its own once the current one signals, an event or a binary
+/// semaphore, which a command buffer's carry of shadowed textures' images reads before it opens
+/// the encoder (`State::shadows_to_carry`); and not before.
+#[test]
+fn a_signal_is_pending_until_the_encoder_after_it_starts_a_batch() {
+    let mut batches = Batches::<char, u8>::default();
+    assert!(!batches.signals_pending());
+    batches.encoder();
+    assert!(!batches.signals_pending(), "an encoder alone");
+    batches.signal('a', 1);
+    assert!(batches.signals_pending(), "an event signal");
+    batches.encoder();
+    assert!(!batches.signals_pending(), "the encoder after it");
+    assert_eq!(batches.all().len(), 2);
+    batches.binary_signal(7);
+    assert!(batches.signals_pending(), "a binary semaphore signal");
+    batches.wait('b', 1);
+    assert!(!batches.signals_pending(), "a wait split the batches");
+    assert_eq!(batches.all().len(), 3);
 }
 
 #[test]
@@ -244,60 +264,6 @@ fn signals_after_a_failing_encoder_are_dropped() {
     );
 }
 
-/// Whether a driver's batches may wait in one kernel submission is the driver's **fact**, never
-/// its name (`command_buffer/group.rs`): a driver measured to merge a `vkQueueSubmit`'s
-/// `VkSubmitInfo`s that signal nothing into the next one's kernel submission
-/// (`DriverFact::SubmissionsWithoutSignalsMerge`) groups its batches; every other driver takes the
-/// ungrouped path, each batch its own call, which is exact alike.
-///
-/// The check over every committed profile: a profile groups only where its driver is one the fact
-/// is measured of, so a decision that read the driver's name -- the Mesa drivers no lane measured
-/// read alike there -- would answer otherwise for one of them. A `MEASURED` row written without a
-/// measurement would show here as a MoltenVK, NVIDIA or SwiftShader profile that groups.
-#[test]
-fn only_drivers_measured_to_merge_their_submissions_group_their_batches() {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles");
-    let mut read = 0;
-    let mut grouped = 0;
-    for entry in std::fs::read_dir(&dir).expect("validation/profiles is readable") {
-        let path = entry.expect("directory entry").path();
-        if path.extension().is_none_or(|x| x != "json") {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path).expect("profile is readable");
-        let description =
-            DeviceDescription::from_khronos_json(&text, None).expect("profile parses");
-        let merges = merges_submissions(&description.driver_facts());
-        if merges {
-            // Only a driver the fact is measured of: Mesa's RADV, ANV and llvmpipe.
-            assert!(
-                matches!(
-                    description.driver_id,
-                    Some(
-                        DriverId::MESA_RADV
-                            | DriverId::INTEL_OPEN_SOURCE_MESA
-                            | DriverId::MESA_LLVMPIPE
-                    )
-                ),
-                "{} groups its batches with no row of its driver",
-                path.display()
-            );
-            grouped += 1;
-        }
-        read += 1;
-    }
-    assert!(read > 1, "profiles read: {read}");
-    // The grouped form is reachable, and the fact alone chooses it.
-    assert!(grouped > 0, "profiles that group: {grouped}");
-    assert!(merges_submissions(
-        &[DriverFact::SubmissionsWithoutSignalsMerge]
-            .into_iter()
-            .collect()
-    ));
-    assert!(!merges_submissions(&Default::default()));
-}
-
 /// Whether a device's queue failures are relayed to the command buffers that failed is the
 /// driver's **fact**, never its name (`device/mod.rs`, `device/relay.rs`): a driver that reports
 /// a command buffer's execution failure through the instance's messenger alone, and loses the
@@ -311,8 +277,7 @@ fn only_drivers_measured_to_merge_their_submissions_group_their_batches() {
 /// including at a release and on a GPU no lane measured.
 #[test]
 fn only_drivers_that_report_their_failures_by_messenger_relay_them() {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles");
+    let dir = metal2vulkan_devtools::validation_dir().join("profiles");
     let mut moltenvk = 0;
     let mut other = 0;
     for entry in std::fs::read_dir(&dir).expect("validation/profiles is readable") {

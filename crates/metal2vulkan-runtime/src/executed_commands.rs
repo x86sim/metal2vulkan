@@ -13,12 +13,14 @@
 //!   records, on the thread that reads them ([`RecordsRead`]), with no lock of the command buffer
 //!   held. An execution `commit` recorded from the CPU's records whose buffer an encoder makes
 //!   resident for writing before its batch is submitted is read again in its host step, and the
-//!   handler sees it again. An execution in an encoder the command buffer's failure runs nothing
+//!   handler sees it again; so is one whose render pass `commit` left to its host step for a
+//!   pipeline its replay met still being made at the command buffer's bound. An execution in an encoder the command buffer's failure runs nothing
 //!   of (`commit_failed`) is never read.
 //! - **Its cost.** None without a handler but one lock of the command buffer's state per
 //!   execution read; with one, the facts are gathered from what the reading resolved already.
 
 use super::command_buffer::CommandBuffer;
+use super::degradation::NoticesFor;
 use super::error::{invalid, Error, Problem};
 use super::indirect_command_buffer::IndirectCommandBuffer;
 use super::residency::Residency;
@@ -33,8 +35,8 @@ pub type ExecutedCommandsHandler = Arc<dyn Fn(&ExecutedCommands) + Send + Sync +
 pub enum RecordsRead {
     /// In `commit`, on the committing thread: the CPU's records as they stood then.
     Commit,
-    /// In the host step, on the scheduler's thread: the records as the GPU and the CPU left
-    /// them, once the work before the execution completed.
+    /// In the host step, on one of the steps' threads (`scheduler/steps.rs`): the records as the
+    /// GPU and the CPU left them, once the work before the execution completed.
     HostStep,
     /// Not on the host: the GPU reads them as it runs (`gpu_execute.rs`), so
     /// [`ExecutedCommands::commands`] is empty and
@@ -102,6 +104,12 @@ impl CommandBuffer {
 
     /// Hand the handlers the facts `facts` gathers of an execution of `buffer` read at `read`,
     /// under `residency`, the command buffer's, where it has handlers; with no lock held.
+    /// Whether the command buffer has an executed-commands handler, which an execution reports
+    /// the commands it ran to ([`report_executed`](Self::report_executed)).
+    pub(crate) fn reports_executed(&self) -> bool {
+        !self.state().executed_handlers.is_empty()
+    }
+
     pub(crate) fn report_executed(
         &self,
         buffer: &IndirectCommandBuffer,
@@ -121,6 +129,8 @@ impl CommandBuffer {
             unread_states_can_encode,
             writable: residency.writable_indirect_command_buffers(),
         };
+        // The program's code: no command buffer's work of the runtime's.
+        let _program = NoticesFor::none();
         for handler in &handlers {
             handler(&executed);
         }

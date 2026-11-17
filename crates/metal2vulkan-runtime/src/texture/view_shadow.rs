@@ -8,9 +8,10 @@
 //!   view's format (`view_plan.rs`).
 //! - **Another format of a texture made without `PixelFormatView` usage**: plain Metal makes the
 //!   view (its API validation stops it) and renders through it the same; the texture's image was
-//!   made mutable, if at all, only for its sRGB twin's formats (`image_plan.rs`), which keeps the
-//!   driver's compression of it, so a view of another format of its class (`BGRA8Unorm` of an
-//!   `RGBA8Unorm` texture) is not a view of that image.
+//!   made mutable, if at all, only for its sRGB twin's formats and, where it renders, its
+//!   channel-order sibling's and that sibling's twin's (`image_plan::reordered_views`), so a view
+//!   of another format of its class (`R32Uint` of an `RGBA8Unorm` texture, or `BGRA8Unorm` of one
+//!   that renders nothing) is not a view of that image.
 //!
 //! Such a view:
 //!
@@ -53,20 +54,21 @@
 //!   `Feature::ViewFormatReinterpretation` (not representable) where the device reinterprets no
 //!   components, else of `Feature::TextureView` (not implemented).
 
-use super::{IdUse, Image, Owner, Storage, Texture};
+use super::{IdUse, Image, Over, Owner, Storage, Stored, Texture};
 use crate::degradation::Degradation;
 use crate::device::lock;
-use crate::error::{internal, Error};
+use crate::error::{internal, Error, RuntimeGap};
 use crate::image_plan::plan_image;
 use crate::image_plan::{copies_between, takes_views_of};
 use crate::memory::Placement;
 use crate::resource::{Identity, ResourceKey};
-use crate::shadow::{Backing, ImageThrough, ShadowCopies, ShadowSource};
+use crate::shadow::{Backing, ImageThrough, ImageTruth, ShadowCopies, ShadowSource};
 use crate::shadow_merge::ScratchSpares;
+use crate::shadow_standing::StandingAcross;
 use crate::texture::{copy_units, image_error, texture_aspects};
 use crate::texture_descriptor::{TextureDescriptor, TextureLayout};
-use crate::tracker::UseRange;
-use crate::values::ResourceOptions;
+use crate::tracker::{ImagePlace, UseRange};
+use crate::values::{ResourceOptions, StorageMode};
 use crate::view_plan::{keeps_components, reinterpretation_refused, ViewRecord};
 use crate::Device;
 use ash::vk;
@@ -109,7 +111,7 @@ impl Texture {
         call: &'static str,
         record: &ViewRecord,
     ) -> Result<Storage, Error> {
-        let device = self.device();
+        let device = self.generation();
         let refused = |image: Option<&Image>| {
             Error::Unsupported(device.apart_refusal(image, record.pixel_format))
         };
@@ -117,7 +119,7 @@ impl Texture {
         if let Some(storage) = self.converted_view(call, record) {
             return storage;
         }
-        match &self.0.storage {
+        match self.storage()? {
             Storage::Image(image) => {
                 let base = match &image.owner {
                     Owner::ViewShadow(shadow) => &shadow.base,
@@ -127,10 +129,13 @@ impl Texture {
                     | Owner::Heap(_)
                     | Owner::HeapShadow(_) => return Err(refused(Some(image.as_ref()))),
                 };
-                if self.device().image_takes_view(base, record.pixel_format) {
+                if self
+                    .generation()
+                    .image_takes_view(base, record.pixel_format)
+                {
                     return Ok(Storage::Image(Arc::clone(base)));
                 }
-                let shadow = self.device().new_view_shadow(
+                let shadow = self.generation().new_view_shadow(
                     call,
                     base,
                     &self.root().0.record,
@@ -143,6 +148,11 @@ impl Texture {
             Storage::Shadow { .. } if record.presented.rotation != 0 => {
                 self.rotated_view(call, record)
             }
+            // A tiled texture's image is a shadow of the bytes already, a copy taken at use
+            // (`Buffer::new_tiled_texture`): no second shadow holds its levels.
+            Storage::Shadow { image, .. } if image.plan().levels > 1 => {
+                Err(refused(Some(image.as_ref())))
+            }
             Storage::Alias { texels, .. } | Storage::Shadow { texels, .. } => {
                 let mut descriptor = TextureDescriptor::texture_2d(
                     record.pixel_format,
@@ -154,10 +164,16 @@ impl Texture {
                 descriptor.swizzle = record.swizzle;
                 descriptor.resource_options = texels.options();
                 let layout = descriptor
-                    .check(self.device().properties().texture_rules())
+                    .check(self.generation().properties().texture_rules())
                     .map_err(|_| refused(None))?;
-                self.device()
-                    .storage_over_buffer(call, Arc::clone(texels), &descriptor, &layout)
+                // A view's storage never moves in place (`texture/storage_form.rs`), and its
+                // shadow is made with it: a view binds no rows.
+                let over = (Arc::clone(texels), &mut None, &mut false);
+                let device = self.generation();
+                match device.storage_over_buffer(call, over, &descriptor, &layout)? {
+                    Over::Storage(storage) => Ok(storage),
+                    Over::Shadow(recipe) => device.made_shadow(&recipe),
+                }
             }
             // A texture buffer's views are texel buffer views of its bytes, which take any
             // format of its class (`Texture::view`).
@@ -172,26 +188,37 @@ impl Texture {
         &self,
         record: &ViewRecord,
     ) -> Option<(Arc<Image>, (PixelFormat, TextureSwizzleChannels))> {
-        let Storage::Image(image) = &self.0.storage else {
+        let Stored::Made(Storage::Image(image)) = self.stored() else {
             return None;
         };
         let base = truth(image);
-        let read_as = self.device().read_as(base, record)?;
+        let read_as = self.generation().read_as(base, record)?;
         Some((Arc::clone(base), read_as))
+    }
+
+    /// The pixel format the texture's bindings present (`ViewRecord::bound`): its own, or, for a
+    /// texture that reads its image in another format (`ViewRecord::read_as`: a view in other
+    /// channels of its image's bits, a two-plane YCbCr texture's luma view, a texture over a P3
+    /// surface), that format, whose texels a slot bound to it reads.
+    pub(crate) fn bound_pixel_format(&self) -> PixelFormat {
+        self.0.record.bound().pixel_format
     }
 
     /// A texture presenting what this one's bindings present (`ViewRecord::bound`) over the same
     /// storage, where they differ: a view that reads its image in the image's own format, as a
-    /// texture of that format. `None` for every other texture.
-    pub(crate) fn bound_twin(&self) -> Option<Texture> {
-        self.0.record.read_as?;
-        Some(Texture::made(
-            self.device(),
-            self.0.storage.clone(),
+    /// texture of that format. `None` for every other texture. Refused as the texture's storage
+    /// is ([`Texture::storage`]).
+    pub(crate) fn bound_twin(&self) -> Result<Option<Texture>, Error> {
+        if self.0.record.read_as.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Texture::made(
+            self.generation(),
+            self.storage()?.clone(),
             self.0.record.bound(),
             Some(self.clone()),
             IdUse::Runtime,
-        ))
+        )))
     }
 
     /// The texture a pass renders into for a view that its bindings present in its image's own
@@ -202,18 +229,18 @@ impl Texture {
     /// into such a view (probe `a8write`: an `A8Unorm` view of an `R8Unorm` texture stores the
     /// fragment's alpha). Refused as the shadow's image is.
     pub(crate) fn view_render_shadow(&self, call: &'static str) -> Result<Texture, Error> {
-        let mut held = lock(&self.0.render_shadow);
+        let mut held = lock(&self.s().render_shadow);
         if let Some(shadow) = held.as_ref() {
             return Ok(shadow.clone());
         }
-        let Storage::Image(image) = &self.0.storage else {
+        let Storage::Image(image) = self.storage()? else {
             return Err(internal("a view read through its image without one"));
         };
         let record = ViewRecord {
             read_as: None,
             ..self.0.record
         };
-        let device = self.device();
+        let device = self.generation();
         let base = truth(image);
         let shadow = device.new_view_shadow(call, base, &self.root().0.record, &record, true)?;
         let texture = Texture::made(
@@ -311,6 +338,9 @@ impl Device {
         view: &ViewRecord,
         rendered: bool,
     ) -> Result<Image, Error> {
+        if base.caller_plane().is_some() {
+            return Err(Error::NotImplemented(RuntimeGap::VkImagePlaneCopy));
+        }
         let apart =
             || Error::Unsupported(self.apart_refusal(Some(base.as_ref()), view.pixel_format));
         let image = self.image_shadow(call, base, texture, view, apart)?;
@@ -352,7 +382,10 @@ impl Device {
     /// An image presenting `view` of `base` in memory of its own, a shadow of `base`'s texels
     /// (the module docs): an image of the view's format and usage and the shape of `texture`, the
     /// record of the texture `base` was made for, whose copies move the levels and layers `view`
-    /// presents (`ShadowSource::Image`). Refused `refused()` where the copies cannot serve the pair
+    /// presents (`ShadowSource::Image`). Its truth is a [`Backing::PrivateImage`] where only the
+    /// runtime's commands write `base` (a tracked `Private` or `Memoryless` image in memory of its
+    /// own), and then it may stand across command buffers until `base`'s `VkImage` is handed out
+    /// (`shadow_standing.rs`). Refused `refused()` where the copies cannot serve the pair
     /// (no transfer usage, formats whose copy units differ), and as `new_texture` refuses the
     /// image.
     pub(super) fn image_shadow(
@@ -389,6 +422,7 @@ impl Device {
             aspects,
             levels: view.base_level..view.base_level + view.level_count,
             layers: view.base_layer..view.base_layer + view.layer_count,
+            place: ImagePlace::WHOLE,
         };
         let volume = texture.texture_type == TextureType::Type3D;
         let regions: Vec<vk::ImageCopy> = (view.base_level..view.base_level + view.level_count)
@@ -456,10 +490,30 @@ impl Device {
             tracked: base.identity.tracked,
         };
         let (truth, truth_key, truth_range) = (
-            base.own_raw(),
+            Arc::clone(base) as Arc<dyn ImageTruth>,
             base.identity.key,
             range(texture_aspects(base.plan())),
         );
+        // Only the runtime's commands write a tracked private image in memory of its own that no
+        // other process opens: the CPU reaches none of its texels, and no other resource lies in
+        // its memory.
+        let private = matches!(
+            base.options.storage_mode(),
+            Ok(StorageMode::Private | StorageMode::Memoryless)
+        );
+        let own = matches!(
+            base.owner,
+            Owner::Runtime {
+                shareable: false,
+                ..
+            }
+        );
+        let backing = match private && own && base.identity.tracked {
+            true => Backing::PrivateImage,
+            false => Backing::Image,
+        };
+        let standing =
+            StandingAcross::over_image(Arc::clone(&truth), backing == Backing::PrivateImage);
         let shadow_range = range(aspects);
         let mut descriptor = TextureDescriptor::texture_2d(view.pixel_format, 1, 1, false);
         descriptor.resource_options = base.options;
@@ -479,10 +533,11 @@ impl Device {
                     shadow_range,
                     tracked: identity.tracked,
                     drops_writes: false,
-                    backing: Backing::Image,
+                    levels: None,
+                    backing,
                     merge_scratch: ScratchSpares::default(),
-                    touched: AtomicU64::new(0),
                     stood: AtomicU64::new(0),
+                    standing,
                 };
                 Owner::ViewShadow(Box::new(ViewShadow {
                     placement,

@@ -64,6 +64,21 @@ pub(super) fn stream(
     w.finish()
 }
 
+/// A module-version-1 stream: identification and a module whose body `body` writes after
+/// `VERSION = 1`, with no string table (version 1 names values in the module symbol table).
+pub(super) fn stream_v1(body: impl FnOnce(&mut Writer)) -> Vec<u8> {
+    let mut w = Writer::bitcode();
+    w.enter(u64::from(codes::IDENTIFICATION_BLOCK), 5);
+    w.unabbrev(1, &chars("test"));
+    w.unabbrev(2, &[0]);
+    w.end();
+    w.enter(u64::from(codes::MODULE_BLOCK), 3);
+    w.unabbrev(1, &[1]);
+    body(&mut w);
+    w.end();
+    w.finish()
+}
+
 pub(super) fn block(w: &mut Writer, id: u32, records: &[(u64, Vec<u64>)]) {
     w.enter(u64::from(id), 4);
     for (code, ops) in records {
@@ -126,13 +141,19 @@ fn good_types() -> Vec<(u64, Vec<u64>)> {
 /// The body of the valid synthetic module. Values: 0 `@g`, 1 `@f`, 2 the aggregate `[i32 7, i32
 /// 1]` (forward references to 3 and 4), 3 `i32 7`, 4 `i32 1`.
 fn good_body(w: &mut Writer) {
+    good_body_in(w, &[0, 1], &[1, 1]);
+}
+
+/// [`good_body`] with `g` and `f` the string-table fields of `@g` and `@f` (version 2), or none
+/// (version 1, which names them in the module symbol table).
+fn good_body_in(w: &mut Writer, g: &[u64], f: &[u64]) {
     block(w, codes::TYPE_BLOCK, &good_types());
     w.unabbrev(3, &chars("e-p:64:64:64-i32:32:32"));
     w.unabbrev(5, &chars("air.static_init"));
     // @g: [2 x i32] addrspace(2) constant, init value 2, internal, align 4, section 1.
-    w.unabbrev(7, &[0, 1, 5, 1 | 2 | (2 << 2), 3, 3, 3, 1]);
+    w.unabbrev(7, &[g, &[5, 1 | 2 | (2 << 2), 3, 3, 3, 1][..]].concat());
     // @f: declare void (%S addrspace(1)*).
-    w.unabbrev(8, &[1, 1, 4, 0, 1, 0, 0, 0, 0]);
+    w.unabbrev(8, &[f, &[4, 0, 1, 0, 0, 0, 0][..]].concat());
     block(
         w,
         codes::CONSTANTS_BLOCK,
@@ -164,6 +185,28 @@ fn good_body(w: &mut Writer) {
 
 fn good() -> Vec<u8> {
     stream(2, 0, b"gf", good_body)
+}
+
+/// A name record of a version-1 module symbol table: `code` (`VST_ENTRY` or `VST_FNENTRY`) with
+/// `ops` before the name's characters.
+pub(super) fn vst_name(code: u32, ops: &[u64], name: &str) -> (u64, Vec<u64>) {
+    (u64::from(code), [ops, chars(name).as_slice()].concat())
+}
+
+/// [`good`] in module version 1, its symbol table `names` (after the module's other blocks).
+fn good_v1(names: &[(u64, Vec<u64>)]) -> Vec<u8> {
+    stream_v1(|w| {
+        good_body_in(w, &[], &[]);
+        block(w, codes::VALUE_SYMTAB_BLOCK, names);
+    })
+}
+
+/// [`good`]'s names in its version-1 symbol table.
+fn good_names() -> Vec<(u64, Vec<u64>)> {
+    vec![
+        vst_name(codes::VST_ENTRY, &[1], "f"),
+        vst_name(codes::VST_ENTRY, &[0], "g"),
+    ]
 }
 
 /// Decode as translation does ([`DecodeOptions::default`]).
@@ -320,6 +363,92 @@ fn decoding_is_deterministic() {
     assert_eq!(decode(&bytes).unwrap(), decode(&bytes).unwrap());
 }
 
+/// Module version 1 names globals and functions in the module symbol table instead of the string
+/// table, and its records hold no name fields: the same module decodes to the same tables, and an
+/// entry may come in any order.
+#[test]
+fn a_version_1_module_decodes_as_its_version_2_twin() {
+    let v2 = decode(&good()).unwrap();
+    assert_eq!(decode(&good_v1(&good_names())).unwrap(), v2);
+    let mut reversed = good_names();
+    reversed.reverse();
+    assert_eq!(decode(&good_v1(&reversed)).unwrap(), v2);
+    // A symbol table ahead of the records it names (where LLVM before 3.8 wrote it, ahead of the
+    // function blocks) reads the same.
+    let early = stream_v1(|w| {
+        block(w, codes::VALUE_SYMTAB_BLOCK, &good_names());
+        good_body_in(w, &[], &[]);
+    });
+    assert_eq!(decode(&early).unwrap(), v2);
+    // A value the table does not name is unnamed, as an empty string-table name leaves it.
+    let unnamed = decode(&good_v1(&good_names()[..1])).unwrap();
+    let g = unnamed.parts.globals.values().next().unwrap();
+    assert_eq!(unnamed.parts.symbols.get(g.name), Some(&b""[..]));
+    let t = decode(&stream(2, 0, b"gf", |w| good_body_in(w, &[0, 0], &[1, 1]))).unwrap();
+    assert_eq!(unnamed, t);
+}
+
+/// Each malformed version-1 symbol table, refused by its record.
+#[test]
+fn version_1_symbol_table_errors_are_typed() {
+    let vst = |code| BitcodeError::MalformedRecord {
+        block: codes::VALUE_SYMTAB_BLOCK,
+        code,
+    };
+    let err = |names: &[(u64, Vec<u64>)]| decode(&good_v1(names)).unwrap_err();
+    let names = |extra: (u64, Vec<u64>)| [good_names(), vec![extra]].concat();
+    // Two names for one value, a name for a constant or a value that does not exist, a block name
+    // in the module's table, and a NUL in a name.
+    for (extra, code) in [
+        (vst_name(codes::VST_ENTRY, &[0], "h"), codes::VST_ENTRY),
+        (vst_name(codes::VST_ENTRY, &[3], "c"), codes::VST_ENTRY),
+        (vst_name(codes::VST_ENTRY, &[99], "x"), codes::VST_ENTRY),
+        (vst_name(codes::VST_BBENTRY, &[0], "bb"), codes::VST_BBENTRY),
+        ((1, vec![2, u64::from(b'a'), 0]), codes::VST_ENTRY),
+        ((1, vec![2, 300]), codes::VST_ENTRY),
+    ] {
+        let e = err(&names(extra.clone()));
+        assert_eq!(bitcode_kind(&e), Some(&vst(code)), "{extra:?}: {e}");
+    }
+    // A function offset on a global (`@f` is a declaration: see `function_tests`).
+    let e = err(&[
+        vst_name(codes::VST_FNENTRY, &[0, 7], "g"),
+        vst_name(codes::VST_ENTRY, &[1], "f"),
+    ]);
+    assert_eq!(bitcode_kind(&e), Some(&vst(codes::VST_FNENTRY)));
+    // A record with no value id.
+    let e = err(&[(u64::from(codes::VST_ENTRY), vec![])]);
+    assert_eq!(bitcode_kind(&e), Some(&vst(codes::VST_ENTRY)));
+    // A summary-index entry LLVM defines, and a code it does not.
+    let e = err(&names((u64::from(codes::VST_COMBINED_ENTRY), vec![2, 0])));
+    assert_eq!(
+        unsupported_feature(&e),
+        Some(&Feature::BitcodeRecord {
+            block: codes::VALUE_SYMTAB_BLOCK,
+            code: codes::VST_COMBINED_ENTRY
+        })
+    );
+    let e = err(&names((9, vec![2])));
+    assert_eq!(
+        bitcode_kind(&e),
+        Some(&BitcodeError::UnknownRecord {
+            block: codes::VALUE_SYMTAB_BLOCK,
+            code: 9
+        })
+    );
+    // Two module symbol tables.
+    let e = decode(&stream_v1(|w| {
+        good_body_in(w, &[], &[]);
+        block(w, codes::VALUE_SYMTAB_BLOCK, &good_names());
+        block(w, codes::VALUE_SYMTAB_BLOCK, &[]);
+    }))
+    .unwrap_err();
+    assert_eq!(bitcode_kind(&e), Some(&vst(0)));
+    // Version 2 names nothing in its module symbol table.
+    let e = with_body(|w| block(w, codes::VALUE_SYMTAB_BLOCK, &good_names())).unwrap_err();
+    assert_eq!(bitcode_kind(&e), Some(&vst(codes::VST_ENTRY)));
+}
+
 fn with_body(extra: impl FnOnce(&mut Writer)) -> Result<ModuleTables, Error> {
     decode(&stream(2, 0, b"gf", |w| {
         good_body(w);
@@ -329,11 +458,14 @@ fn with_body(extra: impl FnOnce(&mut Writer)) -> Result<ModuleTables, Error> {
 
 #[test]
 fn version_and_identification_are_checked() {
-    let e = decode(&stream(1, 0, b"", |_| {})).unwrap_err();
-    assert_eq!(
-        bitcode_kind(&e),
-        Some(&BitcodeError::UnsupportedBitcodeVersion { version: 1 })
-    );
+    // Version 0 numbers values absolutely, which the reader does not; 3 is past LLVM's.
+    for version in [0, 3] {
+        let e = decode(&stream(version, 0, b"", |_| {})).unwrap_err();
+        assert_eq!(
+            bitcode_kind(&e),
+            Some(&BitcodeError::UnsupportedBitcodeVersion { version })
+        );
+    }
     let e = decode(&stream(2, 1, b"", |_| {})).unwrap_err();
     assert_eq!(bitcode_kind(&e), Some(&BitcodeError::BadIdentification));
     // A module record before VERSION.
@@ -428,8 +560,8 @@ fn unknown_and_unsupported_records_are_typed() {
         Some(&Feature::CallingConvention(9))
     );
     // A global in an address space outside AIR's.
-    let e = with_body(|w| w.unabbrev(7, &[0, 1, 0, 2 | (8 << 2), 0, 0, 0, 0])).unwrap_err();
-    assert_eq!(unsupported_feature(&e), Some(&Feature::AddressSpace(8)));
+    let e = with_body(|w| w.unabbrev(7, &[0, 1, 0, 2 | (9 << 2), 0, 0, 0, 0])).unwrap_err();
+    assert_eq!(unsupported_feature(&e), Some(&Feature::AddressSpace(9)));
 }
 
 fn types_only(records: &[(u64, Vec<u64>)]) -> Result<ModuleTables, Error> {
@@ -1020,12 +1152,55 @@ fn constant_errors_are_typed() {
         bitcode_kind(&e),
         Some(BitcodeError::MalformedRecord { .. })
     ));
-    // Block addresses, `select` expressions, and LLVM 23's byte constants are valid LLVM outside
-    // the typed model.
-    for code in [21u32, 13, 35, 36] {
+    // Every constant record LLVM defines outside the typed model is refused by its name: the
+    // constant expressions the IR has no form for, block addresses, signed pointers, and LLVM 23's
+    // byte constants.
+    use crate::error::ConstantRecord as R;
+    for (code, record) in [
+        (13u32, R::Select),
+        (14, R::ExtractElement),
+        (15, R::InsertElement),
+        (16, R::ShuffleVector),
+        (17, R::Compare),
+        (19, R::ShuffleVector),
+        (21, R::BlockAddress),
+        (25, R::UnaryOp),
+        (27, R::DsoLocalEquivalent),
+        (29, R::NoCfi),
+        (31, R::GepWithInrange),
+        (33, R::PtrAuth),
+        (34, R::PtrAuth),
+        (35, R::Byte),
+        (36, R::Byte),
+    ] {
         let e = constants(&[(1, vec![0]), (u64::from(code), vec![0, 0, 0])]).unwrap_err();
-        assert_eq!(unsupported_feature(&e), Some(&Feature::Constant { code }));
+        assert_eq!(
+            unsupported_feature(&e),
+            Some(&Feature::Constant { record }),
+            "{code}"
+        );
     }
+    // A `ptrtoaddr` cast expression (CE_CAST with cast opcode 13) too; an opcode past it is no
+    // LLVM cast.
+    let e = constants(&[(1, vec![0]), (11, vec![13, 0, 0])]).unwrap_err();
+    assert_eq!(
+        unsupported_feature(&e),
+        Some(&Feature::Constant {
+            record: R::PtrToAddr
+        })
+    );
+    let e = constants(&[(1, vec![0]), (11, vec![14, 0, 0])]).unwrap_err();
+    assert!(matches!(
+        bitcode_kind(&e),
+        Some(BitcodeError::MalformedRecord { .. })
+    ));
+    // A WIDE_INTEGER of an integer type of at most 64 bits, which LLVM never writes (the type
+    // table refuses the wider ones).
+    let e = constants(&[(1, vec![0]), (5, vec![2, 0])]).unwrap_err();
+    assert!(matches!(
+        bitcode_kind(&e),
+        Some(BitcodeError::MalformedRecord { .. })
+    ));
     let e = constants(&[(1, vec![0]), (60, vec![])]).unwrap_err();
     assert_eq!(
         bitcode_kind(&e),
@@ -1033,6 +1208,131 @@ fn constant_errors_are_typed() {
             block: codes::CONSTANTS_BLOCK,
             code: 60
         })
+    );
+}
+
+/// `records` in a module-level constants block over [`good_types`] and three more: 6 `void ()`,
+/// 7 `void ()*` (a typed pointer in address space 0), 8 `ptr` (opaque, address space 0).
+fn asm_constants(records: &[(u64, Vec<u64>)]) -> Result<ModuleTables, Error> {
+    let mut types = good_types();
+    types[0] = (1, vec![9]);
+    types.extend([(21, vec![0, 3]), (8, vec![6, 0]), (25, vec![0])]);
+    decode(&stream(2, 0, b"", |w| {
+        block(w, codes::TYPE_BLOCK, &types);
+        block(w, codes::CONSTANTS_BLOCK, records);
+    }))
+}
+
+/// `[len, bytes...]`: an inline assembly string's operands.
+fn asm_text(s: &str) -> Vec<u64> {
+    [vec![s.len() as u64], chars(s)].concat()
+}
+
+/// Every spelling of LLVM's inline assembly record decodes to its text and flags: `INLINEASM`
+/// (code 30, naming its function type), and the typed-pointer `INLINEASM_OLD3` (28),
+/// `INLINEASM_OLD2` (23) and `INLINEASM_OLD` (18), typed by their pointer's pointee. The constant
+/// is a `ptr` in address space 0, and the module verifies.
+#[test]
+fn inline_asm_records_decode_in_every_spelling() {
+    let empty = [asm_text(""), asm_text("")].concat();
+    let text = [asm_text("nop \"x\""), asm_text("~{memory}")].concat();
+    let t = asm_constants(&[
+        (1, vec![8]),
+        // asm sideeffect "", "" of type void (): what an MSL `asm volatile("")` compiles to.
+        (30, [vec![6, 1], empty.clone()].concat()),
+        // Every flag.
+        (30, [vec![6, 0b1111], text.clone()].concat()),
+        (1, vec![7]),
+        (28, [vec![0b1010], text.clone()].concat()),
+        (23, [vec![0b100], empty.clone()].concat()),
+        (18, [vec![0b11], text.clone()].concat()),
+    ])
+    .unwrap();
+    let asm = |i: u64| match &t.parts.consts.get(t.value(i).unwrap()).unwrap().value {
+        Const::InlineAsm(a) => (**a).clone(),
+        other => panic!("value {i}: {other:?}"),
+    };
+    let flags =
+        |a: &crate::ir::InlineAsm| [a.side_effects, a.align_stack, a.intel_dialect, a.can_throw];
+    assert_eq!(asm(0).spelling(), r#"asm sideeffect "", """#);
+    assert_eq!(flags(&asm(0)), [true, false, false, false]);
+    assert_eq!(&*asm(1).template, b"nop \"x\"");
+    assert_eq!(&*asm(1).constraints, b"~{memory}");
+    assert_eq!(
+        asm(1).spelling(),
+        r#"asm sideeffect alignstack inteldialect unwind "nop \22x\22", "~{memory}""#
+    );
+    assert_eq!(flags(&asm(2)), [false, true, false, true]);
+    assert_eq!(flags(&asm(3)), [false, false, true, false]);
+    assert_eq!(&*asm(3).template, b"");
+    assert_eq!(flags(&asm(4)), [true, true, false, false]);
+    assert_eq!(&*asm(4).constraints, b"~{memory}");
+    let ptr0 = |i: u64| t.parts.consts.ty(t.value(i).unwrap()).unwrap();
+    assert_eq!(ptr0(0), ptr0(2), "both pointer spellings erase to one ptr");
+    verify_module_level(&t).unwrap();
+}
+
+/// An inline assembly record that does not fit its spelling is malformed: a flag bit the spelling
+/// does not define, a function type that is none, a string running past the record, a byte above
+/// 255, an operand after the constraints, an old spelling over an opaque pointer (no pointee to
+/// type it), and a type other than a pointer. Inline assembly as another constant's operand fails
+/// verification: LLVM has no such constant.
+#[test]
+fn malformed_inline_asm_records_are_typed() {
+    let empty = [asm_text(""), asm_text("")].concat();
+    for records in [
+        vec![
+            (1, vec![8]),
+            (30, [vec![6, 1 << 4], empty.clone()].concat()),
+        ],
+        vec![(1, vec![7]), (28, [vec![1 << 4], empty.clone()].concat())],
+        vec![(1, vec![7]), (23, [vec![1 << 3], empty.clone()].concat())],
+        vec![(1, vec![7]), (18, [vec![1 << 2], empty.clone()].concat())],
+        vec![(1, vec![8]), (30, [vec![0, 1], empty.clone()].concat())],
+        vec![(1, vec![8]), (30, vec![6, 1, 3, 1, 2])],
+        vec![(1, vec![8]), (30, vec![6, 1, 1, 256, 0])],
+        vec![
+            (1, vec![8]),
+            (30, [vec![6, 1], empty.clone(), vec![0]].concat()),
+        ],
+        vec![(1, vec![8]), (30, vec![6, 1, 0])],
+        vec![(1, vec![8]), (28, [vec![1], empty.clone()].concat())],
+        vec![(1, vec![0]), (30, [vec![6, 1], empty.clone()].concat())],
+    ] {
+        let e = asm_constants(&records).unwrap_err();
+        assert!(
+            matches!(bitcode_kind(&e), Some(BitcodeError::MalformedRecord { .. })),
+            "{records:?}: {e:?}"
+        );
+    }
+    // A struct `{ ptr }` (type 9) holding an inline assembly expression.
+    let mut types = good_types();
+    types[0] = (1, vec![10]);
+    types.extend([
+        (21, vec![0, 3]),
+        (8, vec![6, 0]),
+        (25, vec![0]),
+        (18, vec![0, 8]),
+    ]);
+    let t = decode(&stream(2, 0, b"", |w| {
+        block(w, codes::TYPE_BLOCK, &types);
+        block(
+            w,
+            codes::CONSTANTS_BLOCK,
+            &[
+                (1, vec![8]),
+                (30, [vec![6, 1], empty.clone()].concat()),
+                (1, vec![9]),
+                (7, vec![0]),
+            ],
+        );
+    }))
+    .unwrap();
+    let e = verify_module_level(&t).unwrap_err();
+    assert!(
+        matches!(&e, Error::InvalidInput(i)
+            if i.kind == InputErrorKind::Verify(crate::error::VerifyError::MalformedConstant)),
+        "{e:?}"
     );
 }
 
@@ -1202,6 +1502,7 @@ pub(super) fn mutate(bytes: &[u8]) {
 #[test]
 fn mutated_synthetic_modules_never_panic() {
     mutate(&good());
+    mutate(&good_v1(&good_names()));
 }
 
 // ---- Public fixtures, assembled at test time ----

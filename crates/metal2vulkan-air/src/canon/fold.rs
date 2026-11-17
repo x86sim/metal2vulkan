@@ -1,10 +1,16 @@
 //! Constant folding for SCCP.
 //!
 //! Folds exactly what the spec lists: integer arithmetic and comparisons, `fcmp` on constants
-//! (exact IEEE comparison of the stored values), casts among integers, same-width bit casts, int to
+//! (exact IEEE comparison of the stored values, a NaN by the predicate's order; never of a
+//! subnormal operand, which a device that flushes subnormals compares as zero), casts among
+//! integers, same-width bit casts, int to
 //! pointer of zero and pointer to int of null, `freeze` of a constant, and element and member
 //! access on constant vectors and aggregates. SCCP does **no float arithmetic folding**: the
-//! device's denormal and fast-math behavior is the lowering's contract. Anything else, and any
+//! device's denormal and fast-math behavior is the lowering's contract. It reads what a float
+//! constant is ([`Folder::float_class`]) for the answers an operation's constant operand decides
+//! whatever the others hold: a NaN operand, as it is beside a value only the run knows and quieted
+//! ([`Folder::quiet_nan`]) where every operand is a constant, and a product's `+0` under `nnan`
+//! and `nsz` ([`Folder::float_zero`]). Anything else, and any
 //! operation whose result would be poison (division by zero, an oversized shift, an out-of-range
 //! element), is left unfolded. A fold never guesses: `None` means "not a constant here".
 //!
@@ -66,6 +72,28 @@ fn half_to_f64(h: u16) -> f64 {
         0x1f => f64::NAN,
         e => (1.0 + frac / 1024.0) * 2f64.powi(e - 15),
     }
+}
+
+/// What a float constant is to SCCP's float folds ([`Folder::float_class`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FloatClass {
+    /// Every lane a zero of either sign.
+    Zero,
+    /// Every lane a NaN, quiet or signalling.
+    Nan,
+    /// Anything else.
+    Other,
+}
+
+/// The stored width and mantissa width, in bits, of a float type.
+fn float_bits(ty: &Type) -> Option<(u8, u8)> {
+    Some(match ty {
+        Type::Half => (16, 10),
+        Type::BFloat => (16, 7),
+        Type::Float => (32, 23),
+        Type::Double => (64, 52),
+        _ => return None,
+    })
 }
 
 /// The float formats a static initializer's arithmetic is evaluated in (bfloat is not).
@@ -192,6 +220,19 @@ impl Folder<'_> {
             Const::Int(v) => Some(*v),
             Const::Null => Some(0),
             _ => None,
+        }
+    }
+
+    /// Whether the scalar integer `c` decides `c op x` and `x op c` whatever `x` holds: zero for
+    /// `and` and `mul`, all ones for `or`.
+    pub fn absorbs(&self, op: BinOp, c: ConstId) -> bool {
+        let (Some(w), Some(v)) = (self.ty(c).and_then(|t| self.int_bits(t)), self.int(c)) else {
+            return false;
+        };
+        match op {
+            BinOp::And | BinOp::Mul => v == 0,
+            BinOp::Or => v == mask(w),
+            _ => false,
         }
     }
 
@@ -428,7 +469,128 @@ impl Folder<'_> {
         self.mk(ty, Const::Float(bits), m).map(Some)
     }
 
-    /// `fcmp pred a, b` over scalar floats: an exact IEEE comparison, typed `ty` (`i1`).
+    /// What the float constant `c` is to SCCP's float folds: a zero of either sign (a scalar, a
+    /// vector each lane of which is one, `zeroinitializer` included), or a NaN (a scalar, or a
+    /// vector each lane of which is a NaN or `poison`, at least one a NaN, as LLVM's `m_NaN`
+    /// matches it). Anything else is [`FloatClass::Other`]: a vector of mixed lanes, one with an
+    /// `undef` lane, or a zero with a `poison` lane, and anything not a float constant.
+    pub fn float_class(&self, c: ConstId, m: &mut Meter) -> Result<FloatClass, Error> {
+        let Some(ty) = self.ty(c) else {
+            return Ok(FloatClass::Other);
+        };
+        match (self.types.get(ty), self.value(c)) {
+            (Some(Type::Vector { elem, .. }), Some(Const::Null)) => {
+                Ok(match self.types.get(*elem).and_then(float_bits) {
+                    Some(_) => FloatClass::Zero,
+                    None => FloatClass::Other,
+                })
+            }
+            (Some(Type::Vector { .. }), Some(Const::Aggregate(lanes))) => {
+                m.tick(u32::try_from(lanes.len()).unwrap_or(u32::MAX))?;
+                let (mut zeros, mut nans) = (0, 0);
+                for &lane in lanes.iter() {
+                    match self.scalar_class(lane) {
+                        FloatClass::Zero => zeros += 1,
+                        FloatClass::Nan => nans += 1,
+                        FloatClass::Other if self.poison(lane) => {}
+                        FloatClass::Other => return Ok(FloatClass::Other),
+                    }
+                }
+                Ok(if zeros == lanes.len() {
+                    FloatClass::Zero
+                } else if nans > 0 && zeros == 0 {
+                    FloatClass::Nan
+                } else {
+                    FloatClass::Other
+                })
+            }
+            _ => Ok(self.scalar_class(c)),
+        }
+    }
+
+    /// Whether `c` is `poison`.
+    fn poison(&self, c: ConstId) -> bool {
+        matches!(self.value(c), Some(Const::Poison))
+    }
+
+    /// [`Folder::float_class`] of a scalar.
+    fn scalar_class(&self, c: ConstId) -> FloatClass {
+        let Some((width, mant)) = self
+            .ty(c)
+            .and_then(|t| self.types.get(t))
+            .and_then(float_bits)
+        else {
+            return FloatClass::Other;
+        };
+        let bits = match self.value(c) {
+            Some(Const::Null) => 0,
+            Some(Const::Float(bits)) => *bits,
+            _ => return FloatClass::Other,
+        };
+        let magnitude = bits & mask(width - 1);
+        let exponent = mask(width - 1) & !mask(mant);
+        if magnitude == 0 {
+            FloatClass::Zero
+        } else if magnitude & exponent == exponent && magnitude & mask(mant) != 0 {
+            FloatClass::Nan
+        } else {
+            FloatClass::Other
+        }
+    }
+
+    /// The NaN constant `c` ([`FloatClass::Nan`]) with each NaN quieted, its sign and payload kept
+    /// and its quiet bit, the top mantissa bit, set; a `poison` lane stays `poison`. What constant
+    /// folding of an operation whose every operand is a constant makes of its first NaN operand.
+    pub fn quiet_nan(&mut self, c: ConstId, m: &mut Meter) -> Result<Option<ConstId>, Error> {
+        self.transient(m, |f, m| f.quiet_nan_in(c, m))
+    }
+
+    fn quiet_nan_in(&mut self, c: ConstId, m: &mut Meter) -> Result<Option<ConstId>, Error> {
+        let Some(ty) = self.ty(c) else {
+            return Ok(None);
+        };
+        if !matches!(self.types.get(ty), Some(Type::Vector { .. })) {
+            return self.quiet_scalar(c, m);
+        }
+        let Some(lanes) = self.members(c, m)? else {
+            return Ok(None);
+        };
+        let mut quiet = Vec::with_capacity(lanes.len());
+        for lane in lanes {
+            if self.poison(lane) {
+                quiet.push(lane);
+                continue;
+            }
+            match self.quiet_scalar(lane, m)? {
+                Some(q) => quiet.push(q),
+                None => return Ok(None),
+            }
+        }
+        self.mk(ty, Const::Aggregate(quiet.into_boxed_slice()), m)
+            .map(Some)
+    }
+
+    fn quiet_scalar(&mut self, c: ConstId, m: &mut Meter) -> Result<Option<ConstId>, Error> {
+        let (Some(ty), FloatClass::Nan) = (self.ty(c), self.scalar_class(c)) else {
+            return Ok(None);
+        };
+        let (Some((_, mant)), Some(Const::Float(bits))) =
+            (self.types.get(ty).and_then(float_bits), self.value(c))
+        else {
+            return Ok(None);
+        };
+        let bits = *bits | (1 << (mant - 1));
+        self.mk(ty, Const::Float(bits), m).map(Some)
+    }
+
+    /// The `+0` of the float scalar or vector type `ty` (`zeroinitializer`).
+    pub fn float_zero(&mut self, ty: TypeId, m: &mut Meter) -> Result<ConstId, Error> {
+        self.mk(ty, Const::Null, m)
+    }
+
+    /// `fcmp pred a, b` over scalar floats: an exact IEEE comparison, typed `ty` (`i1`). A NaN
+    /// operand answers by the predicate's order. A subnormal operand is `None`: a device that
+    /// flushes subnormals compares it as a zero of its sign, so the answer is the device's.
     pub fn fcmp(
         &mut self,
         pred: FloatPredicate,
@@ -440,6 +602,9 @@ impl Folder<'_> {
         let (Some(x), Some(y)) = (self.float(a), self.float(b)) else {
             return Ok(None);
         };
+        if self.subnormal(a, x) || self.subnormal(b, y) {
+            return Ok(None);
+        }
         let uno = x.is_nan() || y.is_nan();
         use FloatPredicate as P;
         let r = match pred {
@@ -461,6 +626,17 @@ impl Folder<'_> {
             P::Une => uno || x != y,
         };
         self.mk_int(ty, u64::from(r), m)
+    }
+
+    /// Whether `x`, the value of the float constant `c`, is subnormal in `c`'s format.
+    fn subnormal(&self, c: ConstId, x: f64) -> bool {
+        let min_normal = match self.ty(c).and_then(|t| self.types.get(t)) {
+            Some(Type::Half) => 2f64.powi(-14),
+            Some(Type::BFloat | Type::Float) => f64::from(f32::MIN_POSITIVE),
+            Some(Type::Double) => f64::MIN_POSITIVE,
+            _ => return false,
+        };
+        x != 0.0 && x.abs() < min_normal
     }
 
     /// `op v to ty`.
@@ -532,7 +708,7 @@ impl Folder<'_> {
 
     /// Whether no part of `c` is `undef` or `poison`. The worklist and visited set are charged
     /// as they grow and released on return.
-    fn fully_defined(&self, c: ConstId, m: &mut Meter) -> Result<bool, Error> {
+    pub fn fully_defined(&self, c: ConstId, m: &mut Meter) -> Result<bool, Error> {
         let mut held = 0usize;
         let r = self.walk_defined(c, m, &mut held);
         m.release(held);
@@ -670,17 +846,26 @@ impl Folder<'_> {
             .map(Some)
     }
 
-    /// `llvm.ctpop` over a scalar integer.
-    pub fn ctpop(
+    /// `llvm.{ctpop,bitreverse,bswap}` over a scalar integer (`bswap` of a width that is a
+    /// multiple of 16 bits, as LLVM defines it).
+    pub fn int_unary(
         &mut self,
+        op: LlvmIntOp,
         ty: TypeId,
         x: ConstId,
         m: &mut Meter,
     ) -> Result<Option<ConstId>, Error> {
-        match self.int(x) {
-            Some(v) => self.mk_int(ty, u64::from(v.count_ones()), m),
-            None => Ok(None),
-        }
+        let (Some(w), Some(v)) = (self.int_bits(ty), self.int(x)) else {
+            return Ok(None);
+        };
+        let shift = 64 - u32::from(w.min(64));
+        let r = match op {
+            LlvmIntOp::Ctpop => u64::from(v.count_ones()),
+            LlvmIntOp::BitReverse if w <= 64 => v.reverse_bits() >> shift,
+            LlvmIntOp::Bswap if w <= 64 && w % 16 == 0 => v.swap_bytes() >> shift,
+            _ => return Ok(None),
+        };
+        self.mk_int(ty, r, m)
     }
 
     /// An integer-to-float conversion (`sitofp`/`uitofp`, `air.convert.f.*.{s,u}.*`) of a scalar
@@ -709,6 +894,75 @@ impl Folder<'_> {
         };
         let bits = round_int_to_float(neg, mag, mant_bits, exp_bits);
         self.mk(to, Const::Float(bits), m).map(Some)
+    }
+
+    /// `air.convert` of the integer or `bool` constant `x` (a scalar, or a vector converted lane by
+    /// lane) to type `to`: to `bool`, C++'s `x != 0`; to another integer, zero- or sign-extended by
+    /// the source's signedness (`signed`; a `bool` is zero-extended) or truncated, as C++ converts
+    /// it; a scalar to a float, [`Folder::int_to_float`]. A vector to floats is `None`.
+    pub fn convert_int(
+        &mut self,
+        x: ConstId,
+        signed: bool,
+        to: TypeId,
+        m: &mut Meter,
+    ) -> Result<Option<ConstId>, Error> {
+        self.transient(m, |f, m| f.convert_int_in(x, signed, to, m))
+    }
+
+    fn convert_int_in(
+        &mut self,
+        x: ConstId,
+        signed: bool,
+        to: TypeId,
+        m: &mut Meter,
+    ) -> Result<Option<ConstId>, Error> {
+        let Some(Type::Vector { elem, .. }) = self.types.get(to) else {
+            return self.convert_scalar(x, signed, to, m);
+        };
+        let elem = *elem;
+        if self.types.get(elem).is_some_and(Type::is_float) {
+            return Ok(None);
+        }
+        let Some(lanes) = self.members(x, m)? else {
+            return Ok(None);
+        };
+        let mut out = Vec::with_capacity(lanes.len());
+        for lane in lanes {
+            match self.convert_scalar(lane, signed, elem, m)? {
+                Some(c) => out.push(c),
+                None => return Ok(None),
+            }
+        }
+        self.mk(to, Const::Aggregate(out.into_boxed_slice()), m)
+            .map(Some)
+    }
+
+    /// [`Folder::convert_int`] of a scalar.
+    fn convert_scalar(
+        &mut self,
+        x: ConstId,
+        signed: bool,
+        to: TypeId,
+        m: &mut Meter,
+    ) -> Result<Option<ConstId>, Error> {
+        if self.types.get(to).is_some_and(Type::is_float) {
+            return self.int_to_float(x, signed, to, m);
+        }
+        let (Some(from), Some(dst), Some(v)) = (
+            self.ty(x).and_then(|t| self.int_bits(t)),
+            self.int_bits(to),
+            self.int(x),
+        ) else {
+            return Ok(None);
+        };
+        let r = match (dst, from) {
+            (1, _) => u64::from(v & mask(from) != 0),
+            (_, 1) => v & 1,
+            _ if signed => sext(v, from) as u64,
+            _ => v & mask(from),
+        };
+        self.mk_int(to, r, m)
     }
 
     /// `extractelement vec, idx`.

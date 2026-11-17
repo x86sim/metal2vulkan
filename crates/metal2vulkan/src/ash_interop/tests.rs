@@ -11,8 +11,8 @@ use ash::vk::{Handle, TaggedStructure};
 
 use super::convert::sampler_create_info;
 use super::query::{
-    DepthClampControlFeatures, Maintenance10Properties, Maintenance8Features, ShaderFmaFeatures,
-    ALL_FEATURES,
+    DepthClampControlFeatures, Maintenance10Properties, Maintenance8Features, ShaderFloat8Features,
+    ShaderFmaFeatures, ALL_FEATURES,
 };
 use crate::device::description::FormatProperties;
 use crate::device::profile::Independence;
@@ -158,6 +158,7 @@ fn feature_struct_size(ty: avk::StructureType) -> usize {
         avk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT<'static>,
         Maintenance8Features,
         ShaderFmaFeatures,
+        ShaderFloat8Features,
         avk::PhysicalDeviceBorderColorSwizzleFeaturesEXT<'static>,
         avk::PhysicalDeviceDepthBiasControlFeaturesEXT<'static>,
         avk::PhysicalDeviceDepthClipEnableFeaturesEXT<'static>,
@@ -165,6 +166,7 @@ fn feature_struct_size(ty: avk::StructureType) -> usize {
         avk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT<'static>,
         avk::PhysicalDeviceProvokingVertexFeaturesEXT<'static>,
         avk::PhysicalDeviceLineRasterizationFeaturesEXT<'static>,
+        avk::PhysicalDeviceMultiDrawFeaturesEXT<'static>,
         avk::PhysicalDeviceRayQueryFeaturesKHR<'static>,
         avk::PhysicalDeviceMeshShaderFeaturesEXT<'static>,
         avk::PhysicalDeviceAccelerationStructureFeaturesKHR<'static>,
@@ -450,6 +452,7 @@ const EVERY_EXTENSION: &[&CStr] = &[
     c"VK_KHR_push_descriptor",
     c"VK_KHR_maintenance8",
     c"VK_KHR_shader_fma",
+    c"VK_EXT_shader_float8",
     c"VK_EXT_border_color_swizzle",
     c"VK_EXT_custom_border_color",
     c"VK_EXT_depth_bias_control",
@@ -458,6 +461,7 @@ const EVERY_EXTENSION: &[&CStr] = &[
     c"VK_EXT_primitive_topology_list_restart",
     c"VK_EXT_provoking_vertex",
     c"VK_EXT_line_rasterization",
+    c"VK_EXT_multi_draw",
     c"VK_EXT_sample_locations",
     c"VK_KHR_ray_query",
     c"VK_KHR_acceleration_structure",
@@ -593,6 +597,7 @@ fn unexposed_structures_are_never_chained() {
         VkFeature::ImageView2DOn3DImage,
         VkFeature::SeparateStencilMaskRef,
         VkFeature::ImageViewFormatSwizzle,
+        VkFeature::PointPolygons,
     ] {
         assert!(!desc.features.contains(&absent), "{absent:?}");
     }
@@ -1224,6 +1229,7 @@ fn sampler_create_info_chains_reduction_only_when_needed() {
         reduction: vk::SamplerReductionMode::WEIGHTED_AVERAGE,
         border_components: None,
         ycbcr: None,
+        unnormalized: false,
     };
     let mut reduction = avk::SamplerReductionModeCreateInfo::default();
     let mut border = avk::SamplerBorderColorComponentMappingCreateInfoEXT::default();
@@ -1243,6 +1249,15 @@ fn sampler_create_info_chains_reduction_only_when_needed() {
         (avk::TRUE, avk::CompareOp::LESS.as_raw())
     );
     assert_eq!(info.unnormalized_coordinates, avk::FALSE);
+    // A pixel sampler's description reads texel coordinates.
+    let pixel = vk::SamplerDesc {
+        unnormalized: true,
+        ..desc
+    };
+    let mut reduction = avk::SamplerReductionModeCreateInfo::default();
+    let mut border = avk::SamplerBorderColorComponentMappingCreateInfoEXT::default();
+    let info = sampler_create_info(&pixel, &mut reduction, &mut border);
+    assert_eq!(info.unnormalized_coordinates, avk::TRUE);
     let min = vk::SamplerDesc {
         reduction: vk::SamplerReductionMode::MIN,
         compare: None,

@@ -177,7 +177,13 @@ pub fn replay_against(
     // the case records the venue's gap (above), the sites the run never reached are not
     // divergences because the comparison is told the run stopped, and the device gaps are read
     // **after** the divergences and the refusals, so anything worse outranks them.
-    let (verdict, allowances) = verdict_over(case, answer, &ours, &announced, abort.is_some());
+    let (verdict, allowances) = verdict_over(
+        case,
+        answer,
+        &ours,
+        (&announced, venue.lossless_compression),
+        abort.is_some(),
+    );
     Ok(Replayed {
         case: name.to_owned(),
         venue,
@@ -196,7 +202,8 @@ pub fn replay_against(
 
 /// The verdict of `ours` against `answer`'s outcomes: the most favourable of them, because Metal
 /// produced any of the set and matching one of them is matching Metal. With it, what the case's
-/// allowances did against that outcome.
+/// allowances did against that outcome. `offered` is what the run announced and whether its venue
+/// presents Metal's lossless compression.
 ///
 /// The allowances follow the verdict rather than being gathered over every outcome, because they
 /// are a fact about the comparison the verdict came from: a racy case whose run matched the
@@ -205,7 +212,7 @@ fn verdict_over(
     case: &dyn Case,
     answer: &Answer,
     ours: &Transcript,
-    announced: &[String],
+    (announced, compression): (&[String], bool),
     stopped: bool,
 ) -> (Verdict, Allowances) {
     let allowances = case.allowances();
@@ -231,7 +238,7 @@ fn verdict_over(
             ));
             continue;
         }
-        let offered = Offered::new(announced, &answer.validated);
+        let offered = Offered::new(announced, &answer.validated).on_venue(compression);
         let found = compare_run(&outcome.transcript, ours, &allowances, offered, stopped);
         let used = Allowances {
             named: found.named,
@@ -357,6 +364,60 @@ pub fn shared_memory_notice() -> crate::allowance::Allowance {
     notice_allowance(metal2vulkan_runtime::Degradation::SharedInSystemMemory.code())
 }
 
+/// The declaration a case needs for the split a **venue's driver** makes the runtime take between
+/// two draws that read and write a color in the pixel interlock: `render-pass-split`, which the
+/// runtime announces where a draw that reaches interlocked storage an earlier draw of its
+/// instance wrote begins a render pass instance of its own, on a driver whose such draws race
+/// under load (`DriverFact::InterlockedDrawsRaceUnderLoad`: MoltenVK on Apple's GPUs, which
+/// encodes no Metal barrier inside a render pass there).
+///
+/// **Why it is the venue's and not ours.** Metal runs the case's draws in one pass, ordered by its
+/// tile, and records no split; a driver that orders such draws by the interlock or by a barrier
+/// inside the instance runs them in one instance too. The split is the runtime ordering them on a
+/// driver that does neither, and the notice is it reporting the cost. Like every
+/// [`notice_allowance`] it loosens the notices site alone: every value still compares exactly.
+///
+/// **Its evidence.** Measured on the M3 Max (MoltenVK 1.4.2, macOS 27.0.1): it fired for every row
+/// of `fetch-ordered-*` (its sRGB rows among them), `xr-gamut-*`, `xr-masked-*` whose second draw blends or writes a
+/// `BGR10_XR` word under a mask, and `xr-gradient-*-blended-*`, the families that name it.
+pub fn interlocked_split_notice() -> crate::allowance::Allowance {
+    notice_allowance(metal2vulkan_runtime::Degradation::RenderPassSplit.code())
+}
+
+/// The slug of `docs/API.md`'s accepted difference that says what a device presenting a Mac that
+/// keeps no texture compressed answers, as a Mac with an Intel or AMD GPU does
+/// ([`without_compression`]): "A device answers as the class of Mac it presents".
+pub const WITHOUT_COMPRESSION: &str = "a-device-answers-as-the-class-of-mac-it-presents";
+
+/// The declaration a case needs at `site`, a value Metal's lossless texture compression decides,
+/// for the one answer a **venue's Mac** changes there. The Apple silicon Mac every recording was
+/// taken on keeps textures compressed: a new `Private` texture reads zero or the compressed
+/// texture's fixed pattern, and a GPU blit through a compressed texture writes some formats'
+/// canonical encoding. A device that presents a Mac keeping none
+/// (`DeviceProperties::lossless_compression` false), as a Mac with an Intel or AMD GPU is, answers
+/// as that Mac: the new texture reads zero (`WorkCounts::private_textures_zero_filled`), what such
+/// a Mac's reads where its memory held nothing, and the blit keeps the bytes.
+///
+/// **Why it is the venue's and not ours**, as [`shared_memory_notice`] is: no recording holds what
+/// a Mac without the compression reads, and its answer for a new texture is not one value but
+/// whatever its memory held. Metal's API leaves the contents undefined.
+///
+/// **It loosens the value, and only on such a venue.** The site is unchecked, justified by
+/// [`Justification::WithoutCompression`], which holds only on a run whose venue presents no
+/// compression: on the M3 Max it justifies nothing, so every byte of the site still compares
+/// exactly there, the pattern included, and a difference there is the site's own row, with none
+/// added at the declaration's path ([`crate::allowance::Unjustified::faults_the_case`]). A run
+/// without such a venue counts the claim as one nothing checked
+/// ([`crate::report::Report::unchecked_everywhere`]); a case names it at the sites the compression
+/// decides, never at another, and says in a comment which run it rests on.
+pub fn without_compression(site: &str) -> crate::allowance::Allowance {
+    crate::allowance::Allowance::new(
+        format!("case/{site}/*"),
+        crate::allowance::Loosening::Unchecked,
+        Justification::without_compression(WITHOUT_COMPRESSION),
+    )
+}
+
 /// The declaration a case needs where its kernel reaches a texture or a sampler through an
 /// **argument buffer**: `set-past-layout-support`, which the runtime announces where it makes a
 /// descriptor set layout its driver's `vkGetDescriptorSetLayoutSupport` refuses though the driver
@@ -417,9 +478,17 @@ pub fn set_past_layout_notice() -> crate::allowance::Allowance {
 ///   attachment, whose raw codes no blend unit reads (`extended-range-blend-source`,
 ///   `extended-range-float-blend-source`: `S·Fs op D·Fd` in `float`, where Metal's compiler rounds
 ///   each step to `half`);
+/// - **8-bit floats**: the device's own 8-bit float widening a tensor's 8-bit float element
+///   (`native-float8`, where Metal reads an e4m3 `0x7F` as 480 and the device's OCP encoding reads
+///   a NaN);
+/// - **logic operations**: the device's `logicOp` on a 10-bit or signed normalized format's own
+///   codes (`native-logic-operation`, where Metal operates on 10-bit codes widened to 16 bits, and
+///   reads and stores a signed lowest code as the code above it);
 /// - **resolves**: `device-rounded-resolve`;
 /// - **coverage**: the device's own conversion of a fragment's alpha to its coverage under
-///   alpha-to-coverage (`device-alpha-coverage`).
+///   alpha-to-coverage (`device-alpha-coverage`), its choice of the pixel a width-1 line covers
+///   at a vertex two pixels' diamonds share (`device-line-ties`), and its rasterizer's snap of a
+///   line band's corner half a step off its subpixel grid (`device-subpixel-snap`).
 ///
 /// **What is not here**, and stays each case's to declare: a note of what the device **lacks**
 /// (`device-signed-zero-inf-nan`, `device-anisotropic-filter`, `device-point-size`,
@@ -470,8 +539,12 @@ pub const NATIVE_NOTES: &[metal2vulkan_runtime::Degradation] = {
         D::YCbCrFilterNotExact,
         D::ExtendedRangeBlendSource,
         D::ExtendedRangeFloatBlendSource,
+        D::NativeFloat8,
+        D::NativeLogicOperation,
         D::DeviceRoundedResolve,
         D::DeviceAlphaCoverage,
+        D::DeviceLineTies,
+        D::DeviceSubpixelSnap,
     ]
 };
 

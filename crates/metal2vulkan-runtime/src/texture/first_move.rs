@@ -15,20 +15,37 @@
 //!   `Managed` texture, a stand-in) with the copies of the device's zeros ([`Zeros`]) that write
 //!   every texel. A new texture of every storage mode but `Memoryless` reads zero, a `Private` one
 //!   too; its image of a format a clear writes is cleared ([`FirstMove::cleared`]) rather than
-//!   copied over, single- or multisampled. An image that takes a rebind's new `VkImage` notes that
+//!   copied over, single- or multisampled. A new `Memoryless` one in memory that is not lazily
+//!   allocated is cleared to zero in render passes of each level alone
+//!   ([`FirstMove::zero_in_passes`]), as no transfer writes a transient attachment. An image that takes a rebind's new `VkImage` notes that
 //!   one's (`rebind.rs`). The image (or stand-in) is registered weakly once it is shared
-//!   ([`FirstMoves::register`]). An image over a dma-buf of its own pages (`dma_buf.rs`) starts
-//!   `UNDEFINED` too, and its move is an acquire from `VK_QUEUE_FAMILY_FOREIGN_EXT` for the
-//!   device's queue family (`VK_QUEUE_FAMILY_IGNORED` where its images are concurrent among
-//!   several), from `GENERAL` (which keeps its bytes, as Vulkan's foreign images keep theirs only
-//!   through such an acquire) to `GENERAL` ([`FirstMove::acquired`]); it rests there.
+//!   ([`FirstMoves::register`]); an image that copies on the device's staging queue queues its
+//!   move and zeros there instead, which every submission of the device's makes there before its
+//!   own (`texture/staging_copy.rs`, [`FirstMoves::queue_staging`]). An image over a dma-buf of
+//!   its own pages (`dma_buf.rs`) starts `UNDEFINED` too, and its move is an acquire from
+//!   `VK_QUEUE_FAMILY_FOREIGN_EXT` for the device's queue family (`VK_QUEUE_FAMILY_IGNORED` where
+//!   its images are concurrent among several), from `GENERAL` (which keeps its bytes, as Vulkan's
+//!   foreign images keep theirs only through such an acquire) to `GENERAL`
+//!   ([`FirstMove::acquired`]); it rests there.
 //!   A new buffer whose bytes the host cannot write (`Private`, and a
 //!   `Managed` buffer's device copy) notes its fill with zeros ([`FirstFill`]) the same way
 //!   (`Buffer::clear_first`), and a new `Private` buffer made with bytes then the copy of a staging
 //!   buffer's (`Buffer::fill_first_from`). So do a sparse texture's image (its move; an emulated
 //!   one's zeros too) and its tile map's bytes, and the device's neutrals: a neutral image's move
 //!   and its clear ([`FirstMove::cleared`]: it may be multisampled, which no copy writes), and a
-//!   neutral texel buffer's fill (`neutral.rs`).
+//!   neutral texel buffer's fill (`neutral.rs`). An exportable buffer whose memory an external
+//!   agent wrote notes its acquire from that agent's reserved queue family
+//!   (`Buffer::external_write_done`, [`FirstFill::acquired`]), recorded in the barrier that leads
+//!   the fills.
+//! - **Zeros a first use writes over.** A new zero-filled `Private` texture's zeros
+//!   ([`FirstMove::mark_overwritable`]) stand for what no write left, which a first use that
+//!   writes every texel first never shows. A batch whose first use of such an image among its
+//!   commands writes it whole before any command reads it, by that encoder's own description
+//!   (`encoder.rs`'s `Overwrite`; `command_buffer/submit.rs`'s `first_overwrites`), takes its move
+//!   without them ([`FirstMoves::take_holding`]), counted
+//!   (`WorkCounts::private_textures_overwritten_unfilled`): the move still moves the image, and a
+//!   batch on another `VkQueue` waits for that batch as for any first work, after which the
+//!   texels are written. A submission not made gives the zeros back with the move.
 //! - **Who records it.** The device's next submission that may reach the resource, before any of
 //!   its commands: every batch of the scheduler, whose commands may reach every texture through
 //!   its resource ID and every buffer through its address, unnamed (`heap_sets.rs`), and every
@@ -45,16 +62,34 @@
 //!   first in the command buffer that leads the submission's `VkSubmitInfo` -- a batch's own, or
 //!   the one that holds the staged copies after it; an internal submission's one command buffer
 //!   -- waiting for what the submission waits for: MoltenVK runs each `VkSubmitInfo` as a Metal
-//!   command buffer of its own, so it adds none (`command_buffer/submit.rs`).
+//!   command buffer of its own, so it adds none (`command_buffer/submit.rs`). On a device with a
+//!   fill queue (a copy engine's second queue, `device/staging.rs`), a batch's buffers' fills of
+//!   at least `FILL_QUEUE_LEAST` bytes in all go there instead ([`Taken::take_fills`]), in a
+//!   submission of their own after the batches before it on its `VkQueue` and what it waits for,
+//!   which the batch waits for before any of its commands; its moves and staged copies stay at
+//!   its start, after them. There a batch takes only the fills of memory its commands may reach,
+//!   of the device's own buffers, and every fill where it takes a move of an image in memory
+//!   another resource owns, or a staged copy ([`FillTake::Reached`]); the rest wait for a batch
+//!   that may reach them (`device/staging.rs`). On every device an upload into a buffer the
+//!   program's command buffers may have read already (a `Managed` buffer's copy in,
+//!   [`FirstMoves::register_upload`]) goes only with a batch whose commands may reach the buffer,
+//!   or an internal submission: so it lands after the command buffers before that batch on its
+//!   `VkQueue`, never under one of another queue still to read the bytes it replaces.
 //! - **Staged copies**. `replace_region` of a texture whose `VkImage` is its own for good (in
-//!   memory of its own, or a heap's own pages) and takes no host copies stages the bytes
+//!   memory of its own, or a heap's own pages) and takes no host or staging-queue copies (those
+//!   are queued for the staging queue instead, whose submission of them every submission of the
+//!   device's makes before its own: `texture/staging_copy.rs`) stages the bytes
 //!   ([`TexelCopy`], [`FirstMoves::register_texels`]): the next submission copies them in at
 //!   the start of its work, after the first work's `VkSubmitInfo`, each copy after the writes before
 //!   it, and holds the image and the staging buffer until it completed.
 //! - **Bounded**. Past [`STAGED_BYTES`] bytes, or [`STAGED_COPIES`] copies, staged for the next
-//!   submission (staged bytes' copies into buffers, a `Managed` buffer's uploads, and staged texel
-//!   copies), the call that staged the last makes a submission for them and waits
-//!   (`FirstMoves::register_bytes` and `register_texels` answer when).
+//!   submission (copies into buffers from staging buffers of their own, and staged texel copies),
+//!   the call that staged the last makes a submission for them and waits
+//!   (`FirstMoves::register_bytes` and `register_texels` answer when). The bound is on the
+//!   memory staged: a copy from a host copy the buffer holds whatever the copy (a `Managed`
+//!   buffer's upload from its mirror, or from an import of the caller's pages: [`Keeps::HostCopy`])
+//!   stages nothing, counts toward neither bound, and makes no submission, so a commit's uploads
+//!   of the ranges `did_modify_range` named go with its own batch however many bytes they are.
 //! - **Over host pages.** An image bound to imported host memory starts in `UNDEFINED`
 //!   (`VUID-VkImageCreateInfo-pNext-01443`), and its move "may perform read and write accesses
 //!   on all memory bound to the image subresource range": a no-copy heap's texture bound to the
@@ -63,18 +98,33 @@
 //!   byte over such pages (`in_place.rs`); elsewhere it is a shadow, whose copies address its texels
 //!   alone (`texture.rs`'s `storage_over_buffer`).
 //! - **The work.** A barrier from every command before (memory other commands wrote), then the
-//!   buffers' fills with zeros (copies of the device's zeros; on a device without unified memory,
-//!   which would read those over the bus, one `vkCmdFillBuffer` each, counted:
-//!   `WorkCounts::new_buffer_zero_fills`, `FirstFill::zeros`), then their copies of staged bytes
+//!   buffers' fills with zeros (one `vkCmdFillBuffer` each, counted:
+//!   `WorkCounts::new_buffer_zero_fills`; copies of the device's zeros for a range whose ends are
+//!   not multiples of 4, `FirstFill::zeros`), then their copies of staged bytes
 //!   after a barrier, then a
 //!   barrier carrying each image's move (after the fills: an image placed in a new heap moves
 //!   after the heap's fill, so the fill never overwrites what the move wrote), then the images'
 //!   copies of zeros, then a barrier that makes them visible to every later command and to the
 //!   host.
 //!   Commands after it on the same `VkQueue`, in this submission or a later one, see each image
-//!   in `GENERAL` and each fill done. On a device of several `VkQueue`s a submission on another
-//!   one waits for the batch that did it until that batch completed ([`FirstMoves::waits`]): any
-//!   of its commands may reach the resource unnamed.
+//!   in `GENERAL` and each fill done. On a device of several `VkQueue`s the batch that did it is
+//!   kept with what owns the memory its work wrote ([`Taken::owners`]) until it completed
+//!   ([`FirstMoves::waits`]), and a batch on another one waits for it where its commands, or the
+//!   first work it took, may reach that memory: memory a resource its encoders' uses name or make
+//!   resident owns, every memory where a command of it may reach memory no use names (a pointer
+//!   loaded from memory, work recorded on the GPU alone) or where that work's owner is unknown
+//!   (the device's own resources), and the memory of its own first work, which comes after that
+//!   work's (`command_buffer/submit.rs`, `WorkCounts::first_work_waits_unused` counting the
+//!   batches that waited for such work they reach none of). On the RTX 3090 a compositor's
+//!   frame of one dispatch, beside an app on another queue that makes two 1024 by 1024 `Private`
+//!   textures before each of its command buffers, takes 2.06 ms (p50), as when the app makes
+//!   nothing (2.10 ms); where every batch waited for all such work it took 17.1 ms, and so on a
+//!   device without a fill queue beside an app making buffers, 2.12 against 16.5 ms
+//!   (`tests::fill_waits_bench`). An internal submission waits for every one. Fills made on the
+//!   fill queue are waited for
+//!   by every later batch whose commands may reach what they filled, and every internal
+//!   submission, until the host saw them complete (`Device::fill_queue_wait_for`,
+//!   `Device::fill_queue_wait`).
 //! - **Order**. Each submission holds its place in the order from its take until its submission was
 //!   made, whether or not it took anything: so no submission is made between another's take and its
 //!   submission (one that found nothing to take would otherwise run before the moves another took,
@@ -97,9 +147,23 @@
 //!   ([`FirstMoves::internal_wait`]). Seen without it on RADV: a batch submitted with images in
 //!   `UNDEFINED` in its texture table, under the validation layer.
 //! - **Failure.** A submission that fails gives its work back, still to be done.
+//! - **A resource gone.** A buffer's fill and copies and an image's staged copies go as the
+//!   resource goes ([`FirstMoves::forget`]: a buffer's drop, an image's release), with the
+//!   staging buffer or host copy they hold, each holding the device: left for the next
+//!   submission, they would keep a device whose program let go of it alive for good, as no
+//!   submission comes.
 //! - **Out of reach of a submission.** A texture's `VkImage` handed out (`Texture::vk_image`)
-//!   rests in `GENERAL` as its contract says: handing it out does its work first, by an internal
-//!   submission waited for.
+//!   rests in `GENERAL` as its contract says: handing it out does its work first, by a
+//!   submission waited for, which makes the fills of the buffer an image in place lies in too.
+//!   So does a buffer's `VkBuffer` handed out (`Buffer::vk_buffer`) or its memory exported
+//!   (`Buffer::export_memory_fd`) where a fill waits on that `VkBuffer`
+//!   ([`FirstMoves::fills_wait`]): the caller's own work may write the bytes at once, and a fill
+//!   made after it would wipe them. Each takes its own work alone ([`FirstMoves::take_mine`]),
+//!   in its order, the rest waiting for the device's next submission, and waits for no other
+//!   work of the device's: its sources are the host's and its destinations new
+//!   (`Device::settle_mine`, on the staging queue for a buffer's fills where the device has
+//!   one). A texture in a heap's memory, the caller's or a sparse one, takes the device's work
+//!   as an internal submission does.
 
 use super::super::creation;
 use super::super::device::lock;
@@ -109,10 +173,11 @@ use super::super::heap_sets::HeldSlots;
 use super::super::image_barrier::{image_barrier, ImageDst};
 use super::super::memory::{Memory, MemoryClass, Placement};
 use super::super::release;
-use super::super::resource::ResourceKey;
+use super::super::render_target::{FramebufferObject, RenderPassObject};
+use super::super::resource::{ObjectId, ResourceKey};
 use super::super::tracker::Point;
 use super::super::work_counts::Counters;
-use super::super::Device;
+use super::super::{Buffer, Device};
 use super::decoded_twin::DecodePass;
 use super::{buffer_image_copy, image_aspects, transfer_barrier, ImageRegion, ZERO_BYTES};
 use crate::device::functions::Vk;
@@ -144,6 +209,85 @@ pub(crate) struct FirstMove {
     /// The queue family the move acquires the image for from `VK_QUEUE_FAMILY_FOREIGN_EXT`, an
     /// image over dma-buf pages the CPU writes ([`FirstMove::acquired`]).
     acquire: Option<u32>,
+    /// The bytes of a buffer the image is bound to that the move keeps by copies on the device
+    /// around its layout transition ([`FirstMove::kept`]).
+    keep: Option<GpuKeep>,
+    /// Its zeros are a new texture's that a first use writing every texel stands for
+    /// ([`FirstMove::mark_overwritable`]).
+    overwritable: bool,
+    /// The submission that took it records no zeros: its first use writes every texel first
+    /// ([`FirstMoves::take_holding`]'s `overwrites`). Undone as it is given back.
+    unzeroed: bool,
+}
+
+/// A first move's keep of the bytes its image is bound to, by copies on the device
+/// ([`FirstMove::kept`]): the image, made `UNDEFINED`, aliases a buffer's bytes that only the
+/// device's ordered commands write (`linear_plan::Between::Kept`), and of its move out of
+/// `UNDEFINED` the Synchronization chapter says "the contents of that range may be discarded"
+/// (Image Layout Transitions), the range its subresources are bound to and no more. So the move
+/// copies that span of the buffer into `scratch`, moves the image to `GENERAL`, and copies the
+/// span back through the buffer, in one ordered sequence ([`Taken::record`]). The image is a
+/// `DRM_FORMAT_MOD_LINEAR` one, or the device's linear image in a block of the runtime's buffers
+/// allocated exportable, made for its handle type. In `GENERAL` the image is a host-accessible
+/// subresource (either is linear, the Glossary's Linear Resource), as the buffer is, and two such aliases "interpret the contents of
+/// the memory in consistent ways, and data written to one alias can be read by the other alias"
+/// (Memory Aliasing): the image reads the bytes the buffer held, the bytes between its rows among
+/// them, and the buffer holds every byte it held. Its submission waits for every earlier
+/// submission on the device's other `VkQueue`s, which may access the span ([`Taken::keeps`]), and
+/// a later one there that may reach the buffer's memory waits for it, as for all first work. The
+/// image is a buffer's alias, which copies on no staging queue, so no staging queue records it
+/// (`record_several`). Counted: `WorkCounts::first_moves_kept`, `first_move_bytes_kept`.
+pub(crate) struct GpuKeep {
+    /// The buffer, held until the move's submission completed.
+    buffer: Buffer,
+    /// Where the span starts in the buffer, and its length.
+    at: u64,
+    length: u64,
+    /// The scratch buffer of `length` bytes the span is copied into and back from, held likewise.
+    scratch: Buffer,
+}
+
+impl GpuKeep {
+    /// The keep of `length` bytes of `buffer` from its byte `at`, through `scratch`, a buffer of
+    /// the runtime's own of at least `length` bytes (`Device::scratch_buffer`).
+    pub(crate) fn new(buffer: Buffer, at: u64, length: u64, scratch: Buffer) -> GpuKeep {
+        GpuKeep {
+            buffer,
+            at,
+            length,
+            scratch,
+        }
+    }
+
+    /// The copy of the span out to the scratch buffer, or back with `back`: the source, the
+    /// destination and the region.
+    fn copy(&self, back: bool) -> (vk::Buffer, vk::Buffer, vk::BufferCopy) {
+        let (buffer, at) = self.buffer.at(self.at);
+        let (scratch, start) = self.scratch.at(0);
+        let (src, dst, region) = match back {
+            false => (buffer, scratch, (at, start)),
+            true => (scratch, buffer, (start, at)),
+        };
+        let copy = vk::BufferCopy {
+            src_offset: region.0,
+            dst_offset: region.1,
+            size: self.length,
+        };
+        (src, dst, copy)
+    }
+
+    /// Record the copy out, or back with `back`, into `command_buffer`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Taken::record`]'s; both buffers are live (held) and have transfer usage.
+    unsafe fn record(&self, device: &Vk, command_buffer: vk::CommandBuffer, back: bool) {
+        let (src, dst, copy) = self.copy(back);
+        // SAFETY: the caller's contract; the span lies within the buffer's `VkBuffer` (the image
+        // it is bound to lies within the buffer: `linear_plan::aliases`) and the scratch's.
+        unsafe { device.cmd_copy_buffer(command_buffer, src, dst, &[copy]) };
+        exit_guard::called(Call::CmdCopyBuffer);
+    }
 }
 
 /// How a first move writes Metal's pattern into the first `levels` levels of its image, of
@@ -257,6 +401,9 @@ impl FirstMove {
             holding: None,
             pattern: None,
             acquire: None,
+            keep: None,
+            overwritable: false,
+            unzeroed: false,
         }
     }
 
@@ -275,9 +422,11 @@ impl FirstMove {
         Some(self)
     }
 
-    /// The move, given back by a submission not made: no longer holding its pages.
+    /// The move, given back by a submission not made: no longer holding its pages, its zeros
+    /// still to be written.
     fn unheld(mut self) -> FirstMove {
         self.holding = None;
+        self.unzeroed = false;
         self
     }
 
@@ -291,6 +440,12 @@ impl FirstMove {
     pub(crate) fn acquired(mut self, family: u32) -> FirstMove {
         self.old = vk::ImageLayout::GENERAL;
         self.acquire = Some(family);
+        self
+    }
+
+    /// The move, from `UNDEFINED`, keeping the bytes `keep` names by copies around it ([`GpuKeep`]).
+    pub(crate) fn kept(mut self, keep: GpuKeep) -> FirstMove {
+        self.keep = Some(keep);
         self
     }
 
@@ -310,6 +465,19 @@ impl FirstMove {
         self
     }
 
+    /// Have the move also clear every texel of every aspect to zero in `passes`, which cover every
+    /// level and layer a pass may attach: a new memoryless texture's image, a transient
+    /// attachment, which no transfer writes (`Device::new_texture_image`).
+    pub(crate) fn zero_in_passes(&mut self, passes: Vec<PassClear>) {
+        self.zero = Some(Zero::Passes(passes));
+    }
+
+    /// Whether its zeros are written in render passes ([`zero_in_passes`](Self::zero_in_passes)):
+    /// the barrier after them is from the attachments' stages.
+    fn clears_in_passes(&self) -> bool {
+        matches!(self.zero, Some(Zero::Passes(_)))
+    }
+
     /// The move, which also writes `patterned`'s pattern into its levels; its zeros then write
     /// only the levels after them. Its zeros' copies, if any, cover every level from the first.
     pub(crate) fn patterned(mut self, patterned: Patterned) -> FirstMove {
@@ -317,9 +485,25 @@ impl FirstMove {
         self
     }
 
+    /// Let a submission leave the move's zeros (a new `Private` texture's, which reads zero where
+    /// Metal's reads what no write left, `Device::new_texture_image`) out where the first
+    /// use of the image among its commands writes every texel before any command reads one
+    /// ([`FirstMoves::take_holding`]).
+    pub(crate) fn mark_overwritable(&mut self) {
+        self.overwritable = matches!(self.zero, Some(Zero::Copies(..) | Zero::Clear))
+            && self.pattern.is_none()
+            && self.keep.is_none()
+            && self.acquire.is_none();
+    }
+
+    /// Whether a submission may leave its zeros out ([`mark_overwritable`](Self::mark_overwritable)).
+    pub(crate) fn may_go_unzeroed(&self) -> bool {
+        self.overwritable
+    }
+
     /// Whether it writes anything into its image: zeros or a pattern.
     fn writes(&self) -> bool {
-        self.zero.is_some() || self.pattern.is_some()
+        (self.zero.is_some() && !self.unzeroed) || self.pattern.is_some()
     }
 
     /// Levels `levels` of every aspect and layer of the image.
@@ -367,6 +551,7 @@ impl FirstMove {
         let past_pattern = (self.pattern.as_ref()).is_none_or(|p| p.levels < p.total);
         match &self.zero {
             None => {}
+            Some(_) if self.unzeroed => {}
             Some(Zero::Copies(zeros, copies)) => {
                 let copies: Vec<vk::BufferImageCopy> = (copies.iter())
                     .filter(|copy| copy.image_subresource.mip_level >= first)
@@ -385,6 +570,48 @@ impl FirstMove {
                         );
                     }
                     exit_guard::called(Call::CmdCopyBufferToImage);
+                }
+            }
+            Some(Zero::Passes(passes)) => {
+                let attachments = [vk::ClearAttachment {
+                    aspect_mask: self.aspects,
+                    color_attachment: 0,
+                    clear_value: vk::ClearValue::default(),
+                }];
+                for clear in passes {
+                    let [width, height] = clear.extent;
+                    let area = vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D { width, height },
+                    };
+                    let begin = vk::RenderPassBeginInfo::default()
+                        .render_pass(clear.pass.raw)
+                        .framebuffer(clear.framebuffer.raw)
+                        .render_area(area);
+                    let rects = [vk::ClearRect {
+                        rect: area,
+                        base_array_layer: 0,
+                        layer_count: clear.layers,
+                    }];
+                    // SAFETY: the caller's; the command buffer is outside a render pass, of a
+                    // family with graphics (every queue but the staging queue's, which records no
+                    // such move: a memoryless image copies nothing there); the pass and its
+                    // framebuffer, of a view of the image's level and layers in `GENERAL`, the
+                    // pass's layout, live as long as the move, which the submission holds until
+                    // it completed; the aspects are the image format's, the subpass's one
+                    // attachment's; the rectangle is the framebuffer's area and its layers.
+                    unsafe {
+                        device.cmd_begin_render_pass(
+                            command_buffer,
+                            &begin,
+                            vk::SubpassContents::INLINE,
+                        );
+                        device.cmd_clear_attachments(command_buffer, &attachments, &rects);
+                        device.cmd_end_render_pass(command_buffer);
+                    }
+                    exit_guard::called(Call::CmdBeginRenderPass);
+                    exit_guard::called(Call::CmdClearAttachments);
+                    exit_guard::called(Call::CmdEndRenderPass);
                 }
             }
             Some(Zero::Clear) if !past_pattern => {}
@@ -533,25 +760,26 @@ impl FirstMove {
         }
     }
 
-    /// Record the move alone into `command_buffer`, of a family of `family`'s queue flags: its
-    /// barrier, after every command before, then its writes of zero (and pattern), then the
-    /// barrier that makes them visible to every command after and to the host
-    /// (`device/staging.rs`: a texture moved on the staging queue as it is made, which no batch
-    /// then finds waiting).
+    /// Record `moves` into `command_buffer`, of a family of `family`'s queue flags, on the staging
+    /// queue (`texture/staging_copy.rs`): one barrier carrying every move, after every command
+    /// before, then each one's writes of zero; the barrier that makes them visible after is the
+    /// caller's.
     ///
     /// # Safety
     ///
-    /// `command_buffer` is recording, outside a render pass, for a queue family the image is
-    /// shared with, of `family`'s flags; the image is live, in the layout its move starts from,
-    /// and nothing uses it until the submission completed.
-    pub(crate) unsafe fn record_alone(
-        &self,
+    /// `command_buffer` is recording, outside a render pass, for a queue family each image is
+    /// shared with, of `family`'s flags; each image is live, in the layout its move starts from,
+    /// and nothing else uses it until the submission completed.
+    pub(super) unsafe fn record_several(
+        moves: &[&FirstMove],
         device: &ash::Device,
         command_buffer: vk::CommandBuffer,
         family: vk::QueueFlags,
     ) {
         let all = vk::PipelineStageFlags::ALL_COMMANDS;
-        // SAFETY: the caller's contract; the image is live, in the layout the move starts from.
+        let barriers: Vec<vk::ImageMemoryBarrier<'_>> =
+            moves.iter().map(|first| first.barrier(family)).collect();
+        // SAFETY: the caller's contract; each image is live, in the layout its move starts from.
         unsafe {
             device.cmd_pipeline_barrier(
                 command_buffer,
@@ -560,17 +788,15 @@ impl FirstMove {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[self.barrier(family)],
+                &barriers,
             );
         }
         exit_guard::called(Call::CmdPipelineBarrier);
-        if self.writes() {
-            // SAFETY: as above; the image is in `GENERAL` now and has `TRANSFER_DST` usage where
-            // it reads zero.
-            unsafe { self.record_zero(device, command_buffer, family) };
+        for first in moves.iter().filter(|first| first.writes()) {
+            // SAFETY: as above; each image is in `GENERAL` now and has `TRANSFER_DST` usage
+            // where it reads zero.
+            unsafe { first.record_zero(device, command_buffer, family) };
         }
-        transfer_barrier(device, command_buffer, false);
-        exit_guard::called(Call::CmdPipelineBarrier);
     }
 
     /// The barrier of the move, recorded for a family of `family`'s queue flags, before every
@@ -602,33 +828,85 @@ enum Zero {
     Copies(vk::Buffer, Vec<vk::BufferImageCopy>),
     /// A clear ([`FirstMove::cleared`]).
     Clear,
+    /// Clears in render passes ([`FirstMove::zero_in_passes`]).
+    Passes(Vec<PassClear>),
+}
+
+/// A clear of one level of an image, over `extent` and `layers` layers from its first, in a
+/// render pass of the attachment alone and its framebuffer of a view of them
+/// (`render_target::clear_alone`), which the move holds ([`FirstMove::zero_in_passes`]).
+pub(crate) struct PassClear {
+    pub(crate) pass: RenderPassObject,
+    pub(crate) framebuffer: FramebufferObject,
+    pub(crate) extent: [u32; 2],
+    pub(crate) layers: u32,
 }
 
 /// The most bytes host calls' copies stage for the device's next submission before one is made
 /// for them, waited for (the module docs).
-const STAGED_BYTES: u64 = 256 << 20;
+pub(super) const STAGED_BYTES: u64 = 256 << 20;
 
 /// The most copies host calls stage for the device's next submission before one is made for
 /// them, waited for (the module docs): a bound on the work waiting, whatever its bytes.
-const STAGED_COPIES: usize = 4096;
+pub(super) const STAGED_COPIES: usize = 4096;
+
+/// What a copy of bytes into a buffer keeps until the submission that makes it completed
+/// ([`FirstMoves::register_bytes`], [`FirstMoves::register_upload`]).
+pub(crate) enum Keeps {
+    /// A staging buffer of its own, which holds the bytes: memory that waits on the submission,
+    /// which the bound counts ([`STAGED_BYTES`], [`STAGED_COPIES`]).
+    Staging(Box<dyn Any + Send + Sync>),
+    /// The host copy it reads, which the buffer holds whatever the copy (a `Managed` buffer's
+    /// mirror, an import of the caller's pages): it stages nothing, and the bound counts none of
+    /// it.
+    HostCopy(Box<dyn Any + Send + Sync>),
+}
 
 /// A new buffer's fill: copies of the device's zeros onto `range` of `buffer`, or a fill of its
 /// words with zeros (`word_fill.rs`), or copies of the bytes a staging buffer holds, or a
-/// `Managed` buffer's upload from its host copy.
+/// `Managed` buffer's upload from its host copy; or an exportable buffer's acquire from the
+/// external agent that wrote its memory ([`FirstFill::acquired`]), which copies nothing.
 pub(crate) struct FirstFill {
     buffer: vk::Buffer,
     source: vk::Buffer,
     copies: Vec<vk::BufferCopy>,
-    /// The words one `vkCmdFillBuffer` sets to zero in place of the copies (none then): on a
-    /// device without unified memory, whose zeros (`Zeros`, host-visible) a copy would read over
-    /// the bus ([`FirstFill::zeros`]).
+    /// The words one `vkCmdFillBuffer` sets to zero in place of the copies (none then)
+    /// ([`FirstFill::zeros`]).
     filled: Option<std::ops::Range<u64>>,
-    /// What keeps the staging buffer `source` is, held until the submission that makes the fill
-    /// completed; `None` where `source` is the device's zeros.
+    /// What keeps the staging buffer or host copy `source` is, held until the submission that
+    /// makes the fill completed; `None` where `source` is the device's zeros.
     staging: Option<Box<dyn Any + Send + Sync>>,
+    /// Whether `source` is a staging buffer of the fill's own ([`Keeps::Staging`]), whose bytes
+    /// count toward the bound ([`past_bound`]); false for the device's zeros and a host copy.
+    staged: bool,
+    /// The queue families of an acquire of the whole `VkBuffer` (source, a family reserved for
+    /// external memory; target), recorded in the barrier before every fill, in place of copies
+    /// (none then).
+    acquire: Option<(u32, u32)>,
+    /// The key the program's uses of the memory it writes name ([`Filled::key`]), as it was
+    /// registered.
+    key: Option<ResourceKey>,
+    /// What owns that memory (`used_resources::owner_of`), as the batch that took it last found
+    /// it ([`FillTake::Reached`]); `None` where none did, or none owns it.
+    owner: Option<ObjectId>,
+    /// An upload into a buffer the program's command buffers may have read already
+    /// ([`FirstMoves::register_upload`]), with the stamp of the commit that took its bytes
+    /// (`managed.rs`'s `Modified`; 0 where none did): a batch takes it only where its commands
+    /// may reach the memory and its command buffer was committed at or after that commit, so it
+    /// lands on that batch's `VkQueue`, after the command buffers before it there, and under no
+    /// command buffer committed before the bytes were taken; never because the batch takes every
+    /// fill ([`Taken::every_fill`]). An internal submission's take ([`FillTake::All`]) takes it
+    /// too. `None` for every other fill.
+    upload: Option<u64>,
 }
 
 impl FirstFill {
+    /// The fill, with the key of `keeper`'s memory ([`Filled::key`]).
+    fn keyed(mut self, keeper: &Weak<dyn Filled>) -> FirstFill {
+        self.key = keeper.upgrade().and_then(|filled| filled.key());
+        self
+    }
+
     /// The fill of `length` bytes of `buffer` from byte `start`, from `zeros`, the device's.
     fn new(buffer: vk::Buffer, start: u64, length: u64, zeros: vk::Buffer) -> FirstFill {
         let copies = (0..length.div_ceil(ZERO_BYTES))
@@ -647,18 +925,22 @@ impl FirstFill {
             copies,
             filled: None,
             staging: None,
+            staged: false,
+            acquire: None,
+            key: None,
+            owner: None,
+            upload: None,
         }
     }
 
-    /// The zeros of `range` of `buffer` on `device`: one `vkCmdFillBuffer` of its words on a
-    /// device without unified memory whose fills are `vkCmdFillBuffer`'s (`word_fill.rs`), where
-    /// the range's ends are multiples of 4; else copies of the device's zeros, made now if they
-    /// are not yet. A discrete GPU reads those host-visible zeros over the bus: on the RX 7900 XTX
-    /// (RADV) 512 KiB of them took 66 us to copy and 11 us more in the barrier after it, where a
-    /// fill of the same bytes took 0.7 us and 2.5 us. The copy stays where the device shares the
-    /// host's memory, whose zeros lie in the memory the GPU reads anyway (not measured there),
-    /// and where fills go as transfers (`DriverFact::FillCompiledPerCommandPool`), whose copies
-    /// within the buffer need `TRANSFER_SRC` usage that a neutral buffer lacks.
+    /// The zeros of `range` of `buffer` on `device`: one `vkCmdFillBuffer` of its words
+    /// (`word_fill.rs`), where the range's ends are multiples of 4; else copies of the device's
+    /// zeros, made now if they are not yet. A copy reads the zeros, host-visible, as well as it
+    /// writes the range: on an RX 7900 XTX (RADV) 512 KiB of them took 66 us to copy and 11 us
+    /// more in the barrier after it, where a fill of the same bytes took 0.7 us and 2.5 us. On a
+    /// device that shares the host's memory a fill costs no more: zeroing 17.9 MB in one blit took
+    /// 0.53 ms of GPU time as a fill and 0.75 ms as copies on a Radeon 780M (RADV), and 0.52 ms and
+    /// 0.53 ms on an Iris Xe (ANV), medians of 20.
     fn zeros(
         device: &Device,
         moves: &FirstMoves,
@@ -666,14 +948,18 @@ impl FirstFill {
         range: std::ops::Range<u64>,
     ) -> Result<FirstFill, Error> {
         let words = range.start.is_multiple_of(4) && range.end.is_multiple_of(4);
-        let discrete = !device.properties().has_unified_memory;
-        if words && discrete && !crate::word_fill::by_transfers(device) {
+        if words {
             return Ok(FirstFill {
                 buffer,
                 source: vk::Buffer::null(),
                 copies: Vec::new(),
                 filled: Some(range),
                 staging: None,
+                staged: false,
+                acquire: None,
+                key: None,
+                owner: None,
+                upload: None,
             });
         }
         let zeros = moves.zeros(device, 0)?;
@@ -686,14 +972,18 @@ impl FirstFill {
     }
 
     /// The copy of `length` bytes of `source` from byte `from` onto `buffer` from byte `start`,
-    /// `staging` keeping `source`.
+    /// `keeps` keeping `source`.
     fn bytes(
         buffer: vk::Buffer,
         start: u64,
         (source, from): (vk::Buffer, u64),
         length: u64,
-        staging: Box<dyn Any + Send + Sync>,
+        keeps: Keeps,
     ) -> FirstFill {
+        let (staging, staged) = match keeps {
+            Keeps::Staging(staging) => (staging, true),
+            Keeps::HostCopy(copy) => (copy, false),
+        };
         FirstFill {
             buffer,
             source,
@@ -704,7 +994,52 @@ impl FirstFill {
             }],
             filled: None,
             staging: Some(staging),
+            staged,
+            acquire: None,
+            key: None,
+            owner: None,
+            upload: None,
         }
+    }
+
+    /// The acquire of `buffer`, whole, from `source`, a queue family reserved for external memory
+    /// (`VK_QUEUE_FAMILY_EXTERNAL`, `VK_QUEUE_FAMILY_FOREIGN_EXT`), for `target`: the device's
+    /// queue family, or `VK_QUEUE_FAMILY_IGNORED` where its buffers are concurrent among several.
+    fn acquired(buffer: vk::Buffer, (source, target): (u32, u32)) -> FirstFill {
+        FirstFill {
+            buffer,
+            source: vk::Buffer::null(),
+            copies: Vec::new(),
+            filled: None,
+            staging: None,
+            staged: false,
+            acquire: Some((source, target)),
+            key: None,
+            owner: None,
+            upload: None,
+        }
+    }
+
+    /// The bytes it writes: its copies' and its zeros'.
+    fn written(&self) -> u64 {
+        let copied: u64 = self.copies.iter().map(|copy| copy.size).sum();
+        copied + (self.filled.as_ref()).map_or(0, |range| range.end - range.start)
+    }
+
+    /// The barrier of its acquire, where it is one: no access of the device's before it (an
+    /// acquire's source access is ignored), every access after.
+    fn acquire_barrier(&self) -> Option<vk::BufferMemoryBarrier<'static>> {
+        let (source, target) = self.acquire?;
+        Some(
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                .src_queue_family_index(source)
+                .dst_queue_family_index(target)
+                .buffer(self.buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+        )
     }
 }
 
@@ -721,6 +1056,8 @@ pub(crate) struct TexelCopy {
     /// The decode of what the copies wrote into the image's decoded twin, after them
     /// (`texture/decoded_twin.rs`).
     decode: Option<DecodePass>,
+    /// The hazard-tracking key the program's uses of the image name ([`Fresh::key`]).
+    key: Option<ResourceKey>,
 }
 
 impl TexelCopy {
@@ -737,7 +1074,14 @@ impl TexelCopy {
             staging,
             bytes,
             decode: None,
+            key: None,
         }
+    }
+
+    /// The copies, into an image whose uses name `key` ([`Fresh::key`]).
+    pub(crate) fn keyed(mut self, key: ResourceKey) -> TexelCopy {
+        self.key = Some(key);
+        self
     }
 
     /// The copies, then `pass`, their decode into the image's decoded twin (its scratch counted
@@ -765,6 +1109,18 @@ pub(crate) trait Fresh: Send + Sync {
     /// host pages (the module docs): an internal submission takes that only where it names the
     /// key. `None` for every other.
     fn rebindable(&self) -> Option<ResourceKey>;
+    /// Whether its image lies in memory another resource owns (a buffer's, a heap's), which that
+    /// resource's fills write: a batch that takes its move takes every fill waiting (the module
+    /// docs).
+    fn in_other_memory(&self) -> bool {
+        false
+    }
+    /// The hazard-tracking key the program's uses of its image name, whose owner
+    /// (`used_resources::owner_of`) owns the memory its moves write. `None` for an image of the
+    /// device's own, which no use of the program's names.
+    fn key(&self) -> Option<ResourceKey> {
+        None
+    }
 }
 
 /// A new buffer whose fill waits: what a submission that takes the fill holds until it completes
@@ -774,6 +1130,13 @@ pub(crate) trait Filled: Send + Sync {
     /// A hold on the memory the buffer lies in, kept and never read; `None` where it lies in
     /// none.
     fn memory(&self) -> Option<Box<dyn Any + Send + Sync>>;
+
+    /// The hazard-tracking key the program's uses of the memory the fill writes name: the
+    /// buffer's, or for a buffer placed in a heap the heap's own buffer's. `None` for a buffer
+    /// of the device's own (a neutral), which no use of the program's names.
+    fn key(&self) -> Option<ResourceKey> {
+        None
+    }
 }
 
 /// A resource whose first work waits.
@@ -786,12 +1149,70 @@ enum Waiting {
     Texels(Weak<dyn Any + Send + Sync>, TexelCopy),
 }
 
-/// A resource whose first work a submission took, held.
+/// The fills waiting that a submission takes ([`FirstMoves::take_holding`]).
+pub(crate) enum FillTake<'r> {
+    /// Every one, what owns the memory of what it takes unknown: an internal submission's, a
+    /// handle's.
+    All,
+    /// Every one, knowing what owns the memory of what it takes by `owner_of` (the owner under a
+    /// key, `used_resources::owner_of`), but an upload whose memory its commands do not reach, as
+    /// `reaches` answers for what owns it, or of a commit after `commit`, its command buffer's
+    /// (`FirstFill::upload`): a batch's on a device without a fill queue.
+    Owned {
+        owner_of: &'r dyn Fn(ResourceKey) -> Option<ObjectId>,
+        reaches: &'r dyn Fn(ObjectId) -> bool,
+        commit: u64,
+    },
+    /// A batch's on a device with a fill queue (the module docs): the fills of memory its commands
+    /// may reach, as `reaches` answers for what owns it (`owner_of` naming the owner under a
+    /// key, `used_resources::owner_of`); every fill of memory no use of the program's names; and
+    /// every fill where it takes a move of an image in memory another resource owns, or a staged
+    /// copy ([`Taken::every_fill`]); but an upload of a commit after `commit`, its command
+    /// buffer's (`FirstFill::upload`).
+    Reached {
+        owner_of: &'r dyn Fn(ResourceKey) -> Option<ObjectId>,
+        reaches: &'r dyn Fn(ObjectId) -> bool,
+        commit: u64,
+    },
+}
+
+impl FillTake<'_> {
+    /// The stamp of the commit of the batch's command buffer, where the take is a batch's: it
+    /// takes no upload of a later commit (`FirstFill::upload`).
+    fn commit(&self) -> Option<u64> {
+        match self {
+            FillTake::All => None,
+            FillTake::Owned { commit, .. } | FillTake::Reached { commit, .. } => Some(*commit),
+        }
+    }
+
+    /// What names the owner of the memory under a key, where the take knows it.
+    fn owner_of(&self) -> Option<&dyn Fn(ResourceKey) -> Option<ObjectId>> {
+        match self {
+            FillTake::All => None,
+            FillTake::Owned { owner_of, .. } | FillTake::Reached { owner_of, .. } => {
+                Some(*owner_of)
+            }
+        }
+    }
+}
+
+/// An entry of a take, in its order ([`FirstMoves::take_with`]).
+enum Sorted {
+    Kept(Waiting),
+    Taken(Held),
+    /// A fill whose turn waits until every move taken is known, and its buffer, held until the
+    /// lock is free.
+    Fill(Weak<dyn Filled>, FirstFill, Arc<dyn Filled>),
+}
+
+/// A resource whose first work a submission took, held; a move's and a staged copy's with what
+/// owns the memory they write, as the take found it ([`Held::owner`]).
 enum Held {
-    Moves(Arc<dyn Fresh>, Vec<FirstMove>),
+    Moves(Arc<dyn Fresh>, Vec<FirstMove>, Option<ObjectId>),
     /// The buffer, not kept, the hold on its memory, and its fill.
     Fill(Weak<dyn Filled>, Box<dyn Any + Send + Sync>, FirstFill),
-    Texels(Arc<dyn Any + Send + Sync>, TexelCopy),
+    Texels(Arc<dyn Any + Send + Sync>, TexelCopy, Option<ObjectId>),
 }
 
 impl Held {
@@ -799,14 +1220,50 @@ impl Held {
     fn keeper(self) -> Box<dyn Any + Send + Sync> {
         match self {
             // The moves keep the pages their images are bound to.
-            Held::Moves(fresh, moves) => Box::new((fresh, moves)),
+            Held::Moves(fresh, moves, _) => Box::new((fresh, moves)),
             Held::Fill(_, memory, fill) => match fill.staging {
                 Some(staging) => Box::new((memory, staging)),
                 None => memory,
             },
-            Held::Texels(image, copy) => Box::new((image, copy.staging, copy.decode)),
+            Held::Texels(image, copy, _) => Box::new((image, copy.staging, copy.decode)),
         }
     }
+
+    /// What owns the memory its work writes, by its identity, as the program's uses name it
+    /// (`used_resources::owner_of`): `None` where the take did not know it, or where no use of
+    /// the program's names that memory (the device's own resources).
+    fn owner(&self) -> Option<ObjectId> {
+        match self {
+            Held::Moves(_, _, owner) | Held::Texels(_, _, owner) => *owner,
+            Held::Fill(_, _, fill) => fill.owner,
+        }
+    }
+}
+
+/// What owns the memory the work of `held` writes, each once; `None` where one's owner is
+/// unknown, or memory no use of the program's names, which any command may reach.
+fn owners_of<'h>(held: impl IntoIterator<Item = &'h Held>) -> Option<Vec<ObjectId>> {
+    let mut owners = Vec::new();
+    for held in held {
+        let owner = held.owner()?;
+        if !owners.contains(&owner) {
+            owners.push(owner);
+        }
+    }
+    Some(owners)
+}
+
+/// Of `points`, the last on each `VkQueue`, in the order each queue first came: a wait for it
+/// orders every one before it there.
+pub(crate) fn last_of_each(points: impl IntoIterator<Item = Point>) -> Vec<Point> {
+    let mut last: Vec<Point> = Vec::new();
+    for at in points {
+        match last.iter_mut().find(|point| point.queue == at.queue) {
+            Some(point) => point.value = point.value.max(at.value),
+            None => last.push(at),
+        }
+    }
+    last
 }
 
 /// The device's buffer of [`ZERO_BYTES`] zero bytes, host-visible and written by the host once,
@@ -842,8 +1299,9 @@ pub(crate) struct FirstMoves {
     submissions_waited: AtomicU64,
     submission_wait_nanos: AtomicU64,
     waiting: Mutex<Vec<Waiting>>,
-    /// The point of the last batch on each `VkQueue` that did some, by queue.
-    done_at: Mutex<Vec<Point>>,
+    /// The batches that did some and may not have completed, each at its point, with what owns
+    /// the memory its work wrote ([`Taken::owners`]; `None`: memory any command may reach).
+    done_at: Mutex<Vec<(Point, Option<Vec<ObjectId>>)>>,
     /// The internal submission that did some and may not have completed: the timeline it
     /// signals and the value (`device/submit.rs`).
     internal_at: Mutex<Option<(vk::Semaphore, u64)>>,
@@ -859,6 +1317,15 @@ pub(crate) struct FirstMoves {
     /// (`texture/decoded_twin.rs`, `PassScratch::Device`), and its bytes: made at the first such
     /// decode, kept with the device.
     decode_scratch: Mutex<Option<(Zeros, u64)>>,
+    /// The work queued for the staging queue's next submission (`texture/staging_copy.rs`):
+    /// copies into images that copy there, which every submission of the device's makes there
+    /// before its own.
+    pub(super) staging: Mutex<super::staging_copy::Queued>,
+    /// The staging queue's buffer of [`ZERO_BYTES`] zero bytes, host-visible, which the moves
+    /// queued there copy from (`texture/staging_copy.rs`): made at the first, kept with the
+    /// device, and used by no other queue, as the device's own zeros are exclusive to its
+    /// families.
+    pub(super) staging_zeros: Mutex<Option<super::staging_copy::StagedBytes>>,
 }
 
 /// The side of each of the device's multisampled scratch images ([`FirstMoves::scratch`]): its
@@ -878,17 +1345,38 @@ struct Scratch {
 pub(crate) const PATTERN_BYTES: u64 = 256 << 10;
 
 /// Whether the host calls' copies `waiting` stages passed [`STAGED_BYTES`] or [`STAGED_COPIES`]:
-/// copies of staged bytes into buffers, uploads, and texel copies.
+/// copies into buffers from staging buffers of their own, and texel copies. A copy from a host
+/// copy ([`Keeps::HostCopy`]) stages nothing and counts toward neither.
 fn past_bound(waiting: &[Waiting]) -> bool {
     let staged = waiting.iter().filter_map(|entry| match entry {
         Waiting::Fill(_, fill) => {
-            (fill.staging.as_ref()).map(|_| fill.copies.iter().map(|copy| copy.size).sum())
+            (fill.staged).then(|| fill.copies.iter().map(|copy| copy.size).sum())
         }
         Waiting::Texels(_, copy) => Some(copy.bytes),
         Waiting::Moves(_) => None,
     });
     let (copies, bytes) = staged.fold((0, 0), |(copies, bytes), size| (copies + 1, bytes + size));
     copies > STAGED_COPIES || bytes > STAGED_BYTES
+}
+
+/// The work a handle handed out settles ([`FirstMoves::take_mine`]): the fills whose destination
+/// is `buffer`, and the moves of and copies into the image at `image` (an `Image`'s address).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Mine {
+    pub(crate) buffer: Option<vk::Buffer>,
+    pub(crate) image: Option<*const ()>,
+}
+
+impl Mine {
+    /// Whether `entry` is its work.
+    fn names(self, entry: &Waiting) -> bool {
+        let image = |at: *const ()| self.image == Some(at);
+        match entry {
+            Waiting::Fill(_, fill) => self.buffer == Some(fill.buffer),
+            Waiting::Moves(weak) => image(weak.as_ptr().cast()),
+            Waiting::Texels(weak, _) => image(weak.as_ptr().cast()),
+        }
+    }
 }
 
 impl FirstMoves {
@@ -926,6 +1414,18 @@ impl FirstMoves {
         lock(&self.waiting).push(Waiting::Moves(fresh));
     }
 
+    /// Queue work for the staging queue's next submission (`texture/staging_copy.rs`) with
+    /// `queue`, in its place in the order where registrations wait for it (the module docs): a
+    /// new image's move, which a batch's texture table must not name before the batch, or one
+    /// before it, took it.
+    pub(super) fn queue_staging<R>(
+        &self,
+        queue: impl FnOnce(&mut super::staging_copy::Queued) -> R,
+    ) -> R {
+        let _order = self.registration_place();
+        queue(&mut lock(&self.staging))
+    }
+
     /// The new buffer `keeper`, whose bytes `range` of `buffer` the host cannot write, waits for
     /// its fill with zeros.
     pub(crate) fn register_fill(
@@ -935,30 +1435,81 @@ impl FirstMoves {
         buffer: vk::Buffer,
         range: std::ops::Range<u64>,
     ) -> Result<(), Error> {
-        let fill = FirstFill::zeros(device, self, buffer, range)?;
+        let fill = FirstFill::zeros(device, self, buffer, range)?.keyed(&keeper);
         let _order = self.registration_place();
         lock(&self.waiting).push(Waiting::Fill(keeper, fill));
         Ok(())
     }
 
+    /// The exportable buffer `keeper` waits for the acquire of its `VkBuffer` `buffer`, whole,
+    /// from `families`' source, a queue family reserved for external memory, for its target
+    /// (`FirstFill::acquired`): what an external agent wrote to its memory, which the caller
+    /// waited for, is the device's to read once a submission made it, before any of its commands
+    /// (`Buffer::external_write_done`). Its barrier leads the submission's fills, so the caller
+    /// settles the buffer's own fills first.
+    pub(crate) fn register_acquire(
+        &self,
+        keeper: Weak<dyn Filled>,
+        buffer: vk::Buffer,
+        families: (u32, u32),
+    ) {
+        let fill = FirstFill::acquired(buffer, families).keyed(&keeper);
+        let _order = self.registration_place();
+        lock(&self.waiting).push(Waiting::Fill(keeper, fill));
+    }
+
     /// The buffer `keeper`, whose bytes the host cannot write, waits for the copy of `length`
-    /// bytes of `source` (a buffer and its byte the copy starts at), which `staging` keeps, onto
+    /// bytes of `source` (a buffer and its byte the copy starts at), which `keeps` keeps, onto
     /// its `VkBuffer` `buffer` from byte `start`: after every fill with zeros waiting, its own
     /// among them where it is new, and after the copies registered before it. Whether the copies
-    /// staged now passed their bound, so the caller makes a submission for them.
+    /// staged now passed their bound, so the caller makes a submission for them: never where it
+    /// keeps a host copy ([`Keeps::HostCopy`]), which stages nothing.
     pub(crate) fn register_bytes(
         &self,
         keeper: Weak<dyn Filled>,
         (buffer, start): (vk::Buffer, u64),
         source: (vk::Buffer, u64),
         length: u64,
-        staging: Box<dyn Any + Send + Sync>,
+        keeps: Keeps,
     ) -> bool {
-        let fill = FirstFill::bytes(buffer, start, source, length, staging);
+        let fill = FirstFill::bytes(buffer, start, source, length, keeps).keyed(&keeper);
+        self.register_fill_of_bytes(keeper, fill)
+    }
+
+    /// As [`register_bytes`](Self::register_bytes), of an upload into a buffer the program's
+    /// command buffers may have read already (a `Managed` buffer's copy in, `managed.rs`), of
+    /// bytes taken at the commit stamped `commit` (0: at none): a batch takes it only where its
+    /// commands may reach the buffer's memory and its command buffer was committed at or after
+    /// that commit (`FirstFill::upload`), so it lands after the command buffers before that batch
+    /// on its `VkQueue`, which may still read the bytes it replaces, and before that batch's
+    /// commands, and a command buffer committed before the bytes were taken, submitted after,
+    /// reads the bytes of its own commit, not these. A batch of another queue that reaches none
+    /// of the buffer leaves it waiting.
+    pub(crate) fn register_upload(
+        &self,
+        keeper: Weak<dyn Filled>,
+        (buffer, start): (vk::Buffer, u64),
+        source: (vk::Buffer, u64),
+        length: u64,
+        keeps: Keeps,
+        commit: u64,
+    ) -> bool {
+        let fill = FirstFill::bytes(buffer, start, source, length, keeps).keyed(&keeper);
+        let fill = FirstFill {
+            upload: Some(commit),
+            ..fill
+        };
+        self.register_fill_of_bytes(keeper, fill)
+    }
+
+    /// Register `fill`, a copy of bytes into `keeper`'s buffer: whether it staged them
+    /// ([`Keeps::Staging`]) and the copies staged now passed their bound.
+    fn register_fill_of_bytes(&self, keeper: Weak<dyn Filled>, fill: FirstFill) -> bool {
         let _order = self.registration_place();
+        let staged = fill.staged;
         let mut waiting = lock(&self.waiting);
         waiting.push(Waiting::Fill(keeper, fill));
-        past_bound(&waiting)
+        staged && past_bound(&waiting)
     }
 
     /// The host call's `copy` into the images of `keeper` waits for the device's next
@@ -982,19 +1533,35 @@ impl FirstMoves {
     /// The submission's place in the order is held until it was made or the work given back
     /// ([`Taken`]): every submission takes, whether or not anything waits.
     pub(crate) fn take(&self, named: impl Fn(ResourceKey) -> bool) -> Taken<'_> {
-        self.take_with(named, || None)
+        self.take_with(named, FillTake::All, || None, (|_| true, |_| false))
+    }
+
+    /// As [`take`](Self::take), for a handle handed out (`Buffer::vk_buffer`,
+    /// `Buffer::export_memory_fd`, `Texture::vk_image`): only the work [`Mine`] names, in the order
+    /// it was registered, the rest left waiting for the device's next submission. A move of an
+    /// image bound to host pages is taken where `Mine` names its image, whatever its key.
+    pub(crate) fn take_mine(&self, mine: Mine) -> Taken<'_> {
+        let wanted = |entry: &Waiting| mine.names(entry);
+        self.take_with(|_| true, FillTake::All, || None, (wanted, |_| false))
     }
 
     /// As [`take`](Self::take), for a submission whose commands may bind the heap sets (a
-    /// batch's): where registrations do not wait for their place ([`FirstMoves::ordered`]), it
-    /// also holds the texture slots' writes (`heap_sets::hold`, which `hold` makes) from before it
-    /// takes until its submission was made or the work given back (the module docs).
+    /// batch's), taking the fills `fills` says: where registrations do not wait for their place
+    /// ([`FirstMoves::ordered`]), it also holds the texture slots' writes (`heap_sets::hold`,
+    /// which `hold` makes) from before it takes until its submission was made or the work given
+    /// back (the module docs). The images whose key `overwrites` names are written whole by the
+    /// first use among its commands before any of them reads a texel (`command_buffer/submit.rs`):
+    /// their moves that may go so ([`FirstMove::mark_overwritable`]) record no zeros, counted
+    /// (`WorkCounts::private_textures_overwritten_unfilled`).
     pub(crate) fn take_holding(
         &self,
         named: impl Fn(ResourceKey) -> bool,
+        fills: FillTake<'_>,
         hold: impl FnOnce() -> HeldSlots,
+        overwrites: impl Fn(ResourceKey) -> bool,
     ) -> Taken<'_> {
-        self.take_with(named, || (!self.ordered).then(hold))
+        let hold = || (!self.ordered).then(hold);
+        self.take_with(named, fills, hold, (|_| true, overwrites))
     }
 
     /// The submissions' order, for a submission: taken, and the wait counted where another
@@ -1025,65 +1592,124 @@ impl FirstMoves {
         )
     }
 
-    /// As [`take`](Self::take), holding the slots `hold` gives once its place is taken.
+    /// As [`take`](Self::take), holding the slots `hold` gives once its place is taken, taking
+    /// only the entries `wanted` says, and of the fills those `fills` says: the rest stay waiting,
+    /// in their order. A fill's turn is settled once every move taken is known: a move of an
+    /// image in memory another resource owns, or a staged copy, takes every fill (the module
+    /// docs). The moves of images whose key `overwrites` names record no zeros where they may go
+    /// so ([`take_holding`](Self::take_holding)).
     fn take_with(
         &self,
         named: impl Fn(ResourceKey) -> bool,
+        fills: FillTake<'_>,
         hold: impl FnOnce() -> Option<HeldSlots>,
+        (wanted, overwrites): (impl Fn(&Waiting) -> bool, impl Fn(ResourceKey) -> bool),
     ) -> Taken<'_> {
         let order = self.submission_place();
         let slots = hold();
         let mut held = Vec::new();
         let mut left: Vec<Box<dyn Any + Send + Sync>> = Vec::new();
+        let mut every_fill = matches!(fills, FillTake::All | FillTake::Owned { .. });
         {
             let mut waiting = lock(&self.waiting);
             if waiting.is_empty() {
                 return Taken {
                     moves: self,
                     held,
+                    every_fill,
                     _slots: slots,
                     _order: order,
                 };
             }
-            let mut kept = Vec::new();
+            // Each entry in its order: kept, taken, or a fill whose turn waits for the moves.
+            let mut sorted = Vec::with_capacity(waiting.len());
             for entry in waiting.drain(..) {
+                if !wanted(&entry) {
+                    sorted.push(Sorted::Kept(entry));
+                    continue;
+                }
                 match entry {
                     Waiting::Moves(weak) => {
                         let Some(fresh) = weak.upgrade() else {
                             continue;
                         };
                         if fresh.rebindable().is_some_and(|key| !named(key)) {
-                            kept.push(Waiting::Moves(weak));
+                            sorted.push(Sorted::Kept(Waiting::Moves(weak)));
                             left.push(Box::new(fresh));
                             continue;
                         }
+                        let unzeroed = fresh.key().is_some_and(&overwrites);
                         let moves: Vec<FirstMove> = fresh
                             .take()
                             .into_iter()
                             .filter_map(FirstMove::held)
+                            .map(|mut first| {
+                                first.unzeroed = unzeroed && first.overwritable;
+                                first
+                            })
                             .collect();
                         if moves.is_empty() {
                             left.push(Box::new(fresh));
                         } else {
-                            held.push(Held::Moves(fresh, moves));
+                            every_fill |= fresh.in_other_memory();
+                            let owner = (fills.owner_of())
+                                .and_then(|owner_of| fresh.key().and_then(owner_of));
+                            sorted.push(Sorted::Taken(Held::Moves(fresh, moves, owner)));
                         }
                     }
                     Waiting::Fill(weak, fill) => {
                         let Some(buffer) = weak.upgrade() else {
                             continue;
                         };
-                        // The submission holds the buffer's memory; the buffer goes as the
-                        // program lets go of it, once the lock is free.
-                        if let Some(memory) = buffer.memory() {
-                            held.push(Held::Fill(weak, memory, fill));
-                        }
-                        left.push(Box::new(buffer));
+                        sorted.push(Sorted::Fill(weak, fill, buffer));
                     }
                     // An image gone takes its copy and staging buffer with it.
                     Waiting::Texels(weak, copy) => {
                         if let Some(image) = weak.upgrade() {
-                            held.push(Held::Texels(image, copy));
+                            every_fill = true;
+                            let owner =
+                                (fills.owner_of()).and_then(|owner_of| copy.key.and_then(owner_of));
+                            sorted.push(Sorted::Taken(Held::Texels(image, copy, owner)));
                         }
+                    }
+                }
+            }
+            let mut kept = Vec::new();
+            for entry in sorted {
+                match entry {
+                    Sorted::Kept(entry) => kept.push(entry),
+                    Sorted::Taken(entry) => held.push(entry),
+                    Sorted::Fill(weak, mut fill, buffer) => {
+                        fill.owner =
+                            (fills.owner_of()).and_then(|owner_of| fill.key.and_then(owner_of));
+                        let reached = match (&fills, fill.owner) {
+                            (FillTake::Reached { reaches, .. }, Some(owner)) => reaches(owner),
+                            (FillTake::Owned { reaches, .. }, Some(owner))
+                                if fill.upload.is_some() =>
+                            {
+                                reaches(owner)
+                            }
+                            _ => true,
+                        };
+                        // An upload goes only with a batch that may reach its memory, whatever
+                        // else the batch takes, of a command buffer committed at or after the
+                        // commit that took its bytes.
+                        let in_time = match (fill.upload, fills.commit()) {
+                            (Some(upload), Some(commit)) => upload <= commit,
+                            _ => true,
+                        };
+                        let taken = in_time && (reached || (every_fill && fill.upload.is_none()));
+                        match taken {
+                            // The submission holds the buffer's memory; the buffer goes as the
+                            // program lets go of it, once the lock is free.
+                            true => {
+                                if let Some(memory) = buffer.memory() {
+                                    held.push(Held::Fill(weak, memory, fill));
+                                }
+                            }
+                            false => kept.push(Waiting::Fill(weak, fill)),
+                        }
+                        left.push(Box::new(buffer));
                     }
                 }
             }
@@ -1093,9 +1719,45 @@ impl FirstMoves {
         Taken {
             moves: self,
             held,
+            every_fill,
             _slots: slots,
             _order: order,
         }
+    }
+
+    /// Whether a batch whose commands name nothing takes no work waiting: none waits but fills
+    /// of memory whose key `named_only` says only a batch that may reach it takes
+    /// ([`FillTake::Reached`]), and uploads, which only such a batch takes on any device
+    /// (`FirstFill::upload`). A command buffer that needs no GPU work then goes with no
+    /// submission, and one that finds work waiting carries it as before
+    /// (`command_buffer/submit.rs`).
+    pub(crate) fn none_waiting_but(&self, named_only: impl Fn(ResourceKey) -> bool) -> bool {
+        lock(&self.waiting).iter().all(|entry| {
+            matches!(entry, Waiting::Fill(_, fill)
+                if fill.upload.is_some() || fill.key.is_some_and(&named_only))
+        })
+    }
+
+    /// Let go of the fills and copies that wait for what is at `keeper` (the address of what
+    /// [`register_bytes`](Self::register_bytes), [`register_fill`](Self::register_fill),
+    /// [`register_acquire`](Self::register_acquire) or [`register_texels`](Self::register_texels)
+    /// was given), as it goes: a gone resource's work is no submission's, and what that work
+    /// holds (a staging buffer, a host copy, each holding the device) goes with it, once the lock
+    /// is free. Left waiting, it would hold the device past the program's last handle until a
+    /// submission took it, and a device the program let go of makes none.
+    pub(crate) fn forget(&self, keeper: *const ()) {
+        let gone: Vec<Waiting> = {
+            let mut waiting = lock(&self.waiting);
+            let (gone, kept): (Vec<Waiting>, Vec<Waiting>) =
+                waiting.drain(..).partition(|entry| match entry {
+                    Waiting::Fill(weak, _) => weak.as_ptr().cast::<()>() == keeper,
+                    Waiting::Texels(weak, _) => weak.as_ptr().cast::<()>() == keeper,
+                    Waiting::Moves(_) => false,
+                });
+            waiting.extend(kept);
+            gone
+        };
+        drop(gone);
     }
 
     /// Whether a host call's copy waits for the images of what is at `keeper` (the address of
@@ -1109,15 +1771,29 @@ impl FirstMoves {
         })
     }
 
-    /// The points a submission on `VkQueue` `queue` waits for: of the last batch on each other
-    /// one that did first work, where `completed` says it may not have completed.
-    pub(crate) fn waits(&self, queue: usize, completed: impl Fn(Point) -> bool) -> Vec<Point> {
-        let mut done_at = lock(&self.done_at);
-        done_at.retain(|&point| !completed(point));
-        done_at
+    /// Whether first work waits on `buffer` (a `VkBuffer`): a new buffer's fill with zeros or
+    /// its staged bytes, or a `Managed` buffer's upload, which the device's next submission makes
+    /// before its commands, over whatever another writer wrote there meanwhile.
+    pub(crate) fn fills_wait(&self, buffer: vk::Buffer) -> bool {
+        lock(&self.waiting)
             .iter()
-            .copied()
-            .filter(|point| point.queue != queue)
+            .any(|entry| matches!(entry, Waiting::Fill(_, fill) if fill.buffer == buffer))
+    }
+
+    /// The batches on `VkQueue`s other than `queue` that did first work, where `completed` says
+    /// they may not have completed, each at its point with what owns the memory its work wrote
+    /// (`None`: memory any command may reach): what a submission on `queue` may wait for
+    /// ([`last_of_each`] of their points).
+    pub(crate) fn waits(
+        &self,
+        queue: usize,
+        completed: impl Fn(Point) -> bool,
+    ) -> Vec<(Point, Option<Vec<ObjectId>>)> {
+        let mut done_at = lock(&self.done_at);
+        done_at.retain(|&(point, _)| !completed(point));
+        (done_at.iter())
+            .filter(|(point, _)| point.queue != queue)
+            .cloned()
             .collect()
     }
 
@@ -1222,6 +1898,10 @@ impl FirstMoves {
     /// Release the buffer of zeros, the patterns' and the scratch images into `memory`; the
     /// device is idle.
     pub(crate) fn destroy(&self, device: &ash::Device, memory: &mut Memory) {
+        lock(&self.staging).destroy(device, memory);
+        if let Some(zeros) = lock(&self.staging_zeros).take() {
+            zeros.destroy(device, memory);
+        }
         if let Some(zeros) = &*lock(&self.zeros) {
             zeros.destroy(device, memory);
         }
@@ -1430,6 +2110,8 @@ impl Zeros {
 pub(crate) struct Taken<'a> {
     moves: &'a FirstMoves,
     held: Vec<Held>,
+    /// It took every fill waiting ([`every_fill`](Self::every_fill)).
+    every_fill: bool,
     /// The texture slots' writes it holds ([`FirstMoves::take_holding`]), made as this drops,
     /// before its place goes: the field before `_order`, which drops after it.
     _slots: Option<HeldSlots>,
@@ -1437,15 +2119,59 @@ pub(crate) struct Taken<'a> {
     _order: MutexGuard<'a, ()>,
 }
 
-impl Taken<'_> {
+impl<'a> Taken<'a> {
+    /// Whether it took every fill waiting: it took them all ([`FillTake::All`]), or took a move of
+    /// an image in memory another resource owns, or a staged copy, each of which comes after every
+    /// fill of that memory. Its commands then may reach what any fill-queue submission not yet
+    /// complete filled too (`command_buffer/submit.rs`).
+    pub(crate) fn every_fill(&self) -> bool {
+        self.every_fill
+    }
+
     /// Whether it took first work ([`record`](Self::record)'s): a move or a fill.
     pub(crate) fn has_first(&self) -> bool {
         (self.held.iter()).any(|held| matches!(held, Held::Moves(..) | Held::Fill(..)))
     }
 
+    /// Whether it took a move that keeps a buffer's bytes by copies around its layout transition
+    /// ([`GpuKeep`]): the submission that records it waits for every earlier submission on the
+    /// device's other `VkQueue`s, whose commands may access those bytes while the transition
+    /// rewrites them.
+    pub(crate) fn keeps(&self) -> bool {
+        (self.held.iter()).any(|held| {
+            matches!(held, Held::Moves(_, moves, _) if moves.iter().any(|first| first.keep.is_some()))
+        })
+    }
+
     /// Whether it took host calls' staged copies ([`record_staged`](Self::record_staged)'s).
     pub(crate) fn has_staged(&self) -> bool {
         (self.held.iter()).any(|held| matches!(held, Held::Texels(..)))
+    }
+
+    /// Its buffers' fills, taken out for the fill queue (`device/staging.rs`), in the order they
+    /// were noted; the moves and staged copies stay, recorded after them in submission order.
+    /// `None` where it took no fill, its fills write fewer than `least` bytes in all, or it took
+    /// an acquire from an external agent, whose barrier names the device's family as its target
+    /// and leads every fill (all stay then).
+    pub(crate) fn take_fills(&mut self, least: u64) -> Option<Fills<'a>> {
+        let fill = |held: &Held| matches!(held, Held::Fill(..));
+        let acquire =
+            |held: &Held| matches!(held, Held::Fill(_, _, fill) if fill.acquire.is_some());
+        let written: u64 = (self.held.iter())
+            .map(|held| match held {
+                Held::Fill(_, _, fill) => fill.written(),
+                _ => 0,
+            })
+            .sum();
+        if !self.held.iter().any(fill) || written < least || self.held.iter().any(acquire) {
+            return None;
+        }
+        let (fills, rest): (Vec<Held>, Vec<Held>) = self.held.drain(..).partition(fill);
+        self.held = rest;
+        Some(Fills {
+            moves: self.moves,
+            held: fills,
+        })
     }
 
     /// Record the host calls' staged copies it took into `command_buffer`, each after every
@@ -1459,7 +2185,7 @@ impl Taken<'_> {
     /// submission order -- earlier in this command buffer, or in a submission before.
     pub(crate) unsafe fn record_staged(&self, device: &Vk, command_buffer: vk::CommandBuffer) {
         let staged = self.held.iter().filter_map(|held| match held {
-            Held::Texels(_, copy) => Some(copy),
+            Held::Texels(_, copy, _) => Some(copy),
             Held::Moves(..) | Held::Fill(..) => None,
         });
         let mut copied = false;
@@ -1497,10 +2223,12 @@ impl Taken<'_> {
 
     /// Record the work into `command_buffer`, of a family of `family`'s queue flags: the
     /// buffers' fills with zeros, after every command before (memory other commands wrote, a
-    /// heap's included), then their copies of staged bytes, after the zeros, then a barrier
+    /// heap's included), then their copies of staged bytes, after the zeros, then the copies out
+    /// of the spans the moves keep ([`GpuKeep`]), after every command before, then a barrier
     /// carrying every image's move, after the fills (an image placed in a new heap moves after
-    /// the heap's fill), then the images' copies of zeros, then the barrier that makes every write
-    /// visible to every command after and to the host.
+    /// the heap's fill) and the copies out, then the copies of the kept spans back and the
+    /// images' copies of zeros, then the barrier that makes every write visible to every command
+    /// after and to the host.
     ///
     /// # Safety
     ///
@@ -1530,58 +2258,26 @@ impl Taken<'_> {
             .collect();
         let moves = || {
             self.held.iter().flat_map(|held| match held {
-                Held::Moves(_, moves) => moves.as_slice(),
+                Held::Moves(_, moves, _) => moves.as_slice(),
                 Held::Fill(..) | Held::Texels(..) => &[],
             })
         };
-        if !fills.is_empty() {
+        // SAFETY: the caller's contract.
+        unsafe { record_fills((device, counts), command_buffer, &fills) };
+        let keeps: Vec<&GpuKeep> = moves().filter_map(|first| first.keep.as_ref()).collect();
+        if !keeps.is_empty() {
+            // The spans out, after every command before (the fills and staged copies above
+            // among them), each before its image's move, which the move's barrier orders.
             // SAFETY: the caller's contract.
             unsafe {
                 let flags = vk::DependencyFlags::empty();
                 device.cmd_pipeline_barrier(command_buffer, all, all, flags, &written(), &[], &[]);
             }
             exit_guard::called(Call::CmdPipelineBarrier);
-        }
-        let (zeros, staged): (Vec<&FirstFill>, Vec<&FirstFill>) = fills
-            .iter()
-            .copied()
-            .partition(|fill| fill.staging.is_none());
-        for (at, fill) in zeros.iter().chain(&staged).enumerate() {
-            if at == zeros.len() && at > 0 {
-                // SAFETY: the caller's contract.
-                unsafe {
-                    let flags = vk::DependencyFlags::empty();
-                    device.cmd_pipeline_barrier(
-                        command_buffer,
-                        all,
-                        all,
-                        flags,
-                        &written(),
-                        &[],
-                        &[],
-                    );
-                }
-                exit_guard::called(Call::CmdPipelineBarrier);
+            for keep in &keeps {
+                // SAFETY: as above; the move holds both buffers.
+                unsafe { keep.record(device, command_buffer, false) };
             }
-            if let Some(words) = &fill.filled {
-                // SAFETY: as above; the words lie in the buffer, held, which has `TRANSFER_DST`
-                // usage as every buffer of the runtime's, their ends multiples of 4
-                // (`FirstFill::zeros`).
-                unsafe {
-                    let (buffer, words) = (fill.buffer, words.clone());
-                    crate::word_fill::record_command(device, command_buffer, buffer, words, 0);
-                }
-                exit_guard::called(Call::CmdFillBuffer);
-                counts.new_buffer_zero_filled();
-                continue;
-            }
-            // SAFETY: as above; every copy lies within its source, the device's zeros (live and
-            // `ZERO_BYTES` long) or a staging buffer the fill keeps, and within the buffer,
-            // held, which has `TRANSFER_DST` usage as every buffer of the runtime's.
-            unsafe {
-                device.cmd_copy_buffer(command_buffer, fill.source, fill.buffer, &fill.copies);
-            }
-            exit_guard::called(Call::CmdCopyBuffer);
         }
         let images: Vec<vk::ImageMemoryBarrier<'_>> =
             moves().map(|first| first.barrier(family)).collect();
@@ -1602,9 +2298,23 @@ impl Taken<'_> {
             exit_guard::called(Call::CmdPipelineBarrier);
         }
         let mut copied = !fills.is_empty();
-        for first in moves().filter(|first| first.writes()) {
+        // The spans back through their buffers, after the moves, whose barrier makes the
+        // transitions' writes and the copies out visible to them.
+        for keep in &keeps {
+            // SAFETY: as above.
+            unsafe { keep.record(device, command_buffer, true) };
+            counts.first_move_kept(keep.length);
+            copied = true;
+        }
+        for first in moves() {
+            if first.unzeroed {
+                counts.private_texture_overwritten_unfilled();
+            }
+            if !first.writes() {
+                continue;
+            }
             // SAFETY: as above; the image is in `GENERAL` now and has `TRANSFER_DST` usage where
-            // it reads zero.
+            // it reads zero by a transfer.
             unsafe { first.record_zero(device, command_buffer, family) };
             copied = true;
         }
@@ -1612,18 +2322,38 @@ impl Taken<'_> {
             transfer_barrier(device, command_buffer, false);
             exit_guard::called(Call::CmdPipelineBarrier);
         }
+        // Zeros cleared in render passes, from their attachments' stages, visible to every
+        // command after.
+        if moves().any(FirstMove::clears_in_passes) {
+            // SAFETY: the caller's contract.
+            unsafe {
+                let flags = vk::DependencyFlags::empty();
+                device.cmd_pipeline_barrier(command_buffer, all, all, flags, &written(), &[], &[]);
+            }
+            exit_guard::called(Call::CmdPipelineBarrier);
+        }
+    }
+
+    /// What owns the memory its work writes ([`Held::owner`]), each once; `None` where one's
+    /// owner is unknown, or memory no use of the program's names.
+    pub(crate) fn owners(&self) -> Option<Vec<ObjectId>> {
+        owners_of(&self.held)
     }
 
     /// The submission that records the work was made; on a device of several `VkQueue`s by a
-    /// batch at `at` (`None` for a submission waited for, or a device of one). What the
-    /// submission holds until it completes.
+    /// batch at `at` (`None` for a submission waited for, or a device of one), kept with what
+    /// owns the memory its work writes ([`owners`](Self::owners)) until it completed
+    /// ([`FirstMoves::waits`]). What the submission holds until it completes.
     pub(crate) fn submitted(mut self, at: Option<Point>) -> Vec<Box<dyn Any + Send + Sync>> {
         if let (Some(at), false) = (at, self.held.is_empty()) {
+            let owners = self.owners();
             let mut done_at = lock(&self.moves.done_at);
-            match done_at.iter_mut().find(|point| point.queue == at.queue) {
-                Some(point) => point.value = point.value.max(at.value),
-                None => done_at.push(at),
+            // One whose work any command may reach covers those before it on its `VkQueue`: a
+            // wait for it orders them too.
+            if owners.is_none() {
+                done_at.retain(|(point, _)| point.queue != at.queue);
             }
+            done_at.push((at, owners));
         }
         self.held.drain(..).map(Held::keeper).collect()
     }
@@ -1643,27 +2373,186 @@ impl Taken<'_> {
     }
 }
 
-impl Drop for Taken<'_> {
-    fn drop(&mut self) {
-        if self.held.is_empty() {
-            return;
+/// Record `fills` into `command_buffer`: a barrier after every command before (memory other
+/// commands wrote, a heap's included), carrying the acquires among them, then the fills with zeros,
+/// then, after a barrier, their copies of staged bytes, each copy into bytes a copy before it
+/// wrote after a barrier.
+///
+/// # Safety
+///
+/// As [`Taken::record`]'s; each buffer is live (held) and shared with the command buffer's family
+/// (`sharing.rs`), and each acquire names that family as its target.
+unsafe fn record_fills(
+    (device, counts): (&Vk, &Counters),
+    command_buffer: vk::CommandBuffer,
+    fills: &[&FirstFill],
+) {
+    let all = vk::PipelineStageFlags::ALL_COMMANDS;
+    let written = || {
+        [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)]
+    };
+    if !fills.is_empty() {
+        let acquires: Vec<vk::BufferMemoryBarrier<'_>> = fills
+            .iter()
+            .filter_map(|fill| fill.acquire_barrier())
+            .collect();
+        // SAFETY: the caller's contract; each acquired buffer is live (held), and its acquire
+        // names the device's family for it (`Device::external_acquirer`).
+        unsafe {
+            let flags = vk::DependencyFlags::empty();
+            let (memory, buffers) = (&written(), &acquires);
+            device.cmd_pipeline_barrier(command_buffer, all, all, flags, memory, buffers, &[]);
         }
-        let mut given = Vec::new();
-        for held in self.held.drain(..) {
-            match held {
-                Held::Moves(fresh, moves) => {
-                    fresh.give_back(moves.into_iter().map(FirstMove::unheld).collect());
-                    given.push(Waiting::Moves(Arc::downgrade(&fresh)));
-                }
-                Held::Fill(buffer, _, fill) => {
-                    given.push(Waiting::Fill(buffer, fill));
-                }
-                Held::Texels(image, copy) => {
-                    given.push(Waiting::Texels(Arc::downgrade(&image), copy));
-                }
+        exit_guard::called(Call::CmdPipelineBarrier);
+    }
+    let (zeros, staged): (Vec<&FirstFill>, Vec<&FirstFill>) = fills
+        .iter()
+        .copied()
+        .partition(|fill| fill.staging.is_none());
+    // Copies into bytes a copy before them wrote land after it, in the order they were noted:
+    // a barrier before each that meets one since the last barrier. A `Managed` no-copy
+    // buffer's copies in (`managed_copy.rs`: its making's, a rebind's, each
+    // `did_modify_range`'s) read its pages at different times.
+    let mut landed: Vec<(vk::Buffer, std::ops::Range<u64>)> = Vec::new();
+    for (at, fill) in zeros.iter().chain(&staged).enumerate() {
+        if at == zeros.len() && at > 0 {
+            // SAFETY: the caller's contract.
+            unsafe {
+                let flags = vk::DependencyFlags::empty();
+                device.cmd_pipeline_barrier(command_buffer, all, all, flags, &written(), &[], &[]);
+            }
+            exit_guard::called(Call::CmdPipelineBarrier);
+        }
+        if let Some(words) = &fill.filled {
+            // SAFETY: as above; the words lie in the buffer, held, which has `TRANSFER_DST`
+            // usage as every buffer of the runtime's, their ends multiples of 4
+            // (`FirstFill::zeros`).
+            unsafe {
+                let (buffer, words) = (fill.buffer, words.clone());
+                crate::word_fill::record_command(device, command_buffer, buffer, words, 0);
+            }
+            exit_guard::called(Call::CmdFillBuffer);
+            counts.new_buffer_zero_filled();
+            continue;
+        }
+        // An acquire copies nothing: its barrier led the fills.
+        if fill.copies.is_empty() {
+            continue;
+        }
+        let ranges = fill
+            .copies
+            .iter()
+            .map(|copy| copy.dst_offset..copy.dst_offset + copy.size);
+        let meets = ranges.clone().any(|range| {
+            (landed.iter()).any(|(buffer, before)| {
+                *buffer == fill.buffer && range.start < before.end && before.start < range.end
+            })
+        });
+        if meets {
+            // SAFETY: the caller's contract.
+            unsafe {
+                let flags = vk::DependencyFlags::empty();
+                let memory = &written();
+                device.cmd_pipeline_barrier(command_buffer, all, all, flags, memory, &[], &[]);
+            }
+            exit_guard::called(Call::CmdPipelineBarrier);
+            landed.clear();
+        }
+        landed.extend(ranges.map(|range| (fill.buffer, range)));
+        // SAFETY: as above; every copy lies within its source, the device's zeros (live and
+        // `ZERO_BYTES` long) or a staging buffer the fill keeps, and within the buffer,
+        // held, which has `TRANSFER_DST` usage as every buffer of the runtime's.
+        unsafe {
+            device.cmd_copy_buffer(command_buffer, fill.source, fill.buffer, &fill.copies);
+        }
+        exit_guard::called(Call::CmdCopyBuffer);
+    }
+}
+
+/// `held`, which no submission made, given back to `moves`, still to be done.
+fn give_back(moves: &FirstMoves, held: impl Iterator<Item = Held>) {
+    let mut given = Vec::new();
+    for held in held {
+        match held {
+            Held::Moves(fresh, moves, _) => {
+                fresh.give_back(moves.into_iter().map(FirstMove::unheld).collect());
+                given.push(Waiting::Moves(Arc::downgrade(&fresh)));
+            }
+            Held::Fill(buffer, _, fill) => {
+                given.push(Waiting::Fill(buffer, fill));
+            }
+            Held::Texels(image, copy, _) => {
+                given.push(Waiting::Texels(Arc::downgrade(&image), copy));
             }
         }
-        lock(&self.moves.waiting).extend(given);
+    }
+    if !given.is_empty() {
+        lock(&moves.waiting).extend(given);
+    }
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        give_back(self.moves, self.held.drain(..));
+    }
+}
+
+/// A batch's buffers' fills, taken out of its first work for the fill queue
+/// ([`Taken::take_fills`]): given back as this drops unless the submission that records them was
+/// made ([`submitted`](Fills::submitted)).
+pub(crate) struct Fills<'a> {
+    moves: &'a FirstMoves,
+    held: Vec<Held>,
+}
+
+impl Fills<'_> {
+    /// Record the fills into `command_buffer`, as [`Taken::record`] records them: every write
+    /// before them on the queue the command buffer goes to waited for by a barrier, the zeros,
+    /// then the copies of staged bytes, in the order they were noted. No barrier follows them:
+    /// the submission's signal makes their writes available ("The first access scope includes all
+    /// memory access performed by the device", the Vulkan specification, 7.4.1 Semaphore
+    /// Signaling), and the batch's wait for it makes them visible to its commands.
+    ///
+    /// # Safety
+    ///
+    /// `command_buffer` is recording, outside a render pass, for a family every buffer of the
+    /// device's is shared with (`sharing.rs`: the staging queue's, which the fill queue's is); the
+    /// submission that runs it is made before any that uses one of the buffers, which waits for
+    /// it.
+    pub(crate) unsafe fn record(
+        &self,
+        counted: (&Vk, &Counters),
+        command_buffer: vk::CommandBuffer,
+    ) {
+        let fills: Vec<&FirstFill> = (self.held.iter())
+            .filter_map(|held| match held {
+                Held::Fill(_, _, fill) => Some(fill),
+                Held::Moves(..) | Held::Texels(..) => None,
+            })
+            .collect();
+        // SAFETY: the caller's contract; none is an acquire ([`Taken::take_fills`]).
+        unsafe { record_fills(counted, command_buffer, &fills) };
+    }
+
+    /// What owns the memory the fills write, as the batch that took them found it
+    /// ([`FillTake::Reached`]), each once; `None` where one writes memory no use of the
+    /// program's names, or the take found no owner, which any command may reach.
+    pub(crate) fn owners(&self) -> Option<Vec<ObjectId>> {
+        owners_of(&self.held)
+    }
+
+    /// The submission that records the fills was made: what it holds until it completes (each
+    /// buffer's memory, and a fill's staging buffer).
+    pub(crate) fn submitted(mut self) -> Vec<Box<dyn Any + Send + Sync>> {
+        self.held.drain(..).map(Held::keeper).collect()
+    }
+}
+
+impl Drop for Fills<'_> {
+    fn drop(&mut self) {
+        give_back(self.moves, self.held.drain(..));
     }
 }
 
@@ -1767,6 +2656,301 @@ mod tests {
         let fill = FirstFill::new(vk::Buffer::from_raw(raw), 16, length, vk::Buffer::null());
         lock(&moves.waiting).push(Waiting::Fill(weak, fill));
         buffer
+    }
+
+    /// As [`fill`], of memory whose uses name `key`.
+    fn keyed_fill(moves: &FirstMoves, raw: u64, key: Option<ResourceKey>) -> Arc<Unit> {
+        let buffer = fill(moves, raw, 16);
+        if let Some(Waiting::Fill(_, fill)) = lock(&moves.waiting).last_mut() {
+            fill.key = key;
+        }
+        buffer
+    }
+
+    /// An image in memory another resource owns, holding its move.
+    struct Placed(Mutex<Vec<FirstMove>>);
+
+    impl Fresh for Placed {
+        fn take(&self) -> Vec<FirstMove> {
+            lock(&self.0).drain(..).collect()
+        }
+
+        fn give_back(&self, moves: Vec<FirstMove>) {
+            lock(&self.0).extend(moves);
+        }
+
+        fn rebindable(&self) -> Option<ResourceKey> {
+            None
+        }
+
+        fn in_other_memory(&self) -> bool {
+            true
+        }
+    }
+
+    /// The `VkBuffer`s of the fills `taken` holds, in order.
+    fn filled(taken: &Taken<'_>) -> Vec<u64> {
+        (taken.held.iter())
+            .filter_map(|held| match held {
+                Held::Fill(_, _, fill) => Some(fill.buffer.as_raw()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A batch on a device with a fill queue (`FillTake::Reached`) takes the fills of memory its
+    /// commands reach and of memory no use names, in their order, and leaves the rest waiting,
+    /// which a batch whose commands name nothing leaves too; one that takes a move of an image in
+    /// memory another resource owns, or a staged copy, takes every fill.
+    #[test]
+    fn a_batch_takes_the_fills_of_memory_it_reaches() {
+        let moves = FirstMoves::default();
+        let (reached, unreached) = (ResourceKey::new(), ResourceKey::new());
+        let (owner, other) = (ObjectId::new(), ObjectId::new());
+        let owner_of = |key: ResourceKey| match key == reached {
+            true => Some(owner),
+            false => Some(other),
+        };
+        let reaches = |of: ObjectId| of == owner;
+        let none = |_: ObjectId| false;
+        let _buffers = [
+            keyed_fill(&moves, 1, Some(reached)),
+            keyed_fill(&moves, 2, Some(unreached)),
+            keyed_fill(&moves, 3, None),
+            keyed_fill(&moves, 4, Some(reached)),
+        ];
+        let named_only = |key: ResourceKey| owner_of(key).is_some();
+        assert!(!moves.none_waiting_but(named_only));
+        let fills = FillTake::Reached {
+            owner_of: &owner_of,
+            reaches: &reaches,
+            commit: 0,
+        };
+        let taken = moves.take_with(|_| true, fills, || None, (|_| true, |_| false));
+        assert!(!taken.every_fill());
+        assert_eq!(filled(&taken), [1, 3, 4]);
+        drop(taken.submitted(None));
+        assert!(moves.none_waiting_but(named_only));
+        assert!(!moves.none_waiting_but(|_| false));
+        // A move of an image in another resource's memory takes the fill no use reaches.
+        let placed = Arc::new(Placed(Mutex::new(vec![first(5, false)])));
+        let weak: Weak<Placed> = Arc::downgrade(&placed);
+        moves.register(weak);
+        let fills = FillTake::Reached {
+            owner_of: &owner_of,
+            reaches: &none,
+            commit: 0,
+        };
+        let taken = moves.take_with(|_| true, fills, || None, (|_| true, |_| false));
+        assert!(taken.every_fill());
+        assert_eq!(filled(&taken), [2]);
+        drop(taken.submitted(None));
+        assert!(moves.none_waiting_but(|_| false));
+        // So does a staged copy.
+        let _later = keyed_fill(&moves, 6, Some(unreached));
+        let image: Arc<u32> = Arc::new(0);
+        let image_weak: Weak<u32> = Arc::downgrade(&image);
+        let copy = (vk::Image::null(), vk::BufferImageCopy::default());
+        let staged = TexelCopy::new(vk::Buffer::null(), 16, vec![copy], Box::new(()));
+        assert!(!moves.register_texels(image_weak, staged));
+        let fills = FillTake::Reached {
+            owner_of: &owner_of,
+            reaches: &none,
+            commit: 0,
+        };
+        let taken = moves.take_with(|_| true, fills, || None, (|_| true, |_| false));
+        assert!(taken.every_fill());
+        assert_eq!(filled(&taken), [6]);
+        drop(taken.submitted(None));
+        assert!(moves.none_waiting_but(|_| false));
+    }
+
+    /// As [`keyed_fill`], an upload into a buffer the program may have read already, of bytes
+    /// taken at the commit stamped `commit` (`FirstMoves::register_upload`).
+    fn upload(moves: &FirstMoves, raw: u64, key: ResourceKey, commit: u64) -> Arc<Unit> {
+        let buffer = keyed_fill(moves, raw, Some(key));
+        if let Some(Waiting::Fill(_, fill)) = lock(&moves.waiting).last_mut() {
+            fill.upload = Some(commit);
+        }
+        buffer
+    }
+
+    /// An upload goes only with a batch whose commands may reach its memory, on a device with a
+    /// fill queue or without one, even where the batch takes every other fill (a move of an
+    /// image in another resource's memory, or a device without a fill queue); a batch that
+    /// reaches none of it leaves it waiting, and so does one that needs no GPU work; an internal
+    /// submission takes it.
+    #[test]
+    fn an_upload_goes_only_with_a_batch_that_reaches_its_buffer() {
+        let moves = FirstMoves::default();
+        let (used, unused) = (ResourceKey::new(), ResourceKey::new());
+        let (used_id, unused_id) = (ObjectId::new(), ObjectId::new());
+        let owner_of = |key: ResourceKey| match key == used {
+            true => Some(used_id),
+            false => Some(unused_id),
+        };
+        let reaches = |of: ObjectId| of == used_id;
+        let none = |_: ObjectId| false;
+        // Without a fill queue: a batch that reaches the other buffer takes every fill but the
+        // upload.
+        let _buffers = [
+            upload(&moves, 1, unused, 1),
+            keyed_fill(&moves, 2, Some(used)),
+            upload(&moves, 3, used, 1),
+        ];
+        let fills = FillTake::Owned {
+            owner_of: &owner_of,
+            reaches: &reaches,
+            commit: 1,
+        };
+        let taken = moves.take_with(|_| true, fills, || None, (|_| true, |_| false));
+        assert!(taken.every_fill());
+        assert_eq!(filled(&taken), [2, 3]);
+        drop(taken.submitted(None));
+        assert!(moves.none_waiting_but(|_| false), "only an upload waits");
+        // With a fill queue, a move of an image in another resource's memory takes every fill but
+        // the upload no command of the batch reaches.
+        let placed = Arc::new(Placed(Mutex::new(vec![first(4, false)])));
+        let weak: Weak<Placed> = Arc::downgrade(&placed);
+        moves.register(weak);
+        let fills = FillTake::Reached {
+            owner_of: &owner_of,
+            reaches: &none,
+            commit: 1,
+        };
+        let taken = moves.take_with(|_| true, fills, || None, (|_| true, |_| false));
+        assert!(taken.every_fill());
+        assert!(filled(&taken).is_empty());
+        drop(taken.submitted(None));
+        // A batch that reaches it takes it.
+        let reaches_unused = |of: ObjectId| of == unused_id;
+        let fills = FillTake::Owned {
+            owner_of: &owner_of,
+            reaches: &reaches_unused,
+            commit: 1,
+        };
+        let taken = moves.take_with(|_| true, fills, || None, (|_| true, |_| false));
+        assert_eq!(filled(&taken), [1]);
+        drop(taken.submitted(None));
+        // An internal submission takes one whatever reaches it.
+        let _later = upload(&moves, 5, unused, 1);
+        let taken = moves.take(|_| true);
+        assert_eq!(filled(&taken), [5]);
+        drop(taken.submitted(None));
+        assert!(moves.none_waiting_but(|_| false));
+    }
+
+    /// An upload goes with no batch of a command buffer committed before the commit that took its
+    /// bytes, though the batch reaches its buffer and is submitted after that commit: the batch of
+    /// the commit takes its own upload and leaves the later ones, in their order, to the batches
+    /// of their commits, on a device with a fill queue or without one. An upload no commit took
+    /// (stamped 0) goes with any batch that reaches it.
+    #[test]
+    fn an_upload_goes_with_no_batch_committed_before_its_bytes_were_taken() {
+        let moves = FirstMoves::default();
+        let used = ResourceKey::new();
+        let used_id = ObjectId::new();
+        let owner_of = |key: ResourceKey| (key == used).then_some(used_id);
+        let reaches = |of: ObjectId| of == used_id;
+        let _buffers = [
+            upload(&moves, 1, used, 2),
+            upload(&moves, 2, used, 3),
+            upload(&moves, 3, used, 4),
+        ];
+        let owned = |commit: u64| FillTake::Owned {
+            owner_of: &owner_of,
+            reaches: &reaches,
+            commit,
+        };
+        let reached = |commit: u64| FillTake::Reached {
+            owner_of: &owner_of,
+            reaches: &reaches,
+            commit,
+        };
+        let taken = moves.take_with(|_| true, owned(1), || None, (|_| true, |_| false));
+        assert!(filled(&taken).is_empty(), "committed before every upload");
+        drop(taken.submitted(None));
+        let taken = moves.take_with(|_| true, reached(2), || None, (|_| true, |_| false));
+        assert_eq!(filled(&taken), [1]);
+        drop(taken.submitted(None));
+        let taken = moves.take_with(|_| true, owned(4), || None, (|_| true, |_| false));
+        assert_eq!(filled(&taken), [2, 3]);
+        drop(taken.submitted(None));
+        let _made = upload(&moves, 4, used, 0);
+        let taken = moves.take_with(|_| true, reached(1), || None, (|_| true, |_| false));
+        assert_eq!(filled(&taken), [4]);
+        drop(taken.submitted(None));
+        assert!(moves.none_waiting_but(|_| false));
+    }
+
+    /// An image of the program's whose uses name its key, holding its move.
+    struct Owned(Mutex<Vec<FirstMove>>, ResourceKey);
+
+    impl Fresh for Owned {
+        fn take(&self) -> Vec<FirstMove> {
+            lock(&self.0).drain(..).collect()
+        }
+
+        fn give_back(&self, moves: Vec<FirstMove>) {
+            lock(&self.0).extend(moves);
+        }
+
+        fn rebindable(&self) -> Option<ResourceKey> {
+            None
+        }
+
+        fn key(&self) -> Option<ResourceKey> {
+            Some(self.1)
+        }
+    }
+
+    /// A batch that knows what owns the memory of the first work it takes keeps that with its
+    /// point: two batches of one `VkQueue` over different owners both stay, and one whose work's
+    /// owner no use keeps, which any command may reach, covers those before it there.
+    #[test]
+    fn a_batch_keeps_what_owns_its_first_work_s_memory() {
+        let moves = FirstMoves::default();
+        let [texture, buffer, unkept] = [(); 3].map(|()| ResourceKey::new());
+        let (texture_id, buffer_id) = (ObjectId::new(), ObjectId::new());
+        let owner_of = |key: ResourceKey| {
+            (key == texture)
+                .then_some(texture_id)
+                .or((key == buffer).then_some(buffer_id))
+        };
+        let owned = |raw: u64, key: ResourceKey| {
+            let image = Arc::new(Owned(Mutex::new(vec![first(raw, false)]), key));
+            let weak: Weak<Owned> = Arc::downgrade(&image);
+            moves.register(weak);
+            image
+        };
+        let take = || {
+            let fills = FillTake::Owned {
+                owner_of: &owner_of,
+                reaches: &|_| true,
+                commit: 0,
+            };
+            moves.take_with(|_| true, fills, || None, (|_| true, |_| false))
+        };
+        let image = owned(1, texture);
+        let at = Point { queue: 1, value: 3 };
+        let taken = take();
+        assert_eq!(taken.owners(), Some(vec![texture_id]));
+        drop(taken.submitted(Some(at)));
+        let _buffer = keyed_fill(&moves, 2, Some(buffer));
+        let later = Point { queue: 1, value: 4 };
+        drop(take().submitted(Some(later)));
+        assert_eq!(
+            moves.waits(0, |_| false),
+            [(at, Some(vec![texture_id])), (later, Some(vec![buffer_id]))]
+        );
+        assert_eq!(last_of_each([at, later]), [later]);
+        let unknown = owned(3, unkept);
+        let last = Point { queue: 1, value: 5 };
+        let taken = take();
+        assert_eq!(taken.owners(), None);
+        drop(taken.submitted(Some(last)));
+        assert_eq!(moves.waits(0, |_| false), [(last, None)]);
+        drop((image, unknown));
     }
 
     #[test]
@@ -1948,7 +3132,7 @@ mod tests {
             (raw(2), 16),
             (raw(3), 0),
             64,
-            Box::new(staging.clone()),
+            Keeps::Staging(Box::new(staging.clone())),
         );
         let taken = moves.take(|_| false);
         let copies: Vec<(vk::Buffer, u64, u64, u64)> = (taken.held.iter())
@@ -2044,7 +3228,7 @@ mod tests {
         let bytes = |moves: &FirstMoves| {
             let to = (vk::Buffer::from_raw(7), 0);
             let from = (vk::Buffer::from_raw(8), 0);
-            moves.register_bytes(keeper.clone(), to, from, 4, Box::new(()))
+            moves.register_bytes(keeper.clone(), to, from, 4, Keeps::Staging(Box::new(())))
         };
         for _ in 0..STAGED_COPIES {
             assert!(!bytes(&moves));
@@ -2057,6 +3241,37 @@ mod tests {
             .collect();
         assert!(!past_bound(&lock(&moves.waiting)));
         drop(held);
+    }
+
+    /// A copy from a host copy the buffer holds (`Keeps::HostCopy`: a `Managed` buffer's upload
+    /// from its mirror or its pages' import) stages nothing: past the bytes' bound, and past the
+    /// count's, in copies at the making and uploads a commit took, it passes neither bound, and a
+    /// staged copy after them is counted alone.
+    #[test]
+    fn copies_from_a_host_copy_pass_no_bound() {
+        let moves = FirstMoves::default();
+        let keeper: Weak<dyn Filled> = Weak::<Unit>::new();
+        let to = (vk::Buffer::from_raw(7), 0);
+        let from = (vk::Buffer::from_raw(8), 0);
+        let host_copy = || Keeps::HostCopy(Box::new(()));
+        assert!(!moves.register_bytes(keeper.clone(), to, from, STAGED_BYTES + 1, host_copy()));
+        for commit in 1..=STAGED_COPIES as u64 + 1 {
+            let upload =
+                moves.register_upload(keeper.clone(), to, from, 1 << 20, host_copy(), commit);
+            assert!(!upload, "an upload from a host copy passed the bound");
+        }
+        assert!(!past_bound(&lock(&moves.waiting)));
+        assert!(!moves.register_bytes(
+            keeper.clone(),
+            to,
+            from,
+            STAGED_BYTES,
+            Keeps::Staging(Box::new(()))
+        ));
+        assert!(
+            moves.register_bytes(keeper.clone(), to, from, 1, Keeps::Staging(Box::new(()))),
+            "one staged byte past the bytes' bound"
+        );
     }
 
     #[test]
@@ -2077,7 +3292,7 @@ mod tests {
         let taken = moves.take(|_| false);
         let images: Vec<vk::Image> = (taken.held.iter())
             .flat_map(|held| match held {
-                Held::Moves(_, moves) => moves.iter().map(|m| m.image).collect(),
+                Held::Moves(_, moves, _) => moves.iter().map(|m| m.image).collect(),
                 Held::Fill(..) | Held::Texels(..) => Vec::new(),
             })
             .collect();
@@ -2101,7 +3316,11 @@ mod tests {
         let image = registered(&moves, 1, None);
         let at = Point { queue: 1, value: 5 };
         drop(moves.take(|_| false).submitted(Some(at)));
-        assert_eq!(moves.waits(0, |_| false), [at]);
+        assert_eq!(
+            moves.waits(0, |_| false),
+            [(at, None)],
+            "what owns its memory unknown"
+        );
         assert!(
             moves.waits(1, |_| false).is_empty(),
             "its own queue orders it"
@@ -2111,8 +3330,8 @@ mod tests {
         drop(moves.take(|_| false).submitted(Some(later)));
         assert_eq!(
             moves.waits(2, |_| false),
-            [later],
-            "the last batch of the queue"
+            [(later, None)],
+            "the last batch of the queue, whose work any command may reach"
         );
         assert!(moves.waits(0, |point| point.value <= 7).is_empty());
         assert!(

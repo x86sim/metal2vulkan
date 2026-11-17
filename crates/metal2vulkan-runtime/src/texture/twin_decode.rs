@@ -51,7 +51,7 @@ const ROWS_PER_THREAD: usize = 16;
 pub(super) const ROWS_PER_PART: u32 = 64;
 
 /// The most bytes of written blocks the jobs queued hold.
-pub(super) const QUEUED_BYTES: u64 = 256 << 20;
+pub(crate) const QUEUED_BYTES: u64 = 256 << 20;
 
 /// How long the thread sleeps at most without looking for a job or a stop.
 const WAIT_SLICE: Duration = Duration::from_millis(100);
@@ -153,9 +153,7 @@ impl TwinDecodes {
         lock(&self.shared.queue).stopping = true;
         self.shared.work.notify_all();
         let mut thread = lock(&self.thread);
-        let own = thread
-            .as_ref()
-            .is_some_and(|handle| handle.thread().id() == std::thread::current().id());
+        let own = thread.as_ref().is_some_and(crate::this_thread::runs);
         if !own {
             if let Some(handle) = thread.take() {
                 let _ = handle.join();

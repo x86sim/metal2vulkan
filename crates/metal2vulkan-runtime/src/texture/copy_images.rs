@@ -4,7 +4,7 @@
 //!
 //! - **Within a copy** ([`Reused`]): a later step of a copy (a band of an interleave copy; the
 //!   next aspect or slice of a heap texture's moves) takes an image an earlier step of it made
-//!   that [covers](covers) the one it needs, where no image of the step took it already. A copy's
+//!   that [covers] the one it needs, where no image of the step took it already. A copy's
 //!   steps are recorded one after another into one command buffer, each of their commands after a
 //!   barrier from every command before it to every command after it (`Barrier::everything`, in
 //!   `InterleaveCopy::record` and `SampleCopy::record`), and a step writes each texel of an image
@@ -44,7 +44,7 @@
 use super::super::device::lock;
 use super::super::texture_descriptor::TextureDescriptor;
 use super::super::Device;
-use super::{ImageMaker, ImagePlan, Owner, Storage, Texture};
+use super::{ImageMaker, ImagePlan, Owner, Storage, Stored, Texture};
 use metal2vulkan::vk::ImageUsageFlags;
 use std::sync::Mutex;
 
@@ -78,8 +78,8 @@ fn covers(have: &ImageKey, want: &ImageKey) -> bool {
 /// The bytes of memory of `texture`'s image, where the runtime placed it in memory of its own; 0
 /// for any other.
 fn image_bytes(texture: &Texture) -> u64 {
-    match &texture.0.storage {
-        Storage::Image(image) => match &image.owner {
+    match texture.stored() {
+        Stored::Made(Storage::Image(image)) => match &image.owner {
             Owner::Runtime { placement, .. } => placement.size(),
             _ => 0,
         },

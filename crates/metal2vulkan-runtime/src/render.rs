@@ -107,7 +107,9 @@
 //!   leaves out, bound as storage views of their level and layer, whose fragment shader reads
 //!   and writes join the draw's uses. Either way a fetched attachment whose image lacks the
 //!   usage its form needs (input attachment usage, or `STORAGE`) renders, from the draw on and
-//!   for the whole pass, into a stand-in that has it (`attachment_stand_in.rs`). In a
+//!   for the whole pass, into a stand-in that has it (`attachment_stand_in.rs`): but for the
+//!   instances recorded inline and those a draw pinned to the attachments' own images
+//!   (`render/inline_first.rs`, `render/snapshot.rs`), after which it takes their texels. In a
 //!   multisampled pass the interlock form reads and writes the attachment's sample planes on a
 //!   device without multisampled storage images (`sample_planes.rs`): made at the first draw that
 //!   fetches the attachment, bound to every such draw as a storage view of every layer, and moved
@@ -131,7 +133,10 @@
 //!   the current one's place when nothing recorded into it and, for the pass's first, every
 //!   attachment it leaves out that Metal clears can be cleared before the pass instead (its
 //!   level and layer is the whole render area, cleared by `vkCmdClearColorImage` with the value
-//!   the load operation would take; Vulkan converts both alike); otherwise the pass splits, and
+//!   the load operation would take; Vulkan converts both alike), and the draw is not one that
+//!   samples a color the pass clears after a memory barrier before its first draw, whose copy
+//!   must follow the clear (`texture/attached_reads.rs`; one whose copy is cleared to it instead
+//!   records in its instance); otherwise the pass splits, and
 //!   the new instance follows the current one after a barrier from everything before to
 //!   everything after. A split pass renders its memoryless attachments into stand-ins
 //!   (`attachment_stand_in.rs`), since its instances keep their contents in memory. A query
@@ -270,6 +275,7 @@ use super::binding;
 use super::blit::TRANSFER;
 use super::buffer::Buffer;
 use super::clear_reach::{self, ReachClears};
+use super::clear_value;
 use super::color_list::ColorList;
 use super::color_reformat::{self, Routing};
 use super::color_resolve::ShaderResolves;
@@ -281,28 +287,31 @@ use super::degradation::{
 use super::depth_stand_in::DepthStandIn;
 use super::depth_stencil::{DepthStencilState, FailingDraw};
 use super::depth_stencil_resolve::DrawnResolve;
-use super::depth_stencil_scratch::{ScratchCopy, Separate};
-use super::device::{lock, Device};
+use super::depth_stencil_scratch::{self, ScratchCopy, Separate};
+use super::device::Device;
 use super::draw_source::{CopySteps, DrawSource, IndexBind};
 use super::dynamic_state::ExtendedDynamicState;
 use super::encoder::{EncoderCore, Replayed};
 use super::error::{
-    internal, invalid, vulkan, CommandBufferError, EncoderCall, Error, Problem, RuntimeGap,
+    internal, invalid, vulkan, CommandBufferError, EncoderCall, Error, IndirectRule, Problem,
+    RuntimeGap,
 };
 use super::execution::{ExecutedPipeline, Execution};
 use super::fragment_imageblock::PassImageblock;
 use super::framebuffer_fetch;
 use super::fresh_unwritten::FreshUnwritten;
 use super::function_table::VisibleFunctionTable;
-use super::heap_sets;
+use super::heap_sets::{self, SetVersion, Unkept};
 use super::index_bounds::{self, Bounded, BoundsPass, BoundsSteps};
 use super::index_rewrite::{self, Listed, RewritePass, RewriteSteps, WrittenList};
 use super::kept_bytes;
 use super::linear_attachment;
-use super::linear_merge::LinearMerge;
-use super::live_bind::{Emptied, LiveBind, Reshape};
+use super::linear_merge::{LinearMerge, MERGE_STAGES};
+use super::live_bind::{Emptied, LiveBind, Reshape, SettledHere};
 use super::nan_clear::{keeps_nan_sign, NanDepthWrite};
 use super::owned_kernel::OwnedModule;
+use super::pass_log;
+use super::pass_runs::{Joined, Joining, RunHeld, RunKey, RunMerge, RunWork};
 use super::pipeline::Settled;
 use super::pipeline::{BufferForms, DrawPipeline};
 use super::pipeline::{DrawDynamic, RawPipeline, RenderVariant, VariantObjects};
@@ -315,7 +324,8 @@ use super::render_pass::{
     self, AspectTarget, Attachment, DepthStencilTarget, PassLayout, RenderPassDescriptor,
     RenderPassProblem, Target, MAX_COLOR_ATTACHMENTS,
 };
-use super::render_state::{self, DepthBiasRecord, EncoderState, ViewportList, MAX_VIEWPORTS};
+use super::render_state::MAX_VIEWPORTS;
+use super::render_state::{self, DepthBiasRecord, EncoderState, ScissorRects, ViewportList};
 use super::render_state::{Compensation, DepthBiasEffect, WrittenDepthClamp};
 use super::render_target::{self, covers, Feedback, PassShape, Position, RenderPassObject};
 use super::render_values::{
@@ -326,32 +336,39 @@ use super::residency::Residency;
 use super::resolve::{
     self, DepthStencilResolve, Resolve, ResolveCopies, ResolveMode, ResolveSource,
 };
-use super::resource::ResourceKey;
+use super::resource::{ResourceKey, ResourceRef};
 use super::sample_planes::{self, Planes, PlanesCommands};
 use super::sample_positions;
 use super::sampler::OwnedSampler;
 use super::sampler::{ArgumentSamplers, SamplerState};
-use super::shadow::{self, ShadowCopy};
+use super::shadow::{self, ShadowCopies, ShadowCopy, ShadowTarget, Step};
+use super::shadow_merge::{MergeLease, ShadowMerge};
 use super::shadow_stencil::ShadowStencil;
 use super::sparse::emulated::Scrub;
 use super::tessellation::{FactorBuffer, Factors};
+use super::texture::faces::Unturned;
 use super::texture::held_depth;
-use super::texture::Texture;
+use super::texture::{AttachedColors, Texture};
 use super::tracker::{self, Access, Barrier, GeometryWrites, IndirectReads, UnorderedWrites, Use};
 use super::used_resources::EncoderKind;
 use super::versioned::Versioned;
 use super::visibility::{self, Continuation, Visibility, VisibilityResultMode};
-use super::written_commands::Writers;
 use crate::device::functions::Vk;
 use crate::work_counts::Begun;
+use crate::work_counts::CopyRoute;
+use crate::work_counts::LoggedCall;
 use crate::work_counts::NotInline;
 use crate::work_counts::Split;
+use crate::work_counts::UnkeptDraw;
 use ash::vk;
-use draw_shape::{PipelineInputs, ShapeInputs, ShapeMemo, ShapeToken, ShapedState};
+pub(crate) use draw_shape::KeptShapes;
+use draw_shape::{LayoutView, PipelineInputs, ShapeInputs, ShapeMemo, ShapeToken, ShapedState};
 pub(super) use executions::DeferredPass;
 use executions::{PassInstance, PassStorage, RenderExecution, RunPasses};
 use extended_shadow::ExtendedShadows;
 pub use late_resolve::ResolveTarget;
+use line_width::LineRoute;
+pub(crate) use line_width::LineWidth;
 use metal2vulkan::bind::BindingPlan;
 use metal2vulkan::bind::VertexAmplification;
 use metal2vulkan::bind::{
@@ -371,30 +388,40 @@ use metal2vulkan::metal::{
     Winding,
 };
 use metal2vulkan::pipeline::{
-    ColorGroup, GraphicsState, PipelineInterface, PushField, RuntimeFact, Stage,
+    ColorGroup, GraphicsState, PipelineInterface, PushField, RegionFanOut, RuntimeFact, Stage,
     StorageAttachmentUse, StorageAttachmentView,
 };
 use pass_start_reads::{PassStartReads, PassStartTables};
-use pass_steps::{InstanceSteps, PassSteps, StagedDispatch, StagedRows};
+use pass_steps::{AfterPins, InstanceSteps, PassSteps, StagedDispatch, StagedRows};
 use pending::{OwnedRecording, PendingDraw};
 use provoking::ProvokingForms;
 use shadows::InstanceShadows;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tile_dispatch::{ScratchEdges, TileDispatch};
 
 mod arguments;
+mod attached_levels;
 mod bound;
 mod call_checks;
+mod carried;
 mod color_groups;
+pub(crate) mod coverage;
 mod deferral;
+mod draw_again;
+mod draw_room;
 mod draw_shape;
 mod executions;
-mod extended_shadow;
+pub(crate) mod extended_shadow;
+pub(crate) mod face_swap;
+mod fan_out;
+use fan_out::{FanTable, FanTableKey};
+mod heap_part;
 mod inline_first;
 mod inline_splits;
 mod late_resolve;
+mod line_width;
 mod lowering_worker;
 mod mesh;
 mod mesh_arguments;
@@ -402,6 +429,7 @@ mod pass_start_reads;
 mod pass_steps;
 mod pending;
 mod pending_tile;
+mod plan_facts;
 mod provoking;
 mod queued_commits;
 mod replay;
@@ -409,6 +437,7 @@ mod reroute;
 mod restart;
 mod shadows;
 mod snapshot;
+pub(crate) use snapshot::{LeadingShare, SplitReason};
 mod table_facts;
 mod tessellation_scan;
 mod tile_dispatch;
@@ -418,17 +447,34 @@ mod untouched;
 mod vertex_reach;
 mod vertex_strides;
 
+#[cfg(all(test, debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) use bound::dynamic_compares;
 use bound::{Bound, EqualShapes, Now, Recorded};
-use deferral::Logged;
+pub(crate) use carried::{Carried, NoneKept};
 pub(crate) use deferral::{lowering, DeferredEncoders, EndInFlight};
+use deferral::{Logged, OwnLowering};
 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
 pub(crate) use deferral::{BATCH_CALLS, HANDED_BATCHES};
+#[cfg(all(test, debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) use draw_again::IDENTITIES_CHECKED;
+pub(crate) use draw_again::{Kept as DrawKept, KeptStorage};
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) use draw_room::made as draw_rooms_made;
+pub(crate) use draw_room::SpareDrawRooms;
+#[cfg(all(test, debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) use heap_part::kept_heap_checks;
+pub(crate) use heap_part::KeptHeap;
 pub(crate) use inline_splits::SpareKept;
+#[cfg(all(test, debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) use plan_facts::plan_facts_made;
+pub(crate) use plan_facts::PlanFacts;
 use replay::{
     DrawIndexed, DrawIndexedIndirect, DrawIndexedPatches, DrawIndexedPatchesIndirect, DrawPatches,
     DrawPatchesIndirect, Samplers,
 };
 pub(crate) use replay::{RenderCall, RenderLog, RenderRoom, Table};
+#[cfg(test)]
+pub(crate) use snapshot::snapshot_within;
 
 /// What a draw, or the render pipeline state or tessellation factors set for the draws, did
 /// wrong.
@@ -888,6 +934,44 @@ struct DrawSettings {
     /// Its `VkPipeline` takes the last provoking vertex (`render/provoking.rs`,
     /// `FixedState::provoking_last`).
     provoking_last: bool,
+    /// How it draws its lines at the encoder's width (`render/line_width.rs`).
+    line: LineRoute,
+    /// The band its band variant pushes (`BindState::line_band`): the band's primitive, and its
+    /// Vulkan viewport 0's half extent, the band's half width in pixels and a triangle's band's
+    /// front face (`LineBandState`).
+    line_band: Option<(metal2vulkan::pipeline::BandPrimitive, [f32; 4])>,
+}
+
+/// How a draw is drawn from the encoder's call (`RenderCommandEncoder::routed_draw`): what its
+/// lines' route (`DrawSettings::line`) decides beside its settings.
+struct RoutedDraw {
+    /// Its last provoking vertex (`render/provoking.rs`), and the variant's forms of it.
+    provoking: provoking::Provoking,
+    provoking_forms: ProvokingForms,
+    /// Its strip or private type drawn as its list (`render/restart.rs`), and its private type's
+    /// form (`PrivateForm`).
+    restarted: Option<restart::Restarted>,
+    private: PrivateForm,
+    /// The assembly it draws: its list's where it is listed.
+    assembly: Assembly,
+    settings: Arc<DrawSettings>,
+    /// The pass's hidden depth and stencil it gives (`RenderCommandEncoder::needed_hidden`).
+    hidden: Option<Target>,
+    /// Its settings' entry in the encoder's memo (`render/draw_shape.rs`), `None` where they are
+    /// not kept.
+    shape_token: Option<ShapeToken>,
+    /// The index type its de-indexed variant reads ([`primitive_id_indices`]).
+    primitive_id_indices: Option<IndexType>,
+    /// Its fixed-function layouts the device cannot fetch for it past 4 GiB, which it pulls
+    /// (`BindState::far_vertex_buffers`), and one it leaves unchecked
+    /// (`render/vertex_reach.rs`).
+    far: vertex_reach::FarLayouts,
+    /// It asks to draw its rate-mapped pass's regions several at a time
+    /// (`BindState::region_viewports`, [`RenderLowering::draws_region_batches`]).
+    region_viewports: bool,
+    /// The fan-out it asks for, an execution's command's at a host step that fans the pass's
+    /// triangles out (`BindState::region_fan_out`, `render/fan_out.rs`).
+    region_fan_out: Option<(RegionFanOut, u32)>,
 }
 
 /// The render encoder state one draw takes, statically or as dynamic state, in Vulkan's terms
@@ -902,6 +986,28 @@ struct DrawState {
     /// The depth bias's factors and the command they record by.
     depth_bias: DepthBiasRecord,
     blend_color: [f32; 4],
+    /// The draws one command records: 1 for a plain draw, and the regions of a rate-mapped pass a
+    /// multi-draw records several at a time (`rate_mapped_pass.rs`, `MultiDraws`), each through
+    /// the viewport and scissor at its index, at most its viewports; or, through a region-copy
+    /// variant, the regions of its box (`region_box`), each through the one viewport over the
+    /// render area and the box's scissor.
+    draws: u32,
+    /// The box of a rate-mapped pass's regions it draws through its region-copy variant, which its
+    /// recording pushes: its first region, in its region table's order, and its columns, its
+    /// `draws` regions its rows of them in order (`render/fan_out.rs`, **Region-copy variant**);
+    /// `None` for any other.
+    region_box: Option<[u32; 2]>,
+}
+
+impl DrawState {
+    /// The region draws its recording makes (`rate_mapped_pass::region_draws`): its `draws`
+    /// where it draws through its region-copy variant.
+    fn region_draws(&self) -> u64 {
+        match self.region_box {
+            Some(_) => u64::from(self.draws),
+            None => rate_mapped_pass::region_draws(&self.scissors),
+        }
+    }
 }
 
 impl PartialEq for DrawState {
@@ -916,11 +1022,88 @@ impl PartialEq for DrawState {
             && self.stencil_reference == other.stencil_reference
             && self.depth_bias == other.depth_bias
             && self.blend_color == other.blend_color
+            && self.draws == other.draws
+            && self.region_box == other.region_box
     }
 }
 
+/// How many of a rate-mapped pass's regions a draw of `variant` records at a time where its plan's
+/// variant draws them several at a time (`VariantKey::region_viewports`): as many a command as
+/// `device`'s multi-draw commands take (`MultiDraws::batch`), each command setting that many
+/// viewports, which its `VkPipeline` takes (`FixedState::viewports`, [`region_states`]); `None`
+/// for a variant that draws them one at a time. The host step's draw and an execution's settle
+/// at commit (`render/executions.rs`) key the pipeline alike by it.
+fn region_batch(variant: &RenderVariant, device: &Device) -> Result<Option<usize>, Error> {
+    match (variant.key().region_viewports, &device.shared().multi_draws) {
+        (false, _) => Ok(None),
+        (true, Some(multi)) => Ok(Some(multi.batch() as usize)),
+        (true, None) => Err(internal(
+            "regions drawn several at a time without the multi-draw commands",
+        )),
+    }
+}
+
+/// The states a draw of `state` records a rate-mapped pass's `regions` with
+/// (`rate_mapped_pass.rs`), each region's viewport taking the depth range `depth` where the draw
+/// compensates it: one a region, or, `batch` the most one multi-draw takes
+/// (`VariantKey::region_viewports`), one per `batch` regions in order. Such a state sets `batch`
+/// viewports and scissors, its regions' at the indices of its draws (`DrawState::draws`, its
+/// regions' count), past its regions repeating its first viewport through an empty scissor:
+/// every command of the draw sets the `batch` its `VkPipeline` takes (`FixedState::viewports`),
+/// whatever the map's regions, and draws its own regions alone.
+fn region_states(
+    regions: &[(vk::Viewport, vk::Rect2D)],
+    batch: Option<usize>,
+    state: &DrawState,
+    depth: Option<[f32; 2]>,
+) -> Vec<DrawState> {
+    let ranged = |viewport: vk::Viewport| {
+        let [min_depth, max_depth] = depth.unwrap_or([viewport.min_depth, viewport.max_depth]);
+        vk::Viewport {
+            min_depth,
+            max_depth,
+            ..viewport
+        }
+    };
+    let Some(batch) = batch else {
+        return (regions.iter())
+            .map(|&(viewport, scissor)| DrawState {
+                viewports: ViewportList::One(ranged(viewport)),
+                scissors: ViewportList::One(scissor),
+                ..state.clone()
+            })
+            .collect();
+    };
+    regions
+        .chunks(batch)
+        .filter_map(|chunk| {
+            let &(first, _) = chunk.first()?;
+            let viewports = (chunk.iter().map(|&(viewport, _)| viewport))
+                .chain(std::iter::repeat(first))
+                .take(batch)
+                .map(ranged)
+                .collect();
+            let scissors = (chunk.iter().map(|&(_, scissor)| scissor))
+                .chain(std::iter::repeat(vk::Rect2D::default()))
+                .take(batch)
+                .collect();
+            Some(DrawState {
+                viewports,
+                scissors,
+                fixed: FixedState {
+                    viewports: batch as u32,
+                    ..state.fixed
+                },
+                draws: chunk.len() as u32,
+                ..state.clone()
+            })
+        })
+        .collect()
+}
+
 /// The states a draw records with (`draw_resident`): the whole draw's, or in a rate-mapped pass
-/// each region's of each amplification drawn alone, in order (`rate_mapped_pass.rs`).
+/// each region's of each amplification drawn alone, in order (`rate_mapped_pass.rs`), or each
+/// batch's of its regions (`region_states`).
 enum DrawStates {
     Whole([DrawState; 1]),
     Regions(Vec<Vec<DrawState>>),
@@ -963,17 +1146,46 @@ impl DrawStates {
 /// takes the barrier but where its driver is measured to order such draws' colors by the
 /// interlock alone (`DriverFact::InterlockOrdersDraws`, by
 /// `runtime_lane::interlocked_draw_order`): there a draw's colors are no kind of it
-/// ([`InterlockedStorage::of`]). Another kind of storage a draw reads and writes inside the
-/// interlock joins as a field here and in [`InterlockedStorage::of`].
+/// ([`InterlockedStorage::of`]). On a driver whose such draws race under load
+/// (`DriverFact::InterlockedDrawsRaceUnderLoad`) the draw records into a new instance instead of
+/// after the barrier (`Split::InterlockedWrites`), whose boundary orders it after the draws before.
+/// Another kind of storage a draw reads and writes inside the interlock joins as a field here and
+/// in [`InterlockedStorage::of`].
+///
+/// On a device whose input attachments are ordered between draws alone
+/// (`framebuffer_fetch::inputs_between_draws`: neither rasterization-order color attachment access
+/// nor the pixel interlock), the colors a pass's draws fetch take two more kinds, which the
+/// barrier of the subpass's whole dependency on itself orders (`render_target::between_draws`):
+/// a draw that reads input attachments after an earlier draw of its instance, or its load
+/// operations (`BEGUN`), wrote a color, and a draw that writes a color after an
+/// earlier one read input attachments, records after it. No
+/// interlock orders anything there; the barrier orders the draws, as Vulkan's subpass
+/// self-dependency does ("A vkCmdPipelineBarrier inside a subpass can synchronize prior attachment
+/// writes in the subpass with subsequent input attachment reads", the Render Pass chapter's
+/// Common Render Pass Data Races), and the fetching stage records what it leaves unordered
+/// (`PrecisionNote::UnorderedFetchWithinDraw`). They take that barrier on a driver whose
+/// interlocked draws race under load too, not a new instance: the race is the interlock's
+/// (`InterlockedDrawsRaceUnderLoad`'s measure is of interlocked storage images), and MoltenVK, the
+/// driver with it, ends its Metal render pass and begins another at a by-region barrier whose
+/// destination reads input attachments (`MVKCmdPipelineBarrier::encode`, on a tile-based GPU),
+/// which this barrier is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct InterlockedStorage {
     /// The pass's fragment imageblock storage (`fragment_imageblock.rs`).
     imageblock: bool,
-    /// Colors in the interlocked storage form, the fetch's (`framebuffer_fetch.rs`).
+    /// Colors in the interlocked storage form, the fetch's (`framebuffer_fetch.rs`), and in a
+    /// pass that fetches through input attachments the extended-range colors' `half` shadows,
+    /// which its draws read and write in the interlock beside them (`render/extended_shadow.rs`).
     colors: bool,
     /// The depth's stand-in, which a draw that tests the depth in the shader reads and may write
     /// (`depth_stand_in.rs`).
     depth: bool,
+    /// Colors an input attachment read ordered between draws alone takes after earlier color
+    /// writes: a draw that reads input attachments reaches it, one that writes a color writes it.
+    fetch_after_writes: bool,
+    /// Colors a write takes after earlier input attachment reads ordered between draws alone: a
+    /// draw that writes a color reaches it, one that reads input attachments "writes" it.
+    writes_after_fetch: bool,
 }
 
 impl InterlockedStorage {
@@ -981,6 +1193,20 @@ impl InterlockedStorage {
         imageblock: false,
         colors: false,
         depth: false,
+        fetch_after_writes: false,
+        writes_after_fetch: false,
+    };
+
+    /// What a render pass instance's draws meet before any of them: its colors' load operations'
+    /// writes, which a draw that reads input attachments ordered between draws alone reaches
+    /// (`fetch_after_writes`). Vulkan orders the load operations before every access of the
+    /// instance through the attachment, but RADV on the RX 550 (Polaris) was measured to read a
+    /// load-cleared `RGBA32Uint` attachment's earlier contents at the instance's first fetch
+    /// without the barrier, and the barrier is the one between draws, inside the subpass's
+    /// dependency on itself; no other kind is set, so on every other device it orders nothing.
+    const BEGUN: Self = Self {
+        fetch_after_writes: true,
+        ..Self::NONE
     };
 
     /// Every kind: what an execution of render commands, or the encoder's draws before it, may
@@ -989,38 +1215,72 @@ impl InterlockedStorage {
         imageblock: true,
         colors: true,
         depth: true,
+        fetch_after_writes: true,
+        writes_after_fetch: true,
     };
 
-    /// What a draw of `graphics` whose colors in the interlocked storage form are `storage`
+    /// What a draw of `graphics` whose colors in the interlocked storage form are `storage`, and
+    /// which reads and writes extended-range shadows beside input attachments where `shadows`,
     /// reaches, and what it writes, on a device whose driver orders interlocked draws' colors by
-    /// the interlock alone where `colors_ordered` (then no color is a kind of it). A draw that
-    /// reaches the imageblock may write it, and one that tests the depth in the shader may write
-    /// the depth's stand-in.
+    /// the interlock alone where `colors_ordered` (then no color is a kind of it), in a pass whose
+    /// input attachments are ordered between draws alone where `between_draws`. A draw that
+    /// reaches the imageblock may write it, one that tests the depth in the shader may write the
+    /// depth's stand-in, and one that binds shadows may write them.
     fn of(
         graphics: &GraphicsState,
-        storage: &[StorageAttachmentUse],
-        colors_ordered: bool,
+        (storage, shadows): (&[StorageAttachmentUse], bool),
+        (colors_ordered, between_draws): (bool, bool),
     ) -> (Self, Self) {
         let imageblock = graphics.fragment_imageblock.is_some();
         let depth = graphics.shader_tests.is_some();
+        let fetches = between_draws && !graphics.input_attachments.is_empty();
+        let writes_colors = between_draws
+            && !graphics.rasterizer_discard
+            && (graphics.color_attachments.iter().flatten()).any(|a| !a.write_mask.is_empty());
         let reaches = Self {
             imageblock,
-            colors: !colors_ordered && !storage.is_empty(),
+            colors: !colors_ordered && (!storage.is_empty() || shadows),
             depth,
+            fetch_after_writes: fetches,
+            writes_after_fetch: writes_colors,
         };
         let writes = Self {
             imageblock,
-            colors: !colors_ordered && storage.iter().any(|s| s.writes),
+            colors: !colors_ordered && (storage.iter().any(|s| s.writes) || shadows),
             depth,
+            fetch_after_writes: writes_colors,
+            writes_after_fetch: fetches,
         };
         (reaches, writes)
     }
 
     /// Whether a kind is in both.
     fn meets(self, other: Self) -> bool {
+        self.meets_interlocked(other) || self.meets_fetch(other)
+    }
+
+    /// Whether a kind of storage the pixel interlock orders is in both: the imageblock's, a
+    /// color's or the depth's stand-in.
+    fn meets_interlocked(self, other: Self) -> bool {
         (self.imageblock && other.imageblock)
             || (self.colors && other.colors)
             || (self.depth && other.depth)
+    }
+
+    /// Whether a kind of input attachments ordered between draws is in both: the barrier that
+    /// orders them is the subpass's whole dependency on itself, not the storage's.
+    fn meets_fetch(self, other: Self) -> bool {
+        (self.fetch_after_writes && other.fetch_after_writes)
+            || (self.writes_after_fetch && other.writes_after_fetch)
+    }
+
+    /// The barrier a draw that reaches `self` records after an instance's draws that wrote
+    /// `other`, where they meet.
+    fn barrier(self, other: Self) -> render_target::DrawsBarrier {
+        match self.meets_fetch(other) {
+            true => render_target::DrawsBarrier::Whole,
+            false => render_target::DrawsBarrier::Storage,
+        }
     }
 
     /// The kinds of either.
@@ -1029,8 +1289,31 @@ impl InterlockedStorage {
             imageblock: self.imageblock || other.imageblock,
             colors: self.colors || other.colors,
             depth: self.depth || other.depth,
+            fetch_after_writes: self.fetch_after_writes || other.fetch_after_writes,
+            writes_after_fetch: self.writes_after_fetch || other.writes_after_fetch,
         }
     }
+}
+
+/// A pass's color over a linear attachment rendered apart that joins a run as the pass ends
+/// (`pass_runs.rs`): its index, its run's key, bytes and box, and where it goes on with the run
+/// before it, that run's merge and its last pass's merge left to its submission.
+struct RunColor {
+    index: usize,
+    joining: Joining,
+    on: Option<(Arc<LinearMerge>, Arc<RunMerge>)>,
+}
+
+/// A pass's color that is a shadowed texture merged back, joining a run as the pass ends
+/// (`pass_runs.rs`): its shadow, its run's key and bytes, and where it goes on with the run
+/// before it, that run's merge (whose keep the encoder went on from), the hold on its scratch,
+/// and its last pass's merge left to its submission.
+struct ShadowRunColor {
+    copies: Arc<ShadowCopies>,
+    joining: Joining,
+    on: Option<(Arc<ShadowMerge>, Option<MergeLease>, Arc<RunMerge>)>,
+    /// It follows a pass that merged in place ([`Joined::Placed`]): it opens the run.
+    opens: bool,
 }
 
 /// One render pass instance of an encoder's pass (the module docs).
@@ -1115,7 +1398,7 @@ struct Instance {
     /// whose pipeline is being made, or an execution of render commands, that the instance
     /// before would have taken (`render/inline_first.rs`). The shadowed textures' copies take
     /// the two as one: its draws' shadowed textures and uses are gathered into the first of
-    /// them ([`RenderCommandEncoder::gathering`]), copied in before it, and nothing is copied
+    /// them ([`RenderLowering::gathering`]), copied in before it, and nothing is copied
     /// between them.
     continues: bool,
     /// It records inline after a split (`render/inline_splits.rs`): its commands, kept until its
@@ -1129,11 +1412,19 @@ struct Instance {
     /// for its render pass instance (`render/snapshot.rs`, `render_target::Feedback`). Such an
     /// instance records in a secondary, never inline, and runs as one render pass instance.
     feedback: Feedback,
-    /// The colors whose images a draw recorded into it binds as a storage image
-    /// (`RenderCommandEncoder::storage_colors`): a draw that reads one of them through a
-    /// snapshot records into another instance, as the feedback loop layout serves no storage
-    /// access (`render/snapshot.rs`).
-    storage_colors: u32,
+    /// The snapshot draws of its first draw, where they lead it in a render pass instance of
+    /// their own (`render/snapshot.rs`, leading snapshots). Such an instance records in a
+    /// secondary, never inline, and runs as one render pass instance after the leading one.
+    leading: Option<snapshot::Leading>,
+    /// The colors a draw recorded into it needs in `GENERAL`: those whose images it binds as a
+    /// storage image (`RenderCommandEncoder::storage_colors`), as the feedback loop layout serves
+    /// no storage access, and those whose attached levels the view of a slot narrowed past them
+    /// holds, as its descriptor names `GENERAL` (`render/attached_levels.rs`). A draw that reads
+    /// one of them through a snapshot records into another instance (`render/snapshot.rs`).
+    general_colors: u32,
+    /// It is a run of an execution's commands in a rate-mapped pass that begins a piece of the
+    /// pass's submission (`rate_mapped_pass.rs`, **Pieces**).
+    piece: bool,
 }
 
 /// A pass color a draw renders in another format than the attachment's, where the state's color
@@ -1315,7 +1606,7 @@ pub struct RenderCommandEncoder {
     /// (`RenderLoweringPolicy::AtCall`): no slot, no lock (`render/deferral.rs`). Boxed where
     /// it is made ([`RenderLowering::assemble`]), so neither the encoder's return nor a caller's
     /// move of it copies the lowering's state, thousands of bytes.
-    own: Option<Box<RenderLowering>>,
+    own: Option<OwnLowering>,
     /// Else its slot of the device's, which holds its lowering, its checks at the call and its
     /// calls not yet lowered.
     logged: Option<Logged>,
@@ -1329,6 +1620,11 @@ pub struct RenderCommandEncoder {
 // of it, so it holds its lowering in a box: the lowering's state is thousands of bytes.
 const _: () = assert!(std::mem::size_of::<RenderCommandEncoder>() <= 128);
 
+// An ended pass goes on by value through each step of its end and its later color groups'
+// passes (`color_groups::Ended`): its core and its log in their boxes, so those moves copy no core
+// state (the core's is more than a thousand bytes).
+const _: () = assert!(std::mem::size_of::<color_groups::Ended>() <= 320);
+
 impl std::fmt::Debug for RenderCommandEncoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RenderCommandEncoder")
@@ -1341,9 +1637,15 @@ impl std::fmt::Debug for RenderCommandEncoder {
 /// A render encoder's lowering ([`RenderCommandEncoder`]): the encoder's state, which each of its
 /// calls runs on.
 pub(crate) struct RenderLowering {
-    core: EncoderCore,
+    /// In a box of its own (`EncoderCore::boxed`), which its end empties and gives the device back
+    /// for its next render encoder (`encoder::SpareCores`): the end hands the core on through
+    /// each of its steps (`color_groups::Ended`, the later color groups' passes) as a pointer, not
+    /// the core's state, and the box costs an allocation only where the device has none kept.
+    core: Box<EncoderCore>,
     /// The pass's instances before the current one, which the draws record into.
     earlier: Vec<Instance>,
+    /// The instance the draws record into, in the encoder's box, which its open makes once
+    /// (`assemble`): no box of its own to make at each open.
     current: Instance,
     /// Versioned, as the state and the amplification are: a draw's shape is derived from them
     /// (`render/draw_shape.rs`).
@@ -1354,6 +1656,8 @@ pub(crate) struct RenderLowering {
     /// layered pass (`PassLayout::layers`).
     render_target_array_length: u32,
     state: Versioned<EncoderState>,
+    /// Apart from `state`: setting them keeps the draws' shapes (`ScissorRects`).
+    scissors: ScissorRects,
     pipeline: Option<RenderPipelineState>,
     /// The routing of the drawing state last set (`ShapeInputs::routing`), which its check
     /// and each of its draws (their settings and their coverage) read.
@@ -1368,6 +1672,9 @@ pub(crate) struct RenderLowering {
     /// (`set_object_threadgroup_memory_length`), which its mesh draws bind.
     object_threadgroup_lengths: BTreeMap<u32, u32>,
     visibility: Visibility,
+    /// The pass's readers of its own colors the area rule weighed, and those it measures
+    /// (`render/coverage.rs`).
+    readers: coverage::Readers,
     /// The tile stage's table, which tile dispatches bind (`tile_dispatch.rs`).
     tile: ArgumentTable,
     /// The pass's tile dispatches, each recorded after the instance before it.
@@ -1404,8 +1711,17 @@ pub(crate) struct RenderLowering {
     /// A memory barrier follows draws of the current instance: the next draw records into a new
     /// instance after a barrier from everything before (`fence.rs`).
     barrier: bool,
+    /// A memory barrier over the render targets after the fragment stage came before any draw of
+    /// the pass recorded (`fence.rs`): it orders the pass's load actions before the draws after
+    /// it, so a draw that samples a color the pass clears records into an instance after the
+    /// pass's first, which runs them (`texture/attached_reads.rs`), or reads through snapshots
+    /// (`render/snapshot.rs`). The pass's first split takes it.
+    loads_ordered: bool,
     /// The splits such barriers made, for the split's degrade notice.
     barrier_splits: usize,
+    /// The splits before a draw that reads a color attachment's texture after a memory barrier
+    /// (`Split::AttachedRead`), for the split's degrade notice.
+    attached_read_splits: usize,
     /// What MoltenVK restarts its Metal render pass for inside the subpass, storing the
     /// attachments there, was recorded: a barrier between draws whose destination reads input
     /// attachments (`barrier_between_draws`), or a tessellated draw (`Device::degrade_pass`).
@@ -1413,14 +1729,16 @@ pub(crate) struct RenderLowering {
     /// The splits between draws that reach the pass's tile threadgroup memory, for the split's
     /// degrade notice (`render/tile_memory.rs`).
     tile_memory_splits: usize,
+    /// The splits before a draw that reaches interlocked storage an earlier draw of its instance
+    /// wrote, on a driver whose such draws race under load (`Split::InterlockedWrites`), for the
+    /// split's degrade notice.
+    interlocked_splits: usize,
     /// The tile functions' threadgroup arguments and the pass's tile threadgroup memory
     /// (`render/tile_memory.rs`).
     tile_memory: tile_memory::TileMemory,
     /// What `use_resource(s)` and `use_heap(s)` made resident, each in its render stages
     /// (`render/arguments.rs`).
     residency: Residency,
-    /// The indirect command buffers it made resident for writing (`written_commands.rs`).
-    writers: Writers,
     /// The executions of render commands, in encoding order, left to record with the pass
     /// (`render/executions.rs`).
     executions: Vec<RenderExecution>,
@@ -1430,16 +1748,32 @@ pub(crate) struct RenderLowering {
     /// The encoder's draw calls that returned `Ok` so far: the next one's order among them,
     /// which a draw whose pipeline is being made keeps for its failure (`FailedPipeline::draw`).
     draw_calls: usize,
+    /// Whether the last of them drew nothing (`WorkCounts::encoders_last_draw_empty`).
+    last_draw_empty: bool,
     /// Its tile dispatch calls that returned `Ok` so far, likewise for a tile dispatch
     /// (`render/pending_tile.rs`).
     tile_dispatch_calls: usize,
     /// The encoder records an execution's commands (`render/executions.rs`): a draw that needs
     /// another instance than the execution's is refused.
     replaying: bool,
-    /// The place among the command buffer's ended encoders of the encoder whose execution it
-    /// replays (`RenderExecution`), which names a draw of the commands it drops
-    /// (`CommandBuffer::drop_late_draw`); `None` where it replays none.
-    executing_encoder: Option<usize>,
+    /// Every draw it replayed so far was plain: one a direct draw of the encoder's would keep for
+    /// drawing again (`render/draw_again.rs`) but for its being replayed, which no notice the
+    /// device announces at every occurrence met (`kept_commands.rs`). A chunk of an execution's
+    /// commands whose draws were all plain is kept.
+    replay_plain: bool,
+    /// The draw being drawn reached that keep's test and passed it ([`replay_plain`](Self::replay_plain)).
+    plain_drawn: bool,
+    /// The direct draw being drawn read through snapshots in its instance as it stood and wrote
+    /// nothing but them: keeping nothing, it forgets only the kept draws that read its pass's
+    /// colors (`render/draw_again.rs`).
+    snapshots_alone: bool,
+    /// The direct draw being drawn kept nothing only because it recorded into a later instance
+    /// after a split: it keeps the kept draws set aside into that instance, but those that read
+    /// its pass's colors (`render/draw_again.rs`, re-homed past a split).
+    split_alone: bool,
+    /// The heap set versions the plain draws it replayed bound (`heap_sets::Bound`), each once,
+    /// which a kept recording of them binds again (`kept_commands::KeptEffects`).
+    replayed_heaps: Vec<Weak<SetVersion>>,
     /// The encoder records the current instance's draws again into an instance that leaves more
     /// colors out of its subpass (`render/reroute.rs`): a draw that would record elsewhere, or
     /// whose variant the interlocked storage form refuses, fails the reroute.
@@ -1452,6 +1786,11 @@ pub(crate) struct RenderLowering {
     /// Where it records an execution's GPU form, the replay's draws, which its draw records in
     /// place of its own (`render/executions/gpu.rs`).
     replayed: Option<executions::ReplayedDraws>,
+    /// Where it records a command of an execution's GPU route at a host step, where the route's
+    /// slot tables lie and the command's place among them: each of the command's draws pushes the
+    /// command's own tables at its `PushHole::RootTableAddress` holes, its replay variant's
+    /// (`render/executions/gpu_route.rs`).
+    command_tables: Option<(executions::CommandTables, u32)>,
     /// Where the encoder records an execution's commands, the tracked uses of the pass's draws
     /// before the execution, in the stages a draw runs in inside its pass (`PASS_DRAW_STAGES`):
     /// which an emulated mesh command's dispatches, recorded before the pass, must not touch but
@@ -1461,6 +1800,34 @@ pub(crate) struct RenderLowering {
     /// records into the execution's next run, after a barrier from everything before
     /// (`render/executions.rs`).
     run_barrier: bool,
+    /// The encoder records an execution's commands in a rate-mapped pass, and the pieces before
+    /// hold their work: the next draw records into the execution's next run, which begins a
+    /// piece of the pass's submission (`rate_mapped_pass.rs`, **Pieces**).
+    piece_split: bool,
+    /// The work of the draws the encoder recorded of an execution's commands in a rate-mapped
+    /// pass since the execution's recording last read it (`rate_mapped_pass::draw_work`).
+    piece_work: u64,
+    /// The region draws among it (`rate_mapped_pass::region_draws`).
+    piece_regions: u64,
+    /// The encoder records an execution's commands at a host step that fans a rate-mapped pass's
+    /// triangles out: its run of them, the probe's or the routes' (`render/fan_out.rs`).
+    fan_run: Option<fan_out::FanOutRun>,
+    /// The fan-out the next command's draw asks for, from `fan_run`.
+    fan_out: Option<fan_out::FanOutDraw>,
+    /// The last draw ran its fan-out variant, and whether its pipeline writes memory: what
+    /// `fan_run` hears of it.
+    fanned: (bool, bool),
+    /// The last draw would have fanned out and was drawn through its region-copy variant into
+    /// the boxes its triangles reach instead (`render/fan_out.rs`, **Boxed draws**).
+    boxed: bool,
+    /// The bounds of the run of a flagged draw's blocks the next draw draws region by region
+    /// (`fan_out::run_bounds`): a draw through its region-copy variant draws only the regions
+    /// they reach (`fan_out::run_boxes`); `None` for any other draw.
+    run_bounds: Option<u32>,
+    /// The region table a fan-out draw binds and its regions' scissors in its order, by the
+    /// viewport and scissor it was made for, and `None` where their regions make none
+    /// (`fan_out::table`).
+    fan_table: Option<(FanTableKey, Option<(FanTable, Vec<vk::Rect2D>, [u32; 2])>)>,
     /// The encoder records an execution's commands and the command it draws holds a barrier,
     /// which orders its draw after every draw before it (`render/executions.rs`).
     command_barrier: bool,
@@ -1481,12 +1848,12 @@ pub(crate) struct RenderLowering {
     barriered: bool,
     /// A memory barrier was encoded inside the pass (before the next draw, or between draws
     /// over the render targets): a command after it may read what one before it wrote of an
-    /// attachment (`linear_attachment::choose`).
+    /// attachment, so no run of passes takes the pass (`pass_runs.rs`).
     barrier_inside: bool,
     /// A command of the pass may reach memory it does not name: a draw or tile dispatch whose
     /// functions load pointers from memory (a root table: dynamic roots, which reach every live
     /// buffer, `live_buffers.rs`) or handles (a handle table, which reaches every texture of
-    /// the device's heap set) (`linear_attachment::choose`).
+    /// the device's heap set), so no run of passes takes the pass (`pass_runs.rs`).
     reaches_unnamed: bool,
     /// The instances (by index among the pass's) that follow a memory barrier: before each, the
     /// colors rendered through a copied stand-in over a buffer's bytes are merged back into them
@@ -1537,17 +1904,17 @@ pub(crate) struct RenderLowering {
     /// strips restart (`render/restart.rs`); `None` before any, where they restart at the index
     /// type's all-ones index.
     restart: Option<u64>,
-    /// The bind state the encoder's last draw bound, with its shape, which each draw brings to
-    /// its own in place (`live_bind.rs`). Shared only so that a draw holds it while it calls the
-    /// encoder's other methods.
-    live: Arc<Mutex<LiveBind>>,
     /// Its pass's descriptor and its calls so far, where the device had a buffer over host pages
     /// as it opened (`render/replay.rs`): `None` where it logs nothing, as when it is encoded
-    /// again.
-    log: Option<RenderLog>,
-    /// The last draw's variant, plan and specialization under which the bound values' notices
-    /// were quiet (`Device::degrade_bound_values`), where it was.
-    quiet_bound_values: Option<QuietBoundValues>,
+    /// again. Boxed where it is taken (`SpareLogs::render`), the box its end hands the command
+    /// buffer (`Replay::Render`).
+    log: Option<Box<RenderLog>>,
+    /// The variants, plans and specializations of its draws under which the bound values'
+    /// notices were quiet (`Device::degrade_bound_values`).
+    quiet_bound_values: QuietKept,
+    /// What its layout's attachments render, worked out once a version of it, which every draw
+    /// compares its uses with while their notice is pending (`render_target::AttachedMemo`).
+    attached: render_target::AttachedMemo,
     /// The views and sampler descriptions its draws' binds made or found, taken from the
     /// device's ended render encoders' and given back as it ends (`binding::BindMemo`).
     bind_memo: binding::BindMemo,
@@ -1558,14 +1925,34 @@ pub(crate) struct RenderLowering {
     /// The residency's generation as a command last noted the heaps of what it made resident
     /// (`command_encoded`): no command notes them again before it changes.
     heaps_noted: Option<u64>,
+    /// Of the uses of what the encoder made resident a draw last walked to check whether it may
+    /// be kept for drawing again, their identity and what they answered (`draw_resident`,
+    /// `draw_again::unwritten`).
+    resident_again: Option<(binding::ResidentPrefix, (bool, bool))>,
+    /// The textures made resident whose bytes a carrier holds, found again as the residency
+    /// changes (`command_encoded`).
+    unreadable: crate::pvrtc::ResidentUnreadable,
     /// Whether the pass's first instance records inline (`render/inline_first.rs`).
     inline: inline_first::Inline,
     /// What the draws recorded inline into the pass's command buffer bound there, in its every
     /// render pass instance (`render/inline_splits.rs`).
     held_bound: Bound,
+    /// The last direct draw, kept for drawing again while no call comes (`render/draw_again.rs`).
+    again: draw_again::DrawAgain,
     /// The pass's color group, where the device draws its colors in groups: the encoder draws
     /// that group's (`render/color_groups.rs`).
     grouped: Option<Box<color_groups::Grouped>>,
+    /// The count of the pass's instances through the last that a draw pinned to its colors' own
+    /// images, reading one through a snapshot of it that a later fetch would otherwise render
+    /// through a stand-in (`render/snapshot.rs`): a stand-in arriving after them takes its
+    /// attachment's texels after the last of them. 0 where no draw pinned one.
+    pinned_through: usize,
+    /// A stand-in or the hidden depth and stencil arrived after a pin: no later draw pins
+    /// (`render/snapshot.rs`).
+    pins_frozen: bool,
+    /// What its draws named, for the pass log's line at its end, while that log is on
+    /// (`pass_log.rs`).
+    pass_notes: Option<Box<pass_log::PassNotes>>,
 }
 
 /// What a render encoder's draws retained of their own (their pipeline states, their variants'
@@ -1661,17 +2048,68 @@ impl LastRetained {
     }
 }
 
+/// The most [`QuietBoundValues`] a render encoder keeps: one for each of a few pipeline states its
+/// draws switch between, as a compositor's do every few draws.
+const QUIET_KEPT: usize = 8;
+
+/// The [`QuietBoundValues`] of a render encoder's draws: at most [`QUIET_KEPT`], held in place
+/// (an encoder allocates none for them), the one kept longest ago given up first. So draws that
+/// switch between a few pipeline states test each once.
+#[derive(Default)]
+struct QuietKept {
+    kept: [Option<QuietBoundValues>; QUIET_KEPT],
+    /// Where the next is kept.
+    next: usize,
+}
+
+impl QuietKept {
+    /// Whether one kept is of `variant`, `plan` and `specialization` ([`QuietBoundValues::holds`]).
+    fn holds(
+        &self,
+        variant: &Arc<RenderVariant>,
+        plan: &Arc<BindingPlan>,
+        specialization: &SpecializationKey,
+    ) -> bool {
+        (self.kept.iter().flatten()).any(|quiet| quiet.holds(variant, plan, specialization))
+    }
+
+    /// Keep `quiet`, in place of the one kept longest ago where it keeps as many as it may.
+    fn keep(&mut self, quiet: QuietBoundValues) {
+        self.kept[self.next] = Some(quiet);
+        self.next = (self.next + 1) % QUIET_KEPT;
+    }
+}
+
 /// A variant, plan and specialization under which `Device::degrade_bound_values` was quiet: no
 /// clause of a note it tested held. Which hold is a function of the three alone, so a draw of
 /// the same three announces nothing there. The variant and the plan are held, so a pointer seen
-/// again is the same object.
+/// again is the same object. A draw that takes its plan's specialization
+/// (`BindingPlan::specialization`) keeps it through the plan, so keeping one allocates nothing:
+/// only a draw's own key (a mesh draw's) is copied.
 struct QuietBoundValues {
     variant: Arc<RenderVariant>,
     plan: Arc<BindingPlan>,
-    specialization: SpecializationKey,
+    /// The draw's own specialization, where it was not its plan's.
+    own: Option<SpecializationKey>,
 }
 
 impl QuietBoundValues {
+    /// The three of a draw of `variant` and `plan` under `specialization`, its plan's own or the
+    /// draw's.
+    fn new(
+        variant: &Arc<RenderVariant>,
+        plan: &Arc<BindingPlan>,
+        specialization: &SpecializationKey,
+    ) -> QuietBoundValues {
+        let own =
+            (!std::ptr::eq(specialization, &plan.specialization)).then(|| specialization.clone());
+        QuietBoundValues {
+            variant: Arc::clone(variant),
+            plan: Arc::clone(plan),
+            own,
+        }
+    }
+
     /// Whether a draw of `variant`, `plan` and `specialization` is of the three.
     fn holds(
         &self,
@@ -1679,9 +2117,10 @@ impl QuietBoundValues {
         plan: &Arc<BindingPlan>,
         specialization: &SpecializationKey,
     ) -> bool {
+        let kept = self.own.as_ref().unwrap_or(&self.plan.specialization);
         Arc::ptr_eq(&self.variant, variant)
             && Arc::ptr_eq(&self.plan, plan)
-            && self.specialization == *specialization
+            && (std::ptr::eq(kept, specialization) || *kept == *specialization)
     }
 }
 
@@ -1713,6 +2152,69 @@ impl std::fmt::Debug for RenderLowering {
     }
 }
 
+/// A render encoder's lowering beside the bind state its last draw bound, with its shape, which
+/// each draw brings to its own in place (`live_bind.rs`): held apart from the lowering, so a draw
+/// holds both, the bind state while it calls the lowering's other methods, as two borrows
+/// ([`parts`](Self::parts)), with no lock and no count. Each in its box, so the encoder's return
+/// and moves copy neither one's state. Every other call reaches the lowering through it.
+pub(crate) struct Lowering {
+    lowering: Box<RenderLowering>,
+    live: Box<LiveBind>,
+}
+
+impl std::ops::Deref for Lowering {
+    type Target = RenderLowering;
+
+    fn deref(&self) -> &RenderLowering {
+        &self.lowering
+    }
+}
+
+impl std::ops::DerefMut for Lowering {
+    fn deref_mut(&mut self) -> &mut RenderLowering {
+        &mut self.lowering
+    }
+}
+
+impl std::fmt::Debug for Lowering {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.lowering, f)
+    }
+}
+
+impl Lowering {
+    /// The lowering and the bind state, which a draw takes together.
+    pub(super) fn parts(&mut self) -> (&mut RenderLowering, &mut LiveBind) {
+        (&mut self.lowering, &mut self.live)
+    }
+
+    /// The lowering, its bind state given to the device for its next render encoder to start
+    /// from (`live_bind.rs`): no draw holds it once the encoder ends.
+    fn ending(self) -> Box<RenderLowering> {
+        let Lowering { lowering, live } = self;
+        lowering.core.device().shared().live_binds.give(live);
+        lowering
+    }
+
+    /// The lowering of [`RenderCommandEncoder::end_encoding`] (`RenderLowering::end_encoding`),
+    /// its kept draw carried into its command buffer's next render encoder where it carries
+    /// (`render/carried.rs`).
+    pub(crate) fn end_encoding(self) -> Result<(), Error> {
+        let _for = self.core.notices_for();
+        self.ending_carried().end_encoding()
+    }
+
+    /// `RenderLowering::finish_replay`, its bind state given back first.
+    pub(super) fn finish_replay(self) -> Result<(Replayed, Option<Residency>), Error> {
+        self.ending().finish_replay()
+    }
+
+    /// `RenderLowering::end_pass`, its bind state given back first.
+    fn end_pass(self) -> Result<color_groups::Ended, Error> {
+        self.ending().end_pass()
+    }
+}
+
 impl CommandBuffer {
     /// `renderCommandEncoderWithDescriptor:`: an encoder of the pass `descriptor` describes.
     /// Refused as Metal's validation refuses the descriptor (`render_pass.rs`), and as
@@ -1722,11 +2224,18 @@ impl CommandBuffer {
         &self,
         descriptor: &RenderPassDescriptor,
     ) -> Result<RenderCommandEncoder, Error> {
-        // The last render encoder's end, where its call left it to the device's lowering thread.
-        self.settle_end();
+        let _for = self.notices_for();
+        // The last render encoder's end, where its call left it to the device's lowering thread,
+        // and the kept draw it carried, or its end where it kept none (`render/carried.rs`),
+        // which nothing came between.
+        self.settle_ended();
+        let handed = carried::Handed {
+            carried: self.take_carried(),
+            none_kept: self.take_none_kept(),
+        };
         // Metal's process ends here under some protection options (`command_buffer/protection.rs`).
         self.refuse_protected_encoder("render_command_encoder")?;
-        self.open_render(descriptor, None, None)
+        self.open_render(descriptor, None, None, handed)
             .map(RenderCommandEncoder::new)
     }
 
@@ -1743,7 +2252,8 @@ impl CommandBuffer {
         given: &RenderPassDescriptor,
         again: Option<Residency>,
         screen: Option<[u32; 2]>,
-    ) -> Result<Box<RenderLowering>, Error> {
+        handed: carried::Handed,
+    ) -> Result<Lowering, Error> {
         const CALL: &str = "render_command_encoder";
         let device = self.device();
         let screen = screen.or_else(|| {
@@ -1790,7 +2300,7 @@ impl CommandBuffer {
         // an ended encoder's calls again, nor in a pass of several color groups, whose later
         // groups record after the first group's pass: its draws' secondary begins only where a
         // command records into it (`RenderCommandEncoder::begin_current_draws`).
-        let extended = ExtendedShadows::of(descriptor, &layout, rate_map.is_some());
+        let extended = ExtendedShadows::of(device, descriptor, &layout, rate_map.is_some());
         let opens = match again.is_none() && groups == 1 {
             true => inline_first::opens_inline(device, &layout, rate_map.is_some(), &extended),
             false => Err(NotInline::Encoders),
@@ -1806,11 +2316,41 @@ impl CommandBuffer {
             true => vk::CommandBuffer::null(),
             false => self.begin_draws(&compatible)?,
         };
+        // A pass with a log may take a group of encoders recorded into one `VkCommandBuffer`
+        // (`encoder_fold.rs`, **Render encoders**): it joins one where it records its pass at
+        // its end, and may begin one either way. One over a rasterization-rate map or of several
+        // color groups takes none (a reset of its map, or its later groups, encode it again
+        // alone), nor one whose depth attachment the device holds out of `GENERAL` between passes
+        // (`texture/held_depth.rs`), whose moves go before its own `VkCommandBuffer`.
+        let held_attachment = (layout.depth_stencil.as_ref()).is_some_and(|ds| {
+            let none = crate::tracker::Access::NONE;
+            let key = ds.target.texture.bound_use(none, none).key;
+            device.shared().textures.held.holds(key)
+        });
+        let joining = (log.is_some() && rate_map.is_none() && groups == 1 && !held_attachment)
+            .then_some(super::encoder_fold::Joining::Render { joins: !inline });
         // A refusal past here leaves the secondary command buffer unused, freed with the pool.
         let mut core = match again {
-            None => EncoderCore::open(self, CALL, EncoderKind::Render, false)?,
+            None => EncoderCore::open(self, CALL, EncoderKind::Render, (false, joining), |_| ())?.0,
             Some(_) => EncoderCore::replaying(self, false)?,
+        }
+        .boxed();
+        // A color's texture with faces that the pass renders whole without loading it turns to
+        // its other face here, before anything of the pass names its image; the kept draw the
+        // last render encoder carried bound the face presented before (`render/face_swap.rs`).
+        // A pass encoded again takes again the turns its first encoding took.
+        let passes = groups > 1 || rate_map.is_some();
+        let turns = face_swap::Turns::open(
+            &mut core,
+            &layout,
+            passes.then_some(Unturned::Pass),
+            again.is_some(),
+        );
+        let handed = match turns.turned() {
+            true => handed.turned(device),
+            false => handed,
         };
+        core.take_turns(turns);
         if let Some(pass) = &rate_map {
             let (map, state) = pass.taken();
             core.take_rate_map(map, state);
@@ -1828,7 +2368,7 @@ impl CommandBuffer {
         core.hold_bytes(render_target::attachment_bytes(whole));
         // The pass's loads read a new texture's unwritten texels (`fresh_unwritten.rs`): the
         // descriptor's loads, before a pass of several groups loads a `DontCare` depth or stencil.
-        FreshUnwritten::begin_pass(device, whole)?;
+        FreshUnwritten::begin_pass(core.command_buffer(), whole)?;
         render_pass::degrade_depth_clear(device, whole);
         if groups > 1 {
             color_groups::settle_depth_stencil(&mut layout);
@@ -1856,12 +2396,12 @@ impl CommandBuffer {
             log,
             grouped,
         );
-        Ok(RenderLowering::assemble(core, draws, opening))
+        Ok(RenderLowering::assemble(core, draws, opening, handed))
     }
 }
 
 /// What a render encoder opens with but its core and the secondary command buffer of its first
-/// instance ([`RenderCommandEncoder::assemble`]): its pass's layout (a color group's, where the
+/// instance ([`RenderLowering::assemble`]): its pass's layout (a color group's, where the
 /// device draws the pass's colors in groups), that layout's shape and compatible pass, its
 /// rasterization-rate map, its extended-range shadows and the extended-range colors whose clear
 /// Metal's tile memory holds off its codes, whether its first instance records inline (and its
@@ -1877,7 +2417,7 @@ struct Opening {
     extended_written: BTreeSet<u32>,
     inline: Option<bool>,
     residency: Residency,
-    log: Option<RenderLog>,
+    log: Option<Box<RenderLog>>,
     grouped: Option<Box<color_groups::Grouped>>,
 }
 
@@ -1893,7 +2433,7 @@ impl Opening {
         rate_map: Option<RateMappedPass>,
         inline: Option<bool>,
         residency: Residency,
-        log: Option<RenderLog>,
+        log: Option<Box<RenderLog>>,
         grouped: Option<Box<color_groups::Grouped>>,
     ) -> Opening {
         Opening {
@@ -1918,8 +2458,19 @@ impl Opening {
 
 impl RenderLowering {
     /// An encoder over `core` of the pass `opening` describes, its first instance's draws
-    /// recording into `draws` (null where it records inline), made in its box.
-    fn assemble(core: EncoderCore, draws: vk::CommandBuffer, opening: Opening) -> Box<Self> {
+    /// recording into `draws` (null where it records inline), made in its box: the box is
+    /// allocated first and the lowering written into it, where `Box::new` of a lowering makes it
+    /// on the stack and copies its thousands of bytes in. It starts from the kept draw its
+    /// command buffer's last render encoder carried, of `handed`, where that fits its pass, and
+    /// counts what one would have come to where that encoder kept none (`render/carried.rs`).
+    fn assemble(
+        core: Box<EncoderCore>,
+        draws: vk::CommandBuffer,
+        opening: Opening,
+        handed: carried::Handed,
+    ) -> Lowering {
+        let samplers = core.generation().sampler_slots_changed();
+        let carried = carried::fitting(handed, &opening, (core.device(), samplers));
         let Opening {
             layout,
             render_target_array_length,
@@ -1934,122 +2485,160 @@ impl RenderLowering {
             grouped,
         } = opening;
         let rerecord = extended.keeps_draws();
-        // The bind state the device's last ended render encoder left (`live_bind.rs`).
-        let live = core.device().shared().live_binds.take();
+        // The bind state the device's last ended render encoder left (`live_bind.rs`), where it
+        // starts from no carried one.
+        let start = match carried {
+            Some(carried) => carried::Start::Carried(carried),
+            None => carried::Start::Spare(core.device().shared().live_binds.take()),
+        };
         // The views and sampler descriptions its binds made or found (`binding::BindMemo`).
         let bind_memo = core.device().shared().bind_memos.take();
-        Box::new(RenderLowering {
-            core,
-            earlier: Vec::new(),
-            current: Instance {
-                draws,
-                shape: Versioned::new(shape.clone()),
-                compatible: Arc::clone(&compatible),
-                recorded: false,
-                shadow: false,
-                shader_tests: false,
-                imageblock: false,
-                interlocked_writes: InterlockedStorage::NONE,
-                indirect_reads: IndirectReads::new(),
-                geometry_writes: GeometryWrites::new(),
-                tile_memory: false,
-                barriers: false,
-                views: ViewSetup::default(),
-                pieces: Vec::new(),
-                shadows: InstanceShadows::default(),
-                before: Vec::new(),
-                reformats: Vec::new(),
-                positioned: None,
-                rerecord: rerecord.then(Vec::new),
-                bound: Bound::default(),
-                drawn: clear_reach::DrawnArea::default(),
-                inline: false,
-                continues: false,
-                kept: None,
-                planned: false,
-                feedback: Feedback::NONE,
-                storage_colors: 0,
+        // What its draws gather into, with the room an ended encoder's left
+        // (`render/draw_room.rs`).
+        let room = core.device().shared().draw_rooms.take();
+        // Metal's default viewport and scissor rectangle cover the render area: a rate map's.
+        let area = rate_map
+            .as_ref()
+            .map_or(layout.extent, RateMappedPass::area);
+        let lowering = Box::write(
+            Box::new_uninit(),
+            RenderLowering {
+                core,
+                earlier: Vec::new(),
+                current: Instance {
+                    draws,
+                    shape: Versioned::new(shape.clone()),
+                    compatible: Arc::clone(&compatible),
+                    recorded: false,
+                    shadow: false,
+                    shader_tests: false,
+                    imageblock: false,
+                    interlocked_writes: InterlockedStorage::BEGUN,
+                    indirect_reads: IndirectReads::new(),
+                    geometry_writes: GeometryWrites::new(),
+                    tile_memory: false,
+                    barriers: false,
+                    views: ViewSetup::default(),
+                    pieces: Vec::new(),
+                    shadows: room.shadows,
+                    before: Vec::new(),
+                    reformats: Vec::new(),
+                    positioned: None,
+                    rerecord: rerecord.then(Vec::new),
+                    bound: Bound::default(),
+                    drawn: room.first_drawn,
+                    inline: false,
+                    continues: false,
+                    kept: None,
+                    planned: false,
+                    feedback: Feedback::NONE,
+                    general_colors: 0,
+                    leading: None,
+                    piece: false,
+                },
+                state: Versioned::new(EncoderState::metal_defaults(area)),
+                scissors: ScissorRects::metal_default(area),
+                render_target_array_length,
+                visibility: Visibility::new(layout.visibility.clone()),
+                readers: coverage::Readers::default(),
+                layout: Versioned::new(layout),
+                passes: vec![(shape, compatible)],
+                pipeline: None,
+                routed: None,
+                vertex: ArgumentTable::default(),
+                fragment: ArgumentTable::default(),
+                object: ArgumentTable::default(),
+                mesh: ArgumentTable::default(),
+                object_threadgroup_lengths: BTreeMap::new(),
+                tile: ArgumentTable::default(),
+                dispatches: Vec::new(),
+                dispatched: false,
+                scratch: Vec::new(),
+                shadow: None,
+                returned_stencil: false,
+                depth_stand_in: None,
+                imageblock: None,
+                tile_imageblock: false,
+                factors: Factors::default(),
+                rate_map,
+                amplification: Versioned::new(Amplification::default()),
+                barrier: false,
+                loads_ordered: false,
+                barrier_splits: 0,
+                attached_read_splits: 0,
+                driver_restarts: false,
+                tile_memory_splits: 0,
+                interlocked_splits: 0,
+                tile_memory: tile_memory::TileMemory::default(),
+                residency,
+                executions: Vec::new(),
+                pending: Vec::new(),
+                draw_calls: 0,
+                last_draw_empty: false,
+                tile_dispatch_calls: 0,
+                replaying: false,
+                replay_plain: false,
+                plain_drawn: false,
+                snapshots_alone: false,
+                split_alone: false,
+                replayed_heaps: Vec::new(),
+                rerouting: false,
+                forms: BufferForms::Bound,
+                replayed: None,
+                command_tables: None,
+                drawn_before: Vec::new(),
+                run_barrier: false,
+                piece_split: false,
+                piece_work: 0,
+                piece_regions: 0,
+                fan_run: None,
+                fan_out: None,
+                fanned: (false, false),
+                boxed: false,
+                run_bounds: None,
+                fan_table: None,
+                command_barrier: false,
+                unordered: UnorderedWrites::new(),
+                zero_indices: None,
+                unordered_dispatches: UnorderedWrites::new(),
+                barriered: false,
+                barrier_inside: false,
+                reaches_unnamed: false,
+                reload_at: BTreeSet::new(),
+                called: false,
+                depth_writes: false,
+                drew_depth_writes: false,
+                drew: false,
+                drawn: room.drawn,
+                coverage: linear_attachment::Coverage::default(),
+                inputs_read: BTreeSet::new(),
+                kept_attachments: None,
+                extended_written,
+                extended,
+                pass_start: room.pass_start,
+                restart: None,
+                log,
+                quiet_bound_values: QuietKept::default(),
+                attached: render_target::AttachedMemo::default(),
+                bind_memo,
+                shape_memo: ShapeMemo::default(),
+                last_retained: LastRetained::default(),
+                heaps_noted: None,
+                resident_again: None,
+                unreadable: Default::default(),
+                inline: match inline {
+                    Some(splits) => inline_first::Inline::Open { splits },
+                    None => inline_first::Inline::Never,
+                },
+                held_bound: Bound::default(),
+                again: draw_again::DrawAgain::default(),
+                grouped,
+                pinned_through: 0,
+                pins_frozen: false,
+                pass_notes: pass_log::enabled().then(Box::default),
             },
-            state: Versioned::new(EncoderState::metal_defaults(
-                rate_map
-                    .as_ref()
-                    .map_or(layout.extent, RateMappedPass::area),
-            )),
-            render_target_array_length,
-            visibility: Visibility::new(layout.visibility.clone()),
-            layout: Versioned::new(layout),
-            passes: vec![(shape, compatible)],
-            pipeline: None,
-            routed: None,
-            vertex: ArgumentTable::default(),
-            fragment: ArgumentTable::default(),
-            object: ArgumentTable::default(),
-            mesh: ArgumentTable::default(),
-            object_threadgroup_lengths: BTreeMap::new(),
-            tile: ArgumentTable::default(),
-            dispatches: Vec::new(),
-            dispatched: false,
-            scratch: Vec::new(),
-            shadow: None,
-            returned_stencil: false,
-            depth_stand_in: None,
-            imageblock: None,
-            tile_imageblock: false,
-            factors: Factors::default(),
-            rate_map,
-            amplification: Versioned::new(Amplification::default()),
-            barrier: false,
-            barrier_splits: 0,
-            driver_restarts: false,
-            tile_memory_splits: 0,
-            tile_memory: tile_memory::TileMemory::default(),
-            residency,
-            writers: Writers::default(),
-            executions: Vec::new(),
-            pending: Vec::new(),
-            draw_calls: 0,
-            tile_dispatch_calls: 0,
-            replaying: false,
-            executing_encoder: None,
-            rerouting: false,
-            forms: BufferForms::Bound,
-            replayed: None,
-            drawn_before: Vec::new(),
-            run_barrier: false,
-            command_barrier: false,
-            unordered: UnorderedWrites::new(),
-            zero_indices: None,
-            unordered_dispatches: UnorderedWrites::new(),
-            barriered: false,
-            barrier_inside: false,
-            reaches_unnamed: false,
-            reload_at: BTreeSet::new(),
-            called: false,
-            depth_writes: false,
-            drew_depth_writes: false,
-            drew: false,
-            drawn: clear_reach::DrawnArea::default(),
-            coverage: linear_attachment::Coverage::default(),
-            inputs_read: BTreeSet::new(),
-            kept_attachments: None,
-            extended_written,
-            extended,
-            pass_start: PassStartReads::default(),
-            restart: None,
-            live,
-            log,
-            quiet_bound_values: None,
-            bind_memo,
-            shape_memo: ShapeMemo::default(),
-            last_retained: LastRetained::default(),
-            heaps_noted: None,
-            inline: match inline {
-                Some(splits) => inline_first::Inline::Open { splits },
-                None => inline_first::Inline::Never,
-            },
-            held_bound: Bound::default(),
-            grouped,
-        })
+        );
+        Lowering::starting_from(lowering, start)
     }
 }
 
@@ -2062,11 +2651,13 @@ impl CommandBuffer {
         let inheritance = vk::CommandBufferInheritanceInfo::default()
             .render_pass(compatible.raw)
             .subpass(0);
+        // A chunk kept for later command buffers (`kept_commands.rs`) may run in several at once.
+        let submits = match state.keeping() {
+            true => vk::CommandBufferUsageFlags::SIMULTANEOUS_USE,
+            false => vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+        };
         let begin = vk::CommandBufferBeginInfo::default()
-            .flags(
-                vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT
-                    | vk::CommandBufferUsageFlags::RENDER_PASS_CONTINUE,
-            )
+            .flags(submits | vk::CommandBufferUsageFlags::RENDER_PASS_CONTINUE)
             .inheritance_info(&inheritance);
         // SAFETY: the command buffer was just allocated from the pool, under the state lock;
         // the compatible pass lives as long as the encoder, and its command buffer after.
@@ -2169,7 +2760,7 @@ impl DrawDynamic {
 }
 
 /// No colors or slots: what a draw's set of them is compared with where it names none
-/// ([`RenderCommandEncoder::settle_draw`]).
+/// ([`RenderLowering::settle_draw`]).
 static NO_INDICES: BTreeSet<u32> = BTreeSet::new();
 
 /// The dynamic states a draw records, beside `VERTEX_INPUT_BINDING_STRIDE` (recorded with the
@@ -2196,12 +2787,13 @@ const RECORDED: [vk::DynamicState; 16] = [
 /// The checks of a pipeline state set on an encoder, over the encoder's pass and state as they stand
 /// (`ShapeInputs`): the lowering's, and the program's encoder's at the call (`render/call_checks.rs`).
 impl ShapeInputs<'_> {
-    /// Refuse `pipeline` for this pass in `call` as [`RenderCommandEncoder::set_render_pipeline_state`]
-    /// says.
+    /// Refuse `pipeline` for this pass, of `layout`, in `call` as
+    /// [`RenderCommandEncoder::set_render_pipeline_state`] says.
     pub(super) fn check_pipeline(
         &self,
         call: &'static str,
         state: &RenderPipelineState,
+        layout: &PassLayout,
     ) -> Result<(), Error> {
         let pipeline = match state.kind() {
             RenderStateKind::Graphics(state) => state,
@@ -2282,8 +2874,7 @@ impl ShapeInputs<'_> {
                 .copied()
                 .flatten()
                 .ok_or_else(|| internal("a placed color the state lacks"))?;
-            let pass = self
-                .layout
+            let pass = layout
                 .colors
                 .get(other as usize)
                 .and_then(Option::as_ref)
@@ -2326,7 +2917,8 @@ impl ShapeInputs<'_> {
         // probes). A state of more samples in a pass of one is its single-sample twin here where
         // Metal draws it as one (`drawn_as`). A state that rasterizes nothing has no samples to
         // draw at, and Metal binds it in a pass of any sample count (`unrasterized.rs`).
-        if descriptor.raster_sample_count() != self.layout.samples && !graphics.rasterizer_discard {
+        if descriptor.raster_sample_count() != self.layout.samples() && !graphics.rasterizer_discard
+        {
             return Err(draw_problem(call, DrawProblem::SampleCount));
         }
         // Its formats are the pass's, so a state without an explicit imageblock packs as the
@@ -2456,10 +3048,10 @@ impl ShapeInputs<'_> {
     /// descriptor's `imageblock_sample_length` and its attachments' texels
     /// ([`imageblock_sample_length`](metal2vulkan::metal::format::imageblock_sample_length)).
     pub(super) fn pass_sample_length(&self) -> Result<u64, Error> {
-        let formats = self.layout.pass_formats();
+        let formats = self.layout.formats();
         let packed = metal2vulkan::metal::format::imageblock_sample_length(&formats)
             .ok_or_else(|| internal("a pass attachment without a texel size"))?;
-        Ok(u64::from(packed).max(self.layout.tile.sample_length))
+        Ok(u64::from(packed).max(self.layout.tile().sample_length))
     }
 
     /// Refuse the tile pipeline's state `state` for this pass in `call`: a color format other
@@ -2469,7 +3061,7 @@ impl ShapeInputs<'_> {
     /// sample larger than the pass gives ([`pass_sample_length`](Self::pass_sample_length);
     /// measured: "the pipelineState's per sample imageBlock usage(32) is greater than the
     /// encoder's perSample imageBlock usage(4)"). An explicit imageblock standing alone runs in
-    /// a pass of fewer bytes ([`kept_imageblock_bytes`](Self::kept_imageblock_bytes)).
+    /// a pass of fewer bytes ([`kept_imageblock_bytes`](RenderLowering::kept_imageblock_bytes)).
     pub(super) fn check_tile(&self, call: &'static str, state: &TileState) -> Result<(), Error> {
         let descriptor = state.descriptor();
         // Plain Metal runs a tile function whatever the state's color formats (a Metal probe: one
@@ -2491,8 +3083,7 @@ impl ShapeInputs<'_> {
                 .map(|last| last as usize + 1)
         };
         for index in 0..checked.unwrap_or(0).min(MAX_COLOR_ATTACHMENTS) {
-            let pass = self.layout.colors.get(index).and_then(Option::as_ref);
-            let pass = pass.map(|c| c.target.texture.pixel_format());
+            let pass = self.layout.formats().get(index).copied().flatten();
             let wanted = descriptor
                 .color_attachment_formats
                 .get(index)
@@ -2506,7 +3097,7 @@ impl ShapeInputs<'_> {
                 ));
             }
         }
-        if descriptor.raster_sample_count != self.layout.samples {
+        if descriptor.raster_sample_count != self.layout.samples() {
             return Err(draw_problem(call, DrawProblem::SampleCount));
         }
         // Without an explicit imageblock the colors the function reaches are the pass's, at the
@@ -2537,7 +3128,10 @@ impl RenderLowering {
         &mut self,
         state: &RenderPipelineState,
     ) -> Result<(), Error> {
-        self.log(|log| RenderCall::PipelineState(log.hold_render_state(state)));
+        // The kept draw stays, set aside with its state's bind state at the next draw through
+        // another state (`render/draw_again.rs`): a draw of a state changes nothing a draw of
+        // another reads but what its plain draws hold for the next.
+        self.log_keeping(|log| RenderCall::PipelineState(log.hold_render_state(state)));
         let turn = self.group_turn();
         if let color_groups::Turn::Later(false) = turn {
             return Err(color_groups::gap());
@@ -2551,7 +3145,13 @@ impl RenderLowering {
     /// the pass's color groups taken.
     fn set_state(&mut self, state: &RenderPipelineState) -> Result<(), Error> {
         const CALL: &str = "set_render_pipeline_state";
-        self.core.check_device(CALL, state.device())?;
+        self.core.check_device(CALL, state.bound_device()?)?;
+        if let Some(trail) = self.core.trail() {
+            trail.render(state);
+        }
+        if let Some(times) = self.core.times() {
+            times.render(state);
+        }
         let drawn = drawn_as(self.layout.samples, state)?;
         let state = self.grouped_as(drawn.clone())?;
         // Routed once here: the check and each draw read it (`routing`).
@@ -2569,8 +3169,9 @@ impl RenderLowering {
                 pass,
             });
         }
-        self.shape_inputs().check_pipeline(CALL, &state)?;
-        self.writers.state_set(state.indirect_command_writes());
+        self.shape_inputs()
+            .check_pipeline(CALL, &state, &self.layout)?;
+        (self.core.routes).state_set(state.indirect_command_writes(), || state.function_names());
         self.pipeline = Some(state);
         self.grouped_set(&drawn);
         Ok(())
@@ -2583,7 +3184,7 @@ impl RenderLowering {
         offset: u64,
         index: u32,
     ) -> Result<(), Error> {
-        self.log(|log| {
+        self.log_keeping(|log| {
             let buffer = buffer.map(|buffer| log.hold_buffer(buffer));
             RenderCall::Buffer(Table::Vertex, buffer, offset, index)
         });
@@ -2598,7 +3199,7 @@ impl RenderLowering {
         offsets: &[u64],
         first: u32,
     ) -> Result<(), Error> {
-        self.log(|log| {
+        self.log_keeping(|log| {
             RenderCall::Buffers(
                 Table::Vertex,
                 log.buffer_span(buffers),
@@ -2621,14 +3222,14 @@ impl RenderLowering {
         offset: u64,
         index: u32,
     ) -> Result<(), Error> {
-        self.log(|_| RenderCall::BufferOffset(Table::Vertex, offset, index));
+        self.log_keeping(|_| RenderCall::BufferOffset(Table::Vertex, offset, index));
         self.vertex
             .set_buffer_offset(&mut self.core, "set_vertex_buffer_offset", offset, index)
     }
 
     /// The lowering of [`RenderCommandEncoder::set_vertex_bytes`].
     pub(crate) fn set_vertex_bytes(&mut self, bytes: &[u8], index: u32) -> Result<(), Error> {
-        self.log(|log| RenderCall::Bytes(Table::Vertex, log.byte_span(bytes), index));
+        self.log_keeping(|log| RenderCall::Bytes(Table::Vertex, log.byte_span(bytes), index));
         self.vertex
             .set_bytes(&mut self.core, "set_vertex_bytes", bytes, None, index)
     }
@@ -2639,7 +3240,7 @@ impl RenderLowering {
         texture: Option<&Texture>,
         index: u32,
     ) -> Result<(), Error> {
-        self.log(|log| {
+        self.log_keeping(|log| {
             let texture = texture.map(|texture| log.hold_texture(texture));
             RenderCall::Texture(Table::Vertex, texture, index)
         });
@@ -2653,7 +3254,9 @@ impl RenderLowering {
         textures: &[Option<&Texture>],
         first: u32,
     ) -> Result<(), Error> {
-        self.log(|log| RenderCall::Textures(Table::Vertex, log.texture_span(textures), first));
+        self.log_keeping(|log| {
+            RenderCall::Textures(Table::Vertex, log.texture_span(textures), first)
+        });
         self.vertex
             .set_textures(&mut self.core, "set_vertex_textures", textures, first)
     }
@@ -2664,7 +3267,7 @@ impl RenderLowering {
         sampler: Option<&SamplerState>,
         index: u32,
     ) -> Result<(), Error> {
-        self.log(|log| {
+        self.log_keeping(|log| {
             let sampler = sampler.map(|sampler| log.hold_sampler(sampler));
             RenderCall::Sampler(Table::Vertex, sampler, index)
         });
@@ -2684,7 +3287,9 @@ impl RenderLowering {
         clamps: Option<(&[f32], &[f32])>,
         first: u32,
     ) -> Result<(), Error> {
-        self.log(|_| RenderCall::Samplers(Table::Vertex, Samplers::of(samplers, clamps, first)));
+        self.log_keeping(|_| {
+            RenderCall::Samplers(Table::Vertex, Samplers::of(samplers, clamps, first))
+        });
         self.vertex.set_samplers(
             &mut self.core,
             "set_vertex_sampler_states",
@@ -2701,7 +3306,7 @@ impl RenderLowering {
         offset: u64,
         index: u32,
     ) -> Result<(), Error> {
-        self.log(|log| {
+        self.log_keeping(|log| {
             let buffer = buffer.map(|buffer| log.hold_buffer(buffer));
             RenderCall::Buffer(Table::Fragment, buffer, offset, index)
         });
@@ -2716,7 +3321,7 @@ impl RenderLowering {
         offsets: &[u64],
         first: u32,
     ) -> Result<(), Error> {
-        self.log(|log| {
+        self.log_keeping(|log| {
             RenderCall::Buffers(
                 Table::Fragment,
                 log.buffer_span(buffers),
@@ -2739,14 +3344,14 @@ impl RenderLowering {
         offset: u64,
         index: u32,
     ) -> Result<(), Error> {
-        self.log(|_| RenderCall::BufferOffset(Table::Fragment, offset, index));
+        self.log_keeping(|_| RenderCall::BufferOffset(Table::Fragment, offset, index));
         self.fragment
             .set_buffer_offset(&mut self.core, "set_fragment_buffer_offset", offset, index)
     }
 
     /// The lowering of [`RenderCommandEncoder::set_fragment_bytes`].
     pub(crate) fn set_fragment_bytes(&mut self, bytes: &[u8], index: u32) -> Result<(), Error> {
-        self.log(|log| RenderCall::Bytes(Table::Fragment, log.byte_span(bytes), index));
+        self.log_keeping(|log| RenderCall::Bytes(Table::Fragment, log.byte_span(bytes), index));
         self.fragment
             .set_bytes(&mut self.core, "set_fragment_bytes", bytes, None, index)
     }
@@ -2757,7 +3362,7 @@ impl RenderLowering {
         texture: Option<&Texture>,
         index: u32,
     ) -> Result<(), Error> {
-        self.log(|log| {
+        self.log_keeping(|log| {
             let texture = texture.map(|texture| log.hold_texture(texture));
             RenderCall::Texture(Table::Fragment, texture, index)
         });
@@ -2771,7 +3376,9 @@ impl RenderLowering {
         textures: &[Option<&Texture>],
         first: u32,
     ) -> Result<(), Error> {
-        self.log(|log| RenderCall::Textures(Table::Fragment, log.texture_span(textures), first));
+        self.log_keeping(|log| {
+            RenderCall::Textures(Table::Fragment, log.texture_span(textures), first)
+        });
         self.fragment
             .set_textures(&mut self.core, "set_fragment_textures", textures, first)
     }
@@ -2782,7 +3389,7 @@ impl RenderLowering {
         sampler: Option<&SamplerState>,
         index: u32,
     ) -> Result<(), Error> {
-        self.log(|log| {
+        self.log_keeping(|log| {
             let sampler = sampler.map(|sampler| log.hold_sampler(sampler));
             RenderCall::Sampler(Table::Fragment, sampler, index)
         });
@@ -2802,7 +3409,9 @@ impl RenderLowering {
         clamps: Option<(&[f32], &[f32])>,
         first: u32,
     ) -> Result<(), Error> {
-        self.log(|_| RenderCall::Samplers(Table::Fragment, Samplers::of(samplers, clamps, first)));
+        self.log_keeping(|_| {
+            RenderCall::Samplers(Table::Fragment, Samplers::of(samplers, clamps, first))
+        });
         self.fragment.set_samplers(
             &mut self.core,
             "set_fragment_sampler_states",
@@ -2818,7 +3427,9 @@ impl RenderLowering {
         action: StoreAction,
         index: u32,
     ) -> Result<(), Error> {
-        self.log(|_| RenderCall::ColorStoreAction(action, index));
+        self.log_letting_go(LoggedCall::StoreAction, |_| {
+            RenderCall::ColorStoreAction(action, index)
+        });
         const CALL: &str = "set_color_store_action";
         check_index(CALL, index, MAX_COLOR_ATTACHMENTS as u32)?;
         let which = Attachment::Color(index);
@@ -2854,13 +3465,17 @@ impl RenderLowering {
 
     /// The lowering of [`RenderCommandEncoder::set_depth_store_action`].
     pub(crate) fn set_depth_store_action(&mut self, action: StoreAction) -> Result<(), Error> {
-        self.log(|_| RenderCall::DepthStoreAction(action));
+        self.log_letting_go(LoggedCall::StoreAction, |_| {
+            RenderCall::DepthStoreAction(action)
+        });
         self.set_aspect_store_action("set_depth_store_action", Attachment::Depth, action)
     }
 
     /// The lowering of [`RenderCommandEncoder::set_stencil_store_action`].
     pub(crate) fn set_stencil_store_action(&mut self, action: StoreAction) -> Result<(), Error> {
-        self.log(|_| RenderCall::StencilStoreAction(action));
+        self.log_letting_go(LoggedCall::StoreAction, |_| {
+            RenderCall::StencilStoreAction(action)
+        });
         self.set_aspect_store_action("set_stencil_store_action", Attachment::Stencil, action)
     }
 
@@ -2870,7 +3485,9 @@ impl RenderLowering {
         _options: StoreActionOptions,
         index: u32,
     ) -> Result<(), Error> {
-        self.log(|_| RenderCall::ColorStoreActionOptions(_options, index));
+        self.log_letting_go(LoggedCall::StoreAction, |_| {
+            RenderCall::ColorStoreActionOptions(_options, index)
+        });
         const CALL: &str = "set_color_store_action_options";
         check_index(CALL, index, MAX_COLOR_ATTACHMENTS as u32)?;
         let which = Attachment::Color(index);
@@ -2889,7 +3506,9 @@ impl RenderLowering {
         &mut self,
         options: StoreActionOptions,
     ) -> Result<(), Error> {
-        self.log(|_| RenderCall::DepthStoreActionOptions(options));
+        self.log_letting_go(LoggedCall::StoreAction, |_| {
+            RenderCall::DepthStoreActionOptions(options)
+        });
         self.set_aspect_store_action_options(
             "set_depth_store_action_options",
             Attachment::Depth,
@@ -2902,7 +3521,9 @@ impl RenderLowering {
         &mut self,
         options: StoreActionOptions,
     ) -> Result<(), Error> {
-        self.log(|_| RenderCall::StencilStoreActionOptions(options));
+        self.log_letting_go(LoggedCall::StoreAction, |_| {
+            RenderCall::StencilStoreActionOptions(options)
+        });
         self.set_aspect_store_action_options(
             "set_stencil_store_action_options",
             Attachment::Stencil,
@@ -3027,7 +3648,7 @@ impl RenderLowering {
 
     /// The lowering of [`RenderCommandEncoder::set_viewport`].
     pub(crate) fn set_viewport(&mut self, viewport: Viewport) -> Result<(), Error> {
-        self.log(|_| RenderCall::Viewport(Box::new(viewport)));
+        self.log_restating(|_| RenderCall::Viewport(Box::new(viewport)));
         let refused = render_state::depth_ranges_refused(self.core.device());
         self.state
             .set_viewports("set_viewport", &[viewport], refused)
@@ -3035,7 +3656,7 @@ impl RenderLowering {
 
     /// The lowering of [`RenderCommandEncoder::set_viewports`].
     pub(crate) fn set_viewports(&mut self, viewports: &[Viewport]) -> Result<(), Error> {
-        self.log(|_| RenderCall::Viewports(viewports.into()));
+        self.log_restating(|_| RenderCall::Viewports(viewports.into()));
         let refused = render_state::depth_ranges_refused(self.core.device());
         self.state
             .set_viewports("set_viewports", viewports, refused)
@@ -3043,25 +3664,27 @@ impl RenderLowering {
 
     /// The lowering of [`RenderCommandEncoder::set_scissor_rect`].
     pub(crate) fn set_scissor_rect(&mut self, rect: ScissorRect) -> Result<(), Error> {
-        self.log(|_| RenderCall::ScissorRect(rect));
-        self.state.set_scissors("set_scissor_rect", &[rect])
+        self.log_restating_scissors(|_| RenderCall::ScissorRect(rect));
+        self.scissors = self.state.scissor_rects("set_scissor_rect", &[rect])?;
+        Ok(())
     }
 
     /// The lowering of [`RenderCommandEncoder::set_scissor_rects`].
     pub(crate) fn set_scissor_rects(&mut self, rects: &[ScissorRect]) -> Result<(), Error> {
-        self.log(|_| RenderCall::ScissorRects(rects.into()));
-        self.state.set_scissors("set_scissor_rects", rects)
+        self.log_restating_scissors(|_| RenderCall::ScissorRects(rects.into()));
+        self.scissors = self.state.scissor_rects("set_scissor_rects", rects)?;
+        Ok(())
     }
 
     /// The lowering of [`RenderCommandEncoder::set_cull_mode`].
     pub(crate) fn set_cull_mode(&mut self, mode: CullMode) {
-        self.log(|_| RenderCall::CullMode(mode));
+        self.log_restating(|_| RenderCall::CullMode(mode));
         self.state.set_cull_mode(mode);
     }
 
     /// The lowering of [`RenderCommandEncoder::set_front_facing_winding`].
     pub(crate) fn set_front_facing_winding(&mut self, winding: Winding) {
-        self.log(|_| RenderCall::FrontFacingWinding(winding));
+        self.log_restating(|_| RenderCall::FrontFacingWinding(winding));
         self.state.set_winding(winding);
     }
 
@@ -3071,12 +3694,12 @@ impl RenderLowering {
         state: impl Into<Option<&'a DepthStencilState>>,
     ) -> Result<(), Error> {
         let state = state.into();
-        self.log(|log| {
+        self.log_restating(|log| {
             RenderCall::DepthStencilState(state.map(|state| log.hold_depth_stencil(state)))
         });
         if let Some(state) = state {
             self.core
-                .check_device("set_depth_stencil_state", state.device())?;
+                .check_device("set_depth_stencil_state", state.root_device())?;
         }
         // One boolean: a pass that sets one but draws under none keeps a depth's signs.
         self.depth_writes |= state.is_some_and(|s| s.descriptor().depth_write_enabled);
@@ -3086,13 +3709,13 @@ impl RenderLowering {
 
     /// The lowering of [`RenderCommandEncoder::set_stencil_reference_value`].
     pub(crate) fn set_stencil_reference_value(&mut self, value: u32) {
-        self.log(|_| RenderCall::StencilReferenceValue(value));
+        self.log_restating(|_| RenderCall::StencilReferenceValue(value));
         self.state.set_stencil_references(value, value);
     }
 
     /// The lowering of [`RenderCommandEncoder::set_stencil_reference_values`].
     pub(crate) fn set_stencil_reference_values(&mut self, front: u32, back: u32) {
-        self.log(|_| RenderCall::StencilReferenceValues(front, back));
+        self.log_restating(|_| RenderCall::StencilReferenceValues(front, back));
         self.state.set_stencil_references(front, back);
     }
 
@@ -3103,27 +3726,27 @@ impl RenderLowering {
         slope_scale: f32,
         clamp: f32,
     ) -> Result<(), Error> {
-        self.log(|_| RenderCall::DepthBias(depth_bias, slope_scale, clamp));
+        self.log_restating(|_| RenderCall::DepthBias(depth_bias, slope_scale, clamp));
         self.state.set_depth_bias(depth_bias, slope_scale, clamp)
     }
 
     /// The lowering of [`RenderCommandEncoder::set_depth_clip_mode`].
     pub(crate) fn set_depth_clip_mode(&mut self, mode: DepthClipMode) -> Result<(), Error> {
-        self.log(|_| RenderCall::DepthClipMode(mode));
+        self.log_restating(|_| RenderCall::DepthClipMode(mode));
         let profile = self.core.device().compile_device().profile();
         self.state.set_clip_mode(mode, profile)
     }
 
     /// The lowering of [`RenderCommandEncoder::set_triangle_fill_mode`].
     pub(crate) fn set_triangle_fill_mode(&mut self, mode: TriangleFillMode) -> Result<(), Error> {
-        self.log(|_| RenderCall::TriangleFillMode(mode));
+        self.log_restating(|_| RenderCall::TriangleFillMode(mode));
         let profile = self.core.device().compile_device().profile();
         self.state.set_fill_mode(mode, profile)
     }
 
     /// The lowering of [`RenderCommandEncoder::set_blend_color`].
     pub(crate) fn set_blend_color(&mut self, red: f32, green: f32, blue: f32, alpha: f32) {
-        self.log(|_| RenderCall::BlendColor([red, green, blue, alpha]));
+        self.log_restating(|_| RenderCall::BlendColor([red, green, blue, alpha]));
         self.state.set_blend_color([red, green, blue, alpha]);
     }
 
@@ -3139,7 +3762,7 @@ impl RenderLowering {
         });
         const CALL: &str = "set_tessellation_factor_buffer";
         if let Some(buffer) = buffer {
-            self.core.check_device(CALL, buffer.device())?;
+            self.core.check_device(CALL, buffer.generation())?;
         }
         self.factors.buffer = buffer.map(|buffer| FactorBuffer {
             buffer: buffer.clone(),
@@ -3185,13 +3808,14 @@ impl RenderLowering {
     /// The lowering of [`RenderCommandEncoder::draw_primitives`].
     pub(crate) fn draw_primitives(
         &mut self,
+        live: &mut LiveBind,
         primitive_type: DrawPrimitiveType,
         vertex_start: u32,
         vertex_count: u32,
         instance_count: u32,
         base_instance: u32,
     ) -> Result<(), Error> {
-        self.log(|_| {
+        self.log_keeping(|_| {
             RenderCall::DrawPrimitives(
                 primitive_type,
                 vertex_start,
@@ -3214,12 +3838,13 @@ impl RenderLowering {
             let hangs = vertex_count >= 3 && !empty;
             return self.draw_nine(CALL, empty, hangs.then_some(NineFailure::Hang));
         };
-        self.draw(CALL, assembly, draw, buffers, empty)
+        self.draw(live, CALL, assembly, draw, buffers, empty)
     }
 
     /// The lowering of [`RenderCommandEncoder::draw_indexed_primitives`].
     pub(crate) fn draw_indexed_primitives(
         &mut self,
+        live: &mut LiveBind,
         primitive_type: DrawPrimitiveType,
         index_count: u32,
         index_type: IndexType,
@@ -3240,7 +3865,7 @@ impl RenderLowering {
             base_instance,
         });
         const CALL: &str = "draw_indexed_primitives";
-        self.core.check_device(CALL, index_buffer.device())?;
+        self.core.check_device(CALL, index_buffer.generation())?;
         // Metal reads from the offset's low 32 bits.
         let index_buffer_offset = u64::from(index_buffer_offset as u32);
         let index_buffer_offset =
@@ -3253,7 +3878,7 @@ impl RenderLowering {
             base_vertex,
             base_instance,
         };
-        self.draw_indexed(CALL, draw, index_buffer, index_buffer_offset)
+        self.draw_indexed(live, CALL, draw, index_buffer, index_buffer_offset)
     }
 
     /// Draw `draw`'s indices from `index_buffer_offset` of `index_buffer`, a multiple of the index
@@ -3262,6 +3887,7 @@ impl RenderLowering {
     /// indirect render commands takes too (`render/executions.rs`).
     fn draw_indexed(
         &mut self,
+        live: &mut LiveBind,
         call: &'static str,
         draw: IndexedDraw,
         index_buffer: &Buffer,
@@ -3304,12 +3930,13 @@ impl RenderLowering {
             let fault = NineFailure::Fault(CommandBufferError::PageFault);
             return self.draw_nine(call, empty, Some(fault));
         };
-        self.draw(call, assembly, draw, buffers, empty)
+        self.draw(live, call, assembly, draw, buffers, empty)
     }
 
     /// The lowering of [`RenderCommandEncoder::draw_primitives_indirect`].
     pub(crate) fn draw_primitives_indirect(
         &mut self,
+        live: &mut LiveBind,
         primitive_type: DrawPrimitiveType,
         indirect_buffer: &Buffer,
         indirect_buffer_offset: u64,
@@ -3322,7 +3949,7 @@ impl RenderLowering {
             )
         });
         const CALL: &str = "draw_primitives_indirect";
-        self.core.check_device(CALL, indirect_buffer.device())?;
+        self.core.check_device(CALL, indirect_buffer.generation())?;
         let indirect_buffer_offset =
             check_arguments(CALL, indirect_buffer.length(), indirect_buffer_offset, 16)?;
         let indirect =
@@ -3340,12 +3967,13 @@ impl RenderLowering {
             let victim = NineFailure::Fault(CommandBufferError::GpuRecoveryVictim);
             return self.draw_nine(CALL, false, Some(victim));
         };
-        self.draw(CALL, assembly, draw, buffers, false)
+        self.draw(live, CALL, assembly, draw, buffers, false)
     }
 
     /// The lowering of [`RenderCommandEncoder::draw_indexed_primitives_indirect`].
     pub(crate) fn draw_indexed_primitives_indirect(
         &mut self,
+        live: &mut LiveBind,
         primitive_type: DrawPrimitiveType,
         index_type: IndexType,
         index_buffer: &Buffer,
@@ -3364,8 +3992,8 @@ impl RenderLowering {
             }))
         });
         const CALL: &str = "draw_indexed_primitives_indirect";
-        self.core.check_device(CALL, index_buffer.device())?;
-        self.core.check_device(CALL, indirect_buffer.device())?;
+        self.core.check_device(CALL, index_buffer.generation())?;
+        self.core.check_device(CALL, indirect_buffer.generation())?;
         let size = index_size(index_type);
         let index_buffer_offset = index_buffer_offset - index_buffer_offset % size;
         let indirect_buffer_offset =
@@ -3437,12 +4065,13 @@ impl RenderLowering {
             let victim = NineFailure::Fault(CommandBufferError::GpuRecoveryVictim);
             return self.draw_nine(CALL, false, Some(victim));
         };
-        self.draw(CALL, assembly, draw, buffers, false)
+        self.draw(live, CALL, assembly, draw, buffers, false)
     }
 
     /// The lowering of [`RenderCommandEncoder::draw_patches`].
     pub(crate) fn draw_patches(
         &mut self,
+        live: &mut LiveBind,
         number_of_patch_control_points: u32,
         patch_start: u32,
         patch_count: u32,
@@ -3485,7 +4114,7 @@ impl RenderLowering {
             None => None,
         };
         let points = zeros.as_ref().map(|zeros| (zeros, 0));
-        self.draw_patch_range(CALL, draw, patch_indices, points)
+        self.draw_patch_range(live, CALL, draw, patch_indices, points)
     }
 
     /// Draw `draw`'s patches, each patch's index from `patch_indices` (a buffer and an offset
@@ -3497,6 +4126,7 @@ impl RenderLowering {
     /// commands takes too (`render/executions.rs`).
     fn draw_patch_range(
         &mut self,
+        live: &mut LiveBind,
         call: &'static str,
         draw: PatchDraw,
         patch_indices: Option<(&Buffer, u64)>,
@@ -3524,12 +4154,13 @@ impl RenderLowering {
             ..DrawBuffers::default()
         };
         let empty = patch_count == 0 || instance_count == 0;
-        self.draw(call, Assembly::Patches, draw, buffers, empty)
+        self.draw(live, call, Assembly::Patches, draw, buffers, empty)
     }
 
     /// The lowering of [`RenderCommandEncoder::draw_patches_indirect`].
     pub(crate) fn draw_patches_indirect(
         &mut self,
+        live: &mut LiveBind,
         number_of_patch_control_points: u32,
         patch_index_buffer: Option<&Buffer>,
         patch_index_buffer_offset: u64,
@@ -3548,7 +4179,7 @@ impl RenderLowering {
         const CALL: &str = "draw_patches_indirect";
         let patch_index_buffer_offset =
             self.check_patch_indices(CALL, patch_index_buffer, patch_index_buffer_offset, None)?;
-        self.core.check_device(CALL, indirect_buffer.device())?;
+        self.core.check_device(CALL, indirect_buffer.generation())?;
         let indirect_buffer_offset =
             check_arguments(CALL, indirect_buffer.length(), indirect_buffer_offset, 16)?;
         let indirect =
@@ -3569,12 +4200,13 @@ impl RenderLowering {
             control_point_indices: zeros.as_ref().map(|zeros| (zeros, 0)),
             ..DrawBuffers::default()
         };
-        self.draw(CALL, Assembly::Patches, draw, buffers, false)
+        self.draw(live, CALL, Assembly::Patches, draw, buffers, false)
     }
 
     /// The lowering of [`RenderCommandEncoder::draw_indexed_patches`].
     pub(crate) fn draw_indexed_patches(
         &mut self,
+        live: &mut LiveBind,
         number_of_patch_control_points: u32,
         patch_start: u32,
         patch_count: u32,
@@ -3631,6 +4263,7 @@ impl RenderLowering {
             )
         });
         self.draw_patch_range(
+            live,
             CALL,
             draw,
             patch_index_buffer.map(|b| (b, patch_index_buffer_offset)),
@@ -3641,6 +4274,7 @@ impl RenderLowering {
     /// The lowering of [`RenderCommandEncoder::draw_indexed_patches_indirect`].
     pub(crate) fn draw_indexed_patches_indirect(
         &mut self,
+        live: &mut LiveBind,
         number_of_patch_control_points: u32,
         patch_index_buffer: Option<&Buffer>,
         patch_index_buffer_offset: u64,
@@ -3669,7 +4303,7 @@ impl RenderLowering {
             control_point_index_buffer_offset,
             None,
         )?;
-        self.core.check_device(CALL, indirect_buffer.device())?;
+        self.core.check_device(CALL, indirect_buffer.generation())?;
         let indirect_buffer_offset =
             check_arguments(CALL, indirect_buffer.length(), indirect_buffer_offset, 16)?;
         let indirect =
@@ -3692,7 +4326,7 @@ impl RenderLowering {
             control_point_indices: points,
             ..DrawBuffers::default()
         };
-        self.draw(CALL, Assembly::Patches, draw, buffers, false)
+        self.draw(live, CALL, Assembly::Patches, draw, buffers, false)
     }
 
     /// A patch draw's patch index buffer (`None` for `nil`) at `offset`: the offset the draw reads
@@ -3713,7 +4347,7 @@ impl RenderLowering {
         let Some(buffer) = buffer else {
             return Ok(offset);
         };
-        self.core.check_device(call, buffer.device())?;
+        self.core.check_device(call, buffer.generation())?;
         let offset = offset - offset % 4;
         let Some((patch_start, patch_count)) = direct else {
             return Ok(offset);
@@ -3796,7 +4430,7 @@ impl RenderLowering {
         offset: u64,
         indices: Option<u64>,
     ) -> Result<u64, Error> {
-        self.core.check_device(call, buffer.device())?;
+        self.core.check_device(call, buffer.generation())?;
         let Some(size) = self.control_point_index_size() else {
             return Ok(offset);
         };
@@ -3825,7 +4459,9 @@ impl RenderLowering {
         mode: VisibilityResultMode,
         offset: u64,
     ) -> Result<(), Error> {
-        self.log(|_| RenderCall::VisibilityResultMode(mode, offset));
+        self.log_letting_go(LoggedCall::Visibility, |_| {
+            RenderCall::VisibilityResultMode(mode, offset)
+        });
         let turn = self.group_turn();
         if let color_groups::Turn::Later(ran) = turn {
             // A later group draws as the first one does under the mode, and counts nothing.
@@ -3862,7 +4498,7 @@ impl RenderLowering {
                 (&[], None),
                 (false, false),
                 ViewSetup::default(),
-                false,
+                (false, false),
                 None,
                 &[],
                 &[],
@@ -3897,17 +4533,26 @@ impl RenderLowering {
     pub(crate) fn end_encoding(self: Box<Self>) -> Result<(), Error> {
         self.core.device().shared().counts.render_encoder_ended();
         // And the pass's later color groups, where it draws in groups (`render/color_groups.rs`).
-        let (mut core, residency, log) = self.end_pass()?.with_later_groups()?;
+        let color_groups::Ended {
+            mut core,
+            residency,
+            log,
+            later,
+        } = self.end_pass()?;
+        if let Some(later) = later {
+            core = color_groups::Ended::later_groups(core, &later, log.as_deref())?;
+        }
         // A notice of a kind the device refuses while lowering, announced by the end of an encoder
         // that logged its calls, refuses the end (`render/deferral.rs`).
         if let (Some(call), Some(notice)) = (lowering::current(), lowering::take_refusal()) {
             core.fail_command_buffer(CommandBufferError::CallRefused(call));
             (core.command_buffer().state()).refuse_call(Error::Degraded(Box::new(notice)));
         }
-        core.end_with_replay(
+        EncoderCore::unboxed(core).end_with_replay(
             EncoderKind::Render,
-            Some(residency),
-            log.map(|log| Replay::Render(Box::new(log))),
+            (Some(residency), None),
+            log.map(Replay::Render),
+            None,
         )
     }
 
@@ -3915,8 +4560,18 @@ impl RenderLowering {
     /// (`render/replay.rs`), ended as [`end_encoding`](Self::end_encoding) ends one, into its
     /// place: what it recorded, and what it made resident.
     pub(super) fn finish_replay(self: Box<Self>) -> Result<(Replayed, Option<Residency>), Error> {
-        let (core, residency, _) = self.end_pass()?.with_later_groups()?;
-        Ok((core.finish_replay()?, Some(residency)))
+        let color_groups::Ended {
+            mut core,
+            residency,
+            log,
+            later,
+        } = self.end_pass()?;
+        if let Some(later) = later {
+            core = color_groups::Ended::later_groups(core, &later, log.as_deref())?;
+        }
+        // Its log goes before what it recorded is placed, as it went once its groups were drawn.
+        drop(log);
+        Ok((EncoderCore::unboxed(core).finish_replay()?, Some(residency)))
     }
 
     /// An encoder of `command_buffer`'s, ended and committed, opened again over `descriptor`
@@ -3927,8 +4582,8 @@ impl RenderLowering {
         descriptor: &RenderPassDescriptor,
         residency: Residency,
         screen: Option<[u32; 2]>,
-    ) -> Result<Box<RenderLowering>, Error> {
-        command_buffer.open_render(descriptor, Some(residency), screen)
+    ) -> Result<Lowering, Error> {
+        command_buffer.open_render(descriptor, Some(residency), screen, Default::default())
     }
 
     /// Refuse `call` as its lowering refused it, after it returned, for `error`
@@ -3946,6 +4601,8 @@ impl RenderLowering {
     /// color groups draw (`render/color_groups.rs`).
     fn end_pass(mut self: Box<Self>) -> Result<color_groups::Ended, Error> {
         const CALL: &str = "end_encoding";
+        // Its draws again counted (`render/draw_again.rs`).
+        self.forget_again();
         // Over a mutable rasterization-rate map: Metal's GPU hangs at a pass of no draw call until
         // a command buffer with a draw call over such a map was committed (`rate_mapped_pass.rs`).
         if self.rate_map.as_ref().is_some_and(RateMappedPass::mutable) {
@@ -3979,13 +4636,15 @@ impl RenderLowering {
         // Whether a command of the pass may read an attachment's bytes it did not name.
         let unnamed_reads =
             self.barrier_inside || self.reaches_unnamed || !self.executions.is_empty();
+        let rate_mapped = self.rate_map.is_some();
         let RenderLowering {
             mut core,
-            mut earlier,
+            earlier,
             current,
             mut layout,
             passes,
             mut visibility,
+            readers,
             dispatches,
             scratch: tile_scratch,
             shadow,
@@ -3993,8 +4652,10 @@ impl RenderLowering {
             depth_stand_in,
             imageblock,
             barrier_splits,
+            attached_read_splits,
             driver_restarts,
             tile_memory_splits,
+            interlocked_splits,
             tile_memory,
             executions,
             pending,
@@ -4005,24 +4666,29 @@ impl RenderLowering {
             inputs_read,
             residency,
             extended,
-            reload_at,
+            mut reload_at,
             log,
             depth_writes,
             drew_depth_writes,
             inline,
             grouped,
-            live,
             bind_memo,
+            pass_start,
+            pinned_through,
+            pass_notes,
             ..
         } = *self;
         // The views and sampler descriptions its binds made or found, which the device's next
         // render encoder takes (`binding::BindMemo`).
         core.device().shared().bind_memos.give(bind_memo);
-        // The bind state its last draw left, which the device's next render encoder starts from
-        // (`live_bind.rs`): no draw holds it once the encoder ends.
-        core.device().shared().live_binds.give(live);
-        earlier.push(current);
+        // The pass's measured readers, whose counts their textures take as the command buffer
+        // completes (`render/coverage.rs`): held with its pool until then.
+        if let Some(readback) = readers.readback() {
+            core.retain(readback);
+        }
+        // The pass's instances in order: the earlier ones (a pass split), then the current one.
         let mut instances = earlier;
+        instances.push(current);
         // The first instance's render pass and framebuffer, where it recorded inline in the
         // command buffer the encoder holds for the pass (`render/inline_first.rs`), and the
         // instances' after a split that recorded inline there too (`render/inline_splits.rs`):
@@ -4036,6 +4702,12 @@ impl RenderLowering {
             .iter()
             .take_while(|instance| instance.inline)
             .count();
+        // The last of them's colors in the feedback loop layout, where it recorded inline after a
+        // split, moved back to `GENERAL` right after its render pass instance ends, as the pass's
+        // end ends it (`render/inline_splits.rs`).
+        let inline_moved = (inlined.checked_sub(1))
+            .and_then(|last| instances[last].kept.as_ref())
+            .map_or_else(Vec::new, |kept| kept.moved().to_vec());
         if inline && instances.len() > 1 {
             core.device().shared().counts.inline_pass_split();
         }
@@ -4081,6 +4753,24 @@ impl RenderLowering {
         {
             sample_positions::check_options(CALL, Attachment::Stencil, s.options, s.store, None)?;
         }
+        // A depth stored and resolved into memory whose GPU writes are dropped, beside a stencil
+        // that resolves nothing, is stored and not resolved: Metal's GPU completes such a pass and
+        // leaves the resolve texture's bytes as they were (`store_out.rs`). Neither aspect
+        // resolves then.
+        if let Some(ds) = (layout.depth_stencil.as_mut())
+            .filter(|ds| !ds.hidden && super::store_out::drops_depth_resolve(ds))
+        {
+            ds.depth = ds.depth.map(|depth| AspectTarget {
+                store: StoreAction::Store,
+                ..depth
+            });
+            ds.resolve = None;
+        }
+        // A store-out into memory whose GPU writes are dropped, lying in a copy of its pages:
+        // Metal's GPU faults the command buffer there, from the pass on (`store_out.rs`).
+        if super::store_out::faults(core.device().shared(), &layout) {
+            core.fault(CommandBufferError::PageFault);
+        }
         // A pass that changes no texel records nothing, but holds its attachments until its
         // command buffer completes (`render/untouched.rs`); not the first group of a pass of
         // several color groups, whose later groups' colors its layout leaves out.
@@ -4091,6 +4781,18 @@ impl RenderLowering {
             if let Some(own) = kept_signs(&layout) {
                 own.texture.degrade_kept_signs();
             }
+        }
+        // The pass's line, where the pass log is on and the pass names a texture it watches.
+        if let Some(notes) = pass_notes {
+            pass_log::ended(core.device(), &notes, &layout, instances.len(), &residency);
+        }
+        // The pass as the encoder trail names it, where it is on (`encoder_trail.rs`).
+        if let Some(trail) = core.trail() {
+            trail.pass(crate::encoder_trail::pass_named(
+                &layout,
+                instances.len(),
+                rate_mapped,
+            ));
         }
         if grouped.is_none() && untouched::changes_nothing(&layout, called, &instances) {
             core.device().shared().counts.untouched_pass_skipped();
@@ -4139,7 +4841,7 @@ impl RenderLowering {
         // pass renders it into a backing its texture keeps for the queue, cleared and resolved
         // there, from which nothing is copied back (`attachment_stand_in::kept_backing`).
         if !called {
-            let queue = core.command_buffer().command_queue().id();
+            let queue = core.command_buffer().queue_place().id();
             for color in layout.colors.iter_mut().flatten() {
                 let across = color.clears_and_resolves_across_formats();
                 if across && color.stand_in.is_none() && !color.memoryless {
@@ -4241,46 +4943,26 @@ impl RenderLowering {
         linear_attachment::settle(core.command_buffer(), &mut layout.colors, other, |index| {
             taken.contains(index)
         })?;
-        // One the pass loads renders in place, apart over the box its draws write in; one it
-        // clears through such an image, copied back, only where no command of the pass may read
-        // its bytes: no barrier inside it, no command reaching memory it does not name, and no
-        // command naming the attachment's bytes or a resource over its host pages or in a heap
-        // (`linear_attachment::choose`).
+        // One rendered apart that the pass loads, over the box its draws write in; every other
+        // one in place (`linear_attachment::choose`).
         let reached_heaps = core.reached_heaps();
-        let rebinds = &core.device().shared().rebinds;
-        let may_read = ColorIndices::of((0..layout.colors.len()).filter(|&index| {
-            let Some(color) = layout.colors[index].as_ref() else {
-                return false;
-            };
-            if unnamed_reads || reached_heaps {
-                return true;
-            }
-            let none = crate::tracker::Access::NONE;
-            let key = color.target.texture.bound_use(none, none).key;
-            let named = core.named_keys();
-            if named.contains(&key) {
-                return true;
-            }
-            rebinds.host_range(key).is_some_and(|bytes| {
-                named.iter().any(|&other| {
-                    rebinds
-                        .host_range(other)
-                        .is_some_and(|other| other.start < bytes.end && bytes.start < other.end)
-                })
-            })
-        }));
         linear_attachment::choose(
             core.command_buffer(),
             &mut layout.colors,
             &coverage,
             |index| taken.contains(index),
-            |index| may_read.contains(index),
         )?;
         let device = core.device().clone();
         // The pass's clears write a new texture's unwritten texels where they reach it: through
         // another image only where the pass stores the aspect, whose copy back writes it
         // (`fresh_unwritten.rs`). Before its `DontCare` loads take clears below.
-        FreshUnwritten::cleared(&device, &layout)?;
+        FreshUnwritten::cleared(core.command_buffer(), &layout, called)?;
+        // A new `Private` texture the pass clears whole before its draws: its batch may leave
+        // out its first move's zeros (`texture/first_move.rs`). Before its `DontCare` loads take
+        // clears below, which may reach only some tiles.
+        for overwrite in layout.overwrites() {
+            core.overwrites(overwrite);
+        }
         let count = instances.len();
         // The tiles the pass's draws reach, as far as the host decides them, before the
         // `DontCare` loads below become `Clear` loads (`clear_reach.rs`): where they reach the
@@ -4301,25 +4983,86 @@ impl RenderLowering {
             });
         }
         let loaded_colors = &loaded[..layout.colors.len()];
-        let tiles = match reach {
-            clear_reach::PassReach::Draws => drawn.tiles(&layout),
-            _ => None,
+        // A pass whose draws' rectangles reach no tile reaches none.
+        let reach = match reach {
+            clear_reach::PassReach::Draws if drawn.reaches_no_tile(&layout) => {
+                clear_reach::PassReach::Nothing
+            }
+            reach => reach,
         };
-        let reach = match &tiles {
-            Some(tiles) if tiles.is_empty() => clear_reach::PassReach::Nothing,
-            _ => reach,
-        };
-        let tiles = tiles.filter(|tiles| !tiles.is_empty());
         // A `DontCare` load of an attachment the pass stores: loaded in a pass whose draws reach
         // no tile, else cleared to zero or its clear value, Metal's answer in each tile a draw
-        // reaches (`clear_reach.rs`), and only in those `tiles` bounds.
-        let dont_care = clear_reach::dont_care_loads(&mut layout, reach);
+        // reaches (`clear_reach.rs`), and only in those `tiles` bounds. One the pass does not
+        // store is cleared over the render area where the draws reach a tile, Metal's answer
+        // wherever a fragment reads it, under the policy or on a driver that clears it no slower;
+        // elsewhere it stays `DontCare`, announced.
+        let unstored = clear_reach::UnstoredLoads::of(
+            device.compile_device().policy().unstored_dont_care_loads,
+            &device.properties().driver_facts,
+        );
+        // Separate depth and stencil textures: which aspects the scratch image can load by a copy in
+        // (`depth_stencil_scratch.rs`).
+        let copies_in = match layout.depth_stencil.as_ref() {
+            Some(ds) => match &ds.separate {
+                Some(separate) => depth_stencil_scratch::copies_in(&device, separate),
+                None => [true; 2],
+            },
+            None => [true; 2],
+        };
+        let dont_care = clear_reach::dont_care_loads(&mut layout, reach, unstored, copies_in);
+        // A depth whose `DontCare` load took a clear: at a NaN clear depth, which the device's
+        // clear cannot hold (`clear_reach::dont_care_loads`), and of a `Depth16Unorm` at a depth
+        // a device rounding to nearest takes above Metal's truncation (`clear_value.rs`), as a
+        // `Clear` load's (`render_pass.rs`).
+        let depth_format = layout.depth_stencil.as_ref().and_then(|ds| ds.depth_format);
+        if let (Some((value, nan)), Some(format)) = (dont_care.cleared_depth, depth_format) {
+            if nan {
+                device.degrade(Degradation::SignedDepthTest, || {
+                    (
+                        format!("a {format:?} texture"),
+                        "a render pass's NaN clear depth of a `DontCare` load, which Metal's tile \
+                         holds as 0x7fc00000 and its depth test orders above every value, is \
+                         cleared to 1.0, which a fragment at exactly 1.0 tests otherwise: the \
+                         device's clear takes no NaN"
+                            .to_owned(),
+                    )
+                });
+            }
+            if clear_value::depth16_rounded(format, f64::from(value)) {
+                device.degrade(Degradation::UnormDepthRounding, || {
+                    (
+                        format!("a {format:?} depth attachment's clear to {value}"),
+                        "the device converts the clear depth to its 16-bit code its own way, \
+                         where Metal's clear truncates the depth scaled by 65535: the code can be \
+                         the one above Metal's"
+                            .to_owned(),
+                    )
+                });
+            }
+        }
+        // The tiles the draws reach, which only those loads' clears read: none made for a pass
+        // without one.
+        let tiles = match reach {
+            clear_reach::PassReach::Draws if dont_care.any() => drawn.tiles(&layout),
+            _ => None,
+        };
         if let Some(named) = dont_care.named.clone() {
             device.degrade(Degradation::DontCareLoadTiles, || {
                 (
-                    format!("{named} of a render pass, loaded with `DontCare`"),
+                    format!("{named} of a render pass, loaded with `DontCare` and stored"),
                     "Metal clears only the tiles a draw's primitives touch, which depend on where \
                      the GPU places the vertices"
+                        .to_owned(),
+                )
+            });
+        }
+        if let Some(named) = dont_care.unstored.clone() {
+            device.degrade(Degradation::DontCareUnstoredLoad, || {
+                (
+                    format!("{named} of a render pass, loaded with `DontCare` and not stored"),
+                    "Metal's draws read zero (a color) or the clear value (depth, stencil) of it, \
+                     and this driver is not measured to clear it no slower than its `DONT_CARE` \
+                     load"
                         .to_owned(),
                 )
             });
@@ -4418,6 +5161,8 @@ impl RenderLowering {
             shapes.push(resolving.clone());
         }
         let mut uses = render_target::attachment_uses(&layout)?;
+        // The attachments' uses lead the pass's: the shadows' plan below takes them.
+        let attached = uses.len();
         if let Some(planes) = &planes {
             uses.extend(planes.uses.iter().cloned());
         }
@@ -4460,30 +5205,6 @@ impl RenderLowering {
             (None, _) => None,
         };
         let clear_values = render_target::clear_values(&layout);
-        // Separate depth and stencil textures: the copies into the scratch image the pass
-        // renders, and back (`depth_stencil_scratch.rs`).
-        let (copy_in, copy_out) = match &layout.depth_stencil {
-            Some(DepthStencilTarget {
-                target,
-                depth,
-                stencil: Some(stencil),
-                separate: Some(separate),
-                ..
-            }) => {
-                let plan = |into_scratch| {
-                    ScratchCopy::plan(
-                        core.command_buffer(),
-                        separate,
-                        target,
-                        [depth.as_ref(), Some(stencil)],
-                        layout.extent,
-                        into_scratch,
-                    )
-                };
-                (plan(true)?, plan(false)?)
-            }
-            _ => (None, None),
-        };
         // Fetched textures' scratch images: copied in where Metal loads the texture, and back
         // where it stores it (`attachment_stand_in.rs`).
         // Each over the render area, but the copy back of a stand-in its pass clears past the
@@ -4494,30 +5215,12 @@ impl RenderLowering {
         // covers, and the copy back returns those texels as they came, not the stand-in's.
         // And a stand-in's over the box its draws write in alone (`StandIn::area`).
         let tiled = |taken: bool| taken && tiles.is_some();
-        let area_of = |c: &render_pass::ColorTarget, own: &StandIn| {
+        let own_box = |c: &render_pass::ColorTarget, own: &StandIn| {
             let [width, height] = match c.load == LoadAction::Clear {
-                true => clear_reach::cleared(&layout, c.target.extent, called),
+                true => clear_reach::cleared(&layout, &own.own, called),
                 false => layout.extent,
             };
             own.area.unwrap_or([0, 0, width, height])
-        };
-        let scratch = |copied: &dyn Fn(usize, &render_pass::ColorTarget) -> bool| {
-            layout
-                .colors
-                .iter()
-                .enumerate()
-                .filter_map(|(index, c)| {
-                    let c = c.as_ref()?;
-                    let own = c.stand_in.as_ref().filter(|s| s.copies())?;
-                    let area = area_of(c, own);
-                    copied(index, c).then_some((
-                        &c.target,
-                        &own.own,
-                        area,
-                        vk::ImageAspectFlags::COLOR,
-                    ))
-                })
-                .collect::<Vec<_>>()
         };
         // A depth/stencil texture's stand-in made for the pass's custom sample positions, or for
         // a texture without render target usage: each aspect copied in where the pass loads it
@@ -4565,7 +5268,7 @@ impl RenderLowering {
                 cleared |= aspect.is_some_and(|a| a.load == LoadAction::Clear && stores(a.store));
             }
             let [width, height] = match cleared {
-                true => clear_reach::cleared(&layout, own.own.extent, called),
+                true => clear_reach::cleared(&layout, &own.own, called),
                 false => layout.extent,
             };
             let area = [0, 0, width, height];
@@ -4586,7 +5289,7 @@ impl RenderLowering {
         // area copied in, never a copy back of the area, which would write the pixels no draw
         // wrote with what the copy in read (`linear_merge.rs`).
         let over_bytes = |own: &StandIn| own.copies() && own.own.texture.aliases_buffer();
-        let merged: Vec<(usize, Arc<LinearMerge>)> = layout
+        let merging = layout
             .colors
             .iter()
             .enumerate()
@@ -4595,11 +5298,315 @@ impl RenderLowering {
                 let own = c.stand_in.as_ref().filter(|s| over_bytes(s))?;
                 (loaded(index, c) && stored(c)).then_some((index, c, own))
             })
-            .map(|(index, c, own)| {
-                LinearMerge::new(&device, &c.target, &own.own, area_of(c, own))
+            .collect::<Vec<_>>();
+        // A linear attachment's passes rendered apart, and a shadowed texture's merged back, one
+        // after another, merge once, after the last (`pass_runs.rs`): the colors whose merge the
+        // pass leaves to its batch's submission, each with what it took from the runs, and the
+        // runs it goes on with, ends or passes. Nothing changes where the encoder is encoded
+        // again.
+        let mut runs: Vec<RunColor> = Vec::new();
+        let mut shadow_runs: Vec<ShadowRunColor> = Vec::new();
+        // Where a draw pinned the pass's colors to their own images and stand-ins arrived after
+        // it (`render/snapshot.rs`): the count of the instances through the last pinned one, which
+        // render the attachments themselves. Every stand-in arrived after them, as the pass held
+        // none at a pin: each takes its attachment's texels after the last of them, as after the
+        // instances recorded inline (`render/inline_first.rs`), and is merged back, reloaded or
+        // copied back after them alone; and no run of passes takes the pass (`pass_runs.rs`).
+        // Where the instances recorded inline reach the last pinned one (a reader's instance
+        // recorded inline after a split, `render/inline_splits.rs`), the stand-ins arrive after
+        // them as after any inline instances, after the pinned ones all the same: counted too.
+        let stand_ins = layout.colors.iter().flatten().any(|c| c.stand_in.is_some());
+        let pinned = (inline && pinned_through > inlined && stand_ins).then_some(pinned_through);
+        if let Some(through) = pinned {
+            reload_at.retain(|&at| at >= through);
+        }
+        if inline && pinned_through > 0 && stand_ins {
+            core.device().shared().counts.stand_ins_after_pin();
+        }
+        let run_point =
+            match core.encodes_again() || crate::replay::is_replaying() || pinned.is_some() {
+                true => None,
+                false => Some(core.command_buffer().state().run_point()),
+            };
+        if let Some(now) = run_point {
+            // A quiet pass touches nothing but what its commands name and its attachments: no
+            // command reaches memory it does not name, nor a heap; no draw or tile dispatch
+            // records later; one color group and one part, no fence, no reload between
+            // instances; no resolve or visibility results, which write past its attachments;
+            // and no rasterization-rate map, whose reset encodes it again
+            // (`rate_mapped_pass.rs`).
+            let resolves = layout
+                .colors
+                .iter()
+                .flatten()
+                .any(|c| c.resolve.is_some() || c.copied_resolve.is_some())
+                || layout.depth_stencil.iter().any(|ds| ds.resolve.is_some());
+            let quiet = !unnamed_reads
+                && !reached_heaps
+                && pending.is_empty()
+                && dispatches.is_empty()
+                && grouped.is_none()
+                && !resolves
+                && reload_at.is_empty()
+                && layout.visibility.is_none()
+                && !rate_mapped
+                && !core.uses().fenced()
+                && core.uses().parts() == 1;
+            let named = core.named_keys();
+            let rebinds = &device.shared().rebinds;
+            // Overlapping host ranges name the same bytes.
+            let host_overlap = |key: ResourceKey| {
+                rebinds.host_range(key).is_some_and(|bytes| {
+                    named.iter().any(|&other| {
+                        rebinds
+                            .host_range(other)
+                            .is_some_and(|o| o.start < bytes.end && bytes.start < o.end)
+                    })
+                })
+            };
+            // The keys and images of the pass's attachments: their textures', their stand-ins'
+            // and their planes'; and the shadows among them.
+            let mut attached: Vec<(ResourceKey, Option<vk::Image>)> = Vec::new();
+            let mut attached_shadows: Vec<Arc<ShadowCopies>> = Vec::new();
+            let mut attach = |texture: &Texture| {
+                attached.push((texture.use_key(), texture.raw_image().ok()));
+                attached_shadows.extend(texture.shadow().cloned());
+            };
+            for c in layout.colors.iter().flatten() {
+                attach(&c.target.texture);
+                if let Some(own) = &c.stand_in {
+                    attach(&own.own.texture);
+                }
+                if let Some(planes) = &c.planes {
+                    attach(&planes.texture);
+                }
+            }
+            if let Some(ds) = &layout.depth_stencil {
+                attach(&ds.target.texture);
+                if let Some(own) = &ds.stand_in {
+                    attach(&own.own.texture);
+                }
+                for target in ds.separate.iter().flat_map(Separate::targets) {
+                    attach(&target.texture);
+                }
+            }
+            // None of its attachments lies over host pages but the run's own bytes, which every
+            // pass of the run renders, so a rebind of them encodes the whole run again, each pass
+            // merging alone; outside a predicated loop's laying. Its commands may name buffers
+            // over host pages (a consumer's upload chunk in its guest RAM, which its
+            // `setVertexBytes` lands in): a rebind of one encodes the pass again alone, which
+            // leaves its run and copies the run's box in again after itself
+            // (`command_buffer/reencode.rs`, `pass_runs.rs`'s **Encoded again**).
+            let laying = core.command_buffer().state().predication_mut().laying();
+            let over_pages = |key: &ResourceKey| rebinds.host_range(*key).is_some();
+            let mut joining = Vec::new();
+            for &(index, c, own) in &merging {
+                let bytes = own.own.texture.use_key();
+                let key = RunKey::Linear {
+                    backing: c.target.texture.raw_image()?,
+                    surface: own.own.texture.raw_image()?,
+                    subresource: (own.own.level, own.own.layer, own.own.layers),
+                };
+                // Its bytes are its own attachment's alone: no other attachment lies over them.
+                let alone = attached.iter().filter(|&&(k, _)| k == bytes).count() == 1;
+                let others_over_pages =
+                    (attached.iter()).any(|(k, _)| *k != bytes && over_pages(k));
+                let joins = quiet
+                    && !laying
+                    && !others_over_pages
+                    && !inline
+                    && own.cause == Cause::Linear
+                    && !named.contains(&bytes)
+                    && !host_overlap(bytes)
+                    && alone;
+                if joins {
+                    let area = own_box(c, own);
+                    runs.push(RunColor {
+                        index,
+                        joining: Joining { key, bytes, area },
+                        on: None,
+                    });
+                    joining.push(Joining { key, bytes, area });
+                }
+            }
+            // The shadows the pass's draws take.
+            let drawn_shadows: Vec<&Arc<ShadowCopies>> = (instances.iter())
+                .flat_map(|instance| instance.shadows.copies())
+                .collect();
+            // Whether `copies`, a shadow the pass takes, lies over the bytes `bytes` of a run's
+            // texture of shadow `key`: that shadow, one over the same bytes, or one over host
+            // pages they meet (overlapping host ranges name the same bytes, as above).
+            let pages_meet = |a: ResourceKey, b: ResourceKey| {
+                let (a, b) = (rebinds.host_range(a), rebinds.host_range(b));
+                a.zip(b)
+                    .is_some_and(|(a, b)| a.start < b.end && b.start < a.end)
+            };
+            let over = |copies: &ShadowCopies, key: ResourceKey, bytes: ResourceKey| {
+                let (truth, _) = copies.truth();
+                copies.shadow_key == key
+                    || truth == bytes
+                    || copies.alias() == Some(bytes)
+                    || pages_meet(truth, bytes)
+            };
+            // A shadowed texture's color that joins: one the pass loads and stores and renders
+            // itself (no stand-in, no planes), of a pass of one render pass instance, its truth a
+            // buffer's bytes it merges back into, laid out as one image's texels at its first
+            // level and slice; that names neither those bytes nor their host range, and whose
+            // other attachments and draws take no shadow over them (the texture itself bound to
+            // a draw among them) and lie over none of them.
+            for (c, copies) in (layout.colors.iter().flatten())
+                .filter_map(|c| Some((c, c.target.texture.shadow()?)))
+            {
+                let (bytes, _) = copies.truth();
+                let key = copies.shadow_key;
+                let image = matches!(copies.target(), Some(ShadowTarget::Image { .. }))
+                    && copies.whole_area().is_some()
+                    && c.target.level == 0
+                    && c.target.layer == 0;
+                let alone = attached
+                    .iter()
+                    .filter(|&&(k, _)| k == key || k == bytes)
+                    .count()
+                    == 1
+                    && (attached_shadows.iter())
+                        .filter(|other| over(other, key, bytes))
+                        .count()
+                        == 1
+                    && !drawn_shadows.iter().any(|other| over(other, key, bytes));
+                let joins = quiet
+                    && !laying
+                    && !inline
+                    && instances.len() == 1
+                    && image
+                    && copies.merges_back()
+                    && c.load == LoadAction::Load
+                    && stored(c)
+                    && c.stand_in.is_none()
+                    && c.planes.is_none()
+                    && !named.contains(&bytes)
+                    && !host_overlap(bytes)
+                    && alone;
+                if joins {
+                    let joined = Joining {
+                        key: RunKey::Shadow(key),
+                        bytes,
+                        area: [0; 4],
+                    };
+                    shadow_runs.push(ShadowRunColor {
+                        copies: Arc::clone(copies),
+                        joining: joined,
+                        on: None,
+                        opens: false,
+                    });
+                }
+            }
+            joining.extend(shadow_runs.iter().map(|run| run.joining));
+            let touches = |key: &RunKey, bytes: ResourceKey| {
+                let attached_over = |&(k, image): &(ResourceKey, Option<vk::Image>)| match *key {
+                    RunKey::Linear {
+                        backing, surface, ..
+                    } => k == bytes || image.is_some_and(|i| i == backing || i == surface),
+                    RunKey::Shadow(shadow) => k == bytes || k == shadow,
+                };
+                let shadow_over = |copies: &&Arc<ShadowCopies>| match *key {
+                    RunKey::Linear { .. } => false,
+                    RunKey::Shadow(shadow) => over(copies, shadow, bytes),
+                };
+                !quiet
+                    || named.contains(&bytes)
+                    || host_overlap(bytes)
+                    || attached.iter().any(attached_over)
+                    || attached_shadows.iter().any(|copies| shadow_over(&copies))
+                    || drawn_shadows.iter().any(shadow_over)
+            };
+            let (joined, ended) = core
+                .command_buffer()
+                .state()
+                .pass_runs()
+                .end_of(now, &joining, touches);
+            // Each run it ends lets go of its scratch: its merge lies before this pass.
+            for held in ended {
+                held.end();
+            }
+            let whole = [0, 0, layout.extent[0], layout.extent[1]];
+            let mut joined = joined.into_iter();
+            for (run, joined) in runs.iter_mut().zip(&mut joined) {
+                match joined {
+                    Joined::On {
+                        area,
+                        held: RunHeld::Linear(merge),
+                        last,
+                    } => {
+                        run.joining.area = area;
+                        run.on = Some((merge, last));
+                    }
+                    Joined::On { held, .. } => held.end(),
+                    Joined::Outgrew => run.joining.area = whole,
+                    Joined::Opens | Joined::Placed => {}
+                }
+            }
+            // A shadowed color going on with its run takes its image as the run's passes left
+            // it, kept before the first: where the encoder still carries it.
+            for (run, joined) in shadow_runs.iter_mut().zip(joined) {
+                match joined {
+                    Joined::On {
+                        held: RunHeld::Shadow { merge, lease },
+                        last,
+                        ..
+                    } => {
+                        if core.go_on_shadow(&run.copies, Arc::clone(&merge)) {
+                            run.on = Some((merge, lease, last));
+                        }
+                    }
+                    Joined::On { held, .. } => held.end(),
+                    Joined::Placed => run.opens = true,
+                    Joined::Outgrew | Joined::Opens => {}
+                }
+            }
+        }
+        // Each color's box: a run's where it joins one, else the one its draws write in.
+        let area_of = |index: usize, c: &render_pass::ColorTarget, own: &StandIn| match runs
+            .iter()
+            .find(|run| run.index == index)
+        {
+            Some(run) => run.joining.area,
+            None => own_box(c, own),
+        };
+        let scratch = |copied: &dyn Fn(usize, &render_pass::ColorTarget) -> bool| {
+            layout
+                .colors
+                .iter()
+                .enumerate()
+                .filter_map(|(index, c)| {
+                    let c = c.as_ref()?;
+                    let own = c.stand_in.as_ref().filter(|s| s.copies())?;
+                    let area = area_of(index, c, own);
+                    copied(index, c).then_some((
+                        &c.target,
+                        &own.own,
+                        area,
+                        vk::ImageAspectFlags::COLOR,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        let merged: Vec<(usize, Arc<LinearMerge>)> = merging
+            .iter()
+            .map(|&(index, c, own)| {
+                let on = runs.iter().find(|run| run.index == index);
+                if let Some((merge, _)) = on.and_then(|run| run.on.as_ref()) {
+                    return Ok((index, Arc::clone(merge)));
+                }
+                let area = area_of(index, c, own);
+                LinearMerge::new(core.command_buffer(), &c.target, &own.own, area)
                     .map(|merge| (index, Arc::new(merge)))
             })
             .collect::<Result<_, Error>>()?;
+        // A color going on with a run is copied in and kept by the run's first pass.
+        let goes_on = |index: usize| {
+            runs.iter()
+                .any(|run| run.index == index && run.on.is_some())
+        };
         // One such color the pass does not load, and stores, is copied back over the clear's
         // reach before each instance after a memory barrier too, so a draw after it reads what
         // the pass drew (`reload_at`).
@@ -4615,17 +5622,22 @@ impl RenderLowering {
         // Where the first instance recorded inline, it rendered the attachments themselves: every
         // stand-in, arriving later, takes the attachment's texels right after it, not before the
         // pass (`render/inline_first.rs`).
+        // A pass going on with a run copies nothing in for its color: the image holds what the
+        // run's pass before left (`pass_runs.rs`).
         let mut copied_in = match inline {
             true => scratch(&|_, _| true),
-            false => scratch(&loaded),
+            false => scratch(&|index, c| loaded(index, c) && !goes_on(index)),
         };
         copied_in.extend(depth_stencil_copies(false));
         let stand_ins_in = StandInCopies::plan_aspects(&copied_in, true)?;
-        let (stand_ins_in, stand_ins_after_first) = match inline {
-            true => (None, stand_ins_in),
-            false => (stand_ins_in, None),
+        // Where a draw pinned the colors, after the last pinned instance (`pinned`), the merged
+        // colors' keeps after their copies.
+        let (stand_ins_in, stand_ins_after_first, stand_ins_after_pins) = match (inline, pinned) {
+            (true, Some(_)) => (None, None, stand_ins_in),
+            (true, None) => (None, stand_ins_in, None),
+            (false, _) => (stand_ins_in, None, None),
         };
-        if let Some(copies) = &stand_ins_after_first {
+        for copies in stand_ins_after_first.iter().chain(&stand_ins_after_pins) {
             uses.extend(copies.uses().iter().cloned());
         }
         // A memoryless color's backing, arriving later, where the first instance recorded inline
@@ -4647,16 +5659,12 @@ impl RenderLowering {
             )?,
             false => None,
         };
+        // A backing is cleared after the pass's first instance by the device's clear command of
+        // its whole level and layer, not by a load operation, which on a driver whose clears are
+        // Metal's stores the load operation's texel: it owes no note the load operation does not
+        // (`ColorTarget::withheld_clear`, `DriverFact::ColorClearIsMetals`).
         if let Some(clears) = &backings_after_first {
             uses.extend(clears.uses.iter().cloned());
-            // A backing is cleared after the pass's first instance, not by a load operation: the
-            // note that operation does not owe is (`ColorTarget::withheld_clear`).
-            for color in layout.colors.iter().flatten().filter(|c| c.memoryless) {
-                if let Some(clear) = color.withheld_clear {
-                    let pf = color.target.texture.pixel_format();
-                    super::render_pass::degrade_clear_conversion(core.device(), pf, clear);
-                }
-            }
         }
         let backings_after_first = backings_after_first.filter(|_| inlined == 1);
         let mut copied_back =
@@ -4680,7 +5688,7 @@ impl RenderLowering {
                     (None, None) => Some(&ds.target),
                 };
                 let own = own.ok_or_else(|| internal("a NaN clear depth without its texture"))?;
-                let extent = clear_reach::cleared(&layout, own.extent, called);
+                let extent = clear_reach::cleared(&layout, own, called);
                 Some(NanDepthWrite::plan(core.command_buffer(), own, extent)?)
             }
             _ => None,
@@ -4699,27 +5707,30 @@ impl RenderLowering {
                 .get(index as usize)
                 .and_then(Option::as_ref)
                 .ok_or_else(|| internal("a storage attachment the pass does not have"))?;
-            // Cleared before the pass, not by its load operation: the note that operation does
-            // not owe is (`ColorTarget::withheld_clear`).
-            if let Some(clear) = color
-                .withheld_clear
-                .filter(|_| color.load == LoadAction::Clear)
-            {
+            if color.load != LoadAction::Clear {
+                continue;
+            }
+            // Cleared before the pass, not by its load operation. By the device's clear command
+            // of its whole level and layer, which on a driver whose clears are Metal's stores the
+            // load operation's texel (`DriverFact::ColorClearIsMetals`), it owes no note that
+            // operation does not; as sample planes, or by a render pass of the attachment alone
+            // (`clear_reach.rs`), it owes that note (`ColorTarget::withheld_clear`).
+            let by_command = color.planes.is_none() && cleared_ahead(&color.target, layout.extent)?;
+            if let Some(clear) = color.withheld_clear.filter(|_| !by_command) {
                 let pf = color.target.texture.pixel_format();
                 super::render_pass::degrade_clear_conversion(core.device(), pf, clear);
             }
-            if color.load == LoadAction::Clear && color.planes.is_none() {
-                match cleared_ahead(&color.target, layout.extent)? {
-                    true => clears.push((&color.target, color.clear)),
-                    false => left_out.push(index),
-                }
+            match (color.planes.is_none(), by_command) {
+                (true, true) => clears.push((&color.target, color.clear)),
+                (true, false) => left_out.push(index),
+                (false, _) => {}
             }
         }
         let clears = Clears::plan(clears)?;
         let bounded = tiles.as_ref().map(|tiles| (&dont_care, tiles));
         // Where the first instance recorded inline, its own clears reached as far as Metal's (it
-        // rendered over their reach), and it had no other clear to make before it: no depth or
-        // stencil, storage color or `DontCare` load but a memoryless color's
+        // rendered over their reach, its depth and stencil's too), and it had no other clear to
+        // make before it: no storage color or `DontCare` load but a memoryless color's
         // (`render/inline_first.rs`).
         let reach_clears = match inline {
             true => None,
@@ -4732,6 +5743,32 @@ impl RenderLowering {
         if let Some(reach_clears) = &reach_clears {
             reach_clears.load_in_pass(&mut layout);
         }
+        // Separate depth and stencil textures: the copies into the scratch image the pass
+        // renders, and back (`depth_stencil_scratch.rs`). After the reach clears' loads: an
+        // aspect whose `DontCare` load the draws' tiles bound is loaded, copied in, and its
+        // tiles cleared after the copy.
+        let (copy_in, copy_out) = match &layout.depth_stencil {
+            Some(DepthStencilTarget {
+                target,
+                depth,
+                stencil: Some(stencil),
+                separate: Some(separate),
+                ..
+            }) => {
+                let plan = |into_scratch| {
+                    ScratchCopy::plan(
+                        core.command_buffer(),
+                        separate,
+                        target,
+                        [depth.as_ref(), Some(stencil)],
+                        layout.extent,
+                        into_scratch,
+                    )
+                };
+                (plan(true)?, plan(false)?)
+            }
+            _ => (None, None),
+        };
         // The tile dispatches' cells past their attachments, as Metal's tile memory holds them
         // when the pass begins (`render/tile_dispatch.rs`): of the layout as the pass's clears
         // ahead of it leave its loads.
@@ -4746,6 +5783,21 @@ impl RenderLowering {
                 depth_stencil: None,
                 ..layout.clone()
             });
+        // The instances through the last pinned one render each color's own image, and no hidden
+        // depth or stencil, which arrived after them where it did (`pinned`).
+        let fixed = pinned.map(|_| {
+            let mut fixed = PassLayout {
+                depth_stencil: None,
+                ..layout.clone()
+            };
+            for color in fixed.colors.iter_mut().flatten() {
+                if let Some(own) = color.stand_in.as_ref().map(|s| s.own.clone()) {
+                    color.target = own;
+                    color.stand_in = None;
+                }
+            }
+            fixed
+        });
         // The layout of the instances that resolve: the scratch image as the depth/stencil
         // attachment where its copy stands for it.
         let resolving_layout = resolve_source
@@ -4838,7 +5890,7 @@ impl RenderLowering {
         if let Some(last) = instances.last() {
             visibility.end(raw, last.draws);
         }
-        let results = visibility.plan(&mut core)?;
+        let results = visibility.plan(&mut core, layout.visibility_type)?;
         // A shadowed texture the pass renders, resolves into or a draw uses.
         let texels_shadowed = shadows::attachments_shadowed(&layout)
             || instances
@@ -4848,8 +5900,10 @@ impl RenderLowering {
                 .iter()
                 .any(|dispatch| !dispatch.shadows.is_empty());
         // Their truths, which an execution's commands may reach past what its call gathered
-        // (`render/executions.rs`).
-        let pass_shadows = match texels_shadowed {
+        // (`render/executions.rs`), held by a pass that records later (below): one of no
+        // execution, pending draw or tile dispatch records now, and needs none.
+        let records_later = !executions.is_empty() || !pending.is_empty() || !dispatches.is_empty();
+        let pass_shadows = match texels_shadowed && records_later {
             true => shadows::pass_shadows(
                 &layout,
                 (instances.iter().map(|instance| &instance.shadows))
@@ -4883,12 +5937,12 @@ impl RenderLowering {
                 // Nor does one recorded inline after a split, or the first instance before
                 // one: its copies were planned and recorded as its group ended.
                 if !instance.planned {
-                    // The rectangle bounding the pixels an instance of draws alone writes,
-                    // after the first, whose copies the steps before the pass's instances
-                    // follow; none for an instance through views of another format, whose
-                    // stand-ins' copies write its colors' every texel.
-                    let alone =
-                        index > 0 && instance.reformats.is_empty() && instance.pieces.is_empty();
+                    // The rectangle bounding the pixels an instance of draws alone writes: the
+                    // first's too, whose copies the steps before the pass's instances follow,
+                    // as those write no color the encoder set to load but through a stand-in
+                    // (`render/shadows.rs`, `plan`); none for an instance through views of
+                    // another format, whose stand-ins' copies write its colors' every texel.
+                    let alone = instance.reformats.is_empty() && instance.pieces.is_empty();
                     let bound = alone.then(|| instance.drawn.bounds()).flatten();
                     order.push((&instance.shadows, bound, false));
                 }
@@ -4910,7 +5964,7 @@ impl RenderLowering {
             let planned = shadows::plan(
                 &mut core,
                 order.iter().map(|&(s, bound, _)| (s, bound)),
-                &layout,
+                (&layout, &uses[..attached]),
                 (reached, drawn_bounds.map(|area| (area, loaded_colors))),
                 drawn_bounds.is_some().then_some(&drawn),
             )?;
@@ -5040,9 +6094,27 @@ impl RenderLowering {
         if let Some(copies) = stand_ins_in {
             copies.record(&mut core);
         }
-        // What the merged colors hold once copied in, before any step writes them.
-        for (_, merge) in &merged {
-            merge.record_keep(&mut core);
+        // What the merged colors hold once copied in, before any step writes them: kept by a
+        // run's first pass alone; where a draw pinned the colors, after their copies in after the
+        // last pinned instance; where the first instance recorded inline, after their copies in
+        // after it (`render/inline_first.rs`), which rendered the attachments themselves. A keep
+        // before those copies would hold what the stand-in held before them, and the merge would
+        // drop every word the later instances wrote that equals it.
+        let mut kept_after_pins = Vec::new();
+        let mut kept_after_first = Vec::new();
+        for (index, merge) in &merged {
+            match (goes_on(*index), pinned, inline) {
+                (true, _, _) => {}
+                (false, Some(_), _) => {
+                    uses.extend(merge.keep_uses().iter().cloned());
+                    kept_after_pins.push(Arc::clone(merge));
+                }
+                (false, None, true) => {
+                    uses.extend(merge.keep_uses().iter().cloned());
+                    kept_after_first.push(Arc::clone(merge));
+                }
+                (false, None, false) => merge.record_keep(&mut core),
+            }
         }
         if let Some(clears) = reach_clears {
             clears.record(&mut core);
@@ -5117,12 +6189,19 @@ impl RenderLowering {
         // of their own (`render/executions.rs`), each made in that layout.
         let mut objects = Vec::with_capacity(count - inlined);
         let mut later_moved = Vec::with_capacity(count - inlined);
+        // The pass of the snapshots that lead an instance (`render/snapshot.rs`, leading
+        // snapshots), its depth/stencil attachment in the layout it rests in outside the instance.
+        let mut later_leading = Vec::with_capacity(count - inlined);
         for (index, instance) in instances.iter().enumerate().skip(inlined) {
             let at = Position {
                 first: index == 0,
                 last: index + 1 == count && !resolve_after,
             };
-            let own = instance_layout(&layout, bare.as_ref(), &instance.shape);
+            // An instance through the last pinned one renders the attachments themselves.
+            let own = match (&fixed, pinned) {
+                (Some(fixed), Some(through)) if index < through => fixed,
+                _ => instance_layout(&layout, bare.as_ref(), &instance.shape),
+            };
             let feedback = instance.feedback;
             // Its framebuffer holds the views its draws render colors through.
             let viewed = reformatted(own, &instance.reformats);
@@ -5142,6 +6221,17 @@ impl RenderLowering {
             }
             let shape = &instance.shape;
             let pass = render_target::final_pass(&device, own, shape, at, feedback, depth)?;
+            let rests = match held_depth {
+                Some(_) => depth,
+                None => vk::ImageLayout::GENERAL,
+            };
+            later_leading.push(match instance.leading {
+                Some(leading) => Some((
+                    render_target::leading_pass(&device, own, shape, rests)?,
+                    leading,
+                )),
+                None => None,
+            });
             let framebuffer = render_target::framebuffer(
                 &device,
                 &pass,
@@ -5163,19 +6253,31 @@ impl RenderLowering {
         // its executions (`render/pass_steps.rs`). An empty list of the extended-range shadows'
         // settings or of the stand-ins' copies leaves every instance's empty.
         let dispatch_count = dispatches.len();
+        // The pass's drawn area, which the device keeps for a next encoder's (below).
+        let pass_drawn = drawn;
         let mut drawn = Vec::with_capacity(count - inlined);
         let mut instance_steps = Vec::with_capacity(count);
         let shadow_fills = (shadow_fills.into_iter()).chain(std::iter::repeat_with(Vec::new));
         let none = || (None, None);
         let reformat_copies = (reformat_copies.into_iter()).chain(std::iter::repeat_with(none));
-        let fills_and_copies = shadow_fills.zip(reformat_copies);
-        let moved_images = (std::iter::repeat_with(Vec::new).take(inlined)).chain(later_moved);
-        for (index, ((instance, (shadow_fills, (reformat_in, reformat_out))), moved)) in instances
-            .into_iter()
-            .zip(fills_and_copies)
-            .zip(moved_images)
-            .enumerate()
-        {
+        let mut fills_and_copies = shadow_fills.zip(reformat_copies);
+        let mut moved_images = (std::iter::repeat_with(Vec::new).take(inlined)).chain(later_moved);
+        let mut leading_steps =
+            (std::iter::repeat_with(|| None).take(inlined)).chain(later_leading);
+        // The first instance's gathering and drawn area, which the device keeps for a next
+        // encoder's with the pass's drawn area and fragment writes and reads
+        // (`render/draw_room.rs`).
+        let mut first_gathered = None;
+        // Each instance taken alone, its fills, copies and moves beside it: an instance is near
+        // 2 KiB, which each layer of a zipped iterator's items copied again.
+        for (index, instance) in instances.into_iter().enumerate() {
+            let (Some((shadow_fills, (reformat_in, reformat_out))), Some(moved), Some(leading)) = (
+                fills_and_copies.next(),
+                moved_images.next(),
+                leading_steps.next(),
+            ) else {
+                break;
+            };
             let Instance {
                 draws,
                 shape,
@@ -5185,8 +6287,13 @@ impl RenderLowering {
                 before,
                 positioned,
                 kept,
+                shadows: gathered,
+                drawn: instance_drawn,
                 ..
             } = instance;
+            if index == 0 {
+                first_gathered = Some((gathered, instance_drawn));
+            }
             // Its commands, kept as it recorded inline after a split, were recorded at the pass's
             // end (`render/inline_splits.rs`): their room goes back to the device.
             if let Some(kept) = kept {
@@ -5207,10 +6314,20 @@ impl RenderLowering {
                 reformat_in,
                 reformat_out,
                 moved,
+                leading,
             });
             if index >= inlined {
                 drawn.push((draws, pieces, shape));
             }
+        }
+        if let Some((shadows, first_drawn)) = first_gathered {
+            let room = draw_room::DrawRoom {
+                shadows,
+                first_drawn,
+                drawn: pass_drawn,
+                pass_start,
+            };
+            device.shared().draw_rooms.give(room);
         }
         let mut dispatch_copies = dispatch_copies.into_iter();
         let steps = PassSteps {
@@ -5241,6 +6358,11 @@ impl RenderLowering {
                 device: device.clone(),
                 sets: Default::default(),
             },
+            after_pins: pinned.map(|through| AfterPins {
+                at: through - 1,
+                copies: stand_ins_after_pins,
+                keeps: kept_after_pins,
+            }),
         };
         // An inline first instance's steps before it go before the pass, into the command buffer
         // before the pass's, as the end records them before the pass's first instance; the
@@ -5259,11 +6381,41 @@ impl RenderLowering {
                 });
             }
             core.release_pass()?;
+            if !inline_moved.is_empty() {
+                let family = core.queue_flags();
+                core.command(vk::PipelineStageFlags2::NONE, &[], |raw, command_buffer| {
+                    // SAFETY: the pass's command buffer is recording right after the last inline
+                    // instance's render pass instance ended, and only this encoder records it;
+                    // its colors in the feedback loop layout are there since its begin, their
+                    // images live until the command buffer completes (the layout's textures,
+                    // which the encoder retains).
+                    unsafe {
+                        render_target::moved_barriers(
+                            raw,
+                            command_buffer,
+                            &inline_moved,
+                            false,
+                            family,
+                        )
+                    }
+                });
+            }
         }
         // The passes of the runs an execution may split an instance into (`render/executions.rs`).
         let mut run_objects = Vec::new();
         // The steps of a pass recorded now, or the pass that records later.
         let (mut recorded_steps, mut deferred) = (None, None);
+        // The secondaries of the snapshots that lead each instance of a pass recorded now, each
+        // recorded at its draw: no pending draw's, which records later.
+        let leads = (0..count)
+            .map(|index| match steps.leading(index) {
+                Some(snapshot::Leading::Recorded(draws)) => Ok(Some(draws)),
+                Some(snapshot::Leading::Pending(_)) if pending.is_empty() => Err(internal(
+                    "the leading snapshots of a pending draw the pass does not hold",
+                )),
+                Some(snapshot::Leading::Pending(_)) | None => Ok(None),
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
         // A pass of a draw whose pipeline is being made records later too, once it is made
         // (`render/pending.rs`), and one of a tile dispatch's (`render/pending_tile.rs`).
         let now = match &tiles_made {
@@ -5299,6 +6451,9 @@ impl RenderLowering {
                             if let Some(copies) = &stand_ins_after_first {
                                 copies.record_in(raw, command_buffer);
                             }
+                            for merge in &kept_after_first {
+                                merge.keep_in_pass(raw, command_buffer);
+                            }
                             if let Some(clears) = &backings_after_first {
                                 clears.record_in(raw, command_buffer);
                             }
@@ -5312,6 +6467,9 @@ impl RenderLowering {
                                 Barrier::everything().record(raw, command_buffer);
                             }
                             steps.before(raw, command_buffer, index);
+                            if let Some(&Some(draws)) = leads.get(index) {
+                                steps.lead(raw, command_buffer, index, framebuffer.raw, draws);
+                            }
                             steps.begin(raw, command_buffer, index, pass.raw, framebuffer.raw);
                             // An instance whose secondary never began recorded nothing: its
                             // render pass instance runs its loads and stores alone.
@@ -5358,6 +6516,9 @@ impl RenderLowering {
                         unsafe {
                             if let Some(copies) = &stand_ins_after_first {
                                 copies.record_in(raw, command_buffer);
+                            }
+                            for merge in &kept_after_first {
+                                merge.keep_in_pass(raw, command_buffer);
                             }
                             if let Some(clears) = &backings_after_first {
                                 clears.record_in(raw, command_buffer);
@@ -5461,8 +6622,30 @@ impl RenderLowering {
         if let Some(copies) = stand_ins_out {
             copies.record(&mut core);
         }
-        for (_, merge) in &merged {
-            merge.record_merge(&mut core);
+        for (index, merge) in &merged {
+            let Some(run) = runs.iter().find(|run| run.index == *index) else {
+                merge.record_merge(&mut core);
+                continue;
+            };
+            // Left to its batch's submission, its uses noted here (`pass_runs.rs`); the run's
+            // merge before it, taken over once it is.
+            if !core.note_left_uses(MERGE_STAGES, merge.merge_uses()) {
+                continue;
+            }
+            let took = run.on.as_ref().map(|(_, last)| Arc::clone(last));
+            let left = RunMerge::new(RunWork::Linear(Arc::clone(merge)), took);
+            core.defer(Deferred::RunMerge(Arc::clone(&left)))?;
+            if let Some((_, last)) = &run.on {
+                last.take_over();
+                device.shared().counts.linear_merge_taken_over();
+            }
+            let now = run_point.ok_or_else(|| internal("a run's pass encoded again"))?;
+            (core.command_buffer().state().pass_runs()).open(
+                run.joining,
+                RunHeld::Linear(Arc::clone(merge)),
+                left,
+                now,
+            );
         }
         if let Some(copies) = resolve_copies {
             copies.record(&mut core);
@@ -5493,7 +6676,7 @@ impl RenderLowering {
         }
         // The resolve textures' texels the pass's resolves wrote are no longer a new texture's
         // unwritten pattern (`fresh_unwritten.rs`).
-        FreshUnwritten::resolved(&device, &resolved, layout.extent)?;
+        FreshUnwritten::resolved(core.command_buffer(), &resolved, layout.extent)?;
         // The pass's one instance, where nothing recorded restarts a driver's Metal pass.
         let whole = (shapes.len() == 1 && unbroken).then(|| WholePass {
             shape: &shapes[0],
@@ -5509,6 +6692,8 @@ impl RenderLowering {
                 dispatches: dispatch_count,
                 barriers: barrier_splits,
                 tile_memory: tile_memory_splits,
+                interlocked_writes: interlocked_splits,
+                attached_reads: attached_read_splits,
                 viewed: views,
             },
         );
@@ -5556,6 +6741,55 @@ impl RenderLowering {
             .chain(stood_in)
             .chain(planes_images)
             .collect();
+        // Each shadowed color of a run leaves its merge to its batch's submission, its uses noted
+        // here, as its encoder's end would have merged it; the run's merge before it, taken over
+        // once it is (`pass_runs.rs`). The run holds the merge's scratch past the encoder's end.
+        // A color that neither goes on with a run nor follows a pass merged in place merges in
+        // place, as its encoder ends, and marks where a run may start.
+        for ShadowRunColor {
+            copies,
+            joining,
+            on,
+            opens,
+        } in shadow_runs
+        {
+            let now = run_point.ok_or_else(|| internal("a run's pass encoded again"))?;
+            if on.is_none() && !opens {
+                (core.command_buffer().state().pass_runs()).placed(joining, now);
+                continue;
+            }
+            let Some(copy) = core.leave_shadow_merge(&copies) else {
+                continue;
+            };
+            let Step::Merge(merge) = &copy.step else {
+                return Err(internal("a run's copy back that merges nothing"));
+            };
+            let merge = Arc::clone(merge);
+            if !core.note_left_uses(copy.stages(), &copy.uses()) {
+                continue;
+            }
+            // Reported to a log of the pages as the shadow's own, as the copy back would be.
+            if let Some((log, bytes)) = copy.written_log(&device) {
+                core.command_buffer().dirty().wrote_back(log, bytes);
+            }
+            // The scratch of the run it went on with, or of the keep it made since (a merge of
+            // the run's, then a keep that holds more, `ShadowSync::before`).
+            let (lease, took) = match on {
+                Some((kept, lease, last)) if Arc::ptr_eq(&kept, &merge) => (lease, Some(last)),
+                Some((_, lease, last)) => {
+                    drop(lease);
+                    (core.take_lease(&merge), Some(last))
+                }
+                None => (core.take_lease(&merge), None),
+            };
+            let left = RunMerge::new(RunWork::Shadow(copy), took.clone());
+            core.defer(Deferred::RunMerge(Arc::clone(&left)))?;
+            if let Some(last) = &took {
+                last.take_over();
+            }
+            let held = RunHeld::Shadow { merge, lease };
+            (core.command_buffer().state().pass_runs()).open(joining, held, left, now);
+        }
         // What the pass's commands use, held until the command buffer completes as one object,
         // which lets go of them in this order: the command buffer lets go of what it holds from
         // the last retained back.
@@ -5635,6 +6869,7 @@ impl RenderLowering {
         let state = &mut live.state;
         let views = pipeline.at_bind_views();
         reshape.field(&mut state.view_base_alignment, views.alignment());
+        state.uniform_views_at_residual = views.at_residual();
         let tables = [
             (Stage::Vertex, pass_start.or(Stage::Vertex, &self.vertex)),
             (Stage::Fragment, &self.fragment),
@@ -5651,7 +6886,7 @@ impl RenderLowering {
         // resident holds its ID's slot as they state (`Residency::holds_slots_as`).
         let generation = self.residency.generation();
         let resident = live.read_from.resident(generation, moved);
-        let counts = &self.core.device().shared().counts;
+        let counts = self.core.counts();
         for (at, (stage, table)) in tables.into_iter().enumerate() {
             let kept = state.stages.entry(stage).or_default();
             // Its slots that tell the view base alignment apart are as the state holds them
@@ -5666,11 +6901,16 @@ impl RenderLowering {
             // Only the slots calls changed since it was read, where the table keeps them.
             if let Some(read) = live.read_from.read_under(at).filter(|_| same && views_held) {
                 let read = (&mut *kept, read);
-                if table.refresh_changed(read, (stage, interface), (maps, views), &mut reshape) {
+                let reading = (stage, interface);
+                if table.refresh_changed(read, reading, (maps, views), &mut reshape, counts) {
                     counts.stage_table_read_in_part();
                     continue;
                 }
             }
+            let listed = |read| table.changed_since(read).is_some();
+            let reading = (interface, maps, moved);
+            let why = live.read_from.whole_read(at, reading, views_held, listed);
+            counts.stage_table_read_whole(why);
             table.refresh_reading(kept, (stage, interface), (maps, views), &mut reshape);
         }
         let stamps = tables.map(|(_, table)| table.stamp());
@@ -5688,15 +6928,24 @@ impl RenderLowering {
             "a draw's kept used resources that are not its residency's"
         );
         if !kept {
-            reshape.field(&mut state.used_resources, self.residency.used_resources());
+            let used = self.residency.used_resources();
+            // The shapes it took lately listed the used resources it held (`live_bind.rs`).
+            if state.used_resources != used {
+                live.recent.forget();
+            }
+            reshape.field(&mut state.used_resources, used);
         }
+        // Listed by token (`Residency::used_resources`); the commit points every root table at
+        // the command buffer's resident set, which holds them (`State::root_table`).
+        state.used_in_token_order = true;
+        state.resident_apart = true;
         live.read_from.made_resident(generation);
         // Listed again only where the device's sampler states changed since: not where the
         // listing kept is of every live state at the count of their slots' changes that still
         // holds; else they are taken and compared state by state.
         let device = self.core.device();
         let current = argument_samplers.states().is_none()
-            && live.listed_at == Some(device.sampler_slots_changed());
+            && live.listed_at == Some(self.core.generation().sampler_slots_changed());
         if !current {
             let states = argument_samplers.take(device);
             if !heap_sets::lists(&state.argument_samplers, states) {
@@ -5863,7 +7112,7 @@ impl RenderLowering {
     /// not fetch input attachments renders it in place where its texture is not memoryless and its
     /// image has `STORAGE` and takes the storage view, and through a stand-in for the whole pass
     /// otherwise (`next_instance`), which a draw read through a snapshot of the texture would not
-    /// see (`render/snapshot.rs`).
+    /// see but where it pins the color (`render/snapshot.rs`).
     fn keeps_own_attachment(&self, index: usize) -> bool {
         let Some(color) = self.layout.colors.get(index).and_then(Option::as_ref) else {
             return false;
@@ -5887,7 +7136,10 @@ impl RenderLowering {
     /// layers `views` records, and the pass's layout from it on where stand-ins or sample planes
     /// arrive with it (the module docs, `attachment_stand_in.rs` and `sample_planes.rs`); a draw
     /// `ordered` after the current instance's draws (`render/tile_memory.rs`) records into a new
-    /// one. Refused (`NotImplemented(Render)`) where a fetched texture's scratch cannot be
+    /// one, and one ordered after the pass's load actions alone (`behind_loads`: a draw that
+    /// samples a color the pass clears, after a memory barrier before its first draw,
+    /// `texture/attached_reads.rs`) into one after the pass's first, which runs them with no
+    /// draw. Refused (`NotImplemented(Render)`) where a fetched texture's scratch cannot be
     /// copied, and (`Unsupported`) where the device cannot run the sample planes' copies.
     /// `by`: the state of the draw that fetches them, which a scratch's notice names.
     fn next_instance(
@@ -5895,7 +7147,7 @@ impl RenderLowering {
         (fetched, by): (&[u32], Option<&DrawingState>),
         (shadow, shader_tests): (bool, bool),
         views: ViewSetup,
-        ordered: bool,
+        (ordered, behind_loads): (bool, bool),
         hidden: Option<Target>,
         locations: &[Option<u32>],
         reformats: &[Reformat],
@@ -5989,6 +7241,7 @@ impl RenderLowering {
                             maker,
                             own,
                             &standing_images(&self.layout, &standing),
+                            false,
                         )?,
                         true => attachment_stand_in::stand_in(maker, own, copies)?,
                     };
@@ -6076,12 +7329,13 @@ impl RenderLowering {
                 .and_then(Option::as_ref)
                 .is_some_and(|color| color.load == LoadAction::Clear)
         });
-        // An instance a tile dispatch follows runs before it, recorded or not.
+        // An instance a tile dispatch follows runs before it, recorded or not, and so does the
+        // pass's first ahead of a draw ordered after its load actions.
         // An instance that records the current one's draws again takes its place as an empty
         // one's would (`render/reroute.rs`).
         let replace = !self.dispatched
             && (!self.current.recorded || self.rerouting)
-            && (!first || (ahead && loads && !viewed_clears));
+            && (!first || (ahead && loads && !viewed_clears && !behind_loads));
         let split = !replace;
         if split {
             // A split pass keeps its memoryless attachments in memory between its instances.
@@ -6095,7 +7349,7 @@ impl RenderLowering {
                     .any(|s| matches!(s, Standing::Color(i, ..) if *i == index));
                 if color.stand_in.is_none() && !stood && memoryless(own) {
                     let taken = standing_images(&self.layout, &standing);
-                    let target = attachment_stand_in::pooled_backing(maker, own, &taken)?;
+                    let target = attachment_stand_in::pooled_backing(maker, own, &taken, false)?;
                     let stand_in = StandIn {
                         own: own.clone(),
                         cause: Cause::Backing,
@@ -6146,7 +7400,7 @@ impl RenderLowering {
             shadow,
             shader_tests,
             imageblock: false,
-            interlocked_writes: InterlockedStorage::NONE,
+            interlocked_writes: InterlockedStorage::BEGUN,
             indirect_reads: IndirectReads::new(),
             geometry_writes: GeometryWrites::new(),
             tile_memory: false,
@@ -6166,7 +7420,9 @@ impl RenderLowering {
             kept: None,
             planned: false,
             feedback: Feedback::NONE,
-            storage_colors: 0,
+            general_colors: 0,
+            leading: None,
+            piece: false,
         };
         let instance = Box::new(instance);
         Ok((Next::New { instance, split }, stood))
@@ -6261,7 +7517,7 @@ impl RenderLowering {
             shadow: false,
             shader_tests: false,
             imageblock: false,
-            interlocked_writes: InterlockedStorage::NONE,
+            interlocked_writes: InterlockedStorage::BEGUN,
             indirect_reads: IndirectReads::new(),
             geometry_writes: GeometryWrites::new(),
             tile_memory: false,
@@ -6280,7 +7536,9 @@ impl RenderLowering {
             kept: None,
             planned: false,
             feedback: Feedback::NONE,
-            storage_colors: 0,
+            general_colors: 0,
+            leading: None,
+            piece: false,
         };
         Ok(Next::New {
             instance: Box::new(instance),
@@ -6317,6 +7575,9 @@ impl RenderLowering {
         cause: Split,
     ) {
         if let Some(layout) = stood {
+            // What a stand-in brings after a pin, a later draw cannot pin past
+            // (`render/snapshot.rs`).
+            self.pins_frozen |= self.pinned_through > 0;
             *self.layout = *layout;
             self.kept_attachments = None;
         }
@@ -6346,15 +7607,19 @@ impl RenderLowering {
                 let previous = std::mem::replace(&mut self.current, *instance);
                 self.earlier.push(previous);
                 self.barrier_splits += usize::from(self.barrier);
-                if self.barrier {
+                self.attached_read_splits += usize::from(cause == Split::AttachedRead);
+                // The instance after the one that ran the pass's load actions behind a barrier
+                // before its first draw follows that barrier too.
+                if self.barrier || self.loads_ordered {
                     self.reload_at.insert(self.earlier.len());
                 }
+                self.loads_ordered = false;
             } else {
                 // It takes the place of the current one, whose draws it records again.
                 let mut instance = *instance;
                 instance.drawn.join(&self.current.drawn);
                 let replaced = std::mem::replace(&mut self.current, instance);
-                self.end_unrun(replaced);
+                self.end_unrun(&replaced);
             }
             self.dispatched = false;
             self.barrier = false;
@@ -6367,7 +7632,7 @@ impl RenderLowering {
     /// device's spares unreset (`CommandBuffer::give_up_raw`). One with pieces (the secondaries
     /// of draws whose pipelines were being made) is left to the pool's reset; one whose secondary
     /// never began has none to give up.
-    fn end_unrun(&self, instance: Instance) {
+    fn end_unrun(&self, instance: &Instance) {
         // Nor one recorded inline, in the pass's command buffer or kept (`render/inline_first.rs`,
         // `render/inline_splits.rs`).
         if !instance.pieces.is_empty()
@@ -6435,6 +7700,56 @@ impl RenderLowering {
         unsafe { render_target::between_draws(raw, self.current.draws, view_mask) };
     }
 
+    /// Order the pass's load actions before the draws after a memory barrier over the render
+    /// targets after the fragment stage (`fence.rs`), where it comes before any draw of the pass
+    /// recorded (`loads_ordered`). Past one, the draws before it order themselves
+    /// (`barrier_between_draws`), and an instance after the pass's first follows its load
+    /// actions already.
+    pub(super) fn barrier_orders_loads(&mut self) {
+        if self.earlier.is_empty() && !self.current.recorded {
+            self.loads_ordered = true;
+        }
+    }
+
+    /// [`barrier_orders_loads`](Self::barrier_orders_loads) for a memory barrier over
+    /// `resources`, where one of them is a texture a color attachment of the pass renders.
+    pub(super) fn barrier_orders_loads_of(&mut self, resources: &[ResourceRef<'_>]) {
+        let attached = resources.iter().any(|resource| match resource {
+            ResourceRef::Texture(texture) => texture.attached_in(&self.layout),
+            _ => false,
+        });
+        if attached {
+            self.barrier_orders_loads();
+        }
+    }
+
+    /// The shadowed textures a draw with `uses` uses, copied around its instance
+    /// (`render/shadows.rs`): those its tables bind, then those of `resident`, the copies of what
+    /// the encoder made resident (`LiveBind::shadows`). Where it reads the textures of the pass's
+    /// color attachments through copies (`reading`: its plan and pipeline), each read at its
+    /// fragments' own pixels alone is bounded to the texels around its scissors
+    /// ([`bound_own_pixel_reads`](Self::bound_own_pixel_reads)), and whether one was. A draw
+    /// that takes every step and a draw rebound (`render/draw_again/rebound.rs`) work them out
+    /// so alike.
+    fn draw_shadows(
+        &self,
+        resident: &[Arc<ShadowCopies>],
+        uses: &[Use<ResourceKey>],
+        reading: Option<(&BindingPlan, &metal2vulkan::pipeline::RenderPipeline)>,
+    ) -> (Vec<shadow::ShadowUse>, bool) {
+        let bound = (self.vertex.textures.values())
+            .chain(self.fragment.textures.values())
+            .chain(self.object.textures.values())
+            .chain(self.mesh.textures.values());
+        let mut shadows = shadow::shadow_uses_of(bound, resident, uses);
+        let own_pixel = reading.is_some_and(|(plan, compiled)| {
+            let selects =
+                compiled.graphics.writes_viewport_index || self.amplification.offsets_viewports();
+            self.bound_own_pixel_reads(plan, compiled, selects, &mut shadows)
+        });
+        (shadows, own_pixel)
+    }
+
     /// Bound the copy in of each shadow among `shadows` of a texture that presents a color
     /// attachment of the pass and that a draw of `plan` reads at its fragments' own pixels alone
     /// (`texture/attached_reads.rs`): every binding of the texture in its tables is a sampled one
@@ -6464,26 +7779,11 @@ impl RenderLowering {
             return false;
         };
         let mut scissors = [vk::Rect2D::default(); MAX_VIEWPORTS];
-        let rects = self.state.vk_scissors_in(selects, &mut scissors);
-        let mut drawn: Option<[u32; 4]> = None;
-        for r in rects
-            .iter()
-            .filter(|r| r.extent.width > 0 && r.extent.height > 0)
-        {
-            let (x, y) = (r.offset.x.max(0) as u32, r.offset.y.max(0) as u32);
-            let rect = [x, y, x + r.extent.width, y + r.extent.height];
-            drawn = Some(match drawn {
-                Some([a, b, c, d]) => [
-                    a.min(rect[0]),
-                    b.min(rect[1]),
-                    c.max(rect[2]),
-                    d.max(rect[3]),
-                ],
-                None => rect,
-            });
-        }
+        let rects = self
+            .state
+            .vk_scissors_in(&self.scissors, selects, &mut scissors);
         // A draw of no pixel reads nothing: its copy is left as it was.
-        let Some([x0, y0, x1, y1]) = drawn else {
+        let Some(drawn) = scissors_bound(rects) else {
             return false;
         };
         let mut bounded = false;
@@ -6491,78 +7791,191 @@ impl RenderLowering {
             if used.writes || !used.copies.cuts() {
                 continue;
             }
-            let key = used.copies.shadow_key;
-            // The texture whose shadow it is, and whether each of its bindings reads so.
-            let mut texture = None;
-            let mut own = true;
-            for write in &plan.descriptors {
-                let slot = match &write.source {
-                    WriteSource::Texture { slot, .. }
-                    | WriteSource::CombinedImageSampler {
-                        image: ImageSource::Texture { slot, .. },
-                        ..
-                    } => slot,
-                    _ => continue,
-                };
-                let table = match slot.stage {
-                    Stage::Vertex => &self.vertex,
-                    Stage::Fragment => &self.fragment,
-                    Stage::Object => &self.object,
-                    Stage::Mesh => &self.mesh,
-                    _ => continue,
-                };
-                let Some(bound) = table.textures.get(&slot.index) else {
-                    continue;
-                };
-                if bound.usage_shadow_copies().map(|c| c.shadow_key) != Some(key) {
-                    continue;
-                }
-                own &= slot.stage == Stage::Fragment
-                    && write.ty != metal2vulkan::vk::DescriptorType::STORAGE_IMAGE
-                    && fragment.own_pixel_textures.contains(&slot.index);
-                texture = Some(bound);
-            }
-            let Some(texture) = texture.filter(|t| own && t.attached_in(&self.layout)) else {
+            let texture = self.read_at_own_pixels(plan, fragment, used.copies.shadow_key);
+            let Some(texture) = texture.filter(|t| t.attached_in(&self.layout)) else {
                 continue;
             };
-            let (w, h) = (texture.width() as u32, texture.height() as u32);
-            if w == 0 || h == 0 {
+            let Some(loads) = own_pixel_loads(drawn, texture) else {
                 continue;
-            }
-            let lo = |p: u32, side: u32| p.saturating_sub(1).min(side - 1);
-            let hi = |p: u32, side: u32| (p + 1).min(side);
-            used.loads = Some([lo(x0, w), lo(y0, h), hi(x1, w), hi(y1, h)]);
+            };
+            used.loads = Some(loads);
             bounded = true;
         }
         bounded
     }
 
-    /// Whether a draw of `plan` samples, at a slot of its tables, a texture that presents a color
-    /// attachment of the pass (`texture/attached_reads.rs`): a sampled image or combined image
-    /// sampler binding, not a storage one.
-    fn samples_attachment(&self, plan: &BindingPlan) -> bool {
-        plan.descriptors.iter().any(|write| {
+    /// The texture whose usage shadow is `key` that a draw of `plan` binds in its tables, where
+    /// every binding of it there is a sampled one of a fragment slot that `fragment` reads at the
+    /// fragment's own pixel alone (`StageModule::own_pixel_textures`); `None` where it binds none
+    /// or one is read otherwise.
+    fn read_at_own_pixels(
+        &self,
+        plan: &BindingPlan,
+        fragment: &metal2vulkan::pipeline::StageModule,
+        key: ResourceKey,
+    ) -> Option<&Texture> {
+        let mut texture = None;
+        let mut own = true;
+        for write in &plan.descriptors {
             let slot = match &write.source {
-                WriteSource::Texture { slot, .. } => slot,
-                WriteSource::CombinedImageSampler {
+                WriteSource::Texture { slot, .. }
+                | WriteSource::CombinedImageSampler {
                     image: ImageSource::Texture { slot, .. },
                     ..
                 } => slot,
-                _ => return false,
+                _ => continue,
             };
             let table = match slot.stage {
                 Stage::Vertex => &self.vertex,
                 Stage::Fragment => &self.fragment,
                 Stage::Object => &self.object,
                 Stage::Mesh => &self.mesh,
-                _ => return false,
+                _ => continue,
             };
-            write.ty != metal2vulkan::vk::DescriptorType::STORAGE_IMAGE
-                && table
-                    .textures
-                    .get(&slot.index)
-                    .is_some_and(|texture| texture.attached_in(&self.layout))
+            let Some(bound) = table.textures.get(&slot.index) else {
+                continue;
+            };
+            if bound.usage_shadow_copies().map(|c| c.shadow_key) != Some(key) {
+                continue;
+            }
+            own &= slot.stage == Stage::Fragment
+                && write.ty != metal2vulkan::vk::DescriptorType::STORAGE_IMAGE
+                && fragment.own_pixel_textures.contains(&slot.index);
+            texture = Some(bound);
+        }
+        texture.filter(|_| own)
+    }
+
+    /// Whether a draw of a plan of `facts` and `compiled` that samples a texture presenting a
+    /// color attachment of the pass, after a memory barrier inside the current instance, may read
+    /// a texel the instance changed (`texture/attached_reads.rs`, after a memory barrier): else
+    /// the copy taken before the instance holds every texel it reads as the copy after a split
+    /// would, and it stays in the instance (`WorkCounts::attachment_read_splits_spared`). It may
+    /// unless the instance is one of draws alone (not continuing another, no execution, no
+    /// stand-in of another format) in a pass of no rasterization-rate map or views, and every such
+    /// texture has the shadow its read takes (`Texture::attached_shadow_copies`, made now where
+    /// the draw's binding has not made it yet), the instance's draws wrote its truth only as the
+    /// colors it presents, which change only inside the draws' scissors there
+    /// (`render/shadows.rs`'s `drawn_alone`, loaded), and the instance's drawn area
+    /// (`clear_reach::DrawnArea`) meets none of the texels the draw reads: those around its
+    /// scissors where it reads the texture at its fragments' own pixels alone (as
+    /// `bound_own_pixel_reads` bounds them), else every one.
+    fn reads_what_the_instance_drew(
+        &self,
+        (device, call): (&Device, &'static str),
+        facts: &PlanFacts,
+        (plan, compiled): (&BindingPlan, &metal2vulkan::pipeline::RenderPipeline),
+    ) -> bool {
+        let current = &self.current;
+        if current.continues
+            || !current.pieces.is_empty()
+            || !current.reformats.is_empty()
+            || self.rate_map.is_some()
+            || plan.views.view_mask != 0
+        {
+            return true;
+        }
+        let fragment =
+            (compiled.stages.iter()).find(|m| m.stage == metal2vulkan::vk::ShaderStage::FRAGMENT);
+        let selects =
+            compiled.graphics.writes_viewport_index || self.amplification.offsets_viewports();
+        let mut scissors = [vk::Rect2D::default(); MAX_VIEWPORTS];
+        let rects = self
+            .state
+            .vk_scissors_in(&self.scissors, selects, &mut scissors);
+        let drawn = scissors_bound(rects);
+        let first = self.earlier.is_empty();
+        let colors = AttachedColors::of(&self.layout);
+        for texture in self.sampled_textures(facts) {
+            let mut presented = texture.attached_colors(&colors).peekable();
+            if presented.peek().is_none() {
+                continue;
+            }
+            let loaded_alone = presented.all(|index| {
+                (self.layout.colors.get(index).and_then(Option::as_ref)).is_some_and(|color| {
+                    (color.load == LoadAction::Load || !first)
+                        && shadows::drawn_alone(color, &self.layout)
+                })
+            });
+            let Some(copies) = texture.attached_shadow_copies(call) else {
+                return true;
+            };
+            if !loaded_alone || current.shadows.writes_truth(device, &copies) {
+                return true;
+            }
+            let own = fragment.and_then(|f| self.read_at_own_pixels(plan, f, copies.shadow_key));
+            let reads = match own {
+                // A draw of no pixel reads nothing at its own pixels.
+                Some(texture) => match drawn.and_then(|drawn| own_pixel_loads(drawn, texture)) {
+                    Some(reads) => Some(reads),
+                    None => continue,
+                },
+                None => None,
+            };
+            if current.drawn.meets(reads) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether a draw of a plan of `facts` samples, at a slot of its tables, a texture that
+    /// presents a color attachment of the pass (`texture/attached_reads.rs`) as `presents` tells
+    /// (`Texture::attached_among`, or `Texture::cleared_among` for one the pass clears): a
+    /// sampled image or combined image sampler binding, not a storage one. The pass's color
+    /// attachments are read once for every texture (`AttachedColors`).
+    fn samples_attachment(
+        &self,
+        facts: &PlanFacts,
+        presents: fn(&Texture, &AttachedColors) -> bool,
+    ) -> bool {
+        let colors = AttachedColors::of(&self.layout);
+        colors.any() && (self.sampled_textures(facts)).any(|texture| presents(texture, &colors))
+    }
+
+    /// The textures a draw of a plan of `facts` samples at slots of its tables: through a
+    /// sampled image or combined image sampler binding, not a storage one.
+    fn sampled_textures<'a>(&'a self, facts: &'a PlanFacts) -> impl Iterator<Item = &'a Texture> {
+        facts.sampled().iter().filter_map(|slot| {
+            let table = match slot.stage {
+                Stage::Vertex => &self.vertex,
+                Stage::Fragment => &self.fragment,
+                Stage::Object => &self.object,
+                Stage::Mesh => &self.mesh,
+                _ => return None,
+            };
+            table.textures.get(&slot.index)
         })
+    }
+
+    /// The clears a draw `call` of a plan of `facts` that samples a color the pass clears reads
+    /// through copies cleared to them, in its instance, instead of the copies of the texels from
+    /// before the pass, or, after a memory barrier before the pass's first draw, instead of the
+    /// pass splitting (`texture/attached_reads.rs`): each texture it
+    /// samples that such a color renders, by its shadow ([`Texture::cleared_copy`]), but those the
+    /// pass's first instance clears in already. `None` where one may not be cleared so, where the
+    /// pass split or ran a tile dispatch, or where one is new and a draw recorded into the pass
+    /// already: a draw that wrote the attachment may have left what the copy must then hold. Such
+    /// a draw splits the pass as before.
+    fn cleared_copies(
+        &self,
+        facts: &PlanFacts,
+        call: &'static str,
+    ) -> Option<Vec<(ResourceKey, vk::ClearColorValue)>> {
+        if !self.earlier.is_empty() || !self.dispatches.is_empty() || self.rerouting {
+            return None;
+        }
+        let mut clears: Vec<(ResourceKey, vk::ClearColorValue)> = Vec::new();
+        for texture in self.sampled_textures(facts) {
+            if !texture.cleared_in(&self.layout) {
+                continue;
+            }
+            let (key, value) = texture.cleared_copy(&self.layout, call)?;
+            if !self.current.shadows.clears_in(key) && clears.iter().all(|&(had, _)| had != key) {
+                clears.push((key, value));
+            }
+        }
+        (clears.is_empty() || !self.current.recorded).then_some(clears)
     }
 
     /// Whether the pass renders a color over a buffer's bytes through a copied stand-in, or will
@@ -6572,7 +7985,7 @@ impl RenderLowering {
     /// colors apart as the pass ends). A render-target barrier before such a draw stays inside its
     /// instance: a later draw's read of a color `settle` puts apart misses the draws before the
     /// barrier.
-    fn reloads_at_barriers(&self) -> bool {
+    pub(crate) fn reloads_at_barriers(&self) -> bool {
         let device = self.core.device();
         let over_bytes = |target: &render_pass::Target| target.texture.aliases_buffer();
         let colors = self.layout.colors.iter().flatten();
@@ -6601,7 +8014,7 @@ impl RenderLowering {
             (&[], None),
             (false, false),
             ViewSetup::default(),
-            false,
+            (false, false),
             None,
             &[],
             &[],
@@ -6776,15 +8189,17 @@ impl RenderLowering {
     }
 
     /// The pass's color attachments of an extended-range format (`BGR10_XR`, `BGRA10_XR`,
-    /// `RGB10A8_2P_XR10` and their sRGB twins), by index, with their formats. Not the padded and
-    /// bfloat forms, whose tile memory is unmeasured.
+    /// `RGB10A8_2P_XR10` and their sRGB twins) or a padded 10-bit one (`R10Unorm_X6`,
+    /// `RG10Unorm_X12`, their sRGB twins, `RGB10A2Unorm_sRGB`), by index, with their formats,
+    /// whose tile memory Metal holds as `half` through the pass. Not the bfloat forms, whose tile
+    /// memory is unmeasured.
     fn extended_colors(&self) -> BTreeMap<u32, PixelFormat> {
         (0u32..)
             .zip(&self.layout.colors)
             .filter_map(|(index, c)| {
                 let format = c.as_ref()?.target.texture.pixel_format();
                 ExtendedRange::of(format)
-                    .filter(|form| !form.padded() && !form.bfloat())
+                    .filter(|form| !form.bfloat())
                     .map(|_| (index, format))
             })
             .collect()
@@ -6987,7 +8402,7 @@ impl RenderLowering {
     /// The bytes of each cell of the tile function's explicit imageblock standing alone that this
     /// pass keeps, where they are fewer than its data (`BindState::kept_imageblock_bytes`);
     /// `None` for every other tile state. Plain Metal keeps the imageblock's bytes that lie below
-    /// the pass's imageblock bytes per sample ([`pass_sample_length`](Self::pass_sample_length))
+    /// the pass's imageblock bytes per sample ([`pass_sample_length`](ShapeInputs::pass_sample_length))
     /// rounded up to 8, the imageblock lying after the colors as the state's
     /// `imageblock_sample_length` places it, and reads every other word as zero, dropping its
     /// writes, a dispatch's own included (Metal probes on two M4s: a 16-byte imageblock after an
@@ -7032,6 +8447,10 @@ impl RenderLowering {
             _ => {}
         }
         self.draw_calls += 1;
+        if let Some(times) = self.core.times() {
+            times.worked();
+        }
+        self.last_draw_empty = empty;
         self.called = true;
         Ok(())
     }
@@ -7042,6 +8461,7 @@ impl RenderLowering {
     /// draw passed (the module docs). Every texture the encoder's heaps hold is resident.
     fn draw(
         &mut self,
+        live: &mut LiveBind,
         call: &'static str,
         assembly: Assembly,
         draw: DrawCall,
@@ -7049,6 +8469,33 @@ impl RenderLowering {
         empty: bool,
     ) -> Result<(), Error> {
         self.sync_heaps();
+        if let Some(notes) = self.pass_notes.as_mut() {
+            notes.drew(self.pipeline.as_ref(), &self.fragment.textures);
+        }
+        // What another thread may change of what its steps read, as they begin: what a draw it
+        // keeps is kept under (`render/draw_again.rs`'s `Outside`).
+        self.draw_began();
+        // The encoder's kept draw again, which no call came between: its Vulkan draw alone
+        // (`render/draw_again.rs`), the pipeline state's own where the last draw drew through
+        // another. Any other draw keeps itself in its place where it can, and forgets every
+        // kept draw where it cannot.
+        self.select_kept(live);
+        let mut checked = None;
+        let drawn = (&draw, empty);
+        match self.draw_again(live, (call, assembly), drawn, &buffers, &mut checked) {
+            draw_again::Again::Drawn => return Ok(()),
+            #[cfg(debug_assertions)]
+            draw_again::Again::Check => {}
+            draw_again::Again::No => {}
+            draw_again::Again::Refused(refused) => {
+                self.forget_again();
+                return Err(refused);
+            }
+        }
+        self.drop_kept();
+        self.snapshots_alone = false;
+        self.split_alone = false;
+        let watch = EachWatch::start();
         // And whether it rasterizes, without which its primitives reach no tile (`no_raster_t11`).
         // And whether it chooses its viewport.
         let (reads, rasterizes, selects) =
@@ -7064,13 +8511,34 @@ impl RenderLowering {
         // where it writes there (`render/color_groups.rs`); a skipped draw is counted as drawn.
         let turn = self.group_turn();
         match turn {
-            color_groups::Turn::Later(false) => return Err(color_groups::gap()),
+            color_groups::Turn::Later(false) => {
+                self.forget_again();
+                return Err(color_groups::gap());
+            }
             color_groups::Turn::Later(true) if self.group_skips() => self.group_skipped(),
             _ => {
-                let drawn = self.draw_resident(call, assembly, draw, buffers, empty);
+                self.plain_drawn = false;
+                let drawn = self.draw_resident(live, call, assembly, draw, buffers, empty);
+                self.replay_plain &= self.plain_drawn;
                 self.group_outcome(turn, drawn.is_ok());
+                if drawn.is_err() {
+                    self.forget_again();
+                }
                 drawn?;
             }
+        }
+        // A draw that kept nothing may have changed what a draw set aside with another pipeline
+        // state's bind state reads: every kept draw is forgotten, as at a call. One kept
+        // recorded as a draw again of it would, into its instance as it stood. One that read
+        // through snapshots and wrote nothing else wrote only its pass's colors and its
+        // snapshots, kept or not: it forgets the kept draws that read those alone
+        // (`render/draw_again.rs`).
+        match self.again_kept().map(|kept| kept.reader.is_some()) {
+            None if self.split_alone => self.rehome_aside(live)?,
+            None if self.snapshots_alone => self.forget_readers(live)?,
+            None => self.forget_again(),
+            Some(true) => self.forget_aside_readers(live)?,
+            Some(false) => {}
         }
         // Every draw, one of nothing too; an execution's commands announce at the
         // execution (`executions.rs`).
@@ -7080,50 +8548,68 @@ impl RenderLowering {
             self.degrade_ycbcr_blends();
         }
         self.draw_calls += 1;
+        if let Some(times) = self.core.times() {
+            times.worked();
+        }
+        self.last_draw_empty = empty;
         self.command_encoded(reads);
         self.called = true;
         self.drew |= !empty && rasterizes;
         // A draw that records a command hands the device's pass its depth/stencil state.
-        self.drew_depth_writes |= !empty && self.state.depth_writes();
-        // The pixels it may write: its viewports' within its scissors, every viewport where it
-        // chooses one or an amplification offsets it, and anywhere through a rate map.
+        let depth_writes = !empty && self.state.depth_writes();
+        self.drew_depth_writes |= depth_writes;
         if !empty && rasterizes {
-            match self.rate_map.is_some() {
-                true => {
-                    self.drawn.everywhere();
-                    self.coverage.everywhere();
-                }
-                false => {
-                    let selects = selects || self.amplification.offsets_viewports();
-                    let mut scissors = [vk::Rect2D::default(); MAX_VIEWPORTS];
-                    let rects = self.state.vk_scissors_in(selects, &mut scissors);
-                    self.drawn.add(rects);
-                    // And its instance's, the one it recorded into.
-                    self.current.drawn.add(rects);
-                    // What it writes of each color, and blends, inside its Vulkan scissors
-                    // (`linear_attachment::Coverage`).
-                    // Of each pass color its draws store into: a state color where its routing
-                    // places it, and the pass colors its variant zeroes.
-                    match self.pipeline.as_ref().map(RenderPipelineState::kind) {
-                        Some(RenderStateKind::Graphics(state)) => {
-                            let colors = &state.base().graphics.color_attachments;
-                            let routing = self
-                                .shape_inputs()
-                                .routing(state)
-                                .map_err(|_| internal("a draw of a state its pass refuses"))?;
-                            let zeroed = !self
-                                .shape_inputs()
-                                .routed_colors(state, &routing)
-                                .zeroed
-                                .is_empty();
-                            let writes = linear_attachment::writes(colors);
-                            let writes = linear_attachment::pass_writes(&writes, &routing, zeroed);
-                            self.coverage.add(&writes, rects)
-                        }
-                        _ => self.coverage.everywhere(),
-                    }
-                }
+            self.add_drawn(selects)?;
+        }
+        // A replayed draw that met a notice announced at every occurrence must meet it again.
+        self.replay_plain &= !watch.met();
+        self.kept_again(
+            live,
+            &watch,
+            (reads, !empty && rasterizes, depth_writes),
+            checked,
+        );
+        Ok(())
+    }
+
+    /// Add the pixels a draw that rasterizes may write to the encoder's drawn area, its
+    /// instance's and its coverage: its viewports' within its scissors, every viewport where it
+    /// chooses one (`selects`) or an amplification offsets it, and anywhere through a rate map.
+    fn add_drawn(&mut self, selects: bool) -> Result<(), Error> {
+        if self.rate_map.is_some() {
+            self.drawn.everywhere();
+            self.coverage.everywhere();
+            return Ok(());
+        }
+        let selects = selects || self.amplification.offsets_viewports();
+        let mut scissors = [vk::Rect2D::default(); MAX_VIEWPORTS];
+        let rects = self
+            .state
+            .vk_scissors_in(&self.scissors, selects, &mut scissors);
+        self.drawn.add(rects);
+        // And its instance's, the one it recorded into.
+        self.current.drawn.add(rects);
+        // What it writes of each color, and blends, inside its Vulkan scissors
+        // (`linear_attachment::Coverage`).
+        // Of each pass color its draws store into: a state color where its routing places it,
+        // and the pass colors its variant zeroes.
+        match self.pipeline.as_ref().map(RenderPipelineState::kind) {
+            Some(RenderStateKind::Graphics(state)) => {
+                let colors = &state.base().graphics.color_attachments;
+                let Ok(routing) = self.shape_inputs().routing(state) else {
+                    self.again = Default::default();
+                    return Err(internal("a draw of a state its pass refuses"));
+                };
+                let zeroed = !self
+                    .shape_inputs()
+                    .routed_colors(state, &routing)
+                    .zeroed
+                    .is_empty();
+                let writes = linear_attachment::writes(colors);
+                let writes = linear_attachment::pass_writes(&writes, &routing, zeroed);
+                self.coverage.add(&writes, rects)
             }
+            _ => self.coverage.everywhere(),
         }
         Ok(())
     }
@@ -7153,6 +8639,7 @@ impl RenderLowering {
     /// [`draw`](Self::draw) with the heaps' textures resident.
     fn draw_resident(
         &mut self,
+        live: &mut LiveBind,
         call: &'static str,
         assembly: Assembly,
         mut draw: DrawCall,
@@ -7199,7 +8686,9 @@ impl RenderLowering {
         // Metal's answer there is not measured.
         if !self.rerouting && self.uses_memoryless(&pipeline.base().interface) {
             if self.replaying {
-                return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
+                return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                    IndirectRule::MemorylessTextureUse,
+                )));
             }
             self.core.fail_memoryless_use();
             return Ok(());
@@ -7229,7 +8718,7 @@ impl RenderLowering {
         // A draw that blends into or reads an extended-range color an earlier draw of the pass
         // wrote, or whose clear its codes cannot hold, starts the color's `half` shadow where it
         // can (`render/extended_shadow.rs`).
-        self.start_extended_shadows(&pipeline)?;
+        self.start_extended_shadows(live, &pipeline)?;
         // What the draw settles from the encoder's state, as an execution's precompile at commit
         // settles it (`draw_settings`).
         // An indexed strip the encoder's call restarts at another index than Vulkan's, and a draw
@@ -7237,28 +8726,12 @@ impl RenderLowering {
         // (`render/restart.rs`).
         // A draw under the last provoking vertex is drawn as a list on a device without it
         // (`render/provoking.rs`).
-        let provoking = self.provoking(call, &pipeline, assembly, &draw);
-        let provoking_forms = provoking.forms(assembly, &pipeline);
-        let restarted = self.restarted(assembly, &draw, provoking);
-        let private = match (assembly, restarted) {
-            (Assembly::Private(program), _) => PrivateForm::of(&pipeline, program, &draw),
-            (_, Some(_)) => PrivateForm::listed(&draw),
-            (_, None) => PrivateForm::default(),
-        };
-        let assembly = restarted.map_or(assembly, |r| r.assembly());
-        // Its settings, and the memo entry its draw state and pipeline are found and kept in
-        // (`render/draw_shape.rs`).
-        let (settings, hidden, shape_token) = self.shaped_settings(call, &pipeline, assembly)?;
-        // A direct indexed draw of a pipeline that writes the primitive ID runs its de-indexed
-        // variant; a restarted strip's list keeps the strip's indices, which it does not run.
-        let primitive_id_indices = match restarted {
-            None => primitive_id_indices(&pipeline, &draw),
-            Some(_) => None,
-        };
-        let (topology, primitive_restart) = (settings.topology, settings.primitive_restart);
-        let unsized_points = settings.unsized_points;
-        let (native, compensation) = (settings.native, settings.compensation);
-        let hidden_depth = settings.hidden;
+        // A line or a triangle's edge Apple's `setLineWidth:` widens is drawn by the device's
+        // lines or as the pipeline's band, a strip, loop or fan listed as its primitives, else by
+        // the device's lines at the nearest width they draw (`render/line_width.rs`); a draw of no
+        // complete primitive as every line.
+        let primitives = line_width::draws_primitives(assembly, &draw);
+        let mut routed = self.routed_draw(call, &pipeline, (assembly, primitives), &draw)?;
         let (_, stencil) = self.layout.aspects();
         let max = pipeline.base().graphics.max_vertex_amplification_count;
         let function_tables = pipeline.function_tables();
@@ -7277,58 +8750,127 @@ impl RenderLowering {
             [&self.vertex, &self.object, &self.mesh],
             &pipeline.base().interface,
         )?;
-        self.degrade_kept_colors(&pipeline, &settings.routing);
+        // Its routing is the same whatever its lines' route (`ShapeInputs::routing`).
+        self.degrade_kept_colors(&pipeline, &routed.settings.routing);
         // The pass colors the draw renders through views of other formats, in an instance of
         // its own (`next_instance`). Refused (`NotImplemented(IndirectRenderCommands)`) for an
         // execution's command, whose runs' framebuffers are the pass's.
-        let reformats = self.reformats(&pipeline, &settings.routing)?;
+        let reformats = self.reformats(&pipeline, &routed.settings.routing)?;
         if self.replaying && !reformats.is_empty() {
-            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
+            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                IndirectRule::ReformattedColor,
+            )));
         }
         // The encoder's kept bind state, brought to the draw's (`live_bind.rs`), held for the
         // draw: no draw of the encoder runs inside another past here.
-        let live = Arc::clone(&self.live);
-        let mut held = lock(&live);
-        let live = &mut *held;
-        // A draw that reads its pass's texture after a barrier inside its instance reads it
-        // through a snapshot where it can (`render/snapshot.rs`): asked of the plan, kept where
-        // the plan reads so, else `None` and the split.
-        let mut snapshot = self.snapshot_wanted(&pipeline, &reformats);
+        // A draw that reads its pass's texture at its own pixels and writes nothing of it reads
+        // it in place; else it reads it through a snapshot where it can (`render/snapshot.rs`),
+        // each with a barrier before it or without: asked of the plan, kept where the plan reads
+        // so, else `None` and the copy or the split.
+        let mut snapshot = self
+            .in_place_wanted(&pipeline, &reformats, &routed.settings)
+            .or_else(|| self.snapshot_wanted(&pipeline, &reformats));
+        // Weighed by what it covered when a pass last measured it, else by the area rule, and
+        // measured where the device measures readers: its drawing commands record inside the
+        // query (`render/coverage.rs`).
+        let mut covered_query = None;
+        if let Some(wanted) = snapshot.take() {
+            (snapshot, covered_query) = self.snapshot_by_area(&pipeline, wanted)?;
+        }
         // Its runtime samplers' address modes as the textures they sample map them: what it
         // settles under, and binds with.
         let sampler_maps = self.sampler_maps(&pipeline, &pass_start)?;
+        let settled = loop {
+            let settled = self.settle_draw(
+                live,
+                (
+                    &pipeline,
+                    &routed.settings,
+                    routed.primitive_id_indices,
+                    routed.private,
+                    routed.provoking_forms,
+                    &routed.far.pulled,
+                    (routed.region_viewports, routed.region_fan_out),
+                ),
+                (&pass_start, &sampler_maps),
+                (&mut argument_samplers, &mut unlisted),
+                (&function_tables, &mut snapshot),
+            );
+            // A band variant the translator refuses for the draw's own shape, past the one the
+            // state compiled for its first band: the draw takes the nearest width, routed again,
+            // as the state's later draws of the primitive do (`render/line_width.rs`). Routed
+            // again, it draws no band of the primitive, so it settles once more at most.
+            // A fan-out variant the translator refuses for the device's limits
+            // (`pipeline::link::fan_out`): the draw is drawn region by region, as every draw is
+            // under `RateMapRegionPolicy::Exact` (`render/fan_out.rs`). So it settles once more
+            // at most.
+            if let (Some(_), Err(Error::Unsupported(refused))) = (routed.region_fan_out, &settled) {
+                if refused.feature == ErrorFeature::RasterizationRateMap {
+                    routed.region_fan_out = None;
+                    continue;
+                }
+            }
+            let refused = settled
+                .as_ref()
+                .err()
+                .and_then(|e| routed.settings.line.refused(e));
+            let Some(primitive) = refused else {
+                break settled?;
+            };
+            pipeline.refuse_band(primitive);
+            routed = self.routed_draw(call, &pipeline, (assembly, primitives), &draw)?;
+        };
+        // What the state keeps for its next draw once this one recorded, where it settled afresh.
+        let (settled, found) = settled;
+        let settled_here =
+            (!found).then(|| SettledHere::new(&pipeline, self.forms, settled.clone()));
         let Settled {
             shape,
             variant,
             plan,
-        } = self.settle_draw(
-            live,
-            (
-                &pipeline,
-                &settings,
-                primitive_id_indices,
-                private,
-                provoking_forms,
-            ),
-            (&pass_start, &sampler_maps),
-            (&mut argument_samplers, &mut unlisted),
-            (&function_tables, &mut snapshot),
-        )?;
+            facts,
+        } = settled;
+        let RoutedDraw {
+            provoking,
+            restarted,
+            private,
+            assembly,
+            settings,
+            hidden,
+            shape_token,
+            far,
+            ..
+        } = routed;
+        // Whether a restate by the encoder's scissor rectangles alone may take them alone, where
+        // the draw is kept (`Kept::restates_by_scissors`): its route meets every condition of a
+        // restate (`render/draw_again/restated.rs`).
+        let restates_by_scissors = settings.failing_state.is_none()
+            && hidden.is_none()
+            && restarted.is_none()
+            && matches!(
+                provoking,
+                provoking::Provoking::AsIs | provoking::Provoking::Native
+            );
+        let (topology, primitive_restart) = (settings.topology, settings.primitive_restart);
+        let unsized_points = settings.unsized_points;
+        let (native, compensation) = (settings.native, settings.compensation);
+        let hidden_depth = settings.hidden;
         let planes = |form: &ExtendedRange| matches!(form, ExtendedRange::Planes { .. });
         if plan.variant.extended_range.values().any(planes) {
-            self.core.device().shared().counts.two_plane_draw();
+            self.core.counts().two_plane_draw();
         }
         match provoking {
             provoking::Provoking::AsIs => {}
-            provoking::Provoking::Native => self
-                .core
-                .device()
-                .shared()
-                .counts
-                .provoking_last_pipeline_draw(),
+            provoking::Provoking::Native => self.core.counts().provoking_last_pipeline_draw(),
             provoking::Provoking::Listed(_) | provoking::Provoking::LastCorners => {
-                self.core.device().shared().counts.provoking_listed_draw()
+                self.core.counts().provoking_listed_draw()
             }
+        }
+        match settings.line {
+            LineRoute::Plain => {}
+            LineRoute::Device { .. } => self.core.counts().device_wide_line_draw(),
+            LineRoute::Band { .. } => self.core.counts().line_band_draw(),
+            LineRoute::Nearest { .. } => self.core.counts().nearest_width_line_draw(),
         }
         self.give_up_extended_shadows(&pipeline, &live.state);
         // The draw's primitive type: a vertex function that writes the primitive ID divides by its
@@ -7348,8 +8890,45 @@ impl RenderLowering {
             amplification,
             routing,
             ..
-        } = &settings;
+        } = &*settings;
         let graphics = &variant.pipeline().graphics;
+        // A fan-out variant's draw, or its probe (`render/fan_out.rs`). The probe's run records
+        // its probes alone: a draw whose variant does not fan out, or whose vertex function
+        // writes memory (the probe and the draw would each run it), records nothing there, and the
+        // routes' run draws it region by region. A draw through its region-copy variant draws
+        // region by region (`render/fan_out.rs`, **Region-copy variant**).
+        let writes = graphics.vertex_writes_memory || graphics.fragment_writes_memory;
+        let fans = (variant.key().region_fan_out).filter(|_| !graphics.vertex_writes_memory);
+        let region_copies = fans == Some(RegionFanOut::RegionCopies);
+        self.fanned = (fans.is_some() && !region_copies, writes);
+        self.boxed = region_copies && self.boxed_reach().is_some();
+        if fans.is_none()
+            && self
+                .fan_run
+                .as_ref()
+                .is_some_and(fan_out::FanOutRun::probes)
+        {
+            return Ok(());
+        }
+        // A fan-out draw's region table, and a probe's flags.
+        let fan_buffers = match fans {
+            Some(_) => Some(binding::FanOutBuffers {
+                regions: self.fan_table_bound()?,
+                flags: self.fan_run.as_ref().and_then(fan_out::FanOutRun::flags),
+            }),
+            None => None,
+        };
+        // A fan-out draw's work is its vertices, its triangles' geometry stage and the copies the
+        // probe counted (`rate_mapped_pass::fan_out_work`); a draw through its region-copy
+        // variant's, its region draws (`DrawState::region_draws`), each recording pushing its first
+        // region.
+        let region_offset = (graphics.region_fan_out)
+            .filter(|fan| fan.mode == RegionFanOut::RegionCopies)
+            .map(|fan| fan.push_offset);
+        let fan_copies = match fans {
+            Some(RegionFanOut::Draw | RegionFanOut::DrawFew) => self.fan_out.map(|fan| fan.copies),
+            Some(RegionFanOut::Probe | RegionFanOut::RegionCopies) | None => None,
+        };
         // A fragment function that runs the draw's depth test itself computes and clamps its
         // depth by the draw's own Vulkan depth range, read as push data.
         if graphics.shader_tests.is_some() {
@@ -7398,6 +8977,51 @@ impl RenderLowering {
                 });
             }
         }
+        // A draw under a visibility result whose fragment function writes its sample mask under
+        // early tests, where the device may count after the mask, runs announced
+        // (`visibility.rs`).
+        if graphics.early_fragment_tests && graphics.writes_sample_mask && self.visibility.active()
+        {
+            let device = self.core.device();
+            let limits = device.compile_device().profile().limits();
+            if !limits.early_fragment_multisample_coverage_after_sample_counting {
+                self.core.counts().draw_counted_past_early_mask();
+                device.degrade(Degradation::VisibilityPastEarlyMask, || {
+                    (
+                        format!(
+                            "{call}: a draw whose fragment function writes its sample mask under \
+                             early tests, under a visibility result"
+                        ),
+                        "the device does not state \
+                         earlyFragmentMultisampleCoverageAfterSampleCounting, so its occlusion \
+                         query may count after the fragment function's sample mask"
+                            .to_owned(),
+                    )
+                });
+            }
+        }
+        // A draw that pulls a fixed-function layout the device would fetch past 4 GiB wrapped is
+        // counted; one that leaves such a layout to it where GPU memory states the reach, under
+        // the bounded policy, runs announced (`render/vertex_reach.rs`).
+        if !far.pulled.is_empty() {
+            self.core.counts().far_vertex_fetch_pulled_draw();
+        }
+        if let Some(buffer_index) = far.unchecked {
+            self.core
+                .device()
+                .degrade(Degradation::VertexFetchMayWrap, || {
+                    (
+                        format!(
+                        "{call}: vertex buffer {buffer_index}, fetched in fixed function by a draw \
+                         whose indices or arguments state how far it fetches"
+                    ),
+                        "the device's fixed-function vertex input takes an element's displacement \
+                     modulo 2^32, and the policy pulls a layout only where the draw's own values \
+                     reach past it (VertexReachPolicy::Bounded)"
+                            .to_owned(),
+                    )
+                });
+        }
         // The pass's fragment imageblock storage: one cell's and alignment's, and no tile
         // dispatch's aliased layout past the attachments beside it (`fragment_imageblock.rs`).
         let imageblock_use = graphics.fragment_imageblock;
@@ -7415,13 +9039,14 @@ impl RenderLowering {
                 return Err(Error::NotImplemented(RuntimeGap::ImageblockMasters));
             }
         }
-        // Over the last draw's commands, in their storage (`LiveBind::commands`).
+        // Over the last draw's commands, in their storage (`LiveBind::commands`), but for the heap
+        // tables, which its heap part holds (below).
         // A private type's list in the private list form is drawn without indices (`listed_call`).
         let bound = match (private.private_list, restarted) {
             (true, Some(restarted)) => listed_call(restarted.program, &draw),
             _ => draw,
         };
-        plan.instantiate_draw_into(&live.state, &bound, &mut live.commands)
+        plan.instantiate_draw_apart_into(&live.state, &bound, &mut live.commands)
             .map_err(Error::Bind)?;
         // A mesh draw's own key, its residual form where the plan's is (`RenderVariant::plan`).
         if let Some(own) = live.commands.specialization.as_mut() {
@@ -7433,15 +9058,16 @@ impl RenderLowering {
         }
         let commands = &live.commands;
         // The phase of a draw read through snapshots, which its two draws set
-        // (`render/snapshot.rs`).
+        // (`render/snapshot.rs`); a draw read in place has none.
+        let in_place = snapshot.as_ref().is_some_and(|w| w.in_place);
         let phase_hole = match &snapshot {
-            Some(_) => Some(
+            Some(_) if !in_place => Some(
                 snapshot::phase_hole(&commands.push_holes)
                     .ok_or_else(|| internal("a snapshot variant without its phase"))?,
             ),
-            None => None,
+            _ => None,
         };
-        self.reaches_unnamed |= !commands.root_tables.is_empty() || reads_handles(&plan);
+        self.reaches_unnamed |= !commands.root_tables.is_empty() || facts.reads_handles();
         // A mesh draw the binder launches no threadgroup of (as plain Metal draws nothing).
         let empty = empty
             || matches!(
@@ -7465,12 +9091,26 @@ impl RenderLowering {
             self.core.command_buffer().state().mesh_grid_past_limits();
         }
         // Set 1, the heap: its writes at the elements of their resource IDs, and the device's
-        // texture and sampler tables at the handle tables.
+        // texture and sampler tables at the handle tables. Its heap part kept while what it is
+        // made of holds (`render/heap_part.rs`).
         let compiled = variant.pipeline();
-        let heap = heap_sets::heap_elements(&compiled.layout, &plan, &live.state)?;
+        let heap = live.heap.bring_in(
+            self.core.counts(),
+            heap_part::HeapInputs {
+                plan: &plan,
+                layout: &compiled.layout,
+                generation: self.residency.generation(),
+                listed_at: live.listed_at,
+                state: &live.state,
+            },
+        )?;
+        // Whether it reads a texture its tables bind at a heap slot, which a kept recording's key
+        // does not hold (`render/heap_part.rs`).
+        let slot_textures = live.heap.binds_slot_textures();
         let texture_table = heap_sets::texture_table(self.core.device(), &compiled.layout)?;
         let sampler_table =
             heap_sets::sampler_table(self.core.device(), &compiled.layout, &compiled.dependencies)?;
+        (variant.objects()).bind_sampler_tables(&compiled.layout, &compiled.dependencies);
         // The arguments are GPU memory an earlier command may write; the exact paths are GPU
         // passes over them. The index bounds pass is one (`index_bounds.rs`). An indexed indirect
         // draw takes it where the binder asks for its arguments on the CPU only for its index
@@ -7801,10 +9441,25 @@ impl RenderLowering {
         // The instance the draw records into, and what stands in for the pass's attachments from
         // the draw on: the encoder's layout once the draw is recorded.
         let storage = self.storage_attachments(graphics)?;
-        let colors_ordered =
-            (device.properties().driver_facts).contains(&DriverFact::InterlockOrdersDraws);
-        let (interlocked, interlocked_writes) =
-            InterlockedStorage::of(graphics, &storage, colors_ordered);
+        let driver_facts = &device.properties().driver_facts;
+        let colors_ordered = driver_facts.contains(&DriverFact::InterlockOrdersDraws);
+        // The shadows a draw of a pass that fetches through input attachments reads and writes
+        // in the interlock (`render/extended_shadow.rs`), where the storage form holds none.
+        let shadows = self.layout.fetch_inputs && !live.state.extended_shadows.is_empty();
+        let between_draws = self.layout.fetch_inputs
+            && framebuffer_fetch::inputs_between_draws(device.compile_device().profile());
+        let (interlocked, interlocked_writes) = InterlockedStorage::of(
+            graphics,
+            (&storage, shadows),
+            (colors_ordered, between_draws),
+        );
+        // On a driver whose draws of one instance race on the interlocked storage under load
+        // (`DriverFact::InterlockedDrawsRaceUnderLoad`), a draw that reaches interlocked storage
+        // an earlier draw of the instance wrote records into a new instance, after the one that
+        // wrote it, in place of the barrier between them (`InterlockedStorage`). Input
+        // attachments ordered between draws alone take their barrier there too.
+        let storage_split = interlocked.meets_interlocked(self.current.interlocked_writes)
+            && driver_facts.contains(&DriverFact::InterlockedDrawsRaceUnderLoad);
         let failing = match &failing_state {
             None => None,
             Some(state) => {
@@ -7839,7 +9494,9 @@ impl RenderLowering {
         // stand-in's copies (not built).
         let tests_use = graphics.shader_tests;
         if tests_use.is_some() && self.replaying {
-            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
+            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                IndirectRule::ShaderDepthTest,
+            )));
         }
         // The stencil the draw tests in the shader, held in the pass's shadow of it: a returned
         // `[[stencil]]`'s (the shader-side stencil), or, for a function that runs the draw's
@@ -7864,11 +9521,34 @@ impl RenderLowering {
         // has begun its render pass instance with no color in the feedback loop layout, so the
         // draw records into a new one (`render/snapshot.rs`). So does a draw that binds a texture
         // the current instance holds in that layout as a storage image.
-        let attached = !self.replaying && snapshot.is_none() && self.samples_attachment(&plan);
-        let after_barrier = attached && (self.current.barriers || self.barrier);
+        // One that samples a color the pass clears, before any draw of the pass, reads a copy
+        // cleared to the clear before the pass where that can be (`texture/attached_reads.rs`),
+        // with a memory barrier before the pass's first draw or none. Else, after such a barrier,
+        // which puts the pass's load actions before the draw, it records into an instance after
+        // the pass's first, which runs the clear, and the copy is taken between; with no barrier
+        // it reads the copy taken before the pass.
+        let attached = !self.replaying
+            && snapshot.is_none()
+            && self.samples_attachment(&facts, Texture::attached_among);
+        let clears = attached && self.samples_attachment(&facts, Texture::cleared_among);
+        let copy_clears = clears.then(|| self.cleared_copies(&facts, call)).flatten();
+        let behind_loads = clears && self.loads_ordered && copy_clears.is_none();
+        // Such a draw keeps nothing to draw again: its copy's clear, or its split, is its own
+        // (`render/draw_again.rs`).
+        let reads_clear = behind_loads || copy_clears.is_some();
+        // A draw after a barrier inside the instance that reads nothing the instance drew reads
+        // the copy taken before the instance, which holds what a split's would.
+        let inside = attached && self.current.barriers && !self.barrier && !behind_loads;
+        let spared = inside
+            && !self.reads_what_the_instance_drew((&device, call), &facts, (&*plan, compiled));
+        let after_barrier =
+            (attached && (self.current.barriers || self.barrier) && !spared) || behind_loads;
         let snapshot_split = snapshot.as_ref().is_some_and(|w| self.snapshot_apart(w));
-        let storage_colors = self.storage_colors(&plan);
-        let apart = snapshot_split || storage_colors & self.current.feedback.0 != 0;
+        // A draw whose snapshots lead its instance records first into a new one, which the
+        // leading render pass instance goes before (`render/snapshot.rs`, leading snapshots).
+        let leading = snapshot.as_ref().is_some_and(|w| w.leading);
+        let storage_colors = self.storage_colors(&facts);
+        let apart = snapshot_split || leading || storage_colors & self.current.feedback.0 != 0;
         // A draw that writes a memoryless color the pass renders in place, which no instance
         // recorded inline writes: the pass's first draw that records keeps its first instance in
         // a secondary, and a later one records into a new instance after the inline one
@@ -7881,7 +9561,11 @@ impl RenderLowering {
             (&fetched, Some(&pipeline)),
             (stencil_use.is_some(), tests_use.is_some()),
             views,
-            (ordered || after_barrier || apart || first_write) && !self.replaying,
+            (
+                (ordered || storage_split || after_barrier || apart || first_write)
+                    && !self.replaying,
+                behind_loads,
+            ),
             hidden,
             &routing.locations,
             &reformats,
@@ -7890,13 +9574,23 @@ impl RenderLowering {
             device.shared().counts.inline_memoryless_write_split();
         }
         if attached {
-            device.shared().counts.attachment_read_through_copy();
+            self.core.counts().attachment_read_through_copy();
         }
         if after_barrier && matches!(next, Next::New { split: true, .. }) {
             device.shared().counts.attachment_read_split();
         }
-        if snapshot.is_some() {
-            device.shared().counts.reading_draw_snapshotted();
+        if spared {
+            device.shared().counts.attachment_read_split_spared();
+        }
+        match &snapshot {
+            Some(wanted) if wanted.in_place => device.shared().counts.reading_draw_in_place(),
+            Some(wanted) => {
+                device.shared().counts.reading_draw_snapshotted();
+                if wanted.leading {
+                    device.shared().counts.reading_draw_snapshotted_leading();
+                }
+            }
+            None => {}
         }
         let inline = self.current.inline;
         if snapshot_split && inline && matches!(next, Next::New { split: true, .. }) {
@@ -7928,13 +9622,23 @@ impl RenderLowering {
         if self.rerouting && !matches!(next, Next::Current) {
             return Err(Error::NotImplemented(RuntimeGap::Render));
         }
-        // So does one whose command's barrier stands (`run_barrier`).
-        let next = match (self.replaying && (ordered || self.run_barrier), next) {
+        // So does one whose command's barrier stands (`run_barrier`), one that reaches
+        // interlocked storage an earlier command of the run wrote where the driver's draws race
+        // on it (`storage_split`), and one after the work a piece of a rate-mapped pass holds
+        // (`piece_split`), whose run begins the next piece.
+        let mut next = match (
+            self.replaying && (ordered || storage_split || self.run_barrier || self.piece_split),
+            next,
+        ) {
             (true, Next::Current) => self.next_run()?,
             (_, next) => next,
         };
+        if let (true, Next::New { instance, .. }) = (self.piece_split, &mut next) {
+            instance.piece = true;
+        }
         let split = matches!(next, Next::New { split: true, .. });
         let tile_memory_split = ordered && split;
+        let interlocked_split = storage_split && !ordered && split;
         let run_barrier_split = self.run_barrier && !ordered && split;
         // The query that continues the active one past a split.
         let continuation = match &next {
@@ -8011,21 +9715,21 @@ impl RenderLowering {
             None => None,
         };
         // The pass's tile memory, made at its first draw or dispatch that reads it.
-        let tile_buffer = plan
-            .descriptors
-            .iter()
-            .find_map(|write| match write.source {
-                WriteSource::TileMemory { bytes } => Some(bytes),
-                _ => None,
-            })
+        let tile_buffer = (facts.tile_memory())
             .map(|bytes| self.tile_memory.buffer(&device, bytes))
             .transpose()?;
         // A draw that reads through snapshots binds each slot's snapshot in the form its plan
         // names, made at the first draw that takes it so and kept with the texture
-        // (`render/snapshot.rs`).
+        // (`render/snapshot.rs`). Each slot of a draw that reads in place binds its texture in
+        // the feedback loop layout, with no snapshot.
         let mut snapshot_texels = Vec::new();
         let snapshot_views = match &snapshot {
             None => None,
+            Some(wanted) if wanted.in_place => Some(binding::SnapshotViews {
+                slots: wanted.slots.clone(),
+                views: Vec::new(),
+                feedback: true,
+            }),
             Some(wanted) => {
                 let mut views = Vec::with_capacity(wanted.slots.len());
                 for &slot in &wanted.slots {
@@ -8043,6 +9747,7 @@ impl RenderLowering {
                 Some(binding::SnapshotViews {
                     slots: wanted.slots.clone(),
                     views,
+                    feedback: !wanted.leading,
                 })
             }
         };
@@ -8091,7 +9796,21 @@ impl RenderLowering {
             (Stage::Object, pass_start.or(Stage::Object, &self.object)),
             (Stage::Mesh, pass_start.or(Stage::Mesh, &self.mesh)),
         ];
-        let mut tables = binding::Tables::new(&stages)
+        // The sampled slots that read the levels of their texture apart from the attached ones
+        // in place of its copy (`render/attached_levels.rs`), in the instance the draw records
+        // into.
+        let feedback = match &next {
+            Next::Current => self.current.feedback,
+            Next::New { instance, .. } => instance.feedback,
+        };
+        let narrowed = match attached {
+            true => {
+                let parts = (&*plan, variant.pipeline());
+                self.attached_slots(&device, parts, &stages, (feedback, true))
+            }
+            false => binding::NarrowedSlots::default(),
+        };
+        let mut untwinned = binding::Tables::new(&stages)
             .with_pass(layout, views)
             .with_residency(&self.residency)
             .with_texture_table(texture_table.as_ref())
@@ -8099,13 +9818,24 @@ impl RenderLowering {
             .with_sampler_maps(sampler_maps);
         // The listed function tables: set 1's elements, or the snapshot a variant without the
         // function-table array reads in set 0, which has no heap of its own.
-        tables = tables.with_function_tables(&function_tables);
+        untwinned = untwinned.with_function_tables(&function_tables);
         if attached {
-            tables = tables.with_attachments(layout);
+            untwinned = untwinned.with_attachments(layout).with_narrowed(&narrowed);
         }
         if let Some(views) = &snapshot_views {
-            tables = tables.with_snapshots(views);
+            untwinned = untwinned.with_snapshots(views);
         }
+        // The slots the draw only reads through read twins (`read_twin.rs`), apart from the
+        // texture slots it reads through snapshots, narrowed or attached.
+        let cb = self.core.command_buffer();
+        let roots = !commands.root_tables.is_empty();
+        let twins = facts
+            .twins()
+            .slots(cb, (&*plan, &commands.uses, roots), &untwinned);
+        let mut tables = match &twins {
+            Some(twins) => untwinned.with_twins(twins),
+            None => untwinned,
+        };
         if let Some(heap) = &heap {
             // Taken as the draw settled: its variant has set-1 arrays.
             let states = argument_samplers
@@ -8179,6 +9909,18 @@ impl RenderLowering {
             .map(|dispatch| tessellation_scan::TessellationWork::new(&self.core, dispatch))
             .transpose()?;
         let pipeline_objects = variant.pipeline();
+        // Whether a function that reads a root table may write memory: a vertex or fragment
+        // function the compile found storing nothing writes none (`vertex_writes_memory`,
+        // `fragment_writes_memory`), and any other stage (an object or mesh function, a
+        // synthesized one) has no such proof.
+        let root_writes = graphics.vertex_writes_memory
+            || graphics.fragment_writes_memory
+            || (pipeline_objects.stages.iter()).any(|module| {
+                !matches!(
+                    module.stage,
+                    metal2vulkan::vk::ShaderStage::VERTEX | metal2vulkan::vk::ShaderStage::FRAGMENT
+                )
+            });
         let mut blobs = Vec::new();
         for (index, module) in pipeline_objects.stages.iter().enumerate() {
             // A tessellation pipeline's synthesized stages are its vertex function's.
@@ -8202,14 +9944,19 @@ impl RenderLowering {
                 blobs.push((stage, blob));
             }
         }
+        // Its heap part's heap tables, and its writes past the heap's entries listed of it
+        // (`render/heap_part.rs`).
+        let (heap_tables, past_heap) = live.heap.brought_in()?;
         let command = binding::Command {
             descriptor_bytes: &commands.descriptor_bytes,
+            heap_tables,
             descriptor_ranges: &commands.descriptor_ranges,
             root_tables: commands
                 .root_tables
                 .iter()
                 .map(|(stages, table)| (*stages, table))
                 .collect(),
+            root_writes,
             push_holes: &commands.push_holes,
             uses: &commands.uses,
             blobs,
@@ -8217,24 +9964,59 @@ impl RenderLowering {
             tessellation: tessellation_work
                 .as_ref()
                 .map(tessellation_scan::TessellationWork::regions),
+            fan_out: fan_buffers,
         };
         let (index, indirect) = (buffers.index.as_ref(), buffers.indirect.as_ref());
-        // Over the last draw's uses, in their storage (`LiveBind::uses`).
-        binding::command_uses_into(
-            call,
-            (&plan, &command, &tables),
-            (
-                index.map(DrawSource::metal),
-                indirect.map(DrawSource::metal),
-            ),
-            &mut live.uses,
-        )?;
+        // Over the last draw's uses, in their storage (`LiveBind::uses`), those of what the
+        // encoder made resident kept where they are the last draw's.
+        let sources = (
+            index.map(DrawSource::metal),
+            indirect.map(DrawSource::metal),
+        );
+        let parts = (&plan, &command, &tables);
+        binding::command_uses_into(call, parts, sources, &mut live.uses)?;
+        // A narrowed slot whose levels a write of the draw's own meets: every one takes its copy,
+        // its uses made again (`render/attached_levels.rs`).
+        let narrowed_slots = narrowed.kinds();
+        let written = narrowed.len() > 0 && narrowed.written_by(&live.uses);
+        if written {
+            narrowed.withdraw();
+            binding::command_uses_into(call, parts, sources, &mut live.uses)?;
+        }
+        self.count_narrowed(narrowed_slots, written);
+        // The shadowed textures the draw binds, at the first draw of each, its shadow made now
+        // (`shadow_log.rs`).
+        crate::shadow_log::drew(&device, variant.pipeline(), &stages);
+        let resident_made = live.uses.made() as u64;
+        let counts = self.core.counts();
+        if resident_made > 0 {
+            counts.resident_uses_made(resident_made);
+        }
+        counts.resident_keys_settled(live.uses.settled() as u64);
+        // How many it holds of its plan's alone: a draw rebound works out those alone.
+        let plan_uses = live.uses.len();
         let uses = &mut live.uses;
         // A use of an attachment's memory other than as the attachment, inside its instance,
         // which no copy serves (`texture/attached_reads.rs`): a draw that reads through snapshots
         // reads no attachment otherwise (`snapshot_holds`).
         if snapshot.is_none() {
-            device.degrade_attachment_reads(call, layout, uses)?;
+            // The encoder's layout's attachments as its memo keeps them; a stand-in's, which has
+            // no version, one at a time.
+            let version = stood.is_none().then(|| self.layout.version());
+            let memo = &mut self.attached;
+            let mut shares = |uses: &[Use<ResourceKey>]| match version {
+                Some(version) => memo.shares((layout, version), uses),
+                None => render_target::shares_attachment(layout, uses),
+            };
+            match uses.prefix() {
+                None => self.core.degrade_attachment_reads(call, shares, uses)?,
+                Some(prefix) => {
+                    let uses = (&mut *uses, prefix);
+                    let shares = (&mut shares, version);
+                    self.core
+                        .degrade_resident_attachment_reads(call, shares, uses)?;
+                }
+            }
         }
         // In a pass of several color groups, what the draw reads of what another group writes
         // (`render/color_groups.rs`): checked at its first recording.
@@ -8250,10 +10032,18 @@ impl RenderLowering {
         if let Some(stand_in) = stand_in {
             uses.extend(stand_in.draw_uses()?);
         }
-        uses.extend(self.extended.draw_uses(&plan)?);
+        uses.extend(self.extended.draw_uses(facts.extended())?);
         if let Some(imageblock) = imageblock {
             uses.extend(imageblock.draw_uses()?);
         }
+        // A direct draw that reads through snapshots, and whose every use but its snapshots'
+        // writes nothing, writes its pass's colors and its snapshots alone: where it records into
+        // its instance as it stood (below), it forgets only the kept draws that read them
+        // (`render/draw_again.rs`).
+        let snapshots_alone = matches!(&snapshot, Some(wanted) if !wanted.in_place)
+            && !self.replaying
+            && !self.rerouting
+            && uses.iter().all(|used| used.write.is_empty());
         uses.extend(snapshot_texels.iter().map(Texture::snapshot_use));
         // A draw that names a detached buffer records nothing: its submission fails.
         let named = uses
@@ -8265,29 +10055,21 @@ impl RenderLowering {
             return Ok(());
         }
         // The shadowed textures the draw uses, copied around its instance (`render/shadows.rs`).
-        let textures = self
-            .vertex
-            .textures
-            .values()
-            .chain(self.fragment.textures.values())
-            .chain(self.object.textures.values())
-            .chain(self.mesh.textures.values())
-            .chain(self.residency.textures());
-        let mut draw_shadows = shadow::shadow_uses(textures, uses);
-        // A draw that reads an attachment's texture at its fragments' own pixels alone copies in
-        // only the texels around its scissors (`texture/attached_reads.rs`).
-        if attached {
-            let selects = graphics.writes_viewport_index || self.amplification.offsets_viewports();
-            let compiled = variant.pipeline();
-            if self.bound_own_pixel_reads(&plan, compiled, selects, &mut draw_shadows) {
-                device.shared().counts.own_pixel_read();
-            }
+        let resident = live.shadows.of(&device, &self.residency);
+        let reading = attached.then(|| (&*plan, variant.pipeline()));
+        let (draw_shadows, own_pixel) = self.draw_shadows(resident, uses, reading);
+        if own_pixel {
+            self.core.counts().own_pixel_read();
         }
         if self.replaying && !self.gathered().covers(&draw_shadows) {
-            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
+            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                IndirectRule::UngatheredShadow,
+            )));
         }
-        // Over the last draw's, in their storage (`LiveBind::vertex_buffers`).
+        // Over the last draw's, in their storage (`LiveBind::vertex_buffers`), with where their
+        // spaces start (`LiveBind::vertex_starts`).
         live.vertex_buffers.clear();
+        live.vertex_starts.clear();
         for bind in &plan.vertex_buffers {
             let table = pass_start.or(Stage::Vertex, &self.vertex);
             let offset = commands
@@ -8316,6 +10098,7 @@ impl RenderLowering {
                 (None, None) => return Err(internal("the plan binds an unbound vertex buffer")),
             };
             (live.vertex_buffers).push((bind.binding, raw, start + offset, stride.unwrap_or(0)));
+            live.vertex_starts.push(start);
         }
         let vertex_buffers = &live.vertex_buffers[..];
         // Its draw state: the one an earlier draw of the variant derived under the same settings'
@@ -8328,10 +10111,14 @@ impl RenderLowering {
             viewports,
             depth,
         } = match kept_state {
-            Some(kept) => {
+            // Through the scissor rectangles the draw finds, which no other piece of it reads
+            // (`ScissorRects`).
+            Some(mut kept) => {
+                let selects = graphics.writes_viewport_index;
+                kept.state.scissors = self.state.vk_scissors(&self.scissors, selects);
                 debug_assert!(
                     (self.shape_inputs())
-                        .draw_state(graphics, &settings, failed)
+                        .draw_state(graphics, &settings, failed, &self.scissors)
                         .is_ok_and(|fresh| fresh == kept),
                     "a draw's state derived again differs from the one kept for its inputs"
                 );
@@ -8340,7 +10127,7 @@ impl RenderLowering {
             None => {
                 let watch = EachWatch::start();
                 let inputs = self.shape_inputs();
-                let shaped = inputs.draw_state(graphics, &settings, failed)?;
+                let shaped = inputs.draw_state(graphics, &settings, failed, &self.scissors)?;
                 // Kept where its derivation announced nothing at each occurrence.
                 if let (Some(token), false) = (shape_token, watch.met()) {
                     self.shape_memo.keep_state(token, &variant, &shaped);
@@ -8348,15 +10135,99 @@ impl RenderLowering {
                 shaped
             }
         };
-        let fixed = draw_state.fixed;
+        let mut fixed = draw_state.fixed;
+        // Where its plan's variant draws them so, the draw records those regions several at a
+        // time (`region_batch`).
+        let batch = region_batch(&variant, &device)?;
+        // A draw through its region-copy variant draws as many regions a recording as a
+        // multi-draw takes where it is direct, else one (`render/fan_out.rs`, **Region-copy
+        // variant**).
+        let direct_call = matches!(draw, DrawCall::Primitives { .. } | DrawCall::Indexed { .. });
+        let copy_batch = match (direct_call, &device.shared().multi_draws) {
+            (true, Some(multi)) => multi.copies(),
+            _ => 1,
+        };
         // A rate-mapped pass records the draw once per region of the map's layer of the slice
         // it renders (`rate_mapped_pass.rs`): each amplification drawn one at a time its own
         // slice's, else the draw's one slice, or none known where its primitives choose.
         // `draw_states` holds the recordings of each amplification drawn alone, in order, or of
         // the whole draw.
-        let mut draw_states = match &self.rate_map {
-            None => DrawStates::Whole([draw_state]),
-            Some(pass) => DrawStates::Regions({
+        let mut draw_states = match (&self.rate_map, fans) {
+            (None, _) => DrawStates::Whole([draw_state]),
+            // A draw through its region-copy variant records boxes of the table's regions, each
+            // recording pushing its box and drawing as many regions of it as a direct draw's
+            // multi-draw takes, else one, its rows in order; it sets one viewport, over the render
+            // area of the draw's depth range, and its box's scissor (`render/fan_out.rs`,
+            // **Region-copy variant**).
+            (Some(_), Some(_)) if region_copies => {
+                let depth = (draw_state.viewports.iter().next())
+                    .map_or([0.0, 1.0], |v| [v.min_depth, v.max_depth]);
+                let (viewport, _) = fan_out::target(render_area, depth);
+                let Some((_, Some((_, scissors, grid)))) = &self.fan_table else {
+                    return Err(internal(
+                        "a draw through its region-copy variant without its region table",
+                    ));
+                };
+                // A run of a flagged draw's blocks draws only the regions its bounds reach, in
+                // boxes (`fan_out::run_boxes`), and a boxed draw those its triangles reach; any
+                // other draw every region.
+                let boxes = match (self.run_bounds, self.boxed_reach()) {
+                    (Some(bounds), _) => {
+                        let boxes = fan_out::run_boxes(*grid, bounds);
+                        let regions = boxes.iter().map(fan_out::RegionBox::regions).sum();
+                        let every = regions == scissors.len() as u64;
+                        device.shared().counts.rate_map_run_regions(regions, every);
+                        boxes
+                    }
+                    (None, Some(reach)) => {
+                        device.shared().counts.rate_map_boxed_draw();
+                        fan_out::run_boxes(*grid, reach)
+                    }
+                    (None, None) => vec![fan_out::RegionBox::whole(*grid)],
+                };
+                // Several columns, or rows, a recording where no sample of the pass lies on the
+                // borders between them (`fan_out::folds`).
+                let (layout, standard) = (&self.layout, device.shared().standard_sample_locations);
+                let folds = fan_out::folds(standard, layout.samples, &layout.sample_positions);
+                let [nx, _] = *grid;
+                let recordings: Vec<DrawState> = (boxes.into_iter())
+                    .flat_map(|whole| fan_out::box_recordings(whole, nx, copy_batch, folds))
+                    .map(|boxed| {
+                        let scissor = boxed
+                            .scissor(scissors, nx)
+                            .ok_or_else(|| internal("a box of regions past its region table's"))?;
+                        Ok(DrawState {
+                            viewports: ViewportList::One(viewport),
+                            scissors: ViewportList::One(scissor),
+                            fixed: FixedState {
+                                viewports: 1,
+                                ..draw_state.fixed
+                            },
+                            draws: boxed.columns * boxed.rows,
+                            region_box: Some([boxed.first, boxed.columns]),
+                            ..draw_state.clone()
+                        })
+                    })
+                    .collect::<Result<_, Error>>()?;
+                device
+                    .shared()
+                    .counts
+                    .rate_map_region_copy_draw(recordings.len() as u64);
+                DrawStates::Regions(vec![recordings])
+            }
+            // A fan-out draw, or its probe, records once, through one viewport over the render
+            // area of the draw's depth range (`render/fan_out.rs`).
+            (Some(_), Some(_)) => {
+                let depth = (draw_state.viewports.iter().next())
+                    .map_or([0.0, 1.0], |v| [v.min_depth, v.max_depth]);
+                let (viewport, scissor) = fan_out::target(render_area, depth);
+                DrawStates::Whole([DrawState {
+                    viewports: ViewportList::One(viewport),
+                    scissors: ViewportList::One(scissor),
+                    ..draw_state
+                }])
+            }
+            (Some(pass), None) => DrawStates::Regions({
                 let length = self.render_target_array_length;
                 let slices: Vec<Option<u32>> =
                     match pipeline.vertex_chooses_slice() || views.view_mask != 0 {
@@ -8374,31 +10245,24 @@ impl RenderLowering {
                         let regions = pass.draws(
                             slice,
                             &viewports[0],
-                            self.state.first_scissor(),
+                            self.scissors.first(),
                             graphics,
                             &device.shared().region_limits,
                             render_area,
                         )?;
-                        Ok(regions
-                            .into_iter()
-                            .map(|(viewport, scissor)| {
-                                let [min_depth, max_depth] =
-                                    depth.unwrap_or([viewport.min_depth, viewport.max_depth]);
-                                DrawState {
-                                    viewports: ViewportList::One(vk::Viewport {
-                                        min_depth,
-                                        max_depth,
-                                        ..viewport
-                                    }),
-                                    scissors: ViewportList::One(scissor),
-                                    ..draw_state.clone()
-                                }
-                            })
-                            .collect())
+                        Ok(region_states(&regions, batch, &draw_state, depth))
                     })
                     .collect::<Result<_, Error>>()?
             }),
         };
+        // Its `VkPipeline` takes as many viewports as each of its commands sets, whatever the
+        // map's regions (`region_states`).
+        if let Some(batch) = batch {
+            fixed.viewports = batch as u32;
+        }
+        if region_copies {
+            fixed.viewports = 1;
+        }
         // A draw that reaches no fragment runs its vertex function alone, through empty scissors,
         // and so do unsized points.
         if failing == Some(FailingDraw::Untouched) || unsized_points {
@@ -8412,7 +10276,12 @@ impl RenderLowering {
             Next::Current => &self.current,
             Next::New { instance, .. } => &**instance,
         };
-        // The class's list topology where the pipeline makes the topology dynamic.
+        // The class's list topology where the pipeline makes the topology dynamic; a band's
+        // patches of each primitive's vertices (`render/line_width.rs`).
+        let (topology, primitive_restart) = match settings.line {
+            LineRoute::Band { .. } => (metal2vulkan::vk::PrimitiveTopology::PATCH_LIST, false),
+            _ => (topology, primitive_restart),
+        };
         let (keyed_topology, keyed_restart) =
             super::pipeline::keyed_assembly(topology, primitive_restart, &graphics.dynamic_states);
         // A mesh draw's own complete key (its threadgroup size), else the plan's.
@@ -8433,23 +10302,30 @@ impl RenderLowering {
             strides,
             fixed: FixedState::without_dynamic(fixed, &graphics.dynamic_states),
             sample_positions: &self.layout.sample_positions,
+            feedback_loop: in_place,
         };
         // What each of the draw's recordings takes of its two draws where it reads through
         // snapshots (`render/snapshot.rs`): the drawing draw's masks are the ones the pipeline
-        // would have made static.
+        // would have made static. A draw read in place takes its barriers alone.
         let pair_base = match (phase_hole, device.shared().color_write_masks) {
             (Some(hole), Some(masks)) => Some(snapshot::Pair {
                 phase: snapshot::Phase::Snapshot,
                 first: true,
-                hole,
-                masks,
-                own: {
-                    let key = draw_key();
-                    super::pipeline::color_write_masks(graphics, key.pass, key.fixed.masks_color)
-                },
+                steps: Some(snapshot::PairSteps {
+                    hole,
+                    masks,
+                    own: {
+                        let key = draw_key();
+                        super::pipeline::color_write_masks(
+                            graphics,
+                            key.pass,
+                            key.fixed.masks_color,
+                        )
+                    },
+                }),
             }),
             (Some(_), None) => return Err(internal("a snapshot without its write mask command")),
-            (None, _) => None,
+            (None, _) => in_place.then(|| snapshot::Pair::in_place(true)),
         };
         // The formats the draw binds, which a specialized notice names.
         let formats = |slot| tables.bound_format(slot);
@@ -8457,10 +10333,7 @@ impl RenderLowering {
         // A variant whose notes test no bound value is quiet at every draw, and kept as none
         // (`Device::tests_bound_values`).
         let quiet = !super::Device::tests_bound_values(&variant.pipeline().stages)
-            || self
-                .quiet_bound_values
-                .as_ref()
-                .is_some_and(|q| q.holds(&variant, &plan, specialization));
+            || (self.quiet_bound_values).holds(&variant, &plan, specialization);
         if !quiet
             && device.degrade_bound_values(
                 &variant.pipeline().stages,
@@ -8469,13 +10342,10 @@ impl RenderLowering {
                 Some(&formats),
             )
         {
-            self.quiet_bound_values = Some(QuietBoundValues {
-                variant: Arc::clone(&variant),
-                plan: Arc::clone(&plan),
-                specialization: specialization.clone(),
-            });
+            (self.quiet_bound_values).keep(QuietBoundValues::new(&variant, &plan, specialization));
         }
         device.degrade_cross_class(&plan.diagnostics, &formats);
+        device.degrade_astc_storage(&plan.diagnostics, &formats);
         // Those its notices name, where the device announces any of its variant's kinds at every
         // occurrence (announced as the draw records, below), taken while its tables live.
         let bound_each = device
@@ -8500,8 +10370,8 @@ impl RenderLowering {
         let looked = PipelineInputs {
             variant: &variant,
             plan: &plan,
-            shape: instance.shape.version(),
-            compatible: &instance.compatible,
+            shape: &instance.shape,
+            sample_positions: &self.layout.sample_positions,
             strides,
             fixed,
             topology: (keyed_topology, keyed_restart),
@@ -8514,13 +10384,15 @@ impl RenderLowering {
             None => {
                 let watch = EachWatch::start();
                 let key = draw_key();
-                // An execution's replay records now: under its command buffer's bound its draw
-                // waits for its making on the device's pool (most begun by the settle at commit,
-                // `RenderExecution::settle`) until the bound at most, past which it records
-                // nothing. Not a device replay's draw, of one recording for every command.
+                // An execution's replay in `commit` records now: under its command buffer's
+                // bound its draw waits for its making on the device's pool until the bound at
+                // most, past which the replay leaves the pass to the host step
+                // (`render/pending.rs`). A host step's waits until it is made, on the step's
+                // thread, as does a device replay's draw, of one recording for every command.
                 let bounded = (self.replaying && self.replayed.is_none() && !self.rerouting)
                     && !(empty || culled)
-                    && self.layout.sample_positions.is_empty();
+                    && self.layout.sample_positions.is_empty()
+                    && !crate::exit_guard::in_host_step();
                 let deadline = match bounded {
                     true => self.core.command_buffer().making_deadline(),
                     false => None,
@@ -8554,12 +10426,16 @@ impl RenderLowering {
                                         )?;
                                         (DrawPipeline::Made(made), own)
                                     }
-                                    // Still being made at the bound: the draw records nothing,
-                                    // before anything of it is tracked, as a draw whose pipeline
-                                    // a capture misses does; later command buffers draw with it.
+                                    // Still being made at the bound: the replay stops, before
+                                    // anything of the draw is tracked, and its pass is left to
+                                    // the host step, which waits for the making
+                                    // (`DeferredPass::left_for_makings`).
                                     None => {
-                                        self.drop_late_replayed_draw(&variant, specialization)?;
-                                        return Ok(());
+                                        self.core.command_buffer().leave_unmade(making);
+                                        return Err(internal(
+                                            "a replayed draw's pipeline still being made at its \
+                                             command buffer's bound",
+                                        ));
                                     }
                                 }
                             }
@@ -8587,7 +10463,7 @@ impl RenderLowering {
             }
         };
         if reused_state && reused_pipeline {
-            device.shared().counts.draw_shape_reused();
+            self.core.counts().draw_shape_reused();
         }
         // A pipeline made at the state's creation announces its notices at the first draw that
         // finds it made; a draw that began a making announced them as it began it.
@@ -8611,6 +10487,7 @@ impl RenderLowering {
                 &mut state,
                 (&plan, &command, &tables),
                 (memo, &mut writes, &mut samplers),
+                Some(past_heap),
             )?
         };
         // The draw's push bytes, filled in place, over the last draw's (`LiveBind::pushes`).
@@ -8621,6 +10498,11 @@ impl RenderLowering {
             Some(replayed) => replayed.first_tables(&commands.push_holes, &mut live.pushes)?,
             None => Vec::new(),
         };
+        // A GPU route's command's draws read its own slot tables, at every recording
+        // (`render/executions/gpu_route.rs`).
+        if let Some((tables, command)) = &self.command_tables {
+            tables.fill(*command, &commands.push_holes, &mut live.pushes)?;
+        }
         let push = &live.pushes;
         // A plan that draws one amplification at a time records the draw once per amplification,
         // in order, each after that amplification's push writes.
@@ -8793,6 +10675,20 @@ impl RenderLowering {
             )),
         };
         let vk_draws = &vk_draws[..count];
+        // Regions drawn several at a time are direct draws' alone (`draws_region_batches`, and a
+        // region-copy variant's `copy_batch`).
+        let direct = |&(_, _, draw): &(_, _, metal2vulkan::vk::DrawCommand)| {
+            matches!(
+                draw,
+                metal2vulkan::vk::DrawCommand::Draw { .. }
+                    | metal2vulkan::vk::DrawCommand::DrawIndexed { .. }
+            )
+        };
+        if (batch.is_some() || (region_copies && copy_batch > 1)) && !vk_draws.iter().all(direct) {
+            return Err(internal(
+                "regions drawn several at a time by a draw of another command",
+            ));
+        }
         // The draw's steps before the pass (its copies, its index bounds or rewrite pass) read
         // what an earlier draw or tile dispatch of the encoder wrote behind a memory barrier: they
         // record before the draw's render pass instance instead, which follows the writer's.
@@ -8871,7 +10767,9 @@ impl RenderLowering {
         let reads_fragments = work && earlier(&only(true), FRAGMENT_DRAW_STAGES);
         let writes_fragments = work && earlier(&only(false), FRAGMENT_DRAW_STAGES);
         if writes_fragments || (after_geometry && (reads_fragments || !self.command_barrier)) {
-            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
+            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                IndirectRule::MeshDispatchOrder,
+            )));
         }
         // A scan reads Metal's arguments where the draw reads them, after their copy. An arguments
         // pass, which writes no Metal resource, waits only for what wrote them.
@@ -8883,26 +10781,52 @@ impl RenderLowering {
                     || before_instance
             }
         };
-        let stages = uses
-            .iter()
-            .fold(vk::PipelineStageFlags2::empty(), |all, used| {
-                all | used.read.stages | used.write.stages
-            });
-        let reaching = (&**uses, uses.resident());
-        self.core
-            .note_reaching(stages, reaching, Some(&mut live.noted))?;
-        self.unordered.add(uses);
-        self.pass_start.announce(&device, uses, mesh_before);
-        self.pass_start.add(uses);
-        let heap_set = match heap {
-            Some(_) => Some(heap_sets::bind(
-                &device,
-                &objects,
-                &mut self.core.command_buffer().state().heaps,
-                heap_writes,
-                uses,
-            )?),
-            None => None,
+        match uses.reaching_prefix() {
+            None => {
+                let stages = uses
+                    .iter()
+                    .fold(vk::PipelineStageFlags2::empty(), |all, used| {
+                        all | used.read.stages | used.write.stages
+                    });
+                let reaching = (&**uses, uses.resident());
+                self.core
+                    .note_reaching(stages, reaching, Some(&mut live.noted))?;
+            }
+            Some(prefix) => {
+                let reaching = (&**uses, uses.resident(), prefix);
+                self.core.note_draw(reaching, &mut live.noted)?;
+            }
+        }
+        // The uses of what the encoder made resident each tracker below walks
+        // (`WorkCounts::resident_uses_unordered_writes` and kin).
+        let resident = uses.prefix().map_or(0, |prefix| prefix.len as u64);
+        match uses.prefix() {
+            None => self.unordered.add(uses),
+            Some(prefix) => {
+                if self.unordered.add_draw((uses, prefix)) {
+                    self.core.counts().resident_uses_unordered_writes(resident);
+                }
+            }
+        }
+        match uses.prefix() {
+            None => {
+                self.pass_start.announce(&device, uses, mesh_before);
+                self.pass_start.add(uses);
+            }
+            Some(prefix) => (self.pass_start).draw(&device, (uses, prefix), mesh_before),
+        }
+        let (heap_set, heap_again) = match heap {
+            Some(_) => {
+                let bound = heap_sets::bind(
+                    &device,
+                    &objects,
+                    &mut self.core.command_buffer().state().heaps,
+                    heap_writes,
+                    uses,
+                )?;
+                (Some(bound.set), Some(bound.again))
+            }
+            None => (None, None),
         };
         // The query that resumes the active one after a draw whose fragments Vulkan would count
         // and Metal does not.
@@ -9068,14 +10992,22 @@ impl RenderLowering {
                 Some((making.clone(), state, (draws, after), loan))
             }
         };
+        // A draw whose snapshots lead its instance records its snapshot draws into a secondary
+        // of their own, begun against the instance's pass, which the leading render pass
+        // instance executes (`render/snapshot.rs`, leading snapshots): taken before anything
+        // records.
+        let leading_draws = match leading && !empty && !culled {
+            true => Some(self.core.command_buffer().begin_draws(&compatible)?),
+            false => None,
+        };
         // Its execution record's creation times, which its making sets once made.
         let mut later = None;
         // Whether the draw can record again into an instance that leaves more colors out of its
-        // subpass (`render/reroute.rs`). A stand-in arriving with it does not stop it: the pass's
-        // layout keeps the stand-in from the draw on, so the draw records again into it, as a later
+        // subpass, or in a pass that fetches through input attachments one of the same shape
+        // (`render/reroute.rs`). A stand-in arriving with it does not stop it: the pass's layout
+        // keeps the stand-in from the draw on, so the draw records again into it, as a later
         // draw would.
         let again = !self.replaying
-            && !self.layout.fetch_inputs
             && self.layout.samples == 1
             && self.rate_map.is_none()
             && !self.counts_visibility()
@@ -9114,7 +11046,7 @@ impl RenderLowering {
                     (&fetched, Some(&pipeline)),
                     (stencil_use.is_some(), tests_use.is_some()),
                     views,
-                    true,
+                    (true, false),
                     None,
                     &routing.locations,
                     &reformats,
@@ -9129,8 +11061,11 @@ impl RenderLowering {
         };
         // The colors the draw reads through snapshots are in the feedback loop layout for its
         // instance's render pass instance (`render/snapshot.rs`): a new one's from its begin,
-        // which therefore records in a secondary.
-        let feedback = snapshot.as_ref().map_or(Feedback::NONE, |w| w.feedback);
+        // which therefore records in a secondary. Not those of snapshots that lead it, which
+        // read them in `GENERAL`.
+        let feedback = (snapshot.as_ref())
+            .filter(|w| !w.leading)
+            .map_or(Feedback::NONE, |w| w.feedback);
         if let Next::New { instance, .. } = &mut next {
             instance.feedback.0 |= feedback.0;
         }
@@ -9145,8 +11080,10 @@ impl RenderLowering {
         )?;
         // And a later instance of such a pass after a split, where it can, the instance before's
         // copies planned (`render/inline_splits.rs`).
+        // Not one whose snapshots lead it, which the leading render pass instance goes before.
         let split_inline = match inline {
             Some(_) => None,
+            None if leading => None,
             None => self.inline_split(&next, stood.as_deref(), (!empty && !culled, made_ahead)),
         };
         // A new instance that records inline takes no secondary; any other begins its own.
@@ -9168,13 +11105,42 @@ impl RenderLowering {
                 "a draw replay's draw of other recordings than one",
             ));
         }
+        // Whether the draw takes no step of its own beside its Vulkan draw, and records into the
+        // current instance as it stood or into the pass's first instance begun inline at it
+        // (`render/inline_first.rs`), for keeping it to draw again (`render/draw_again.rs`):
+        // read before its steps below take their parts.
+        // Split as `WorkCounts::draws_unkept_instance` splits it: a later instance, a step of its
+        // own.
+        let begun = inline.is_some();
+        let later_instance = !begun
+            && (split_inline.is_some()
+                || !matches!(next, Next::Current)
+                || stood.is_some()
+                || continuation.is_some());
+        let own_steps = rewrite.is_some()
+            || listed.is_some()
+            || bounds.is_some()
+            || fold.is_some()
+            || arguments.is_some()
+            || mesh_steps.is_some()
+            || tessellation_steps.is_some()
+            || before_instance
+            || made.is_some()
+            || made_stand_in.is_some()
+            || made_imageblock.is_some()
+            || pending.is_some();
+        let stepless = !later_instance && !own_steps;
+        // Into a later instance after a split alone: not a continuation, nor with a stand-in
+        // arriving (`render/draw_again.rs`, re-homed past a split).
+        let split_only = later_instance && stood.is_none() && continuation.is_none();
+        self.snapshots_alone = snapshots_alone && !begun && !later_instance;
         // Recording starts here: nothing below can be refused.
         if let Some(written) = written {
             self.core.keep_set_zero(written, &writes);
         }
         self.driver_restarts |= tessellation.is_some_and(|t| !t.emulated);
         if !pushed.is_empty() {
-            device.shared().counts.draw_pushing_set_zero();
+            self.core.counts().draw_pushing_set_zero();
         }
         if let Some(made) = made {
             self.shadow = Some(made);
@@ -9193,6 +11159,8 @@ impl RenderLowering {
         // Why the draw splits the pass where it does: the first that holds.
         let cause = if ordered {
             Split::TileMemory
+        } else if storage_split {
+            Split::InterlockedWrites
         } else if after_barrier {
             Split::AttachedRead
         } else if apart {
@@ -9206,9 +11174,21 @@ impl RenderLowering {
         } else {
             Split::Shape
         };
+        // A draw that pins its colors to their own images brings nothing to the pass's layout
+        // (`snapshot_wanted`): its instance and those before it render them.
+        let pins = snapshot.as_ref().is_some_and(|wanted| wanted.pins != 0);
+        if pins && stood.is_some() {
+            return Err(internal(
+                "a stand-in arriving with a draw that pins its colors",
+            ));
+        }
         self.install(next, stood, continuation, cause);
+        if pins {
+            self.pinned_through = self.earlier.len() + 1;
+            device.shared().counts.reading_draw_pinned();
+        }
         self.current.feedback.0 |= feedback.0;
-        self.current.storage_colors |= storage_colors;
+        self.current.general_colors |= storage_colors | narrowed.spanned();
         if let Some(begin) = inline {
             self.begin_inline(begin);
         }
@@ -9217,9 +11197,27 @@ impl RenderLowering {
         }
         self.installed_extended_draw(&pipeline);
         self.tile_memory_splits += usize::from(tile_memory_split);
+        self.interlocked_splits += usize::from(interlocked_split);
         self.barrier_splits += usize::from(run_barrier_split);
         self.run_barrier = false;
-        self.gathering().add(&draw_shadows, uses);
+        self.piece_split = false;
+        if let Some(clears) = copy_clears.as_deref().filter(|clears| !clears.is_empty()) {
+            self.gathering().clear_in(clears);
+            device.shared().counts.attachment_read_cleared();
+        }
+        match uses.prefix() {
+            None => self.gathering().add(&draw_shadows, uses),
+            Some(prefix) => {
+                if self.gathering().add_draw(&draw_shadows, (uses, prefix)) {
+                    let counts = self.core.counts();
+                    counts.resident_uses_gathered(prefix.len as u64);
+                }
+            }
+        }
+        // Whether it recorded a barrier in its instance, or a state command (`Recorded`); and the
+        // count of the record's recordings just after its last recorded through it, where one did
+        // (`Bound::records`): what it holds kept (`Kept::settled`).
+        let (mut barriered, mut draw_alone, mut through_record) = (false, false, None);
         if !empty && !culled {
             for source in index.into_iter().chain(indirect) {
                 match (source.copy_steps(&mut self.core), before_instance) {
@@ -9274,25 +11272,26 @@ impl RenderLowering {
             // imageblock's, a color's or the depth's stand-in, records after the barrier
             // (`InterlockedStorage`).
             let after_writes = interlocked.meets(self.current.interlocked_writes);
+            barriered |= after_writes;
             let mut storage_barrier = None;
             if after_writes {
                 let view_mask = self.current.shape.view_mask;
+                let barrier = interlocked.barrier(self.current.interlocked_writes);
+                if barrier == render_target::DrawsBarrier::Whole {
+                    device.shared().counts.fetch_draw_barrier();
+                }
                 match (pending.is_some(), &mut self.current.kept) {
-                    (true, _) => storage_barrier = Some(view_mask),
+                    (true, _) => storage_barrier = Some((view_mask, barrier)),
                     // An instance recorded inline after a split keeps it with its draws
                     // (`render/inline_splits.rs`).
                     (false, Some(kept)) => {
-                        kept.storage_barrier(view_mask);
+                        kept.storage_barrier(view_mask, barrier);
                     }
                     // SAFETY: the secondary command buffer (or the pass's, inline) is recording
                     // inside the compatible pass, which `render_target` made, and only this
                     // encoder records it.
                     (false, None) => unsafe {
-                        render_target::between_storage_draws(
-                            device.shared().vk(),
-                            self.current.draws,
-                            view_mask,
-                        )
+                        barrier.record(device.shared().vk(), self.current.draws, view_mask)
                     },
                 }
             }
@@ -9302,6 +11301,7 @@ impl RenderLowering {
             // Instances follow one another behind a barrier from everything before.
             let written = self.current.indirect_reads.written_in(uses) & PASS_DRAW_STAGES;
             let mut indirect_barrier = None;
+            barriered |= !written.is_empty();
             if !written.is_empty() {
                 let view_mask = self.current.shape.view_mask;
                 let stages = tracker::legacy_stages(written, vk::PipelineStageFlags::ALL_GRAPHICS);
@@ -9320,13 +11320,32 @@ impl RenderLowering {
                     },
                 }
             }
-            self.current.indirect_reads.add(uses);
+            match uses.prefix() {
+                None => self.current.indirect_reads.add(uses),
+                Some(prefix) => {
+                    if self.current.indirect_reads.add_draw((uses, prefix)) {
+                        self.core.counts().resident_uses_indirect_reads(resident);
+                    }
+                }
+            }
             // A draw whose fragment shader reads or writes what an earlier draw of the instance
             // wrote before its fragments records after a memory dependency from those writes
             // (`render_target::after_geometry_writes`): Metal runs every draw's vertex, object
             // and mesh functions before any draw's fragments.
             let mut geometry_barrier = None;
-            if let Some(barrier) = self.current.geometry_writes.barrier_before(uses) {
+            let geometry = match uses.prefix() {
+                None => self.current.geometry_writes.barrier_before(uses),
+                Some(prefix) => {
+                    let (barrier, walked) =
+                        (self.current.geometry_writes).barrier_before_draw((uses, prefix));
+                    self.core
+                        .counts()
+                        .resident_uses_geometry_checked(walked as u64);
+                    barrier
+                }
+            };
+            if let Some(barrier) = geometry {
+                barriered = true;
                 let view_mask = self.current.shape.view_mask;
                 let scopes = render_target::GEOMETRY_SELF_DEPENDENCY;
                 let mut legacy = barrier.legacy();
@@ -9348,7 +11367,14 @@ impl RenderLowering {
                     },
                 }
             }
-            self.current.geometry_writes.add(uses);
+            match uses.prefix() {
+                None => self.current.geometry_writes.add(uses),
+                Some(prefix) => {
+                    if self.current.geometry_writes.add_draw((uses, prefix)) {
+                        self.core.counts().resident_uses_geometry_writes(resident);
+                    }
+                }
+            }
             if imageblock_use.is_some() {
                 self.current.imageblock = true;
             }
@@ -9378,9 +11404,39 @@ impl RenderLowering {
             };
             let mut owned = Vec::new();
             let mut states_recorded = Recorded::default();
+            // The Vulkan draws it records, now or once its pipeline is made: its command
+            // buffer's count of what its recordings hold (`CommandBuffer::recorded`).
+            let mut draws_recorded = 0u64;
+            // The work of what it records of an execution's commands in a rate-mapped pass
+            // (`rate_mapped_pass.rs`, **Pieces**).
+            let mut piece_work = 0u64;
+            let mut piece_regions = 0u64;
+            let counts_work = self.replaying && self.rate_map.is_some();
+            // A draw through its region-copy variant counts its vertex work into a run's or the
+            // whole table's, the encoder's own where it records no execution's command; a
+            // fanned-out one its vertices, and those into the regions of the boxes its blocks'
+            // triangles reach (`WorkCounts::rate_map_whole_copy_vertex_regions`,
+            // `rate_map_fanned_box_vertex_regions`).
+            let copy_route = match (self.run_bounds, self.boxed) {
+                (Some(_), _) => CopyRoute::Run,
+                (None, true) => CopyRoute::Boxed,
+                (None, false) => CopyRoute::Whole {
+                    own: !self.replaying,
+                },
+            };
+            let fanned_box_regions: u64 = match (fan_copies, self.fan_out, &self.fan_table) {
+                (Some(_), Some(fan), Some((_, Some((_, _, grid))))) => {
+                    let boxes = fan_out::run_boxes(*grid, fan.reach);
+                    boxes.iter().map(fan_out::RegionBox::regions).sum()
+                }
+                _ => 0,
+            };
             // A draw read through snapshots records its recordings twice: every snapshot draw,
-            // then every drawing draw (`render/snapshot.rs`).
-            let phases: &[Option<snapshot::Phase>] = match pair_base {
+            // then every drawing draw (`render/snapshot.rs`); one read in place, once.
+            let phases: &[Option<snapshot::Phase>] = match &pair_base {
+                Some(base) if base.phase == snapshot::Phase::InPlace => {
+                    &[Some(snapshot::Phase::InPlace)]
+                }
                 Some(_) => &[
                     Some(snapshot::Phase::Snapshot),
                     Some(snapshot::Phase::Drawing),
@@ -9399,7 +11455,36 @@ impl RenderLowering {
                     None => (&pushes[a][..], vk_draws),
                 }
             };
+            // A measured reader's drawing commands record inside its query, into its instance or
+            // kept with its draws where the instance is kept (`render/inline_splits.rs`); not
+            // those of a pipeline still being made, which a later step records, nor where no
+            // query records (`records_coverage_query`). A query never recorded reads as never run.
+            let covered_query =
+                covered_query.filter(|_| made_now.is_some() && self.records_coverage_query());
+            // What the snapshot draws that lead the instance bound in their secondary.
+            let mut leading_bound = Bound::default();
             for &phase in phases {
+                let counted = covered_query.filter(|_| phase != Some(snapshot::Phase::Snapshot));
+                if let Some((pool, query)) = counted {
+                    match &mut self.current.kept {
+                        Some(kept) => kept.begin_query(pool, query),
+                        // SAFETY: the instance's command buffer (or the pass's, inline) is
+                        // recording inside its pass, which has one sample and one layer (the
+                        // area rule's checks); the query is the pass's own, reset on the host and
+                        // begun nowhere else; no other occlusion query is active (no visibility
+                        // query is, the checks); the pool is held until the command buffer
+                        // completes.
+                        None => unsafe {
+                            device.shared().vk().cmd_begin_query(
+                                self.current.draws,
+                                pool,
+                                query,
+                                vk::QueryControlFlags::PRECISE,
+                            )
+                        },
+                    }
+                    device.shared().counts.coverage_query();
+                }
                 let mut first = true;
                 // Amplification by amplification, each through its recordings' regions: Metal
                 // renders every primitive of one before the next's, and a pixel's regions are one.
@@ -9407,7 +11492,36 @@ impl RenderLowering {
                 for a in 0..entries {
                     let (push, vk_draws) = entry(a);
                     for state in draw_states.of(a) {
+                        // A recording through the region-copy variant pushes its box of regions
+                        // (`render/fan_out.rs`, **Region-copy variant**).
+                        let region_push;
+                        let push = match (state.region_box, region_offset) {
+                            (Some(boxed), Some(offset)) => {
+                                region_push = fan_out::region_push(push, offset, boxed)?;
+                                &region_push[..]
+                            }
+                            _ => push,
+                        };
                         for &(index, indirect, draw) in vk_draws {
+                            draws_recorded += 1;
+                            let vertices = rate_mapped_pass::vertices(&draw);
+                            let counts = &device.shared().counts;
+                            if state.region_box.is_some() {
+                                let work = vertices.saturating_mul(state.region_draws());
+                                counts.rate_map_region_copy_vertices(work, copy_route);
+                            } else if fan_copies.is_some() {
+                                counts.rate_map_fanned_vertices(vertices, fanned_box_regions);
+                            }
+                            if counts_work {
+                                let regions = state.region_draws();
+                                let mut work = rate_mapped_pass::draw_work(regions, &draw);
+                                if let Some(copies) = fan_copies {
+                                    let fanned = rate_mapped_pass::fan_out_work(&draw, copies);
+                                    work = work.saturating_add(fanned);
+                                }
+                                piece_work = piece_work.saturating_add(work);
+                                piece_regions += regions;
+                            }
                             if indirect.is_some()
                                 && phase != Some(snapshot::Phase::Snapshot)
                                 && matches!(
@@ -9421,21 +11535,28 @@ impl RenderLowering {
                                     1,
                                 );
                             }
+                            // Snapshots that lead the instance record no barrier inside a subpass:
+                            // the barriers around the leading render pass instance order them
+                            // (`render/pass_steps.rs`).
                             let pair = match (&pair_base, phase) {
                                 (Some(base), Some(phase)) => {
                                     let at_first = first;
                                     first = false;
                                     Some(snapshot::Pair {
                                         phase,
-                                        first: at_first,
+                                        first: at_first && leading_draws.is_none(),
                                         ..base.clone()
                                     })
                                 }
                                 _ => None,
                             };
+                            let leads = match (phase, leading_draws) {
+                                (Some(snapshot::Phase::Snapshot), Some(leading)) => Some(leading),
+                                _ => None,
+                            };
                             let recording = Recording {
                                 raw: device.shared().vk(),
-                                command_buffer: self.current.draws,
+                                command_buffer: leads.unwrap_or(self.current.draws),
                                 layout: objects.layout(),
                                 shape: objects.set_zero_shape(),
                                 pipeline: made_now.unwrap_or_default(),
@@ -9451,11 +11572,13 @@ impl RenderLowering {
                                 index,
                                 indirect,
                                 dynamic,
+                                settled: None,
                                 topology,
                                 primitive_restart,
                                 state,
                                 extended,
                                 mesh: device.shared().mesh_draws.as_ref(),
+                                multi: device.shared().multi_draws.as_ref(),
                                 draw,
                                 pair,
                             };
@@ -9471,9 +11594,10 @@ impl RenderLowering {
                                 // that command buffer bound there: the instance's, or the pass's
                                 // command buffer's for an inline one.
                                 (Some(_), None) => {
-                                    let bound = match self.current.inline {
-                                        true => &mut self.held_bound,
-                                        false => &mut self.current.bound,
+                                    let bound = match (leads, self.current.inline) {
+                                        (Some(_), _) => &mut leading_bound,
+                                        (None, true) => &mut self.held_bound,
+                                        (None, false) => &mut self.current.bound,
                                     };
                                     // A device replay's: each command's draw after it
                                     // (`render/executions/gpu.rs`).
@@ -9481,7 +11605,13 @@ impl RenderLowering {
                                         Some(replayed) => unsafe {
                                             replayed.record(&recording, bound, &replay_holes)
                                         },
-                                        None => unsafe { recording.record(bound) },
+                                        None => {
+                                            let recorded = unsafe { recording.record(bound) };
+                                            if leads.is_none() {
+                                                through_record = Some(bound.records());
+                                            }
+                                            recorded
+                                        }
                                     }
                                 }
                                 (None, _) => owned.push(recording.owned()),
@@ -9489,8 +11619,32 @@ impl RenderLowering {
                         }
                     }
                 }
+                if let Some((pool, query)) = counted {
+                    match &mut self.current.kept {
+                        Some(kept) => kept.end_query(pool, query),
+                        // SAFETY: the query this phase began, in the same subpass.
+                        None => unsafe {
+                            device
+                                .shared()
+                                .vk()
+                                .cmd_end_query(self.current.draws, pool, query)
+                        },
+                    }
+                }
             }
-            states_recorded.count(&device.shared().counts);
+            // The secondary of the snapshot draws that lead the instance ends, a pending draw's
+            // once it records (`render/pending.rs`).
+            if let (Some(leading), Some(_)) = (leading_draws, made_now) {
+                // SAFETY: only this encoder records it, begun at the draw, inside no render pass
+                // of its own.
+                unsafe { self.core.command_buffer().end_raw(leading) }.map_err(vulkan)?;
+                self.current.leading = Some(snapshot::Leading::Recorded(leading));
+            }
+            draw_alone = states_recorded.draw_alone();
+            self.piece_work = self.piece_work.saturating_add(piece_work);
+            self.piece_regions = self.piece_regions.saturating_add(piece_regions);
+            states_recorded.count(self.core.counts());
+            (self.core.command_buffer()).recorded(draws_recorded + states_recorded.states);
             if let Some((making, state, draws, query)) = split {
                 // The record's times: the pipeline's, then those of the other `VkPipeline`s the
                 // draw records, made at the draw, set once the making made it. Every copy of the
@@ -9511,8 +11665,12 @@ impl RenderLowering {
                 }
                 // What a failed making names: the draw's place, and the variant it drew.
                 let encoder = self.core.command_buffer().state().open_encoder_place();
+                if leading_draws.is_some() {
+                    self.current.leading = Some(snapshot::Leading::Pending(self.pending.len()));
+                }
                 self.pending.push(PendingDraw {
                     draws,
+                    leading: leading_draws,
                     pipeline: making,
                     state,
                     encoder,
@@ -9553,6 +11711,281 @@ impl RenderLowering {
                     (object, reason)
                 });
             }
+        }
+        // The draw, kept for drawing again where it took no step of its own, no notice it met
+        // aside (`kept_again`), and where nothing it left changes what the next draw meets
+        // (`render/draw_again.rs`).
+        // Its uses: none written, none read as indirect arguments, and whether one reads an image
+        // other than as an attachment (`draw_again::unwritten`). Those of what the encoder made
+        // resident are a function of their identity, so they are walked once for it
+        // (`WorkCounts::resident_uses_again_checked`); whether those write is counted where the
+        // draw is not kept (`WorkCounts::draws_unkept_writing_resident`).
+        // A reader through snapshots' writes of its snapshots aside: it is kept with them, its
+        // draw again taking them again behind its own barriers (`render/snapshot.rs`).
+        let snapshot_uses = uses.len() - snapshot_texels.len();
+        let (unwritten, reads_images, resident_writes) = {
+            let (resident, own) = match uses.prefix() {
+                Some(prefix) => {
+                    let facts = match self.resident_again {
+                        Some((of, facts)) if of == prefix => facts,
+                        _ => {
+                            self.core
+                                .counts()
+                                .resident_uses_again_checked(prefix.len as u64);
+                            let facts = draw_again::unwritten(&uses[..prefix.len]);
+                            self.resident_again = Some((prefix, facts));
+                            facts
+                        }
+                    };
+                    (facts, &uses[prefix.len..snapshot_uses])
+                }
+                None => ((true, false), &uses[..snapshot_uses]),
+            };
+            match resident {
+                (true, resident_reads) => {
+                    let (unwritten, reads_images) = draw_again::unwritten(own);
+                    let snapshots = !snapshot_texels.is_empty();
+                    (
+                        unwritten,
+                        resident_reads || reads_images || snapshots,
+                        false,
+                    )
+                }
+                (false, _) => (false, false, true),
+            }
+        };
+        let extended = |c: &render_pass::ColorTarget| {
+            ExtendedRange::of(c.target.texture.pixel_format()).is_some()
+        };
+        // A draw that binds a zero region of its own binds a new one at each step
+        // (`binding::binds_own_zeros`): kept, it would bind the region its kept draw had.
+        let own_zeros = facts.own_zeros();
+        // A reader through snapshots is kept with its two draws (`render/draw_again.rs`): not one
+        // read in place, nor one that pins its colors to their images, whose pins are its pass's.
+        let reader_keeps = matches!(
+            (&snapshot, &pair_base),
+            (Some(wanted), Some(snapshot::Pair { steps: Some(_), .. }))
+                if !wanted.in_place && wanted.pins == 0
+        );
+        // Plain but for the later instance it may have recorded into: `stepless` but for that.
+        let plain_apart = !own_steps
+            && !own_zeros
+            && !barriered
+            && !empty
+            && !culled
+            && !self.rerouting
+            && self.replayed.is_none()
+            && self.command_tables.is_none()
+            && self.grouped.is_none()
+            && self.rate_map.is_none()
+            && matches!(draw_pipeline, DrawPipeline::Made(_))
+            && tessellation.is_none()
+            && !meshes
+            && pushes.len() == 1
+            && vk_draws.len() == 1
+            && chunked.is_empty()
+            && (pair_base.is_none() || reader_keeps)
+            && matches!(draw_states, DrawStates::Whole(_))
+            && (snapshot.is_none() || reader_keeps)
+            && !reads_clear
+            && (draw_shadows.is_empty() || !self.replaying)
+            && stencil_use.is_none()
+            && tests_use.is_none()
+            && imageblock_use.is_none()
+            && tile_buffer.is_none()
+            && unlisted.is_none()
+            && bound_each.is_none()
+            && !reads_tile_memory
+            && !apart
+            && !first_write
+            && storage_colors == 0
+            // A draw that reads input attachments ordered between draws alone and writes a color
+            // of its pass meets its own writes: drawn again, it records after a barrier.
+            && !interlocked.meets_fetch(interlocked_writes)
+            && reformats.is_empty()
+            && views == ViewSetup::default()
+            && resumed.is_none()
+            && commands.root_tables.is_empty()
+            && (commands.push_holes.iter()).all(|hole| {
+                reader_keeps && matches!(hole, metal2vulkan::bind::PushHole::SnapshotPhase { .. })
+            })
+            && pass_start.reads_encoders()
+            && matches!(settings.line, LineRoute::Plain)
+            && matches!(
+                provoking,
+                provoking::Provoking::AsIs | provoking::Provoking::Native
+            )
+            && restarted.is_none()
+            && !private.private_list
+            && !private.quad_primitive_ids
+            && variant.key().primitive_id_indices.is_none()
+            && indirect.is_none()
+            && index.is_none_or(DrawSource::in_place)
+            && unwritten
+            && !self.extended.keeps_draws()
+            && live.state.extended_shadows.is_empty()
+            && !plan.variant.extended_range.values().any(planes)
+            && !(self.layout.colors.iter().flatten()).any(extended)
+            && !facts.in_place();
+        let plain_but_heap = !later_instance && plain_apart;
+        let tableless = heap.is_none() && texture_table.is_none() && sampler_table.is_none();
+        let plain = plain_but_heap && tableless;
+        // A replayed draw that reads the heap is plain where a kept recording of it binds the heap
+        // set again as it did (`heap_sets::Bound`), it reads no sampler table and its tables bind
+        // no texture its heap part reads; the texture table is the device's one buffer, which a
+        // kept recording reads as a fresh draw does. A direct draw kept for drawing again binds
+        // none of them (`render/draw_again.rs`).
+        let heap_kept = match (sampler_table.is_some(), slot_textures, heap_again) {
+            (true, _, _) => Err(Unkept::SamplerTable),
+            (false, true, _) => Err(Unkept::TableTextures),
+            (false, false, Some(again)) => again.map(Some),
+            (false, false, None) => Ok(None),
+        };
+        // A replayed draw plain so would be kept but for its being replayed: a chunk of its
+        // execution's commands whose draws all are is kept (`kept_commands.rs`). One the heap
+        // alone keeps from it is counted by why.
+        self.plain_drawn = plain_but_heap && heap_kept.is_ok();
+        match heap_kept {
+            Err(unkept) if plain_but_heap && self.replaying => {
+                device.shared().counts.replayed_heap_draw_unkept(unkept);
+            }
+            Ok(Some(version))
+                if self.plain_drawn && !self.replayed_heaps.iter().any(|v| v.ptr_eq(&version)) =>
+            {
+                self.replayed_heaps.push(version);
+            }
+            _ => {}
+        }
+        // Its uses noted as the next draw would find them noted (`noted_apart.rs`), into the
+        // state it is kept under: what another thread may change as its steps began
+        // (`render/draw_again.rs`'s `Outside`), so uses noted after such a change keep nothing.
+        let drawn_by = self
+            .pipeline
+            .as_ref()
+            .and_then(RenderPipelineState::downgrade);
+        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+        if !self.replaying {
+            device.line().hooks.reach_keep();
+        }
+        let under = self.kept_under();
+        let keeps =
+            plain && !self.replaying && self.core.noted_now(&live.noted, under.noted_into());
+        // A draw that keeps nothing only because it recorded into a later instance after a
+        // split, of the shape, views and formats of the one before, its other steps a plain
+        // draw's, keeps the kept draws set aside into it (`render/draw_again.rs`).
+        self.split_alone = !keeps
+            && split_only
+            && plain_apart
+            && tableless
+            && !self.replaying
+            && (self.earlier.last()).is_some_and(|before| {
+                *before.shape == *self.current.shape
+                    && before.views == self.current.views
+                    && before.reformats.is_empty()
+                    && self.current.reformats.is_empty()
+            });
+        // What kept a direct draw of its own from being kept (`WorkCounts::draws_unkept`).
+        if !keeps && !self.replaying && !self.rerouting && !empty && !culled {
+            let unkept = UnkeptDraw {
+                instance: !stepless,
+                instance_split: (later_instance, own_steps),
+                barrier: barriered,
+                shadowed: reads_clear
+                    || snapshot.is_some()
+                    || !live.state.extended_shadows.is_empty(),
+                tables: heap.is_some()
+                    || texture_table.is_some()
+                    || sampler_table.is_some()
+                    || !commands.root_tables.is_empty()
+                    || !commands.push_holes.is_empty()
+                    || unlisted.is_some(),
+                index_copied: !index.is_none_or(DrawSource::in_place),
+                writing: !unwritten || own_zeros,
+                writing_resident: resident_writes,
+                tables_heap: heap.is_some(),
+                making: !matches!(draw_pipeline, DrawPipeline::Made(_)),
+            };
+            self.core.counts().draw_unkept(unkept);
+        }
+        // A draw kept is plain: its pipeline made ahead.
+        if let (true, Some(drawn_by), DrawPipeline::Made(made)) = (keeps, drawn_by, &draw_pipeline)
+        {
+            let execution = records.then(|| draw_again::KeptExecution {
+                pipeline: ExecutedPipeline::Render(Arc::clone(variant.shared_pipeline())),
+                shape: Arc::clone(&shape),
+                created: created.clone(),
+            });
+            // What a draw rebound takes of it (`render/draw_again/rebound.rs`), where its state made
+            // no visible-function table: set-0 writes that hold no keeper, its plan's uses alone,
+            // no push hole, and its one recording's parts (its variant and plan are the bind
+            // state's kept settle).
+            let recorded = match (&draw_states, &draw_pipeline, vk_draws) {
+                (DrawStates::Whole([state]), DrawPipeline::Made(made), [(index, _, command)]) => {
+                    Some(draw_again::KeptRecording {
+                        layout: objects.layout(),
+                        shape: objects.set_zero_shape(),
+                        pipeline: made.raw,
+                        index: *index,
+                        topology,
+                        primitive_restart,
+                        state: state.clone(),
+                        draw: *command,
+                    })
+                }
+                _ => None,
+            };
+            let rebinds = function_tables.is_empty()
+                && uses.len() == plan_uses + snapshot_texels.len()
+                && bound.holes.is_empty()
+                && writes.iter().all(|write| write.held.is_none());
+            let recorded = recorded.filter(|_| rebinds);
+            let rebinds = recorded.is_some();
+            if let Some(recorded) = recorded {
+                live.kept.keep(&writes, dynamic, recorded, &draw_shadows);
+            }
+            let kept = draw_again::Kept {
+                pipeline: drawn_by,
+                epoch: self.again_epoch(),
+                stated: self.again_stated(),
+                settings: Arc::clone(&settings),
+                restates_by_scissors,
+                between: false,
+                call,
+                assembly,
+                draw,
+                index: index.and_then(draw_again::KeptIndex::of),
+                under,
+                command_buffer: self.current.draws,
+                command: vk_draws[0].2,
+                again,
+                pushes_set_zero: !pushed.is_empty(),
+                last_vertex: provoking == provoking::Provoking::Native,
+                through_copies: (attached, own_pixel),
+                narrowed: narrowed.listed().collect(),
+                reads_images,
+                execution,
+                reads: RenderStages::empty(),
+                rasterizes: false,
+                depth_writes: false,
+                draw_alone,
+                stamps: self.table_stamps(),
+                rebinds,
+                settled: through_record,
+                carried: false,
+                across: false,
+                rehomed: false,
+                made: draw_again::KeptPipeline(Arc::clone(made)),
+                reader: match (&snapshot, &pair_base) {
+                    (
+                        Some(wanted),
+                        Some(snapshot::Pair {
+                            steps: Some(steps), ..
+                        }),
+                    ) => Some(snapshot::KeptReader::new(wanted, steps, objects.layout())),
+                    _ => None,
+                },
+            };
+            self.again.keep(kept);
         }
         let padding = index.and_then(DrawSource::padding);
         if let (Some(source), Some(positions)) = (index, padding) {
@@ -9632,6 +12065,9 @@ impl RenderLowering {
         if heap.is_some() && !function_tables.is_empty() {
             self.core.retain(function_tables);
         }
+        if let Some(here) = settled_here {
+            live.settled = Some(here);
+        }
         Ok(())
     }
 
@@ -9639,11 +12075,12 @@ impl RenderLowering {
     fn shape_inputs(&self) -> ShapeInputs<'_> {
         ShapeInputs {
             device: self.core.device(),
-            layout: &self.layout,
+            layout: LayoutView::of(&self.layout),
             state: &self.state,
             amplification: &self.amplification,
             counts_visibility: self.counts_visibility(),
             rate_map: self.rate_map.as_ref(),
+            executes: self.replaying,
             routed: self.routed.as_ref(),
             versions: [
                 self.layout.version(),
@@ -9654,7 +12091,8 @@ impl RenderLowering {
     }
 
     /// [`ShapeInputs::settings`] of a draw of `pipeline` as `assembly`, which gives the pass its
-    /// hidden depth and stencil where its state needs them ([`needed_hidden`](Self::needed_hidden)).
+    /// hidden depth and stencil where its state needs them ([`needed_hidden`](Self::needed_hidden)):
+    /// an execution's command's, which may draw a primitive (its record holds its count).
     fn draw_settings(
         &self,
         call: &'static str,
@@ -9664,42 +12102,321 @@ impl RenderLowering {
     ) -> Result<DrawSettings, Error> {
         let hidden = self.needed_hidden()?.is_some();
         self.shape_inputs()
-            .settings(call, (pipeline, assembly), hidden, announce)
+            .settings(call, (pipeline, assembly, true), hidden, announce)
     }
 
-    /// A draw's settings ([`draw_settings`](Self::draw_settings)), with the hidden depth and
+    /// How the encoder's `call` of `assembly` (which may draw a primitive where `primitives`)
+    /// draws `draw` of `pipeline` ([`RoutedDraw`]): its lines' route at the encoder's width
+    /// (`render/line_width.rs`), its last provoking vertex (`render/provoking.rs`), a strip or
+    /// private type as its list (`render/restart.rs`), and its settings
+    /// ([`shaped_settings`](Self::shaped_settings)).
+    fn routed_draw(
+        &mut self,
+        call: &'static str,
+        pipeline: &DrawingState,
+        (assembly, primitives): (Assembly, bool),
+        draw: &DrawCall,
+    ) -> Result<RoutedDraw, Error> {
+        let line = (self.shape_inputs()).line_route(call, (pipeline, assembly, primitives), false);
+        let provoking = self.provoking(call, pipeline, (assembly, line.band()), draw);
+        let provoking_forms = provoking.forms(assembly, pipeline);
+        let restarted = self.restarted(assembly, draw, (provoking, line));
+        let private = match (assembly, restarted) {
+            (Assembly::Private(program), _) => PrivateForm::of(pipeline, program, draw),
+            (_, Some(_)) => PrivateForm::listed(draw),
+            (_, None) => PrivateForm::default(),
+        };
+        let assembly = restarted.map_or(assembly, |r| r.assembly());
+        // Its settings, and the memo entry its draw state and pipeline are found and kept in
+        // (`render/draw_shape.rs`).
+        let (settings, hidden, shape_token) =
+            self.shaped_settings(call, pipeline, (assembly, primitives))?;
+        // A direct indexed draw of a pipeline that writes the primitive ID runs its de-indexed
+        // variant; a restarted strip's list keeps the strip's indices, which it does not run.
+        let primitive_id_indices = match restarted {
+            None => primitive_id_indices(pipeline, draw),
+            Some(_) => None,
+        };
+        // Its fixed-function layouts the device cannot fetch for it past 4 GiB
+        // (`render/vertex_reach.rs`): none in a form that pulls every attribute.
+        let far = match private.private_list || primitive_id_indices.is_some() {
+            true => vertex_reach::FarLayouts::default(),
+            false => self.far_vertex_buffers(pipeline.base(), draw),
+        };
+        let direct = matches!(draw, DrawCall::Primitives { .. } | DrawCall::Indexed { .. });
+        let region_viewports = self.draws_region_batches(pipeline, &settings, direct);
+        let region_fan_out = self.fan_out_asked(pipeline, &settings, assembly, Some(draw))?;
+        Ok(RoutedDraw {
+            provoking,
+            provoking_forms,
+            restarted,
+            private,
+            assembly,
+            settings,
+            hidden,
+            shape_token,
+            primitive_id_indices,
+            far,
+            region_viewports,
+            region_fan_out,
+        })
+    }
+
+    /// The fan-out a draw of `pipeline` under `settings` as `assembly` asks for, and the word it
+    /// binds (`BindState::region_fan_out`, `render/fan_out.rs`): the next command's, where the
+    /// encoder records an execution's commands at a host step that fans the pass's triangles out,
+    /// a probe's at its index and a draw's 0; else, in a rate-mapped pass on a device that fans out
+    /// (`fan_out::fans_out`), outside a probe's run, for a pipeline whose vertex function writes no
+    /// memory, its region-copy variant, 0 until each recording pushes its first region
+    /// (`render/fan_out.rs`, **Region-copy variant**). Either for a draw of triangles filled, of
+    /// one amplification, without a compensation or a band, of a pipeline whose vertex function
+    /// chooses no slice, over a map whose layers are alike, whose regions make a region table
+    /// ([`fan_table`](Self::fan_table)); `None` for any other. A draw to fan out whose triangles
+    /// reach few regions asks for its region-copy variant instead, where it takes one
+    /// ([`boxed_reach`](Self::boxed_reach)); without its `draw` (an execution's settle at commit),
+    /// none is boxed.
+    fn fan_out_asked(
+        &mut self,
+        pipeline: &DrawingState,
+        settings: &DrawSettings,
+        assembly: Assembly,
+        draw: Option<&DrawCall>,
+    ) -> Result<Option<(RegionFanOut, u32)>, Error> {
+        let fan = match self.fan_out {
+            Some(fan) => Some(fan),
+            // The probe's run records its probes alone.
+            None if (self.fan_run.as_ref()).is_some_and(fan_out::FanOutRun::probes) => {
+                return Ok(None)
+            }
+            None => None,
+        };
+        let regions = self.rate_map.is_some()
+            && fan_out::copies_regions(self.core.device())
+            && !pipeline.base().graphics.vertex_writes_memory;
+        if fan.is_none() && !regions {
+            return Ok(None);
+        }
+        let triangles = matches!(
+            assembly,
+            Assembly::Primitives(PrimitiveType::Triangle | PrimitiveType::TriangleStrip)
+        );
+        let asks = triangles
+            && self.state.fill_mode() == TriangleFillMode::Fill
+            && settings.amplification.count == 1
+            && settings.compensation.is_none()
+            && !matches!(settings.line, LineRoute::Band { .. })
+            && !pipeline.vertex_chooses_slice()
+            && self
+                .rate_map
+                .as_ref()
+                .is_some_and(RateMappedPass::layers_alike);
+        if !asks || !self.fan_table(pipeline)? {
+            return Ok(None);
+        }
+        Ok(Some(match fan {
+            Some(fan) if fan.mode == RegionFanOut::Probe => (fan.mode, fan.index),
+            Some(fan) if regions && draw.is_some_and(|d| self.boxes_cheaper(fan, assembly, d)) => {
+                (RegionFanOut::RegionCopies, 0)
+            }
+            Some(fan) => (fan.mode, 0),
+            None => (RegionFanOut::RegionCopies, 0),
+        }))
+    }
+
+    /// Whether the draw `fan` would fan out, of `draw` as `assembly`, is drawn through its
+    /// region-copy variant into the boxes of regions its triangles reach by the probe's bounds
+    /// instead (`render/fan_out.rs`, **Boxed draws**): a direct draw where that holds no more work
+    /// (`rate_mapped_pass::boxes_cheaper`), its triangles counted at the least a list or a strip
+    /// of its vertices holds (a strip's restarted after each triangle).
+    fn boxes_cheaper(&self, fan: fan_out::FanOutDraw, assembly: Assembly, draw: &DrawCall) -> bool {
+        let Some((_, Some((_, _, grid)))) = &self.fan_table else {
+            return false;
+        };
+        let (count, instances) = match *draw {
+            DrawCall::Primitives {
+                vertex_count,
+                instance_count,
+                ..
+            } => (vertex_count, instance_count),
+            DrawCall::Indexed {
+                index_count,
+                instance_count,
+                ..
+            } => (index_count, instance_count),
+            _ => return false,
+        };
+        let triangles = match assembly {
+            Assembly::Primitives(PrimitiveType::Triangle) => count / 3,
+            Assembly::Primitives(PrimitiveType::TriangleStrip) => count / 4,
+            _ => return false,
+        };
+        let regions = (fan_out::run_boxes(*grid, fan.reach).iter())
+            .map(fan_out::RegionBox::regions)
+            .sum();
+        let instances = u64::from(instances);
+        rate_mapped_pass::boxes_cheaper(
+            regions,
+            u64::from(count) * instances,
+            u64::from(triangles) * instances,
+        )
+    }
+
+    /// The bounds a draw through its region-copy variant that would fan out is drawn into, the
+    /// buckets its triangles reach ([`boxes_cheaper`](Self::boxes_cheaper)): `fan_out_asked`
+    /// asks for that variant for such a draw only where it boxes it, so a fan-out draw drawn
+    /// through it is boxed. `None` for a run (its own bounds) and any other draw.
+    fn boxed_reach(&self) -> Option<u32> {
+        let draws = |fan: &fan_out::FanOutDraw| {
+            matches!(fan.mode, RegionFanOut::Draw | RegionFanOut::DrawFew)
+        };
+        (self.fan_out.filter(draws))
+            .filter(|_| self.run_bounds.is_none())
+            .map(|fan| fan.reach)
+    }
+
+    /// Whether the encoder's first viewport and scissor plan regions that make a fan-out draw of
+    /// `pipeline` a region table (`fan_out::table`): of the regions as a draw records them region
+    /// by region, over the render area; its bytes made once for each viewport and scissor, and
+    /// uploaded only by a draw that binds them ([`fan_table_bound`](Self::fan_table_bound)), so
+    /// an execution's settle at commit, which records nothing, uploads none.
+    fn fan_table(&mut self, pipeline: &DrawingState) -> Result<bool, Error> {
+        let Some(pass) = &self.rate_map else {
+            return Ok(false);
+        };
+        let viewport = self.state.used_viewports(false)[0];
+        let scissor = *self.scissors.first();
+        let extent = self.layout.extent;
+        let key = FanTableKey::new(&viewport, &scissor, extent);
+        if let Some((kept, table)) = &self.fan_table {
+            if *kept == key {
+                return Ok(table.is_some());
+            }
+        }
+        let device = self.core.device().clone();
+        let graphics = &pipeline.base().graphics;
+        let regions = pass.draws(
+            Some(0),
+            &viewport,
+            &scissor,
+            graphics,
+            &device.shared().region_limits,
+            extent,
+        )?;
+        let table = (fan_out::table(&regions, extent))
+            .map(|made| (FanTable::Bytes(made.table), made.scissors, made.grid));
+        let made = table.is_some();
+        self.fan_table = Some((key, table));
+        Ok(made)
+    }
+
+    /// The region table the next fan-out draw binds ([`fan_table`](Self::fan_table)), uploaded to
+    /// the command buffer by the encoder's first draw that binds it.
+    fn fan_table_bound(&mut self) -> Result<vk::DescriptorBufferInfo, Error> {
+        let Some((_, Some((table, _, _)))) = &mut self.fan_table else {
+            return Err(internal("a fan-out draw without its region table"));
+        };
+        let bytes = match table {
+            FanTable::Bound(bound) => return Ok(*bound),
+            FanTable::Bytes(bytes) => bytes,
+        };
+        let device = self.core.device();
+        let mut state = self.core.command_buffer().state();
+        let region = state.uploads.upload(device, bytes, bytes.len() as u64)?;
+        device.shared().counts.rate_map_fan_table_uploaded();
+        let bound = vk::DescriptorBufferInfo::default()
+            .buffer(region.raw())
+            .offset(region.offset())
+            .range(region.len());
+        *table = FanTable::Bound(bound);
+        Ok(bound)
+    }
+
+    /// Whether a draw of `pipeline` under `settings`, `direct` (not from an indirect buffer), asks
+    /// to record its rate-mapped pass's regions several at a time, each one draw of a multi-draw
+    /// through the viewport and scissor at its index (`rate_mapped_pass.rs`): where the device
+    /// has the multi-draw commands (`DeviceShared::multi_draws`), the pass has a map, the draw is
+    /// direct and of one amplification, and its pipeline is a vertex and fragment pipeline whose
+    /// vertex function's `ViewportIndex` reaches the rasterizer as it stores it: no stage after
+    /// it, and no index, position compensation or band of its own. Not a device replay's draw,
+    /// whose commands record one at a time. Whatever the map holds: a reset of it never changes
+    /// the variant its pass's encoding again draws with. The plan settles whether it does
+    /// (`VariantKey::region_viewports`).
+    fn draws_region_batches(
+        &self,
+        pipeline: &DrawingState,
+        settings: &DrawSettings,
+        direct: bool,
+    ) -> bool {
+        let base = pipeline.base();
+        let graphics = &base.graphics;
+        let plain_stages = (base.stages.iter()).all(|s| {
+            matches!(
+                s.stage,
+                metal2vulkan::vk::ShaderStage::VERTEX | metal2vulkan::vk::ShaderStage::FRAGMENT
+            )
+        });
+        self.core.device().shared().multi_draws.is_some()
+            && self.rate_map.is_some()
+            && self.replayed.is_none()
+            && direct
+            && settings.amplification.count == 1
+            && settings.compensation.is_none()
+            && !matches!(settings.line, LineRoute::Band { .. })
+            && plain_stages
+            && graphics.tessellation.is_none()
+            && graphics.emulated_tessellation.is_none()
+            && !graphics.writes_viewport_index
+            && !pipeline.vertex_chooses_slice()
+    }
+
+    /// A draw's settings ([`draw_settings`](Self::draw_settings), of a draw of `assembly` that may
+    /// draw a primitive where `primitives`), with the hidden depth and
     /// stencil it gives the pass: those an earlier draw of the encoder derived from the same
-    /// inputs, else derived and kept (`render/draw_shape.rs`); with the token of their memo
-    /// entry, `None` where their derivation met a notice the device announces at every
-    /// occurrence ([`EachWatch`]), which keeps nothing.
+    /// inputs, else those an earlier encoder's draw of the drawing state derived from the same
+    /// values (`draw_shape::KeptShapes`), else derived and kept (`render/draw_shape.rs`); with
+    /// the token of their memo entry, `None` where their derivation met a notice the device
+    /// announces at every occurrence ([`EachWatch`]), which keeps nothing.
     fn shaped_settings(
         &mut self,
         call: &'static str,
         pipeline: &DrawingState,
-        assembly: Assembly,
-    ) -> Result<(DrawSettings, Option<Target>, Option<ShapeToken>), Error> {
+        (assembly, primitives): (Assembly, bool),
+    ) -> Result<(Arc<DrawSettings>, Option<Target>, Option<ShapeToken>), Error> {
         let hidden = self.needed_hidden()?;
         let given = hidden.is_some();
         let inputs = self.shape_inputs();
         let inputs = (inputs.versions, inputs.counts_visibility);
-        if let Some((kept, token)) = self.shape_memo.settings((pipeline, assembly), inputs) {
+        let drawn = (pipeline, assembly, primitives);
+        if let Some((kept, token)) = self.shape_memo.settings(drawn, inputs) {
             debug_assert!(
                 (self.shape_inputs())
-                    .settings(call, (pipeline, assembly), given, false)
-                    .is_ok_and(|fresh| fresh == kept),
+                    .settings(call, drawn, given, false)
+                    .is_ok_and(|fresh| fresh == *kept),
                 "a draw's settings derived again differ from those kept for its inputs"
             );
             return Ok((kept, hidden, Some(token)));
         }
+        if let Some(carried) = self.shape_inputs().carried(drawn, given) {
+            debug_assert!(
+                (self.shape_inputs())
+                    .settings(call, drawn, given, false)
+                    .is_ok_and(|fresh| fresh == **carried.settings()),
+                "a draw's settings derived again differ from those an earlier encoder kept for \
+                 its values"
+            );
+            self.core.counts().draw_shape_carried();
+            let settings = Arc::clone(carried.settings());
+            let token = self.shape_memo.keep(drawn, inputs, carried);
+            return Ok((settings, hidden, Some(token)));
+        }
         let watch = EachWatch::start();
-        let settings = self
-            .shape_inputs()
-            .settings(call, (pipeline, assembly), given, true)?;
+        let settings = Arc::new(self.shape_inputs().settings(call, drawn, given, true)?);
         // Derived again at each draw, which announces it again.
         if watch.met() {
             return Ok((settings, hidden, None));
         }
-        let token = (self.shape_memo).keep_settings((pipeline, assembly), inputs, &settings);
+        let token = (self.shape_memo).keep_settings(drawn, inputs, &settings);
+        self.shape_inputs().keep_carried(drawn, given, &settings);
         Ok((settings, hidden, Some(token)))
     }
 
@@ -9727,7 +12444,9 @@ impl RenderLowering {
     /// Bring `live`, the encoder's kept bind state, to the bind state a draw of `pipeline` under
     /// `settings` binds in, reading its indices as `primitive_id_indices` says (`BindState::
     /// primitive_id_indices`, [`primitive_id_indices`]), a private type's list as `private` says
-    /// (`BindState::quad_primitive_ids` and `private_list`, [`PrivateForm`]),
+    /// (`BindState::quad_primitive_ids` and `private_list`, [`PrivateForm`]), the fixed-function
+    /// layouts it pulls past 4 GiB as `far` says (`BindState::far_vertex_buffers`,
+    /// `render/vertex_reach.rs`),
     /// its triangles' barycentric weights and an emulated mesh's corners as `provoking` says
     /// (`BindState::rotated_weights` and `mesh_last_first`, `render/provoking.rs`),
     /// its vertex, object and mesh tables
@@ -9742,22 +12461,24 @@ impl RenderLowering {
     fn settle_draw(
         &self,
         live: &mut LiveBind,
-        (pipeline, settings, primitive_id_indices, private, provoking): (
+        (pipeline, settings, primitive_id_indices, private, provoking, far, regions): (
             &DrawingState,
             &DrawSettings,
             Option<IndexType>,
             PrivateForm,
             ProvokingForms,
+            &BTreeSet<u32>,
+            (bool, Option<(RegionFanOut, u32)>),
         ),
         (pass_start, sampler_maps): (&PassStartTables, &SamplerMaps),
         (argument_samplers, unlisted): (&mut ArgumentSamplers, &mut Option<(u64, u64)>),
         (function_tables, snapshot): (&[VisibleFunctionTable], &mut Option<snapshot::Wanted>),
-    ) -> Result<Settled, Error> {
+    ) -> Result<(Settled, bool), Error> {
         // The pass's extended-range colors' shadows, which a variant that writes or reads them
         // reads and writes beside the codes (`render/extended_shadow.rs`).
         let mut shadows = self.extended_shadows_bound();
         // From the state the pipeline state's last draw left, where the encoder set it aside.
-        live.select(&pipeline.base().interface);
+        live.select(pipeline);
         loop {
             let mut reshape = self.refresh_bind_state(
                 live,
@@ -9780,16 +12501,27 @@ impl RenderLowering {
                 settings.written_clamp.map(|w| w.range),
                 Option::is_some,
             );
+            // The shape reads the band's primitive alone (`BindShape::line_band`).
+            reshape.shaped(&mut state.line_band, settings.line_band, |band| {
+                band.map(|(primitive, _)| primitive)
+            });
             let colors = &settings.routed_colors;
             reshape.field_from(&mut state.zeroed_colors, &colors.zeroed);
             reshape.field(&mut state.primitive_id_indices, primitive_id_indices);
             reshape.field(&mut state.quad_primitive_ids, private.quad_primitive_ids);
             reshape.field(&mut state.private_list, private.private_list);
+            reshape.field_from(&mut state.far_vertex_buffers, far);
+            let (region_viewports, region_fan_out) = regions;
+            reshape.field(&mut state.region_viewports, region_viewports);
+            reshape.field(&mut state.region_fan_out, region_fan_out);
             reshape.field(&mut state.rotated_weights, provoking.rotated_weights);
             reshape.field(&mut state.mesh_last_first, provoking.mesh_last_first);
             reshape.field_from(&mut state.dropped_colors, &colors.dropped);
             reshape.field_from(&mut state.extended_shadows, shadows);
-            let snapshots = snapshot.as_ref().map_or(&NO_INDICES, |w| &w.slots);
+            // A draw that reads in place reads its slots through no snapshot.
+            let snapshots = (snapshot.as_ref())
+                .filter(|w| !w.in_place)
+                .map_or(&NO_INDICES, |w| &w.slots);
             reshape.field_from(&mut state.snapshot_textures, snapshots);
             let depth_stencil = match &settings.failing_state {
                 Some(failing) => failing.failing_depth(),
@@ -9811,17 +12543,28 @@ impl RenderLowering {
             reshape.field(&mut state.render_area, render_area);
             reshape.field(&mut state.tile_threadgroup, tile_threadgroup);
             live.reshaped(reshape);
-            let counts = &self.core.device().shared().counts;
-            let shape = live.shape(counts, |state| pipeline.kept_shape(state));
-            // Through what the pipeline state settled lately (`GraphicsState::settle_shape`).
-            let settled = match pipeline.settle_shape(&shape, self.forms) {
+            let counts = self.core.counts();
+            let shape = live.shape(counts, |state, key| pipeline.kept_shape(state, key, counts));
+            // As the state's last recorded draw settled, where it settled the same
+            // (`live_bind.rs`): no lock of the pipeline state's; else through what the pipeline
+            // state settled lately (`GraphicsState::settle_shape`).
+            let kept = live.settled(pipeline, &shape, self.forms).cloned();
+            let found = kept.is_some();
+            let settled = kept.map_or_else(|| pipeline.settle_shape(&shape, self.forms), Ok);
+            let settled = match settled {
+                // A band variant the translator refuses for the draw's shape: the caller routes
+                // the draw again (`LineRoute::refused`).
+                Err(refused) if settings.line.refused(&refused).is_some() => return Err(refused),
                 // A variant that reads through snapshots the compile or bind layer refuses: the
-                // draw takes the split (`render/snapshot.rs`).
+                // draw takes the split, or with no barrier before it the copy, counted under no
+                // split reason (`render/snapshot.rs`).
                 Err(Error::Unsupported(_) | Error::Bind(BindError::Unsupported(_)))
-                    if snapshot.is_some() =>
+                    if snapshot.as_ref().is_some_and(|w| !w.in_place) =>
                 {
-                    let reason = "the variant that reads through snapshots is refused";
-                    snapshot::snapshot_fallback(self.core.device(), reason);
+                    if snapshot.as_ref().is_some_and(|w| w.split_otherwise) {
+                        let reason = snapshot::SplitReason::VariantRefused;
+                        snapshot::snapshot_fallback(self.core.device(), reason);
+                    }
                     *snapshot = None;
                     continue;
                 }
@@ -9839,18 +12582,35 @@ impl RenderLowering {
                 }
                 settled => settled?,
             };
+            // The variant reads no slot the state's bind state leaves out (`ReadSlots`).
+            #[cfg(debug_assertions)]
+            (pipeline.at_bind_views()).check_variant(settled.variant.pipeline());
+            // Vulkan takes no `InterpolateAtSample` in a pipeline made with custom sample
+            // locations (`VUID-VkGraphicsPipelineCreateInfo-sampleLocationsEnable-01524`), where
+            // Metal's answer is not measured.
+            if settled.variant.pipeline().graphics.interpolates_at_sample
+                && !self.layout.sample_positions.is_empty()
+            {
+                return Err(Error::NotImplemented(
+                    RuntimeGap::InterpolateAtSampleWithPositions,
+                ));
+            }
             // A plan that does not read through every snapshot the draw asked for: the draw
-            // takes the split, settled again without them.
+            // takes the split, settled again without them. One that does not read in place as the
+            // draw asked, or through snapshots with no barrier before it, takes the copy, counted
+            // under no split reason.
             if let Some(wanted) = snapshot.as_ref() {
                 if let Err(reason) = self.snapshot_holds(&settled, wanted) {
-                    snapshot::snapshot_fallback(self.core.device(), reason);
+                    if wanted.split_otherwise {
+                        snapshot::snapshot_fallback(self.core.device(), reason);
+                    }
                     *snapshot = None;
                     continue;
                 }
             }
             let set = settled.variant.pipeline().layout.sets.get(1);
             if argument_samplers.fit(set, unlisted) {
-                return Ok(settled);
+                return Ok((settled, found));
             }
             // A variant of set-1 arrays writes the listed states' elements: it takes the states,
             // listed again (alike, where the kept listing is current) against them.
@@ -10383,7 +13143,15 @@ impl RenderCommandEncoder {
         }
     }
 
-    /// `setTriangleFillMode:`. `Lines` needs `fillModeNonSolid` (`Unsupported`).
+    /// `setTriangleFillMode:` (`MTLTriangleFillMode`). `Lines` needs `fillModeNonSolid`
+    /// (`Unsupported`). `Points` is the raw value 2, which no SDK header declares and Apple's GL
+    /// renderer sends for `glPolygonMode(GL_POINT)`: Metal draws each triangle's vertices as points
+    /// of one pixel on an Apple M3 Max and an Intel UHD Graphics 630 (a Radeon Pro 5300M fills the
+    /// triangle), and the runtime draws them as points (`VK_POLYGON_MODE_POINT`). It needs
+    /// `fillModeNonSolid`, and on a portability-subset device `pointPolygons` (`Unsupported`). A
+    /// point takes the size the vertex function writes (`[[point_size]]`), where the M3 Max draws
+    /// one pixel whatever it writes: a draw whose vertex function writes one announces
+    /// `Degradation::TrianglePointSize`.
     pub fn set_triangle_fill_mode(&mut self, mode: TriangleFillMode) -> Result<(), Error> {
         match self.lowers_at_call() {
             true => self.at_call(|lowering| lowering.set_triangle_fill_mode(mode)),
@@ -10474,8 +13242,9 @@ impl RenderCommandEncoder {
     ) -> Result<(), Error> {
         let primitive_type = primitive_type.into();
         match self.lowers_at_call() {
-            true => self.at_call(|lowering| {
+            true => self.draw_at_call(|lowering, live| {
                 lowering.draw_primitives(
+                    live,
                     primitive_type,
                     vertex_start,
                     vertex_count,
@@ -10517,8 +13286,9 @@ impl RenderCommandEncoder {
     ) -> Result<(), Error> {
         let primitive_type = primitive_type.into();
         match self.lowers_at_call() {
-            true => self.at_call(|lowering| {
+            true => self.draw_at_call(|lowering, live| {
                 lowering.draw_indexed_primitives(
+                    live,
                     primitive_type,
                     index_count,
                     index_type,
@@ -10555,8 +13325,9 @@ impl RenderCommandEncoder {
     ) -> Result<(), Error> {
         let primitive_type = primitive_type.into();
         match self.lowers_at_call() {
-            true => self.at_call(|lowering| {
+            true => self.draw_at_call(|lowering, live| {
                 lowering.draw_primitives_indirect(
+                    live,
                     primitive_type,
                     indirect_buffer,
                     indirect_buffer_offset,
@@ -10591,8 +13362,9 @@ impl RenderCommandEncoder {
     ) -> Result<(), Error> {
         let primitive_type = primitive_type.into();
         match self.lowers_at_call() {
-            true => self.at_call(|lowering| {
+            true => self.draw_at_call(|lowering, live| {
                 lowering.draw_indexed_primitives_indirect(
+                    live,
                     primitive_type,
                     index_type,
                     index_buffer,
@@ -10636,8 +13408,9 @@ impl RenderCommandEncoder {
         base_instance: u32,
     ) -> Result<(), Error> {
         match self.lowers_at_call() {
-            true => self.at_call(|lowering| {
+            true => self.draw_at_call(|lowering, live| {
                 lowering.draw_patches(
+                    live,
                     number_of_patch_control_points,
                     patch_start,
                     patch_count,
@@ -10679,8 +13452,9 @@ impl RenderCommandEncoder {
         indirect_buffer_offset: u64,
     ) -> Result<(), Error> {
         match self.lowers_at_call() {
-            true => self.at_call(|lowering| {
+            true => self.draw_at_call(|lowering, live| {
                 lowering.draw_patches_indirect(
+                    live,
                     number_of_patch_control_points,
                     patch_index_buffer,
                     patch_index_buffer_offset,
@@ -10726,8 +13500,9 @@ impl RenderCommandEncoder {
         base_instance: u32,
     ) -> Result<(), Error> {
         match self.lowers_at_call() {
-            true => self.at_call(|lowering| {
+            true => self.draw_at_call(|lowering, live| {
                 lowering.draw_indexed_patches(
+                    live,
                     number_of_patch_control_points,
                     patch_start,
                     patch_count,
@@ -10776,8 +13551,9 @@ impl RenderCommandEncoder {
         indirect_buffer_offset: u64,
     ) -> Result<(), Error> {
         match self.lowers_at_call() {
-            true => self.at_call(|lowering| {
+            true => self.draw_at_call(|lowering, live| {
                 lowering.draw_indexed_patches_indirect(
+                    live,
                     number_of_patch_control_points,
                     patch_index_buffer,
                     patch_index_buffer_offset,
@@ -10820,6 +13596,22 @@ impl RenderCommandEncoder {
         match self.lowers_at_call() {
             true => self.at_call(|lowering| lowering.set_visibility_result_mode(mode, offset)),
             false => self.defer(|_| RenderCall::VisibilityResultMode(mode, offset)),
+        }
+    }
+
+    /// `label`: the label [`set_label`](Self::set_label) gave it, or `None`, as Metal's is `nil`
+    /// until set.
+    pub fn label(&self) -> Option<String> {
+        self.command_buffer()?.open_encoder_label()
+    }
+
+    /// `setLabel:`: label it `label`, which its command buffer's ended encoders keep
+    /// ([`CommandBuffer::ended_encoders`](crate::CommandBuffer::ended_encoders)) and the
+    /// runtime's notices naming the command buffer state, as [`CommandBuffer::set_label`](crate::CommandBuffer::set_label)'s.
+    /// Its calls' numbering ([`EncoderCall`]) skips it.
+    pub fn set_label(&mut self, label: &str) {
+        if let Some(command_buffer) = self.command_buffer() {
+            command_buffer.label_open_encoder(label);
         }
     }
 
@@ -10887,6 +13679,11 @@ struct Recording<'a> {
     /// The dynamic states the pipeline holds: its own, but for those of a part it lacks (the
     /// fragment states of a pipeline that discards rasterization, `fragment_state`).
     dynamic: &'a [vk::DynamicState],
+    /// Where the record it records through holds its pipeline and its dynamic states as the
+    /// last recording through it set them, of the same values (a draw rebound:
+    /// `render/draw_again/rebound.rs`), those of `dynamic` no value of the record holds, which it
+    /// sets at every draw: it compares the others with none (`render/bound.rs`).
+    settled: Option<&'a [vk::DynamicState]>,
     /// The draw's input assembly, which the pipeline takes as dynamic state where it makes the
     /// topology dynamic.
     topology: metal2vulkan::vk::PrimitiveTopology,
@@ -10895,9 +13692,12 @@ struct Recording<'a> {
     extended: Option<super::dynamic_state::ExtendedDynamicState>,
     /// The device's mesh draw commands, where it enabled `meshShader`.
     mesh: Option<&'a crate::recorder::MeshDraws>,
+    /// The device's multi-draw commands, where a rate-mapped pass may record its regions with
+    /// them (`DrawState::draws`).
+    multi: Option<&'a crate::recorder::MultiDraws>,
     draw: metal2vulkan::vk::DrawCommand,
-    /// Its part in a draw read through snapshots (`render/snapshot.rs`): the barrier, write
-    /// masks and phase it records before its draw.
+    /// Its part in a draw read through snapshots, or in place (`render/snapshot.rs`): the
+    /// barrier, write masks and phase it records before its draw, and the barrier after it.
     pair: Option<snapshot::Pair>,
 }
 
@@ -10971,7 +13771,6 @@ impl Recording<'_> {
     /// `render_target` made, of no views (`snapshot::Pair::record`).
     unsafe fn record(&self, bound: &mut Bound) -> Recorded {
         let (raw, cb) = (self.raw, self.command_buffer);
-        let dynamic = |state| self.dynamic.contains(&state);
         bound.follow(cb);
         let mut recorded = 0;
         let mut writes_pushed = 0;
@@ -11032,13 +13831,22 @@ impl Recording<'_> {
                     recorded += 1;
                 }
             }
-            if !self.push.is_empty() && bound.pushes(self.layout, self.push) {
-                for (stages, offset, bytes) in self.push {
-                    raw.cmd_push_constants(cb, self.layout, *stages, *offset, bytes);
+            let pushed = match self.push.is_empty() {
+                true => None,
+                false => Some(bound.pushes(self.layout, self.push)).filter(|p| p.any()),
+            };
+            if let Some(pushed) = pushed {
+                for (at, (stages, offset, bytes)) in self.push.iter().enumerate() {
+                    if pushed.has(at) {
+                        raw.cmd_push_constants(cb, self.layout, *stages, *offset, bytes);
+                    }
                 }
                 recorded += 1;
             }
-            let strides = dynamic(vk::DynamicState::VERTEX_INPUT_BINDING_STRIDE);
+            // Whether the pipeline takes the strides as dynamic state: looked up among its dynamic
+            // states only for a draw that binds a vertex buffer.
+            let strides = !self.vertex_buffers.is_empty()
+                && (self.dynamic).contains(&vk::DynamicState::VERTEX_INPUT_BINDING_STRIDE);
             for &(binding, buffer, offset, stride) in self.vertex_buffers {
                 match (strides, &self.extended) {
                     (true, Some(extended)) => {
@@ -11080,7 +13888,7 @@ impl Recording<'_> {
                 topology: self.topology,
                 primitive_restart: self.primitive_restart,
             };
-            for &state in self.dynamic {
+            for &state in self.settled.unwrap_or(self.dynamic) {
                 // The write masks, which only a draw read through snapshots makes dynamic, are
                 // its pair's to set at every draw (below).
                 if state == vk::DynamicState::COLOR_WRITE_MASK_EXT || !bound.dynamic(state, now) {
@@ -11123,95 +13931,152 @@ impl Recording<'_> {
             if let Some(pair) = &self.pair {
                 pair.record(raw, cb, self.layout);
             }
-            match self.draw {
-                metal2vulkan::vk::DrawCommand::Draw {
-                    vertex_count,
-                    instance_count,
-                    first_vertex,
-                    first_instance,
-                } => raw.cmd_draw(
-                    cb,
-                    vertex_count,
-                    instance_count,
-                    first_vertex,
-                    first_instance,
-                ),
-                metal2vulkan::vk::DrawCommand::DrawIndexed {
-                    index_count,
-                    instance_count,
-                    first_index,
-                    vertex_offset,
-                    first_instance,
-                    ..
-                } => raw.cmd_draw_indexed(
-                    cb,
-                    index_count,
-                    instance_count,
-                    first_index,
-                    vertex_offset,
-                    first_instance,
-                ),
-                metal2vulkan::vk::DrawCommand::DrawIndirect {
-                    offset,
-                    draw_count,
-                    stride,
-                } => {
-                    if let Some(buffer) = self.indirect {
-                        raw.cmd_draw_indirect(cb, buffer, offset, draw_count, stride);
-                    }
-                }
-                metal2vulkan::vk::DrawCommand::DrawIndexedIndirect {
-                    offset,
-                    draw_count,
-                    stride,
-                    ..
-                } => {
-                    if let Some(buffer) = self.indirect {
-                        raw.cmd_draw_indexed_indirect(cb, buffer, offset, draw_count, stride);
-                    }
-                }
-                // A mesh render pipeline's state compiles only where the device enabled
-                // `meshShader`, which loads the commands.
-                metal2vulkan::vk::DrawCommand::DrawMeshTasks {
-                    group_count_x,
-                    group_count_y,
-                    group_count_z,
-                } => {
-                    if let Some(mesh) = self.mesh {
-                        mesh.cmd_draw_mesh_tasks(cb, group_count_x, group_count_y, group_count_z);
-                    }
-                }
-                metal2vulkan::vk::DrawCommand::DrawMeshTasksIndirect {
-                    offset,
-                    draw_count,
-                    stride,
-                } => {
-                    if let (Some(mesh), Some(buffer)) = (self.mesh, self.indirect) {
-                        mesh.cmd_draw_mesh_tasks_indirect(cb, buffer, offset, draw_count, stride);
-                    }
-                }
-                metal2vulkan::vk::DrawCommand::DrawMeshTasksIndirectCount {
-                    offset,
-                    count_offset,
-                    max_draw_count,
-                    stride,
-                } => {
-                    if let (Some(mesh), Some(buffer)) = (self.mesh, self.indirect) {
-                        mesh.cmd_draw_mesh_tasks_indirect_count(
-                            cb,
-                            buffer,
-                            (offset, count_offset),
-                            max_draw_count,
-                            stride,
-                        );
-                    }
-                }
+            let regions = self
+                .multi
+                .filter(|_| s.draws > 1)
+                .map(|multi| (multi, s.draws));
+            record_draw_command(raw, cb, self.draw, self.indirect, (self.mesh, regions));
+            if let Some(pair) = &self.pair {
+                pair.record_after(raw, cb);
             }
         }
+        bound.recorded();
         Recorded {
             states: recorded,
             writes_pushed,
             equal_shapes,
+        }
+    }
+}
+
+/// Record `draw`, the Vulkan draw command, into `cb`: an indirect one from `indirect`, a mesh one
+/// through `mesh`, the device's mesh draw commands, and a direct one `n` times in one command
+/// through `multi` where `regions` is `Some((multi, n))`: a rate-mapped pass's `n` regions, draw
+/// `i` through the viewport and scissor at index `i`, or through a region-copy variant region `i`
+/// of its box (`DrawState::draws`).
+///
+/// # Safety
+///
+/// `cb` is recording inside a pass compatible with the bound pipeline's, with every state the
+/// pipeline and the command take bound or set, and every handle live until it completes; `mesh`
+/// is the device's, where it enabled `meshShader`, and `multi` its multi-draw commands, `n` at
+/// most their batch.
+unsafe fn record_draw_command(
+    raw: &ash::Device,
+    cb: vk::CommandBuffer,
+    draw: metal2vulkan::vk::DrawCommand,
+    indirect: Option<vk::Buffer>,
+    (mesh, regions): (
+        Option<&crate::recorder::MeshDraws>,
+        Option<(&crate::recorder::MultiDraws, u32)>,
+    ),
+) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        match draw {
+            metal2vulkan::vk::DrawCommand::Draw {
+                vertex_count,
+                instance_count,
+                first_vertex,
+                first_instance,
+            } => match regions {
+                Some((multi, n)) => {
+                    let one = vk::MultiDrawInfoEXT {
+                        first_vertex,
+                        vertex_count,
+                    };
+                    let draws = vec![one; n as usize];
+                    multi.cmd_draw_multi(cb, &draws, instance_count, first_instance)
+                }
+                None => raw.cmd_draw(
+                    cb,
+                    vertex_count,
+                    instance_count,
+                    first_vertex,
+                    first_instance,
+                ),
+            },
+            metal2vulkan::vk::DrawCommand::DrawIndexed {
+                index_count,
+                instance_count,
+                first_index,
+                vertex_offset,
+                first_instance,
+                ..
+            } => match regions {
+                Some((multi, n)) => {
+                    let one = vk::MultiDrawIndexedInfoEXT {
+                        first_index,
+                        index_count,
+                        vertex_offset,
+                    };
+                    let draws = vec![one; n as usize];
+                    multi.cmd_draw_multi_indexed(cb, &draws, instance_count, first_instance)
+                }
+                None => raw.cmd_draw_indexed(
+                    cb,
+                    index_count,
+                    instance_count,
+                    first_index,
+                    vertex_offset,
+                    first_instance,
+                ),
+            },
+            metal2vulkan::vk::DrawCommand::DrawIndirect {
+                offset,
+                draw_count,
+                stride,
+            } => {
+                if let Some(buffer) = indirect {
+                    raw.cmd_draw_indirect(cb, buffer, offset, draw_count, stride);
+                }
+            }
+            metal2vulkan::vk::DrawCommand::DrawIndexedIndirect {
+                offset,
+                draw_count,
+                stride,
+                ..
+            } => {
+                if let Some(buffer) = indirect {
+                    raw.cmd_draw_indexed_indirect(cb, buffer, offset, draw_count, stride);
+                }
+            }
+            // A mesh render pipeline's state compiles only where the device enabled
+            // `meshShader`, which loads the commands.
+            metal2vulkan::vk::DrawCommand::DrawMeshTasks {
+                group_count_x,
+                group_count_y,
+                group_count_z,
+            } => {
+                if let Some(mesh) = mesh {
+                    mesh.cmd_draw_mesh_tasks(cb, group_count_x, group_count_y, group_count_z);
+                }
+            }
+            metal2vulkan::vk::DrawCommand::DrawMeshTasksIndirect {
+                offset,
+                draw_count,
+                stride,
+            } => {
+                if let (Some(mesh), Some(buffer)) = (mesh, indirect) {
+                    mesh.cmd_draw_mesh_tasks_indirect(cb, buffer, offset, draw_count, stride);
+                }
+            }
+            metal2vulkan::vk::DrawCommand::DrawMeshTasksIndirectCount {
+                offset,
+                count_offset,
+                max_draw_count,
+                stride,
+            } => {
+                if let (Some(mesh), Some(buffer)) = (mesh, indirect) {
+                    mesh.cmd_draw_mesh_tasks_indirect_count(
+                        cb,
+                        buffer,
+                        (offset, count_offset),
+                        max_draw_count,
+                        stride,
+                    );
+                }
+            }
         }
     }
 }
@@ -11307,7 +14172,7 @@ const INPUT_ATTACHMENT: metal2vulkan::vk::ImageUsageFlags =
 
 /// Whether `target`'s texture is memoryless.
 fn memoryless(target: &Target) -> bool {
-    target.texture.storage_mode() == super::values::StorageMode::Memoryless
+    target.texture.is_memoryless()
 }
 
 /// The clears of color attachments a pass's first instance leaves out, recorded before the pass,
@@ -11803,6 +14668,44 @@ fn late_store(
         ));
     }
     Ok(action)
+}
+
+/// The rectangle `[x0, y0, x1, y1)` bounding the pixels of `rects` (a draw's Vulkan scissors),
+/// those of no pixel left out: `None` where none has one.
+fn scissors_bound(rects: &[vk::Rect2D]) -> Option<[u32; 4]> {
+    let mut drawn: Option<[u32; 4]> = None;
+    for r in rects
+        .iter()
+        .filter(|r| r.extent.width > 0 && r.extent.height > 0)
+    {
+        let (x, y) = (r.offset.x.max(0) as u32, r.offset.y.max(0) as u32);
+        let rect = [x, y, x + r.extent.width, y + r.extent.height];
+        drawn = Some(match drawn {
+            Some([a, b, c, d]) => [
+                a.min(rect[0]),
+                b.min(rect[1]),
+                c.max(rect[2]),
+                d.max(rect[3]),
+            ],
+            None => rect,
+        });
+    }
+    drawn
+}
+
+/// The texels of `texture` a draw whose scissors `drawn` bounds ([`scissors_bound`]) reads at its
+/// fragments' own pixels, `[x0, y0, x1, y1)`: `drawn` widened by a pixel each way, for its helper
+/// invocations, and clamped as the read's coordinate is, on each axis
+/// `[min(max(x0 - 1, 0), w - 1), min(x1 + 1, w))`, `w` the texture's (`texture/attached_reads.rs`).
+/// `None` for a texture of no texel.
+fn own_pixel_loads([x0, y0, x1, y1]: [u32; 4], texture: &Texture) -> Option<[u32; 4]> {
+    let (w, h) = (texture.width() as u32, texture.height() as u32);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let lo = |p: u32, side: u32| p.saturating_sub(1).min(side - 1);
+    let hi = |p: u32, side: u32| (p + 1).min(side);
+    Some([lo(x0, w), lo(y0, h), hi(x1, w), hi(y1, h)])
 }
 
 #[cfg(test)]

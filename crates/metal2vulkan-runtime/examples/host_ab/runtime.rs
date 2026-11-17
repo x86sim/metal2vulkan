@@ -2,7 +2,9 @@
 //! finds (MoltenVK on a Mac). The device is opened as the consumer opens it (reims-vgpu's
 //! `device_options`): GPU times from the host's clock, the exact completion and uncompressed heap
 //! textures, the rest of the policy at its defaults, the shader cache in a directory of the
-//! bench's own.
+//! bench's own. It is then held until the device's own checks answered
+//! ([`Runtime::settle_checks`]), as a consumer's device that reads their verdicts from its cache's
+//! records knows them as it is made.
 
 use crate::gpu::{Format, Gpu};
 use metal2vulkan::bind::SamplerDescriptor;
@@ -19,12 +21,16 @@ use metal2vulkan_runtime as rt;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// The degradation notices the runtime's device announced.
 pub static NOTICES: AtomicU64 = AtomicU64::new(0);
 
 /// The other messages the runtime's device's sink heard.
 pub static MESSAGES: AtomicU64 = AtomicU64::new(0);
+
+/// How long [`Runtime::settle_checks`] waits for each of the device's checks to answer.
+const SETTLE: Duration = Duration::from_secs(30);
 
 pub struct Runtime {
     device: rt::Device,
@@ -57,6 +63,40 @@ impl Runtime {
         let device = rt::Device::system_default_with(&options).expect("open the runtime's device");
         let queue = device.new_command_queue().expect("new_command_queue");
         Runtime { device, queue }
+    }
+
+    /// Wait until the device's own checks answered: of textures over host pages in place, of its
+    /// submissions and of its queue switch. Each runs once per driver on a thread of its own, its
+    /// verdicts kept in the shader cache's records, and the bench's cache is a new directory of
+    /// each run's unless `--cache` names one, so each would else run beside the workloads: its
+    /// work, which the device counts as its own, in whichever call's window it fell (the in-place
+    /// check, which the first texture over a buffer in exported memory starts, makes and binds
+    /// its images on its thread for as long as it runs), and the calls before its verdicts taking
+    /// another path than those after. A consumer's device that read the verdicts from its cache's
+    /// records runs none of them, and so is the device every workload is measured on. How long
+    /// they took is reported apart from the device's opening (`meta device_checks`, ms); a check
+    /// that did not answer within [`SETTLE`] is named on stderr, and the run goes on.
+    pub fn settle_checks(&self) {
+        let started = Instant::now();
+        let settled = [
+            ("in-place", self.device.settle_in_place_checks(SETTLE)),
+            ("submission", self.device.settle_submit_checks(SETTLE)),
+            (
+                "queue switch",
+                self.device.settle_queue_switch_check(SETTLE),
+            ),
+        ];
+        crate::workloads::emit(
+            "meta",
+            "device_checks",
+            "ms",
+            &mut [started.elapsed().as_secs_f64() * 1e3],
+        );
+        for (check, answered) in settled {
+            if !answered {
+                eprintln!("runtime: the device's {check} check did not answer within {SETTLE:?}");
+            }
+        }
     }
 
     pub fn device(&self) -> &rt::Device {
@@ -111,6 +151,14 @@ impl Gpu for Runtime {
 
     fn label(&self) -> String {
         format!("runtime on {}", self.device.name())
+    }
+
+    fn with_own_queue(&self) -> Runtime {
+        let queue = self.device.new_command_queue().expect("new_command_queue");
+        Runtime {
+            device: self.device.clone(),
+            queue,
+        }
     }
 
     fn library(&self, metallib: &Path) -> rt::Library {
@@ -263,6 +311,10 @@ impl Gpu for Runtime {
 
     fn pipeline_id(&self, state: &rt::ComputePipelineState) -> u64 {
         state.gpu_resource_id().0
+    }
+
+    fn texture_id(&self, texture: &rt::Texture) -> u64 {
+        texture.gpu_resource_id().0
     }
 
     fn cpu_indirect_commands(&self, count: usize) -> rt::IndirectCommandBuffer {
@@ -694,6 +746,17 @@ impl Gpu for Runtime {
             .expect("set_vertex_buffer");
     }
 
+    fn set_vertex_buffer_offset(
+        &self,
+        encoder: &mut rt::RenderCommandEncoder,
+        offset: usize,
+        index: usize,
+    ) {
+        encoder
+            .set_vertex_buffer_offset(offset as u64, index as u32)
+            .expect("set_vertex_buffer_offset");
+    }
+
     fn set_vertex_buffers(
         &self,
         encoder: &mut rt::RenderCommandEncoder,
@@ -988,6 +1051,16 @@ impl Gpu for Runtime {
             .expect("use_resources");
     }
 
+    fn use_textures(&self, encoder: &mut rt::ComputeCommandEncoder, textures: &[&rt::Texture]) {
+        let resources: Vec<_> = textures
+            .iter()
+            .map(|texture| texture.as_resource())
+            .collect();
+        encoder
+            .use_resources(&resources, ResourceUsage::READ)
+            .expect("use_resources");
+    }
+
     fn execute_commands(
         &self,
         encoder: &mut rt::ComputeCommandEncoder,
@@ -1240,6 +1313,10 @@ impl Gpu for Runtime {
             ("splits_barrier", c.instance_splits_barrier),
             ("splits_tile_dispatch", c.instance_splits_tile_dispatch),
             ("splits_tile_memory", c.instance_splits_tile_memory),
+            (
+                "splits_interlocked_writes",
+                c.instance_splits_interlocked_writes,
+            ),
             ("splits_attached_read", c.instance_splits_attached_read),
             ("splits_feedback", c.instance_splits_feedback),
             (
@@ -1262,6 +1339,7 @@ impl Gpu for Runtime {
             ("requirement_images_made", c.requirement_images_made),
             ("arena_pools_made", c.arena_pools_made),
             ("command_pools_made", c.command_pools_made),
+            ("command_buffers_made", c.command_buffers_made),
             ("dispatches", recorded.cmd_dispatch),
             ("draws", recorded.cmd_draw),
             ("gpu_form_commands", c.gpu_form_commands),
@@ -1277,6 +1355,11 @@ impl Gpu for Runtime {
             (
                 "dispatches_settled_as_before",
                 c.dispatches_settled_as_before,
+            ),
+            ("dispatches_instantiated", c.dispatches_instantiated),
+            (
+                "dispatches_instantiated_as_before",
+                c.dispatches_instantiated_as_before,
             ),
             (
                 "dispatches_planned_as_before",
@@ -1453,6 +1536,11 @@ impl Gpu for Runtime {
             ("pipeline_layouts_made", c.pipeline_layouts_made),
             ("pipeline_layouts_shared", c.pipeline_layouts_shared),
             ("flights_followed", c.flights_followed),
+            (
+                "makings_held_for_compile_memory",
+                c.makings_held_for_compile_memory,
+            ),
+            ("compile_memory_held_nanos", c.compile_memory_held_nanos),
             ("predicated_loop_runs_again", c.predicated_loop_runs_again),
             ("variants_taken_back", c.variants_taken_back),
             (
@@ -1520,7 +1608,6 @@ impl Gpu for Runtime {
                 c.heap_texture_untiled_layouts,
             ),
             ("fills_recorded", c.fills_recorded),
-            ("fills_by_transfers", c.fills_by_transfers),
             ("ycbcr_refreshes", c.ycbcr_refreshes),
             ("ycbcr_whole_conversions", c.ycbcr_whole_conversions),
             ("attachment_clears_recorded", c.attachment_clears_recorded),
@@ -1598,6 +1685,7 @@ impl Gpu for Runtime {
             ("registrations_waited", c.registrations_waited),
             ("scheduler_wakes_completion", c.scheduler_wakes_completion),
             ("scheduler_sleep_slices", c.scheduler_sleep_slices),
+            ("scheduler_slice_rescues", c.scheduler_slice_rescues),
             ("scheduler_gpu_waits", c.scheduler_gpu_waits),
             ("wakes_completion_waiters", c.wakes_completion_waiters),
             (
@@ -1616,6 +1704,7 @@ impl Gpu for Runtime {
             ("bare_starts", c.bare_starts),
             ("prefixed_starts", c.prefixed_starts),
             ("command_barriers", c.command_barriers),
+            ("commands_ordered_inside", c.commands_ordered_inside),
             ("unrun_instances_ended", c.unrun_instances_ended),
             ("untouched_passes_skipped", c.untouched_passes_skipped),
             ("inline_passes", c.inline_passes),
@@ -1686,6 +1775,15 @@ impl Gpu for Runtime {
             ("images_started_on_the_host", c.images_started_on_the_host),
             ("host_texel_copies", c.host_texel_copies),
             ("staging_submissions", c.staging_submissions),
+            ("staging_copies_queued", c.staging_copies_queued),
+            ("staging_moves_queued", c.staging_moves_queued),
+            ("staging_flushes", c.staging_flushes),
+            ("staging_gpu_waits", c.staging_gpu_waits),
+            ("fill_queue_submissions", c.fill_queue_submissions),
+            ("fill_queue_waits", c.fill_queue_waits),
+            ("fill_queue_waits_unused", c.fill_queue_waits_unused),
+            ("first_work_waits", c.first_work_waits),
+            ("first_work_waits_unused", c.first_work_waits_unused),
             ("uncached_host_images", c.uncached_host_images),
             ("cpu_block_decodes", c.cpu_block_decodes),
             ("block_decode_passes", c.block_decode_passes),
@@ -1700,8 +1798,19 @@ impl Gpu for Runtime {
             ),
             ("draw_shapes_made", c.draw_shapes_made),
             ("draw_shapes_found", c.draw_shapes_found),
+            ("dispatch_shapes_made", c.dispatch_shapes_made),
+            ("dispatch_shapes_found", c.dispatch_shapes_found),
+            (
+                "dispatch_used_resources_listed",
+                c.dispatch_used_resources_listed,
+            ),
+            ("resident_textures_looked_at", c.resident_textures_looked_at),
+            ("resident_resources_joined", c.resident_resources_joined),
+            ("heap_tables_worked_out", c.heap_tables_worked_out),
             ("argument_samplers_taken", c.argument_samplers_taken),
             ("bind_views_worked_out", c.bind_views_worked_out),
+            ("bind_samplers_worked_out", c.bind_samplers_worked_out),
+            ("bind_spaces_read", c.bind_spaces_read),
             ("stage_tables_read", c.stage_tables_read),
             ("stage_tables_read_in_part", c.stage_tables_read_in_part),
             ("no_copy_lies_read", c.no_copy_lies_read),
@@ -1721,6 +1830,7 @@ impl Gpu for Runtime {
                 c.linear_passes_through_copies,
             ),
             ("kept_bytes_passes", c.kept_bytes_passes),
+            ("kept_texels_passes", c.kept_texels_passes),
             ("color_group_passes", c.color_group_passes),
             ("color_group_twins", c.color_group_twins),
             ("color_group_draws_skipped", c.color_group_draws_skipped),
@@ -1755,13 +1865,19 @@ impl Gpu for Runtime {
             ),
             ("host_keep_alives_kept", c.host_keep_alives_kept),
             ("host_keep_alives_covered", c.host_keep_alives_covered),
+            ("host_releases_held_inside", c.host_releases_held_inside),
             ("host_mappings_queried", c.host_mappings_queried),
             ("dma_buf_imports", c.dma_buf_imports),
             ("dma_buf_memories_live", c.dma_buf_memories_live),
             ("dma_buf_image_memories_live", c.dma_buf_image_memories_live),
             ("host_imports_released", c.host_imports_released),
             ("host_imports_reimported", c.host_imports_reimported),
+            (
+                "host_imports_joined_releasable",
+                c.host_imports_joined_releasable,
+            ),
             ("host_imports_resident", c.host_imports_resident),
+            ("host_imports_held_for_good", c.host_imports_held_for_good),
             ("host_imports_lost", c.host_imports_lost),
             ("host_import_fds_kept", c.host_import_fds_kept),
             ("host_imports_kept_for_fds", c.host_imports_kept_for_fds),
@@ -1784,8 +1900,20 @@ impl Gpu for Runtime {
                 c.host_imports_read_apart_texture,
             ),
             (
-                "host_imports_read_apart_second_buffer",
-                c.host_imports_read_apart_second_buffer,
+                "host_imports_read_apart_inside",
+                c.host_imports_read_apart_inside,
+            ),
+            (
+                "host_imports_read_apart_shared_range",
+                c.host_imports_read_apart_shared_range,
+            ),
+            (
+                "host_imports_read_apart_heap",
+                c.host_imports_read_apart_heap,
+            ),
+            (
+                "host_imports_read_apart_rebound",
+                c.host_imports_read_apart_rebound,
             ),
             (
                 "host_imports_read_apart_unreleased",
@@ -1994,15 +2122,40 @@ impl Gpu for Runtime {
             ("shadow_texels_kept", c.shadow_texels_kept),
             ("bounded_shadow_copies", c.bounded_shadow_copies),
             ("views_through_swizzle", c.views_through_swizzle),
+            ("alpha_textures_held_in_red", c.alpha_textures_held_in_red),
             ("view_shadows", c.view_shadows),
             (
                 "attachment_reads_through_copies",
                 c.attachment_reads_through_copies,
             ),
             ("attachment_read_splits", c.attachment_read_splits),
+            ("attachment_read_clears", c.attachment_read_clears),
+            ("fetch_draw_barriers", c.fetch_draw_barriers),
             ("reading_draws_snapshotted", c.reading_draws_snapshotted),
+            (
+                "reading_draws_snapshotted_leading",
+                c.reading_draws_snapshotted_leading,
+            ),
             ("snapshot_inline_splits", c.snapshot_inline_splits),
+            ("reading_draws_by_coverage", c.reading_draws_by_coverage),
+            (
+                "reading_draws_leading_covered_within",
+                c.reading_draws_leading_covered_within,
+            ),
+            (
+                "reading_draws_leading_covered_to_half",
+                c.reading_draws_leading_covered_to_half,
+            ),
+            (
+                "reading_draws_leading_covered_over_half",
+                c.reading_draws_leading_covered_over_half,
+            ),
+            ("coverage_queries", c.coverage_queries),
+            ("coverage_pools_made", c.coverage_pools_made),
+            ("reading_draws_pinned", c.reading_draws_pinned),
+            ("stand_ins_after_pins", c.stand_ins_after_pins),
             ("feedback_loop_alias_images", c.feedback_loop_alias_images),
+            ("feedback_loop_shadow_images", c.feedback_loop_shadow_images),
             ("depth_attachments_moved", c.depth_attachments_moved),
             ("depth_instances_held", c.depth_instances_held),
             ("held_depths_released", c.held_depths_released),
@@ -2045,6 +2198,30 @@ impl Gpu for Runtime {
             ),
             ("vk_image_bindings", c.object_churn.vk_image_bindings),
             ("vk_buffer_bindings", c.object_churn.vk_buffer_bindings),
+            (
+                "vk_images_made_this_thread",
+                c.object_churn.vk_images_made_this_thread,
+            ),
+            (
+                "vk_buffers_made_this_thread",
+                c.object_churn.vk_buffers_made_this_thread,
+            ),
+            (
+                "vk_image_views_made_this_thread",
+                c.object_churn.vk_image_views_made_this_thread,
+            ),
+            (
+                "vk_memory_allocations_this_thread",
+                c.object_churn.vk_memory_allocations_this_thread,
+            ),
+            (
+                "vk_image_bindings_this_thread",
+                c.object_churn.vk_image_bindings_this_thread,
+            ),
+            (
+                "vk_buffer_bindings_this_thread",
+                c.object_churn.vk_buffer_bindings_this_thread,
+            ),
             ("churn_images_in_buffers", c.object_churn.images_in_buffers),
             ("churn_images_in_heaps", c.object_churn.images_in_heaps),
             ("churn_images_other", c.object_churn.images_other),
@@ -2059,6 +2236,14 @@ impl Gpu for Runtime {
             (
                 "churn_imports_inside_live",
                 c.object_churn.imports_inside_live,
+            ),
+            (
+                "churn_buffers_bound_in_import",
+                c.object_churn.buffers_bound_in_import,
+            ),
+            (
+                "churn_imports_over_ram_chunk_pages",
+                c.object_churn.imports_over_ram_chunk_pages,
             ),
             ("keeps_render_cut", c.shadow_keeps.render_cut),
             ("keeps_render_cut_texels", c.shadow_keeps.render_cut_texels),

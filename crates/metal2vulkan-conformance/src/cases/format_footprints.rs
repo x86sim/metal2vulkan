@@ -144,10 +144,10 @@
 //!
 //! # Why a case stops at its first refusal
 //!
-//! The runtime holds **no image of 32 of the 33** (`BGRA4Unorm` is the one it holds, in the
-//! Vulkan word of its bits): every other one is refused
-//! `Unsupported { feature: Format, needs: NotImplemented }`, measured over every descriptor of
-//! every case of this family. A case that recorded a refusal at each site and went on — which is
+//! The runtime holds **no image of 26 of the 33** (it holds `BGRA4Unorm`, in the Vulkan word of
+//! its bits, and ASTC's six 4x2 and 8x4 forms, whose blocks lie in a carrier with a decoded twin):
+//! every other one is refused `Unsupported { feature: Format, needs: NotImplemented }`, measured
+//! over every descriptor of every case of this family. A case that recorded a refusal at each site and went on — which is
 //! what `heap_metal_sizes` does, because the runtime answers all of its descriptors — would print
 //! some 2900 `Refused` rows and need a `known-gaps.tsv` row for each, which is a ledger nobody
 //! reads and therefore no ledger. So each case stops at the first site it is refused, and the
@@ -163,10 +163,13 @@
 //! the point: the gap was a number in a generated document and it is now a row of the report
 //! naming the format, the descriptor and both answers.
 
+use crate::allowance::Allowance;
 use crate::case::{Abort, Case, Input, MetalSource, Side, TextureRole, TextureSpec};
 use crate::texture_query::{HeapTextureQuery as Q, Storage};
 use crate::transcript::{Aspect, ByteLayout, Element, Gaps, Node, Observed, Region, Sites, Value};
+use metal2vulkan::bind::AstcDecode;
 use metal2vulkan::metal::{PixelFormat, TextureType};
+use metal2vulkan_runtime::Degradation;
 
 /// The two storage modes every case of the family sweeps.
 const BOTH_STORAGE: [Storage; 2] = [Storage::Shared, Storage::Private];
@@ -314,6 +317,16 @@ pub struct FootprintCase {
     /// The formats a round trip runs for, in order. Empty where Metal makes no texture of any
     /// format of the case.
     round_trips: Vec<PixelFormat>,
+    /// Whether the runtime makes a `Shared` texture buffer of one of the case's formats: the
+    /// buffer under it is `Shared` memory, which a device without unified memory places in system
+    /// memory and announces (`shared-in-system-memory`). Measured on the RTX 5080 Laptop
+    /// (615.71.09): the plain stragglers' case announced it in the whole-set replay. Measured on
+    /// the RX 7900 XTX (RADV NAVI31, the round's replay at 6898863f3f): the one-plane YCbCr and
+    /// padded wide-channel cases announced it too, the runtime now making their formats'
+    /// `Shared` texture buffers as Metal makes them, and no other case of the family did: the
+    /// ASTC formats take no texture buffer, the two-plane ones are refused and the packed ones
+    /// nil.
+    shared_texture_buffers: bool,
 }
 
 /// Every case of the family.
@@ -375,6 +388,7 @@ fn case_over(
         } else {
             Vec::new()
         },
+        shared_texture_buffers: false,
     }
 }
 
@@ -388,19 +402,28 @@ fn astc_footprints() -> FootprintCase {
 /// `BGRA4Unorm` and `ARGB8Unorm_sRGB`: an ordinary 2-byte texel and an ordinary 4-byte one, whose
 /// answers are what a reader compares the rest of the family against.
 fn plain_stragglers() -> FootprintCase {
-    case_over(PLAIN_STRAGGLERS, &PLAIN, &all_types(), true)
+    FootprintCase {
+        shared_texture_buffers: true,
+        ..case_over(PLAIN_STRAGGLERS, &PLAIN, &all_types(), true)
+    }
 }
 
 /// Apple's nine one-plane YCbCr formats, whose cube and cube-array descriptors answer a size and
 /// **no texture**.
 fn one_plane_ycbcr() -> FootprintCase {
-    case_over(ONE_PLANE_YCBCR, &ONE_PLANE, &all_types(), true)
+    FootprintCase {
+        shared_texture_buffers: true,
+        ..case_over(ONE_PLANE_YCBCR, &ONE_PLANE, &all_types(), true)
+    }
 }
 
 /// The padded 10- and 12-bit display formats and the transfer-function twins of the two
 /// `*10A2Unorm` ones.
 fn padded_wide_channels() -> FootprintCase {
-    case_over(PADDED_WIDE_CHANNELS, &PADDED, &all_types(), true)
+    FootprintCase {
+        shared_texture_buffers: true,
+        ..case_over(PADDED_WIDE_CHANNELS, &PADDED, &all_types(), true)
+    }
 }
 
 /// The two-plane 10-bit-plus-alpha family, whose plane 0 is 16 KiB-aligned.
@@ -546,6 +569,36 @@ impl Case for FootprintCase {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
+    }
+
+    fn allowances(&self) -> Vec<Allowance> {
+        // An ASTC 4x2 or 8x4 texture lies in a carrier image with a decoded twin on every device
+        // (no Vulkan format holds such a block), announced `carried-decoded-twin`; the round
+        // trip's `replaceRegion` decodes its blocks into the twin on the CPU (`cpu-block-decode`).
+        // An LDR form's twin holds 8-bit codes, whose `decoded-texel-precision` is announced at a
+        // command's first read of the twin, which the case never makes. Metal announces nothing,
+        // so the notices are declared by their codes. They loosen the notices site alone: the
+        // case reads bytes, every one compared with Metal's exactly. Measured: lavapipe announced
+        // both, MoltenVK over an M3 Max the first, and every other field was Metal's on both.
+        let astc = self
+            .round_trips
+            .iter()
+            .any(|&pf| AstcDecode::of(pf).is_some());
+        let mut named = Vec::new();
+        if astc {
+            named.extend(
+                [Degradation::CarriedDecodedTwin, Degradation::CpuBlockDecode]
+                    .into_iter()
+                    .map(|kind| crate::replay::notice_allowance(kind.code())),
+            );
+        }
+        // A `Shared` texture buffer's own buffer, on a device without unified memory
+        // (`crate::replay::shared_memory_notice` holds the whole reason). It loosens the notices
+        // site alone, like the two above.
+        if self.shared_texture_buffers {
+            named.push(crate::replay::shared_memory_notice());
+        }
+        named
     }
 
     fn inputs(&self) -> Result<Vec<Input>, String> {

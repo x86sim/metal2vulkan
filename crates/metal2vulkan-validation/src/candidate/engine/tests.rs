@@ -128,6 +128,7 @@ fn kernel_interface(params: Vec<crate::check::interface::Param>) -> AirInterface
     AirInterface::synthetic(
         metal2vulkan_air::abi::Stage::Kernel {
             max_total_threads: None,
+            work_group_size: None,
         },
         params,
         vec![],
@@ -2207,7 +2208,7 @@ fn k14d_replay_cases_register_their_regions_variants() {
 /// A device replay's fault refuses the row (`not_supported{bind}`) only when every reason is one of
 /// the product's typed limits (no registered variant, a grid past `2^32 - 1` threads, more regions
 /// than the execution records); any other reason, alone or beside them, fails the row, as the host
-/// replay fails an address in no allocation or a dynamic stride, and as a preprocess that
+/// replay fails a dynamic stride, and as a preprocess that
 /// disagrees with the host decode must. The verdict names the reasons.
 #[test]
 fn a_replay_fault_refuses_the_row_only_for_the_products_typed_limits() {
@@ -2218,7 +2219,6 @@ fn a_replay_fault_refuses_the_row_only_for_the_products_typed_limits() {
         F::ACTION,
         F::PIPELINE,
         F::BUFFERS,
-        F::ADDRESS,
         F::RECORD,
         F::RANGE,
     ];
@@ -2245,11 +2245,6 @@ fn a_replay_fault_refuses_the_row_only_for_the_products_typed_limits() {
         assert!(why.contains(&format!("{:#x}", bit.0)), "{why}");
         refused(bit.0 | F::VARIANT.0).expect_err("fails the row beside a limit");
     }
-    let why = refused(F::ADDRESS.0).expect_err("fails the row");
-    assert!(
-        why.contains("an address in no resident allocation"),
-        "{why}"
-    );
     // A fault bit with no reason is no typed limit.
     refused(0).expect_err("fails the row");
 }

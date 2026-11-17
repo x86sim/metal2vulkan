@@ -23,14 +23,14 @@
 
 use super::super::address::RangeToken;
 use super::super::buffer_texture::TexelsHome;
-use super::super::error::{invalid, nil, Error, Problem};
+use super::super::error::{nil, Error, Problem};
 use super::super::image_plan::plan_image;
 use super::super::resource_ids::IdPlacement;
 use super::super::texture_descriptor::TextureDescriptor;
 use super::super::values::StorageMode;
 use super::super::view_plan::ViewRecord;
 use super::super::Device;
-use super::{image_error, IdUse, Owner, Storage, Texture};
+use super::{image_error, IdUse, Initial, Owner, Storage, Stored, Texture};
 use metal2vulkan::metal::TextureType;
 use std::sync::Arc;
 
@@ -49,8 +49,9 @@ impl std::fmt::Debug for SharedTextureHandle {
 }
 
 impl SharedTextureHandle {
-    /// `device`: the device the texture was made by, the only one that opens the handle.
-    pub fn device(&self) -> &Device {
+    /// `device`: the device the texture was made by, the only one that opens the handle: an owned
+    /// handle of it, the caller's ([`Texture::device`]).
+    pub fn device(&self) -> Device {
         self.0.device()
     }
 }
@@ -68,6 +69,14 @@ impl Device {
     /// multisample sample count's rule; a swizzle with writes under `write_swizzle_enabled` too
     /// (`Invalid`, `SwizzleWithWrites`), which Metal's validation stops here alone.
     pub fn new_shared_texture(&self, descriptor: &TextureDescriptor) -> Result<Texture, Error> {
+        self.at_serving(|device| device.new_shared_texture_now(descriptor))
+    }
+
+    /// [`Device::new_shared_texture`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn new_shared_texture_now(
+        &self,
+        descriptor: &TextureDescriptor,
+    ) -> Result<Texture, Error> {
         const CALL: &str = "new_shared_texture";
         // Plain Metal makes a shareable texture without `framebufferOnly`, whatever the
         // descriptor says, so a rotated one asserts as one without it does.
@@ -97,7 +106,7 @@ impl Device {
             .check_shared(self.properties().texture_rules())
             .map_err(|refused| refused.error(CALL))?;
         if self.is_lost() {
-            return Err(Error::DeviceLost);
+            return Err(self.lost_refusal());
         }
         let id_use = IdUse::Program(descriptor.placement);
         if layout.texture_type == TextureType::TextureBuffer {
@@ -112,15 +121,17 @@ impl Device {
             .facts(self.compile_device().profile());
         let plan = plan_image(&layout, descriptor.image_usage(), false, &facts)
             .map_err(|refusal| image_error(CALL, refusal))?;
-        let mut image = self.new_texture_image(plan, &layout, descriptor, hazard)?;
+        let mut image =
+            self.new_texture_image(plan, &layout, descriptor, (hazard, Initial::AsMetal))?;
         if let Owner::Runtime { shareable, .. } = &mut image.owner {
             *shareable = true;
         }
         let image = self.with_decoded_twin(image, &layout, descriptor, true)?;
         let record = ViewRecord::of_descriptor(&layout, descriptor);
-        let storage = Storage::Image(image.shared());
-        let texture = Texture::made(self, storage, record, None, id_use);
-        texture.start_decoded_twin()?;
+        let image = image.shared();
+        // Its last step that may fail, before the texture takes its ID (`resource_ids.rs`).
+        image.start_decoded_twin()?;
+        let texture = Texture::made(self, Storage::Image(image), record, None, id_use);
         // A shared texture takes the device's sampler ID as any texture of the device's does
         // (`resource_ids.rs`); one opened from a handle needs none, the handle's texture having
         // taken it on this device.
@@ -138,7 +149,7 @@ impl Device {
         descriptor: &TextureDescriptor,
         token: RangeToken,
     ) -> Result<Texture, Error> {
-        let texture = self.new_shared_texture(descriptor)?;
+        let texture = self.at_serving(|device| device.new_shared_texture_now(descriptor))?;
         texture.keep_range_token(token)?;
         Ok(texture)
     }
@@ -157,14 +168,23 @@ impl Device {
         handle: &SharedTextureHandle,
         placement: IdPlacement,
     ) -> Result<Texture, Error> {
+        self.at_serving(|device| device.new_shared_texture_with_handle_now(handle, placement))
+    }
+
+    /// [`Device::new_shared_texture_with_handle`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn new_shared_texture_with_handle_now(
+        &self,
+        handle: &SharedTextureHandle,
+        placement: IdPlacement,
+    ) -> Result<Texture, Error> {
         const CALL: &str = "new_shared_texture_with_handle";
         let texture = &handle.0;
-        if !texture.device().same(self) {
-            return Err(invalid(CALL, Problem::ForeignObject));
+        if !texture.generation().same(self) {
+            return Err(texture.generation().foreign(CALL, self));
         }
         let record = &texture.0.record;
         self.check_texture_placement(CALL, placement, record.usage, record.texture_type)?;
-        let storage = match &texture.0.storage {
+        let storage = match texture.storage()? {
             Storage::Image(image) => Storage::Image(Arc::clone(image)),
             Storage::Texels(texels) => Storage::Texels(Arc::clone(texels)),
             Storage::Alias { .. } | Storage::Shadow { .. } => {
@@ -185,9 +205,10 @@ impl Texture {
     /// `isShareable`: a texture of [`Device::new_shared_texture`], or one opened from a handle;
     /// never a view.
     pub fn is_shareable(&self) -> bool {
+        let _held = self.hold();
         self.0.parent.is_none()
-            && match &self.0.storage {
-                Storage::Image(image) => {
+            && match self.stored() {
+                Stored::Made(Storage::Image(image)) => {
                     matches!(
                         image.owner,
                         Owner::Runtime {
@@ -196,8 +217,9 @@ impl Texture {
                         }
                     )
                 }
-                Storage::Texels(texels) => texels.home == TexelsHome::Shared,
-                Storage::Alias { .. } | Storage::Shadow { .. } => false,
+                Stored::Made(Storage::Texels(texels)) => texels.home == TexelsHome::Shared,
+                Stored::Made(Storage::Alias { .. } | Storage::Shadow { .. })
+                | Stored::Unmade(_) => false,
             }
     }
 

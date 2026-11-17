@@ -470,6 +470,10 @@ impl Plan {
         if device != 0 {
             tally(&mut out, simd::DEVICE_LOCKSTEP.into(), device, 0);
         }
+        // A kernel emulated in place of the widest mode's pin: one use, no words.
+        if self.families.simd.widest_pin {
+            tally(&mut out, simd::WIDEST_PIN.into(), 1, 0);
+        }
         out
     }
 }
@@ -840,7 +844,7 @@ fn route_air(cx: &SelectCx<'_>, op: &AirIntrinsic, decl: FuncId) -> Route {
         | A::SimdgroupSize(_)
         | A::SimdMatrix(_) => Route::Family(LowerFamily::Simd),
         A::Sync(_) | A::Derivative(_) => Route::Family(LowerFamily::Barrier),
-        A::Fragment(_) => Route::Family(LowerFamily::Fragment),
+        A::Fragment(_) | A::Interpolate(_) => Route::Family(LowerFamily::Fragment),
         // A read of an argument the function constants removed, which specialization made.
         A::FunctionConstant(
             FunctionConstant::AbsentRead(_) | FunctionConstant::AbsentMemory(_),
@@ -878,6 +882,14 @@ fn route_air(cx: &SelectCx<'_>, op: &AirIntrinsic, decl: FuncId) -> Route {
         // An encoder operation writes its command's record through device addresses.
         A::IndirectCommand(_) => Route::Family(LowerFamily::Access),
         A::Mesh(_) => Route::Family(LowerFamily::Mesh),
+        // Canonicalization makes every vector data call its element accesses.
+        A::VectorData(_) => Route::Refuse(invariant(
+            "a vector data function survived canonicalization",
+        )),
+        // Canonicalization answers every space query of a generic pointer (`canon::generic`).
+        A::PointerSpace(_) => Route::Refuse(invariant(
+            "a generic pointer's space query survived canonicalization",
+        )),
         // Canonicalization made every read of a global built-in at a constant lane a read of a
         // built-in parameter, but a fragment's read of one Metal refuses there, which is
         // refused as its own feature; a read at another lane is not lowered.
@@ -890,6 +902,14 @@ fn route_air(cx: &SelectCx<'_>, op: &AirIntrinsic, decl: FuncId) -> Route {
         }
         A::GlobalBuiltin(_) => Route::Refuse(
             Unsupported::not_implemented(Feature::Lowering(LowerFamily::Dispatch)).into(),
+        ),
+        // Canonicalization reads each of them from the hidden buffer of a kernel compiled in
+        // OpenCL mode; no other pipeline has the values, and Metal makes no other pipeline of a
+        // function that reads them.
+        A::WorkItem(_) => Route::Refuse(
+            Unsupported::not_implemented(Feature::Lowering(LowerFamily::Dispatch))
+                .naming(decl_name(cx, decl))
+                .into(),
         ),
     }
 }
@@ -908,6 +928,9 @@ fn route_llvm(op: &LlvmIntrinsic) -> Route {
         L::Float { .. } | L::Int { .. } | L::Abs { .. } | L::Cttz { .. } | L::Ctlz { .. } => {
             Route::Family(LowerFamily::Arith)
         }
+        // A narrow integer's operation canonicalization did not fold over constants: no SPIR-V
+        // type has its width.
+        L::NarrowInt { .. } => Route::Refuse(not_lowered(LowerFamily::Arith)),
     }
 }
 
@@ -978,6 +1001,10 @@ fn route(cx: &SelectCx<'_>, id: InstId, inst: &Inst) -> Route {
             Callee::Direct(_) => Route::Refuse(invariant("a direct call survived inlining")),
             Callee::UnknownIntrinsic(_) => {
                 Route::Refuse(Unsupported::not_implemented(Feature::UnknownIntrinsic).into())
+            }
+            // Canon's post-check refuses every call whose immediates are not constants.
+            Callee::Unbound { .. } => {
+                Route::Refuse(invariant("an unbound intrinsic survived canon"))
             }
         },
     }
@@ -1154,12 +1181,13 @@ fn function_storage(
     Ok((required > storage.bytes()).then_some(PrecisionNote::FunctionStorageAssumed))
 }
 
-/// Select the plan of `e`.
+/// Select the plan of `e` under `inputs`, a kernel weighed for the `Emulated` tier in place of its
+/// widest mode's pin or keeping it as `widest_pin` says.
 pub fn select(
     e: &Entry,
     mp: &MemoryPlan,
     p: &DeviceProfile,
-    inputs: &LowerInputs,
+    (inputs, widest_pin): (&LowerInputs, simd::WidestPin),
     m: &mut Meter,
 ) -> Result<Plan, Error> {
     let func = e
@@ -1191,9 +1219,10 @@ pub fn select(
         stage,
         values: mp.values,
         push: BTreeSet::new(),
-        // A call stack's depth, which a compiled kernel's pipeline must match.
+        // A call stack's depth, and OpenCL mode, which a compiled kernel's pipeline must match.
         facts: (e.call_stack.into_iter())
             .map(|stack| RuntimeFact::CallStackDepth { depth: stack.depth })
+            .chain(inputs.open_cl_mode.then_some(RuntimeFact::OpenClMode))
             .collect(),
         // Private memory past the floor of a device not measured rests on no measurement, as
         // does a group operation in a branch no measurement says Metal speculates. A rate-map
@@ -1216,7 +1245,7 @@ pub fn select(
         func: e.func,
         observed,
     };
-    let result = select_entry(cx, body, func.params.len(), m);
+    let result = select_entry(cx, body, func.params.len(), widest_pin, m);
     m.release(observed_bytes);
     m.release(root_bytes);
     result
@@ -1226,6 +1255,7 @@ fn select_entry(
     mut cx: SelectCx<'_>,
     body: &Body,
     params: usize,
+    widest_pin: simd::WidestPin,
     m: &mut Meter,
 ) -> Result<Plan, Error> {
     // The varyings a vertex function writes the same at every vertex of a primitive, which a
@@ -1267,7 +1297,7 @@ fn select_entry(
     // The specialized notes' clauses are held until `finish` resolves them, and the facts until it
     // moves them into the plan.
     let noted = cx.noted;
-    let result = selected.and_then(|sel| finish(cx, sel, &mut fact_bytes, m));
+    let result = selected.and_then(|sel| finish(cx, sel, widest_pin, &mut fact_bytes, m));
     m.release(noted);
     m.release(fact_bytes.charged());
     m.release(bytes);
@@ -1290,6 +1320,21 @@ struct BodySelection {
     cross: Vec<(ValueId, DemoteTy)>,
     phis: Vec<(ValueId, DemoteTy)>,
     blocks: u64,
+}
+
+/// A texture or sampler family's refusal of an `air.*` call that names nothing names the
+/// intrinsic's declaration (diagnostics only): one family refuses many operations alike.
+fn named_image_call(cx: &SelectCx<'_>, inst: &Inst, family: LowerFamily, e: Error) -> Error {
+    let image = matches!(family, LowerFamily::Texture | LowerFamily::Sampler);
+    match (e, &inst.kind) {
+        (Error::Unsupported(u), InstKind::Call(c)) if image && u.symbol.is_none() => {
+            match c.callee {
+                crate::air::ir::Callee::Air { decl, .. } => u.naming(decl_name(cx, decl)).into(),
+                _ => u.into(),
+            }
+        }
+        (e, _) => e,
+    }
 }
 
 fn located(e: Error, cx: &SelectCx<'_>, block: u32, inst: InstId) -> Error {
@@ -1378,11 +1423,13 @@ fn select_body(
                 .ok_or_else(|| invariant("an instruction out of the value range"))?;
             let outcome = match route(cx, id, inst) {
                 Route::Refuse(e) => Err(e),
-                Route::Family(f) => select_inst(cx, id, inst, f, m).map(|s| {
-                    if let Some(slot) = strategy.get_mut(vid.index()) {
-                        *slot = Some(s);
-                    }
-                }),
+                Route::Family(f) => select_inst(cx, id, inst, f, m)
+                    .map_err(|e| named_image_call(cx, inst, f, e))
+                    .map(|s| {
+                        if let Some(slot) = strategy.get_mut(vid.index()) {
+                            *slot = Some(s);
+                        }
+                    }),
                 Route::Control => match &inst.kind {
                     InstKind::Phi { .. } => cx
                         .lowered_repr(Value::Inst(id), inst.ty)
@@ -1564,11 +1611,14 @@ fn select_body(
 fn finish(
     mut cx: SelectCx<'_>,
     mut sel: BodySelection,
+    widest_pin: simd::WidestPin,
     fact_bytes: &mut Growth,
     m: &mut Meter,
 ) -> Result<Plan, Error> {
     let p = cx.profile;
     let stage = cx.stage;
+    // The class of the lockstep pass's simdgroup barriers, beside the program's own.
+    sync::barrier::lockstep_class(&mut cx);
     // Each family completes its own plan and contributes its descriptors, facts, simd class,
     // and tangled instructions before the combined checks below.
     stage_io::finish(&mut cx)?;
@@ -1592,6 +1642,9 @@ fn finish(
     sync::memory_model::finish(&mut cx)?;
     arith::finish(&mut cx)?;
 
+    // An object function's partial threadgroups read its region, which a folded variant's slot
+    // plan then reads from its record; so do a kernel's under its input.
+    mesh::plan_partial_groups(&mut cx)?;
     let slots = access::finish_slots(&mut cx, m)?;
     access::absent::finish(&mut cx);
     sync::memory_model::finish_interlock(&mut cx, &slots)?;
@@ -1616,10 +1669,17 @@ fn finish(
     // A kernel compiled for dispatches with a partial simdgroup emulates its simdgroups whatever
     // tier the profile's subgroups give them, and depends on that variant. A kernel whose lockstep
     // order is only exact on emulated simdgroups emulates them on every dispatch, which no variant
-    // selects.
+    // selects, and so does a large kernel whose `Direct` tier pins the device's widest mode
+    // (`simd::widest_pin`), unless the emulated tier refuses it below or the kernel keeps the pin
+    // (`widest_pin`, a plan made again past its driver's stage bound).
     let model = &p.fields().subgroup;
     let variant = cx.inputs.emulated_simdgroups && stage == Stage::Kernel;
-    let tier = if variant || (cx.entry.lockstep.emulated && stage == Stage::Kernel) {
+    let lockstep = cx.entry.lockstep.emulated && stage == Stage::Kernel;
+    let widest = !variant
+        && !lockstep
+        && widest_pin == simd::WidestPin::Weighed
+        && simd::widest_pin(&cx, m)?;
+    let mut tier = if variant || lockstep || widest {
         if variant {
             cx.facts.insert(RuntimeFact::EmulatedSimdgroups);
         }
@@ -1627,17 +1687,41 @@ fn finish(
     } else {
         subgroup::tier(&cx.simd, stage, model)?
     };
+    // A flat grid of the call's threadgroups returns its invocations past the grid before the
+    // body (`dispatch::emit_entry`), so the rest of their workgroup cannot meet a workgroup
+    // synchronization: a module that would hold one (the emulated tier's exchanges, or a
+    // simdgroup barrier emitted at workgroup scope where the subgroup is not the simdgroup) is
+    // refused, and its dispatch runs split instead.
+    if cx.inputs.flat_grid && cx.inputs.call_threadgroups {
+        let set = simd::divergent::SyncSet::WorkgroupBarriers { stage, tier };
+        if tier == Tier::Emulated || sel.strategy.iter().flatten().any(|s| set.holds(s)) {
+            return Err(Unsupported::not_implemented(Feature::GpuEncodedIndirectCommands).into());
+        }
+    }
+    // A kernel's partial threadgroups walk their invocations past the grid on a subgroup tier
+    // (`simd::divergent::barriers`); the emulated tier's exchanges are not walked so, and its
+    // dispatches keep their exact split.
+    if cx.inputs.partial_threadgroups && stage == Stage::Kernel && tier == Tier::Emulated {
+        return Err(Unsupported::not_implemented(Feature::GpuEncodedIndirectCommands).into());
+    }
     if tier == Tier::Emulated {
-        // The emulated tier's exchange carries its own active flags.
-        cx.families.simd.partly_live.clear();
-        simd::workgroup::check(
+        match simd::workgroup::check(
             &mut cx,
             &sel.strategy,
             &mut sel.cross,
             uniformity.as_ref(),
             m,
-        )?;
-    } else {
+        ) {
+            // The emulated tier's exchange carries its own active flags.
+            Ok(()) => cx.families.simd.partly_live.clear(),
+            // A kernel the emulated tier refuses, which changed nothing, keeps its `Direct` tier
+            // where only the widest mode chose emulation.
+            Err(Error::Unsupported(_)) if widest => tier = Tier::Direct,
+            Err(e) => return Err(e),
+        }
+        cx.families.simd.widest_pin = widest && tier == Tier::Emulated;
+    }
+    if tier != Tier::Emulated {
         // A workgroup barrier part of the workgroup skips is walked predicated in every tier.
         simd::divergent::barriers(
             &mut cx,
@@ -1694,7 +1778,7 @@ fn finish(
             cx.body,
             cx.values,
             &sel.strategy,
-            p.set,
+            p,
         ));
     }
     let access = access::routine_words(&cx.families.access);
@@ -1715,6 +1799,14 @@ fn finish(
     if dispatch.as_ref().is_some_and(|d| d.folded_groups) {
         estimate.add(dispatch::FOLDED_GROUPS_WORDS);
     }
+    // A kernel's partial threadgroups: the test before the body, and each builtin parameter's.
+    if let Some(d) = dispatch
+        .as_ref()
+        .filter(|d| d.partial_groups && stage == Stage::Kernel)
+    {
+        let derivations = 1 + d.params.len() as u64;
+        estimate.add(dispatch::PARTIAL_THREADGROUPS_WORDS.saturating_mul(derivations));
+    }
     estimate.add(tessellation::estimate_words(&cx.families.tessellation));
     estimate.add(
         cx.families
@@ -1724,8 +1816,9 @@ fn finish(
             .map_or(0, access::tile::TilePlan::words_estimate),
     );
 
+    let (entry, body) = (cx.entry, cx.body);
     let (precision, specialized) = resolve_notes(&cx.families, cx.precision, cx.specialized);
-    Ok(Plan {
+    let mut plan = Plan {
         stage,
         values: cx.values,
         strategy: sel.strategy,
@@ -1745,17 +1838,52 @@ fn finish(
         specialized,
         estimate,
         private_bytes: cx.memory.private_bytes,
-    })
+    };
+    let walk = match &plan.families.simd.predication {
+        Some(p) => walk_construct_words(entry, body, &plan, p, m)?,
+        None => 0,
+    };
+    plan.estimate.add(walk);
+    Ok(plan)
 }
 
-/// The constant a [`NoteTest`] reads: a sampler slot's `SamplerState` word, by the function's slot
-/// index, or a texture slot's `UnmeasuredTexels` boolean, or the class of the format bound at a
-/// texture slot, which no constant carries (`SpecKey::BoundTexelFormat`).
+/// The words the predicated walk of `plan` adds for the constructs of its structured tree
+/// (`structurize::emit::construct_words`): the tree emission builds from the same view, here
+/// built, measured and released before emission.
+fn walk_construct_words(
+    entry: &Entry,
+    body: &Body,
+    plan: &Plan,
+    p: &simd::divergent::Predication,
+    m: &mut Meter,
+) -> Result<u64, Error> {
+    let view = crate::lower::view::EntryView::new(entry, body, plan);
+    let s = crate::structurize::structurize(&view, m)?;
+    let words = crate::structurize::emit::construct_words(&s.tree, |b| p.syncs(b), m);
+    s.release(m);
+    words
+}
+
+/// The constant a [`NoteTest`] reads: a sampler slot's `SamplerState` word or its
+/// `NearestPixelSampler` boolean, by the function's slot index, or a texture slot's
+/// `UnmeasuredTexels` boolean, or the class of the format bound at a texture slot, which no
+/// constant carries (`SpecKey::BoundTexelFormat`), or the whole word of the sampler bound at a
+/// sampler slot, which none carries either (`SpecKey::BoundSamplerWord`), or whether a texture a
+/// stage's handles can name is two-plane YCbCr (`SpecKey::HeapYCbCrTextures`) or held by its raw
+/// texels alone (`SpecKey::HeapRawTextures`), or the families of such textures whose texels may
+/// hold a NaN (`SpecKey::HeapNanFamilies`), or whether a sampler state an argument buffer can
+/// name filters (`SpecKey::FilteringArgumentSampler`), which the plan gives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum NoteOn {
     Sampler(u32),
+    NearestPixel(u32),
     Unmeasured(u32),
     Bound(u32),
+    BoundSampler(u32),
+    HeapYCbCr(Stage),
+    HeapRaw(Stage),
+    HeapNan(Stage),
+    ArgumentSamplers,
 }
 
 /// A test of one slot's specialization constant `v`: it holds where `(v & mask == bits) == equal`,
@@ -1812,7 +1940,8 @@ pub(crate) fn any_of(tests: impl IntoIterator<Item = NoteTest>) -> Vec<NoteClaus
 /// The declared constant `t` reads, as its [`SpecTest`], or `None` where the function declares no
 /// such constant, or a sampler word whose fields leave out a bit the test reads. A texture slot's
 /// bound format class (`NoteOn::Bound`) is no constant: its test reads `SpecKey::BoundTexelFormat`,
-/// which the runtime takes from the bound texture.
+/// which the runtime takes from the bound texture; nor is a sampler slot's bound word
+/// (`NoteOn::BoundSampler`), whose test reads `SpecKey::BoundSamplerWord`, which the plan gives.
 fn declared(families: &FamilyPlans, t: NoteTest) -> Option<SpecTest> {
     let key = match t.on {
         NoteOn::Unmeasured(index) => {
@@ -1821,6 +1950,15 @@ fn declared(families: &FamilyPlans, t: NoteTest) -> Option<SpecTest> {
         }
         // Read from the bound texture by the runtime, never a constant: every slot has one.
         NoteOn::Bound(index) => SpecKey::BoundTexelFormat(families.texture.slots.get(&index)?.slot),
+        // Given by the plan from the bound sampler, never a constant: every runtime slot has one.
+        NoteOn::BoundSampler(index) => {
+            SpecKey::BoundSamplerWord(families.sampler.slots.get(&index)?.slot)
+        }
+        // Given by the plan from what the command's handles can name, never a constant.
+        NoteOn::HeapYCbCr(stage) => SpecKey::HeapYCbCrTextures(stage),
+        NoteOn::HeapRaw(stage) => SpecKey::HeapRawTextures(stage),
+        NoteOn::HeapNan(stage) => SpecKey::HeapNanFamilies(stage),
+        NoteOn::ArgumentSamplers => SpecKey::FilteringArgumentSampler,
         NoteOn::Sampler(index) => {
             let r = families.sampler.slots.get(&index)?;
             let fields = r.fields();
@@ -1828,6 +1966,10 @@ fn declared(families: &FamilyPlans, t: NoteTest) -> Option<SpecTest> {
                 slot: r.slot,
                 fields,
             })?
+        }
+        NoteOn::NearestPixel(index) => {
+            let r = families.sampler.slots.get(&index)?;
+            r.nearest.then_some(SpecKey::NearestPixelSampler(r.slot))?
         }
     };
     Some(SpecTest {

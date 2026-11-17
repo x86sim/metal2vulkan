@@ -7,15 +7,14 @@
 //!
 //! - The stride form reads vertex `v` at `offset + v * stride`; so do the range form and the
 //!   offset form, which sets both.
-//! - A buffer bound without a stride (the plain setters, the plain offset form after a stride
-//!   form, or `MTLAttributeStrideStatic`) under a dynamic layout reads at stride 0, as plain
-//!   Metal does (an M4; an M3 Max and an M4), where Metal's debug layer stops the draw; a stride
-//!   past 32 bits is refused at the setter.
+//! - A buffer bound without a stride (the plain setters, or the plain offset form after a stride
+//!   form) under a dynamic layout reads at stride 0, as plain Metal does (an M4; an M3 Max and an
+//!   M4), where Metal's debug layer stops the draw; a stride past 32 bits reads at its low 32
+//!   bits, and `MTLAttributeStrideStatic` at `2^32 - 1`: vertex 0's element and zero past it, as
+//!   plain Metal on an M3 Max reads it.
 //! - An executed indirect render command's vertex buffer set without a stride under a dynamic
-//!   layout, on a command buffer whose descriptor supports dynamic attribute strides, refuses the
-//!   commit the runtime's own gap (`IndirectCommandUnstridedBuffer`): plain Metal takes such a
-//!   command and completes it, and its fetch reads the buffer at stride 2^32 - 1, which the
-//!   runtime's 32-bit fetch cannot place.
+//!   layout, on a command buffer whose descriptor supports dynamic attribute strides, reads at
+//!   stride 2^32 - 1, as plain Metal's fetch reads it: vertex 0's element and zero past it.
 
 use super::{
     buffer_with, layer_reported_nothing_at_all, read_buffer, validated_device, Messages,
@@ -34,9 +33,8 @@ use metal2vulkan_devtools::llvm_assemble;
 use metal2vulkan_runtime::{
     Buffer, CommandBufferStatus, CommandQueue, Device, Error, IndirectCommandBufferDescriptor,
     IndirectRenderCommand, PipelineOptions, RenderCommandEncoder, RenderPassDescriptor,
-    RenderPipelineState, ResourceOptions, RuntimeGap,
+    RenderPipelineState, ResourceOptions,
 };
-use std::path::Path;
 
 /// The vertices each draw has.
 const VERTICES: u32 = 8;
@@ -49,8 +47,7 @@ pub(super) fn pipeline(device: &Device, stride: Option<u32>) -> RenderPipelineSt
 
 /// [`pipeline`], made with `supportIndirectCommandBuffers` where `indirect`.
 fn pipeline_of(device: &Device, stride: Option<u32>, indirect: bool) -> RenderPipelineState {
-    let ll =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/public/engine/ob3_vertex_input.ll");
+    let ll = metal2vulkan_devtools::engine_dir().join("ob3_vertex_input.ll");
     let library = device
         .new_library_with_air(&llvm_assemble(&ll).unwrap())
         .unwrap();
@@ -112,6 +109,14 @@ pub(super) fn read_at(first: u32, step: u32) -> Vec<u32> {
     (0..VERTICES).map(|v| 100 + first + v * step).collect()
 }
 
+/// The words a layout bound at `MTLAttributeStrideStatic` reads: word 0 for vertex 0, and zero for
+/// every vertex past it, whose element lies `2^32 - 1` bytes on.
+pub(super) fn read_static() -> Vec<u32> {
+    (0..VERTICES)
+        .map(|v| if v == 0 { 100 } else { 0 })
+        .collect()
+}
+
 /// Each stride form binds the stride a dynamic layout reads; a buffer bound without one reads at
 /// stride 0, as plain Metal's does; a stride past 32 bits binds its low 32 bits.
 #[test]
@@ -168,7 +173,7 @@ fn vertex_buffers_bind_the_strides_a_dynamic_layout_reads() {
         );
         assert_eq!(
             draw(&|e, b| e.set_vertex_buffer_with_stride(Some(b), 0, u64::MAX, 0)),
-            Ok(read_at(0, 0)),
+            Ok(read_static()),
             "MTLAttributeStrideStatic"
         );
         // A stride past 32 bits reads at its low 32 bits, as plain Metal reads it (an M4; Metal's
@@ -251,12 +256,12 @@ fn executed(
 }
 
 /// An executed indirect render command's vertex buffer set without a stride under a dynamic
-/// layout, on a command buffer that supports dynamic attribute strides, refuses the commit the
-/// runtime's own gap (`IndirectCommandUnstridedBuffer`), where plain Metal takes the command and
-/// its fetch reads the buffer at stride 2^32 - 1; the same command with the stride form draws as
-/// the encoder's draw at that stride.
+/// layout, on a command buffer that supports dynamic attribute strides, is read at stride
+/// `2^32 - 1`, as plain Metal's fetch reads it (the record's 32-bit stride word): vertex 0 reads
+/// word 0 and every vertex past it zero, its element past the buffer, as the stride form at
+/// `2^32 - 1` reads; the stride form at another stride draws as the encoder's draw at that stride.
 #[test]
-fn an_executed_command_s_unstrided_vertex_buffer_is_refused() {
+fn an_executed_command_s_unstrided_vertex_buffer_reads_at_the_record_s_stride() {
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
     {
@@ -271,10 +276,15 @@ fn an_executed_command_s_unstrided_vertex_buffer_is_refused() {
                 0,
                 0
             )),
-            Err(Error::NotImplemented(
-                RuntimeGap::IndirectCommandUnstridedBuffer { index: 0 }
-            )),
+            Ok(read_static()),
             "the plain form"
+        );
+        assert_eq!(
+            executed(&queue, &pipeline, &data, |c, b| {
+                c.set_vertex_buffer_with_stride(Some(b), 0, 0xFFFF_FFFF, 0)
+            }),
+            Ok(read_static()),
+            "the stride form at 2^32 - 1"
         );
         assert_eq!(
             executed(&queue, &pipeline, &data, |c, b| {
@@ -288,13 +298,16 @@ fn an_executed_command_s_unstrided_vertex_buffer_is_refused() {
 }
 
 /// A buffer of `length` bytes, more than `2^32`, for a fetch past 4 GiB: on macOS a no-copy
-/// buffer over fresh anonymous memory, with the mapping it holds; elsewhere device memory.
+/// buffer over fresh anonymous memory, with the mapping it holds; elsewhere device memory. Only
+/// the GPU hazards make one (`m2v_gpu_hazards`).
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
 pub(super) struct Large {
     pub(super) buffer: Buffer,
     #[cfg(target_os = "macos")]
     _mapping: super::host_memory::Mapping,
 }
 
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
 impl Large {
     /// The buffer on `device`; `None`, printed, where its `max_buffer_length` holds no such
     /// buffer (RADV, ANV and lavapipe hold at most `2^32` bytes).
@@ -349,7 +362,9 @@ impl Large {
 /// vertices 0 to 7, whose furthest byte lies below `2^32`, draws from the buffer as from any
 /// other: each vertex `v` reads the word `100 + v` written at byte `6 v`. Skipped, printed, where
 /// the device's `max_buffer_length` holds no such buffer (RADV, ANV and lavapipe hold at most
-/// `2^32` bytes).
+/// `2^32` bytes). A GPU hazard (`m2v_gpu_hazards`): the buffer is 4 GiB and 4 KiB, device memory or
+/// imported host memory.
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
 #[test]
 fn vertex_fetches_past_4_gib_of_a_buffer_are_refused() {
     use metal2vulkan::metal::IndexType;
@@ -373,10 +388,12 @@ fn vertex_fetches_past_4_gib_of_a_buffer_are_refused() {
             buffer_with(&device, &long).unwrap(),
         );
         let past = |reach: u64| {
-            Err(Error::NotImplemented(RuntimeGap::VertexFetchPast4GiB {
-                buffer_index: 0,
-                reach,
-            }))
+            Err(Error::NotImplemented(
+                metal2vulkan_runtime::RuntimeGap::VertexFetchPast4GiB {
+                    buffer_index: 0,
+                    reach,
+                },
+            ))
         };
         let mut pass = RenderPassDescriptor::new();
         pass.render_target_width = 1;

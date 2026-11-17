@@ -35,11 +35,10 @@ use crate::families::{
     FamilyRow, FeatureRow, FormatCapabilities, FormatCapability, GpuFamily, LimitRow, Refusal,
     RowAudit, RowState,
 };
-use crate::linear_plan::LINEAR_ALIGNMENT;
 use crate::render_state::MAX_VIEWPORTS;
 use crate::texture_descriptor::{largest_side, MAX_ARRAY_LENGTH};
 use crate::{Degradation, Device};
-use metal2vulkan::device::{MetalDeviceProperties, VkExtension, VkFeature};
+use metal2vulkan::device::{MetalDeviceProperties, VkFeature};
 use metal2vulkan::error::{Capability, Needs};
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureType};
 
@@ -98,16 +97,23 @@ pub enum PrivateCount {
     /// `supportsVertexAmplificationCount:` takes 1 to 8, so not the views a pipeline may draw). No
     /// Vulkan limit means it: on Apple's own GPUs MoltenVK reports `maxMultiviewViewCount` 32.
     MaxVertexAmplificationCount,
-    /// `deviceLinearTextureAlignmentBytes`: the device's: 16, the alignment the runtime takes a
-    /// linear texture's offset and rows in its buffer at on every device (`LINEAR_ALIGNMENT`,
-    /// `minimumLinearTextureAlignmentForPixelFormat:`), shadowing the image where the device's
-    /// own linear image would not sit there.
+    /// `deviceLinearTextureAlignmentBytes`: the device's: the largest of its
+    /// `minimumLinearTextureAlignmentForPixelFormat:` answers over the formats a buffer can back
+    /// ([`Device::minimum_linear_texture_alignment_for_pixel_format`]), at least the 16 bytes
+    /// Metal answers on an Apple GPU: 256 on Mesa's RADV, 64 on lavapipe.
     DeviceLinearTextureAlignmentBytes,
     /// `linearTextureAlignmentBytes`: as
     /// [`DeviceLinearTextureAlignmentBytes`](Self::DeviceLinearTextureAlignmentBytes).
     LinearTextureAlignmentBytes,
-    /// `iosurfaceTextureAlignmentBytes`: the device's: 16, the alignment the runtime takes an
-    /// IOSurface plane's offset and rows at on every device (`LINEAR_ALIGNMENT`).
+    /// `iosurfaceTextureAlignmentBytes`: the device's, as
+    /// [`DeviceLinearTextureAlignmentBytes`](Self::DeviceLinearTextureAlignmentBytes): the
+    /// alignment of a texture's offset and rows at which the device's images hold it in place over
+    /// a buffer's bytes (256 on Mesa's RADV, 64 on lavapipe), where Metal answers 16 on an Apple
+    /// GPU. A caller that lays out its surfaces by it aligns their rows so (a macOS 11 guest's
+    /// CoreAnimation rounds its backing stores' rows to it, at least 64). The runtime still takes a
+    /// plane at any offset and rows that are multiples of 16
+    /// ([`Buffer::new_texture_with_iosurface_plane`](crate::Buffer::new_texture_with_iosurface_plane)):
+    /// a texture over one the device lays out no image at is a shadow.
     IosurfaceTextureAlignmentBytes,
     /// `iosurfaceReadOnlyTextureAlignmentBytes`: as
     /// [`IosurfaceTextureAlignmentBytes`](Self::IosurfaceTextureAlignmentBytes): a plane read
@@ -329,7 +335,8 @@ pub enum PrivateFlag {
     /// `areProgrammableSamplePositionsSupported`, which Metal answers alike).
     SupportsProgrammableSamplePositions,
     /// `supportsResourceDetachBacking`: the device's (a no-copy buffer or heap is detached from
-    /// its pages, `detach_backing`, wherever one is made: the device imports host memory).
+    /// its pages, `detach_backing`, wherever one is made: the device imports host memory, by its
+    /// pointer or as dma-bufs of its pages).
     SupportsResourceDetachBacking,
     /// `supportsSharedTextureHandles`: the device's, yes (a shareable texture's handle, within
     /// the process, `new_shared_texture_handle`).
@@ -466,18 +473,23 @@ impl PrivateProperties {
 
     /// The answers on a device of `properties`, whose compile layer answers
     /// `metal`, and whose rows of [`MEASURED_FAMILY`] are `rows`, and the runtime gives a pixel
-    /// format the capabilities `formats` answers.
+    /// format the capabilities `formats` answers and a texture over a buffer the linear
+    /// alignment `linear_alignment` (`Device::device_linear_texture_alignment`), and makes no-copy
+    /// buffers where `no_copy` (it imports host memory: `host_memory.rs`'s `Importer`).
     pub(crate) fn of(
         properties: &DeviceProperties,
         metal: &MetalDeviceProperties,
         rows: &[RowAudit],
-        formats: &dyn Fn(PixelFormat) -> FormatCapabilities,
+        (formats, linear_alignment): (&dyn Fn(PixelFormat) -> FormatCapabilities, u64),
+        no_copy: bool,
     ) -> PrivateProperties {
         let answers = Answers {
             properties,
             metal,
             rows,
             formats,
+            linear_alignment,
+            no_copy,
         };
         PrivateProperties {
             counts: PrivateCount::ALL.map(|p| {
@@ -505,12 +517,21 @@ impl Device {
     /// runtime answers them on this device (the module docs). It judges the
     /// device by the GPU-family rows, so read it once.
     pub fn private_properties(&self) -> PrivateProperties {
+        self.current().private_properties_now()
+    }
+
+    /// [`Device::private_properties`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn private_properties_now(&self) -> PrivateProperties {
         let compile = self.compile_device();
         let answers = PrivateProperties::of(
             self.properties(),
             compile.metal_properties(),
-            &self.family_rows(MEASURED_FAMILY),
-            &|pf| self.pixel_format_capabilities(pf),
+            &self.family_rows_now(MEASURED_FAMILY),
+            (
+                &|pf| self.pixel_format_capabilities_now(pf),
+                self.device_linear_texture_alignment(),
+            ),
+            self.shared().host_import.is_ok(),
         );
         // The properties the device has no answer for, announced once.
         let unknown = answers.unknown();
@@ -540,6 +561,11 @@ struct Answers<'a> {
     /// The texture capabilities the runtime gives a pixel format on the device
     /// ([`Device::pixel_format_capabilities`]).
     formats: &'a dyn Fn(PixelFormat) -> FormatCapabilities,
+    /// The device's linear texture alignment (`Device::device_linear_texture_alignment`).
+    linear_alignment: u64,
+    /// The device makes no-copy buffers: it imports host memory, by its pointer or as dma-bufs
+    /// of its pages (`host_memory.rs`'s `Importer`).
+    no_copy: bool,
 }
 
 impl Answers<'_> {
@@ -589,7 +615,7 @@ impl Answers<'_> {
             C::DeviceLinearTextureAlignmentBytes
             | C::LinearTextureAlignmentBytes
             | C::IosurfaceTextureAlignmentBytes
-            | C::IosurfaceReadOnlyTextureAlignmentBytes => LINEAR_ALIGNMENT,
+            | C::IosurfaceReadOnlyTextureAlignmentBytes => self.linear_alignment,
             C::MaxVertexBuffers
             | C::MaxFragmentBuffers
             | C::MaxComputeBuffers
@@ -661,11 +687,7 @@ impl Answers<'_> {
                     .are_programmable_sample_positions_supported()
                     == Ok(true)
             }
-            F::SupportsResourceDetachBacking => self
-                .properties
-                .description
-                .extensions
-                .contains(&VkExtension::ExtExternalMemoryHost),
+            F::SupportsResourceDetachBacking => self.no_copy,
             F::SupportsSharedTextureHandles => true,
             F::SupportsSimdReduction => {
                 self.exact(R::SimdReduction) && self.exact(R::QuadReduction)

@@ -24,12 +24,16 @@
 //!
 //! The fields are fixed when the device is made. An answer that changes while the device lives is
 //! a method of its object's step on `Device` instead: step 5's per-format mipmap verdict, settled
-//! by the first mipmap generation of each format.
+//! by the first mipmap generation of each format. So is one the device's images decide, worked out
+//! for every format at the first query of any and fixed from there:
+//! `Device::minimum_linear_texture_alignment_for_pixel_format`.
 
+use super::device::argument_buffers::APPLE;
 use super::device::DeviceKind;
 use super::driver_defects;
 use super::error::{invalid, Error, Problem, RuntimeGap};
 use super::linear_plan::linear_alignment;
+use super::sampler::argument_buffer_sampler_count;
 use super::texture_descriptor::TextureRules;
 use super::values::Size;
 use metal2vulkan::device::{DeviceDescription, DriverFact, VkFeature};
@@ -69,6 +73,15 @@ pub struct DeviceProperties {
     /// follows Metal's contract for the answer (`managed.rs`), and `Shared` storage lies where a
     /// Mac's does (docs/API.md "The runtime's memory model").
     pub has_unified_memory: bool,
+    /// Whether the Mac the device presents keeps textures losslessly compressed, as an Apple
+    /// silicon Mac's GPU does, a Mac with an Intel or AMD GPU's does not: true where the device
+    /// presents [`MacClass::AppleSilicon`], the class
+    /// [`DeviceOptions::mac_class`](crate::DeviceOptions::mac_class) declares, else the one of
+    /// the device's GPU ([`MacClass::of_vendor`]). Metal has no property for it: it shows in what
+    /// a new `Private` texture reads before anything writes it (Metal's fixed pattern or zero,
+    /// against zero or a released texture's texels), in the encoding a GPU blit through such a
+    /// texture writes, and in a `half` NaN clear's sign (docs/API.md, the accepted differences).
+    pub lossless_compression: bool,
     /// `VkPhysicalDeviceProperties::vendorID`.
     pub vendor_id: u32,
     /// `VkPhysicalDeviceProperties::deviceID`.
@@ -97,20 +110,53 @@ pub struct DeviceProperties {
     pub drm_render: Option<(i64, i64)>,
     /// The Vulkan version the device runs at: the lower of the instance's and the device's.
     pub api_version: ApiVersion,
-    /// `maxBufferLength`: the longest buffer a shader can bind whole, the compile layer's answer:
-    /// `maxStorageBufferRange` where buffers are reached through descriptors only, else the lower
-    /// of `maxBufferSize` and `maxMemoryAllocationSize` (the device's allocation sizes, which
-    /// follow its machine's memory on integrated GPUs, as Metal's answer does).
+    /// `maxBufferLength`: the longest buffer a shader can bind whole, the compile layer's answer
+    /// (`maxStorageBufferRange` where buffers are reached through descriptors only, else the lower
+    /// of `maxBufferSize` and `maxMemoryAllocationSize`), at most three quarters of the device's
+    /// largest device-local heap, rounded down to 16 KiB (`working_set_buffer_bound`). Metal
+    /// answers three quarters of its `recommendedMaxWorkingSetSize`: 3,208,642,560 of 4,278,190,080
+    /// on an AMD Radeon Pro 5300M (4 GiB, macOS 26.7.1), and 41,747,087,360 of 55,662,788,608, to
+    /// 16 KiB, on an Apple M3 Max (64 GiB, macOS 27.0.1); the runtime holds no working set size and
+    /// takes the heap for it, so a discrete GPU's answer follows its memory, as Metal's does, where
+    /// its Vulkan limits alone allow far more (`maxBufferSize` 1 TiB on NVIDIA's 615.71.09). On
+    /// MoltenVK the bound is above the compile layer's answer, Metal's own.
     pub max_buffer_length: u64,
     /// `maxThreadsPerThreadgroup`: per axis, `maxComputeWorkGroupSize` capped by
     /// `maxComputeWorkGroupInvocations` and by an Apple GPU's 1024.
     pub max_threads_per_threadgroup: Size,
     /// `maxThreadgroupMemoryLength`: `maxComputeSharedMemorySize`, since a kernel's threadgroup
-    /// arenas are exactly its Metal allocations, capped by an Apple GPU's 32 KiB.
+    /// arenas are exactly its Metal allocations, capped by what Metal answers on the class of Mac
+    /// the device presents ([`MacClass`]): an Apple silicon Mac's 32 KiB, a Mac with an Intel or
+    /// AMD GPU's 64 KiB. A dispatch takes threadgroup memory up to the device's own limit, so
+    /// every length this answers runs.
     pub max_threadgroup_memory_length: u64,
     /// `argumentBuffersSupport`: `Tier2` where buffers are reached by device address and texture
     /// and sampler handles through the descriptor heap (descriptor indexing), else `Tier1`.
     pub argument_buffers_support: ArgumentBuffersTier,
+    /// `maxArgumentBufferSamplerCount`: the most live sampler states functions can read through
+    /// argument buffers, one fewer than the smaller of two counts, each with a slot the states do
+    /// not take:
+    /// - the elements of a set-1 sampler array, which holds each live state at an element of its
+    ///   own and the neutral sampler at element 0
+    ///   ([`heap_sampler_capacity`](metal2vulkan::pipeline::heap_sampler_capacity): the least of
+    ///   the handle table's 65536 entries, `maxDescriptorSetUpdateAfterBindSamplers` and
+    ///   `maxPerStageDescriptorUpdateAfterBindSamplers`, 0 where no function can read one);
+    /// - `maxSamplerAllocationCount`, the Vulkan samplers the device holds live at once, one past
+    ///   them refused (`Error::SamplerLimit`): the array's neutral sampler and a sampler of each
+    ///   state it holds are among them.
+    ///
+    /// It is the most any pipeline reads. Fewer can be: in a pipeline whose set-1 arrays are
+    /// smaller (its heap has more arrays of a kind, or its set 0 counts descriptors of them), where
+    /// other Vulkan samplers live (another use's array, a slot's bind, a pipeline's constexpr
+    /// samplers), and where other holders of sampler IDs (the device's own sampler, a pipeline
+    /// state's numbered samplers) hold IDs the device's sampler tables reach, IDs 1 to 65535 under
+    /// plain allocation. A state
+    /// left out reads the neutral sampler through an argument buffer, announced
+    /// (`Degradation::UnlistedArgumentSampler`). Every live state counts, with or without
+    /// `supportArgumentBuffers`, since Metal reads one without it through an argument buffer too;
+    /// Metal's count is of the states with it. Metal answers 500000 on an Apple M3 Max (macOS
+    /// 27.0.1), where the runtime answers 65535 on MoltenVK, the handle table's reach.
+    pub max_argument_buffer_sampler_count: u64,
     /// `readWriteTextureSupport`: the highest tier whose every format has a storage-image form
     /// on the device.
     pub read_write_texture_support: ReadWriteTextureTier,
@@ -155,6 +201,11 @@ pub struct DeviceProperties {
     /// Custom sample positions are taken at every texture sample count above 1
     /// (`sample_positions.rs`).
     programmable_sample_positions: bool,
+    /// The compile layer lowers an `interpolant` read at its centroid, a sample or an offset
+    /// ([`DeviceProperties::supports_pull_model_interpolation`]).
+    pull_model_interpolation: bool,
+    /// The class of Mac the device presents ([`presented_class`]).
+    mac_class: MacClass,
 }
 
 /// What [`DeviceProperties::new`] reads of the physical device itself, beside the description
@@ -179,22 +230,132 @@ pub(crate) struct DeviceIdentity {
     pub api_version: ApiVersion,
     /// `VkPhysicalDeviceLimits::maxViewports`.
     pub max_viewports: u32,
+    /// `VkPhysicalDeviceLimits::maxSamplerAllocationCount`: the device's live samplers are held
+    /// to it (`SamplerCount`), and it bounds
+    /// [`DeviceProperties::max_argument_buffer_sampler_count`].
+    pub max_sampler_allocation_count: u32,
     /// The GPU's cores as its driver reports them ([`DeviceProperties::gpu_core_count`]).
     pub gpu_core_count: Option<u32>,
     /// The sample counts every color and depth image can be sampled at:
     /// `sampledImageColorSampleCounts & sampledImageDepthSampleCounts`.
     pub sampled_sample_counts: SampleCountFlags,
+    /// The size of the device's largest `DEVICE_LOCAL` memory heap, where it was read
+    /// (`VkPhysicalDeviceMemoryProperties`): what bounds [`DeviceProperties::max_buffer_length`],
+    /// and what `PhysicalDeviceIdentity::recommended_max_working_set_size` answers.
+    pub device_local_heap: Option<u64>,
+}
+
+/// The longest buffer Metal's rule allows a device whose working set is `working_set` bytes:
+/// three quarters of it, rounded down to 16 KiB ([`DeviceProperties::max_buffer_length`]).
+pub(crate) fn working_set_buffer_bound(working_set: u64) -> u64 {
+    const PAGE: u64 = 16 << 10;
+    working_set / 4 * 3 / PAGE * PAGE
+}
+
+/// The class of Mac a device presents, whose GPU decides answers Metal gives without a property
+/// of its own: what a new `Private` texture reads before anything writes it, the encoding a GPU
+/// blit through a compressed texture writes, a `half` NaN clear's sign, how far a `Clear`
+/// load reaches past the render area of a pass without a draw call (docs/API.md, the accepted
+/// differences), whether a sampler state's `lodBias` moves its samples' level
+/// (`SamplerDescriptor::lod_bias`), and the most threadgroup memory a kernel may take
+/// ([`DeviceProperties::max_threadgroup_memory_length`]). Every Mac's Metal answers one class's
+/// way, by the GPU it has (Apple silicon, or an Intel or AMD GPU); the runtime answers the class
+/// the consumer declares
+/// ([`DeviceOptions::mac_class`](crate::DeviceOptions::mac_class)), else the one of the device's
+/// GPU ([`MacClass::of_vendor`]), and states it as
+/// [`DeviceProperties::lossless_compression`]. No Metal counterpart: a Mac's GPU is what it is.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MacClass {
+    /// An Apple silicon Mac, whose GPU keeps a texture losslessly compressed where Metal's rule
+    /// holds (`allowGPUOptimizedContents`, a level 0 of 16 texels or more on its shorter side, a
+    /// colour format of neither `ShaderWrite` nor `PixelFormatView` usage): a new `Private` such
+    /// texture reads Metal's fixed pattern over its first levels and zero elsewhere, blits
+    /// through it write three formats' canonical encodings, and a `half` NaN clear keeps its
+    /// sign. A `Clear` load in a pass of one layer without a draw call clears such a texture's
+    /// whole level and slice past the render area, and any other texture's render area rounded
+    /// up to 32x32 tiles, as a pass with a draw call clears every texture, other levels and
+    /// slices untouched (our probes and the consumer's on the M3 Max). The runtime writes the pattern and the zeros (a pattern no clear or copy writes
+    /// exactly reads zero, announced as `fresh-pattern-zeroed`), and clears so. Its GPU samples
+    /// every level through a sampler state as with no LOD bias, whatever the state's `lodBias`
+    /// (an Apple M3 Max, Apple9): so does the runtime. Its `maxThreadgroupMemoryLength` is 32 KiB
+    /// (an Apple M3 Max).
+    AppleSilicon,
+    /// A Mac with an Intel or AMD GPU, which keeps no texture compressed: a new `Private`
+    /// texture reads zero, blits keep the bytes, and a `half` NaN clear goes through `half`. Such
+    /// a Mac's new `Private` texture holds what its memory held (zero, or a released texture's
+    /// texels of the same process: an Intel UHD 630 and an AMD Radeon Pro 5300M); the runtime
+    /// fills it with zeros instead (`WorkCounts::private_textures_zero_filled`), as the memory
+    /// may have held another process's where a consumer's processes share the device. A `Clear`
+    /// load in a pass of one layer
+    /// without a draw call clears the whole level and slice past the render area, the AMD Radeon
+    /// Pro 5300M's answer; an Intel UHD 630 clears anything from the render area alone to the
+    /// whole texture there, by format and shape (the consumer's probes). Its GPU adds a sampler
+    /// state's `lodBias` to every sample's level, an explicit level's, a gradient's and an
+    /// implicit one's alike, the sum clamped into the texture's levels (both GPUs, the
+    /// consumer's probes): so does the runtime, through the device's `mipLodBias`, within its
+    /// `maxSamplerLodBias` (`Degradation::CappedLodBias` past it, and where the device's
+    /// portability subset withholds `samplerMipLodBias`). Its `maxThreadgroupMemoryLength` is
+    /// 64 KiB (both GPUs, the consumer's probes).
+    IntelOrAmd,
+}
+
+impl MacClass {
+    /// The class of the Mac whose GPU is of PCI vendor `vendor_id`
+    /// (`VkPhysicalDeviceProperties::vendorID`): an Apple GPU's (`0x106b`, MoltenVK on Apple
+    /// silicon) is [`AppleSilicon`](Self::AppleSilicon); every other GPU's (Intel, AMD, NVIDIA, a
+    /// CPU implementation's) is [`IntelOrAmd`](Self::IntelOrAmd), whose GPUs keep no texture
+    /// compressed, an integrated GPU of unified memory such as Intel's included. The class a
+    /// device presents where the consumer declares none. No Metal counterpart.
+    pub fn of_vendor(vendor_id: u32) -> MacClass {
+        match vendor_id == APPLE {
+            true => MacClass::AppleSilicon,
+            false => MacClass::IntelOrAmd,
+        }
+    }
+
+    /// The `maxThreadgroupMemoryLength` Metal answers on a Mac of this class: 32,768 bytes on an
+    /// Apple silicon Mac (an Apple M3 Max, macOS 27.0.1), 65,536 on a Mac with an Intel or AMD
+    /// GPU (an Intel UHD 630 and an AMD Radeon Pro 5300M, macOS 26.7.1). A device answers the
+    /// lower of it and its own `maxComputeSharedMemorySize`
+    /// (`DeviceProperties::max_threadgroup_memory_length`).
+    pub(crate) fn max_threadgroup_memory_length(self) -> u64 {
+        match self {
+            MacClass::AppleSilicon => 32 << 10,
+            MacClass::IntelOrAmd => 64 << 10,
+        }
+    }
+}
+
+/// The class of Mac a device of `identity`, its class declared as `declared`, presents: the one
+/// place the runtime decides it. Every answer that differs between an Apple silicon Mac and a Mac
+/// with an Intel or AMD GPU reads it: because the first compresses
+/// ([`DeviceProperties::lossless_compression`]: a new `Private` texture's contents, a blit's
+/// canonical encodings, a `half` NaN clear's sign), because the second adds a sampler's LOD bias
+/// to every sample's level (`sampler.rs`), and because their GPUs' threadgroup memory differs
+/// ([`DeviceProperties::max_threadgroup_memory_length`]).
+fn presented_class(identity: &DeviceIdentity, declared: Option<MacClass>) -> MacClass {
+    declared.unwrap_or_else(|| MacClass::of_vendor(identity.vendor_id))
 }
 
 impl DeviceProperties {
     /// The properties of the device `identity` names, created with `description` (what it
-    /// enables), whose compile-layer device is `compile`.
+    /// enables), whose compile-layer device is `compile`, presenting the Mac class `mac_class`
+    /// declares (`None`: its GPU's).
     pub(crate) fn new(
         identity: DeviceIdentity,
         description: DeviceDescription,
         compile: &metal2vulkan::device::Device,
+        mac_class: Option<MacClass>,
     ) -> DeviceProperties {
+        let mac_class = presented_class(&identity, mac_class);
+        let lossless_compression = mac_class == MacClass::AppleSilicon;
         let metal = compile.metal_properties();
+        let max_buffer_length = identity
+            .device_local_heap
+            .map_or(metal.max_buffer_length, |heap| {
+                metal.max_buffer_length.min(working_set_buffer_bound(heap))
+            });
         let [width, height, depth] = metal.max_threads_per_threadgroup.map(u64::from);
         let texture_sample_counts = metal.raster_sample_counts & identity.sampled_sample_counts;
         let max_vertex_amplification_count = if description.has(VkFeature::Multiview) {
@@ -206,16 +367,24 @@ impl DeviceProperties {
             name: identity.name,
             kind: identity.kind,
             has_unified_memory: identity.kind.has_unified_memory(),
+            lossless_compression,
             vendor_id: identity.vendor_id,
             device_id: identity.device_id,
             device_uuid: identity.device_uuid,
             pci_bus: identity.pci_bus,
             drm_render: identity.drm_render,
             api_version: identity.api_version,
-            max_buffer_length: metal.max_buffer_length,
+            max_buffer_length,
             max_threads_per_threadgroup: Size::new(width, height, depth),
-            max_threadgroup_memory_length: u64::from(metal.max_threadgroup_memory_length),
+            max_threadgroup_memory_length: u64::from(
+                compile.profile().limits().max_compute_shared_memory_size,
+            )
+            .min(mac_class.max_threadgroup_memory_length()),
             argument_buffers_support: metal.argument_buffers_tier,
+            max_argument_buffer_sampler_count: argument_buffer_sampler_count(
+                metal2vulkan::pipeline::heap_sampler_capacity(compile.profile()),
+                identity.max_sampler_allocation_count,
+            ),
             read_write_texture_support: metal.read_write_texture_tier,
             supports_32bit_float_filtering: metal.supports_32bit_float_filtering,
             max_viewports: identity.max_viewports,
@@ -227,10 +396,19 @@ impl DeviceProperties {
                 texture_sample_counts,
             ),
             max_vertex_amplification_count,
+            pull_model_interpolation: compile.profile().interpolation_function_needs().is_empty(),
+            mac_class,
             driver_defects: driver_defects::of(&description),
             driver_facts: description.driver_facts(),
             description,
         }
+    }
+
+    /// The class of Mac the device presents: the one
+    /// [`DeviceOptions::mac_class`](crate::DeviceOptions::mac_class) declares, else its GPU's
+    /// ([`MacClass::of_vendor`]).
+    pub(crate) fn mac_class(&self) -> MacClass {
+        self.mac_class
     }
 
     /// `areRasterOrderGroupsSupported`: the pixel interlock is enabled
@@ -291,6 +469,25 @@ impl DeviceProperties {
         }
     }
 
+    /// `supportsPullModelInterpolation`: a fragment function may read an `interpolant` through
+    /// every interpolation function, `interpolate_at_center`, `_centroid`, `_sample` and
+    /// `_offset`, which the compile layer lowers to `GLSL.std.450`'s interpolation functions: the
+    /// device has `sampleRateShading`, and on a portability-subset device (MoltenVK)
+    /// `shaderSampleRateInterpolationFunctions`
+    /// ([`DeviceProfile::interpolation_function_needs`](metal2vulkan::device::DeviceProfile::interpolation_function_needs)
+    /// is empty). Without them only `interpolate_at_center` compiles, and a function that reads
+    /// otherwise is refused, `Unsupported(PullModelInterpolation)`. What differs from Metal: an
+    /// offset is read on the device's grid and within its range
+    /// (`PrecisionNote::DeviceInterpolationOffset`), a centroid where Vulkan puts it
+    /// (`PrecisionNote::MultisamplePosition`), a perspective interpolant read at a sample or an
+    /// offset on RADV is the driver's extrapolation from the pixel center
+    /// (`PrecisionNote::ExtrapolatedInterpolation`), and a draw at custom sample positions through
+    /// a function that reads at a sample is refused
+    /// ([`RuntimeGap::InterpolateAtSampleWithPositions`]).
+    pub fn supports_pull_model_interpolation(&self) -> Result<bool, RuntimeGap> {
+        Query::PullModelInterpolation.answer(self.pull_model_interpolation)
+    }
+
     /// `supportsSamplerReductionMode`: no, on every device, as Metal answers on an Apple M4
     /// (macOS 27.0.1). There a sampler's minimum or maximum reduction reads the weighted average
     /// (Metal's validation layer refuses one), and so does every sampler the runtime makes and
@@ -341,31 +538,29 @@ impl DeviceProperties {
     /// visibility result all complete and leave the pages as they were, and a colour attachment with
     /// [`StoreAction::Store`](crate::StoreAction::Store), a resolve target or a depth or stencil
     /// attachment over such memory ends its command buffer in error. On macOS, where the device
-    /// imports the pages through a read-only view of them, that is yes; elsewhere the import is of
-    /// the caller's own pages and this answers no, with the difference announced
-    /// ([`Degradation::PrivateResourceOption`](crate::Degradation::PrivateResourceOption)).
+    /// imports the pages through a read-only view of them, that is yes. Elsewhere the memory is a
+    /// copy of the pages whose GPU writes are dropped, announced
+    /// ([`Degradation::CopiedHostPages`](crate::Degradation::CopiedHostPages)), and this answers
+    /// no: the CPU and the command buffers committed after a writer's completion read the pages'
+    /// own bytes, but a command buffer committed before it may read the GPU's writes. A render
+    /// pass's store-out into such memory faults its command buffer on either.
     pub fn drops_gpu_writes_to_read_only_memory(&self) -> bool {
         crate::read_only_view::VIEWS_DROP_WRITES
     }
+}
 
-    /// `minimumLinearTextureAlignmentForPixelFormat:`: the alignment of a texture's offset and
-    /// rows in a buffer, 16 bytes for every format a buffer can back, as Metal answers on an M3 Max
-    /// and an M4. Refused, `Invalid` with
-    /// [`BufferTextureProblem::NotLinear`](crate::BufferTextureProblem::NotLinear), for a
-    /// compressed, depth or stencil format, on which Metal's query asserts, and for a format Metal
-    /// describes none of ([`Device::pixel_format_info`](crate::Device::pixel_format_info) answers
-    /// [`PixelFormatInfo::INVALID`](crate::PixelFormatInfo::INVALID)), on which it asserts too.
-    pub fn minimum_linear_texture_alignment_for_pixel_format(
-        &self,
-        format: PixelFormat,
-    ) -> Result<u64, Error> {
-        linear_alignment(format).map_err(|problem| {
-            invalid(
-                "minimum_linear_texture_alignment_for_pixel_format",
-                Problem::BufferTexture(problem),
-            )
-        })
-    }
+/// Metal's rule for `minimumLinearTextureAlignmentForPixelFormat:` of `format`: 16 bytes for every
+/// format a buffer can back, as Metal answers on an Apple M3 Max and an M4, the least the device
+/// answers (`Device::minimum_linear_texture_alignment_for_pixel_format`); refused, `Invalid` with
+/// `BufferTextureProblem::NotLinear`, for a compressed, depth or stencil format, on which Metal's
+/// query asserts, and for a format Metal describes none of, on which it asserts too.
+pub(crate) fn linear_alignment_rule(format: PixelFormat) -> Result<u64, Error> {
+    linear_alignment(format).map_err(|problem| {
+        invalid(
+            "minimum_linear_texture_alignment_for_pixel_format",
+            Problem::BufferTexture(problem),
+        )
+    })
 }
 
 /// Whether `count` samples is one of the Vulkan sample counts `flags` holds: a power of two whose
@@ -406,11 +601,13 @@ pub enum Query {
     MinimumLinearTextureAlignment,
     /// `supportsSamplerReductionMode`.
     SamplerReductionMode,
+    /// `supportsPullModelInterpolation`.
+    PullModelInterpolation,
 }
 
 impl Query {
     /// Every query, in declaration order.
-    pub const ALL: [Query; 8] = [
+    pub const ALL: [Query; 9] = [
         Query::RasterOrderGroups,
         Query::Depth24Stencil8,
         Query::ProgrammableSamplePositions,
@@ -419,6 +616,7 @@ impl Query {
         Query::RasterizationRateMapLayerCount,
         Query::MinimumLinearTextureAlignment,
         Query::SamplerReductionMode,
+        Query::PullModelInterpolation,
     ];
 
     /// Metal's selector.
@@ -432,6 +630,7 @@ impl Query {
             Query::RasterizationRateMapLayerCount => "supportsRasterizationRateMapWithLayerCount:",
             Query::MinimumLinearTextureAlignment => "minimumLinearTextureAlignmentForPixelFormat:",
             Query::SamplerReductionMode => "supportsSamplerReductionMode",
+            Query::PullModelInterpolation => "supportsPullModelInterpolation",
         }
     }
 
@@ -446,7 +645,8 @@ impl Query {
             | Query::Depth24Stencil8
             | Query::TextureSampleCount
             | Query::MinimumLinearTextureAlignment
-            | Query::SamplerReductionMode => None,
+            | Query::SamplerReductionMode
+            | Query::PullModelInterpolation => None,
         }
     }
 
@@ -467,6 +667,7 @@ impl DeviceProperties {
             raster_order_groups: self.raster_order_groups,
             texture_sample_counts: self.texture_sample_counts,
             max_vertex_amplification_count: self.max_vertex_amplification_count,
+            pull_model_interpolation: self.pull_model_interpolation,
         }
     }
 }
@@ -478,4 +679,5 @@ pub(super) struct DeviceAnswers {
     pub raster_order_groups: bool,
     pub texture_sample_counts: SampleCountFlags,
     pub max_vertex_amplification_count: u64,
+    pub pull_model_interpolation: bool,
 }

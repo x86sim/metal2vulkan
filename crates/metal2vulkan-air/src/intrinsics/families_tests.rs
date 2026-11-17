@@ -492,6 +492,10 @@ const OBSERVED: &[(&str, &str)] = &[
     ("air.get_height_depth_cube_array", "i32 (p1, i32)"),
     ("air.is_null_texture_1d", "i1 (p1)"),
     ("air.get_null_texture_3d", "p1 ()"),
+    // OpenCL C's image format queries (Apple's OpenCL compiler, macOS 27.0.1 and 26.7.1).
+    ("air.get_channel_order_texture_2d", "i32 (p1)"),
+    ("air.get_channel_data_type_texture_1d_array", "i32 (p1)"),
+    ("air.get_channel_order_texture_3d", "i32 (p1)"),
     ("air.get_read_sampler", "p2 ()"),
     // Derivatives and boolean reductions.
     ("air.dfdx.v3f16", "v3f16 (v3f16)"),
@@ -532,6 +536,19 @@ const OBSERVED: &[(&str, &str)] = &[
     // AIR 2.9 (`xcrun metal` 32023.921 at deployment target macOS 27): a barrier takes its order,
     // and a memory atomic its `mem_flags` before the volatile flag.
     ("air.wg.barrier", "void (i32, i32, i32)"),
+    // AIR 2.9: a tensor's extent takes one more operand, a strided initialization three.
+    (
+        "air.get_extent_private_tensor.i32",
+        "i32 (p0, i16, i16, i16)",
+    ),
+    (
+        "air.init_strided_private_tensor.i32.global",
+        "void (p0, i16, p1, p0, p0, i8, p1, i32, i8)",
+    ),
+    (
+        "air.init_strided_private_tensor.i32.local",
+        "void (p0, i16, p3, p0, p0, i8, p3, i32, i8)",
+    ),
     ("air.simdgroup.barrier", "void (i32, i32, i32)"),
     (
         "air.atomic.global.add.u.i32",
@@ -760,6 +777,35 @@ const OBSERVED: &[(&str, &str)] = &[
     ("air.get_dispatch_threads_per_threadgroup.i32", "i32 (i32)"),
     ("air.get_local_linear_id.i32", "i32 ()"),
     ("air.get_quadgroups_per_threadgroup.i32", "i32 ()"),
+    // OpenCL C's `get_global_offset(d)` and `get_work_dim()` (Apple's OpenCL compiler, macOS
+    // 27.0.1).
+    ("air.get_global_offset.i32", "i32 (i32)"),
+    ("air.get_work_dim.i32", "i32 ()"),
+    // OpenCL C's `native_<function>` and `half_<function>` (Apple's OpenCL compiler, macOS 27.0.1
+    // and 26.7.1).
+    ("air.native_powr.v4f32", "v4f32 (v4f32, v4f32)"),
+    ("air.native_powr.f32", "f32 (f32, f32)"),
+    ("air.native_sqrt.v16f32", "v16f32 (v16f32)"),
+    ("air.native_exp10.v3f32", "v3f32 (v3f32)"),
+    ("air.half_cos.v4f32", "v4f32 (v4f32)"),
+    ("air.half_powr.v4f32", "v4f32 (v4f32, v4f32)"),
+    // OpenCL C's vector data functions (the same compilers).
+    ("air.vload.global.v3i32", "v3i32 (i64, p1)"),
+    ("air.vload.constant.v16i8", "v16i8 (i64, p2)"),
+    ("air.vload.local.v2i64", "v2i64 (i64, p3)"),
+    ("air.vload.private.v3f32", "v3f32 (i64, p0)"),
+    ("air.vstore.global.v3i32", "void (v3i32, i64, p1)"),
+    ("air.vstore.private.v16i8", "void (v16i8, i64, p0)"),
+    ("air.vload_half.constant.f32", "f32 (i64, p2)"),
+    ("air.vload_half.global.v16f32", "v16f32 (i64, p1)"),
+    ("air.vloada_half.global.v3f32", "v3f32 (i64, p1)"),
+    ("air.vstore_half.global.rtz.f32", "void (f32, i64, p1)"),
+    ("air.vstore_half.local.rte.v4f32", "void (v4f32, i64, p3)"),
+    (
+        "air.vstore_half.global.rtn.v16f32",
+        "void (v16f32, i64, p1)",
+    ),
+    ("air.vstorea_half.global.rtp.v3f32", "void (v3f32, i64, p1)"),
     // Simdgroup matrices.
     (
         "air.simdgroup_matrix_8x8_load.v64f32.p3f32",
@@ -817,6 +863,24 @@ const OBSERVED: &[(&str, &str)] = &[
     ("air.get_num_samples.i32", "i32 (i32)"),
     ("air.quad_is_helper_thread", "i1 ()"),
     ("air.simd_is_helper_thread", "i1 ()"),
+    // Pull-model interpolation (`pull_model_interpolants`).
+    ("air.interpolate_center_perspective.v4f32", "v4f32 (p1)"),
+    ("air.interpolate_center_no_perspective.f32", "f32 (p1)"),
+    ("air.interpolate_centroid_perspective.v2f32", "v2f32 (p1)"),
+    ("air.interpolate_centroid_no_perspective.f16", "f16 (p1)"),
+    (
+        "air.interpolate_sample_perspective.v4f16",
+        "v4f16 (p1, i32)",
+    ),
+    (
+        "air.interpolate_sample_no_perspective.v4f32",
+        "v4f32 (p1, i32)",
+    ),
+    ("air.interpolate_offset_perspective.f32", "f32 (p1, v2f32)"),
+    (
+        "air.interpolate_offset_no_perspective.v2f32",
+        "v2f32 (p1, v2f32)",
+    ),
     ("air.imageblock_data", "p4 (v2i16, i32, i16)"),
     ("air.get_imageblock_width", "i16 ()"),
     (
@@ -2273,7 +2337,7 @@ fn texture_immediates_bind() {
             ..
         }
     ));
-    // An access outside the qualifiers stays unknown; a non-constant flag is malformed.
+    // An access outside the qualifiers stays unknown; a non-constant flag does not bind.
     let args = [v(0), v(1), v(2), no, v(4), no, v(6), v(7), c.i32(4)];
     assert_eq!(bind(sample, &args, &c.table), Ok(Bound::Unknown));
     let args = [v(0), v(1), v(2), v(3), v(4), no, v(6), v(7), zero];
@@ -2701,7 +2765,7 @@ fn air_2_9_atomics_read_their_flags() {
         // The same call in both forms: only the flags differ.
         assert_eq!(b.flags, Some(flags), "{name}");
         assert_eq!(Atomic { flags: None, ..b }, a, "{name}");
-        // A flag bit outside Metal's five stays unknown; a non-constant one is malformed.
+        // A flag bit outside Metal's five stays unknown; a non-constant one does not bind.
         let mut args = new_args.clone();
         let at = args.len() - 2;
         args[at] = c.i32(32);
@@ -3624,5 +3688,121 @@ fn legacy_block_forms_are_chosen_by_the_declaration() {
             DeclClass::Mismatch,
             "{decl}"
         );
+    }
+}
+
+#[test]
+fn interpolation_functions_read_their_location_and_interpolant() {
+    let i = |name: &str, decl: &str| match declared_air(name, decl) {
+        AirIntrinsic::Interpolate(i) => i,
+        other => panic!("{name}: {other:?}"),
+    };
+    let f32x = |lanes| NumTy {
+        elem: Elem::F32,
+        lanes,
+    };
+    let offset = i(
+        "air.interpolate_offset_no_perspective.v2f32",
+        "v2f32 (p1, v2f32)",
+    );
+    assert_eq!(
+        offset,
+        Interpolate {
+            at: InterpolateAt::Offset,
+            perspective: false,
+            ty: f32x(2),
+        }
+    );
+    let sample = i(
+        "air.interpolate_sample_perspective.v4f16",
+        "v4f16 (p1, i32)",
+    );
+    assert_eq!(
+        (sample.at, sample.perspective),
+        (InterpolateAt::Sample, true)
+    );
+    let center = i("air.interpolate_center_perspective.f32", "f32 (p1)");
+    assert_eq!(center.ty, f32x(1));
+    // The interpolant is the one handle, a device-space pointer.
+    for x in [offset, sample, center] {
+        let handles: Vec<_> = x.signature().handles().collect();
+        assert_eq!(handles, [(0, HandleKind::Interpolant)]);
+        assert_eq!(HandleKind::Interpolant.space(), AddrSpace::Device);
+    }
+    // No other location, qualifier or value type is an interpolation function.
+    for name in [
+        "air.interpolate_center_flat.f32",
+        "air.interpolate_pixel_perspective.f32",
+        "air.interpolate_center_perspective.i32",
+        "air.interpolate_center_perspective.v8f32",
+        "air.interpolate_centerperspective.f32",
+    ] {
+        assert_eq!(AirIntrinsic::parse(name), None, "{name}");
+    }
+}
+
+/// A tensor's extent has two declarations: AIR 2.8's three operands and AIR 2.9's four. Another
+/// added operand is a mismatch.
+#[test]
+fn a_tensor_extent_has_its_air_2_9_form() {
+    let name = "air.get_extent_private_tensor.i32";
+    for (decl, trailing) in [
+        ("i32 (p0, i16, i16)", false),
+        ("i32 (p0, i16, i16, i16)", true),
+    ] {
+        assert_eq!(
+            declared_air(name, decl),
+            AirIntrinsic::Tensor(Tensor::Extent { trailing }),
+            "{decl}"
+        );
+    }
+    for decl in ["i32 (p0, i16, i16, i32)", "i32 (p0, i16, i16, i16, i16)"] {
+        assert_eq!(declared(name, decl), DeclClass::Mismatch, "{decl}");
+    }
+}
+
+/// A strided tensor's initialization has two declarations: AIR 2.8's six operands and AIR 2.9's
+/// nine (`xcrun metal` 32023.922 at deployment target macOS 27), whose added pointer is in the
+/// data's space. Another added operand list is a mismatch.
+#[test]
+fn a_strided_tensor_initialization_has_its_air_2_9_form() {
+    for (name, data, p) in [
+        (
+            "air.init_strided_private_tensor.i32.global",
+            AddrSpace::Device,
+            "p1",
+        ),
+        (
+            "air.init_strided_private_tensor.i32.local",
+            AddrSpace::Threadgroup,
+            "p3",
+        ),
+    ] {
+        let air28 = format!("void (p0, i16, {p}, p0, p0, i8)");
+        let air29 = format!("void (p0, i16, {p}, p0, p0, i8, {p}, i32, i8)");
+        assert_eq!(
+            declared_air(name, &air28),
+            AirIntrinsic::Tensor(Tensor::InitStrided {
+                data,
+                trailing: false
+            }),
+            "{name}"
+        );
+        assert_eq!(
+            declared_air(name, &air29),
+            AirIntrinsic::Tensor(Tensor::InitStrided {
+                data,
+                trailing: true
+            }),
+            "{name}"
+        );
+        let other = if p == "p1" { "p3" } else { "p1" };
+        for decl in [
+            format!("void (p0, i16, {p}, p0, p0, i8, {other}, i32, i8)"),
+            format!("void (p0, i16, {p}, p0, p0, i8, {p}, i32)"),
+            format!("void (p0, i16, {p}, p0, p0, i8, {p}, i32, i8, i8)"),
+        ] {
+            assert_eq!(declared(name, &decl), DeclClass::Mismatch, "{name} {decl}");
+        }
     }
 }

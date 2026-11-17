@@ -16,7 +16,7 @@
 //! so and checks nothing.
 
 use super::first_move::Fresh;
-use super::{Image, Owner, Storage, Texture};
+use super::{Image, Owner, Storage, Stored, Texture};
 use crate::buffer::MemoryHold;
 use crate::device::lock;
 use crate::{
@@ -40,10 +40,10 @@ const SIDE: u64 = 16;
 const ROW: u64 = SIDE * 4;
 
 /// A scratch directory for the device's shader cache, removed when dropped.
-struct Scratch(PathBuf);
+pub(super) struct Scratch(pub(super) PathBuf);
 
 impl Scratch {
-    fn new(case: &str) -> Scratch {
+    pub(super) fn new(case: &str) -> Scratch {
         let path = std::env::temp_dir().join(format!("m2v-{case}-{}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
         Scratch(path)
@@ -81,7 +81,7 @@ impl Drop for Host {
 
 /// The device the cfg selects: a CPU device under `m2v_cpu_icd`, else a GPU, its shader cache
 /// in `cache`.
-fn device(cache: &Path) -> Device {
+pub(super) fn device(cache: &Path) -> Device {
     let options = DeviceOptions {
         kinds: match cfg!(m2v_cpu_icd) {
             true => vec![DeviceKind::Cpu],
@@ -115,9 +115,9 @@ fn texels() -> Vec<u8> {
 
 /// The image `texture`'s storage holds, as an alias of a buffer's bytes or as its own.
 fn image_of(texture: &Texture) -> Option<&Arc<Image>> {
-    match &texture.0.storage {
-        Storage::Alias { image, .. } | Storage::Image(image) => Some(image),
-        Storage::Texels(_) | Storage::Shadow { .. } => None,
+    match texture.stored() {
+        Stored::Made(Storage::Alias { image, .. } | Storage::Image(image)) => Some(image),
+        Stored::Made(Storage::Texels(_) | Storage::Shadow { .. }) | Stored::Unmade(_) => None,
     }
 }
 
@@ -139,7 +139,7 @@ fn a_waiting_move_of_an_image_a_detach_let_go_of_is_dropped() {
     let device = device(&scratch.0);
     // SAFETY: the memory outlives the device (dropped after it), and nothing else uses it.
     let made = unsafe {
-        device.new_buffer_with_bytes_no_copy(
+        device.new_buffer_with_bytes_no_copy_now(
             HostMemory::new(host.0),
             BYTES as u64,
             ResourceOptions::shared(),
@@ -190,7 +190,12 @@ fn a_host_copy_makes_the_waiting_move_of_an_image_over_host_pages() {
         HeapDescriptor::new(HeapType::Automatic, BYTES as u64, ResourceOptions::shared());
     // SAFETY: the memory outlives the device (dropped after it), and nothing else uses it.
     let made = unsafe {
-        device.new_heap_with_bytes_no_copy(HostMemory::new(host.0), &heap_descriptor, None, None)
+        device.new_heap_with_bytes_no_copy_now(
+            HostMemory::new(host.0),
+            &heap_descriptor,
+            None,
+            None,
+        )
     };
     let Ok(heap) = made else {
         eprintln!(
@@ -245,7 +250,7 @@ fn an_image_in_a_buffer_s_memory_holds_the_memory_not_the_buffer() {
         return;
     };
     let pages = match &image.owner {
-        Owner::Buffer { memory } => match &*lock(memory) {
+        Owner::Buffer { memory, .. } => match &*lock(memory) {
             Some(MemoryHold::Fixed { _pages }) => Arc::downgrade(_pages),
             _ => panic!("the image holds no memory of the runtime's"),
         },

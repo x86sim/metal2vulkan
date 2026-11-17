@@ -66,11 +66,12 @@ use super::copy_plan::{block_extent, ImageRegion};
 use super::degradation::Degradation;
 use super::device::Device;
 use super::image_plan::{block_family, sample_count, ImageFacts, ImagePlan};
+use super::residency::Residency;
 use super::texture::Texture;
 use super::texture_descriptor::{effective_usage, TextureLayout};
 use metal2vulkan::bind::PvrtcDecode;
 use metal2vulkan::metal::format::{image_type, vk_format, FormatEmulation, FormatMapping};
-use metal2vulkan::metal::{PixelFormat, TextureUsage};
+use metal2vulkan::metal::{PixelFormat, RenderStages, TextureUsage};
 use metal2vulkan::vk::{
     Format, FormatFeatureFlags2, ImageAspectFlags, ImageCreateFlags, ImageUsageFlags,
 };
@@ -268,13 +269,86 @@ pub(super) fn decode_of(plan: &ImagePlan) -> Option<PvrtcDecode> {
 
 /// The carrier's format of `texture`, whose bytes a carrier holds for copies alone: a PVRTC,
 /// ETC2 or EAC texture's blocks, or a 4:2:2 texture's texels (`chroma_pairs.rs`), without a
-/// decoded twin (the module docs, `etc.rs`); `None` for any other texture.
+/// decoded twin (the module docs, `etc.rs`), or the texels of a format the translator holds for
+/// copies alone (`metal::format::copies_only`), which nothing decodes; `None` for any other
+/// texture.
 pub(super) fn held_for_copies(texture: &Texture) -> Option<Format> {
     let plan = texture.image_plan().ok()?;
+    if plan.mapping.emulation == FormatEmulation::CopiesOnly {
+        return Some(plan.format);
+    }
     let carried = holds_blocks(plan)
         || super::etc::decode_of(plan).is_some()
         || super::chroma_pairs::holds_pairs(plan);
     (carried && !texture.has_decoded_twin()).then_some(plan.format)
+}
+
+/// The textures a residency made resident whose bytes a carrier holds for copies alone
+/// ([`held_for_copies`]), in the order it made them resident, each with the render stages it made
+/// it resident in: kept by an encoder between its commands and found again only where the
+/// residency's generation moved since (`Residency::generation`), as whether a carrier holds a
+/// texture's bytes, and whether it has a decoded twin, are fixed at its making. A command that
+/// reads texture handles looks among them alone, not at every texture made resident.
+#[derive(Default)]
+pub(super) struct ResidentUnreadable {
+    found_at: Option<u64>,
+    textures: Vec<(Texture, RenderStages)>,
+}
+
+impl ResidentUnreadable {
+    /// Find them again among those `residency` made resident where it may have changed, `looked`
+    /// counting the look.
+    fn find(&mut self, residency: &Residency, looked: impl FnOnce()) {
+        let generation = residency.generation();
+        if self.found_at != Some(generation) {
+            self.textures.clear();
+            let carried =
+                |(texture, _): &(&Texture, RenderStages)| held_for_copies(texture).is_some();
+            (self.textures).extend(
+                (residency.textures_made_in())
+                    .filter(carried)
+                    .map(|(texture, stages)| (texture.clone(), stages)),
+            );
+            self.found_at = Some(generation);
+            looked();
+        }
+    }
+
+    /// The first of them among those `residency`, of `device`, made resident: what a dispatch
+    /// reading texture handles reaches.
+    pub(super) fn of(&mut self, device: &Device, residency: &Residency) -> Option<&Texture> {
+        self.find(residency, || {
+            device.shared().counts.resident_textures_looked_at()
+        });
+        self.textures.first().map(|(texture, _)| texture)
+    }
+
+    /// Those of them among those `residency`, of `device`, made resident in one of render
+    /// `stages`: what a draw or tile dispatch whose functions read texture handles in those
+    /// stages reaches, in the order they were made resident.
+    pub(super) fn reached(
+        &mut self,
+        device: &Device,
+        residency: &Residency,
+        stages: RenderStages,
+    ) -> impl Iterator<Item = &Texture> {
+        self.find(residency, || {
+            device
+                .shared()
+                .counts
+                .thread()
+                .draw_resident_textures_looked_at()
+        });
+        (self.textures.iter())
+            .filter(move |(_, made)| made.intersects(stages))
+            .map(|(texture, _)| texture)
+    }
+
+    /// Hold none: an ended encoder's, kept for the next (`compute/live.rs`).
+    pub(super) fn let_go(&mut self) {
+        self.found_at = None;
+        self.textures.clear();
+    }
 }
 
 /// Announce once ([`Degradation::UnreadableHandleTexture`]) that `command` (named), encoded, whose
@@ -286,23 +360,44 @@ pub(super) fn degrade_unreadable<'a>(
     textures: impl IntoIterator<Item = &'a Texture>,
     command: &str,
 ) {
-    let Some((texture, carrier)) = textures
-        .into_iter()
-        .find_map(|texture| Some((texture, held_for_copies(texture)?)))
-    else {
-        return;
-    };
-    device.degrade(Degradation::UnreadableHandleTexture, || {
-        (
-            format!(
-                "{:?} texture at resource ID {}",
-                texture.pixel_format(),
-                texture.gpu_resource_id().0
-            ),
-            format!(
-                "{command}: a function reading texture handles from memory reaches the texture, \
-                 whose bytes a {carrier:?} image holds for copies alone"
-            ),
-        )
-    });
+    if let Some(found) = textures.into_iter().find_map(Unreadable::of) {
+        found.announce(device, command);
+    }
+}
+
+/// What [`degrade_unreadable`] names of a texture whose bytes a carrier image holds for copies
+/// alone: kept without the texture, for a notice made once no lock or hold is (`heap_sets.rs`).
+pub(super) struct Unreadable {
+    pixel_format: PixelFormat,
+    id: u64,
+    carrier: Format,
+}
+
+impl Unreadable {
+    /// What `texture` is named by, where a carrier holds its bytes for copies alone.
+    pub(super) fn of(texture: &Texture) -> Option<Unreadable> {
+        Some(Unreadable {
+            carrier: held_for_copies(texture)?,
+            pixel_format: texture.pixel_format(),
+            id: texture.gpu_resource_id().0,
+        })
+    }
+
+    /// Announce it, reached by `command`.
+    pub(super) fn announce(&self, device: &Device, command: &str) {
+        let Unreadable {
+            pixel_format,
+            id,
+            carrier,
+        } = self;
+        device.degrade(Degradation::UnreadableHandleTexture, || {
+            (
+                format!("{pixel_format:?} texture at resource ID {id}"),
+                format!(
+                    "{command}: a function reading texture handles from memory reaches the \
+                     texture, whose bytes a {carrier:?} image holds for copies alone"
+                ),
+            )
+        });
+    }
 }

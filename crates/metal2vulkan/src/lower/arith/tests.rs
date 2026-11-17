@@ -19,7 +19,7 @@ use super::libm::Lib;
 use super::math::{self, ConvertKind, FloatFn, IntFn, Sign};
 use super::nan::NanTest;
 use super::ops::{self, BitcastPlan, CastKind};
-use crate::air::ir::{BinOp as AirBin, FloatPredicate, IntPredicate};
+use crate::air::ir::{BinOp as AirBin, FloatPredicate, IntFlags, IntPredicate};
 use crate::device::DeviceProfile;
 use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
 use crate::spirv::builder::{FunctionBuilder, MaskForm, ModuleBuilder, ProductForm, QuantizeForm};
@@ -332,6 +332,7 @@ fn kernel_defs(
 ) -> BResult<TypedModule> {
     let mut b = ModuleBuilder::new();
     b.set_quantize_form(QuantizeForm::Controlled);
+    b.set_half_controls(true);
     let outb = buffer(&mut b, 0)?;
     let inb = buffer(&mut b, 1)?;
     let funcs = defs(&mut b)?;
@@ -831,9 +832,48 @@ fn integer_operators_match_llvm_at_every_width() {
                 &format!("{op:?} i{bits}"),
                 &[f, f],
                 f,
-                &|fb, x| ops::int_binary(fb, op, f, x[0], x[1]),
+                &|fb, x| ops::int_binary(fb, op, IntFlags::NONE, f, x[0], x[1]),
                 &pairs(&vals, b),
                 &|c| Some(vec![llvm_int(op, bits, arg(c, 0), arg(c, 1))?]),
+                false,
+            );
+        }
+    }
+}
+
+/// LLVM's `op nuw` on `bits`-bit operands: `None` where the unsigned result leaves the width
+/// (poison).
+fn llvm_nuw(op: AirBin, bits: u8, a: u64, b: u64) -> Option<u64> {
+    let (a, b) = (u128::from(a), u128::from(b));
+    let r = match op {
+        AirBin::Add => a + b,
+        AirBin::Sub => a.checked_sub(b)?,
+        AirBin::Mul => a * b,
+        AirBin::Shl if b < u128::from(bits) => a << b,
+        _ => return None,
+    };
+    u64::try_from(r).ok().filter(|r| *r <= mask(bits))
+}
+
+/// An add, sub, mul or shl marked `nuw` is left unmasked, and answers LLVM's result wherever it
+/// is defined, at every width held in a container.
+#[test]
+fn nuw_operators_match_llvm_where_defined() {
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    for bits in [5, 8, 16, 40] {
+        let vals = int_values(bits, &mut rng, 6);
+        let mut shifts = vals.clone();
+        shifts.extend(0..u64::from(bits));
+        let f = int(bits);
+        for op in [AirBin::Add, AirBin::Sub, AirBin::Mul, AirBin::Shl] {
+            let b: &[u64] = if op == AirBin::Shl { &shifts } else { &vals };
+            check(
+                &format!("{op:?} nuw i{bits}"),
+                &[f, f],
+                f,
+                &|fb, x| ops::int_binary(fb, op, IntFlags::NUW, f, x[0], x[1]),
+                &pairs(&vals, b),
+                &|c| Some(vec![llvm_nuw(op, bits, arg(c, 0), arg(c, 1))?]),
                 false,
             );
         }
@@ -853,7 +893,7 @@ fn integer_operators_on_vectors_work_per_lane() {
             &format!("{op:?} <4 x i8>"),
             &[f, f],
             f,
-            &|fb, x| ops::int_binary(fb, op, f, x[0], x[1]),
+            &|fb, x| ops::int_binary(fb, op, IntFlags::NONE, f, x[0], x[1]),
             &cases,
             &|c| {
                 (0..4)
@@ -997,6 +1037,153 @@ fn a_multiply_without_contraction_is_the_product() {
             },
             false,
         );
+    }
+}
+
+/// An `f32` product by a constant with `-0.0` components is IEEE's product bit for bit in every
+/// [`ProductForm`] (a NaN's bits aside), as `OpFMul` with the constant on either side, with and
+/// without contraction, and as `OpVectorTimesScalar` by a `-0.0` scalar or of a constant vector.
+/// Under [`ProductForm::PositiveZeroFactors`], the form of a driver that keeps one multiply for
+/// products of one value by zeros of opposite sign (`DriverWorkaround::OppositeZeroProductsMerged`,
+/// ANV), no product the module emits has a `-0.0` component in a constant factor; under
+/// [`ProductForm::Multiply`] the factor is the constant itself.
+#[test]
+fn a_product_by_a_negative_zero_factor_keeps_its_sign_in_every_form() {
+    const NZ: u64 = 0x8000_0000;
+    const TWO: u64 = 0x4000_0000;
+    #[derive(Clone, Copy, Debug)]
+    enum Shape {
+        /// `x · c`, or `c · x` with `left`, both of `lanes` components.
+        Mul { left: bool },
+        /// `OpVectorTimesScalar(x, c)` of a vector `x` and a scalar `c`.
+        ByScalar,
+        /// `OpVectorTimesScalar(c, x)` of a constant vector `c` and a scalar `x`.
+        OfConstant,
+    }
+    let factors: [(u8, Shape, &[u64]); 7] = [
+        (1, Shape::Mul { left: false }, &[NZ]),
+        (1, Shape::Mul { left: true }, &[NZ]),
+        (4, Shape::Mul { left: false }, &[NZ, NZ, NZ, NZ]),
+        (4, Shape::Mul { left: true }, &[NZ, 0, TWO, NZ]),
+        (4, Shape::Mul { left: false }, &[0, 0, TWO, 0]),
+        (4, Shape::ByScalar, &[NZ]),
+        (4, Shape::OfConstant, &[0, NZ, TWO, NZ]),
+    ];
+    let negative_factors = |m: &TypedModule| {
+        let negative = |v: Value| {
+            let Ok(def) = m.value(v) else { return false };
+            let crate::spirv::ir::ValueOrigin::Const(c) = def.origin else {
+                return false;
+            };
+            match &m.consts().get(c).expect("constant").kind {
+                crate::spirv::ir::ConstKind::Plain(Constant::Scalar { bits, .. }) => bits.0 == NZ,
+                crate::spirv::ir::ConstKind::Plain(Constant::Composite { parts, .. }) => parts
+                    .iter()
+                    .any(|p| m.consts().scalar_bits(*p).is_some_and(|b| b.0 == NZ)),
+                _ => false,
+            }
+        };
+        m.blocks()
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|n| match n.inst {
+                Inst::Binary {
+                    op: BinOp::FMul | BinOp::VectorTimesScalar,
+                    a,
+                    b,
+                    ..
+                } => negative(a) || negative(b),
+                _ => false,
+            })
+            .count()
+    };
+    let vals = f32_values();
+    for form in [
+        ProductForm::Multiply,
+        ProductForm::NegativeZeroFma,
+        ProductForm::PositiveZeroFactors,
+    ] {
+        for contract in [Contraction::Forbidden, Contraction::Allowed] {
+            for (lanes, shape, c) in factors {
+                let what = format!("{form:?} {contract:?} {shape:?} x{lanes} by {c:x?}");
+                let x_lanes = match shape {
+                    Shape::OfConstant => 1,
+                    _ => lanes,
+                };
+                let input = vec(float(32), x_lanes);
+                let out = vec(float(32), lanes);
+                let body = |fb: &mut FunctionBuilder<'_>, xs: &[Value]| -> BResult<Value> {
+                    fb.module().product_form(form);
+                    let f32_ty = fb.module().ty(Type::Float { width: 32 })?;
+                    let parts = c
+                        .iter()
+                        .map(|bits| {
+                            fb.module().constant(Constant::Scalar {
+                                ty: f32_ty,
+                                bits: ConstBits(*bits),
+                            })
+                        })
+                        .collect::<BResult<Vec<_>>>()?;
+                    let k = if parts.len() == 1 {
+                        parts[0]
+                    } else {
+                        let ty = fb.module().ty(Type::Vector {
+                            elem: f32_ty,
+                            len: parts.len() as u8,
+                        })?;
+                        fb.module().constant(Constant::Composite {
+                            ty,
+                            parts: parts.into(),
+                        })?
+                    };
+                    let k = fb.module().const_value(k)?;
+                    let (op, a, b) = match shape {
+                        Shape::Mul { left: false } => (BinOp::FMul, xs[0], k),
+                        Shape::Mul { left: true } => (BinOp::FMul, k, xs[0]),
+                        Shape::ByScalar => (BinOp::VectorTimesScalar, xs[0], k),
+                        Shape::OfConstant => (BinOp::VectorTimesScalar, k, xs[0]),
+                    };
+                    fb.binary_with(op, a, b, contract)
+                };
+                let m = kernel_with(&[input], out, &body, true, false)
+                    .unwrap_or_else(|e| panic!("{what}: build: {e:?}"));
+                let has_negative_zero = c.contains(&NZ);
+                match form {
+                    ProductForm::PositiveZeroFactors => {
+                        assert_eq!(negative_factors(&m), 0, "{what}: a -0.0 factor");
+                    }
+                    ProductForm::Multiply => assert_eq!(
+                        negative_factors(&m) > 0,
+                        has_negative_zero,
+                        "{what}: the factor as given"
+                    ),
+                    ProductForm::NegativeZeroFma => {}
+                }
+                let cases: Vec<Case> = vals
+                    .iter()
+                    .map(|x| vec![vec![*x; usize::from(x_lanes)]])
+                    .collect();
+                let factor = |l: usize| f32::from_bits(c[if c.len() == 1 { 0 } else { l }] as u32);
+                check_module(
+                    &what,
+                    m,
+                    &[input],
+                    out,
+                    &cases,
+                    &|case| {
+                        let x = |l: usize| {
+                            f32::from_bits(case[0][if x_lanes == 1 { 0 } else { l }] as u32)
+                        };
+                        Some(
+                            (0..usize::from(lanes))
+                                .map(|l| u64::from((x(l) * factor(l)).to_bits()))
+                                .collect(),
+                        )
+                    },
+                    &|g, w| g == w || (is_nan(out, g) && is_nan(out, w)),
+                );
+            }
+        }
     }
 }
 
@@ -1330,6 +1517,11 @@ fn int_ref(op: IntFn, bits: u8, a: &[u64]) -> Option<u64> {
         IntFn::Max(sg) => wrap(val(sg, 0).max(val(sg, 1))),
         IntFn::Min3(sg) => wrap(val(sg, 0).min(val(sg, 1)).min(val(sg, 2))),
         IntFn::Max3(sg) => wrap(val(sg, 0).max(val(sg, 1)).max(val(sg, 2))),
+        IntFn::Median3(sg) => {
+            let mut v = [val(sg, 0), val(sg, 1), val(sg, 2)];
+            v.sort_unstable();
+            wrap(v[1])
+        }
         IntFn::Clamp(sg) => wrap(val(sg, 0).max(val(sg, 1)).min(val(sg, 2))),
         IntFn::MulHi(sg) => wrap(hi(sg)),
         IntFn::MadHi(sg) => wrap(hi(sg) + u(2)),
@@ -1421,6 +1613,59 @@ fn int_ref(op: IntFn, bits: u8, a: &[u64]) -> Option<u64> {
     })
 }
 
+/// The edges of an integer width: zero, one, all ones (`-1` signed, the unsigned maximum), the
+/// signed minimum and maximum, and their neighbours.
+fn width_edges(bits: u8) -> [u64; 7] {
+    let (m, smin) = (mask(bits), 1u64 << (bits - 1));
+    [0, 1, m, m - 1, smin, smin - 1, smin + 1]
+}
+
+/// Every ordered triple of `values`, `lanes` to a case: each operand's lanes are the triples'
+/// first, second and third values.
+fn triples(values: &[u64], lanes: usize) -> Vec<Case> {
+    let mut all = Vec::new();
+    for &a in values {
+        for &b in values {
+            for &c in values {
+                all.push([a, b, c]);
+            }
+        }
+    }
+    all.chunks_exact(lanes)
+        .map(|t| (0..3).map(|k| t.iter().map(|v| v[k]).collect()).collect())
+        .collect()
+}
+
+/// Metal's integer `median3` answers the middle one of its operands at 8, 16, 32 and 64 bits,
+/// signed and unsigned, on scalars and on 4-lane vectors: every ordered triple of the width's
+/// edges, so every order of three distinct values, two alike in each position, all three alike,
+/// and the extremes (`INT_MIN`, `INT_MAX`, `UINT_MAX`) beside each other and beside zero.
+#[test]
+fn integer_median3_answers_the_middle_one_at_ties_and_extremes() {
+    for bits in [8u8, 16, 32, 64] {
+        let edges = width_edges(bits);
+        for s in [Sign::Signed, Sign::Unsigned] {
+            let op = IntFn::Median3(s);
+            for lanes in [1u8, 4] {
+                let f = vec(int(bits), lanes);
+                check(
+                    &format!("{op:?} i{bits} x{lanes}"),
+                    &[f; 3],
+                    f,
+                    &|fb, x| math::int_fn(fb, op, f, x),
+                    &triples(&edges, usize::from(lanes)),
+                    &|c| {
+                        (0..usize::from(lanes))
+                            .map(|l| int_ref(op, bits, &[c[0][l], c[1][l], c[2][l]]))
+                            .collect::<Option<Vec<u64>>>()
+                    },
+                    false,
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn sixty_four_bit_bit_fields_work_per_lane() {
     let f = vec(int(64), 2);
@@ -1487,6 +1732,7 @@ fn integer_functions(part: usize, of: usize) {
             IntFn::Clamp(s),
             IntFn::Min3(s),
             IntFn::Max3(s),
+            IntFn::Median3(s),
             IntFn::MulHi(s),
             IntFn::MadHi(s),
             IntFn::MadSat(s),
@@ -2460,9 +2706,64 @@ const KHR_FACTS: super::FloatFacts = super::FloatFacts {
     },
     metal_functions: false,
     device_denormals: false,
+    unary_denormals: false,
     nans: crate::device::profile::NanEncoding::Native,
     native_min_max: false,
+    nan_moves: false,
 };
+
+/// `ldexp` on `float` is lowered on the bits ([`math::ldexp_bits`]), which answer a NaN operand
+/// itself, bit for bit, as Metal does (`NanAnswer::Operand`): no NaN of the device's reaches the
+/// result, so the call records no `NativeNanEncoding` and leaves no NaN answer to the device, on a
+/// device of either NaN encoding. A `half` `ldexp` multiplies, so its NaN is the device's product's
+/// where Metal answers its canonical `half` NaN, and stays noted on a device not measured to answer
+/// that.
+#[test]
+fn float_ldexp_answers_metals_nan_itself() {
+    use super::nan::NanAnswer as A;
+    use crate::air::ir::FastMath;
+    use crate::device::profile::NanEncoding;
+    use crate::pipeline::artifact::PrecisionNote;
+    let form = |fmt| Form {
+        held: Held::Float(fmt),
+        lanes: 1,
+    };
+    assert!(FloatFn::Ldexp.metal_nans(FloatFmt::F32));
+    assert!(!FloatFn::Ldexp.metal_nans(FloatFmt::Half));
+    let every = FastMath::ALL
+        .iter()
+        .fold(FastMath::NONE, |a, (b, _)| a.union(*b));
+    for nans in [NanEncoding::Native, NanEncoding::MetalCanonical] {
+        let facts = super::FloatFacts { nans, ..KHR_FACTS };
+        for fmf in [FastMath::NONE, every] {
+            let call = super::float_call(FloatFn::Ldexp, false, fmf, form(FloatFmt::F32), facts)
+                .expect("float ldexp");
+            assert_eq!(call.nan, None, "{nans:?} {fmf:?}");
+            let noted = (call.notes.always.iter())
+                .chain(&call.notes.unless_metal_fast)
+                .any(|n| matches!(n, PrecisionNote::NativeNanEncoding));
+            assert!(!noted, "{nans:?} {fmf:?}: {:?}", call.notes);
+        }
+        let half = super::float_call(
+            FloatFn::Ldexp,
+            false,
+            FastMath::NONE,
+            form(FloatFmt::Half),
+            facts,
+        )
+        .expect("half ldexp");
+        assert_eq!(half.nan, Some(A::Canonical), "{nans:?}");
+        if nans == NanEncoding::Native {
+            assert!(
+                half.notes
+                    .always
+                    .contains(&PrecisionNote::NativeNanEncoding),
+                "{:?}",
+                half.notes
+            );
+        }
+    }
+}
 
 /// Precise `pow` on `float` leaves its NaNs to the device (the device's `Pow`, and the device's sum
 /// of NaN operands), where Metal's NaN is measured: the canonical NaN, but a NaN base to the
@@ -2521,6 +2822,40 @@ fn precise_pow_notes_its_measured_nan_as_the_devices() {
 
 /// Class E: Metal's `float` `fneg` and `fabs` flip or clear the sign bit alone, a NaN's payload and
 /// a denormal kept (`nan_signbits`, `nan_signbits_fast`). The lowering takes the device's
+/// `floor`, `ceil` and `fabs` on `float` leave their denormals to the device, noted
+/// `DeviceDenormals`, but where the profile takes `DriverDeviation::MetalUnaryDenormals`
+/// (`denormal::Covered::Unary`, `denormal::moves_sign`); `trunc` follows the other deviation
+/// alone, in either mode.
+#[test]
+fn unary_denormals_follow_their_deviation() {
+    use crate::air::ir::FastMath;
+    use crate::pipeline::artifact::PrecisionNote;
+    let f = Form {
+        held: Held::Float(FloatFmt::F32),
+        lanes: 1,
+    };
+    for unary in [false, true] {
+        // A profile that takes the unary deviation (MoltenVK on an Apple9 GPU) takes
+        // `MetalFloatFunctions` too: its `fabs` is one of Metal's functions.
+        let facts = super::FloatFacts {
+            unary_denormals: unary,
+            metal_functions: unary,
+            ..KHR_FACTS
+        };
+        for op in [FloatFn::Floor, FloatFn::Ceil, FloatFn::Abs, FloatFn::Trunc] {
+            for fast in [false, true] {
+                let call = super::float_call(op, fast, FastMath::NONE, f, facts)
+                    .unwrap_or_else(|| panic!("{op:?}: no float call"));
+                assert_eq!(
+                    call.notes.always.contains(&PrecisionNote::DeviceDenormals),
+                    !(unary && op != FloatFn::Trunc),
+                    "{op:?}, fast {fast}, unary {unary}"
+                );
+            }
+        }
+    }
+}
+
 /// `OpFNegate` and `FAbs` on every format, whose NaN is the device's: a `float` `fabs` answers
 /// Metal's operand NaN by none of its own, noted `NativeNanEncoding` (and a `half` one Metal's
 /// canonical NaN, class D), and off Metal's own functions records the device's precision and
@@ -3494,7 +3829,10 @@ fn saturating_float_to_integer_convert_matches_metal() {
                     &|fb, x| {
                         math::convert(
                             fb,
-                            ConvertKind::ToInt { signed },
+                            ConvertKind::ToInt {
+                                signed,
+                                round: None,
+                            },
                             ff,
                             tf,
                             x[0],
@@ -3598,7 +3936,10 @@ fn saturating_converts_saturate_at_every_bound() {
                     &|fb, x| {
                         math::convert(
                             fb,
-                            ConvertKind::ToInt { signed },
+                            ConvertKind::ToInt {
+                                signed,
+                                round: None,
+                            },
                             ff,
                             int(ibits),
                             x[0],
@@ -3623,7 +3964,10 @@ fn saturating_converts_saturate_at_every_bound() {
                 &|fb, x| {
                     math::convert(
                         fb,
-                        ConvertKind::ToInt { signed },
+                        ConvertKind::ToInt {
+                            signed,
+                            round: None,
+                        },
                         half,
                         int(ibits),
                         x[0],
@@ -3655,7 +3999,10 @@ fn integer_and_float_converts_follow_their_source_kind() {
                 &|fb, x| {
                     math::convert(
                         fb,
-                        ConvertKind::Int { signed },
+                        ConvertKind::Int {
+                            signed,
+                            saturate: None,
+                        },
                         ff,
                         tf,
                         x[0],
@@ -3685,7 +4032,10 @@ fn integer_and_float_converts_follow_their_source_kind() {
             &|fb, x| {
                 math::convert(
                     fb,
-                    ConvertKind::ToFloat { signed },
+                    ConvertKind::ToFloat {
+                        signed,
+                        directed: None,
+                    },
                     i16f,
                     f32f,
                     x[0],
@@ -3810,6 +4160,7 @@ mod blend16;
 mod blend8;
 mod blend_packed;
 mod color_write;
+mod convert_suffix;
 mod divide;
 mod fast;
 mod fused;

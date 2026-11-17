@@ -266,6 +266,9 @@ pub struct MeshPlan {
     /// An object or mesh function's payload arena's bytes (`arena::payload_bytes` of
     /// [`payload_extent`]), `None` without a payload (`StageInterface::payload`).
     pub payload: Option<u32>,
+    /// An object function, or a kernel under `LoweringInputs::partial_threadgroups`: it runs a
+    /// partial threadgroup's threads alone where its region says so ([`plan_partial_groups`]).
+    pub partial_groups: bool,
 }
 
 /// The index in [`MeshPlan::outputs`] of every mesh entry's `CullPrimitiveEXT`.
@@ -424,15 +427,15 @@ pub fn payload_size(e: &Entry) -> Option<u64> {
 }
 
 /// The bytes the entry's payload arena holds, if it has a payload: its own ([`payload_size`]),
-/// and a mesh function's at least its pipeline's object function's
-/// (`LoweringInputs::object_payload`). Metal sizes a pipeline's payload by the type its object
-/// function declares (`payloadMemoryLength` 0), and a mesh function's read of its payload past the
-/// type it declares itself reads the object function's within it (measured on the M3 Max under
-/// macOS 27.0.1).
+/// and an object or mesh function's at least its pipeline's (`LoweringInputs::object_payload`).
+/// Metal sizes a pipeline's payload by the type its object function declares
+/// (`payloadMemoryLength` 0), and a mesh function's read of its payload past the type it declares
+/// itself reads the object function's within it (measured on the M3 Max under macOS 27.0.1); a
+/// descriptor's `payloadMemoryLength` sizes the payload of both stages (Metal's header).
 pub fn payload_extent(cx: &SelectCx<'_>) -> Option<u64> {
     let own = payload_size(cx.entry)?;
     let object = match cx.stage {
-        Stage::Mesh => cx.inputs.object_payload.map_or(0, u64::from),
+        Stage::Object | Stage::Mesh => cx.inputs.object_payload.map_or(0, u64::from),
         _ => 0,
     };
     Some(own.max(object))
@@ -531,6 +534,40 @@ pub fn check_payload(cx: &SelectCx<'_>, size: u64) -> Result<(), Error> {
     workgroup_limit(cx).check(0)
 }
 
+/// Plan an object function's partial threadgroups, and a kernel's under
+/// `LoweringInputs::partial_threadgroups`: it reads its region (`PushField::DispatchRegion`) and
+/// answers a partial threadgroup of a `drawMeshThreads`, or of a `dispatchThreads`, as Metal runs
+/// it, with the threads left (`lower::dispatch`'s partial threadgroups;
+/// `RuntimeFact::PartialObjectThreadgroups`, `RuntimeFact::PartialThreadgroups`). Its invocations
+/// past them return before the body where the body holds no workgroup barrier; where it holds
+/// one, the body is walked predicated from its threadgroup's threads
+/// (`simd::divergent::barriers`, `Predication::partial_groups`), so they walk to each barrier
+/// without running anything else of it. A tile function, a kernel that reads a stage-input region,
+/// one with compute derivatives (whose quads a returned lane would leave partial) and one with a
+/// cooperative imageblock slice write (`texture::cooperative`, whose cells every invocation of the
+/// workgroup shares) are refused the kernel's input, `Unsupported{GpuEncodedIndirectCommands, NotImplemented}`. Called before
+/// the push fields are placed.
+pub fn plan_partial_groups(cx: &mut SelectCx<'_>) -> Result<(), Error> {
+    match cx.stage {
+        Stage::Object => {}
+        Stage::Kernel if cx.inputs.partial_threadgroups => {
+            if crate::lower::access::tile::is_tile(cx)
+                || cx.inputs.stage_input.is_some()
+                || cx.families.barrier.compute_derivatives
+                || !cx.families.texture.cooperative.is_empty()
+            {
+                return Err(
+                    Unsupported::not_implemented(Feature::GpuEncodedIndirectCommands).into(),
+                );
+            }
+        }
+        _ => return Ok(()),
+    }
+    cx.families.mesh.partial_groups = true;
+    cx.push.insert(PushField::DispatchRegion);
+    Ok(())
+}
+
 /// Plan the entry: an object function needs `VK_EXT_mesh_shader` and `taskShader` enabled
 /// (`Unsupported{MeshShading}` naming the missing ones), and a mesh function without them is
 /// emulated (the module docs); a mesh function's shape, its always-declared outputs ([`CULLED`],
@@ -606,7 +643,9 @@ pub fn plan_entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         .vertex
         .iter()
         .any(|f| matches!(f.role, MeshFieldRole::PointSize) && !f.gated_off);
-    if point_size {
+    // The rasterizer reads a vertex's size for points alone: a line or triangle mesh's size draws
+    // nothing, whatever the device's largest point.
+    if point_size && shape.topology == MeshTopology::Point {
         crate::lower::stage_io::note_device_point_size(cx);
     }
     // Staged indices are the wrapper's workgroup words, held to the stage's limit whether or not
@@ -2168,9 +2207,13 @@ fn emulated_object_wrapper(
         Ok(())
     })?;
     // Its payload's words, as many as the slot holds (`S − 4`).
+    // Every invocation copies, a partial threadgroup's past its threads too.
     let words = cx.plan.families.mesh.payload_words;
     if words > 0 && cx.decl.families.access.local.payload.is_some() {
-        let n = thread_count(cx, &mut fb)?;
+        let running = k.running_threads(&mut fb)?;
+        let [rx, ry, rz] = [0, 1, 2].map(|i| fb.composite_extract(running, &[i]));
+        let rxy = fb.binary(BinOp::IMul, rx?, ry?)?;
+        let n = fb.binary(BinOp::IMul, rxy, rz?)?;
         let grid_words = k32(&mut fb, work::GRID)?;
         let room = fb.binary(BinOp::ISub, s, grid_words)?;
         let start = fb.binary(BinOp::IAdd, slot, grid_words)?;

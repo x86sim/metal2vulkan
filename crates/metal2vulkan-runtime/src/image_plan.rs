@@ -28,7 +28,10 @@
 //!   `PixelFormatView` usage without a format list, and otherwise exactly the
 //!   formats its own views and its sRGB twin's need (`VkImageFormatListCreateInfo`), so drivers
 //!   that compress only listed formats keep doing so. Metal views between a format and its sRGB
-//!   twin without `PixelFormatView` (measured on an Apple M3 Max and M4).
+//!   twin without `PixelFormatView` (measured on an Apple M3 Max and M4). A texture that renders
+//!   of `RGBA8Unorm`, `BGRA8Unorm` or a twin of one also lists its channel-order sibling's views
+//!   and that sibling's twin's ([`reordered_views`]), which a pass renders into, unless their
+//!   linear tiling lacks what the texture's other formats hold ([`linear_keeping`]).
 //! - **Cubes.** Cube and cube-array textures are cube-compatible, and so is a square 2D array of
 //!   at least six single-sample layers, which Metal views as cubes (Vulkan has no cube view of an
 //!   image that is not square).
@@ -42,6 +45,11 @@
 //!   (lavapipe's `R8_SRGB`, ANV's and NVIDIA's `R8G8_SRGB`) samples its texture through the twin's
 //!   view: the image holds the twin's format, the same bytes, and the shader reads the raw codes
 //!   and decodes them as Metal does (the variant; [`holds_srgb_twin`]).
+//! - **Multisampled words.** A multisampled texture of a format the device samples but renders
+//!   only through the view of its word (`metal::format::WordAttachment`), whose own image takes
+//!   one sample (no attachment feature), is held in the word's unsigned format, which renders at
+//!   the count, mutable to the format's sampled view ([`word_samples`]): every sample holds the
+//!   word Metal stores.
 //! - **Exactness.** A texture is held only in an exact representation: 24-bit depth held as
 //!   32-bit float depth (`FormatEmulation::DepthWidened`) is refused, naming the format it needs.
 //!
@@ -50,6 +58,7 @@
 
 use super::chroma_pairs::plan_pairs;
 use super::framebuffer_fetch;
+use super::linear_plan::linear_lack;
 use super::memory::MemoryClass;
 use super::pvrtc::plan_blocks;
 use super::sample_positions::compatible_depth;
@@ -76,6 +85,7 @@ use metal2vulkan::vk::{
     ImageUsageFlags, NumericType, SampleCountFlags,
 };
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
 
 /// The device facts an image plan reads beyond the profile's format tables: the raw format
 /// properties (for transfer and blit bits), whether storage images may be multisampled, and what
@@ -92,6 +102,9 @@ pub(super) struct ImageFacts<'a> {
     /// image of a format whose linear tiling has `LINEAR_COLOR_ATTACHMENT_NV` renders, where
     /// every color attachment of the render pass instance is linear (`linear_attachment.rs`).
     pub(super) linear_attachments: bool,
+    /// The formats the runtime views a texture of any pixel format as on `profile`
+    /// ([`AnyViews`]), kept for the device's life.
+    pub(super) any_views: &'a AnyViews,
 }
 
 /// What a device's driver is measured to keep in a `D32_SFLOAT` image, of the `float`s Metal's
@@ -101,9 +114,6 @@ pub(super) struct ImageFacts<'a> {
 pub(super) struct DepthImageFacts {
     /// `DriverFact::DepthImageKeepsDenormals`.
     pub(super) denormals: bool,
-    /// `DriverFact::DepthImageKeepsValuesOutsideUnitRange`: without
-    /// `VK_EXT_depth_range_unrestricted`.
-    pub(super) outside_unit_range: bool,
     /// `DriverFact::DepthTestKeepsDenormals`.
     pub(super) test_denormals: bool,
     /// `DriverFact::DepthTestComparesMagnitudes`: the depth test is Metal's for every value a
@@ -116,7 +126,6 @@ impl DepthImageFacts {
     pub(super) fn of(facts: &BTreeSet<DriverFact>) -> DepthImageFacts {
         DepthImageFacts {
             denormals: facts.contains(&DriverFact::DepthImageKeepsDenormals),
-            outside_unit_range: facts.contains(&DriverFact::DepthImageKeepsValuesOutsideUnitRange),
             test_denormals: facts.contains(&DriverFact::DepthTestKeepsDenormals),
             test_magnitudes: facts.contains(&DriverFact::DepthTestComparesMagnitudes),
         }
@@ -145,17 +154,17 @@ impl ImageFacts<'_> {
         }
     }
 
-    /// Whether a `D32_SFLOAT` image may store a copied value outside `[0, 1]` clamped: the
-    /// device lacks `VK_EXT_depth_range_unrestricted`, where Vulkan leaves such a value undefined
-    /// (`VUID-vkCmdCopyBufferToImage-pRegions-07931`), and its driver is not measured to keep one
-    /// (`DriverFact::DepthImageKeepsValuesOutsideUnitRange`).
+    /// Whether a copy into a `D32_SFLOAT` image clamps a value outside `[0, 1]` first
+    /// (`depth_clamp.rs`): the device lacks `VK_EXT_depth_range_unrestricted`, where Vulkan takes
+    /// no such value by a copy (`VUID-vkCmdCopyBufferToImage-pRegions-07931`), whatever its
+    /// driver is measured to keep.
     pub(super) fn depth_clamps(&self) -> bool {
         let unrestricted = self
             .profile
             .enabled()
             .extensions
             .contains(&VkExtension::ExtDepthRangeUnrestricted);
-        !unrestricted && !self.depth_images.outside_unit_range
+        !unrestricted
     }
 
     /// The optimal-tiling features of `format`.
@@ -335,7 +344,7 @@ pub(super) fn sample_count(samples: u32) -> Option<SampleCountFlags> {
 
 /// Metal's sRGB pairs: the linear format, then the format whose texels are the same bytes read
 /// through sRGB encoding.
-const SRGB_PAIRS: [(PixelFormat, PixelFormat); 31] = [
+const SRGB_PAIRS: [(PixelFormat, PixelFormat); 33] = [
     (PixelFormat::R8Unorm, PixelFormat::R8UnormSRGB),
     (PixelFormat::RG8Unorm, PixelFormat::RG8UnormSRGB),
     (PixelFormat::RGBA8Unorm, PixelFormat::RGBA8UnormSRGB),
@@ -367,6 +376,8 @@ const SRGB_PAIRS: [(PixelFormat, PixelFormat); 31] = [
     (PixelFormat::ASTC10x10LDR, PixelFormat::ASTC10x10SRGB),
     (PixelFormat::ASTC12x10LDR, PixelFormat::ASTC12x10SRGB),
     (PixelFormat::ASTC12x12LDR, PixelFormat::ASTC12x12SRGB),
+    (PixelFormat::ASTC4x2LDR, PixelFormat::ASTC4x2SRGB),
+    (PixelFormat::ASTC8x4LDR, PixelFormat::ASTC8x4SRGB),
 ];
 
 /// The other member of `pf`'s sRGB pair (`RGBA8Unorm` and `RGBA8Unorm_sRGB`): Metal views a
@@ -381,6 +392,27 @@ pub(super) fn srgb_twin(pf: PixelFormat) -> Option<PixelFormat> {
             None
         }
     })
+}
+
+/// The other member of `pf`'s channel-order pair (`RGBA8Unorm` and `BGRA8Unorm`, and their sRGB
+/// twins), and that member's sRGB twin: views of a texture made without `PixelFormatView` usage.
+/// Apple documents the second as needing no such usage (`MTLTextureUsage.pixelFormatView`: "if
+/// your texture uses the `rgba8Unorm` pixel format and your texture view uses `bgra8Unorm_srgb`");
+/// plain Metal makes the first too and renders through it, which its API validation stops
+/// (`runtime_lane::view_attachments`). Empty for any other format.
+pub(super) fn reordered_views(pf: PixelFormat) -> Vec<PixelFormat> {
+    use PixelFormat as P;
+    let sibling = match pf {
+        P::RGBA8Unorm => P::BGRA8Unorm,
+        P::BGRA8Unorm => P::RGBA8Unorm,
+        P::RGBA8UnormSRGB => P::BGRA8UnormSRGB,
+        P::BGRA8UnormSRGB => P::RGBA8UnormSRGB,
+        _ => return Vec::new(),
+    };
+    [Some(sibling), srgb_twin(sibling)]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// The member of `pf`'s compressed family that names it: block-compressed formats whose texels
@@ -414,6 +446,8 @@ pub(super) fn block_family(pf: PixelFormat) -> PixelFormat {
         P::ASTC10x10HDR => P::ASTC10x10LDR,
         P::ASTC12x10HDR => P::ASTC12x10LDR,
         P::ASTC12x12HDR => P::ASTC12x12LDR,
+        P::ASTC4x2HDR => P::ASTC4x2LDR,
+        P::ASTC8x4HDR => P::ASTC8x4LDR,
         other => other,
     }
 }
@@ -526,6 +560,17 @@ fn plan_held(
             Feature::TextureSampleCount,
             Capability::Feature(VkFeature::MultisampleArrayImage),
         )));
+    }
+    // A multisampled texture of a format the device samples but renders only through its word's
+    // view, whose own image takes one sample, is held in the word's format ([`word_samples`]).
+    if let Some(plan) = word_samples(
+        layout,
+        usage,
+        memoryless,
+        facts,
+        (image_type, flags, samples),
+    ) {
+        return Ok(plan);
     }
     // A PVRTC texture the device has no format for holds its blocks in a carrier (`pvrtc.rs`).
     if !memoryless {
@@ -773,18 +818,26 @@ fn plan_held(
             unavailable |= usage.intersection(TextureUsage::RENDER_TARGET);
         }
     }
-    // A color texture Metal keeps uncompressed (`metal_keeps_uncompressed`) whose image takes no
-    // storage usage (a multisample one the device stores no samples of, say) is planned as one
-    // of `PixelFormatView` usage, a mutable image: a driver that compresses images keeps a
+    // A single-sample color texture Metal keeps uncompressed (`metal_keeps_uncompressed`) whose
+    // image takes no storage usage (of a format the device stores no texel of, say) is planned as
+    // one of `PixelFormatView` usage, a mutable image: a driver that compresses images keeps a
     // mutable one of any view format uncompressed (MoltenVK gives its Metal texture
     // `PixelFormatView` usage, as a storage image's `ShaderWrite`), as Metal keeps the texture.
     // Such an image no shader reads, writes or renders through is sampled too where the format
     // samples: MoltenVK gives a mutable image's Metal texture `PixelFormatView` usage only where
     // the image has a view usage (sampled, storage, input or color attachment; MoltenVK 1.4.1's
     // `MVKPixelFormats::getMTLTextureUsage`); without one it made a compressed texture, larger
-    // than Metal's (a `PixelFormatView` texture alone, the consumer's M3 Max).
+    // than Metal's (a `PixelFormatView` texture alone, the consumer's M3 Max). A multisample one
+    // the device stores no samples of lists its views, as one without `ShaderWrite` does: what
+    // Metal answers of its compression (its heap size and alignment, the reach of its clears, what
+    // it reads before a write: `texture/heap_tiled.rs`, `clear_reach.rs`) is the runtime's model,
+    // not the image's, and a driver that compresses multisample images keeps a mutable one of any
+    // view format compressed alike (ANV's MCS is format-agnostic), where such an image clears to a
+    // colour other than its default slowly (ANV's clear of a 4x `RGBA8Unorm` one: 0.20 ms).
+    let multisample = layout.samples > 1;
     let any_format = usage.contains(TextureUsage::PIXEL_FORMAT_VIEW)
         || (metal_keeps_uncompressed(!depth_stencil, usage)
+            && !multisample
             && !usage_flags.contains(ImageUsageFlags::STORAGE));
     let view_usage = ImageUsageFlags::SAMPLED
         | ImageUsageFlags::STORAGE
@@ -836,6 +889,11 @@ fn plan_held(
         );
     }
     views.insert(format);
+    let sibling: BTreeSet<Format> = reordered_formats(pf, format, usage, usage_flags, profile)
+        .into_iter()
+        .filter(|f| !views.contains(f))
+        .collect();
+    views.extend(sibling.iter().copied());
     // A usage the image's own format lacks, which a view format has (a storage alias, a sampled
     // twin, a word attachment), needs extended usage.
     let extended = [
@@ -871,7 +929,159 @@ fn plan_held(
     {
         flags |= render_3d_flags(profile);
     }
-    Ok(ImagePlan {
+    let plan = ImagePlan {
+        pixel_format: pf,
+        flags,
+        image_type,
+        format,
+        extent: layout.extent,
+        levels: layout.levels,
+        layers: layout.layers,
+        samples,
+        usage: usage_flags,
+        view_formats,
+        mapping,
+        unavailable,
+    };
+    Ok(linear_keeping(plan, &sibling, facts))
+}
+
+/// `plan`, or, where the linear tiling of a format only its channel-order sibling's views list
+/// (`sibling`, [`reordered_formats`]) lacks what the plan's usages need and the plan holds every
+/// other format linear ([`linear_lack`]), the plan without them, as planned without them: a linear
+/// image of the texture (over a buffer's or host pages) keeps its route, and its sibling's views
+/// stay apart (`texture/view_shadow.rs`).
+fn linear_keeping(plan: ImagePlan, sibling: &BTreeSet<Format>, facts: &ImageFacts) -> ImagePlan {
+    if sibling.is_empty() || linear_lack(&plan, facts).is_none() {
+        return plan;
+    }
+    let mut bare = plan.clone();
+    bare.view_formats.retain(|f| !sibling.contains(f));
+    if bare.view_formats.len() == 1 && !bare.flags.contains(ImageCreateFlags::EXTENDED_USAGE) {
+        bare.view_formats.clear();
+        bare.flags = bare.flags.difference(ImageCreateFlags::MUTABLE_FORMAT);
+    }
+    match linear_lack(&bare, facts) {
+        None => bare,
+        Some(_) => plan,
+    }
+}
+
+/// The image of a multisampled color texture of `layout` with Metal `usage` (`memoryless` for
+/// `MTLStorageModeMemoryless`) whose format the device samples and renders only through the view
+/// of its word (`WordAttachment::of`: `R8Unorm_sRGB`, the packed 16-bit formats and `RGB9E5Float`
+/// on the RTX 5080), where the format's own image takes one sample: a format without an attachment
+/// feature has no multisampled image (`VkImageFormatProperties::sampleCounts`). Such a texture is
+/// held in the word's unsigned format, which the device renders at the texture's count, so every
+/// sample holds exactly the word Metal stores (its draws' and clears' words, which the fragment
+/// function and the runtime's clear values write, as at one sample). Its image is mutable to the
+/// format's own sampled view, through which a `texture2d_ms` read decodes each sample's word as
+/// the format's (Metal's `float` read of these formats is each code's value, measured by our probe
+/// `msaa_word_formats.m` on an M3 Max); to an 8-bit sRGB format's UNORM twin, through which the
+/// resolve reads its codes (`color_resolve.rs`), and to its sRGB twin's views, as any texture of
+/// the format. Its resolve is the crate-owned one (`color_resolve.rs`): no device's average reads
+/// a word. Shader writes are unavailable: Metal writes no multisampled texture from a function.
+/// `None` for a single-sampled texture, a format with no word on the device, or one whose image
+/// the device multisamples (an 8-bit sRGB format held in its UNORM twin, which renders).
+fn word_samples(
+    layout: &TextureLayout,
+    usage: TextureUsage,
+    memoryless: bool,
+    facts: &ImageFacts<'_>,
+    (image_type, flags, samples): (ImageType, ImageCreateFlags, SampleCountFlags),
+) -> Option<ImagePlan> {
+    let pf = layout.pixel_format;
+    let profile = facts.profile;
+    if samples.as_raw() == 1 {
+        return None;
+    }
+    let word = WordAttachment::of(pf, profile)?;
+    let format = word.word_format();
+    let mapping = vk_format(pf, &[FormatUsage::SampledImage].into(), profile).ok()?;
+    let attachments =
+        FormatFeatureFlags2::COLOR_ATTACHMENT | FormatFeatureFlags2::DEPTH_STENCIL_ATTACHMENT;
+    if facts.optimal(mapping.format).intersects(attachments)
+        || !compatible(format, mapping.format, false)
+    {
+        return None;
+    }
+    let usage = effective_usage(usage);
+    let wants = |bit: TextureUsage| usage.contains(bit);
+    let mut usage_flags = ImageUsageFlags::empty();
+    let mut views = BTreeSet::from([format]);
+    if wants(TextureUsage::RENDER_TARGET) {
+        usage_flags |= attachment_flag(false, profile);
+    }
+    let unavailable = if memoryless {
+        // A memoryless texture is a render target only.
+        usage_flags |= ImageUsageFlags::TRANSIENT_ATTACHMENT;
+        usage.difference(TextureUsage::RENDER_TARGET)
+    } else {
+        let optimal = facts.optimal(format);
+        for (feature, bit) in [
+            (
+                FormatFeatureFlags2::TRANSFER_SRC,
+                ImageUsageFlags::TRANSFER_SRC,
+            ),
+            (
+                FormatFeatureFlags2::TRANSFER_DST,
+                ImageUsageFlags::TRANSFER_DST,
+            ),
+        ] {
+            if optimal.contains(feature) {
+                usage_flags |= bit;
+            }
+        }
+        if wants(TextureUsage::SHADER_READ) {
+            usage_flags |= ImageUsageFlags::SAMPLED;
+            views.insert(mapping.format);
+        }
+        usage.intersection(
+            TextureUsage::SHADER_WRITE
+                | TextureUsage::SHADER_ATOMIC
+                | TextureUsage::BLOCK_WRITES_ONLY,
+        )
+    };
+    // An 8-bit sRGB word's resolve reads and writes its codes through the UNORM twin's view.
+    if let WordAttachment::Srgb8 { .. } = word {
+        views.extend(
+            srgb_raw_twin(pf)
+                .and_then(direct_format)
+                .filter(|&raw| profile.supports_format(raw, FormatUsage::ColorAttachment)),
+        );
+    }
+    if let Some(twin) = srgb_twin(pf) {
+        let twin_word = WordAttachment::of(twin, profile).map(|w| w.word_format());
+        views.extend(
+            view_formats(twin, usage_flags, profile)
+                .into_iter()
+                .filter(|&f| compatible(format, f, true) && Some(f) != twin_word),
+        );
+    }
+    views.extend(reordered_formats(pf, format, usage, usage_flags, profile));
+    let extended = [
+        (ImageUsageFlags::SAMPLED, FormatUsage::SampledImage),
+        (
+            ImageUsageFlags::COLOR_ATTACHMENT,
+            FormatUsage::ColorAttachment,
+        ),
+    ]
+    .iter()
+    .any(|&(bit, need)| usage_flags.contains(bit) && !profile.supports_format(format, need));
+    let any_format = !memoryless && usage.contains(TextureUsage::PIXEL_FORMAT_VIEW);
+    let mut flags = flags;
+    let mut view_formats = Vec::new();
+    if any_format || views.len() > 1 || extended {
+        flags |= ImageCreateFlags::MUTABLE_FORMAT;
+        if extended {
+            flags |= ImageCreateFlags::EXTENDED_USAGE;
+        }
+        if !any_format {
+            view_formats.push(format);
+            view_formats.extend(views.iter().copied().filter(|&f| f != format));
+        }
+    }
+    Some(ImagePlan {
         pixel_format: pf,
         flags,
         image_type,
@@ -887,12 +1097,49 @@ fn plan_held(
     })
 }
 
+/// The formats of the views of `pf`'s channel-order sibling and its twin ([`reordered_views`])
+/// that an image of `format` lists for a texture of Metal `usage` that renders (`RenderTarget`),
+/// planned with `usage_flags`: a pass renders into such a view, which Metal makes without
+/// `PixelFormatView` usage, through a Vulkan view of the image itself rather than a shadow
+/// (`texture/view_shadow.rs`), and its other uses view the image too. Not the view of a sibling's
+/// word (`WordAttachment`), as for the sRGB twin. None for a texture that renders nothing: its
+/// sibling's views present the image through a swizzle where they can.
+fn reordered_formats(
+    pf: PixelFormat,
+    format: Format,
+    usage: TextureUsage,
+    usage_flags: ImageUsageFlags,
+    profile: &DeviceProfile,
+) -> Vec<Format> {
+    if !usage.contains(TextureUsage::RENDER_TARGET) {
+        return Vec::new();
+    }
+    reordered_views(pf)
+        .into_iter()
+        .flat_map(|view| {
+            let word = WordAttachment::of(view, profile).map(|w| w.word_format());
+            view_formats(view, usage_flags, profile)
+                .into_iter()
+                .filter(move |&f| compatible(format, f, true) && Some(f) != word)
+        })
+        .collect()
+}
+
+/// The Vulkan usages [`view_formats`] reads: the views it lists follow these alone.
+pub(super) const VIEWED_USAGES: [ImageUsageFlags; 4] = [
+    ImageUsageFlags::SAMPLED,
+    ImageUsageFlags::STORAGE,
+    ImageUsageFlags::COLOR_ATTACHMENT,
+    ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+];
+
 /// The formats of the views the runtime makes of a texture of `pf` for the Vulkan usages in
-/// `usage` on `profile`: its sampled representation, its storage view (the alias, or the direct
-/// format), and its attachment format (the direct format, or the view of its word where the device
-/// renders that and not the format, `WordAttachment`). A view the device cannot make for `pf`
-/// is left out: a format list naming a format the device lacks is one some drivers make no image
-/// of (ANV, for an `RG8Unorm` render target listing its twin's `R8G8_SRGB`).
+/// `usage` on `profile` (of [`VIEWED_USAGES`], the only ones it reads): its sampled
+/// representation, its storage view (the alias, or the direct format), and its attachment format
+/// (the direct format, or the view of its word where the device renders that and not the format,
+/// `WordAttachment`). A view the device cannot make for `pf` is left out: a format list naming a
+/// format the device lacks is one some drivers make no image of (ANV, for an `RG8Unorm` render
+/// target listing its twin's `R8G8_SRGB`).
 pub(super) fn view_formats(
     pf: PixelFormat,
     usage: ImageUsageFlags,
@@ -922,6 +1169,43 @@ pub(super) fn view_formats(
         }
     }
     out
+}
+
+/// Every format the runtime views a texture of any pixel format as ([`view_formats`] of each of
+/// `PixelFormat::ALL`) on a device's profile, by the usages of [`VIEWED_USAGES`] asked for:
+/// worked out at the first ask of each set of them and kept, in `Format` order, for the device's
+/// life (its `TextureState`). An image whose views may take any compatible format (`MUTABLE_FORMAT`
+/// with no list) is checked against these at each making (`linear_plan::viewed_formats`): a
+/// `Shared` heap's texture of `allowGPUOptimizedContents` off on a device whose optimal images
+/// take no memory of such a heap asks at every making, as its linear image is checked.
+///
+/// Every ask passes the profile its device plans images from, the one `TextureState::facts` is
+/// given.
+#[derive(Debug, Default)]
+pub(super) struct AnyViews([OnceLock<Box<[Format]>>; 1 << VIEWED_USAGES.len()]);
+
+impl AnyViews {
+    /// The formats the runtime views a texture of any pixel format as, for `usage`'s bits of
+    /// [`VIEWED_USAGES`], on `profile`.
+    pub(super) fn of(&self, usage: ImageUsageFlags, profile: &DeviceProfile) -> &[Format] {
+        let index = VIEWED_USAGES
+            .iter()
+            .enumerate()
+            .filter(|&(_, &bit)| usage.contains(bit))
+            .fold(0, |index, (n, _)| index | 1 << n);
+        self.0[index].get_or_init(|| {
+            let usage = VIEWED_USAGES
+                .iter()
+                .fold(ImageUsageFlags::empty(), |asked, &bit| {
+                    asked | usage.intersection(bit)
+                });
+            let formats: BTreeSet<Format> = PixelFormat::ALL
+                .iter()
+                .flat_map(|&pf| view_formats(pf, usage, profile))
+                .collect();
+            formats.into_iter().collect()
+        })
+    }
 }
 
 /// Whether an image of `plan` takes the views the runtime makes of a texture of `pf` on

@@ -54,18 +54,22 @@
 //! one index buffer; indirect draws over one arguments buffer, [`IndirectGatherDraw`]) can take
 //! one [`IndexGather`] dispatch of [`index_gather_module`] for all of them instead (an indirect
 //! run's after one [`index_gather_plan_module`] dispatch, [`IndexGatherPlanModule`]), and one
-//! indexed draw each. A pass's `Boolean` visibility results are query
-//! counts copied to their offsets and made Metal's 1 or 0 in place by a [`VisibilityResolve`]
-//! dispatch of [`visibility_resolve_module`]; where a split pass continues a result's query in a
-//! later render pass instance, a [`VisibilityCombine`] dispatch of [`visibility_combine_module`]
-//! first ORs the continuations' counts into it. A pass whose fetching draws read a multisampled
-//! attachment's sample planes (`StorageAttachmentView::SamplePlanes`) splits the attachment into
-//! them with [`planes_split_module`] and merges them back with [`planes_merge_modules`], through
-//! the [`PlanesCopy`] view of its texel size. A multisampled depth or stencil aspect moves
-//! between images without colour copies through the draws of [`depth_stencil_copy_modules`] and
-//! the kernel of [`stencil_split_module`], and resolves where the device's resolve modes do not
-//! state Metal's filter through the draws of [`depth_stencil_resolve_modules`]. The mipmaps of a
-//! format the device's blits cannot filter are a bilinear filter in `float` through the
+//! indexed draw each. A pass's visibility results are its queries' results copied to their
+//! offsets, a `Boolean` one the device's own nonzero value where a sample passed; where a split
+//! pass continues a result's query in a later render pass instance, a [`VisibilityCombine`]
+//! dispatch of [`visibility_combine_module`] sums the continuations' counts into a `Counting`
+//! result and ORs them into a `Boolean` one, and where the results accumulate it takes every query
+//! into the word the buffer holds, a count into its low half alone. A pass whose fetching draws
+//! read a multisampled attachment's sample planes (`StorageAttachmentView::SamplePlanes`) splits
+//! the attachment into them with [`planes_split_module`] and merges them back with
+//! [`planes_merge_modules`], through the [`PlanesCopy`] view of its texel size. A multisampled
+//! depth or stencil aspect moves between images without colour copies through the draws of
+//! [`depth_stencil_copy_modules`] and the kernel of [`stencil_split_module`], and resolves where
+//! the device's resolve modes do not state Metal's filter through the draws of
+//! [`depth_stencil_resolve_modules`]. The runtime's check of render targets in place over host
+//! pages draws into one through [`check_draw_modules`]. The mipmaps of a format the device's
+//! blits cannot filter are
+//! a bilinear filter in `float` through the
 //! [`MipmapFilterChain`] dispatches of [`mipmap_filter_module`]. Compute commands
 //! a kernel encodes into an indirect command buffer replay on the device where it has device
 //! addresses: the [`replay_preprocess`] of an execution ([`ReplayExecution`]) over registered
@@ -86,7 +90,12 @@
 //! [`shadow_copy_in_module`] copies a merged texture's texels in and keeps them with one dispatch.
 //! A copy of many
 //! equal rows between two buffers is one dispatch of [`rows_copy_module`] where a copy's region
-//! per row costs more. A blit between a buffer
+//! per row costs more. A reset of a run of indirect commands is one dispatch of
+//! [`icb_reset_module`], which writes only the records whose written flag is set. A copy of 32-bit float depths into a depth image of a device that takes
+//! none outside `[0, 1]` clamps them first through [`depth_clamp_module`] ([`clamped_depth`] on
+//! the CPU). A blit through a `BGRA10_XR` texture Metal keeps losslessly compressed
+//! writes Metal's canonical encoding of its texels through [`extended_canonical_module`] where
+//! the policy asks for it. A blit between a buffer
 //! and a two-plane extended-range texture moves its color words through [`plane_words_module`],
 //! and a blit between two such textures moves both planes as Metal's blit does through
 //! [`plane_copy_module`]. A rotated texture's texels move between its
@@ -95,7 +104,7 @@
 //! [`two_plane_texels_module`]; a blit into such a texture of a heap writes the heap's bytes at
 //! Metal's rows through [`plane_bytes_copy_module`]. A heap texture over host pages keeps its
 //! elements in the heap's bytes in Metal's tiled layout, moved between its image and those bytes
-//! through [`tiled_texels_module`]. An ASTC LDR texture
+//! through [`tiled_texels_module`]. An ASTC texture
 //! on a device without its block is read through a twin of Metal's decode of its blocks
 //! ([`AstcDecode`], in the texels [`AstcTexels`] names), which [`astc_decode_module`] writes from
 //! the blocks each write left, each decode module of [`BlockDecodeModule`]'s shape; a
@@ -128,16 +137,21 @@ pub(crate) mod acceleration;
 pub(crate) mod argument_buffer;
 pub(crate) mod astc_decode;
 pub(crate) mod block_decode;
+pub(crate) mod check_draw;
 pub(crate) mod chroma_decode;
 pub(crate) mod color_resolve;
+pub(crate) mod depth_clamp;
 pub(crate) mod depth_stencil_copy;
 pub(crate) mod depth_stencil_resolve;
 pub(crate) mod dispatch;
 pub(crate) mod dynamic_views;
 pub(crate) mod etc_decode;
+pub(crate) mod extended_canonical;
 pub(crate) mod extended_shadow;
+pub mod fan_out;
 pub(crate) mod graphics;
 pub(crate) mod heap;
+pub(crate) mod icb_reset;
 pub(crate) mod index_bounds;
 pub(crate) mod index_rewrite;
 pub(crate) mod indirect_clamp;
@@ -147,6 +161,7 @@ pub(crate) mod mesh_arguments;
 pub(crate) mod mesh_scan;
 pub(crate) mod mipmap_filter;
 pub(crate) mod neutral;
+pub(crate) mod pages_copy;
 pub(crate) mod plan;
 pub(crate) mod plane_bytes_copy;
 pub(crate) mod plane_copy;
@@ -167,11 +182,11 @@ pub(crate) mod state;
 pub(crate) mod status;
 pub(crate) mod table;
 pub(crate) mod tessellation_scan;
+pub(crate) mod texel_rows;
 pub(crate) mod tile_map;
 pub(crate) mod tiled_texels;
 pub(crate) mod two_plane_texels;
 pub(crate) mod visibility_combine;
-pub(crate) mod visibility_resolve;
 pub(crate) mod ycbcr_convert;
 pub(crate) mod ycbcr_in_place;
 pub(crate) mod ycbcr_refresh;
@@ -188,6 +203,7 @@ pub use argument_buffer::{
 };
 pub use astc_decode::{astc_decode_module, AstcDecode, AstcTexels};
 pub use block_decode::BlockDecodeModule;
+pub use check_draw::{check_draw_modules, CheckDrawModules};
 pub use chroma_decode::{
     chroma_decode_module, chroma_sample_module, ChromaDecode, ChromaSampleModule,
 };
@@ -195,6 +211,7 @@ pub use color_resolve::{
     color_resolve_modules, ColorResolveFormat, ColorResolveModules, ResolveChannel, ResolveRule,
     ResolveSource, SRGB_RESOLVE_LINEAR, SRGB_RESOLVE_THRESHOLDS,
 };
+pub use depth_clamp::{clamped_depth, depth_clamp_module, DepthClampModule};
 pub use depth_stencil_copy::{
     depth_split_module, depth_stencil_copy_modules, stencil_split_module, CopySource,
     DepthSplitModule, DepthStandInForm, DepthStencilCopy, DepthStencilCopyModules, StencilBit,
@@ -206,9 +223,12 @@ pub use depth_stencil_resolve::{
 };
 pub use dispatch::{Dispatch, DispatchCommands, DispatchRegion, IndirectArgs};
 pub use etc_decode::{etc_decode_module, EtcDecode, EtcTexels};
+pub use extended_canonical::{
+    extended_canonical_module, extended_range_canonical, ExtendedCanonicalModule,
+};
 pub use extended_shadow::{extended_shadow_module, ExtendedShadowModule};
 pub use graphics::{
-    DrawCall, DrawCommands, IndexOverrun, MeshDispatch, MeshGroups, MeshRecordsRegion,
+    DrawCall, DrawCommands, IndexOverrun, MeshDispatch, MeshGroups, MeshRecordsRegion, SlotRebinds,
     TessellationDispatch, TessellationRecords,
 };
 pub use heap::{
@@ -229,7 +249,7 @@ pub use index_rewrite::{
 pub use indirect_clamp::{indirect_clamp_module, IndirectClamp, IndirectClampModule};
 pub use instantiate::{
     BufferExtent, BufferRange, DescriptorBytes, DescriptorRange, IndexBufferRef, IndirectRef,
-    PushConstantWrite, PushHole, ResidentRange, ResidentSet, RootTable,
+    PushConstantWrite, PushHole, ResidentPart, ResidentRange, ResidentSet, RootTable,
 };
 pub use mesh_arguments::{
     fold_object_grid, mesh_arguments_module, metal_object_grid, MeshArguments, MeshArgumentsForm,
@@ -242,6 +262,7 @@ pub use mipmap_filter::{
     MipmapFilterModule,
 };
 pub use neutral::NeutralResource;
+pub use pages_copy::{pages_copy_module, PagesCopy, PagesCopyModule};
 pub use plan::resources::sampler_desc;
 pub use plan::{
     AccessClass, BindingPlan, ByteRange, ComputeTemplate, DescriptorWrite, FieldLocation,
@@ -253,16 +274,17 @@ pub use rate_map::{
     RateMapRegion, RateMapRegions, RegionError, RegionLimits, UnpinnedCompile, MAX_SCREEN_EXTENT,
 };
 pub use replay::{
-    draw_merge_module, DrawMergeModule, MergePhase, MergedLayout, MERGED_CHUNK,
-    MERGED_HEADER_BYTES, MERGED_REST_FIRST,
+    draw_merge_module, DrawMergeModule, MergePhase, MergedLayout, DRAW_INDEX_ENTRY_BYTES,
+    MERGED_CHUNK, MERGED_HEADER_BYTES, MERGED_REST_FIRST,
 };
 pub use replay::{
-    draw_replay_draw, draw_replay_merges, draw_replay_primitive_type, draw_replay_slots,
-    draw_replay_state, DrawReplayRule, DRAW_REPLAY_WRITES,
+    draw_replay_draw, draw_replay_indexed, draw_replay_merges, draw_replay_primitive_type,
+    draw_replay_slots, draw_replay_state, draw_replay_vertex_layouts, DrawReplayRule,
+    DRAW_REPLAY_WRITES,
 };
 pub use replay::{
     draw_replay_module, draw_replay_preprocess, DrawReplay, DrawReplayLayout, DrawReplayModule,
-    DrawReplayPreprocess, DRAW_ARGUMENT_BYTES, MAX_DRAW_REPLAY_TYPES,
+    DrawReplayPreprocess, InheritedBytes, DRAW_ARGUMENT_BYTES, MAX_DRAW_REPLAY_TYPES,
 };
 pub use replay::{
     flat_dispatch_module, replay_preprocess, replay_preprocess_generated, replay_preprocess_module,
@@ -271,7 +293,7 @@ pub use replay::{
     ReplayPreprocessModule, ReplayRefusal, ReplayVariant, MAX_REPLAY_DISPATCHES,
     MAX_REPLAY_REGIONS, MAX_REPLAY_SLOTS, MAX_REPLAY_VARIANTS,
 };
-pub(crate) use replay::{merged_vertex, MergedVertex};
+pub(crate) use replay::{merged_fragment_table, merged_vertex, MergedVertex};
 pub use replay::{
     predication_step_module, PredicationCompare, PredicationOp, PredicationStep,
     PredicationStepForm, PredicationStepModule,
@@ -288,6 +310,7 @@ pub use state::{
 // How `BindState::shape` classes a buffer: the crate reads it from `state`, and a consumer takes
 // shapes from `BindState::shape`; only the crate's tests and validation reach it here.
 pub use dynamic_views::{dynamic_views_module, DynamicViewsModule};
+pub use icb_reset::{icb_reset_module, IcbResetModule};
 pub use plane_bytes_copy::{
     plane_bytes_copy_module, PlaneBytes, PlaneBytesCopyModule, PlaneSource,
 };
@@ -318,14 +341,12 @@ pub use table::{FunctionTableSnapshot, FunctionTableWords};
 pub use tessellation_scan::{
     tessellation_scan_module, TessellationScanKernel, TessellationScanModule,
 };
+pub use texel_rows::TexelRows;
 pub use tile_map::{SparseTileMap, TileMapError, TileMapping};
 pub use tiled_texels::{tiled_texels_module, TiledLevelMove, TiledTexelsModule};
 pub use two_plane_texels::{two_plane_texels_module, PlaneLayout, TwoPlaneTexelsModule};
 pub use visibility_combine::{
     visibility_combine_module, ContinuedResult, VisibilityCombine, VisibilityCombineModule,
-};
-pub use visibility_resolve::{
-    visibility_resolve_module, VisibilityResolve, VisibilityResolveModule,
 };
 pub use ycbcr_convert::{
     ycbcr_convert_floats_module, ycbcr_convert_module, ycbcr_read, ycbcr_texel, YCbCrCodes,

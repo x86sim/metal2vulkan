@@ -25,11 +25,14 @@ use metal2vulkan_runtime::{
 /// whose multisample colour images lie so
 /// (`DriverFact::MultisampleColorImagesLieAsMetalHeapTextures`: MoltenVK 1.4.2 on the M3 Max,
 /// measured by this lane) every sample lies there and the device counts and announces none for
-/// `heap-texture-untiled-layout`; elsewhere it counts every texture, and one it counts for none
-/// lies in Metal's tiles each way. Then one
+/// `heap-texture-untiled-layout`; elsewhere it counts every texture but a shadow of its samples
+/// in Metal's tiles (`shadowed-texture`, announced: the NVIDIA RTX 5080 Laptop's,
+/// `texture/heap.rs`), and one it counts for none lies in Metal's tiles each way. Then one
 /// Metal keeps compressed (`RGBA8Unorm`, 64 x 64, 4 samples, the property on), whose
 /// `heap-texture-lossless-layout` notice says its image lies in the heap's bytes, not in memory of
-/// its own. `HEAPTEX device-samples` lines print the samples off Metal's tiles.
+/// its own: where the device held the others as shadows of their samples, a shadow of its samples
+/// as Metal lays them out uncompressed (the RTX 5080 Laptop's). `HEAPTEX device-samples` lines
+/// print the samples off Metal's tiles.
 #[test]
 fn device_heap_multisample_colour_textures_lie_where_announced() {
     let messages = Messages::default();
@@ -115,7 +118,9 @@ fn device_heap_multisample_colour_textures_lie_where_announced() {
                 textures += 1;
                 counted += u64::from(announced);
                 off_tiles += u64::from(off + read_off > 0);
-                assert_eq!(announced, !as_metal, "{what}: counted untiled");
+                if as_metal {
+                    assert!(!announced, "{what}: counted untiled");
+                }
                 if !announced {
                     assert_eq!((off, read_off), (0, 0), "{what}: samples off Metal's tiles");
                 }
@@ -126,11 +131,19 @@ fn device_heap_multisample_colour_textures_lie_where_announced() {
         "HEAPTEX device-samples: {textures} textures, {counted} counted untiled, {off_tiles} with \
          samples off Metal's tiles (fact {as_metal})"
     );
-    let untiled_notices = (messages.take_notices().iter())
+    let kinds: Vec<Degradation> = (messages.take_notices().iter())
         .filter_map(|message| message.degradation.as_ref())
-        .filter(|notice| notice.degradation == untiled)
-        .count();
-    assert_eq!(untiled_notices, usize::from(!as_metal), "untiled notices");
+        .map(|notice| notice.degradation)
+        .collect();
+    let untiled_notices = kinds.iter().filter(|&&kind| kind == untiled).count();
+    assert_eq!(untiled_notices, usize::from(counted > 0), "untiled notices");
+    // The textures not counted on a driver without the fact are shadows of Metal's tiles.
+    if !as_metal && counted < textures {
+        assert!(
+            kinds.contains(&Degradation::ShadowedTexture),
+            "shadows of Metal's tiles: {kinds:?}"
+        );
+    }
     let lossless = Degradation::HeapTextureLosslessLayout;
     let compressed = descriptor(PixelFormat::RGBA8Unorm, [64, 64], 4, true);
     let answer = device.heap_texture_size_and_align(&compressed).unwrap();
@@ -152,10 +165,16 @@ fn device_heap_multisample_colour_textures_lie_where_announced() {
         .collect();
     eprintln!("HEAPTEX device-samples compressed: {reasons:?}");
     assert_eq!(reasons.len(), 1, "{reasons:?}");
+    // Where the device holds the uncompressed ones as shadows of their samples in Metal's
+    // tiles, it holds this one as a shadow of its uncompressed tiles in the heap's bytes.
+    let shadows = !as_metal && counted < textures;
+    let lies = match shadows {
+        true => "the heap's bytes hold its samples as Metal lays them out uncompressed",
+        false => "its image lies in the heap's bytes",
+    };
     assert!(
-        reasons[0].contains("its image lies in the heap's bytes")
-            && !reasons[0].contains("memory of its own"),
-        "{}",
+        reasons[0].contains(lies) && !reasons[0].contains("memory of its own"),
+        "shadows {shadows}: {}",
         reasons[0]
     );
     drop((texture, heap));

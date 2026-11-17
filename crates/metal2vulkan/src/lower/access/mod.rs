@@ -747,9 +747,13 @@ pub struct AccessPlan {
     /// while the dispatch or draw runs, and an atomic needs a storage view's word pointer, so the
     /// per-stage storage-buffer fallback never views them as uniform buffers.
     pub ordered: BTreeSet<usize>,
+    /// Memory-plan slots read through a storage view whose memory nothing in the module writes
+    /// ([`unwritten_slots`]): their views are decorated `NonWritable`, so the device may read them
+    /// as read-only memory (on RADV a uniform read is a scalar load).
+    pub unwritten: BTreeSet<usize>,
     /// The units ([`Units`]) the static-root accesses of each slot read or write whole, by
-    /// memory-plan slot index: narrow units whose storage access the profile has, and `uvec4`
-    /// units. The slot gets a view of each that its final view kind holds
+    /// memory-plan slot index: narrow units whose storage access the profile has, and `uvec2`
+    /// and `uvec4` units. The slot gets a view of each that its final view kind holds
     /// (`views::UnitViews::declare`).
     pub units: BTreeMap<usize, Units>,
     /// A tile function's attachments and the ones it stages ([`tile`]).
@@ -781,6 +785,21 @@ pub struct AccessPlan {
     /// (`lower::texture::emit`): the handle-table search carries the index, as under
     /// [`heap_class`](Self::heap_class), but the module needs no table of the classes.
     pub heap_class_index: bool,
+    /// A heap storage access the function makes converts a member by its texel class and its
+    /// red-blue order (`lower::texture::heap_storage_conversions`): the handle-table search
+    /// carries the entry's `FLAG_RED_BLUE` too (`memory::handles::Lookup::Flagged`).
+    pub heap_red_blue: bool,
+    /// A `float` or `half` texel the function writes through a heap handle marks the texel it
+    /// stores in a member's write shadow where the handle carries the entry's
+    /// `FLAG_YCBCR_WRITES` (`lower::texture::emit`): the handle-table search carries it, under
+    /// the stage's `SpecKey::HeapYCbCrWrites` (`memory::handles::Lookup::Flagged`).
+    pub heap_ycbcr_writes: bool,
+    /// A heap texture's read through a sampler may hand back its border texels
+    /// (`lower::texture::Through`), which its handle-table entry holds
+    /// (`memory::handles::FLAG_BORDER_TEXELS`): the search yields each heap handle's entry index
+    /// beside its element (`memory::handles::Lookup::Indexed`), by which the read loads them, and
+    /// every use reads the entry's other flags it needs from the entry.
+    pub heap_border: bool,
     /// The relaxed atomic loads an exit of a loop holding them depends on ([`atomic::spin`]): each
     /// acquires its memory. Planned before any instruction is selected.
     pub spins: BTreeSet<InstId>,
@@ -798,13 +817,25 @@ impl AccessPlan {
 
     /// What the function's handle-table search yields.
     pub fn lookup(&self) -> crate::memory::handles::Lookup {
-        if self.heap_alpha || self.carries_class() {
-            crate::memory::handles::Lookup::Flagged {
-                alpha: self.heap_alpha,
-                class: self.carries_class(),
+        use crate::memory::handles::Lookup;
+        let (alpha, class, red_blue) = (self.heap_alpha, self.carries_class(), self.heap_red_blue);
+        let ycbcr = self.heap_ycbcr_writes;
+        if self.heap_border {
+            Lookup::Indexed {
+                alpha,
+                class,
+                red_blue,
+                ycbcr,
+            }
+        } else if alpha || class || red_blue || ycbcr {
+            Lookup::Flagged {
+                alpha,
+                class,
+                red_blue,
+                ycbcr,
             }
         } else {
-            crate::memory::handles::Lookup::Element
+            Lookup::Element
         }
     }
 }
@@ -1254,10 +1285,15 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
         lowering.push(Some(l));
     }
     // Source buffers no accessed slot shares: read-only `Whole` storage slots of their own, whose
-    // range is never provably within `maxStorageBufferRange`.
+    // range is never provably within `maxStorageBufferRange`; a replay variant's are read through
+    // their root entries, as its other slots are.
     let mut own: Vec<(SlotRef, SlotLowering)> = Vec::new();
     for &s in &sources {
         if shared_slot(s).is_some() {
+            continue;
+        }
+        if replay {
+            own.push((s, psb_lowering(Window::Whole)?));
             continue;
         }
         cx.facts.insert(RuntimeFact::BufferRangeLimit { slot: s });
@@ -1507,17 +1543,66 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
     }
     sourced.sort_by_key(|p| p.slot.index);
     cx.families.access.pulled = sourced;
+    cx.families.access.unwritten = unwritten_slots(cx, &lowering, &sources);
     cx.families.access.slots = lowering;
     cx.families.access.psb_contained = p.fields().containment != Containment::UnsafeOff;
     cx.families.access.psb_units = psb::narrow_units(p);
     Ok(slots)
 }
 
+/// The string attribute by which Metal's compiler declares that a buffer argument's memory is
+/// reached through no other argument: every buffer argument of the AIR it emits carries it.
+const BUFFER_NO_ALIAS: &[u8] = b"air-buffer-no-alias";
+
+/// The memory-plan slots whose memory nothing in the module writes, among those read through a
+/// storage view (`lowering`): a plain buffer argument the AIR declares unaliased
+/// ([`BUFFER_NO_ALIAS`]) that no store or atomic of the function reaches, through the slot or
+/// through a pointer its address may come back as (`SlotPlan::wide`), and that no volatile or
+/// coherent access reads (what it reads may change while the dispatch runs). Being unaliased, its
+/// memory is no other argument's, so no write of the module lands on it. A buffer-table element
+/// and a pulled fetch's source are left out.
+fn unwritten_slots(
+    cx: &SelectCx<'_>,
+    lowering: &[Option<SlotLowering>],
+    sources: &[SlotRef],
+) -> BTreeSet<usize> {
+    let module = &cx.entry.module;
+    let Some(func) = module.func(cx.entry.func) else {
+        return BTreeSet::new();
+    };
+    let unaliased = |param: u32| {
+        func.params.get(param as usize).is_some_and(|p| {
+            p.attrs
+                .strings
+                .iter()
+                .any(|&(key, _)| module.symbols().get(key) == Some(BUFFER_NO_ALIAS))
+        })
+    };
+    let storage = Some(SlotLowering::View(ViewKind::Storage));
+    cx.memory
+        .slots
+        .iter()
+        .zip(lowering)
+        .enumerate()
+        .filter(|&(i, (plan, l))| {
+            *l == storage
+                && plan.element.is_none()
+                && !sources.contains(&plan.slot)
+                && !plan.access.write
+                && !plan.wide.write
+                && !plan.atomic
+                && !cx.families.access.ordered.contains(&i)
+                && unaliased(plan.param)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// The checks and push fields of a device-replay variant (`LoweringInputs::replay_bindings`), a
 /// flat variant (`LoweringInputs::flat_grid`) or a folded variant
 /// (`LoweringInputs::folded_groups`), before its slots' forms are chosen: a kernel with neither a
 /// stage-input descriptor or fetch (`sources`) nor a tile function's attachments, or for a replay
-/// variant also a vertex function with no fetch or a fragment function, or for a folded variant
+/// variant also a vertex function whose fetch is all pulled or a fragment function, or for a folded variant
 /// also an object function (whose draw's pieces fold its grid, `bind::mesh_arguments`), on a
 /// profile with device addresses. A replay variant reads every `SlotGuestBase` the selection asked for from its
 /// slot's root entry instead ([`replay_guest_base`]), so the push block holds the root table's
@@ -1541,21 +1626,25 @@ fn plan_replay(cx: &mut SelectCx<'_>, sources: &[SlotRef]) -> Result<(), Error> 
         .into());
     }
     // A replayed command is a compute dispatch with no stage-in region and no tile pass, or a
-    // draw whose vertex function fetches no attribute: its buffers are the record's, read through
-    // the slot table, which no fetch of a vertex descriptor reads.
+    // draw whose vertex function fetches no attribute in fixed function: its buffers are the
+    // record's, read through the slot table, which a pulled attribute's read reaches and
+    // fixed-function input does not (the replay pulls every layout,
+    // `bind::draw_replay_vertex_layouts`).
     use crate::pipeline::sym::Stage;
     let drawn = cx.inputs.replay_bindings && matches!(cx.stage, Stage::Vertex | Stage::Fragment);
     // A folded object function: its draw's pieces fold Metal's object grid
     // (`bind::mesh_arguments`).
     let pieces = cx.inputs.folded_groups && cx.stage == Stage::Object;
-    let fetches = cx
-        .inputs
-        .vertex_fetch
-        .as_ref()
-        .is_some_and(|f| !f.attributes.is_empty());
+    let fetches = (cx.inputs.vertex_fetch.as_ref()).is_some_and(|f| {
+        (f.attributes.values())
+            .any(|a| *a == crate::pipeline::lower_inputs::VertexFetch::FixedFunction)
+    });
+    // A drawn vertex function's sources are its pulled attributes' buffers, which its slot table
+    // holds; a kernel's are its stage-in fetch's.
+    let pulled = drawn && cx.stage == Stage::Vertex;
     if (cx.stage != Stage::Kernel && !drawn && !pieces)
         || fetches
-        || !sources.is_empty()
+        || (!sources.is_empty() && !pulled)
         || cx.inputs.stage_input.is_some()
         || cx.inputs.tile_attachments.is_some()
         || cx.families.access.tile.is_some()
@@ -1748,6 +1837,9 @@ pub fn declare(
             (Some(c), Some(SlotLowering::View(kind))) => Some(views::declare(mb, c.slot, kind)?),
             _ => None,
         };
+        if let (Some(c), true) = (s, plan.families.access.unwritten.contains(&i)) {
+            mb.unwritten_buffer(views::binding_symbol(c.slot));
+        }
         d.views.push(view);
         d.at_bind.push(match (s, view.map(|v| v.kind)) {
             (Some(c), Some(ViewKind::UniformWords { .. } | ViewKind::UniformVec4 { .. })) => {
@@ -1958,7 +2050,8 @@ fn select_access(
 ) -> Result<Access, Error> {
     let (targets, null, blob_check) = blob_roots(cx, ptr, value.is_some(), m)?;
     let align = align.map_or(1, |a| a.bytes());
-    let leaf = leaf::leaf_of(cx.entry, cx.profile, &cx.memory.layouts, ty, align)?;
+    let proven = cx.memory.proven_align(cx.entry, ptr);
+    let leaf = leaf::leaf_of(cx.entry, cx.profile, &cx.memory.layouts, ty, align, proven)?;
     access_with_leaf(cx, ptr, value, leaf, targets, null, blob_check)
 }
 
@@ -2006,8 +2099,8 @@ fn place_targets(cx: &mut SelectCx<'_>, targets: &mut [Target], write: bool) -> 
 }
 
 /// Give each slot of `targets` the unit views that read or write `leaf` (a store when `write`)
-/// in whole units ([`leaf::leaf_units`]): a storage slot the narrow views the profile can access,
-/// and any slot a `uvec4` view.
+/// in whole units ([`leaf::leaf_units`]): a storage slot the narrow views the profile can access
+/// and a `uvec2` view, and any slot a `uvec4` view.
 fn note_units(
     cx: &mut SelectCx<'_>,
     targets: &[Target],
@@ -2026,7 +2119,7 @@ fn note_units(
             .ok_or_else(|| cx.invariant("a target names a missing slot"))?;
         let units = match view_kind(cx.profile, plan) {
             ViewKind::Storage => units,
-            // A uniform view has no narrow view.
+            // A uniform view has no narrow or `uvec2` view.
             ViewKind::UniformWords { .. } | ViewKind::UniformVec4 { .. } => Units {
                 vec4: units.vec4,
                 ..Units::NONE

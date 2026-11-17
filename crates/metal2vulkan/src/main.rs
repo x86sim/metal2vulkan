@@ -26,7 +26,7 @@ use metal2vulkan::pipeline::{
     ColorAttachmentDescriptor, ComputePipeline, ComputePipelineDescriptor,
     ComputePipelineMetalInfo, FunctionDescriptor, GraphicsState, PipelineInterface, PipelineLayout,
     PrecisionNote, Reconvergence, RenderPipeline, RenderPipelineDescriptor, RuntimeDependency,
-    SpecializationLayout, StageInputDescriptor, StageModule, StageSource,
+    SpecializationLayout, StageEntries, StageInputDescriptor, StageModule, StageSource,
     TileRenderPipelineDescriptor, VertexDescriptor, VertexInputState,
 };
 use metal2vulkan::{vk, Budget};
@@ -200,13 +200,15 @@ fn run(
             .map_err(|e| Failure::detailed("profile not read", e.to_string()))?;
     let device = Device::new(description, DevicePolicy::default())
         .map_err(|e| Failure::detailed("profile refused", e.to_string()))?;
-    let bitcode = if input.ends_with(".ll") {
-        assemble(source)?
+    let assembled;
+    let bitcode: &[u8] = if input.ends_with(".ll") {
+        assembled = assemble(source)?;
+        &assembled
     } else {
-        source.to_vec()
+        source
     };
     let library =
-        Library::parse(&bitcode).map_err(|e| Failure::detailed("input not read", e.to_string()))?;
+        Library::parse(bitcode).map_err(|e| Failure::detailed("input not read", e.to_string()))?;
     let compiled = compile(args, &device, &library)?;
 
     let stages = compiled.stages();
@@ -350,6 +352,15 @@ fn compile(args: &Args, device: &Device, library: &Library) -> Result<Compiled, 
             if let Some(count) = args.vertex_amplification_count {
                 descriptor.max_vertex_amplification_count = count;
             }
+            // Metal makes a pipeline of a vertex function that returns no value only with
+            // rasterization disabled (`DescriptorError::RasterizedVoidVertex`): with no fragment
+            // function named, the tool compiles that form of one.
+            if descriptor.fragment.is_none() {
+                let entries = StageEntries::new();
+                let returns =
+                    (descriptor.vertex_returns_value(&budget, &entries)).map_err(refusal)?;
+                descriptor.rasterization_enabled = returns;
+            }
             device
                 .compile_render_pipeline(&descriptor, &budget)
                 .map(|p| Compiled::Render(Box::new(p)))
@@ -418,9 +429,6 @@ fn constant_values(constants: &[(String, FunctionConstantValue)]) -> FunctionCon
 /// A compile error as a failure, naming the option that supplies a missing pipeline input.
 fn refusal(error: Error) -> Failure {
     let hint = match &error {
-        Error::NeedsInput(RuntimeInput::FunctionConstant { index }) => {
-            format!("; supply it with --constant {index}:TYPE:VALUE")
-        }
         Error::NeedsInput(RuntimeInput::StageInputDescriptor { .. }) => {
             "; supply a stage-input descriptor with --stage-input".to_string()
         }

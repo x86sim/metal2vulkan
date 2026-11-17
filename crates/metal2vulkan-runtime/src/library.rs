@@ -9,8 +9,11 @@
 //! it with, as its stage or as a function the stage links ([`Function::linked_function`],
 //! `MTLLinkedFunctions`), and the options it was made with (`newFunctionWithDescriptor:`): one
 //! compiled to a binary is what Metal takes in a stage's `binaryFunctions` and adds to a made
-//! pipeline state.
+//! pipeline state. A library and its functions hold no Vulkan object, so they go on past the
+//! device's recovery, as Metal's do, the recovery carrying their handle of the device alone
+//! (`device/carry.rs`'s `LineDevice`), which a library's functions share.
 
+use super::device::carry::LineDevice;
 use super::device::device_error;
 use super::error::{invalid, Problem, RuntimeGap};
 use super::Device;
@@ -18,7 +21,7 @@ use super::Error;
 use crate::derived::{Derived, DerivedMap};
 use crate::resource_ids::{function_name, FunctionHolds, LibraryHolds};
 use metal2vulkan::bind::ArgumentBufferLayout;
-use metal2vulkan::library::{FunctionConstantValues, LibraryType};
+use metal2vulkan::library::{FunctionConstantValues, FunctionStage, LibraryType};
 use metal2vulkan::metal::{FunctionOptions, FunctionType, PatchType};
 use metal2vulkan::pipeline::{FunctionDescriptor as StageFunction, LinkedFunction};
 use metal2vulkan::reflection::{
@@ -31,7 +34,9 @@ use std::sync::{Arc, Mutex};
 /// A Metal library (`MTLLibrary`). Cheap to clone; `Send + Sync`.
 #[derive(Clone, Debug)]
 pub struct Library {
-    device: Device,
+    /// The device: its root handle, which the checks of the calls that take the library match
+    /// by its line, and the generation handle `device` answers.
+    device: LineDevice,
     library: metal2vulkan::library::Library,
     /// What the library holds of the sampler IDs its functions' pipeline states numbered, shared
     /// with every live library of the same content (`resource_ids/numbered.rs`).
@@ -53,7 +58,8 @@ pub struct Library {
 /// Cheap to clone; `Send + Sync`.
 #[derive(Clone, Debug)]
 pub struct Function {
-    device: Device,
+    /// The device, its library's.
+    device: LineDevice,
     function: metal2vulkan::library::Function,
     constants: FunctionConstantValues,
     /// Whether the function was made with constant values (`newFunctionWithName:constantValues:`),
@@ -88,6 +94,13 @@ pub struct Function {
     /// The options the function was made with (`newFunctionWithDescriptor:`); none for the
     /// other forms.
     options: FunctionOptions,
+    /// The specialized name the function was made with (`newFunctionWithDescriptor:`'s
+    /// `specializedName`), which it answers and links under; none for the other forms.
+    specialized_name: Option<String>,
+    /// Whether the function was made by `newFunctionWithDescriptor:`, which Metal makes a
+    /// specialized function of with constant values or without: a stage links it specialized
+    /// ([`LinkedFunction::specialized`]).
+    by_descriptor: bool,
     /// What the function object holds of the sampler IDs its function's pipeline states
     /// numbered, shared with every function object of the same function of its library
     /// (`resource_ids/numbered.rs`); held for its drop.
@@ -100,6 +113,10 @@ pub struct Function {
 pub struct FunctionDescriptor {
     /// `name`.
     pub name: String,
+    /// `specializedName`: the name the made function answers ([`Function::name`]) and links
+    /// under in place of `name`, where a visible-function reference names it; `None` (nil) for
+    /// `name` itself. The function's definition is still `name`'s.
+    pub specialized_name: Option<String>,
     /// `constantValues`: `None` for nil, the function as `newFunctionWithName:` makes it.
     pub constant_values: Option<FunctionConstantValues>,
     /// `options`. `COMPILE_TO_BINARY` makes a function a stage's `binary_functions` and a made
@@ -110,13 +127,21 @@ pub struct FunctionDescriptor {
 }
 
 impl FunctionDescriptor {
-    /// The descriptor of the function named `name`, with no constant values and no options.
+    /// The descriptor of the function named `name`, with no specialized name, no constant values
+    /// and no options.
     pub fn new(name: &str) -> FunctionDescriptor {
         FunctionDescriptor {
             name: name.to_string(),
+            specialized_name: None,
             constant_values: None,
             options: FunctionOptions::NONE,
         }
+    }
+
+    /// This descriptor with the specialized name `name` (`specializedName`).
+    pub fn with_specialized_name(mut self, name: impl Into<String>) -> FunctionDescriptor {
+        self.specialized_name = Some(name.into());
+        self
     }
 }
 
@@ -128,18 +153,28 @@ impl Device {
     /// bytes that are no metallib, on an Apple M4. AIR goes in through the translator
     /// ([`Device::new_library_with_compile_library`]).
     pub fn new_library_with_data(&self, data: &[u8]) -> Result<Library, Error> {
+        self.at_serving(|device| device.new_library_with_data_now(data))
+    }
+
+    /// [`Device::new_library_with_data`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn new_library_with_data_now(&self, data: &[u8]) -> Result<Library, Error> {
         let library = metal2vulkan::library::Library::from_metallib(data).map_err(device_error)?;
-        Ok(self.new_library_with_compile_library(library))
+        Ok(self.new_library_with_compile_library_now(library))
     }
 
     /// `newLibraryWithSource:options:error:` (and its completion-handler form): a library
     /// compiled from Metal Shading Language source. Not built: the runtime compiles AIR, not
     /// MSL, so every source is refused, `NotImplemented(LibrarySource)`
-    /// ([`RuntimeGap::LibrarySource`](crate::RuntimeGap::LibrarySource)), where Metal compiles it.
+    /// ([`RuntimeGap::LibrarySource`]), where Metal compiles it.
     /// `MTLCompileOptions` has no counterpart: no option changes the answer. Compile the source
     /// ahead of time with Apple's `metal` tool and load the metallib with
     /// [`new_library_with_data`](Self::new_library_with_data).
     pub fn new_library_with_source(&self, _source: &str) -> Result<Library, Error> {
+        self.at_serving(|device| device.new_library_with_source_now(_source))
+    }
+
+    /// [`Device::new_library_with_source`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn new_library_with_source_now(&self, _source: &str) -> Result<Library, Error> {
         Err(Error::NotImplemented(RuntimeGap::LibrarySource))
     }
 
@@ -152,9 +187,18 @@ impl Device {
         &self,
         library: metal2vulkan::library::Library,
     ) -> Library {
+        self.current().new_library_with_compile_library_now(library)
+    }
+
+    /// [`Device::new_library_with_compile_library`] on the generation that serves
+    /// (`device/line.rs`).
+    pub(crate) fn new_library_with_compile_library_now(
+        &self,
+        library: metal2vulkan::library::Library,
+    ) -> Library {
         let holds = LibraryHolds::of(&self.shared().resource_ids, *library.content_hash());
         Library {
-            device: self.clone(),
+            device: LineDevice::new(self),
             library,
             holds,
             reflections: Arc::default(),
@@ -163,17 +207,49 @@ impl Device {
 }
 
 impl Library {
-    /// `device`.
-    pub fn device(&self) -> &Device {
-        &self.device
+    /// `device`: a generation handle of the device, owned, as Metal's `device` answers a retained
+    /// device: of the generation the library was made on, then of each one the device's recoveries
+    /// carried the library to. The handle is the caller's: it keeps meaning that generation while
+    /// held, past a recovery that carries the library on, its raw handles that generation's
+    /// `VkDevice`'s, kept alive while held.
+    pub fn device(&self) -> Device {
+        self.device.generation().clone()
     }
 
-    /// `functionNames`, in the library's table order.
+    /// A root handle of the library's device, which the calls that take it match by its line.
+    pub(crate) fn root_device(&self) -> &Device {
+        self.device.root()
+    }
+
+    /// `functionNames`, in the library's table order. A Core Image kernel library's extern
+    /// functions are not among them, as Metal leaves them out
+    /// ([`extern_function_names`](Self::extern_function_names) lists them).
     pub fn function_names(&self) -> Vec<String> {
         self.library
             .functions()
+            .filter(|info| info.stage != FunctionStage::Extern)
             .map(|info| info.name.to_string())
             .collect()
+    }
+
+    /// `externFunctionNames` (private to Metal's own library class): the extern functions of a
+    /// Core Image kernel library (`metal -fcikernel`, `metallib -cikernel`), the kernels Core Image
+    /// takes with [`new_extern_function_with_name`](Self::new_extern_function_with_name) and links
+    /// into a kernel of its own; none for any other library. The names are Metal's; their order is
+    /// the reverse of the library's table order, which differs from Metal's: Metal answers that
+    /// order for some libraries (one of the kernels `tint` and `shift`), and for others (libraries
+    /// of 4 to 200 kernels written from scratch, and Core Image's own) an order of its own,
+    /// neither the table's, its reverse, nor sorted (an M3 Max under macOS 27.0.1, the
+    /// conformance crate's `probes/metallib_function_hashes.m`).
+    pub fn extern_function_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .library
+            .functions()
+            .filter(|info| info.stage == FunctionStage::Extern)
+            .map(|info| info.name.to_string())
+            .collect();
+        names.reverse();
+        names
     }
 
     /// `type`: [`LibraryType::Dynamic`] for a dynamic library's metallib (or the universal file
@@ -197,10 +273,28 @@ impl Library {
     /// constant it declares is undefined). A name the library lacks, or names more than once, is
     /// refused (`Compile(InvalidDescriptor)`), where Metal answers nil. Every name of a dynamic
     /// library is refused (`Invalid(DynamicLibraryFunction)`): Metal stops at an assertion for
-    /// each, its functions being no stage.
+    /// each, its functions being no stage. A Core Image kernel library's extern function is made,
+    /// as Metal makes it ([`new_extern_function_with_name`](Self::new_extern_function_with_name)).
     pub fn new_function_with_name(&self, name: &str) -> Result<Function, Error> {
         self.function(
             "new_function_with_name",
+            name,
+            &FunctionConstantValues::defaults(),
+            false,
+        )
+    }
+
+    /// `newExternFunctionWithName:` (private to Metal's own library class): the function named
+    /// `name`, as [`new_function_with_name`](Self::new_function_with_name) makes and refuses it,
+    /// which is how Metal answers both for any library (measured with an executable library's
+    /// kernel and a Core Image kernel library's extern functions, an M3 Max under macOS 27.0.1).
+    /// A Core Image kernel library's function is an extern function
+    /// ([`Function::function_type`] answers [`FunctionType::Extern`]): a pipeline state made from
+    /// it is refused (`Compile(InvalidDescriptor)`), as Metal fails it ("Function ... was not
+    /// found in the module").
+    pub fn new_extern_function_with_name(&self, name: &str) -> Result<Function, Error> {
+        self.function(
+            "new_extern_function_with_name",
             name,
             &FunctionConstantValues::defaults(),
             false,
@@ -214,7 +308,9 @@ impl Library {
     /// ignored, as Metal ignores it. The others are checked against the constants the function
     /// declares when a pipeline state compiles it, where Metal checks them here: a value of
     /// another type, or a used constant without a value, refuses that pipeline state
-    /// (`Compile`). A dynamic library's function is refused as
+    /// (`Compile`), and so do values that put two of the function's arguments on overlapping
+    /// slots of one argument table (`Compile(InvalidDescriptor(OverlappingArgument))`; Metal's
+    /// "argument has invalid location"). A dynamic library's function is refused as
     /// [`new_function_with_name`](Self::new_function_with_name) refuses it.
     pub fn new_function_with_name_constant_values(
         &self,
@@ -233,7 +329,11 @@ impl Library {
     /// [`new_function_with_name_constant_values`](Self::new_function_with_name_constant_values)
     /// makes it where the descriptor has constant values and as
     /// [`new_function_with_name`](Self::new_function_with_name) where it has none, refused as
-    /// they refuse; with the descriptor's options ([`Function::options`]). Made with
+    /// they refuse; with the descriptor's options ([`Function::options`]) and specialized name,
+    /// which the function answers as its [`name`](Function::name) and links under. Either way a
+    /// stage links it specialized, as Metal links what this call makes: a function constant it
+    /// was given no value for reads as undefined (measured with values and with none, an M3 Max
+    /// under macOS 27.0.1, `linked_function_specialized_name.m`). Made with
     /// `COMPILE_TO_BINARY`, its [`linked_function`](Function::linked_function) is precompiled, as
     /// a stage's `binary_functions` and a made state's added binary functions must be (Metal's
     /// API validation stops another, and its creation fails without validation; measured on an
@@ -263,6 +363,8 @@ impl Library {
             )?,
         };
         function.options = descriptor.options;
+        function.specialized_name = descriptor.specialized_name.clone();
+        function.by_descriptor = true;
         Ok(function)
     }
 
@@ -289,6 +391,8 @@ impl Library {
             properties: Arc::default(),
             constants_dictionary: Arc::default(),
             options: FunctionOptions::NONE,
+            specialized_name: None,
+            by_descriptor: false,
             _holds: holds,
         })
     }
@@ -320,14 +424,34 @@ impl Library {
 }
 
 impl Function {
-    /// `device`.
-    pub fn device(&self) -> &Device {
-        &self.device
+    /// `device`: a generation handle of the device, owned, as Metal's `device` answers a retained
+    /// device: of the generation its library was made on, then of each one the device's recoveries
+    /// carried its library to. The handle is the caller's: it keeps meaning that generation while
+    /// held, past a recovery that carries its library on, its raw handles that generation's
+    /// `VkDevice`'s, kept alive while held.
+    pub fn device(&self) -> Device {
+        self.generation().clone()
     }
 
-    /// `name`.
+    /// The generation handle [`device`](Self::device) answers a clone of, borrowed for the
+    /// runtime's own reads: a caller's handle is `device`'s, as a recovery lets go of the
+    /// object's handle of a lost generation at that generation's rest (`device/carry.rs`).
+    pub(crate) fn generation(&self) -> &Device {
+        self.device.generation()
+    }
+
+    /// A root handle of the function's device, which the calls that take it match by its line.
+    pub(crate) fn root_device(&self) -> &Device {
+        self.device.root()
+    }
+
+    /// `name`: the specialized name a [`FunctionDescriptor`] made the function with, else the
+    /// library function's own, as Metal answers it (`base_fn` made with the specialized name
+    /// `custom_fn` answers `custom_fn`, an M3 Max under macOS 27.0.1).
     pub fn name(&self) -> &str {
-        self.function.info().name
+        self.specialized_name
+            .as_deref()
+            .unwrap_or(self.function.info().name)
     }
 
     /// `options`: the options a [`FunctionDescriptor`] made the function with; none for a
@@ -448,26 +572,42 @@ impl Function {
     /// linked functions (`FunctionDescriptor::with_linked` adds them): a stage of a
     /// [`RenderPipelineDescriptor`] or the kernel of a [`ComputePipelineDescriptor`] as
     /// `StageSource::Function` (`MTLRenderPipelineDescriptor.vertexFunction` and
-    /// `.fragmentFunction`, `MTLComputePipelineDescriptor.computeFunction`).
+    /// `.fragmentFunction`, `MTLComputePipelineDescriptor.computeFunction`). It is specialized
+    /// (`FunctionDescriptor::specialized`) where the function was made with constant values or by
+    /// [`Library::new_function_with_descriptor`]; a pipeline state of one made by
+    /// [`Library::new_function_with_name`] whose function declares function constants is refused
+    /// (`Invalid` with [`Problem::UnspecializedFunction`]),
+    /// as plain Metal ends its process at the creation.
     ///
     /// [`RenderPipelineDescriptor`]: metal2vulkan::pipeline::RenderPipelineDescriptor
     /// [`ComputePipelineDescriptor`]: metal2vulkan::pipeline::ComputePipelineDescriptor
     pub fn function_descriptor(&self) -> StageFunction {
-        let mut descriptor = StageFunction::new(self.function.clone());
+        let mut descriptor = StageFunction::new(self.function.clone())
+            .with_specialized(self.specialized || self.by_descriptor);
         descriptor.constants = self.constants.clone();
         descriptor
     }
 
-    /// The function as a stage links it, with its constant values, and precompiled where it was
-    /// made compiled to a binary: an entry of [`LinkedFunctions`] (`MTLLinkedFunctions.functions`,
+    /// The function as a stage links it, with its constant values, under its specialized name
+    /// where it was made with one, specialized where it was made with constant values or by
+    /// [`Library::new_function_with_descriptor`], and precompiled where it was made compiled to a
+    /// binary: an entry of [`LinkedFunctions`] (`MTLLinkedFunctions.functions`,
     /// `.privateFunctions`, and the rest), which a stage's
     /// [`FunctionDescriptor`](metal2vulkan::pipeline::FunctionDescriptor) carries
-    /// (`with_linked`).
+    /// (`with_linked`). A visible-function reference resolves to it by [`name`](Self::name), as
+    /// Metal resolves it. A function constant of its module it was given no value for reads as
+    /// undefined where it is specialized; a function made by
+    /// [`Library::new_function_with_name`] that reaches one refuses the pipeline state
+    /// (`Compile`, `LinkProblem::UnresolvedConstant`), as Metal fails the creation ("cannot lower
+    /// module with unresolved function constants").
     ///
     /// [`LinkedFunctions`]: metal2vulkan::pipeline::LinkedFunctions
     pub fn linked_function(&self) -> LinkedFunction {
-        LinkedFunction::new(self.function.clone())
+        let mut linked = LinkedFunction::new(self.function.clone())
             .with_constants(self.constants.clone())
-            .with_precompiled(self.precompiled())
+            .with_specialized(self.specialized || self.by_descriptor)
+            .with_precompiled(self.precompiled());
+        linked.specialized_name = self.specialized_name.clone();
+        linked
     }
 }

@@ -200,10 +200,15 @@ surface! {
         enum ExtendedRangeBlend N;
         enum RuntimeInput N;
         enum DescriptorError N;
+        enum MetalAnswer N;
         enum DynamicLibraryProblem N;
+        enum MeshPipelineProblem N;
+        enum ComputePipelineProblem N;
         enum LinkProblem N;
         enum Limit N;
         enum BudgetExceeded N;
+        enum ConstantRecord N;
+        enum GenericPointer N;
         struct InternalError N;
         enum InternalKind N;
         enum BindError N;
@@ -225,12 +230,24 @@ surface! {
         enum ContainmentPolicy N;
         struct DevicePolicy N;
         enum HeapCompressionPolicy N;
+        enum HeapAnswerPolicy N;
         enum CompletionPolicy N;
         enum BatchOrderPolicy N;
         enum RenderLoweringPolicy N;
         enum HostPageTexturePolicy N;
         enum HalfChainPolicy N;
+        enum YCbCrInPlacePolicy N;
         enum PipelineWaitPolicy N;
+        enum WideLinePolicy N;
+        enum ExtendedRangeBlitPolicy N;
+        enum QueueSharingPolicy N;
+        enum UnsharedIsolationPolicy N;
+        enum DontCareColorPolicy N;
+        enum UnstoredDontCarePolicy N;
+        enum VertexReachPolicy N;
+        enum RateMapRegionPolicy N;
+        enum ManagedCopyInPolicy N;
+        enum IndirectRecordsPolicy N;
         struct DeviceProfile O;
         struct SpirvValidation N;
         struct EnabledCaps N;
@@ -313,6 +330,7 @@ surface! {
         struct UnwrittenFragmentInputs N;
     }
     "pipeline" => metal2vulkan::pipeline {
+        fn heap_sampler_capacity;
         fn heap_unused_while_pending;
         struct ComputePipeline N;
         struct ComputePipelineMetalInfo N;
@@ -322,6 +340,7 @@ surface! {
         struct EntryPlan N;
         enum EntryRef E;
         struct LinkedSource O;
+        struct MeshPipelineMetalInfo N;
         struct StageEntries O;
         struct StandaloneModule N;
         struct ModuleStats N;
@@ -356,12 +375,16 @@ surface! {
         struct VertexAttributeDescriptor N;
         struct VertexBufferLayoutDescriptor N;
         struct VertexDescriptor N;
+        enum BandPrimitive E;
         struct BlendState N;
         struct ColorAttachmentState N;
+        struct FanOutState N;
         struct FragmentImageblock N;
         struct GraphicsState N;
         enum ImageblockMechanism N;
         struct InputAttachmentUse N;
+        struct LineBandState N;
+        enum RegionFanOut E;
         struct ShaderTestsUse N;
         struct ShadowStencilUse N;
         struct StandInUse N;
@@ -377,6 +400,7 @@ surface! {
         struct BufferSlot N;
         struct CommandWrites E;
         enum DescriptorView N;
+        struct LevelReads N;
         struct MeshRecords N;
         enum NumberedSampler N;
         enum PatchDomain N;
@@ -386,8 +410,12 @@ surface! {
         struct PushPlacement N;
         struct RecordField N;
         enum RecordValue N;
+        struct SampledLevels N;
+        struct SamplerArray N;
+        struct SamplerLevels N;
         struct SamplerSlot N;
         enum SlotInterface N;
+        enum SnapshotRefusal N;
         struct TextureAccess N;
         struct TextureSlot N;
         struct ThreadgroupArgument N;
@@ -464,6 +492,7 @@ surface! {
         struct MeshDispatch N;
         enum MeshGroups N;
         enum MeshRecordsRegion N;
+        struct SlotRebinds O;
         struct TessellationDispatch N;
         enum TessellationRecords N;
         fn heap_classes;
@@ -488,6 +517,7 @@ surface! {
         struct IndirectRef N;
         struct PushConstantWrite N;
         enum PushHole E;
+        struct ResidentPart O;
         struct ResidentRange N;
         struct ResidentSet O;
         struct RootTable N;
@@ -574,19 +604,23 @@ surface! {
         struct DrawReplayLayout N;
         struct DrawReplayModule N;
         struct DrawReplayPreprocess N;
+        struct InheritedBytes N;
         const DRAW_ARGUMENT_BYTES;
         const MAX_DRAW_REPLAY_TYPES;
         fn draw_replay_draw;
+        fn draw_replay_indexed;
         fn draw_replay_merges;
         fn draw_replay_primitive_type;
         fn draw_replay_slots;
         fn draw_replay_state;
+        fn draw_replay_vertex_layouts;
         enum DrawReplayRule N;
         const DRAW_REPLAY_WRITES;
         fn draw_merge_module;
         struct DrawMergeModule N;
         enum MergePhase E;
         struct MergedLayout N;
+        const DRAW_INDEX_ENTRY_BYTES;
         const MERGED_CHUNK;
         const MERGED_HEADER_BYTES;
         const MERGED_REST_FIRST;
@@ -628,9 +662,6 @@ surface! {
         struct ContinuedResult N;
         struct VisibilityCombine N;
         struct VisibilityCombineModule N;
-        fn visibility_resolve_module;
-        struct VisibilityResolve N;
-        struct VisibilityResolveModule N;
         fn shadow_copy_back_module;
         struct ShadowCopyBackModule N;
         enum ShadowTexelView E;
@@ -638,6 +669,17 @@ surface! {
         struct ShadowCopyInModule N;
         fn rows_copy_module;
         struct RowsCopyModule N;
+        fn icb_reset_module;
+        struct IcbResetModule N;
+        fn pages_copy_module;
+        enum PagesCopy E;
+        struct PagesCopyModule N;
+        fn extended_canonical_module;
+        fn extended_range_canonical;
+        struct ExtendedCanonicalModule N;
+        fn depth_clamp_module;
+        fn clamped_depth;
+        struct DepthClampModule N;
         fn dynamic_views_module;
         struct DynamicViewsModule N;
         fn shadow_merge_module;
@@ -710,6 +752,7 @@ surface! {
         struct YCbCrPlanes N;
         struct YCbCrInPlace N;
         struct YCbCrPlanesSampler N;
+        struct TexelRows N;
         struct YCbCrConversion N;
         struct YCbCrCodes N;
         enum YCbCrOutput N;
@@ -728,6 +771,8 @@ surface! {
         enum PlanesCopy N;
         struct PlanesMergeModules N;
         struct PlanesSplitModule N;
+        fn check_draw_modules;
+        struct CheckDrawModules N;
         fn interleave_merge_modules;
         fn interleave_split_module;
         struct InterleaveMergeModules N;
@@ -782,7 +827,29 @@ surface! {
         enum RewriteProgram N;
         struct RewriteRunDraw E;
         enum RewriteSource N;
+        mod fan_out;
         mod indirect_commands;
+    }
+    "bind::fan_out" => metal2vulkan::bind::fan_out {
+        const BLOCK_SET;
+        const BLOCK_TRIANGLES;
+        const BOUND_BUCKETS;
+        const FEW_COPIES;
+        const HEADER_ENTRIES;
+        const MAX_SEGMENTS;
+        const PROBE_BLOCKS;
+        const PROBE_BOUNDS_AT;
+        const PROBE_COUNT_WORDS;
+        const PROBE_DRAW_WORDS;
+        const PROBE_SETS;
+        const STRADDLE_SET;
+        const TABLE_BYTES;
+        const WIDEN_PIXELS;
+        fn bucket;
+        fn clip_entry;
+        fn line_entry;
+        fn scissors;
+        fn table;
     }
     "bind::indirect_commands" => metal2vulkan::bind::indirect_commands {
         enum Action E;
@@ -811,7 +878,9 @@ surface! {
         const RECORDS_ADDRESS_BASE;
         const RECORDS_ID_LIMIT;
         const THREADGROUP_BUFFER_ARGUMENT_COUNT;
+        const WRITTEN_FLAG_BYTES;
         fn records_address;
+        fn written_flag_offset;
     }
     "cache" => metal2vulkan::cache {
         type Hash256;
@@ -891,6 +960,7 @@ surface! {
         fn block_extent;
         enum Footprint N;
         fn footprint;
+        fn copies_only;
         fn imageblock_sample_length;
         fn color_record;
         fn explicit_imageblock_sample_length;
@@ -925,9 +995,11 @@ surface! {
         struct SamplerWord E;
         struct AddressModeMap O;
         enum OpaqueBlackBorder N;
+        enum DeviceLodBias N;
         const NOT_MIPMAPPED_MAX_LOD;
         fn check_sampler;
         fn vk_sampler;
+        fn device_lod_bias;
         fn check_border_swizzle;
         fn check_border_view;
         fn opaque_black_reads_transparent;
@@ -1446,7 +1518,10 @@ fn a_signed_integer_attachment_compiles_the_fragment_for_it() {
             dev.compile_render_pipeline(&foreign, &Budget::standard())
                 .unwrap_err(),
             metal2vulkan::error::Error::InvalidDescriptor(
-                metal2vulkan::error::DescriptorError::ColorAttachment { index: 1 }
+                metal2vulkan::error::DescriptorError::ColorAttachment {
+                    index: 1,
+                    metal: metal2vulkan::error::MetalAnswer::NilWithError,
+                }
             ),
             "{stem}"
         );
@@ -2275,6 +2350,7 @@ fn scanned_modules() -> Vec<&'static str> {
         "reflection",
         "pipeline",
         "bind",
+        "bind::fan_out",
         "bind::indirect_commands",
         "cache",
         "metal",

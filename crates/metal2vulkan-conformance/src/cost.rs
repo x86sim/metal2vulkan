@@ -74,9 +74,35 @@ const NOT_SUBTRACTABLE: [(&str, &str); 3] = [
     ("_nanos", "an accumulated time, which no count gate holds"),
 ];
 
+/// A prefix of the fields that count the device's own checks (the runtime's `submit_check.rs`,
+/// `queue_switch_check.rs`, `in_place_check.rs`), with why the cost half does not read them. A
+/// check runs once per driver and release with no stored verdict, on a thread of its own, as the
+/// first device of a run is made or first asks, so inside whichever case met that device: seen on
+/// the M3 Max in a fresh workspace, `pass-bytes-srgb-decode-all-bytes` read 162 of the submission
+/// checks' calls and their one run, and their allocations among its own. Their work is counted
+/// apart from the device's (`submit_check_*`, and `device_checks` for their makings, releases and
+/// other submissions), and none of it is a case's.
+const DEVICE_CHECKS: [(&str, &str); 2] = [
+    (
+        "submit_check",
+        "the device's own submission checks' work, once per driver and release on a thread of \
+         its own, counted apart from the device's: never a case's",
+    ),
+    (
+        "device_checks",
+        "the device's own checks' makings, releases and submissions, once per driver and release \
+         on threads of their own, counted apart from the device's: never a case's",
+    ),
+];
+
 /// Whether `name` is a field the cost half reads, or why it is not.
 pub fn excluded(name: &str) -> Option<&'static str> {
     let head = name.split('.').next().unwrap_or(name);
+    for (prefix, why) in DEVICE_CHECKS {
+        if head.starts_with(prefix) {
+            return Some(why);
+        }
+    }
     for (suffix, why) in NOT_A_COUNT {
         if head.ends_with(suffix) {
             return Some(why);
@@ -231,7 +257,7 @@ pub struct PipelinesPerState {
 impl PipelinesPerState {
     /// The ratio this measurement read, where it read one.
     pub fn ratio(&self) -> Option<f64> {
-        (self.states > 0).then(|| self.pipelines as f64 / self.states as f64)
+        (self.states > 0).then_some(self.pipelines as f64 / self.states as f64)
     }
 
     /// The most pipelines this bound allows a run that created `states` states.
@@ -395,8 +421,35 @@ const COMPLEMENT: &str = "which of our own threads ran a command buffer's transi
 /// Measured: it reached 1 where the measurement's most was 0 on `sample-positions-custom-2x` in two
 /// whole-set replays, and both measurement shapes read 0 — a release that lands in the replay's
 /// timing and not in the measurement's is exactly what a quiet period does.
+///
+/// The same quiet period stands behind `memory_frees.kept_stale` (a kept empty block freed after
+/// `KEPT_EMPTY_FOR` without a placement), `blocks_ahead_unused` (a block made ahead freed once
+/// its pool had stopped growing for 10 s) and the two totals that count those frees among others,
+/// `memory_frees.blocks` and `memory_frees_posted`. Measured: a whole-set replay on this M3 Max
+/// put all four at 1 where the measurement's most was 0 on `swizzled-storage-rgba8unorm`,
+/// `rotated-planes-store-0-64x16`, `render-then-sample-exact` and
+/// `pass-start-barrier-private-read`, and the whole-set measurement of the same tree read 0.
 const QUIET: &str = "a pooled memory block freed because it had been kept empty past its quiet \
      period, which is a question about elapsed time rather than about the case's work";
+
+/// Why `memory_frees_paced` is reported and never gated: it counts the frees of the runtime's own
+/// background threads that waited first, and a free waits only where it came sooner after the one
+/// before it than that one took (`step_aside::pace` in the runtime). Those threads' frees are
+/// themselves timed: the free thread's are the ones `memory_frees_posted` counts, which the
+/// quiet period already reports ([`QUIET`]), the residency thread's are imports idle past their
+/// window, and a guest RAM's thread's are chunks and lists idle past theirs. So whether a paced
+/// free lands in a case's window, and whether it waited, is a question about when those threads
+/// ran. Its partner `memory_frees_paced_nanos` is an accumulated time, reported by its suffix.
+///
+/// Measured on this M3 Max at `43d2308170`: the whole-set measurement moved it between the runs
+/// of one case (`depthstencil-depth-codes` 0..2, `read-write-tier-round-trip-uint` 0..1), and a
+/// whole-set replay put it at 1 on `fresh-buffer-private` and 2 on
+/// `fresh-texture-2d-rgba8unorm-shared` where the measurement read 0, two cases that free nothing
+/// of their own, alone or together (no free of any kind in eight runs of each shape).
+const PACED: &str = "a free of one of the runtime's own background threads that waited after \
+     the free before it, which happens only where it came sooner after that one than it took, \
+     and those threads free on timers (the quiet period, the idle windows), which is a question \
+     about elapsed time rather than about the case's work";
 
 /// Why `finales_folded` is reported and never gated: it is one half of a split the **submission
 /// path** decides as it runs, not a count of what the case asked for.
@@ -457,7 +510,7 @@ const POOLED: &str = "an object made because no spare was free, where a spare co
 /// replays of a larger case set — which reads like a regression and is not one. See [`BORROWED`].
 /// `slot_returns` beside it stays gated: it counts work items, one a command buffer, and has held
 /// still alone and in both case sets.
-const RACY: [(&str, &str); 33] = [
+const RACY: [(&str, &str); 47] = [
     ("fences_made", POOLED),
     // What is alive, parked or waiting at the instant the counts were read.
     ("memory_blocks_live", INSTANTANEOUS),
@@ -478,6 +531,10 @@ const RACY: [(&str, &str); 33] = [
     // own work, and `_reused` by counts of what a case's own encoder settled once.
     ("pipeline_layouts_shared", FOUND),
     ("shader_modules_shared", FOUND),
+    // A linked pipeline taken from another variant of the same link: in company, a case's first
+    // creation of a link finds it linked by a case before it, which moves this up and its partner
+    // `pipelines_linked`, which stays gated, down.
+    ("linked_pipelines_shared", FOUND),
     // An ask for a stage's function answered by the device's memo, a binary archive or the shader
     // cache on disk. The memo and the cache are the device's and the run's, so whether this case's
     // *first* ask for a function finds it already translated depends on whether a case before it
@@ -488,15 +545,64 @@ const RACY: [(&str, &str); 33] = [
     ("sampler_sets_shared", FOUND),
     ("variants_taken_back", FOUND),
     ("draw_shapes_reused", FOUND),
+    // A draw's shape taken from an earlier encoder's draw of its drawing state: kept, or not, by
+    // the same rule as a shape `draw_shapes_reused` counts, so reported beside it (its own
+    // movement with the selection is unmeasured).
+    ("draw_shapes_carried", FOUND),
     ("completed_waits", BORROWED),
     ("pipeline_pool_busy", POOL_STATE),
     ("encoder_primaries_begun_ahead", AHEAD),
     ("primaries_begun_ahead", AHEAD),
     ("commands_recorded.begin_command_buffer", BEGUN),
     ("completed_where_seen", COMPLEMENT),
+    (
+        "completion_waiter_",
+        "how many times a queue's waiter slept on its condition variable, which is when that \
+         thread ran and not what the case asked for",
+    ),
+    (
+        "batches_submitted_by_waiters",
+        "the batches a thread about to block for a command buffer's completion submitted in its \
+         own pass over the scheduler's order, which is nonzero only where the scheduler's own \
+         thread had not yet submitted them, which is when that thread ran and not what the case \
+         asked for",
+    ),
+    (
+        "batches_held_for_another_queue",
+        "whether a queue's waiter saw a batch complete before the waiter of the batch it waited \
+         for on another queue saw that one, which is when those threads ran and not what the case \
+         asked for",
+    ),
+    (
+        "command_buffers_completed_after_another_queue",
+        "whether the transition of the command buffer a command buffer waited for on another \
+         queue had reached its handlers as that command buffer completed, which is when the \
+         handler threads ran",
+    ),
+    (
+        "commits_taken_in",
+        "counted as the scheduler's pass that took a commit in ends, which can come after the \
+         command buffer completed and the case read its counts",
+    ),
+    (
+        "completion_turns_where_taken",
+        "which of our own threads finished a command buffer taken with no submission: the one \
+         that took it where its queue's earlier work had completed by then, else a queue's \
+         waiter, so it moves with when the GPU finished that work",
+    ),
     ("pooled_memory_blocks_freed", QUIET),
+    // The allocator's frees by cause: the quiet-period cause, and the two totals that hold it.
+    // Every other cause (`memory_frees.dedicated`, `.pooled_emptied`, `.kept_for_room`, the
+    // imports' and `.teardown`) stays gated by its own name, so reporting the totals drops no
+    // gate on a free that is a case's own work.
+    ("memory_frees.kept_stale", QUIET),
+    ("memory_frees.blocks", QUIET),
+    ("memory_frees_posted", QUIET),
+    ("memory_frees_paced", PACED),
+    ("blocks_ahead_unused", QUIET),
     ("finales_folded", FOLDED),
     ("command_pools_made", POOLED),
+    ("command_buffers_made", POOLED),
     ("spare_command_pools_", POOLED),
     ("live_tables_uploaded", POOLED),
     (
@@ -611,7 +717,7 @@ pub fn monotone(name: &str) -> Option<&'static str> {
 /// truncated and it reran. The other read the counters behind its own movements and found every one
 /// of them process-shared. Neither symptom could be read off a single run, which is the property
 /// that makes this class worth naming rather than discovering again.
-const SHARED: [(&str, &str); 21] = [
+const SHARED: [(&str, &str); 23] = [
     // `work_counts.rs`: "every batch, by how far its queue's work ran behind its submission".
     // Four buckets of one histogram, and which bucket a batch lands in is decided by how fast the
     // GPU drained what was submitted before it, earlier cases included. The sum is the case's own
@@ -637,6 +743,11 @@ const SHARED: [(&str, &str); 21] = [
     // them is pending. Whether a registration finds a submission holding the order is a race with
     // that submission. Reads 0 on this venue, and is here on its definition.
     ("registrations_waited", QUEUE_DEPTH),
+    // Host steps whose gate "left out work submitted before it". A gate the batches that last
+    // wrote what the step reads set holds no value for a writer the host had already seen
+    // complete, so whether it falls below the queue's last submission depends on how far the GPU
+    // had got when it was taken. Here on its definition.
+    ("host_step_gates_narrowed", QUEUE_DEPTH),
     // The two halves of a transition's thread that an earlier pass left gated because nothing had
     // been seen to move them. Definition-first says otherwise, and consistency matters more than
     // the reach: `scheduled_where_submitted` is documented as running "on the scheduler's thread
@@ -671,6 +782,11 @@ const SHARED: [(&str, &str); 21] = [
     ("heads_held_for_event_values", LOOKS),
     ("heads_held_for_earlier_commits", LOOKS),
     ("heads_waiting_at_their_gate", LOOKS),
+    // Command buffers made `Scheduled` as "a look found their queue's head waiting at its host
+    // step's gate": whether a look came while the head waited there, before the GPU reached the
+    // gate, is when that thread ran against the GPU's progress, as for the count above. Here on
+    // its definition.
+    ("scheduled_behind_host_steps", LOOKS),
     ("heads_awaiting_check_signals", LOOKS),
     ("batches_held_past_a_look", LOOKS),
 ];
@@ -740,7 +856,7 @@ impl Region {
 
 /// The name prefixes that put a count in [`Region::Translation`]: making a module, a layout or a
 /// pipeline.
-const TRANSLATION: [&str; 19] = [
+const TRANSLATION: [&str; 21] = [
     // The AIR decode and specialization a pipeline creation does for its stages, and the question
     // it asks about a linked function's uses. Translation work by definition -- an entry's
     // specialization depends on the functions and the constants, never on the pipeline state -- so
@@ -776,16 +892,18 @@ const TRANSLATION: [&str; 19] = [
     "pipeline_libraries_",
     "fragment_shader_libraries_",
     "pipelines_linked",
+    "linked_pipelines_shared",
     "dispatch_pipelines_pooled",
     "tile_pipelines_pooled",
     "variants_taken_back",
     "flights_followed",
+    "makings_held_for_compile_memory",
     "residual_form_makings",
 ];
 
 /// The name prefixes that put a count in [`Region::Submission`]: the commit path, our own other
 /// threads and the GPU.
-const SUBMISSION: [&str; 48] = [
+const SUBMISSION: [&str; 58] = [
     "commands_recorded.",
     "command_buffers_",
     "command_pools_made",
@@ -797,6 +915,19 @@ const SUBMISSION: [&str; 48] = [
     "submit_infos",
     "internal_submissions",
     "staging_submissions",
+    // The staging queue's submissions that carried the copies host calls queued, and the
+    // batches' GPU waits for them: work a burst of calls left to a later submission.
+    "staging_flushes",
+    "staging_gpu_waits",
+    // The staging queue's command buffers made past those it keeps, and the waits on the host
+    // for one to come free.
+    "staging_buffer",
+    // The fill queue's submissions: a batch's new buffers' fills on a copy engine, before it;
+    // and the batches' GPU waits for them.
+    "fill_queue_submissions",
+    "fill_queue_waits",
+    // The batches' GPU waits for other queues' batches that did new resources' first work.
+    "first_work_waits",
     "grouped_submissions",
     "batches_",
     "group_ends_",
@@ -826,11 +957,15 @@ const SUBMISSION: [&str; 48] = [
     "trail_waits",
     "missed_completion_wakes",
     "completed_where_seen",
+    "completion_seen_handlers_",
+    "completion_turns_where_taken",
+    "completion_waiter_",
     "scheduled_where_submitted",
     "timestamp_slots_",
     "calibration",
     "queue_drains",
     "commits_handed_off",
+    "commits_taken_in",
     "render_log_",
     "replay_logs_kept",
     "encoders_reencoded",
@@ -1644,6 +1779,29 @@ impl std::fmt::Display for CostVerdict {
     }
 }
 
+/// The venue a cost run on `device` names, and so the record it is held to or writes: the device's
+/// name, and the build's profile where the build is not the one the suite measures in.
+///
+/// A count is the build's as much as the device's. A build with debug assertions takes paths of
+/// its own: a kept draw rebound again takes the whole check at its first and every second hit
+/// (the runtime's `render/draw_again.rs` and `render/draw_again/rebound.rs`), so
+/// `point-viewport-coverage`'s rebinds read 1 there where a release build of the same tree read 3
+/// (the M3 Max, 11-07). Every committed record was measured by the suite's debug binary (the
+/// bless runs `cost --write` from `target/debug`), and a release build's runs name their venue
+/// apart: held to no record of the other profile, they are [`CostVerdict::Unmeasured`], and a
+/// release build's `--write` keeps a record of its own beside the debug one.
+pub fn venue(device: &str) -> String {
+    venue_of(device, cfg!(debug_assertions))
+}
+
+/// [`venue`]'s name for a build with debug assertions where `debug`, else a release build's.
+pub(crate) fn venue_of(device: &str, debug: bool) -> String {
+    match debug {
+        true => device.to_owned(),
+        false => format!("{device}, release build"),
+    }
+}
+
 /// Hold `observed` to the bounds `records` holds for `venue`.
 ///
 /// `whole_set` says whether the run was of the whole case set, which is the measurement's own
@@ -1797,6 +1955,28 @@ pub enum Shape {
     Alone,
 }
 
+/// Why a `cost --write` of `shape` over `selected` of the case set's `whole` cases writes nothing,
+/// where it may not: an in-set measurement of a selection that is not the whole case set.
+///
+/// A case's in-set counts are of what ran before it in the process, and [`judge`] holds them to
+/// their bounds only in a run of the whole set, so a bound or ratio written from a smaller
+/// selection is of a composition the gate never runs. Measured: the 36 cases the interlocked split
+/// moved, written from a selection of those 36 alone, recorded `xr-masked-bgr10xr-red` at 3
+/// pipelines over its 2 states and `xr-masked-bgr10xr-blue-green` at 6, where every whole-set run
+/// reads 6 and 3 (the released variants the next creation takes back are another case's in the
+/// whole set), and the gate failed both. Each case alone is the same shape in any selection, so an
+/// alone measurement writes from any.
+pub fn write_refusal(shape: Shape, selected: usize, whole: usize) -> Option<String> {
+    (shape == Shape::InSet && selected != whole).then(|| {
+        format!(
+            "--write takes an in-set measurement of the whole case set ({whole} cases) alone, \
+             and this selection holds {selected}: a case's in-set counts are of what ran before \
+             it, and the gate holds them to their bounds only in a run of the whole set \
+             (`--alone --write` writes from any selection)"
+        )
+    })
+}
+
 /// What one case's cost run came to: the counts it moved, and how long it took.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaseCost {
@@ -1909,12 +2089,32 @@ impl CaseCost {
         for (count, _, apart) in self.apart_from(held) {
             folded.composed.insert(count.to_owned(), apart);
         }
+        // A ceiling is this lone run's reading, taken again at each lone measurement: the one
+        // `held` carries was an earlier lone run's, and the whole-set write raised the bound to it
+        // (`carrying_the_contrast_of`) without reading the case alone. A lone run that now reads
+        // lower (a making the tree no longer does) lowers the ceiling and the bound it set, down to
+        // what the gate's own shape read; kept, the stale ceiling held the bound at the old reading
+        // for good, and the set's lower reading went to `composed` as a disagreement. Measured: the
+        // re-bless at 24ae90feb3 kept `render-then-sample-magnified-nearest`'s
+        // `creation_pipelines_made` at a ceiling of 3, both shapes reading 2.
+        for count in held.ceilings.keys() {
+            if monotone(count).is_some() && racy(count).is_none() {
+                let apart = self.counts.get(count);
+                let inside = set_reading(held, count, apart);
+                folded.ceilings.remove(count);
+                if let Some(bound) = folded.bounds.get_mut(count) {
+                    *bound = inside.max(apart);
+                }
+            }
+        }
         // And the counts this run read *above* the gate's own shape for the one reason that is a
         // ceiling rather than a disagreement. They stay gated, at this reading, and it is written
-        // down so a later measurement of the gate's own shape cannot drop it.
+        // down so a later measurement of the gate's own shape cannot drop it. One that held a
+        // ceiling keeps it at this reading, where the set's own did not exceed it.
         for (count, apart) in self.counts.iter() {
-            let inside = held.bounds.get(count).copied().unwrap_or(0);
-            if monotone(count).is_some() && apart > inside {
+            let inside = set_reading(held, count, apart);
+            let held_one = held.ceilings.contains_key(count);
+            if monotone(count).is_some() && (apart > inside || (held_one && apart == inside)) {
                 folded.ceilings.insert(count.to_owned(), apart);
             }
         }
@@ -1949,10 +2149,8 @@ impl CaseCost {
         names
             .into_iter()
             .filter_map(|count| {
-                let (inside, apart) = (
-                    held.bounds.get(count).copied().unwrap_or(0),
-                    self.counts.get(count),
-                );
+                let apart = self.counts.get(count);
+                let inside = set_reading(held, count, apart);
                 let its_ceiling = monotone(count).is_some() && apart > inside;
                 (inside != apart && !its_ceiling && racy(count).is_none())
                     .then_some((count, inside, apart))
@@ -1981,6 +2179,21 @@ impl CaseCost {
                 (least < most && racy(count).is_some()).then_some((count, least, most))
             })
             .collect()
+    }
+}
+
+/// What the gate's own shape read of `count`, as `held` says, beside a lone run's reading `apart`.
+///
+/// `held`'s bound, but where it holds a ceiling of the count that its bound does not exceed: the
+/// whole-set write raised the bound to that ceiling (`CostRecord::carrying_the_contrast_of`), so
+/// the set read at most it, and by the direction its `MONOTONE` row rests on, at most a lone run's
+/// reading. So the smaller of the bound and `apart`: a stale ceiling is neither a disagreement nor
+/// the set's own reading.
+fn set_reading(held: &CostRecord, count: &str, apart: u64) -> u64 {
+    let bound = held.bounds.get(count).copied().unwrap_or(0);
+    match held.ceilings.get(count) {
+        Some(&ceiling) if monotone(count).is_some() && bound <= ceiling => bound.min(apart),
+        _ => bound,
     }
 }
 
@@ -2447,10 +2660,10 @@ mod the_ratio {
 ///
 /// # The census these numbers are, read off the committed recordings
 ///
-/// 589 recordings carry a cost record that makes a creation pipeline at all. Over them: **1,446
-/// made, 815 taken by a command, 631 taken by none.** 158 cases take every one they make, 411 take
-/// none of theirs, and 16 take some and not others — the `xr-blend-planes-*` family at 3 made and 1
-/// taken, `topology-class-plain-function` and `frame-length-chain` at 4 and 2.
+/// 607 cost records make a creation pipeline at all. Over them: **1,483 made, 958 taken by a
+/// command, 525 taken by none.** 260 take every one they make, 326 take none of theirs, and 21 take
+/// some and not others — the `xr-blend-planes-*` family at 3 made and 1 taken,
+/// `topology-class-plain-function` and `frame-length-chain` at 4 and 2.
 ///
 /// **The ceiling rose from 508 to 624 because the coverage did, and the rate improved sharply while
 /// it did.** Every one of the 1,103 recordings carries a cost record now, where 399 carried none,
@@ -2464,12 +2677,12 @@ mod the_ratio {
 /// # And the total is two predictions, which is the thing it cannot say
 ///
 /// `creation_pipelines_made` is one count over the render prediction (`pipeline/predicted.rs`) and
-/// the compute one (`pipeline/dispatch_making.rs`), so 631 says nothing about either. Split by the
+/// the compute one (`pipeline/dispatch_making.rs`), so 525 says nothing about either. Split by the
 /// commands each record's own counts say our leg recorded ([`Speculated`], and no new counter was
-/// needed for it), the two are nothing like each other: **the render prediction is taken 754 times
-/// in 799 over the 154 rows that draw and do not dispatch, and the compute prediction 0 times in
-/// 461 over the 277 rows that dispatch and do not draw.** 461 of the 631 is one prediction with no
-/// hit in the whole committed census, and 455 of those 461 are rows that make no render pass at
+/// needed for it), the two are nothing like each other: **the render prediction is taken 863 times
+/// in 892 over the 222 rows that draw and do not dispatch, and the compute prediction 0 times in
+/// 386 over the 223 rows that dispatch and do not draw.** 386 of the 525 is one prediction with no
+/// hit in the whole committed census, and 379 of those 386 are rows that make no render pass at
 /// all. [`WASTED_BY_CLASS`] holds the four classes apart and [`DRAWS_TAKEN`] holds the render
 /// prediction's reach, which a ceiling on waste does not.
 #[cfg(test)]
@@ -2491,7 +2704,13 @@ mod the_creation_prediction {
     /// dispatch rather than draw, so no command can take a predicted render pipeline, which is
     /// the legitimate half of the question and the shape `known-slow-calls.tsv` already names as
     /// the largest single share of this count.
-    const WASTED: u64 = 631;
+    ///
+    /// **Lowered to 593 by the render prediction's reach** (a key holds no pass's resolves, a
+    /// point draw of the point class takes its guard band's variant, a multisampled reader of an
+    /// extended-range color its shadow's, a creation whose fragment converts texels to `half`
+    /// makes only the plain arm its draws take), which took 24 from the draws class and 14 from
+    /// both kinds ([`WASTED_BY_CLASS`]); the census reads 525.
+    const WASTED: u64 = 593;
 
     /// **The same ceiling, per class of speculation**, which is the statement [`WASTED`] cannot
     /// make: it is one number over two predictions, so it holds neither.
@@ -2501,25 +2720,46 @@ mod the_creation_prediction {
     ///
     /// | class | rows | made | taken | by none | taken |
     /// |---|---|---|---|---|---|
-    /// | draws and no dispatch | 154 | 799 | 754 | 45 | 94.4% |
-    /// | dispatches and no draw | 277 | 461 | 0 | 461 | 0.0% |
-    /// | both kinds | 84 | 107 | 61 | 46 | 57.0% |
-    /// | no command at all | 74 | 79 | 0 | 79 | 0.0% |
-    /// | all | 589 | 1,446 | 815 | 631 | 56.4% |
+    /// | draws and no dispatch | 222 | 892 | 863 | 29 | 96.7% |
+    /// | dispatches and no draw | 223 | 386 | 0 | 386 | 0.0% |
+    /// | both kinds | 103 | 141 | 95 | 46 | 67.4% |
+    /// | no command at all | 59 | 64 | 0 | 64 | 0.0% |
+    /// | all | 607 | 1,483 | 958 | 525 | 64.6% |
     ///
     /// **So the two predictions are nothing like each other, and the total hides it.** The render
-    /// prediction is taken 754 times in 799 on the cases that draw, and its 45 misses are spread
-    /// one or two to a row over 42 rows led by `sample-positions-*` and the `a2c-*` sweeps — the
-    /// shape this module's docs already name as unpredictable, since `GraphicsKey` carries
-    /// `sample_positions` and the pass. The compute prediction is taken **0** times in 461 over
-    /// 277 rows. 461 of the 631 is one prediction, and 455 of those 461 are rows that make no
-    /// render pass at all.
+    /// prediction is taken 863 times in 892 on the cases that draw. The compute prediction is
+    /// taken **0** times in 386 over 223 rows. 386 of the 525 is one prediction, and 379 of those
+    /// 386 are rows that make no render pass at all.
+    ///
+    /// **The draws class's 29, by what a creation cannot know** (`pipeline/predicted.rs`), one to
+    /// a row but `topology-class-plain-function`'s two:
+    ///
+    /// - 17 `sample-positions-*` rows whose pass sets custom sample positions, which `GraphicsKey`
+    ///   carries and a creation cannot see.
+    /// - The six `xr-masked-bgr10xr-*` rows: a single-sampled pass holds an extended-range color's
+    ///   `half` shadow only once an earlier draw wrote it (`render/extended_shadow.rs`), which a
+    ///   creation cannot see either.
+    /// - Five draws of another primitive than the state's class predicts: the
+    ///   `topology-class-*` cases' states of the point and line classes drawing triangles, and
+    ///   states of the unspecified class drawing points or lines (`point-viewport-coverage`,
+    ///   `render-draw-forms-lines`, `topology-class-point-size-function`'s unspecified state),
+    ///   which a creation predicts as triangles.
+    /// - `depthstencil-stencil-compares`, one, not traced to its key.
+    ///
+    /// None of them is a draw in a pass that resolves, a point draw of the point class or a
+    /// multisampled blend into an extended-range color: a creation predicts those
+    /// (`PassShape::keyed`, the point guard, the shadows), and their draws take its pipeline.
+    ///
+    /// A state whose fragment function converts a texture's texels to `half`
+    /// (`render-then-sample-magnified-nearest` and `-linear`) makes the one pipeline its draws
+    /// take: a general form keeps the predicted plain arm (`render/residual.rs`), so its creation
+    /// makes no class routine's arm beside it, and both rows read 2 made and 2 taken.
     ///
     /// # Why the total cannot hold this
     ///
-    /// A ceiling on the sum passes a trade between the halves. Were the compute prediction's 461
-    /// to go to nothing while the render prediction lost half its accuracy — 799 made, about 400
-    /// taken — the census would read about 586 against the ceiling of 631 and this family would
+    /// A ceiling on the sum passes a trade between the halves. Were the compute prediction's 386
+    /// to go to nothing while the render prediction lost half its accuracy — 892 made, about 446
+    /// taken — the census would read about 556 against the ceiling of 593 and this family would
     /// report everything well. The per-class ceilings below fail it, and name the class that
     /// widened.
     ///
@@ -2527,7 +2767,7 @@ mod the_creation_prediction {
     /// the rows that grew rows that run no command of that kind — legitimate — or rows that
     /// mispredict a command they do run.
     const WASTED_BY_CLASS: [(Speculated, u64); 4] = [
-        (Speculated::Draws, 45),
+        (Speculated::Draws, 29),
         (Speculated::Dispatches, 461),
         (Speculated::Both, 46),
         (Speculated::NoCommand, 79),
@@ -2539,9 +2779,9 @@ mod the_creation_prediction {
     /// A ceiling on waste is not this statement. A case family that stops drawing, or a landing
     /// that removes one, lowers the waste and the reach together, and only the ceiling notices
     /// nothing. This is the half that says the prediction is still *right*, and it is the reason
-    /// the render prediction must not be made lazy: at 754 of 799 it is taken 94.4% of the time,
+    /// the render prediction must not be made lazy: at 863 of 892 it is taken 96.7% of the time,
     /// so a lazy render pipeline would move a creation's compile into the first draw's command
-    /// buffer 94 times in 100 — which is the cold making inside a command buffer's execution that
+    /// buffer 97 times in 100 — which is the cold making inside a command buffer's execution that
     /// `pipeline/predicted.rs` exists to have removed.
     const DRAWS_TAKEN: u64 = 754;
 
@@ -2836,7 +3076,7 @@ mod the_creation_prediction {
             "the rows that draw and do not dispatch now take {} of the {} pipelines their \
              creations make, where {DRAWS_TAKEN} were taken. A ceiling on waste cannot say this: \
              a family that stops drawing lowers the waste and the reach together. The render \
-             prediction being taken 94% of the time is why it is made at a creation at all, so a \
+             prediction being taken 96% of the time is why it is made at a creation at all, so a \
              drop here is a cold compile moving back inside a first draw's command buffer",
             read.drawn,
             read.made,

@@ -26,7 +26,8 @@ pub enum HostBacking {
     ImportedByPointer,
     /// In place: the device imported dma-bufs of the pages that the caller's source made
     /// ([`HostMemory::with_dma_buf`](crate::HostMemory::with_dma_buf)), where it refused their
-    /// pointer. Released while idle and imported again as an import by pointer may be.
+    /// pointer or imports none (it enables no `VK_EXT_external_memory_host`). Released while idle
+    /// and imported again as an import by pointer may be.
     ImportedAsDmaBuf,
     /// In place: bound in the device's import of a chunk of a guest RAM it uses
     /// ([`Device::use_host_ram`](crate::Device::use_host_ram),
@@ -35,14 +36,22 @@ pub enum HostBacking {
     /// A copy of the pages in memory of the device's own, which the GPU reads and writes in their
     /// place: the caller's gate refused their import
     /// ([`HostMemory::with_import_gate`](crate::HostMemory::with_import_gate)), the import the
-    /// device and the gate admitted failed, or a rebind's new bytes lie at another offset in
-    /// their page than the old under a texture over the buffer. Announced as the
+    /// device and the gate admitted failed, a rebind's new bytes lie at another offset in their
+    /// page than the old under a texture over the buffer, on Linux the process maps some of the
+    /// pages read-only, or off macOS the memory is of Metal's private option bit 24; the copy of
+    /// read-only pages or bit-24 memory drops the GPU's writes. Announced as the
     /// [`copied-host-pages`](crate::Degradation::CopiedHostPages) degradation: each commit writes
     /// into the copy the bytes the CPU changed in the pages, and each batch's completion writes
     /// back the bytes the GPU changed, where Metal's GPU uses the pages themselves.
     Copied,
     /// In no pages: detached ([`Buffer::detach_backing`]) until a rebind gives it some.
     Detached,
+    /// Two copies, as Metal keeps a `Managed` resource on a Mac with a discrete GPU: the caller's
+    /// pages, which `contents` maps, and the GPU's own in device-local memory, which every command
+    /// uses. `did_modify_range` copies the pages in, and a blit encoder's `synchronize_resource`
+    /// copies the GPU's copy out to them. A `Managed` no-copy buffer on a device without unified
+    /// memory, where device-local memory had room for its copy.
+    DeviceCopy,
 }
 
 impl Buffer {
@@ -54,22 +63,32 @@ impl Buffer {
     /// instead, announced as the
     /// [`copied-host-pages`](crate::Degradation::CopiedHostPages) degradation.
     ///
+    /// A `Managed` no-copy buffer on a device without unified memory answers
+    /// [`HostBacking::DeviceCopy`] (or `Detached` while its pages are detached).
+    ///
     /// The answer changes only where the buffer's pages do: at its
     /// [`rebind_bytes_no_copy`](Buffer::rebind_bytes_no_copy), which may move it between an import
     /// and a copy, and its [`detach_backing`](Buffer::detach_backing) (for a heap's buffer, its
     /// heap's); between them it stays. A query alone: it reads no page and keeps no import
     /// imported, unlike [`gpu_address`](Buffer::gpu_address).
     pub fn host_backing(&self) -> Option<HostBacking> {
+        if let Some(caller) = self.caller_copy() {
+            return Some(match caller.mapped_contents() {
+                Some(_) => HostBacking::DeviceCopy,
+                None => HostBacking::Detached,
+            });
+        }
         let pages = match self.pages_cell()?.lying() {
             Lying::In(pages) => pages,
             Lying::Detached(_) => return Some(HostBacking::Detached),
+            Lying::Gone(_) => super::buffer::read_gone(),
         };
         let backing = if pages.copied() {
             HostBacking::Copied
-        } else if pages.over_dma_buf() {
-            HostBacking::ImportedAsDmaBuf
         } else if pages.in_ram_chunk() {
             HostBacking::InHostRam
+        } else if pages.over_dma_buf() {
+            HostBacking::ImportedAsDmaBuf
         } else {
             HostBacking::ImportedByPointer
         };

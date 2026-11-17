@@ -8,15 +8,13 @@ use crate::encoder::{EncoderCore, Recorded};
 use crate::texture::storage_form::Riding;
 
 impl State {
-    /// Whether its commit may take a switch (`texture/storage_form.rs`): it may be committed, it
-    /// holds a slot of its queue (so it counts among the device's uncommitted command buffers)
-    /// and ended an encoder; every encoder of it may run; it waits for no event or binary
-    /// semaphore and leaves no segment and no sparse update to a host step, so the scheduler
-    /// submits all of it once its submission checks (if it has any) ran; and it bound no heap
-    /// set.
+    /// Whether its commit may take a switch (`texture/storage_form.rs`), as far as its state
+    /// tells: it may be committed and ended an encoder; every encoder of it may run; it waits for
+    /// no event or binary semaphore and leaves no segment and no sparse update to a host step, so
+    /// the scheduler submits all of it once its submission checks (if it has any) ran; and it
+    /// bound no heap set.
     fn takes_storage_forms(&self) -> bool {
         self.refusal().is_none()
-            && self.slot.is_some()
             && !self.ended.is_empty()
             && self.fails_from.is_none()
             && self.faulted.is_empty()
@@ -42,9 +40,11 @@ impl CommandBuffer {
         if injected || !device.storage_forms_wanted() {
             return false;
         }
+        // It holds a slot of its queue too, so it counts among the device's uncommitted command
+        // buffers.
         let parts = {
             let state = self.state();
-            if !state.takes_storage_forms() {
+            if !state.takes_storage_forms() || lock(&self.0.slot).is_none() {
                 return false;
             }
             state.recorded.len()
@@ -56,7 +56,7 @@ impl CommandBuffer {
             device.put_back_switch(switch);
             return false;
         };
-        let prepared = switch.prepare(&mut core);
+        let prepared = switch.prepare(device, &mut core);
         if prepared.is_empty() {
             drop(core);
             device.give_up_switch(switch, prepared);
@@ -84,10 +84,14 @@ impl CommandBuffer {
             Recorded {
                 encoder,
                 raws: recorded.raws,
+                barriered: None,
                 segments: Vec::new(),
                 summary: recorded.summary,
                 sparse: Vec::new(),
                 twin_writes: Vec::new(),
+                overwrites: Vec::new(),
+                trail: (device.shared().encoder_trail)
+                    .then(|| crate::encoder_trail::Named::new("the runtime's storage form switch")),
             },
         );
         state.retained.extend(recorded.retained.into_entry());
@@ -113,6 +117,7 @@ impl CommandBufferShared {
     /// ran (no check failed a submission of it, and its submission did not fail). Whether one
     /// rode on it.
     pub(crate) fn settle_storage_forms(&self) -> bool {
+        let _for = self.notices_for();
         let state = lock(&self.state);
         let Some(riding) = &state.storage_form else {
             return false;

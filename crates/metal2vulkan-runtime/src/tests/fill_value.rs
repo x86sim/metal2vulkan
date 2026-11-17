@@ -314,6 +314,28 @@ fn every_measured_fill_texel_is_metal_s() {
     assert!(wrong.is_empty(), "fills unlike Metal's: {wrong:?}");
 }
 
+/// On every device a plain fill is announced wherever a normalized channel's scaled color is off a
+/// whole code, where Vulkan lets the device's clear store either of the two codes closest to it,
+/// as the RTX 5080 Laptop GPU's clears stored. A whole code, and a float channel, is not.
+#[test]
+fn every_fill_off_a_whole_code_is_announced() {
+    for (pf, color) in [
+        (P::R16Unorm, [0.001, 0.0, 0.0, 0.0]),
+        (P::RG8Unorm, [0.0, 0.904, 0.0, 0.0]),
+        (P::R8Snorm, [0.649_799_282_935_052, 0.0, 0.0, 0.0]),
+        (P::B5G6R5Unorm, [0.0, 0.0, 0.752_941_176_470_588_2, 0.0]),
+    ] {
+        assert!(device_apart(pf, color), "{pf:?} {color:?}");
+    }
+    for (pf, color) in [
+        (P::RGBA8Unorm, [0.0, 1.0, 0.0, 1.0]),
+        (P::R8Snorm, [-1.0, 0.0, 0.0, 0.0]),
+        (P::R32Float, [0.1, 0.0, 0.0, 0.0]),
+    ] {
+        assert!(!device_apart(pf, color), "{pf:?} {color:?}");
+    }
+}
+
 /// Unsigned normalized: a 4- or 8-bit channel rounds the exact product half up, any other width
 /// the product's `float` (the probe's thresholds).
 #[test]
@@ -1018,10 +1040,10 @@ fn the_m3_packs_these_formats_and_no_other() {
 
 /// A plain fill is the device's clear of the color only where the format's fill converts a
 /// `float` (`device_converts`), and the clear is announced where the device's conversion may store
-/// another texel than Metal's fill packs (`device_apart`: a normalized tie, which the fill rounds
-/// half up, a packed 16-bit channel within the step through `half` of one, an sRGB value inside
-/// `(0, 1)`, a value a half, small float or shared exponent does not hold), or a NaN it converts
-/// as it likes (`device_nan`).
+/// another texel than Metal's fill packs (`device_apart`: a normalized value off a whole code, a
+/// tie among them, which the fill rounds half up, an sRGB value inside `(0, 1)`, a value a half,
+/// small float or shared exponent does not hold), or a NaN it converts as it likes
+/// (`device_nan`).
 #[test]
 fn the_device_s_clear_is_announced_where_its_conversion_is_in_question() {
     for pf in [
@@ -1051,19 +1073,19 @@ fn the_device_s_clear_is_announced_where_its_conversion_is_in_question() {
     let one = |x: f64| [x, 0.0, 0.0, 1.0];
     let apart = [
         (P::RGBA8Unorm, one(0.5), true),
-        (P::RGBA8Unorm, one(0.25), false),
+        (P::RGBA8Unorm, one(0.25), true),
         (P::RGBA8Unorm, one(1.0), false),
         (P::RGBA8Unorm, one(f64::NAN), false),
-        // Off a tie by a hundredth of a code: a tie for a packed 16-bit channel, whose clear may
-        // step through `half`, and not for an 8-bit one.
-        (P::RGBA8Unorm, one(127.51 / 255.0), false),
+        // Off a tie by a hundredth of a code, off a whole code all the same.
+        (P::RGBA8Unorm, one(127.51 / 255.0), true),
         (P::B5G6R5Unorm, one(15.51 / 31.0), true),
         (P::R16Unorm, one(0.5 / 65535.0), true),
         (P::RG8Snorm, one(-0.5 / 127.0), true),
         (P::RG8Snorm, one(-1.0), false),
         (P::RGBA8UnormSRGB, one(0.5), true),
         (P::RGBA8UnormSRGB, [0.0, 1.0, 0.0, 0.5], true),
-        (P::RGBA8UnormSRGB, [0.0, 1.0, 0.0, 0.25], false),
+        (P::RGBA8UnormSRGB, [0.0, 1.0, 0.0, 0.25], true),
+        (P::RGBA8UnormSRGB, [0.0, 1.0, 0.0, 1.0], false),
         (P::RGBA16Float, one(0.1), true),
         (P::RGBA16Float, one(0.5), false),
         (P::RGBA16Float, one(1e6), true),

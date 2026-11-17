@@ -352,6 +352,31 @@ pub enum VkFeature {
     /// covers every pixel the line's rectangle contains and so covers pixels Metal leaves
     /// untouched (`pipeline/graphics.rs`).
     BresenhamLines,
+    /// `wideLines` (Vulkan 1.0): a line width other than 1
+    /// (`VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-00749`), within `lineWidthRange`. The
+    /// runtime draws Apple's `setLineWidth:` widths through it where the device's own lines are
+    /// its route (`render/line_width.rs`).
+    WideLines,
+    // Appended.
+    /// `VK_EXT_multi_draw`'s `multiDraw`: `vkCmdDrawMultiEXT` and `vkCmdDrawMultiIndexedEXT`, one
+    /// command of several draws, each draw's `DrawIndex` its index in the command ("if
+    /// vkCmdDrawMultiEXT or vkCmdDrawMultiIndexedEXT is used, this variable contains the integer
+    /// value corresponding to the zero-based index of the draw", the specification's `DrawIndex`).
+    /// The runtime draws a rate-mapped pass's regions through it, several in one command, each
+    /// region's viewport selected by its draw's index (`LoweringInputs::region_viewports`).
+    MultiDraw,
+    // Appended.
+    /// `VK_EXT_shader_float8`'s `shaderFloat8`: the SPIR-V capability `Float8EXT`, 8-bit floats of
+    /// the encodings `Float8E4M3EXT` and `Float8E5M2EXT` (`SPV_EXT_float8`), which Vulkan requires
+    /// of every device that lists the extension. The lowering converts an 8-bit float to a wider
+    /// one through the device's own type where it has it (`lower::arith::narrow`'s `fp8_native`).
+    ShaderFloat8,
+    // Appended.
+    /// `pointPolygons` (a portability-subset member): `VK_POLYGON_MODE_POINT` with rasterization
+    /// on (`VUID-VkPipelineRasterizationStateCreateInfo-pointPolygons-04458`), as the render
+    /// encoder's `TriangleFillMode::Points` draws. Like every portability member, a device without
+    /// `VK_KHR_portability_subset` has no such restriction.
+    PointPolygons,
 }
 
 /// A Vulkan device extension the new core can require.
@@ -479,6 +504,15 @@ pub enum VkExtension {
     /// `VK_FORMAT_A4R4G4B4_UNORM_PACK16` and `VK_FORMAT_A4B4G4R4_UNORM_PACK16`, which hold
     /// `MTLPixelFormatBGRA4Unorm`'s word.
     Ext4444Formats,
+    // Appended.
+    /// `VK_EXT_multi_draw` (never promoted): [`VkFeature::MultiDraw`].
+    ExtMultiDraw,
+    // Appended.
+    /// `VK_EXT_shader_float8` (never promoted): the 8-bit float types of `SPV_EXT_float8`, whose
+    /// `shaderFloat8` Vulkan requires of every device that lists it. The core enables it where the
+    /// device lists it, and there refuses a `matmul2d` of 8-bit floats, whose conversion through
+    /// the device's type is not built yet.
+    ExtShaderFloat8,
 }
 
 /// One subgroup operation class (`VkSubgroupFeatureFlagBits`).
@@ -557,7 +591,8 @@ pub enum VkProperty {
     /// `GLSL.std.450 InterpolateAtOffset` reads at the pixel center plus its offset, as
     /// GLSL.std.450 states. Every device has it but one whose description reports a MoltenVK
     /// driver, which reads 1/16 pixel off the center at any release. A module that uses the
-    /// instruction requires it.
+    /// instruction requires it, but one that requires
+    /// [`VkProperty::InterpolateAtOffsetFromSevenSixteenths`] instead.
     InterpolateAtOffsetCentered,
     /// The device runs each 32 consecutive invocations of a compute workgroup in lockstep, as an
     /// Apple GPU runs a Metal simdgroup (the driver's measured deviation
@@ -618,12 +653,6 @@ pub enum VkProperty {
     /// the NaN of a lane the function rounds to nearest even. No Vulkan query reports it. Without
     /// it, such a write records `PrecisionNote::DeviceNanEncoding`.
     MetalFloatColorNans,
-    /// The device stores a `half` NaN a fragment function writes to a half-float color channel
-    /// as its own bits, as Metal does (the driver's measured deviation
-    /// [`DriverDeviation::MetalHalfColorNans`](crate::error::DriverDeviation::MetalHalfColorNans)).
-    /// No Vulkan query reports it. Without it, such a write records
-    /// `PrecisionNote::DeviceNanEncoding`.
-    MetalHalfColorNans,
     /// The device's `GLSL.std.450 Fma` on 16-bit floats is Metal's own `half` `fma` (the
     /// driver's measured deviation
     /// [`DriverDeviation::MetalHalfFma`](crate::error::DriverDeviation::MetalHalfFma)). No Vulkan
@@ -640,7 +669,10 @@ pub enum VkProperty {
     /// No Vulkan query reports it: `DenormFlushToZero` makes only the results' flush a
     /// requirement, the operands' remains the device's choice. A module that leaves such an
     /// operation's denormals to the device, recording no `PrecisionNote::DeviceDenormals` for it,
-    /// requires it; without it, they are the device's own, and the module records that note.
+    /// requires it; without it, they are the device's own, and the module records that note. So
+    /// does a module whose entry declares the 16-bit float controls on a driver measured to keep
+    /// `f32` denormals there (`DriverWorkaround::FloatDenormalsKeptUnderHalfControls`), which
+    /// requires no such property.
     MetalFloatDenormals,
     /// The device reads a center-sampled varying of a multisampled pipeline at the pixel center
     /// in every fragment invocation, a sample-rate one's included, as Metal does (the driver's
@@ -799,14 +831,6 @@ pub enum VkProperty {
     /// shading), including "any pipeline already bound when beginning the render pass instance"
     /// (`VUID-vkCmdBindPipeline-pipelineBindPoint-04881`).
     ProvokingVertexModePerPipeline,
-    /// The device's `D32_SFLOAT` images keep each value outside `[0, 1]` without
-    /// [`VkExtension::ExtDepthRangeUnrestricted`] enabled, as Metal's `Depth32Float` textures do
-    /// (the runtime's measured driver fact
-    /// [`DriverFact::DepthImageKeepsValuesOutsideUnitRange`](crate::device::DriverFact::DepthImageKeepsValuesOutsideUnitRange)).
-    /// No Vulkan query reports it: Vulkan leaves such a value undefined without the extension. A
-    /// module whose depth comparisons the device makes requires it on a device without the
-    /// extension in place of recording `PrecisionNote::RestrictedDepthRange`.
-    DepthImageKeepsValuesOutsideUnitRange,
     /// The device's fixed-function vertex input converts a normalized format's codes to Metal's
     /// `float` at every code (the driver's measured deviation
     /// [`DriverDeviation::MetalNormalizedVertexFetch`](crate::error::DriverDeviation::MetalNormalizedVertexFetch)).
@@ -826,6 +850,63 @@ pub enum VkProperty {
     /// requires it, where no module does (the coverage is the pipeline's multisample state);
     /// without it, the pipeline's fragment stage records that note.
     MetalAlphaCoverage,
+    /// The device's widening and narrowing between 16- and 32-bit floats, and its `OpFNegate`
+    /// and `FAbs`, answer Metal's NaN bits (the driver's measured deviation
+    /// [`DriverDeviation::MetalNanMoves`](crate::error::DriverDeviation::MetalNanMoves)). No Vulkan
+    /// query reports it: Vulkan states no NaN's bits. A module that reads a `half` from its bits or
+    /// encodes one to them, widens a `half` to `float`, negates a `float` or takes the magnitude
+    /// of a `float` or `half`, and records no
+    /// [`PrecisionNote::NativeNanEncoding`](crate::pipeline::PrecisionNote::NativeNanEncoding)
+    /// for it requires it.
+    MetalNanMoves,
+    /// The device's conversions of the packed normalized formats measured to answer Metal's
+    /// (the driver's measured deviation
+    /// [`DriverDeviation::MetalPackConversions`](crate::error::DriverDeviation::MetalPackConversions)).
+    /// No Vulkan query reports it: Vulkan leaves the conversions' rounding to the device. A
+    /// module that converts one of those forms and records no
+    /// [`PrecisionNote::DevicePackConversion`](crate::pipeline::PrecisionNote::DevicePackConversion)
+    /// for it requires it.
+    MetalPackConversions,
+    /// The device's conversion of a 32-bit float to 16 bits answers Metal's `half(float)` where
+    /// the module converts a `float` it holds, and Metal's own `half` texel where the `float` is
+    /// an image instruction's texel (the driver's measured deviation
+    /// [`DriverDeviation::MetalHalfConversion`](crate::error::DriverDeviation::MetalHalfConversion)).
+    /// No Vulkan query reports it: without the float controls Vulkan leaves the conversion's
+    /// rounding to the device. A module that rounds a `half` through that conversion in those
+    /// forms alone (a texel's value among them: one the module decodes itself, or a merge of
+    /// texels) records no
+    /// [`PrecisionNote::NativeHalfConversion`](crate::pipeline::PrecisionNote::NativeHalfConversion)
+    /// and requires it.
+    MetalHalfConversion,
+    /// The device stores a NaN a shader writes to a packed small float storage image
+    /// (`B10G11R11_UFLOAT_PACK32`) as Metal stores it, a `float`'s or a `half`'s widened (the
+    /// driver's measured deviation
+    /// [`DriverDeviation::MetalSmallFloatNans`](crate::error::DriverDeviation::MetalSmallFloatNans)).
+    /// Vulkan states no encoding for it. A module whose write may reach such an image records no
+    /// [`PrecisionNote::DeviceNanEncoding`](crate::pipeline::PrecisionNote::DeviceNanEncoding)
+    /// for it and requires it.
+    MetalSmallFloatNans,
+    /// The device's `float` `OpFNegate` and `FAbs` keep an `f32` denormal and its `Floor` and
+    /// `Ceil` read one as the zero of its sign, as Metal's `-x`, `fabs`, `floor` and `ceil` do (the
+    /// driver's measured deviation
+    /// [`DriverDeviation::MetalUnaryDenormals`](crate::error::DriverDeviation::MetalUnaryDenormals)).
+    /// Vulkan lets a device keep or flush them. A module that leaves those operations' denormals to
+    /// the device records no
+    /// [`PrecisionNote::DeviceDenormals`](crate::pipeline::PrecisionNote::DeviceDenormals) for
+    /// them and requires it.
+    MetalUnaryDenormals,
+    /// `GLSL.std.450 InterpolateAtOffset` at offset `v` reads Metal's `interpolate_at_offset` at
+    /// `v + 7/16`, measured from the pixel's upper-left corner: a device whose description reports
+    /// a MoltenVK driver, whose SPIRV-Cross hands the instruction to Metal so at any release
+    /// (`CompilerMSL`'s `GLSLstd450InterpolateAtOffset`, read in its source), where Metal reads at
+    /// the offset as given (the Apple M3 Max, macOS 27.0.1). No Vulkan query reports it. A module
+    /// that hands Metal's `interpolate_at_offset` to the instruction moved by 7/16 requires it in
+    /// place of [`VkProperty::InterpolateAtOffsetCentered`].
+    InterpolateAtOffsetFromSevenSixteenths,
+    /// `subgroupSupportedStages` contains the geometry stage, which runs only the translator's
+    /// own geometry stages (`pipeline::link::geometry`): a geometry module's subgroup operations
+    /// require it, where a Metal stage's require [`VkProperty::SubgroupStage`].
+    SubgroupGeometryStage,
 }
 
 /// One depth or stencil resolve mode (`VkResolveModeFlagBits`), named by
@@ -1148,6 +1229,8 @@ pub enum SpirvExtension {
     KhrQuadControl,
     // Appended.
     KhrPostDepthCoverage,
+    // Appended.
+    ExtFloat8,
 }
 
 /// The SPIR-V capabilities a module's [`Requirements`] list without the feature that enables them,

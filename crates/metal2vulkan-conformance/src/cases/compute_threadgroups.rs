@@ -577,6 +577,8 @@ mod tests {
                 device: "unwriting".to_owned(),
                 driver: "none".to_owned(),
                 api: "none".to_owned(),
+                lossless_compression: true,
+                host: None,
             }
         }
 

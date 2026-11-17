@@ -33,24 +33,35 @@
 //!
 //! # What the rows are held to, and the one branch of the lane that is not exercised
 //!
-//! **Not one byte of this family is loosened.** Every row's bytes are Metal's own on MoltenVK, on
-//! lavapipe and on an RTX 5080 Laptop, so the only field that may differ is the set of degrade
-//! notices our side announced. The depth row's on lavapipe, which cannot hold Metal's denormal
-//! depths (`depth-denormals`), is the device's own answer, which the suite declares for every case
-//! ([`crate::replay::NATIVE_NOTES`]).
+//! **One site of one kind of row is loosened, and only on one kind of venue.** Every row's bytes
+//! are Metal's own on MoltenVK and on lavapipe, which present the recordings' Apple silicon Mac's
+//! lossless compression, so there the only field that may differ is the set of degrade notices
+//! our side announced. The depth row's on lavapipe, which cannot hold Metal's denormal depths
+//! (`depth-denormals`), is the device's own answer, which the suite declares for every case
+//! ([`crate::replay::NATIVE_NOTES`]). On a device that presents a Mac keeping no texture
+//! compressed (`DeviceProperties::lossless_compression` false, as an RTX 5080 Laptop presents
+//! today), a new `Private` texture holds what its memory held and nothing writes it, so the
+//! `fresh` site of every `Private` texture row and every pattern row reads zero, the released
+//! texture's [`OLD`] bytes or whatever else the memory held; that site alone is declared, by
+//! [`crate::replay::without_compression`], which justifies nothing on a venue that presents the
+//! compression. The `written` site, the statuses and every `Shared` and `Managed` row still compare
+//! exactly there.
 //!
 //! Every row names one notice, and it belongs to the venue rather than to any row: the declaration
 //! [`crate::replay::shared_memory_notice`] carries, the notice a device without unified memory
 //! announces for the `Shared` buffer each row reads its answer back through.
 //!
 //! The lane also carries a branch for a device that **cannot** write Metal's pattern and so reads
-//! zero, announcing `fresh-pattern-zeroed`. That branch is right for the lane, which must run
-//! anywhere, but **neither venue of this round takes it**: MoltenVK and lavapipe both write Metal's
-//! pattern exactly, in all 58 formats and every patterned shape. So these rows hold our side to
-//! Metal's pattern and name no allowance for the zeroing — an allowance that fires on no venue is
-//! a claim no run has checked, which the suite counts and which this family deliberately does not
-//! add. A device that does zero will read as `Divergent` here, and the allowance belongs in the
-//! commit that has that device's run behind it.
+//! zero, announcing `fresh-pattern-zeroed`. Two rows take it on one venue: `Depth32Float`'s
+//! pattern is a NaN, a depth outside `[0, 1]`, which a device without
+//! `VK_EXT_depth_range_unrestricted` takes into no depth image by a copy (MoltenVK on the M3 Max,
+//! replayed: the `fresh` site reads zero, announced). That format's texture row and pattern row
+//! alone declare the zeroing at their `fresh` site, and the texture row the
+//! `restricted-depth-upload` its [`OLD`] write announces. Elsewhere
+//! MoltenVK and lavapipe write Metal's pattern exactly, in every other format and patterned shape,
+//! so the other rows hold our side to Metal's pattern and name no allowance for the zeroing: an
+//! allowance that fires on no venue is a claim no run has checked, which the suite counts and
+//! which this family deliberately does not add.
 //!
 //! # Why one process is the right place for this, and more than the lane had
 //!
@@ -130,7 +141,7 @@ const READ_AND_TARGET: u32 = 5;
 /// *bytes* turned a 16 KiB level into 8,193 runs and a 3.5 MB recording, while runs of equal
 /// texels make it one line. A tail shorter than a texel is a run of its own, so nothing is lost
 /// where a length is not a whole number of texels.
-fn texel_runs(bytes: &[u8], texel: usize) -> Value {
+pub(super) fn texel_runs(bytes: &[u8], texel: usize) -> Value {
     let width = texel.max(1);
     let mut runs: Vec<Value> = Vec::new();
     let mut held: Option<(usize, &[u8], u64)> = None;
@@ -1085,7 +1096,22 @@ impl Case for FreshTexture {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        vec![shared_memory_notice()]
+        let mut allowances = vec![shared_memory_notice()];
+        // A new `Private` texture on a device that presents no texture compression holds what
+        // its memory held (the module docs). Expected, not yet run: no such venue replayed it.
+        if self.row.storage == Storage::Private {
+            allowances.push(crate::replay::without_compression("fresh"));
+        }
+        // The `Depth32Float` row on a device without `VK_EXT_depth_range_unrestricted`: its
+        // pattern zeroed ([`zeroed_depth_pattern`]), and its `OLD` write of 0.5 an upload such a
+        // device clamps and announces, which leaves 0.5 as it is.
+        if self.row.shape.format == DEPTH32FLOAT.format {
+            allowances.extend(zeroed_depth_pattern());
+            allowances.push(crate::replay::notice_allowance(
+                metal2vulkan_runtime::Degradation::RestrictedDepthUpload.code(),
+            ));
+        }
+        allowances
     }
 
     fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {
@@ -1313,6 +1339,24 @@ impl Pattern {
     }
 }
 
+/// What a `Depth32Float` row declares (the module docs): Metal's pattern for it is a NaN, a depth
+/// outside `[0, 1]`, which a device without `VK_EXT_depth_range_unrestricted` takes into no depth
+/// image by a copy, so the runtime zeroes the new texture and announces `fresh-pattern-zeroed`.
+/// Its `fresh` site goes unchecked, named, counted and reported, with that notice as the
+/// justification, and the notice is declared; measured on the M3 Max (MoltenVK), the zeroed
+/// texel is the whole of the difference beside the notices.
+fn zeroed_depth_pattern() -> [Allowance; 2] {
+    let zeroed = metal2vulkan_runtime::Degradation::FreshPatternZeroed.code();
+    [
+        Allowance::new(
+            "case/fresh/*",
+            crate::allowance::Loosening::Unchecked,
+            crate::allowance::Justification::Degradation(zeroed.to_owned()),
+        ),
+        crate::replay::notice_allowance(zeroed),
+    ]
+}
+
 /// A pattern row of the family: one format.
 pub struct FreshPattern {
     row: &'static Pattern,
@@ -1332,10 +1376,18 @@ impl Case for FreshPattern {
         // compressed: the note of the encoding the device's copy keeps, where it is not native
         // (`compressed_blits::kept_encoding_notice`). The pattern's bytes are each format's
         // canonical encoding, so every value still compares exactly.
-        let mut allowances = vec![shared_memory_notice()];
+        let mut allowances = vec![
+            shared_memory_notice(),
+            // A new `Private` texture on a device that presents no texture compression holds
+            // what its memory held, never the pattern (the module docs). Expected, not yet run.
+            crate::replay::without_compression("fresh"),
+        ];
         allowances.extend(super::compressed_blits::kept_encoding_notice(
             self.row.format,
         ));
+        if self.row.format == DEPTH32FLOAT.format {
+            allowances.extend(zeroed_depth_pattern());
+        }
         allowances
     }
 
@@ -2032,26 +2084,37 @@ mod tests {
         }
     }
 
-    /// **A row loosens the notices site and nothing else.** Not one byte of this family is ever
-    /// loosened: MoltenVK, lavapipe and an RTX 5080 Laptop all read Metal's own bytes, and the only
-    /// field that may differ is the set of notices our side announced.
+    /// **A row loosens the notices site, and a `Private` texture's row its `fresh` site on a venue
+    /// that presents no texture compression, and nothing else.** On a venue that presents the
+    /// compression (MoltenVK, lavapipe) every byte compares exactly: the one value declaration,
+    /// [`crate::replay::without_compression`], justifies nothing there.
     ///
     /// Every row names [`shared_memory_notice`], which is the venue's memory model and not the
-    /// row's; **only** the three pattern rows whose read blits out of a texture Metal keeps
-    /// compressed in a format whose canonical encoding the device's copy may keep apart from
-    /// Metal's (`BGRA10_XR`, its sRGB twin, `RGB9E5Float`; the notes lavapipe announced) name a
-    /// second kind. A row whose notices were a guess would show here as a row loosening a site
-    /// nothing needed.
+    /// row's; every `Private` texture row and every pattern row names the value declaration at its
+    /// `fresh` site, and no `Shared` or `Managed` row, buffer row or texture over a buffer does;
+    /// **only** the three pattern rows whose read blits out of a texture Metal keeps compressed in
+    /// a format whose canonical encoding the device's copy may keep apart from Metal's
+    /// (`BGRA10_XR`, its sRGB twin, `RGB9E5Float`; the notes lavapipe announced) name a further
+    /// notice. The two `Depth32Float` rows apart: each also leaves its `fresh` site unchecked under
+    /// `fresh-pattern-zeroed` and declares that notice ([`zeroed_depth_pattern`]), and the texture
+    /// row declares `restricted-depth-upload` too, the notices MoltenVK announced. A row whose
+    /// notices were a guess would show here as a row loosening a site nothing needed.
     #[test]
-    fn a_row_loosens_the_notices_site_alone() {
+    fn a_row_loosens_the_notices_site_and_a_private_texture_s_fresh_site() {
         let notices = format!("case/{}/*", crate::replay::NOTICES_SITE);
+        let fresh = crate::replay::without_compression("fresh");
+        let [zeroed, _] = zeroed_depth_pattern();
         let shared = metal2vulkan_runtime::Degradation::SharedInSystemMemory
             .code()
             .to_owned();
         for case in all() {
             let allowances = case.allowances();
             for allowance in &allowances {
-                assert_eq!(allowance.path, notices, "{}", case.name());
+                assert!(
+                    allowance.path == notices || *allowance == fresh || *allowance == zeroed,
+                    "{}: {allowance:?}",
+                    case.name()
+                );
             }
             // The venue's notice is the one every row declares, and it is declared exactly once.
             let declared = allowances
@@ -2063,7 +2126,17 @@ mod tests {
             assert_eq!(declared, 1, "{}", case.name());
         }
         for row in TEXTURES {
-            assert_eq!(FreshTexture { row }.allowances().len(), 1, "{}", row.case);
+            let private = row.storage == Storage::Private;
+            let depth = row.shape.format == DEPTH32FLOAT.format;
+            let allowances = FreshTexture { row }.allowances();
+            assert_eq!(
+                allowances.len(),
+                1 + usize::from(private) + 3 * usize::from(depth),
+                "{}",
+                row.case
+            );
+            assert_eq!(allowances.contains(&fresh), private, "{}", row.case);
+            assert_eq!(allowances.contains(&zeroed), depth, "{}", row.case);
         }
         // Everything else is held to Metal exactly, the venue's own notice apart.
         for (case, storage) in BUFFERS {
@@ -2085,12 +2158,16 @@ mod tests {
                 row.case,
                 "fresh-pattern-552" | "fresh-pattern-553" | "fresh-pattern-93"
             );
+            let depth = row.format == DEPTH32FLOAT.format;
+            let allowances = FreshPattern { row }.allowances();
             assert_eq!(
-                FreshPattern { row }.allowances().len(),
-                1 + usize::from(kept),
+                allowances.len(),
+                2 + usize::from(kept) + 2 * usize::from(depth),
                 "{}",
                 row.case
             );
+            assert!(allowances.contains(&fresh), "{}", row.case);
+            assert_eq!(allowances.contains(&zeroed), depth, "{}", row.case);
         }
     }
 

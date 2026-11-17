@@ -72,12 +72,14 @@
 //!   or the depth and stencil where the draw runs in a later group too, a resolve texture, the
 //!   visibility result buffer, or memory the draw does not name (a handle table, or a root table
 //!   where one of those lies over a buffer's bytes), and a resolve target set after a draw read
-//!   its texture. A draw that reads its own group's attachments where it runs in that group alone
-//!   reads them as in any pass (`texture/attached_reads.rs`).
+//!   its memory (a texture placed in a heap, or made over a buffer's bytes, apart from what a draw
+//!   read of the heap or buffer is not: `tracker::ImagePlace`). A draw that reads its own group's
+//!   attachments where it runs in that group alone reads them as in any pass
+//!   (`texture/attached_reads.rs`).
 
 use super::extended_shadow::ExtendedShadows;
 use super::{
-    reads_handles, DrawingState, Opening, RenderLog, RenderLowering, RenderPipelineState,
+    reads_handles, DrawingState, Lowering, Opening, RenderLog, RenderLowering, RenderPipelineState,
     RenderStateKind,
 };
 use crate::attachment_stand_in::{self, StandInCopies};
@@ -85,6 +87,7 @@ use crate::binding::CommandUses;
 use crate::device::Device;
 use crate::encoder::EncoderCore;
 use crate::error::{internal, Error, RuntimeGap};
+use crate::key_hash::KeyMap;
 use crate::rate_mapped_pass::RateMappedPass;
 use crate::render_pass::{
     AspectTarget, ColorTarget, DepthStencilTarget, PassLayout, RenderPassDescriptor, Target,
@@ -98,7 +101,6 @@ use crate::tracker::{Access, UseRange};
 use ash::vk;
 use metal2vulkan::pipeline::ColorGroup;
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 
 /// The refusal of what a pass drawn in color groups does not build (the module docs).
 pub(super) fn gap() -> Error {
@@ -241,16 +243,16 @@ struct First {
     /// The pass's colors by Metal's index, which the encoder's color-indexed calls check and set
     /// where another group holds the color, as Metal checks them.
     others: Vec<Option<ColorTarget>>,
-    /// The resources the pass's draws read, which a resolve target set later may not be: noted
-    /// by a draw's check, which holds the encoder's tables.
-    read: RefCell<BTreeSet<ResourceKey>>,
+    /// What the pass's draws read, which a resolve target set later may not share memory with:
+    /// noted by a draw's check, which holds the encoder's tables ([`Read`]).
+    read: RefCell<Read>,
     /// The drawing state the encoder's state is the first group's twin of
     /// (`GraphicsState::color_group`), as the program's last `set_render_pipeline_state` that
     /// took set it: its twins decide which groups a draw runs in ([`Grouped::draws_in`]).
     set: Option<DrawingState>,
 }
 
-/// A decisive call's turn in a pass drawn in groups ([`RenderCommandEncoder::group_turn`]).
+/// A decisive call's turn in a pass drawn in groups ([`RenderLowering::group_turn`]).
 #[derive(Clone, Copy)]
 pub(super) enum Turn {
     /// A pass of one group: the call runs as in any pass.
@@ -271,7 +273,7 @@ impl Grouped {
                 others: full.colors.clone(),
                 full,
                 started: started.clone(),
-                read: RefCell::new(BTreeSet::new()),
+                read: RefCell::default(),
                 set: None,
             })),
             outcomes: Vec::new(),
@@ -316,7 +318,7 @@ impl Grouped {
 }
 
 /// What the first group's pass leaves the later groups of a pass of more
-/// ([`Ended::with_later_groups`]).
+/// ([`Ended::later_groups`]).
 pub(super) struct Later {
     group: ColorGroup,
     full: PassLayout,
@@ -415,43 +417,35 @@ fn twin(
 /// An ended pass of a render encoder: its core, what it made resident, its log, and what its
 /// later color groups draw.
 pub(super) struct Ended {
-    pub(super) core: EncoderCore,
+    pub(super) core: Box<EncoderCore>,
     pub(super) residency: Residency,
-    pub(super) log: Option<RenderLog>,
+    pub(super) log: Option<Box<RenderLog>>,
     pub(super) later: Option<Box<Later>>,
 }
 
 impl Ended {
-    /// The pass's later color groups drawn (the module docs), each over the encoder's core from
-    /// its log: the core, what the first group's encoder made resident, and the log, from which
-    /// a rebind may encode the encoder again.
-    pub(super) fn with_later_groups(
-        self,
-    ) -> Result<(EncoderCore, Residency, Option<RenderLog>), Error> {
-        let Ended {
-            mut core,
-            residency,
-            log,
-            later,
-        } = self;
-        if let Some(later) = later {
-            let log = log
-                .as_ref()
-                .ok_or_else(|| internal("a pass of several color groups without its log"))?;
-            for group in 1..later.group.groups() {
-                let mut encoder = RenderLowering::later_group(core, &later, group, log)?;
-                log.replay_into(&mut encoder);
-                if encoder.group_diverged() {
-                    return Err(internal(
-                        "a later color group's call ran otherwise than the first group's",
-                    ));
-                }
-                let ended = encoder.end_pass()?;
-                core = ended.core;
-                core.device().shared().counts.color_group_pass();
+    /// The pass's later color groups drawn (the module docs), each over the encoder's `core`
+    /// from the first group's `log`: the core they leave. A pass of one group has none
+    /// (`later` `None`), and its end calls nothing here.
+    pub(super) fn later_groups(
+        mut core: Box<EncoderCore>,
+        later: &Later,
+        log: Option<&RenderLog>,
+    ) -> Result<Box<EncoderCore>, Error> {
+        let log = log.ok_or_else(|| internal("a pass of several color groups without its log"))?;
+        for group in 1..later.group.groups() {
+            let mut encoder = RenderLowering::later_group(core, later, group, log)?;
+            log.replay_into(&mut encoder);
+            if encoder.group_diverged() {
+                return Err(internal(
+                    "a later color group's call ran otherwise than the first group's",
+                ));
             }
+            let ended = encoder.end_pass()?;
+            core = ended.core;
+            core.device().shared().counts.color_group_pass();
         }
-        Ok((core, residency, log))
+        Ok(core)
     }
 }
 
@@ -459,11 +453,11 @@ impl RenderLowering {
     /// The encoder of later group `group` of the pass `later` and `log` describe, over `core`
     /// (the module docs).
     fn later_group(
-        core: EncoderCore,
+        core: Box<EncoderCore>,
         later: &Later,
         group: u32,
         log: &RenderLog,
-    ) -> Result<Box<RenderLowering>, Error> {
+    ) -> Result<Lowering, Error> {
         const CALL: &str = "end_encoding";
         let grouping = ColorGroup::of(later.group.present.clone(), later.group.width, group)
             .ok_or_else(|| internal("a later color group of a pass in one"))?;
@@ -476,7 +470,7 @@ impl RenderLowering {
         let shape = PassShape::of(&layout)?;
         let compatible = render_target::shared_compatible_pass(&device, &shape)?;
         let draws = core.command_buffer().begin_draws(&compatible)?;
-        let extended = ExtendedShadows::of(&descriptor, &layout, rate_map.is_some());
+        let extended = ExtendedShadows::of(&device, &descriptor, &layout, rate_map.is_some());
         let opening = Opening::new(
             &descriptor,
             (layout, extended),
@@ -494,7 +488,14 @@ impl RenderLowering {
                 counting: false,
             })),
         );
-        Ok(RenderLowering::assemble(core, draws, opening))
+        // A later group's encoder starts from no carried draw: a group's pass carries none
+        // (`render/carried.rs`).
+        Ok(RenderLowering::assemble(
+            core,
+            draws,
+            opening,
+            Default::default(),
+        ))
     }
 
     /// Whether a later group's decisive call ran otherwise than the first group's.
@@ -674,22 +675,22 @@ impl RenderLowering {
         let reads_watched = uses.iter().any(|used| {
             watched
                 .iter()
-                .any(|w| used.key == w.key && used.range.overlaps(&w.range))
+                .any(|w| used.key == w.key && used.range.shares_memory(&w.range))
         });
         if reads_watched {
             return Err(gap());
         }
         if let Some(first) = &g.first {
-            first
-                .read
-                .borrow_mut()
-                .extend(uses.iter().map(|used| used.key));
+            let mut read = first.read.borrow_mut();
+            for used in uses.iter() {
+                read.note(used.key, &used.range);
+            }
         }
         Ok(())
     }
 
     /// In the first group's encoder of a pass of more: refuse a resolve target set on `texture`
-    /// where a draw of the pass read it (the module docs).
+    /// where a draw of the pass read its memory (the module docs).
     pub(super) fn check_group_resolve(&self, texture: Option<&Texture>) -> Result<(), Error> {
         let first = self
             .grouped
@@ -699,8 +700,8 @@ impl RenderLowering {
         let (Some(first), Some(texture)) = (first, texture) else {
             return Ok(());
         };
-        let key = texture.bound_use(Access::NONE, Access::NONE).key;
-        match first.read.borrow().contains(&key) {
+        let target = texture.bound_use(Access::NONE, Access::NONE);
+        match first.read.borrow().meets(target.key, &target.range) {
             true => Err(gap()),
             false => Ok(()),
         }
@@ -774,7 +775,44 @@ impl RenderLowering {
     }
 }
 
-/// A resource a draw of a pass drawn in groups may not read ([`RenderCommandEncoder::watched`]).
+/// What the draws of a pass drawn in groups read, by key ([`First::read`]): each key's ranges,
+/// those of bytes joined where they meet or touch, so a pass of many draws reading one buffer at
+/// offsets after one another holds one range of it, and the rest each once.
+#[derive(Default)]
+struct Read(KeyMap<ResourceKey, Vec<UseRange>>);
+
+impl Read {
+    /// Note a read of `range` of `key`.
+    fn note(&mut self, key: ResourceKey, range: &UseRange) {
+        let ranges = self.0.entry(key).or_default();
+        let UseRange::Bytes(bytes) = range else {
+            if !ranges.contains(range) {
+                ranges.push(range.clone());
+            }
+            return;
+        };
+        // The noted byte ranges neither meet nor touch one another, so the one they join into
+        // takes every one that meets or touches it, in one pass.
+        let mut joined = bytes.clone();
+        ranges.retain(|noted| match noted {
+            UseRange::Bytes(noted) if noted.start <= joined.end && joined.start <= noted.end => {
+                joined = joined.start.min(noted.start)..joined.end.max(noted.end);
+                false
+            }
+            _ => true,
+        });
+        ranges.push(UseRange::Bytes(joined));
+    }
+
+    /// Whether a draw read memory that `range` of `key` holds (`UseRange::shares_memory`: a
+    /// texture placed in a heap, or made over a buffer's bytes, apart from what was read of the
+    /// key holds none of it).
+    fn meets(&self, key: ResourceKey, range: &UseRange) -> bool {
+        (self.0.get(&key)).is_some_and(|ranges| ranges.iter().any(|r| r.shares_memory(range)))
+    }
+}
+
+/// A resource a draw of a pass drawn in groups may not read ([`RenderLowering::watched`]).
 struct Watched {
     key: ResourceKey,
     range: UseRange,

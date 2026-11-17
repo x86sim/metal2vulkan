@@ -6,13 +6,20 @@
 //! (lavapipe) holds 512 of its threads a threadgroup, where Metal holds 1024. Its state answers
 //! the device's number; a threadgroup past Metal's 1024 runs nothing, as plain Metal's does; one
 //! within Metal's limit but past the device's is the device's gap, refused typed in every dispatch
-//! form, and never run as nothing.
+//! form, and never run as nothing. A state whose descriptor requires a threadgroup size answers
+//! that size's threads, within the device's number.
 
 use super::indirect_host_steps::state;
 use super::tile_states::on_device;
 use super::{buffer_with, read_buffer, WAIT};
+use crate::air_library::AirLibrary;
 use metal2vulkan::error::{BindError, Feature};
-use metal2vulkan_runtime::{CommandBufferStatus, ComputeCommandEncoder, Device, Error, Size};
+use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
+use metal2vulkan_devtools::{engine_dir, llvm_assemble};
+use metal2vulkan_runtime::{
+    CommandBufferStatus, ComputeCommandEncoder, ComputePipelineState, Device, Error,
+    PipelineOptions, Size,
+};
 
 /// Metal's threads a threadgroup.
 const METAL: u64 = 1024;
@@ -147,5 +154,101 @@ fn a_compute_threadgroup_past_the_devices_limit_within_metals_is_refused_typed()
                 None => unreachable!("the encoder ran"),
             }
         }
+    });
+}
+
+/// The state of the owned fixture `stem`'s kernel, its descriptor requiring `required` threads per
+/// threadgroup.
+fn required_state(device: &Device, stem: &str, required: [u32; 3]) -> ComputePipelineState {
+    let bitcode = llvm_assemble(&engine_dir().join(format!("{stem}.ll"))).unwrap();
+    let library = device.new_library_with_air(&bitcode).unwrap();
+    let function = library.new_function_with_name(stem).unwrap();
+    let mut descriptor =
+        ComputePipelineDescriptor::new(StageSource::Function(function.function_descriptor()));
+    descriptor.required_threads_per_threadgroup = Some(required);
+    device
+        .new_compute_pipeline_state(&descriptor, &PipelineOptions::default())
+        .unwrap()
+}
+
+/// A compute state whose descriptor requires a threadgroup size answers that size's threads as
+/// its `maxTotalThreadsPerThreadgroup`, as Metal's compute state does where Metal compiles it for
+/// the first time (an M3 Max, macOS 27.0.1: 1 for 1x1x1, 21 for 7x3x1, 128 for 8x8x2). Where the
+/// device holds fewer threads than the size, the answer is the device's limit, which the state
+/// with no size answers.
+#[test]
+fn a_compute_state_with_a_required_size_answers_its_threads() {
+    on_device(|device| {
+        let stem = "ttg_compute_simd_scratch";
+        let unrequired = state(device, stem, false).max_total_threads_per_threadgroup();
+        assert!((32..=1024).contains(&unrequired), "{unrequired}");
+        for (required, threads) in [([1, 1, 1], 1), ([7, 3, 1], 21), ([8, 8, 2], 128)] {
+            let made = required_state(device, stem, required);
+            assert_eq!(
+                made.max_total_threads_per_threadgroup(),
+                threads.min(unrequired),
+                "{required:?}"
+            );
+            let [width, height, depth] = required.map(u64::from);
+            assert_eq!(
+                made.required_threads_per_threadgroup(),
+                Size::new(width, height, depth)
+            );
+        }
+    });
+}
+
+/// A compute state whose required size has more threads than its kernel's own
+/// `[[max_total_threads_per_threadgroup(n)]]` is refused, as Metal's first compile of the kernel
+/// refuses it (an M3 Max, macOS 27.0.1, `compute_pipeline_limits.m` with a salt: 128 by 1 by 1
+/// beside 64, code 3), before a state of the kernel is made and after: the size is no part of the
+/// compiled pipeline's key, so the later creations find the pipeline compiled. A size of the
+/// maximum's threads or fewer is made and answers its threads (32 for 32 by 1 by 1, as Metal's
+/// first compile answers), and the kernel without a maximum makes the size refused beside 64.
+#[test]
+fn a_required_size_past_the_kernels_own_maximum_is_refused_every_time() {
+    use metal2vulkan_runtime::{Invalid, Problem, RequiredThreadsProblem};
+    on_device(|device| {
+        let bitcode = llvm_assemble(&engine_dir().join("compute_thread_limit.ll")).unwrap();
+        let library = device.new_library_with_air(&bitcode).unwrap();
+        let create = |name: &str, required: Option<[u32; 3]>| {
+            let function = library.new_function_with_name(name).unwrap();
+            let mut descriptor = ComputePipelineDescriptor::new(StageSource::Function(
+                function.function_descriptor(),
+            ));
+            descriptor.required_threads_per_threadgroup = required;
+            device.new_compute_pipeline_state(&descriptor, &PipelineOptions::default())
+        };
+        let refused = |required: [u32; 3]| {
+            let error = create("compute_thread_limit_64", Some(required)).err();
+            assert!(
+                matches!(
+                    error,
+                    Some(Error::Invalid(Invalid {
+                        problem: Problem::RequiredThreads(RequiredThreadsProblem::OverKernelMax {
+                            threads: 128,
+                            max: 64
+                        }),
+                        ..
+                    }))
+                ),
+                "{required:?}: {error:?}"
+            );
+        };
+        refused([128, 1, 1]);
+        let plain = create("compute_thread_limit_64", None).unwrap();
+        assert_eq!(plain.max_total_threads_per_threadgroup(), 64);
+        refused([128, 1, 1]);
+        refused([16, 8, 1]);
+        for (required, threads) in [([32, 1, 1], 32), ([8, 8, 1], 64)] {
+            let made = create("compute_thread_limit_64", Some(required)).unwrap();
+            assert_eq!(
+                made.max_total_threads_per_threadgroup(),
+                threads,
+                "{required:?}"
+            );
+        }
+        let unlimited = create("compute_thread_limit_plain", Some([128, 1, 1])).unwrap();
+        assert_eq!(unlimited.max_total_threads_per_threadgroup(), 128);
     });
 }

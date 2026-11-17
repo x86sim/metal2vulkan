@@ -1,4 +1,4 @@
-//! Canonicalization: entry selection, linking, function-constant baking, SCCP, inlining.
+//! Canonicalization: entry selection, linking, function-constant baking, SCCP, inlining, unrolling.
 //!
 //! [`specialize_linked`] turns a decoded module, its ABI, a [`SpecRequest`], and the pipeline's
 //! linked functions into one [`Entry`] ([`specialize`] links none): a
@@ -19,7 +19,9 @@
 //!    as undefined as the constant.
 //! 5. **Pointer erasure**: casts between identical erased pointer types disappear, so typed- and
 //!    opaque-pointer bitcode of one program canonicalize identically. Each defined function is
-//!    erased in place before inlining, so the inlined body is built erased.
+//!    erased in place before inlining, so the inlined body is built erased. Before it, each call
+//!    passing a thread-memory argument `byval` makes the callee's copy (an `alloca` and an
+//!    `llvm.memcpy`) and passes it plainly (`byval`).
 //! 6. **Inlining**: every direct call to a defined function is inlined into the entry, after a
 //!    memoized size pre-pass checked against `Limit::InlinedInstructions`; a call cycle is
 //!    `Unsupported{Recursion}`. Between the pre-pass and building the inlined body, a value use of
@@ -28,11 +30,38 @@
 //!    function addresses direct, reads visible-function tables as buffers of words, and makes each
 //!    call through a table a switch over the functions it may call; the direct calls this makes are
 //!    inlined in turn, round after round, until none is made.
-//! 7. **SCCP** over the inlined entry, including `air.is_function_constant_defined` and loads of
-//!    bound constants; unreachable blocks are deleted. A value use of an unsupplied constant that
-//!    survives is `Error::NeedsInput(FunctionConstant)`.
-//! 8. **Post-check**: no unknown intrinsic, indirect call, or call to an undefined non-intrinsic
-//!    function survives, and no reachable branch tests `undef`. A table call's refused candidate,
+//! 7. **SCCP** over the inlined entry, including `air.is_function_constant_defined`, loads of
+//!    bound constants, loads of the integer fields of a constant-space global whose value is
+//!    its initializer (`const_loads`), a pointer loaded from a constant table at an index only the
+//!    run knows as the `select` chain over its elements (`const_tables`), the integer `llvm.*`
+//!    operations on constants, and the
+//!    float operations a constant operand decides whatever the others hold (a NaN operand, and a
+//!    product by a zero under `nnan` and `nsz`); unreachable blocks are deleted.
+//!    **Thread-memory forwarding** then reads each load of a stack allocation whose address does
+//!    not escape as the value of the one store that wrote its bytes, where that store dominates
+//!    it (a load of an aggregate that holds a pointer excepted), and removes an allocation no read
+//!    is left of, with its stores: a lambda's closure of captured addresses, and a struct passed
+//!    to a function by pointer, leave the captured objects' own addresses, and a pointer's bits
+//!    read back and turned back into its pointer are the pointer (`forward`). It runs over the
+//!    body SCCP specialized, and SCCP runs again where it changed one. **Generic
+//!    pointers**: then each pointer of MSL 4.1's generic address space becomes a pointer of the
+//!    one space every pointer it may hold comes from, its space queries answered, and SCCP runs
+//!    again where one was; a generic pointer of two spaces, or of one only the run knows, is
+//!    `Unsupported{GenericPointer(..)}` (`generic`). A call whose immediates were not constants where it was
+//!    decoded (`Callee::Unbound`: an internal function's parameter passed on to the intrinsic) is
+//!    bound where they now are, each inlined copy with its own call site's constants. A value use of an unsupplied
+//!    constant that survives is `Error::NeedsInput(FunctionConstant)`. **Unrolling**: a loop whose
+//!    trip count SCCP made constant, and whose counter decides a branch of its body, is unrolled
+//!    within fixed ceilings, and SCCP runs again over the copies; the result is kept where it is
+//!    no larger than the loops it replaces (`unroll`). **Private reach**: then each private array
+//!    of nested arrays whose every index the constants bound (constants, and the counters of loops
+//!    whose trip count they decide), and whose address reaches only element accesses, is allocated
+//!    as far as those indices reach; one index with no bound keeps its declared type (`reach`).
+//!    Before SCCP, each OpenCL C vector data load
+//!    or store becomes its element accesses (`vector_data`), and in OpenCL mode each operation of
+//!    a 1D image becomes the 2D texture's that Apple's OpenCL binds for it (`opencl_1d`).
+//! 8. **Post-check**: no unknown or unbound intrinsic, indirect call, or call to an undefined
+//!    non-intrinsic function survives, and no reachable branch tests `undef`. A table call's refused candidate,
 //!    a table call no linked function answers, and a function pointer used as a value are refused
 //!    here, as stubs are. Indirect calls, calls to functions of a dynamic library, and ray
 //!    intersection are refused as their typed features, not implemented yet, naming the callee; a
@@ -45,13 +74,19 @@
 //! 9. **Arm speculation**: a branch whose short arms Metal's backend runs in every lane of the
 //!    branch's block, and whose arms hold a group operation that answers differently there,
 //!    becomes a jump into its arms with a `select` for each value they join with (`speculate`).
-//!    **Rasterization-rate maps**: each `float2` `air.map_*_coordinates` call becomes Apple's GPU
-//!    decoder of Metal's parameter data (`rate_map_data`) in plain AIR: word loads through the
-//!    call's map pointer and Apple's arithmetic. **AIR 2.7 simdgroup-matrix block loads and
+//!    **Rasterization-rate maps**: each `air.map_*_coordinates` call, `float2` or `uint2`, becomes
+//!    Apple's GPU decoder of Metal's parameter data (`rate_map_data`) in plain AIR: word loads
+//!    through the call's map pointer and Apple's arithmetic. **AIR 2.7 simdgroup-matrix block loads and
 //!    stores** take their AIR 2.8 form, their extent, stride and origin built from the elements per
-//!    row, the origin and the constant transpose flag (`legacy_matrix`). **Global built-in
+//!    row, the origin and the constant transpose flag (`legacy_matrix`). **Aggregate accesses**: a
+//!    load or store of a whole array or struct in buffer or threadgroup memory becomes its scalar
+//!    and vector members' accesses, joined by `insertvalue` or split by `extractvalue`
+//!    (`aggregates`). **Global built-in
 //!    variables**: each `air.get_*` read of a program-scope built-in becomes a read of a built-in
-//!    parameter appended to the entry (`global_builtin`). **Program-scope bindings** (MSL 3.2's
+//!    parameter appended to the entry (`global_builtin`); in OpenCL mode, first, the entry takes
+//!    the three hidden buffers, each OpenCL C work-item read becomes a read of its built-in or of
+//!    the first buffer, and each image format query a read of the third ([`opencl`]).
+//!    **Program-scope bindings** (MSL 3.2's
 //!    `!air.global_bindings`) became parameters before SCCP the same way: each load of a bound
 //!    global reads a parameter of the binding's role appended to the entry (`global_binding`).
 //! 10. **ABI resolution and pruning**: predicate-gated parameters and outputs that are off
@@ -64,9 +99,14 @@
 //! Inlining runs before SCCP: SCCP over the one inlined body sees each call's constant arguments,
 //! which per-function SCCP could not, and deletes the callees' dead paths with the caller's.
 
+mod adapt;
+mod aggregates;
 mod async_copy;
+mod block_read;
+mod byval;
 mod command_writes;
 mod const_loads;
+mod const_tables;
 mod devirt;
 #[cfg(test)]
 mod devirt_tests;
@@ -78,7 +118,9 @@ mod dynamic_tests;
 mod erase;
 mod fc;
 mod fold;
+mod forward;
 pub mod function_table;
+mod generic;
 mod global_binding;
 mod global_builtin;
 mod inline;
@@ -88,11 +130,14 @@ mod link;
 #[cfg(test)]
 mod link_tests;
 mod matmul2d;
+pub mod opencl;
+mod opencl_1d;
 mod out;
 mod pieces;
 mod prune;
 mod rate_map;
 pub mod rate_map_data;
+mod reach;
 mod reads;
 mod recursion;
 mod renumber;
@@ -106,6 +151,8 @@ mod static_init;
 mod table_copy;
 #[cfg(test)]
 mod tests;
+mod unroll;
+mod vector_data;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -151,6 +198,11 @@ pub struct SpecRequest {
     /// The pipeline's `maxCallStackDepth`: it sizes the explicit call stack of a recursion through
     /// visible functions. 0 is taken as 1, Metal's default.
     pub call_stack_depth: u32,
+    /// The entry is a kernel of a compute pipeline of OpenCL mode (`openCLModeEnabled`, Apple
+    /// SPI): it takes three hidden buffers before its own, each of its buffer-indexed arguments
+    /// sits 3 past its index, and OpenCL C's work-item functions read the dispatch's values
+    /// ([`opencl`]). Any other entry than a kernel specializes as without it.
+    pub open_cl_mode: bool,
 }
 
 /// The constexpr samplers of one linked function that a pipeline state numbers
@@ -222,6 +274,11 @@ pub struct Entry {
     /// out the threadgroup objects of the specialized function, whose references a constant may
     /// remove, so an integer threadgroup address is not translated in such a module.
     pub function_constants: bool,
+    /// The function constants (by index) the request leaves undefined whose values the body
+    /// reads: an instruction it keeps uses one (as its type's zero), or a branch or `select` was
+    /// decided on one (its false way). Metal makes such a pipeline too, and its reads of the
+    /// constant vary, so what a run computes from one is not Metal's answer.
+    pub undefined_reads: Vec<u32>,
     /// The Metal buffer indices of the visible-function-table parameters read as buffers of
     /// words: `ep` states each as a read-only device `Buffer`, and the interface says the slot
     /// holds a table.
@@ -270,12 +327,35 @@ pub struct Lockstep {
     /// make exact, left out because the device's lockstep orders their pairs as Apple's does. The
     /// module then requires the property. 0 elsewhere.
     pub device: u32,
+    /// Every inserted simdgroup barrier orders only pairs whose threads meet where a simdgroup
+    /// spans two rows of its threadgroup (two of its threads then share their position's `x`, or
+    /// hold different `y`s or `z`s): in a threadgroup whose simdgroups each lie within one row (a
+    /// single row, or rows of a multiple of 32 threads) no pair a simdgroup barrier orders
+    /// conflicts. The inserted threadgroup barriers may order pairs that meet there too; a
+    /// threadgroup barrier stands where the whole threadgroup runs together, orders every pair a
+    /// simdgroup barrier at its place would, and needs no subgroup size, so a pipeline for such
+    /// threadgroups keeps them and leaves out only the simdgroup barriers, and with them the
+    /// subgroup size they pinned: an exact removal. Decided where a subgroup barrier keeps a
+    /// 32-lane tier (maximal reconvergence on 32-lane subgroups, without the device's own
+    /// lockstep); `false` elsewhere and where no barrier is inserted.
+    pub rows: bool,
+    /// The inserted threadgroup barriers that order only pairs whose threads meet where a
+    /// simdgroup spans two rows of its threadgroup, sorted: each runs only in a threadgroup whose
+    /// simdgroups may span two rows (more than one row, of a width not a multiple of 32), and in
+    /// any other no pair it orders meets.
+    pub across_rows: Vec<crate::ir::InstId>,
 }
 
 impl Lockstep {
     /// Whether instruction `i` is an inserted barrier.
     pub fn inserted(&self, i: crate::ir::InstId) -> bool {
         self.barriers.binary_search(&i).is_ok()
+    }
+
+    /// Whether instruction `i` is an inserted barrier that orders only pairs meeting across rows
+    /// (one of [`across_rows`](Self::across_rows)).
+    pub fn orders_across_rows(&self, i: crate::ir::InstId) -> bool {
+        self.across_rows.binary_search(&i).is_ok()
     }
 }
 
@@ -354,6 +434,7 @@ fn writes_texture(op: &AirIntrinsic) -> bool {
         | TexOp::SampleGrad { .. }
         | TexOp::Gather { .. }
         | TexOp::Read
+        | TexOp::BlockRead
         | TexOp::Fence
         | TexOp::Query(_)
         | TexOp::IsNull
@@ -377,7 +458,9 @@ fn calls(module: &Module, ep: &EntryPoint, wanted: impl Fn(&AirIntrinsic) -> boo
         .any(|inst| match &inst.kind {
             InstKind::Call(call) => match call.callee {
                 Callee::Air { op, .. } => wanted(&op),
-                Callee::Indirect { .. } | Callee::UnknownIntrinsic(_) => true,
+                Callee::Indirect { .. } | Callee::UnknownIntrinsic(_) | Callee::Unbound { .. } => {
+                    true
+                }
                 Callee::Llvm { .. } => false,
                 Callee::Direct(f) => declared(f) && !ep.is_control_point_function(f),
             },
@@ -407,6 +490,18 @@ pub fn specialize_linked(
     specialize_dynamic(module, abi, req, (linked, &DynamicLinks::default()), m)
 }
 
+/// Whether the linkage signature of a module (`abi`'s) has no reading: a linked-constants
+/// module that still declares function constants. Any other signature describes how a closed
+/// module was produced, and the module's own code is what runs, as the entry's module and as a
+/// linked module alike: a stitched module (Metal's stitcher, `newLibraryWithStitchedDescriptor:`)
+/// defines every stitched function, its graph's nodes inlined, and a linked-constants module was
+/// specialized with the constants it lists and declares none.
+fn unread_signature(abi: &AirAbi) -> bool {
+    abi.linkage_signature
+        .is_some_and(|s| s.kind == crate::abi::LinkageSignatureKind::LinkedConstants)
+        && !abi.function_constants.is_empty()
+}
+
 /// [`specialize_linked`], resolving the module's dynamic-library imports against the stage's
 /// `dynamic` libraries too.
 pub fn specialize_dynamic(
@@ -416,15 +511,9 @@ pub fn specialize_dynamic(
     (linked, dynamic): (&[LinkedModule], &DynamicLinks),
     m: &mut Meter,
 ) -> Result<Entry, Error> {
-    // A linkage signature describes how a closed module was produced: a stitched module defines
-    // every stitched function, and a linked-constants module was specialized with the constants it
-    // lists and declares none. What the module still needs from outside is what any module needs
-    // (constants, linked functions), refused or bound as usual. A linked-constants module that
-    // still declares constants has no reading.
-    let linked_constants = abi
-        .linkage_signature
-        .is_some_and(|s| s.kind == crate::abi::LinkageSignatureKind::LinkedConstants);
-    if linked_constants && !abi.function_constants.is_empty() {
+    // What the module still needs from outside is what any module needs (constants, linked
+    // functions), refused or bound as usual.
+    if unread_signature(abi) {
         let at = Location::metadata(None, None, Some("air.signature"));
         return Err(Unsupported::not_implemented(Feature::Linking).at(at).into());
     }
@@ -508,30 +597,17 @@ pub fn specialize_dynamic(
     // the inliner copies erased bodies and the inlined body, as large as the entry's whole call
     // tree, is never rebuilt to erase it (that copy beside the inlined body was a translation's
     // ledger peak).
+    // Each `byval` argument's copy, made at its call, so the inliner takes the call.
+    byval::explicit(&mut parts, m)?;
     let emap = erase::erase_consts(&mut parts.consts, m)?;
     erase::erase_globals(parts.globals.values_mut(), &emap);
     erase_functions(&mut parts, &emap, m)?;
-    // The entry block always runs: a value use there of an unsupplied constant is SCCP's first
-    // refusal, known before the inlined body is built.
-    let entry_refusal = |consts: &ConstTable, m: &mut Meter| {
-        let body = parts
-            .funcs
-            .get(func)
-            .and_then(|f| f.body.as_ref())
-            .ok_or_else(|| invariant("the entry has no body"))?;
-        let inlined = |k: &InstKind| inline::inlined_callee(&parts.funcs, k).is_some();
-        match sccp::entry_block_refusal(body, consts, &fcs, &inlined, m)? {
-            Some(index) => Err(Error::NeedsInput(MissingInput::FunctionConstant { index })),
-            None => Ok(()),
-        }
-    };
     let inlined = inline::inline(
         &parts.funcs,
         (&parts.types, &parts.symbols),
         &mut parts.consts,
         func,
         m,
-        entry_refusal,
     );
     let body = inlined.and_then(|inlined| erased_entry(&parts, func, inlined, &emap, m));
     // Devirtualization: calls through constant function addresses and visible-function tables
@@ -577,50 +653,106 @@ pub fn specialize_dynamic(
     // A kernel's simdgroup asynchronous copies complete when their calls return, shared by the
     // simdgroup's lanes, and each wait is a simdgroup barrier.
     let body = async_copy::expand(body, &mut parts, ep, m)?;
+    // Metal 4.1's block reads are the reads of their texels.
+    let body = block_read::expand(body, &mut parts, ep.func, m)?;
+    // OpenCL C's vector data loads and stores are their element accesses.
+    let body = vector_data::expand(body, &mut parts, ep.func, m)?;
+    // OpenCL mode: a 1D image's operations are the 2D texture's that Apple's OpenCL binds for it.
+    let body = if req.open_cl_mode && matches!(ep.stage, Stage::Kernel { .. }) {
+        opencl_1d::expand(body, &mut parts, ep.func, m)?
+    } else {
+        body
+    };
     // MSL 3.2 program-scope bindings: each load of a bound global becomes a read of a parameter
     // added to the entry, before SCCP sees the global's `undef` initializer.
     let (body, global_bindings) =
         global_binding::expand(body, &mut parts, func, abi, &ep.stage, m)?;
 
     // SCCP. The body it read is freed as soon as it has run.
-    let solved = {
-        let mut cx = sccp::Context {
-            folder: fold::Folder {
-                types: &parts.types,
-                consts: &mut parts.consts,
-                held: 0,
-            },
-            globals: &parts.globals,
-            fcs: &fcs,
-            name: name.clone(),
-        };
-        sccp::run(&body, &mut cx, m)?
-    };
+    let solved = solve(&body, &mut parts, &fcs, &name, m)?;
     body.release(m);
-    let body = solved;
+    let sccp::Rebuilt {
+        body,
+        reads: mut undefined_reads,
+    } = solved;
     // A pointer loaded from a field of a constant global is the field's constant: a `constexpr
     // sampler` that SCCP's folded select picked is its sampler state. SCCP runs again over a body
     // that changed, to fold what those constants decide.
     let (body, folded) = const_loads::fold(body, &mut parts, m)?;
-    let body = if folded {
-        let solved = {
-            let mut cx = sccp::Context {
-                folder: fold::Folder {
-                    types: &parts.types,
-                    consts: &mut parts.consts,
-                    held: 0,
-                },
-                globals: &parts.globals,
-                fcs: &fcs,
-                name: name.clone(),
-            };
-            sccp::run(&body, &mut cx, m)?
-        };
+    // A pointer loaded from a constant table at an index only the run knows is the `select` chain
+    // over the table's elements: a `constexpr` sampler table read at a dynamic index.
+    let (body, tabled) = const_tables::fold(body, &mut parts, func, m)?;
+    let body = if folded || tabled {
+        let solved = solve(&body, &mut parts, &fcs, &name, m)?;
         body.release(m);
-        solved
+        undefined_reads.extend(solved.reads);
+        solved.body
     } else {
         body
     };
+    // Thread-memory fields that one store wrote, read as its value, and the objects no read is
+    // left of removed: a closure's captured addresses are the captured objects' own (`forward`).
+    // It runs over the body SCCP specialized to the constants, whose size is the variant's, not
+    // the whole function's; SCCP runs again over a body it changed, to fold what the values it
+    // read decide.
+    let params: Vec<TypeId> = match parts.funcs.get(func).and_then(|f| parts.types.get(f.ty)) {
+        Some(Type::Function { params, .. }) => params.to_vec(),
+        _ => return Err(invariant("the entry's type is not a function")),
+    };
+    let (forwarded, changed) = forward::forward(body, &parts, &params, m)?;
+    let mut body = if changed {
+        let solved = solve(&forwarded, &mut parts, &fcs, &name, m)?;
+        forwarded.release(m);
+        undefined_reads.extend(solved.reads);
+        solved.body
+    } else {
+        forwarded
+    };
+    // MSL 4.1's generic pointers, each a pointer of the one space its pointers come from; SCCP
+    // runs again over a body whose space queries that answered.
+    let (resolved, queried) = generic::resolve(body, &mut parts, func, &name, m)?;
+    body = if queried {
+        let solved = solve(&resolved, &mut parts, &fcs, &name, m)?;
+        resolved.release(m);
+        undefined_reads.extend(solved.reads);
+        solved.body
+    } else {
+        resolved
+    };
+    // Loops whose trip count the constants decided, unrolled where their counters decide a branch
+    // of their body; SCCP after each round folds what the copies decide. The unrolled body is
+    // kept only where it comes out no larger than the loops it replaces (`unroll::live_size`).
+    let mut grown = 0;
+    let mut trial: Option<(Body, BTreeSet<u32>)> = None;
+    for _ in 0..unroll::ROUNDS {
+        let current = trial.as_ref().map_or(&body, |(b, _)| b);
+        let Some(unrolled) = unroll::round(current, &mut parts, &mut grown, m)? else {
+            break;
+        };
+        let solved = solve(&unrolled, &mut parts, &fcs, &name, m)?;
+        unrolled.release(m);
+        let reads = match trial {
+            Some((old, mut reads)) => {
+                old.release(m);
+                reads.extend(solved.reads);
+                reads
+            }
+            None => solved.reads,
+        };
+        trial = Some((solved.body, reads));
+    }
+    if let Some((unrolled, reads)) = trial {
+        if unroll::live_size(&unrolled, m)? <= unroll::live_size(&body, m)? {
+            body.release(m);
+            body = unrolled;
+            undefined_reads.extend(reads);
+        } else {
+            unrolled.release(m);
+        }
+    }
+    // Each private array of nested arrays allocated as far as its accesses reach, where the
+    // constants bound every index of it.
+    let body = reach::narrow(body, &mut parts, func, m)?;
     matmul2d::refuse_left(&body, &parts, &ep.stage, &name, m)?;
     post_check(&body, &parts, &stubs, &name, &control_points(ep), m)?;
     // A branch's short arms that Metal's backend speculates, where a group operation in them
@@ -635,20 +767,32 @@ pub fn specialize_dynamic(
         };
         speculate::expand(body, (&parts.types, &parts.consts), (tys, &f.params), m)?
     };
-    // Rasterization-rate maps: each `float2` map call becomes Apple's GPU decoder of the parameter
-    // data, word loads through its own map pointer.
+    // Rasterization-rate maps: each map call, `float2` or `uint2`, becomes Apple's GPU decoder of
+    // the parameter data, word loads through its own map pointer.
     let body = rate_map::expand(body, &mut parts, m)?;
     // The AIR 2.7 simdgroup-matrix block loads and stores in their AIR 2.8 form.
     let body = legacy_matrix::expand(body, &mut parts, m)?;
     // Metal runtime routines: each `frexp` and `ilogb` call becomes the routine's measured answer
     // in plain AIR.
     let body = routine::expand(body, &mut parts, m)?;
+    // Aggregate loads and stores of buffer and threadgroup memory as their members' accesses.
+    let body = aggregates::expand(body, &mut parts, func, m)?;
     // A simdgroup reduction before a discard that Metal's compiler moves past it is placed after
     // the discard, where the fragment lowering gives Metal's lanes.
     let body = if matches!(ep.stage, Stage::Fragment { .. }) {
         discard_sink::expand(body, m)?
     } else {
         body
+    };
+    // OpenCL mode: the three hidden buffers appended to the entry, each OpenCL work-item read a
+    // read of its built-in or of the first buffer, which the global built-ins below take, and each
+    // image format query a read of the third.
+    let (body, hidden) = if req.open_cl_mode && matches!(ep.stage, Stage::Kernel { .. }) {
+        let images = opencl::Images::of(ep, m)?;
+        let (body, first) = opencl::expand(body, &mut parts, (func, images), m)?;
+        (body, Some(first))
+    } else {
+        (body, None)
     };
     // Global built-in variables: each read becomes a read of a built-in parameter added to the
     // entry, but one Metal refuses in the entry's stage.
@@ -674,6 +818,10 @@ pub fn specialize_dynamic(
     // The lane parameters `matmul2d`'s lowering added.
     if let Some(lanes) = lanes {
         ep.params.extend(lanes.bindings());
+    }
+    // OpenCL mode's indices and hidden buffers.
+    if let Some(first) = hidden {
+        ep = opencl::entry(ep, first)?;
     }
     // The built-in parameters the global built-ins' reads became.
     ep.params.extend(global_builtins);
@@ -765,12 +913,34 @@ pub fn specialize_dynamic(
         unnumbered_linked_samplers,
         intersection_candidates,
         function_constants: !abi.function_constants.is_empty(),
+        undefined_reads: undefined_reads.into_iter().collect(),
         function_tables,
         lockstep: Lockstep::default(),
         call_stack,
         unmeasured_speculation,
         module,
     })
+}
+
+/// SCCP over `body`, with the module's constants and the function constants `fcs`.
+fn solve(
+    body: &Body,
+    parts: &mut ModuleParts,
+    fcs: &HashMap<GlobalId, sccp::FcState>,
+    name: &DiagName,
+    m: &mut Meter,
+) -> Result<sccp::Rebuilt, Error> {
+    let mut cx = sccp::Context {
+        folder: fold::Folder {
+            types: &parts.types,
+            consts: &mut parts.consts,
+            held: 0,
+        },
+        globals: &parts.globals,
+        fcs,
+        name: name.clone(),
+    };
+    sccp::run(body, &mut cx, m)
 }
 
 /// The entry's visible-function-table parameters.
@@ -938,7 +1108,6 @@ fn reinline(
         &mut parts.consts,
         r.func,
         m,
-        |_, _| Ok(()),
     )?;
     let body = erased_entry(parts, r.func, inlined, r.emap, m)?;
     inline_rounds(body, parts, stubs, r, m)
@@ -1002,7 +1171,6 @@ fn inline_rounds(
             &mut parts.consts,
             r.func,
             m,
-            |_, _| Ok(()),
         )?;
         body = erased_entry(parts, r.func, inlined, r.emap, m)?;
     }
@@ -1215,7 +1383,8 @@ pub fn select<'a>(module: &Module, abi: &'a AirAbi, entry: &str) -> Result<&'a E
 }
 
 /// Each refusal carries the call's location in the inlined body (the entry's function, block, and
-/// instruction) and names its callee's symbol where it has one. Indirect calls devirtualization
+/// instruction) and names its callee's symbol where it has one. A call whose immediates are still
+/// not constants (`Callee::Unbound`) is `InvalidInput(Intrinsic(ImmediateNotConstant))`. Indirect calls devirtualization
 /// left (a function pointer loaded from memory or computed, a table that is no entry parameter),
 /// calls to functions this module does not define (linking), and unknown intrinsics of a typed
 /// family (`intrinsics::UNDECODED_FEATURES`) are refused as their features, not implemented yet;
@@ -1280,7 +1449,7 @@ fn post_check(
                         }
                         Some(Stub::Refused(Error::Unsupported(u))) => Ok(u.clone()),
                         Some(Stub::Refused(e)) => Err(e.clone()),
-                        Some(Stub::Resolved(_)) => {
+                        Some(Stub::Resolved { .. }) => {
                             Err(invariant("a call to a resolved stub survived linking"))
                         }
                         // A dynamic-library import, or a declaration no library can define.
@@ -1293,6 +1462,11 @@ fn post_check(
                 };
             let refusal = match call.callee {
                 Callee::Air { .. } | Callee::Llvm { .. } => continue,
+                // An immediate that inlining and constant propagation did not make a constant.
+                Callee::Unbound { .. } => {
+                    let kind = InputErrorKind::Intrinsic(IntrinsicError::ImmediateNotConstant);
+                    return Err(InputError::new(kind, at).into());
+                }
                 // The decoder keeps a call through a function's own constant address indirect when
                 // the call's function type is not the function's (`bitcode::function`): its callee
                 // is still that one function, so it is classified by the function, not as dynamic.
@@ -1329,7 +1503,11 @@ fn post_check(
                                 _ => undefined(f)?,
                             }
                         }
-                        None => Unsupported::not_implemented(Feature::DynamicCall),
+                        None => match parts.consts.inline_asm(callee) {
+                            Some(asm) => Unsupported::not_implemented(Feature::InlineAsm)
+                                .naming(DiagName::new(asm.spelling())),
+                            None => Unsupported::not_implemented(Feature::DynamicCall),
+                        },
                     }
                 }
                 Callee::Direct(f) => match parts.funcs.get(f) {

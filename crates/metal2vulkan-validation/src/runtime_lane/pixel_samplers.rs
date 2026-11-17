@@ -16,27 +16,41 @@
 //! reads its border color, here opaque white, as clamp to the border does, and a constexpr one
 //! transparent black.
 //!
-//! Each configuration here runs the same grid through the runtime. A pixel coordinate reaches
-//! the device divided by the texture's size, and the device's sampler reads that normalized
-//! coordinate in its own arithmetic: the stages record it (`PrecisionNote::PixelSamplerScaling`,
-//! and `ArgumentPixelSamplerScaling` for an argument buffer's sampler) and every device announces
-//! it. Each pixel configuration is held to its normalized control on the same device (the runtime
-//! state's `norm`; for `const`, a constexpr sampler of the same words in normalized coordinates):
-//! a cell that differs from the control at the same coordinate must be the control's answer at a
-//! coordinate within [`REACH`] ulps of it on each axis, and the widest shift each configuration
-//! needed is printed (`PIXEL-SAMPLER-REACH` lines). On a device with `VkProperty::MetalSampler`
-//! (MoltenVK) each `norm` control's hash must be Metal's. Elsewhere every sample is the device's
+//! Each configuration here runs the same grid through the runtime. A constexpr sampler's sample
+//! of this 2D texture hands the device's unnormalized sampler the coordinate itself; a nearest
+//! runtime or argument buffer's sampler's hands the device's normalized sampler its texel's centre
+//! over the size, where the device reads exactly that texel; a linear one hands it the coordinate
+//! over the size, which the device's sampler reads in its own arithmetic: the stages record it
+//! (`PrecisionNote::PixelSamplerScaling`, and `ArgumentPixelSamplerScaling` for an argument
+//! buffer's sampler) and every device announces it. Each pixel configuration is held to its
+//! normalized control on the same device (the runtime state's `norm`; for `const`, a constexpr
+//! sampler of the same words in normalized coordinates): a cell that differs from the control at
+//! the same coordinate must be the control's answer at a coordinate within [`REACH`] ulps of it on
+//! each axis, and the widest shift each configuration needed is printed (`PIXEL-SAMPLER-REACH`
+//! lines). A `const` linear configuration on a device whose sampler is not Metal's is the one
+//! exception: it is the device's linear filter in unnormalized coordinates, whose arithmetic is
+//! that path's own rather than the normalized filter's at a moved coordinate (lavapipe: 79 to 107
+//! of 800 cells of clamp to zero and to the border apart from the control in their last bits, none
+//! of clamp to edge), so it is printed and not held to the control. A configuration whose hash is
+//! Metal's needs no control: the NVIDIA RTX 5080 Laptop's normalized nearest controls answer the
+//! texel below at an edge (`(1, -0.5)` reads texel 0, where the pixel configurations and Metal
+//! read texel 1), past any shift within [`REACH`] ulps, and every nearest pixel configuration
+//! there is Metal's. On a device with
+//! `VkProperty::MetalSampler` (MoltenVK) each `norm` control's hash, each `const` configuration's
+//! and each nearest configuration's must be Metal's. Elsewhere every sample is the device's
 //! sampler's, which the stages record (`PrecisionNote::DeviceSampling`) and the device announces.
 //! Every configuration that is not Metal's is printed (`PIXEL-SAMPLER-DIFFERS` lines) without
-//! failing. An argument buffer's note waits for a dispatch while a pixel state lives
-//! ([`the_argument_buffer_note_waits_for_a_pixel_state`]).
+//! failing where it need not be Metal's. An argument buffer's note waits for a dispatch while a
+//! pixel state lives ([`the_argument_buffer_note_waits_for_a_pixel_state`]).
 
 use super::argument_linear_samples::kernel;
 use super::degrade_notices::counts;
 use super::depth_compares::{pipeline_of, run_held, Held, Through};
 use super::driver_deviations::stage_notes;
 use super::extended_range_targets::half_bits;
-use super::{layer_reported_nothing_at_all, validated_device, Messages, ScratchCache};
+use super::{
+    at_plan, layer_reported_nothing_at_all, validated_device_with, Messages, ScratchCache,
+};
 use crate::gpu::TEST_DEVICE;
 use metal2vulkan::bind::SamplerDescriptor;
 use metal2vulkan::device::VkProperty;
@@ -631,16 +645,19 @@ fn compare(device: &Device) -> Vec<Outcome> {
 }
 
 /// Every device announces both pixel samplers' notes, and every pixel configuration's cell is its
-/// normalized control's within [`REACH`] ulps of the control's coordinate (the module docs). On a
-/// device with Metal's own sampler each `norm` control answers Metal's results; elsewhere the
-/// samples are the device's sampler's and the device announces `device-sampling`. Each
-/// configuration that is not Metal's is printed with the cells where it differs from its control.
+/// normalized control's within [`REACH`] ulps of the control's coordinate, but for a `const` linear
+/// one where the device's sampler is not Metal's and one whose results are Metal's (the module
+/// docs). On a
+/// device with Metal's own sampler each `norm` control, each `const` configuration and each
+/// nearest configuration answers Metal's results; elsewhere the samples are the device's sampler's
+/// and the device announces `device-sampling`. Each configuration that is not Metal's is printed
+/// with the cells where it differs from its control.
 #[test]
 fn pixel_samplers_answer_metal_s_texels() {
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
     let (outcomes, metal_sampler, name) = {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         eprintln!("pixel samplers on {}", device.name());
         (
             compare(&device),
@@ -689,9 +706,13 @@ fn pixel_samplers_answer_metal_s_texels() {
             o.differs
         );
     }
+    // The device's own linear filter in unnormalized coordinates, where its sampler is not Metal's:
+    // not its normalized filter at a moved coordinate (the module docs). A configuration whose
+    // results are Metal's is held to them, whatever its control answers.
+    let own_filter = |o: &Outcome| !metal_sampler && o.name.contains("_const_linear_");
     let beyond: Vec<(&str, &[String])> = outcomes
         .iter()
-        .filter(|o| o.reach.is_none())
+        .filter(|o| o.reach.is_none() && !own_filter(o) && !o.metal)
         .map(|o| (o.name.as_str(), o.differs.as_slice()))
         .collect();
     assert!(
@@ -703,6 +724,14 @@ fn pixel_samplers_answer_metal_s_texels() {
         assert!(
             controls.is_empty(),
             "{name}: normalized controls not Metal's: {controls:?}"
+        );
+        let exact: Vec<&&str> = wrong
+            .keys()
+            .filter(|n| n.contains("_const_") || n.contains("_nearest_"))
+            .collect();
+        assert!(
+            exact.is_empty(),
+            "{name}: constexpr and nearest configurations not Metal's: {exact:?}"
         );
     }
 }
@@ -743,7 +772,7 @@ fn the_argument_buffer_note_waits_for_a_pixel_state() {
     let messages = Messages::default();
     let kind = Degradation::ArgumentPixelSamplerScaling;
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let bitcode = llvm_assemble_text(&kernel(true, Through::Argument, false, false)).unwrap();
         assert!(
             stage_notes(&device, &bitcode, "k")
@@ -777,6 +806,58 @@ fn the_argument_buffer_note_waits_for_a_pixel_state() {
         let after = counts(&messages.take_notices());
         assert_eq!(after.get(&kind).copied(), Some(1), "{after:?}");
         drop(pixel);
+    }
+    layer_reported_nothing_at_all(&messages);
+}
+
+/// `device-denormals` of a nearest pixel sample through a runtime sampler slot, whose texel's
+/// centre `floor(x) + 0.5` reads a negative subnormal coordinate by the device's `floor`, waits for
+/// a dispatch through a state whose `s` or `t` mode reads texel -1 apart from texel 0: its stage
+/// records the note held under the bound word (`SpecKey::BoundSamplerWord`), the pipeline's making
+/// announces nothing, dispatches at subnormal coordinates through clamp to edge and mirror clamp to
+/// edge announce nothing, and the next, through clamp to zero, announces it once.
+#[test]
+fn a_texel_centre_s_denormals_wait_for_a_mode_that_parts_texel_minus_one() {
+    let cache = ScratchCache::new().unwrap();
+    let messages = Messages::default();
+    let kind = Degradation::DeviceDenormals;
+    {
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
+        let bitcode = llvm_assemble_text(&kernel(false, Through::Runtime, false, false)).unwrap();
+        assert!(
+            stage_notes(&device, &bitcode, "k").contains(&PrecisionNote::DeviceDenormals),
+            "a runtime slot's nearest sample records the note"
+        );
+        let slot = pipeline_of(&device, &bitcode, "k");
+        let made = counts(&messages.take_notices());
+        assert!(!made.contains_key(&kind), "made: {made:?}");
+        let texture = texture(&device, PixelFormat::RGBA8Unorm);
+        let below = -f32::from_bits(1);
+        let jobs = [[below, 1.5, 0.0, 0.0], [2.5, below, 0.0, 0.0]];
+        for (address, noted) in [
+            (SamplerAddressMode::ClampToEdge, false),
+            (SamplerAddressMode::MirrorClampToEdge, false),
+            (SamplerAddressMode::ClampToZero, true),
+        ] {
+            let state = sampler(&device, SamplerMinMagFilter::Nearest, address, false);
+            run_held(
+                &device,
+                (&texture, Held::Slot, Some(&state)),
+                &slot,
+                &jobs,
+                1,
+            );
+            let after = counts(&messages.take_notices());
+            eprintln!(
+                "TEXEL-CENTRE-DENORMALS {}: {address:?}: {after:?}",
+                device.name()
+            );
+            assert_eq!(
+                after.get(&kind).copied(),
+                noted.then_some(1),
+                "{address:?}: {after:?}"
+            );
+        }
     }
     layer_reported_nothing_at_all(&messages);
 }

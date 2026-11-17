@@ -63,7 +63,8 @@
 //! - **Freed off the runtime's completion threads.** A queue's waiter that publishes a value while
 //!   blocks wait posts their release to a handler thread ([`Unpark`]), which frees the blocks it
 //!   reached and then lets go of what waited for them; a block whose values were reached as it
-//!   went is freed at once, where it went. At the device's teardown, its queues idle, every block
+//!   went is freed at once, on the device's free thread (`free_thread.rs`) where it is no import
+//!   and nothing waits for it, else where it went. At the device's teardown, its queues idle, every block
 //!   left is freed (`Memory::destroy`).
 //! - **Holding nothing of the device.** The watch and the releases hold only the parts of the
 //!   device they work with ([`Parts`]), never a handle: posted as the program's wait returns, or
@@ -568,7 +569,7 @@ pub(crate) mod held {
         }
 
         /// Let them go once `closed` is set, or once they were let go already.
-        pub(super) fn release_once(&self, closed: &AtomicBool) {
+        pub(crate) fn release_once(&self, closed: &AtomicBool) {
             while !closed.load(Ordering::SeqCst) && lock(&self.state).0 {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -591,8 +592,13 @@ pub(crate) mod held {
             }
         }
 
+        /// How many wait at the hold now.
+        pub(crate) fn waiting(&self) -> usize {
+            lock(&self.state).1
+        }
+
         /// As a watch or release begins: wait while held, counted.
-        pub(super) fn pass(&self) {
+        pub(crate) fn pass(&self) {
             let mut state = lock(&self.state);
             state.1 += 1;
             self.changed.notify_all();

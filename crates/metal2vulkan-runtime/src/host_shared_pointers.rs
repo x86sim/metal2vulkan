@@ -22,45 +22,56 @@ impl Device {
     /// counterpart (Metal takes any page). Found once per device by importing one page of a
     /// `memfd` mapped shared, read and write (anonymous shared memory off Linux), which is
     /// released at once, and answered from that after; the import is counted as a no-copy
-    /// buffer's is. False for a device that imports no host memory.
+    /// buffer's is. False for a device that imports no host pointer (one without
+    /// `VK_EXT_external_memory_host`).
     ///
-    /// Where it is false, a no-copy buffer over shared memory is made only from the caller's
-    /// dma-buf source ([`HostMemory::with_dma_buf`](crate::HostMemory::with_dma_buf)), and a
-    /// source is what such memory needs, whatever its pages' protection: pages the process maps
-    /// read-only go to the source without their pointer's import being tried (a dma-buf pins
-    /// nothing of the process's mapping), so a caller need not make a writable second mapping of
-    /// them for the import. Measured: MoltenVK (an M3 Max) and lavapipe answer true, RADV (a
-    /// Radeon 780M and an RX 7900 XTX, Mesa 26.2.4) false; NVIDIA's driver imported such memory
-    /// where the no-copy buffers were measured, though this answer was not asked there.
+    /// Where it is false, a no-copy buffer over shared memory is imported only from the caller's
+    /// dma-buf source ([`HostMemory::with_dma_buf`](crate::HostMemory::with_dma_buf)), and without
+    /// one that works is a copy of the pages, announced (`copied-host-pages`,
+    /// `WorkCounts::copied_host_buffers_device_refused`), as is any memory without one on a
+    /// device that imports no pointer. A source is what such memory needs to be imported,
+    /// whatever its pages' protection: pages the process maps read-only go to the source without
+    /// their pointer's import being tried (a dma-buf pins nothing of the process's mapping), so a
+    /// caller need not make a writable second mapping of them for the import. Measured: MoltenVK
+    /// (an M3 Max) and lavapipe answer true, RADV (a Radeon 780M and an RX 7900 XTX, Mesa 26.2.4)
+    /// false; NVIDIA's driver imported such memory where the no-copy buffers were measured,
+    /// though this answer was not asked there.
     ///
     /// Fails only where the answer cannot be found: out of host memory for the page, or the
     /// device lost. The device's refusal of the pointer is no failure but the answer, false.
     pub fn imports_shared_host_pointers(&self) -> Result<bool, Error> {
+        self.at_serving(|device| device.imports_shared_host_pointers_now())
+    }
+
+    /// [`Device::imports_shared_host_pointers`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn imports_shared_host_pointers_now(&self) -> Result<bool, Error> {
         let shared = self.shared();
         if let Some(&answer) = shared.shared_pointer_imports.get() {
             return Ok(answer);
         }
-        let Ok(importer) = shared.host_import.as_ref() else {
+        let Some((importer, pointers)) = (shared.host_import.as_ref().ok())
+            .and_then(|importer| Some((importer, importer.pointers()?)))
+        else {
             return Ok(false);
         };
         if self.is_lost() {
-            return Err(Error::DeviceLost);
+            return Err(self.lost_refusal());
         }
-        let unit = importer.page.max(importer.alignment);
+        let unit = pointers.unit();
         let memory = SharedPages::new(2 * unit).ok_or(Error::OutOfMemory(MemoryKind::Host))?;
         // The first whole unit of the pages: the import's window is exactly it.
         let at = (memory.at.as_ptr() as u64).next_multiple_of(unit);
         let pointer = NonNull::new(at as *mut u8).ok_or(Error::OutOfMemory(MemoryKind::Host))?;
-        let window = import_window(at, unit, importer.page, importer.alignment)
+        let window = import_window(at, unit, importer.page, pointers.alignment)
             .map_err(|_| Error::OutOfMemory(MemoryKind::Host))?;
         // SAFETY: the window's pages are this call's mapping, which stays mapped until the
         // placement is freed below.
         let imported = unsafe {
-            self.import_pointer(importer, pointer, unit, &window, MemoryClass::Shared, false)
+            self.import_pointer(pointers, pointer, unit, &window, MemoryClass::Shared, false)
         };
         let answer = match imported {
             Ok((buffer, placement)) => {
-                self.discard_import(buffer, placement);
+                self.discard_import(buffer.raw, placement);
                 true
             }
             Err(error) if refused(&error) => false,

@@ -8,8 +8,10 @@
 //! elsewhere.
 //!
 //! The kernels read two `float`s from buffer 0 and store one result after them: a `half` sum of
-//! the two narrowed, and the first narrowed alone. `llvm-as` assembles the module; without it the
-//! compiling tests skip visibly.
+//! the two narrowed, and the first narrowed alone; and, under the float controls, a `float` sum,
+//! product and fused multiply-add of the two rounded to `half`, which a driver may fuse into the
+//! narrowing (`DriverWorkaround::HalfConversionFusedWithArithmetic`). `llvm-as` assembles the
+//! module; without it the compiling tests skip visibly.
 
 use crate::air::{self, SpecRequest};
 use crate::device::requirements::VkProperty;
@@ -19,10 +21,12 @@ use crate::error::DriverDeviation;
 use crate::lower::arith::narrow::{controlled_modes, native_rounding, quantize_form};
 use crate::lower::emit::emit_module;
 use crate::lower::select::{select, LowerInputs};
+use crate::lower::simd::WidestPin;
 use crate::memory::static_root::analyze_memory;
 use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
-    compile, compile_kept, link_and_validate, llvm_assemble, meter, profile, AssembleError, Scratch,
+    compile, compile_kept, device_nan_bits, link_and_validate, llvm_assemble, meter, profile,
+    AssembleError, Scratch,
 };
 use crate::pipeline::PrecisionNote;
 use crate::spirv::builder::QuantizeForm;
@@ -46,23 +50,51 @@ const KERNELS: [(&str, &str); 2] = [
     ),
 ];
 
+/// Kernels that round `float` arithmetic to `half`: the sum and the product of the two `float`s, and
+/// their fused multiply-add (the second added to the product of the two), each narrowed and widened
+/// back, and the first narrowed alone.
+const ARITHMETIC: [(&str, &str); 4] = [
+    (
+        "float_sum",
+        "  %s = fadd float %a, %b\n  %h = fptrunc float %s to half\n  %r = fpext half %h to float\n",
+    ),
+    (
+        "float_product",
+        "  %s = fmul float %a, %b\n  %h = fptrunc float %s to half\n  %r = fpext half %h to float\n",
+    ),
+    (
+        "float_fma",
+        "  %s = call float @air.fma.f32(float %a, float %b, float %b)\n  %h = fptrunc float %s to half\n  %r = fpext half %h to float\n",
+    ),
+    (
+        "float_narrow",
+        "  %h = fptrunc float %a to half\n  %r = fpext half %h to float\n",
+    ),
+];
+
 /// The module of every kernel.
 fn module() -> String {
+    module_of(&KERNELS)
+}
+
+/// The module of `kernels`.
+fn module_of(kernels: &[(&str, &str)]) -> String {
     let mut s = String::from(
         "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32\"\ntarget triple = \"air64_v28-apple-macosx26.0.0\"\n\n",
     );
-    for (name, body) in &KERNELS {
+    for (name, body) in kernels {
         s.push_str(&format!(
             "define void @{name}(ptr addrspace(1) noundef \"air-buffer-no-alias\" %0) {{\nentry:\n  %p1 = getelementptr inbounds float, ptr addrspace(1) %0, i64 1\n  %p2 = getelementptr inbounds float, ptr addrspace(1) %0, i64 2\n  %a = load float, ptr addrspace(1) %0, align 4\n  %b = load float, ptr addrspace(1) %p1, align 4\n{body}  store float %r, ptr addrspace(1) %p2, align 4\n  ret void\n}}\n\n"
         ));
     }
-    let refs: Vec<String> = (0..KERNELS.len()).map(|i| format!("!{}", 20 + i)).collect();
+    let refs: Vec<String> = (0..kernels.len()).map(|i| format!("!{}", 20 + i)).collect();
+    s.push_str("declare float @air.fma.f32(float, float, float)\n\n");
     s.push_str(&format!(
         "!llvm.module.flags = !{{!0}}\n!air.kernel = !{{{}}}\n!air.version = !{{!17}}\n!air.language_version = !{{!18}}\n\n",
         refs.join(", ")
     ));
     s.push_str("!0 = !{i32 7, !\"air.max_device_buffers\", i32 31}\n!10 = !{}\n!11 = !{!12}\n!12 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read_write\", !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4, !\"air.arg_type_name\", !\"float\", !\"air.arg_name\", !\"io\"}\n!17 = !{i32 2, i32 8, i32 0}\n!18 = !{!\"Metal\", i32 4, i32 0, i32 0}\n");
-    for (i, (name, _)) in KERNELS.iter().enumerate() {
+    for (i, (name, _)) in kernels.iter().enumerate() {
         s.push_str(&format!("!{} = !{{ptr @{name}, !10, !11}}\n", 20 + i));
     }
     s
@@ -113,7 +145,14 @@ fn interpret_bytes(bitcode: &[u8], entry: &str, p: &DeviceProfile, bytes: Vec<u8
     };
     let spec = air::specialize(decoded, &req, &mut m).expect("specialize");
     let memory = analyze_memory(&spec, p, &mut m).expect("memory");
-    let plan = select(&spec, &memory, p, &LowerInputs::new(), &mut m).expect("select");
+    let plan = select(
+        &spec,
+        &memory,
+        p,
+        (&LowerInputs::new(), WidestPin::Weighed),
+        &mut m,
+    )
+    .expect("select");
     let module = emit_module(&spec, &plan, &mut m).expect("emit").module;
     let res = Resources {
         buffers: vec![Buffer {
@@ -134,11 +173,14 @@ fn interpret_bytes(bitcode: &[u8], entry: &str, p: &DeviceProfile, bytes: Vec<u8
 }
 
 /// The form a profile's `half` roundings take: the controlled conversion where the profile has
-/// `shaderFloat16` and its float controls, else the conversion with `shaderFloat16`, else the
-/// quantize.
+/// `shaderFloat16` and its float controls and its driver keeps the round trip (not NVIDIA's,
+/// `DriverWorkaround::HalfConversionPairFolded`), else the conversion with `shaderFloat16`, else
+/// the quantize.
 fn expected(p: &DeviceProfile) -> QuantizeForm {
     let float16 = p.fields().leaf.float16;
-    if float16 && controlled_modes(p).is_some() {
+    let folds = (p.workarounds())
+        .contains(&crate::device::profile::DriverWorkaround::HalfConversionPairFolded);
+    if float16 && controlled_modes(p).is_some() && !folds {
         QuantizeForm::Controlled
     } else if float16 {
         QuantizeForm::Converted
@@ -177,9 +219,12 @@ fn half_rounding_is_the_devices_on_every_profile() {
 }
 
 /// On lavapipe and MoltenVK (`shaderFloat16`, no `DenormPreserve` for 16 bits) each kernel rounds
-/// its `half` through the conversion, records `NativeHalfConversion` and requires no measured
-/// fact; on a profile without `shaderFloat16` it quantizes and records `NativeHalfQuantize`; RADV
-/// takes the controlled conversion, with no fact and no note. Each passes L3. On the interpreter,
+/// its `half` through the conversion: lavapipe records `NativeHalfConversion` and requires no
+/// measured fact, and MoltenVK on the M3 Max's identity, whose conversion of a `float` the function
+/// holds is measured to be Metal's (`DriverDeviation::MetalHalfConversion`), records nothing and
+/// requires `VkProperty::MetalHalfConversion`; on a profile without `shaderFloat16` it quantizes
+/// and records `NativeHalfQuantize`; RADV takes the controlled conversion, with no fact and no
+/// note. Each passes L3. On the interpreter,
 /// whose conversion and quantize round to nearest even, the native modules answer Metal's
 /// `half(float)`, but for the quantize's zero below the smallest normal half.
 #[test]
@@ -191,13 +236,14 @@ fn native_half_rounding_records_its_kind_and_requires_no_fact() {
         PrecisionNote::NativeHalfConversion,
         PrecisionNote::NativeHalfQuantize,
     ];
-    let cases: [(&str, Option<PrecisionNote>); 4] = [
-        ("lavapipe", Some(natives[0])),
-        ("swiftshader", Some(natives[1])),
-        ("moltenvk-m3", Some(natives[0])),
-        ("amd-780m-radv", None),
+    // Each profile, its note, and whether it requires the measured conversion.
+    let cases: [(&str, Option<PrecisionNote>, bool); 4] = [
+        ("lavapipe", Some(natives[0]), false),
+        ("swiftshader", Some(natives[1]), false),
+        ("moltenvk-m3", None, true),
+        ("amd-780m-radv", None, false),
     ];
-    for (stem, note) in cases {
+    for (stem, note, measured) in cases {
         let p = profile(stem, DevicePolicy::default()).expect("profile");
         for (name, _) in &KERNELS {
             let what = format!("{name} on {stem}");
@@ -205,6 +251,13 @@ fn native_half_rounding_records_its_kind_and_requires_no_fact() {
             link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
             let noted: Vec<_> = natives.iter().filter(|n| a.precision.contains(n)).collect();
             assert_eq!(noted, note.iter().collect::<Vec<_>>(), "{what}");
+            assert_eq!(
+                a.requirements
+                    .properties
+                    .contains(&VkProperty::MetalHalfConversion),
+                measured,
+                "{what}"
+            );
         }
     }
     // Metal's `half(float)` on the interpreter's nearest-even conversion and quantize: a tie to
@@ -361,14 +414,18 @@ fn decodes(m: &TypedModule) -> (usize, usize) {
 }
 
 /// A `half` read from memory is the device's widening of its bits on every profile, inside a loop
-/// and out, with no integer decode: on lavapipe and NVIDIA (the device's conversion, no float
-/// controls) the module records `NativeNanEncoding` and `NativeHalfConversion` (a NaN's bits and,
-/// where the device flushes 16-bit denormals, a denormal); on MoltenVK, whose widening the measured
+/// and out, with no integer decode: on lavapipe (the device's conversion, no float controls) the
+/// module records `NativeNanEncoding` and `NativeHalfConversion` (a NaN's bits and, where the
+/// device flushes 16-bit denormals, a denormal); on NVIDIA, under the float controls (its driver
+/// folds only the conversion's round trip, `narrow::half_controls`), `NativeNanEncoding` alone,
+/// requiring no fact; on MoltenVK, whose widening the measured
 /// `MetalHalfArithmetic` reads as Metal's, it records `NativeNanEncoding` alone and requires that
 /// fact; on the floor (no `shaderFloat16`) it is `UnpackHalf2x16` of each word, recording both
 /// notes and requiring no fact. A `half4` widens as one vector (two words unpacked and shuffled
 /// where the device unpacks). Each module passes L3 and answers the `half`s' values on the
-/// interpreter (whose widening is exact).
+/// interpreter (whose widening is exact). Where the device's moves of a NaN are measured to be
+/// Metal's (`DriverDeviation::MetalNanMoves`, MoltenVK on the M3 Max's identity), a module that
+/// moves its `half`s only so requires that in place of the NaN's note (`device_nan_bits`).
 #[test]
 fn a_half_decode_is_the_devices_widening_inside_loops_and_out() {
     let Some(bc) = assemble("native-half-decode", &decode_module()) else {
@@ -386,17 +443,16 @@ fn a_half_decode_is_the_devices_widening_inside_loops_and_out() {
         0x3800 | (0x3400 << 16),
         0,
     ];
-    let nan = PrecisionNote::NativeNanEncoding;
     let conversion = PrecisionNote::NativeHalfConversion;
-    // Each profile, whether its widening is noted `NativeHalfConversion` (else measured), and
-    // whether it unpacks words (no `shaderFloat16`).
+    // Each profile, whether its widening is noted `NativeHalfConversion`, whether it requires the
+    // measured `MetalHalfArithmetic`, and whether it unpacks words (no `shaderFloat16`).
     let cases = [
-        ("lavapipe", true, false),
-        ("nvidia-rtx5080-laptop", true, false),
-        ("moltenvk-m3", false, false),
-        ("vk12-floor", true, true),
+        ("lavapipe", true, false, false),
+        ("nvidia-rtx5080-laptop", false, false, false),
+        ("moltenvk-m3", false, true, false),
+        ("vk12-floor", true, false, true),
     ];
-    for (stem, native, unpacks) in cases {
+    for (stem, native, measured, unpacks) in cases {
         let p = profile(stem, DevicePolicy::default()).expect("profile");
         for (entry, both) in [("both", true), ("inside", false)] {
             let what = format!("{entry} on {stem}");
@@ -413,7 +469,7 @@ fn a_half_decode_is_the_devices_widening_inside_loops_and_out() {
             };
             let (device, integer) = decodes(&kept);
             assert_eq!((device, integer), (reads, 0), "{what}: the decodes");
-            assert!(a.precision.contains(&nan), "{what}: {:?}", a.precision);
+            assert!(device_nan_bits(&a), "{what}: {:?}", a.precision);
             assert_eq!(
                 a.precision.contains(&conversion),
                 native,
@@ -424,7 +480,7 @@ fn a_half_decode_is_the_devices_widening_inside_loops_and_out() {
                 a.requirements
                     .properties
                     .contains(&VkProperty::MetalHalfArithmetic),
-                !native,
+                measured,
                 "{what}: {:?}",
                 a.requirements.properties
             );
@@ -551,8 +607,8 @@ struct Rounding {
     quantizes: usize,
     /// `OpConstant`s of 32-bit float type with Metal's canonical NaN, `0x7FC00000`.
     canonical_nans: usize,
-    /// `OpFAdd`s, `OpFSub`s and extended instructions of a 16-bit float type: a `half` operation
-    /// on the device's 16-bit arithmetic (`ops::f16_binary`), between exact conversions.
+    /// `OpFAdd`s, `OpFSub`s, `OpFMul`s and extended instructions of a 16-bit float type: a `half`
+    /// operation on the device's 16-bit arithmetic (`ops::f16_binary`), between exact conversions.
     f16_ops: usize,
     /// `OpLoad`s of a 16-bit integer: a 16-bit storage unit read.
     unit_loads: usize,
@@ -639,7 +695,7 @@ fn rounding(words: &[u32]) -> Rounding {
     }
     for i in &parsed.instructions {
         let width = i.result_type.and_then(|t| widths.get(&t).copied());
-        if matches!(i.opcode, Op::FAdd | Op::FSub | Op::ExtInst) && width == Some(16) {
+        if matches!(i.opcode, Op::FAdd | Op::FSub | Op::FMul | Op::ExtInst) && width == Some(16) {
             r.f16_ops += 1;
         }
         let of_int16 = word(i.operands.first())
@@ -675,8 +731,9 @@ fn rounding(words: &[u32]) -> Rounding {
 /// Metal's `half(float)` by the Vulkan spec (every ANV and RADV profile), and its driver does not
 /// fold the round trip (`DriverWorkaround::HalfConversionPairFolded`, NVIDIA's), each kernel
 /// rounds its `half` through that conversion and its widening, every one decorated
-/// `NoContraction`, with no quantize, and computes its `half` sum on the
-/// device's 16-bit arithmetic, between conversions that are exact and undecorated; its entry
+/// `NoContraction`, with no quantize, and computes its `half` sum on the device's 16-bit
+/// arithmetic, which reads the roundings' 16-bit results themselves and is widened once, exactly
+/// and undecorated (`spirv::half_hold`); its entry
 /// declares `RoundingModeRTE`, `DenormPreserve` and `SignedZeroInfNanPreserve` for 16 bits and the
 /// modes the device's independence ties to them (`RoundingModeRTE` for 32 and 64 bits on ANV,
 /// whose rounding modes are not independent; `RoundingModeRTE` and `DenormPreserve` for 64 bits on
@@ -737,11 +794,15 @@ fn a_controlled_conversion_rounds_half_where_the_float_controls_allow() {
             let r = rounding(&a.module.words);
             assert_eq!(r.quantizes, 0, "{what}: {r:?}");
             assert!(r.narrowings > 0 && r.widenings > 0, "{what}: {r:?}");
-            assert_eq!(r.f16_ops, usize::from(*name == "half_sum"), "{what}: {r:?}");
-            // Each 16-bit operation narrows its two operands and widens its result, exactly.
+            let sum = *name == "half_sum";
+            assert_eq!(r.f16_ops, usize::from(sum), "{what}: {r:?}");
+            // The roundings' narrowings, each decorated, and one widening of the result: the
+            // 16-bit sum reads the roundings' 16-bit results themselves (`spirv::half_hold`) and
+            // its widening is exact and undecorated; the narrowing alone keeps its pair's
+            // decorated widening.
             assert_eq!(
-                r.uncontracted + 3 * r.f16_ops,
-                r.narrowings + r.widenings,
+                (r.narrowings, r.widenings, r.uncontracted),
+                if sum { (2, 1, 2) } else { (1, 1, 2) },
                 "{what}: {r:?}"
             );
             // Less `SignedZeroInfNanPreserve` for 32 and 64 bits, which the entry's own `float`
@@ -809,6 +870,202 @@ fn a_controlled_conversion_rounds_half_where_the_float_controls_allow() {
     }
 }
 
+/// Kernels of `half` arithmetic on the two `float`s narrowed: their sum, their product, the
+/// product plus the first (two roundings), and the first narrowed and widened back alone.
+const NATIVE: [(&str, &str); 4] = [
+    (
+        "half_sum",
+        "  %ha = fptrunc float %a to half\n  %hb = fptrunc float %b to half\n  %hs = fadd half %ha, %hb\n  %r = fpext half %hs to float\n",
+    ),
+    (
+        "half_product",
+        "  %ha = fptrunc float %a to half\n  %hb = fptrunc float %b to half\n  %hp = fmul half %ha, %hb\n  %r = fpext half %hp to float\n",
+    ),
+    (
+        "half_chain",
+        "  %ha = fptrunc float %a to half\n  %hb = fptrunc float %b to half\n  %hp = fmul half %ha, %hb\n  %hs = fadd half %hp, %ha\n  %r = fpext half %hs to float\n",
+    ),
+    (
+        "half_narrow",
+        "  %ha = fptrunc float %a to half\n  %r = fpext half %ha to float\n",
+    ),
+];
+
+/// NVIDIA's driver folds the conversion's round trip (`DriverWorkaround::HalfConversionPairFolded`)
+/// but reports every 16-bit float control, so its `half` arithmetic is the device's 16-bit
+/// instructions under them: on the committed RTX 50 series profiles (`nvidia-rtx50-linux`,
+/// `nvidia-rtx5080-laptop`) and on the RTX 5080 Laptop GPU's description given an RTX 2080's
+/// (`0x1E87`) and an RTX 3090's (`0x2204`) device ID (the workaround is the driver's, whatever the
+/// GPU), a `half` sum, product and product plus a sum compute on 16-bit floats, one `OpFAdd` or
+/// `OpFMul` an operation, between the narrowings of the loaded `float`s, which feed them directly
+/// (no round trip, so no `NativeHalfConversion`); the entry declares `RoundingModeRTE`,
+/// `DenormPreserve` and `SignedZeroInfNanPreserve` for 16 bits and requires their properties.
+/// A `half` narrowed and widened back alone is the round trip, the device's conversion
+/// (`QuantizeForm::Converted`), recorded. Each passes L3. On the interpreter each operation rounds
+/// to `half`: `(1 + 2^-10)^2` is `1 + 2^-9`, and that plus `1 + 2^-10` the tie `2 + 3·2^-10`,
+/// rounded to the even `2 + 2^-8` (the `float` computation, unrounded, is `2 + 3·2^-10 + 2^-20`).
+/// The negative control: the RTX 2080's description without `shaderRoundingModeRTEFloat16`
+/// computes in `f32` (no 16-bit instruction, no 16-bit mode) and records the note on every
+/// kernel, as does Pascal's profile, without `shaderFloat16`.
+#[test]
+fn nvidia_computes_half_on_16_bit_floats_under_the_float_controls() {
+    use crate::device::profile::DriverWorkaround;
+    use crate::device::requirements::{FloatControl, FloatWidth};
+    use crate::device::{Device, DeviceDescription};
+    use crate::lower::arith::narrow::half_controls;
+    use crate::spv::ExecutionMode as M;
+    let Some(bc) = assemble("native-half-nvidia", &module_of(&NATIVE)) else {
+        return;
+    };
+    let of = |desc: DeviceDescription| {
+        Device::new(desc, DevicePolicy::default())
+            .expect("device")
+            .profile()
+            .clone()
+    };
+    let laptop = crate::pipeline::testing::description("nvidia-rtx5080-laptop").expect("profile");
+    let as_gpu = |id: u32| {
+        let mut desc = laptop.clone();
+        desc.device_id = id;
+        of(desc)
+    };
+    let nvidia = [
+        (
+            "nvidia-rtx50-linux".to_owned(),
+            profile("nvidia-rtx50-linux", DevicePolicy::default()).expect("profile"),
+        ),
+        ("nvidia-rtx5080-laptop".to_owned(), of(laptop.clone())),
+        ("RTX 2080 (0x1E87)".to_owned(), as_gpu(0x1E87)),
+        ("RTX 3090 (0x2204)".to_owned(), as_gpu(0x2204)),
+    ];
+    let one = 1.0 + 2f32.powi(-10);
+    for (stem, p) in &nvidia {
+        assert!(
+            p.workarounds()
+                .contains(&DriverWorkaround::HalfConversionPairFolded),
+            "{stem}"
+        );
+        assert!(half_controls(p), "{stem}");
+        assert_eq!(quantize_form(p), QuantizeForm::Converted, "{stem}");
+        for (name, _) in &NATIVE {
+            let what = format!("{name} on {stem}");
+            let a = compile(&bc, name, p).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            link_and_validate(&a, p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
+            let r = rounding(&a.module.words);
+            let ops = match *name {
+                "half_chain" => 2,
+                "half_narrow" => 0,
+                _ => 1,
+            };
+            assert_eq!(r.f16_ops, ops, "{what}: {r:?}");
+            assert_eq!(r.quantizes, 0, "{what}: {r:?}");
+            let conversion = a.precision.contains(&PrecisionNote::NativeHalfConversion);
+            assert_eq!(conversion, ops == 0, "{what}: {:?}", a.precision);
+            if ops == 0 {
+                continue;
+            }
+            for mode in [
+                M::RoundingModeRTE,
+                M::DenormPreserve,
+                M::SignedZeroInfNanPreserve,
+            ] {
+                assert!(
+                    r.modes.contains(&(mode as u32, 16)),
+                    "{what}: {mode:?} {r:?}"
+                );
+            }
+            for kind in [
+                FloatControl::RoundingModeRte,
+                FloatControl::DenormPreserve,
+                FloatControl::SignedZeroInfNanPreserve,
+            ] {
+                assert!(
+                    a.requirements
+                        .properties
+                        .contains(&VkProperty::FloatControl(kind, FloatWidth::F16)),
+                    "{what}: {kind:?}"
+                );
+            }
+        }
+        let run = |name: &str| interpret(&bc, name, p, [one, one]);
+        assert_eq!(run("half_sum"), 2.0 + 2f32.powi(-9), "{stem}");
+        assert_eq!(run("half_product"), 1.0 + 2f32.powi(-9), "{stem}");
+        assert_eq!(
+            run("half_chain"),
+            2.0 + 2f32.powi(-8),
+            "{stem}: each operation rounded"
+        );
+    }
+    // The negative control.
+    let mut uncontrolled = laptop.clone();
+    uncontrolled.device_id = 0x1E87;
+    uncontrolled.float_controls.f16.rounding_rte = false;
+    let pascal = profile("nvidia-pascal-linux", DevicePolicy::default()).expect("profile");
+    for (stem, p) in [
+        ("RTX 2080 without RTE for 16 bits", of(uncontrolled)),
+        ("nvidia-pascal-linux", pascal),
+    ] {
+        assert!(!half_controls(&p), "{stem}");
+        for (name, _) in &NATIVE {
+            let what = format!("{name} on {stem}");
+            let a = compile(&bc, name, &p).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
+            let r = rounding(&a.module.words);
+            assert_eq!(r.f16_ops, 0, "{what}: {r:?}");
+            assert!(!r.modes.iter().any(|&(_, w)| w == 16), "{what}: {r:?}");
+            assert!(
+                a.precision
+                    .contains(&native_rounding(quantize_form(&p)).expect("native")),
+                "{what}: {:?}",
+                a.precision
+            );
+        }
+    }
+}
+
+/// Under the float controls (`QuantizeForm::Controlled`), a `half` rounded from `float` arithmetic
+/// (a sum, a product, a fused multiply-add) records `NativeHalfConversion` where the driver fuses
+/// the operation into the narrowing (`DriverWorkaround::HalfConversionFusedWithArithmetic`, every
+/// RADV profile) and not elsewhere (ANV); a loaded `float` narrowed alone records it on neither
+/// (`narrow::rounds_arithmetic`). Each passes L3.
+#[test]
+fn a_controlled_rounding_of_arithmetic_is_noted_where_the_driver_fuses_it() {
+    use crate::device::profile::DriverWorkaround;
+    let Some(bc) = assemble("native-half-arithmetic", &module_of(&ARITHMETIC)) else {
+        return;
+    };
+    let mut seen = (0, 0);
+    for (stem, p) in &committed_profiles().expect("profiles") {
+        if quantize_form(p) != QuantizeForm::Controlled {
+            continue;
+        }
+        let fuses = p
+            .workarounds()
+            .contains(&DriverWorkaround::HalfConversionFusedWithArithmetic);
+        if fuses {
+            seen.0 += 1;
+        } else {
+            seen.1 += 1;
+        }
+        for (name, _) in &ARITHMETIC {
+            let what = format!("{name} on {stem}");
+            let a = compile(&bc, name, p).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            link_and_validate(&a, p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
+            let noted = a.precision.contains(&PrecisionNote::NativeHalfConversion);
+            assert_eq!(
+                noted,
+                fuses && *name != "float_narrow",
+                "{what}: {:?}",
+                a.precision
+            );
+        }
+    }
+    assert!(
+        seen.0 > 0 && seen.1 > 0,
+        "fusing and other controlled profiles: {seen:?}"
+    );
+}
+
 /// A kernel that reads a `half` from buffer 0 and stores it widened to `float` after the two
 /// `float`s the other kernels read (bytes 8 to 12), and the `half` itself after that (bytes 12 to
 /// 14).
@@ -827,10 +1084,14 @@ fn half_load_module() -> String {
 /// the device's) and selects no canonical NaN. With `shaderFloat16` the widening is the device's
 /// conversion (a 16-bit storage unit it reads is read as a 16-bit float itself): under the float
 /// controls (ANV, RADV) its entry declares them (`narrow::controlled_modes`, so a half denormal
-/// widens exactly) and it records no other note; where the measured `MetalHalfArithmetic` reads
+/// widens exactly) and it records no other note, and so on NVIDIA, which rounds by the device's
+/// conversion (`QuantizeForm::Converted`, its driver folding the round trip) but computes under
+/// those controls (`narrow::half_controls`); where the measured `MetalHalfArithmetic` reads
 /// every `half` through that widening as Metal's (MoltenVK) it requires the fact; elsewhere
-/// (NVIDIA, lavapipe: the device's conversion, no float controls) it records
-/// `NativeHalfConversion`, whose bound holds a denormal the device flushes. Without it (Pascal,
+/// (lavapipe: the device's conversion, no float controls) it records
+/// `NativeHalfConversion`, whose bound holds a denormal the device flushes; where the device's
+/// moves of a NaN are measured to be Metal's (`DriverDeviation::MetalNanMoves`, MoltenVK on the
+/// M3 Max's identity) it requires that in place of `NativeNanEncoding`. Without it (Pascal,
 /// the LunarG baseline, SwiftShader, the floor) the widening is one `UnpackHalf2x16` of the word,
 /// a 16-bit unit's zero extension where the profile has 16-bit storage, with no 16-bit float type,
 /// recording `NativeHalfConversion` too and requiring no fact. Each passes L3; on the interpreter
@@ -858,6 +1119,11 @@ fn a_half_read_from_memory_is_the_devices_widening_on_every_profile() {
             .properties
             .contains(&VkProperty::MetalHalfArithmetic);
         let nan = a.precision.contains(&PrecisionNote::NativeNanEncoding);
+        let moves = p.takes_driver_deviation(DriverDeviation::MetalNanMoves);
+        let moved = a
+            .requirements
+            .properties
+            .contains(&VkProperty::MetalNanMoves);
         let conversion = a.precision.contains(&PrecisionNote::NativeHalfConversion);
         match form {
             QuantizeForm::Device => {
@@ -876,9 +1142,22 @@ fn a_half_read_from_memory_is_the_devices_widening_on_every_profile() {
             }
             QuantizeForm::Converted => {
                 assert_eq!((r.widenings, r.unpacks), (1, 0), "{what}: {r:?}");
-                assert!(nan, "{what}: {:?}", a.precision);
-                assert_eq!(conversion, !measured, "{what}: {:?}", a.precision);
+                assert_eq!((nan, moved), (!moves, moves), "{what}: {:?}", a.precision);
+                let controls = crate::lower::arith::narrow::half_controls(p);
+                assert_eq!(
+                    conversion,
+                    !measured && !controls,
+                    "{what}: {:?}",
+                    a.precision
+                );
                 assert_eq!(fact, measured, "{what}: {:?}", a.requirements.properties);
+                for mode in [M::RoundingModeRTE, M::DenormPreserve] {
+                    assert_eq!(
+                        r.modes.contains(&(mode as u32, 16)),
+                        controls,
+                        "{what}: {mode:?} {r:?}"
+                    );
+                }
             }
         }
         assert_eq!(r.canonical_nans, 0, "{what}: {r:?}");
@@ -907,4 +1186,156 @@ fn a_half_read_from_memory_is_the_devices_widening_on_every_profile() {
         }
     }
     assert_eq!(forms.len(), 3, "a profile of each form: {forms:?}");
+}
+
+/// Kernels of one `half` `+ - *` each on the two `float`s narrowed: under fast math (`contract` and
+/// `reassoc`, left to the device's compiler), under `contract` alone and with no flag (kept
+/// apart).
+const CONTRACTION: [(&str, &str); 5] = [
+    (
+        "fast_sum",
+        "  %ha = fptrunc float %a to half\n  %hb = fptrunc float %b to half\n  %hs = fadd fast half %ha, %hb\n  %r = fpext half %hs to float\n",
+    ),
+    (
+        "fast_difference",
+        "  %ha = fptrunc float %a to half\n  %hb = fptrunc float %b to half\n  %hs = fsub fast half %ha, %hb\n  %r = fpext half %hs to float\n",
+    ),
+    (
+        "fast_product",
+        "  %ha = fptrunc float %a to half\n  %hb = fptrunc float %b to half\n  %hs = fmul fast half %ha, %hb\n  %r = fpext half %hs to float\n",
+    ),
+    (
+        "contract_sum",
+        "  %ha = fptrunc float %a to half\n  %hb = fptrunc float %b to half\n  %hs = fadd contract half %ha, %hb\n  %r = fpext half %hs to float\n",
+    ),
+    (
+        "kept_product",
+        "  %ha = fptrunc float %a to half\n  %hb = fptrunc float %b to half\n  %hs = fmul half %ha, %hb\n  %r = fpext half %hs to float\n",
+    ),
+];
+
+/// The 16-bit `OpFAdd`, `OpFSub`, `OpFMul` and `GLSL.std.450 Fma` of `words`: each opcode (the
+/// `Fma` as `Op::ExtInst`) and whether it is decorated `NoContraction`.
+fn f16_arithmetic(words: &[u32]) -> Vec<(crate::spv::Op, bool)> {
+    use crate::spirv_binary::{parse_bytes, Operand};
+    use crate::spv::{Decoration, Op};
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let parsed = parse_bytes(&bytes).expect("parse");
+    let word = |o: Option<&Operand>| match o {
+        Some(Operand::Word(w) | Operand::IdRef(w)) => Some(*w),
+        _ => None,
+    };
+    let mut half = std::collections::HashSet::new();
+    let mut no_contraction = std::collections::HashSet::new();
+    for i in &parsed.instructions {
+        match i.opcode {
+            Op::TypeFloat if word(i.operands.first()) == Some(16) => half.extend(i.result_id),
+            Op::TypeVector if word(i.operands.first()).is_some_and(|e| half.contains(&e)) => {
+                half.extend(i.result_id)
+            }
+            Op::Decorate if word(i.operands.get(1)) == Some(Decoration::NoContraction as u32) => {
+                no_contraction.extend(word(i.operands.first()));
+            }
+            _ => {}
+        }
+    }
+    let fma = |i: &crate::spirv_binary::Instruction| {
+        matches!(i.operands.get(1), Some(Operand::LiteralExtInstInteger(n))
+            if *n == GlslOp::Fma.to_spirv() as u32)
+    };
+    parsed
+        .instructions
+        .iter()
+        .filter(|i| i.result_type.is_some_and(|t| half.contains(&t)))
+        .filter(|i| {
+            matches!(i.opcode, Op::FAdd | Op::FSub | Op::FMul)
+                || (i.opcode == Op::ExtInst && fma(i))
+        })
+        .map(|i| {
+            let kept = i.result_id.is_some_and(|id| no_contraction.contains(&id));
+            (i.opcode, kept)
+        })
+        .collect()
+}
+
+/// A `half` `+ - *` on the device's 16-bit arithmetic (`ops::f16_binary`) takes the AIR's own
+/// contraction, as a `float` one does, on every profile that computes it so (MoltenVK, measured,
+/// and the float-controls profiles): under fast math its one 16-bit instruction is undecorated, a
+/// product a plain `OpFMul`; under `contract` alone or no flag it is kept apart, decorated
+/// `NoContraction`, a product `Fma(a, b, -0.0)`. A lone operation has no neighbour to be rewritten
+/// with, so a float-controls profile notes nothing, as for `float`; on MoltenVK, whose Metal compile
+/// folds an undecorated one's conversions away, a fast one records `FastMathRewrites` and needs no
+/// `MetalHalfArithmetic`, which a kept one requires. On the interpreter each answers the rounded
+/// result either way.
+#[test]
+fn half_arithmetic_on_the_device_takes_the_airs_contraction() {
+    use crate::spv::Op;
+    let Some(bc) = assemble("half-contraction", &module_of(&CONTRACTION)) else {
+        return;
+    };
+    let (mut measured_seen, mut controlled_seen) = (0, 0);
+    for (stem, p) in &committed_profiles().expect("profiles") {
+        let measured = p.fields().leaf.float16
+            && p.takes_driver_deviation(DriverDeviation::MetalHalfArithmetic);
+        let controlled = crate::lower::arith::narrow::half_controls(p);
+        if !measured && !controlled {
+            continue;
+        }
+        measured_seen += usize::from(measured);
+        controlled_seen += usize::from(controlled && !measured);
+        for (name, _) in &CONTRACTION {
+            let what = format!("{name} on {stem}");
+            let allowed = name.starts_with("fast_");
+            let a = compile(&bc, name, p).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            link_and_validate(&a, p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
+            let want = match (name.ends_with("product"), allowed) {
+                (false, _) if name.ends_with("difference") => Op::FSub,
+                (false, _) => Op::FAdd,
+                (true, true) => Op::FMul,
+                (true, false) => Op::ExtInst,
+            };
+            assert_eq!(
+                f16_arithmetic(&a.module.words),
+                vec![(want, !allowed)],
+                "{what}"
+            );
+            assert_eq!(
+                a.precision.contains(&PrecisionNote::FastMathRewrites),
+                measured && allowed,
+                "{what}: {:?}",
+                a.precision
+            );
+            assert_eq!(
+                a.requirements
+                    .properties
+                    .contains(&VkProperty::MetalHalfArithmetic),
+                measured && !allowed,
+                "{what}: {:?}",
+                a.requirements.properties
+            );
+        }
+        let run = |name: &str, x: [f32; 2]| interpret(&bc, name, p, x);
+        let (x, y) = (1.0 + 2f32.powi(-10), 2f32.powi(-11));
+        for name in ["fast_sum", "contract_sum"] {
+            assert_eq!(
+                run(name, [x, y]),
+                1.0 + 2f32.powi(-9),
+                "{name} on {stem}: a tie to even"
+            );
+        }
+        assert_eq!(run("fast_difference", [x, y]), 1.0, "{stem}: a tie to even");
+        for name in ["fast_product", "kept_product"] {
+            assert_eq!(run(name, [x, x]), 1.0 + 2f32.powi(-9), "{name} on {stem}");
+            let z = run(name, [-0.0, 1.0]);
+            assert!(z == 0.0 && z.is_sign_negative(), "{name} on {stem}: {z}");
+        }
+    }
+    assert!(
+        measured_seen >= 1,
+        "the MoltenVK capture computes it, measured"
+    );
+    assert!(
+        controlled_seen >= 2,
+        "the float-controls profiles compute it"
+    );
 }

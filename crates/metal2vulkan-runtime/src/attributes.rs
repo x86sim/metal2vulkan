@@ -140,6 +140,15 @@ impl ResourceAttributes {
         }
     }
 
+    /// The label and purgeable state now, for the resource carried to its device's next
+    /// generation (`device/carry.rs`).
+    pub(super) fn carried(&self) -> ResourceAttributes {
+        ResourceAttributes {
+            label: Mutex::new(lock(&self.label).clone()),
+            purgeable: Mutex::new(*lock(&self.purgeable)),
+        }
+    }
+
     /// `setLabel:`.
     pub(super) fn set_label(&self, label: &str) {
         *lock(&self.label) = Some(label.to_owned());
@@ -187,10 +196,15 @@ impl Buffer {
     /// Metal answers where its validation stops every call there, a query included. Fails only when
     /// zeroing a `Managed` buffer's bytes on a device without unified memory fails.
     pub fn set_purgeable_state(&self, state: PurgeableState) -> Result<PurgeableState, Error> {
+        // Its parts held while the call reaches them, across a recovery (`Buffer::held_parts`).
+        let _held = self.held_parts();
         if self.heap().is_some() {
             return Ok(PurgeableState::NonVolatile);
         }
-        if self.caller_memory().is_some() || self.length() < PURGEABLE_ALLOCATION {
+        // A two-copy buffer (`managed_copy.rs`) is a no-copy buffer: its device copy is the
+        // runtime's own memory, but its bytes are the caller's pages.
+        let no_copy = self.caller_memory().is_some() || self.caller_copy().is_some();
+        if no_copy || self.length() < PURGEABLE_ALLOCATION {
             return Ok(PurgeableState::NonVolatile);
         }
         let answer = self.attributes().set_purgeable_state(state);

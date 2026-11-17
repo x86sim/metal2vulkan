@@ -33,7 +33,9 @@
 //!   self-check's, [`holding`]) keeps those its runtime thread held, for the self-check to read.
 //! - **The exit guard.** The thread is one of the runtime's (`exit_guard::spawn_scoped`) and makes
 //!   the call inside a section of its own. Where the host starts no thread, or once the process is
-//!   exiting (the guard closed), the asking thread makes the call itself, as before.
+//!   exiting (the guard closed), the asking thread makes the call itself, as before. Each driver
+//!   call that returned, on whichever thread made it, registers the exit hook again
+//!   (`exit_guard::pipelines_made`), after the destructors the driver's compiler registered in it.
 //! - **No compile outlives its call.** The runtime's thread is joined before the call returns
 //!   (`std::thread::scope`). Each device counts the calls in progress here, and in builds with
 //!   debug assertions the runtime's last hold of the device ([`unregister`], in the teardown just
@@ -281,10 +283,17 @@ pub(crate) fn holding<R>(call: impl FnOnce() -> R) -> (R, Vec<(MessageSink, Debu
             let _ = HELD.try_with(|held| *held.borrow_mut() = outer);
         }
     }
-    let restore = Restore(HELD.with(|held| held.borrow_mut().replace(Vec::new())));
+    // Past this thread's thread-locals' end (a program's exit handler, `this_thread.rs`), `call`
+    // alone: its messages are delivered as they are raised.
+    let Ok(outer) = HELD.try_with(|held| held.borrow_mut().replace(Vec::new())) else {
+        return (call(), Vec::new());
+    };
+    let restore = Restore(outer);
     let made = call();
     let messages = HELD
-        .with(|held| held.borrow_mut().take())
+        .try_with(|held| held.borrow_mut().take())
+        .ok()
+        .flatten()
         .unwrap_or_default();
     drop(restore);
     (made, messages)
@@ -368,6 +377,7 @@ unsafe extern "system" fn create_graphics_pipelines(
         let out = unsafe { std::slice::from_raw_parts(pipelines, count as usize) };
         let live = out.iter().filter(|p| **p != vk::Pipeline::null()).count();
         crate::census::add(&crate::census::PIPELINES, live as i64);
+        exit_guard::pipelines_made();
         made
     })
 }
@@ -402,6 +412,7 @@ unsafe extern "system" fn create_compute_pipelines(
         let out = unsafe { std::slice::from_raw_parts(pipelines, count as usize) };
         let live = out.iter().filter(|p| **p != vk::Pipeline::null()).count();
         crate::census::add(&crate::census::PIPELINES, live as i64);
+        exit_guard::pipelines_made();
         made
     })
 }

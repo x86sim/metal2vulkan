@@ -9,14 +9,15 @@
 //! nothing at all.
 
 use super::{
-    bound_buffers, buffer_with, buffer_with_options, encode_case, layer_reported_nothing,
-    pipeline_state, public_case, read_buffer, run_case, validated_device, CaseResources, Messages,
-    ScratchCache,
+    at_plan, bound_buffers, buffer_with, buffer_with_options, encode_case, layer_reported_nothing,
+    pipeline_state, public_case, read_buffer, run_case, validated_device, validated_device_with,
+    CaseResources, Messages, ScratchCache,
 };
 use crate::air_library::AirLibrary;
 use crate::gpu::{DeviceType, TEST_DEVICE};
 use metal2vulkan::bind::StatusReport;
 use metal2vulkan::metal::{BarrierScope, DispatchType};
+use metal2vulkan_runtime::DeviceOptions;
 use metal2vulkan_runtime::{
     Buffer, CommandBufferStatus, CpuCacheMode, Device, DeviceKind, Error, HazardTrackingMode,
     Invalid, Nil, PipelineOptions, Problem, ResourceOptions, Size, StorageMode,
@@ -211,10 +212,16 @@ fn forty_devices_one_after_another_all_open_and_go() {
 /// ([`layer_reported_nothing`]). `test` may take the messages reported so far itself, to fail at
 /// the step that caused them.
 fn on_device(test: impl FnOnce(&Device, &Messages)) {
+    on_device_with(|_| {}, test)
+}
+
+/// [`on_device`], `adjust` applied to the options of each device it makes (`at_plan` gives them
+/// their queue plan).
+fn on_device_with(adjust: fn(&mut DeviceOptions), test: impl FnOnce(&Device, &Messages)) {
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), adjust).unwrap();
         test(&device, &messages);
     }
     layer_reported_nothing(
@@ -423,7 +430,7 @@ fn an_indirect_stage_in_region_reads_as_the_direct_one() {
     use metal2vulkan_runtime::Region;
     const NAME: &str = "kernel-stage-input-word";
     let size = |axes: [u32; 3]| Size::new(axes[0].into(), axes[1].into(), axes[2].into());
-    on_device(|device, _| {
+    on_device_with(at_plan, |device, _| {
         let case = public_case(NAME).unwrap();
         let Dispatch::Threads {
             threads,
@@ -507,6 +514,14 @@ fn an_indirect_stage_in_region_reads_as_the_direct_one() {
 /// call no linked function supplies; a name the linked `functions` repeat, and a kernel the compile
 /// layer already compiled, are refused typed, and one function in `functions` and
 /// `binary_functions` is linked once, as plain Metal takes it.
+///
+/// A call never resolves to a function `binary_functions` alone holds, as plain Metal's creation
+/// fails (code 3, "unresolved visible function reference", an M3 Max under macOS 27.0.1,
+/// `binary_function_linking.m`), whether it is compiled to a binary or not: the call no linked
+/// function supplies refuses the state, before the function not compiled to a binary does, in
+/// Metal's order. Beside a `linked_scale` of `functions`, another (the owned
+/// `linked_other_functions`', `x + 100`) in `binary_functions` is made, as plain Metal makes it,
+/// and the call calls the one of `functions`, from either module.
 #[test]
 fn a_kernel_runs_the_functions_its_descriptor_links() {
     use metal2vulkan::error::{Error as CompileError, RuntimeInput};
@@ -518,13 +533,15 @@ fn a_kernel_runs_the_functions_its_descriptor_links() {
     use metal2vulkan_devtools::{engine_dir, llvm_assemble};
     const N: u32 = 32;
     let fixture = |stem: &str| llvm_assemble(&engine_dir().join(format!("{stem}.ll"))).unwrap();
-    let (caller, functions) = (
+    let (caller, functions, other) = (
         fixture("linked_visible_caller"),
         fixture("linked_visible_functions"),
+        fixture("linked_other_functions"),
     );
     on_device(|device, _| {
         let caller = device.new_library_with_air(&caller).unwrap();
         let functions = device.new_library_with_air(&functions).unwrap();
+        let other = device.new_library_with_air(&other).unwrap();
         let undeclared = FunctionConstantValues::defaults().with_index(
             5,
             FunctionConstantValue::new(DataType::UInt, 1u32.to_le_bytes()),
@@ -552,8 +569,9 @@ fn a_kernel_runs_the_functions_its_descriptor_links() {
         }
         let zeros = vec![0u8; N as usize * 4];
         let queue = device.new_command_queue().unwrap();
-        // The dispatch of `pipeline` computes what Metal's does.
-        let runs = |pipeline: &metal2vulkan_runtime::ComputePipelineState| {
+        // The dispatch of `pipeline` computes what Metal's does, `scaled` the words.
+        let runs_scaled = |pipeline: &metal2vulkan_runtime::ComputePipelineState,
+                           scaled: &dyn Fn(u32) -> u32| {
             let (words, floats) = (
                 buffer_with(device, &zeros).unwrap(),
                 buffer_with(device, &zeros).unwrap(),
@@ -579,16 +597,16 @@ fn a_kernel_runs_the_functions_its_descriptor_links() {
                     .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
                     .collect::<Vec<_>>()
             };
-            assert_eq!(
-                values(&words),
-                (0..N).map(|i| 3 * i + (i & 7)).collect::<Vec<_>>()
-            );
+            assert_eq!(values(&words), (0..N).map(scaled).collect::<Vec<_>>());
             assert_eq!(
                 values(&floats),
                 (0..N)
                     .map(|i| (i as f32 * 0.5 + 1.0).to_bits())
                     .collect::<Vec<_>>()
             );
+        };
+        let runs = |pipeline: &metal2vulkan_runtime::ComputePipelineState| {
+            runs_scaled(pipeline, &|i| 3 * i + (i & 7))
         };
         let pipeline = device
             .new_compute_pipeline_state(
@@ -616,6 +634,46 @@ fn a_kernel_runs_the_functions_its_descriptor_links() {
                 .new_compute_pipeline_state(&descriptor(across), &defaults)
                 .unwrap(),
         );
+        // A call to a function `binary_functions` alone holds: no linked function supplies it,
+        // compiled to a binary or not.
+        let compiled = |library: &metal2vulkan_runtime::Library, name: &str| {
+            let mut made = metal2vulkan_runtime::FunctionDescriptor::new(name);
+            made.options = metal2vulkan::metal::FunctionOptions::COMPILE_TO_BINARY;
+            made.constant_values = Some(undeclared.clone());
+            library
+                .new_function_with_descriptor(&made)
+                .unwrap()
+                .linked_function()
+        };
+        let rest = || {
+            LinkedFunctions::new()
+                .with_function(linked(&functions, "linked_blend"))
+                .with_private_function(linked(&caller, "linked_offset"))
+        };
+        for scale in [
+            compiled(&functions, "linked_scale"),
+            linked(&functions, "linked_scale"),
+        ] {
+            let mut alone = rest();
+            alone.binary_functions.push(scale);
+            match device.new_compute_pipeline_state(&descriptor(alone), &defaults) {
+                Err(Error::Compile(CompileError::NeedsInput(RuntimeInput::LinkedFunction {
+                    symbol,
+                }))) => assert_eq!(symbol.to_string(), "linked_scale"),
+                other => panic!("linked_scale in binary_functions alone: {other:?}"),
+            }
+        }
+        // Two functions of the name, one in each list: the call calls the one of `functions`.
+        let own: fn(u32) -> u32 = |i| 3 * i + (i & 7);
+        let others: fn(u32) -> u32 = |i| i + 100;
+        for (listed, binary, scaled) in [(&functions, &other, own), (&other, &functions, others)] {
+            let mut both = rest().with_function(linked(listed, "linked_scale"));
+            both.binary_functions.push(compiled(binary, "linked_scale"));
+            let pipeline = device
+                .new_compute_pipeline_state(&descriptor(both), &defaults)
+                .unwrap();
+            runs_scaled(&pipeline, &scaled);
+        }
         // A name `functions` repeats: Metal's creation fails ("duplicated symbol").
         let within = LinkedFunctions::new()
             .with_function(linked(&functions, "linked_scale"))

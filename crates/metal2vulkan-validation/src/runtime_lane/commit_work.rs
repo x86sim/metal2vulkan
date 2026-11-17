@@ -8,11 +8,13 @@
 //!   the scheduler's section, where no spare is taken. A command buffer's first encoder records
 //!   into its spare pool's primary begun ahead, as the command buffer that gave the pool back
 //!   completed; before, it began one on the thread that encodes (8 to 20 us on ANV).
-//! - **Empty submissions.** A command buffer that encoded nothing and waits for nothing is one
-//!   `vkQueueSubmit` of no `VkCommandBuffer`: its signals alone. Before, it carried one of the
-//!   barrier to the host, and ANV on i915 lists every `VkDeviceMemory` of the device in a kernel
-//!   submission of commands (47 objects at 32 host imports on an Iris Xe), where it lists two in
-//!   one of none.
+//! - **No empty submissions.** A command buffer that encoded nothing and waits for and signals
+//!   nothing makes no `vkQueueSubmit` where no first work of the device's waits
+//!   (`WorkCounts::command_buffers_unsubmitted`): it completes in its queue's order, once the work
+//!   submitted before it did. Before, it was one `vkQueueSubmit` of no `VkCommandBuffer`, its
+//!   signals alone, and before that it carried one of the barrier to the host, and ANV on i915
+//!   lists every `VkDeviceMemory` of the device in a kernel submission of commands (47 objects at
+//!   32 host imports on an Iris Xe), where it lists two in one of none.
 //! - **First work rides along.** A new texture's first work (`texture/first_move.rs`) is a
 //!   `VkSubmitInfo` of the next submission's own `vkQueueSubmit`, a commit's or an internal one's
 //!   (handing its `VkImage` out): one call each, which Mesa's drivers run as one kernel submission;
@@ -71,7 +73,9 @@
 //!   reads pointers (2.5 ms a commit at 32768 live buffers on an Apple M4).
 
 use super::degrade_notices::{on_device, on_device_with};
-use super::{bound_buffers, encode_case, pipeline_state, public_case, CaseResources, WAIT};
+use super::{
+    at_plan, bound_buffers, encode_case, pipeline_state, public_case, CaseResources, WAIT,
+};
 use metal2vulkan::device::{BatchOrderPolicy, DriverFact};
 use metal2vulkan::error::RuntimeDriverDefect;
 use metal2vulkan::metal::{PixelFormat, TextureUsage};
@@ -102,9 +106,13 @@ fn finish(command_buffer: &CommandBuffer) {
 /// parking's mark (`freed_memory.rs`), which no use of the runtime's own takes, and so counts one
 /// too many here.
 pub(super) fn relay_marks(device: &Device) -> u64 {
-    let relays =
-        (device.properties().driver_facts).contains(&DriverFact::QueueFailuresReportedByMessenger);
-    u64::from(relays)
+    u64::from(relays(device))
+}
+
+/// Whether `device` relays its queues' failures (`device/relay.rs`): on a device the lane made,
+/// the runtime's branch on `DriverFact::QueueFailuresReportedByMessenger` ([`relay_marks`]).
+pub(super) fn relays(device: &Device) -> bool {
+    (device.properties().driver_facts).contains(&DriverFact::QueueFailuresReportedByMessenger)
 }
 
 /// A command buffer of a blit that fills `buffer`.
@@ -181,10 +189,9 @@ fn a_first_encoder_takes_the_primary_its_spare_pool_began_ahead() {
     });
 }
 
-/// Empty command buffers one after another submit no `VkCommandBuffer`: each is one
-/// `vkQueueSubmit` of its signals alone (the module docs).
+/// Empty command buffers one after another make no `vkQueueSubmit` (the module docs).
 #[test]
-fn empty_command_buffers_submit_no_command_buffer() {
+fn empty_command_buffers_make_no_submission() {
     on_device(|device, _| {
         let queue = device.new_command_queue().unwrap();
         // The first takes any first work the device's creation left.
@@ -194,7 +201,11 @@ fn empty_command_buffers_submit_no_command_buffer() {
             finish(&queue.command_buffer().unwrap());
         }
         let after = device.work_counts();
-        assert_eq!(after.queue_submissions - before.queue_submissions, 8);
+        assert_eq!(after.queue_submissions, before.queue_submissions);
+        assert_eq!(
+            after.command_buffers_unsubmitted - before.command_buffers_unsubmitted,
+            8
+        );
         assert_eq!(
             after.command_buffers_submitted,
             before.command_buffers_submitted
@@ -296,10 +307,9 @@ fn fills_across_rounds_reuse_a_bounded_set_of_command_pools() {
         }
         let after = device.work_counts();
         let made = (after.command_pools_made - before.command_pools_made) as usize;
-        let by_transfers = after.fills_by_transfers - before.fills_by_transfers;
         eprintln!(
             "FILL-POOL-REUSE {}: {made} command pools made for {} command buffers over {ROUNDS} \
-             rounds, {by_transfers} fills by transfers",
+             rounds",
             device.name(),
             ROUNDS * IN_FLIGHT
         );
@@ -328,7 +338,7 @@ fn bytes(buffer: &Buffer) -> Vec<u8> {
 /// event reaches the second value.
 #[test]
 fn a_batch_ends_in_its_last_command_buffer() {
-    on_device(|device, _| {
+    on_device_with(at_plan, |device, _| {
         let queue = device.new_command_queue().unwrap();
         let buffer = device.new_buffer(4096, ResourceOptions::shared()).unwrap();
         // The first takes any first work the device's creation left.
@@ -410,7 +420,10 @@ fn a_batch_ends_in_its_last_command_buffer() {
 #[test]
 fn batches_with_nothing_planned_wait_for_completed_work_instead_of_a_barrier() {
     on_device_with(
-        |options| options.gpu_times_from_host = true,
+        |options| {
+            options.gpu_times_from_host = true;
+            at_plan(options)
+        },
         |device, _| {
             let by_barrier = device
                 .properties()
@@ -524,10 +537,10 @@ pub(super) fn orders_by_ends(device: &Device, batch_order: BatchOrderPolicy) -> 
 /// Under the default, on a device made with `gpu_times_from_host` (so no start timestamp is
 /// written before a batch's work): a long fill, waiting for a shared event, then a chain of
 /// command buffers on the same command queue, each copying what the one before wrote, the first
-/// copying the long one's last fill; the host raises the event once all are committed, so none
-/// is complete as the next is planned. Where the device orders batches by their ends, every batch
-/// begins with no command buffer of barriers, as the end of the batch before orders it (the
-/// module docs), and the chain's last copy reads the long one's fill. Elsewhere
+/// copying the long one's last fill; the host raises the event once all are committed. Where the
+/// device orders batches by their ends, every batch begins with no command buffer of barriers, as
+/// the end of the batch before orders it (the module docs), and the chain's last copy reads the
+/// long one's fill. Elsewhere
 /// [`batches_of_one_queue_in_the_exact_form_begin_with_their_barriers`]'s.
 #[test]
 fn batches_of_one_queue_ordered_by_their_ends_begin_with_no_barrier() {
@@ -535,7 +548,8 @@ fn batches_of_one_queue_ordered_by_their_ends_begin_with_no_barrier() {
 }
 
 /// The same under `BatchOrderPolicy::Exact`: each batch of the chain begins with a command buffer
-/// of barriers for the copy before it, still in flight, and the last reads the same bytes.
+/// of barriers for the copy before it exactly where that copy was in flight as the batch was
+/// planned, and the last reads the same bytes.
 #[test]
 fn batches_of_one_queue_in_the_exact_form_begin_with_their_barriers() {
     chained_batches(BatchOrderPolicy::Exact);
@@ -544,9 +558,22 @@ fn batches_of_one_queue_in_the_exact_form_begin_with_their_barriers() {
 /// The two tests above under `batch_order`. Where the driver's submissions stall on semaphore
 /// operations (`DriverFact::SemaphoreOperationsStallSubmits`), every batch begins with its command
 /// buffer of barriers under either.
+///
+/// The scheduler holds the long fill on the host until the event is raised (no batch is submitted
+/// waiting for a value the host may set, `event_timeline.rs`), and the chain behind it, so every
+/// batch is planned after the raise, while the work before it runs on the GPU or after it
+/// completed, as the GPU's speed and the host's planning fall. Under the exact form a batch begins
+/// with no barrier exactly where the host saw no earlier batch of its queue pending as it planned
+/// it: `WorkCounts::bare_starts` equals `batches_with_none_pending`, both counted from the
+/// completed value the plan took, the long fill always among them (what it depends on completed).
+/// A run where the GPU finished every batch before the next was planned exercises only that side,
+/// and says so; the planner's barrier for work in flight is `tests::tracker`'s
+/// `a_chain_of_copies_orders_each_after_the_one_before_only_while_it_is_in_flight`, by
+/// construction. The long fill writes 16 GiB, so the barrier side usually runs: on the Radeon RX
+/// 7900 XTX every copy of 24 runs was planned behind work in flight.
 fn chained_batches(batch_order: BatchOrderPolicy) {
     const CHAIN: usize = 8;
-    const LONG_FILLS: u64 = 64;
+    const LONG_FILLS: u64 = 1024;
     on_device_with(
         |options| {
             options.gpu_times_from_host = true;
@@ -603,18 +630,24 @@ fn chained_batches(batch_order: BatchOrderPolicy) {
             }
             let after = device.work_counts();
             let bare = after.bare_starts - before.bare_starts;
+            let none_pending = after.batches_with_none_pending - before.batches_with_none_pending;
+            let exact = !by_barrier && !by_ends;
+            let only_bare = match exact && none_pending == CHAIN as u64 + 1 {
+                true => "; only the bare side ran: each batch's work before it had completed",
+                false => "",
+            };
             eprintln!(
-                "CHAINED-BATCHES {} {batch_order:?}: {bare} bare starts of {} batches",
+                "CHAINED-BATCHES {} {batch_order:?}: {bare} bare starts of {} batches, \
+                 {none_pending} planned with no earlier work in flight{only_bare}",
                 device.name(),
                 CHAIN + 1,
             );
-            // The long fill begins bare under either: what it depends on completed. Each copy
-            // behind it plans a barrier for the copy before it, in flight, unless batches are
-            // ordered by their ends.
+            // Each copy plans a barrier for the copy before it where that one was in flight,
+            // unless batches are ordered by their ends.
             let expected = match (by_barrier, by_ends) {
                 (true, _) => 0,
                 (false, true) => CHAIN as u64 + 1,
-                (false, false) => 1,
+                (false, false) => none_pending,
             };
             assert_eq!(bare, expected, "bare starts");
             assert!(

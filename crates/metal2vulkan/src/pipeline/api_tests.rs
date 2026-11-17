@@ -46,6 +46,8 @@ fn stage_module_bytes_are_little_endian_words() {
         rounded_colors: Vec::new(),
         own_pixel_textures: Vec::new(),
         snapshot_textures: Vec::new(),
+        snapshot_refusals: Vec::new(),
+        level_reads: Vec::new(),
         private_bytes: 0,
         specialized_notes: Vec::new(),
         stats: ModuleStats::default(),
@@ -96,6 +98,8 @@ fn a_stage_s_notes_under_a_specialization_are_its_held_clauses() {
         rounded_colors: Vec::new(),
         own_pixel_textures: Vec::new(),
         snapshot_textures: Vec::new(),
+        snapshot_refusals: Vec::new(),
+        level_reads: Vec::new(),
         private_bytes: 0,
         specialized_notes: vec![
             SpecializedNote {
@@ -209,6 +213,8 @@ mod serde_round_trips {
             psb_slots: BTreeSet::from([buffer(1)]),
             pulled_vertex_buffers: BTreeSet::from([2, 5]),
             emulated_simdgroups: true,
+            one_row: true,
+            unit_axes: 6,
             dropped_vertex_layer: true,
             storage_view_slots: BTreeSet::from([buffer(3)]),
             srgb_textures: BTreeSet::from([slot(Stage::Kernel, SlotClass::Texture, 4)]),
@@ -217,12 +223,15 @@ mod serde_round_trips {
                 slot(Stage::Kernel, SlotClass::Texture, 7),
                 planes_sampler(),
             )]),
+            texel_rows: BTreeSet::from([slot(Stage::Kernel, SlotClass::Texture, 9)]),
             flat_grid: true,
+            call_threadgroups: true,
             replay_bindings: true,
             merged_draws: true,
             amplification_draws: Some(AmplificationDraws::new(true, false)),
             viewport_compensation: Some(ViewportCompensation::new(true)),
             folded_groups: true,
+            partial_threadgroups: true,
             extended_range: BTreeMap::from([(
                 slot(Stage::Kernel, SlotClass::Texture, 5),
                 crate::metal::format::ExtendedRange::Bgra10 { srgb: true },
@@ -233,6 +242,7 @@ mod serde_round_trips {
             depth_clamp_range: true,
             rotated_weights: true,
             mesh_last_first: true,
+            line_band: Some(crate::pipeline::BandPrimitive::Triangles),
             swizzled_storage: BTreeSet::from([slot(Stage::Kernel, SlotClass::Texture, 6)]),
             addressed_function_tables: true,
             interlocked_colors: BTreeSet::from([1]),
@@ -262,6 +272,8 @@ mod serde_round_trips {
             )]),
             anisotropic_samplers: BTreeSet::from([slot(Stage::Fragment, SlotClass::Sampler, 1)]),
             color_group: 1,
+            region_viewports: true,
+            region_fan_out: Some(crate::pipeline::RegionFanOut::Probe),
         });
         round_trip(&SpecializationKey {
             data: vec![1, 0, 0, 0],
@@ -293,6 +305,7 @@ mod serde_round_trips {
             storage_images: BTreeMap::new(),
             psb_slots: BTreeSet::from([buffer(0), buffer(30)]),
             emulated_simdgroups: true,
+            one_row: true,
             dropped_vertex_layer: true,
             stage_input: Some({
                 let mut d = StageInputDescriptor::new();
@@ -351,6 +364,7 @@ mod serde_round_trips {
                 slot(Stage::Fragment, SlotClass::Texture, 9),
                 planes_sampler(),
             )]),
+            texel_rows: BTreeSet::from([slot(Stage::Fragment, SlotClass::Texture, 10)]),
             viewport_index_varying: true,
             // An emulated post-tessellation vertex function's state.
             tessellation: Some(crate::pipeline::TessellationDescriptor {
@@ -359,7 +373,9 @@ mod serde_round_trips {
                 ..Default::default()
             }),
             max_call_stack_depth: Some(8),
+            open_cl_mode: true,
             flat_grid: true,
+            call_threadgroups: true,
             render_target_array_index_varying: true,
             primitive_id_varying: true,
             primitive_id_indices: Some(crate::metal::IndexType::UInt16),
@@ -403,6 +419,7 @@ mod serde_round_trips {
             absent_varyings: BTreeSet::from([VaryingKey::user(b"generated(5colorDv4_f)")]),
             viewport_compensation: Some(ViewportCompensation::new(false)),
             folded_groups: true,
+            partial_threadgroups: true,
             extended_range: BTreeMap::from([(
                 slot(Stage::Fragment, SlotClass::Texture, 2),
                 crate::metal::format::ExtendedRange::Bgr10 { srgb: false },
@@ -429,6 +446,7 @@ mod serde_round_trips {
             unattached_colors: BTreeSet::from([5, 7]),
             sample_mask: Some([0b1010, 0b0010, 0b1000, 0]),
             alpha_test: Some(metal::CompareFunction::GreaterEqual),
+            logic_operation: Some(crate::vk::LogicOp::XOR),
             depth_compare_clamp_mask: 0x8000_0005,
             read_only_tests: true,
             shader_tests: true,
@@ -473,6 +491,9 @@ mod serde_round_trips {
                 group: 1,
             }),
             object_payload: Some(64),
+            region_viewports: true,
+            region_copies: true,
+            unit_axes: 2,
         });
     }
 
@@ -491,6 +512,7 @@ mod serde_round_trips {
                         immutable_sampler: None,
                         flags: vk::DescriptorBindingFlags::empty(),
                         variables: 1,
+                        immutable_samplers: Vec::new(),
                     },
                     DescriptorBinding {
                         binding: 1,
@@ -504,6 +526,7 @@ mod serde_round_trips {
                         immutable_sampler: None,
                         flags: vk::DescriptorBindingFlags::empty(),
                         variables: 1,
+                        immutable_samplers: Vec::new(),
                     },
                 ],
                 flags: vk::DescriptorSetLayoutCreateFlags::empty(),
@@ -610,6 +633,7 @@ mod serde_round_trips {
                 samples: 4,
             }),
             early_fragment_tests: true,
+            writes_sample_mask: true,
             // An emulated mesh function's records.
             mesh_records: Some(crate::pipeline::MeshRecords {
                 vertices: 3,
@@ -644,6 +668,7 @@ mod serde_round_trips {
                 ],
                 slot_words: 12,
             }),
+            mesh_corners: Some(3),
             // An emulated tessellation pipeline's state.
             emulated_tessellation: Some(crate::pipeline::EmulatedTessellation {
                 domain: crate::pipeline::interface::PatchDomain::Quad,
@@ -681,6 +706,16 @@ mod serde_round_trips {
                 group: 0,
             }),
             logic_op: Some(vk::LogicOp::EQUIVALENT),
+            line_band: Some(crate::pipeline::LineBandState {
+                push_offset: 112,
+                primitive: crate::pipeline::BandPrimitive::Triangles,
+            }),
+            interpolates_at_sample: true,
+            region_fan_out: Some(crate::pipeline::FanOutState {
+                mode: crate::pipeline::RegionFanOut::Probe,
+                copies: 7,
+                push_offset: 116,
+            }),
         });
         let mut slots = BTreeMap::new();
         slots.insert(
@@ -722,6 +757,7 @@ mod serde_round_trips {
             command_writes: CommandWrites {
                 operations: CommandWrites::DRAW | CommandWrites::RESET,
                 primitive_types: 0b1000,
+                kinds: CommandWrites::RENDER_COMMANDS,
             },
             texture_writing_stages: vec![Stage::Vertex, Stage::Fragment],
             numbered_samplers: vec![
@@ -731,6 +767,15 @@ mod serde_round_trips {
                 ),
                 (Stage::Vertex, vec![NumberedSampler::Write]),
             ],
+            stage_in: vec![crate::pipeline::stage_io::StageInFetch {
+                format: metal::AttributeFormat::Float2,
+                buffer_index: 3,
+                offset: 8,
+                stride: None,
+                step_function: metal::StepFunction::ThreadPositionInGridY,
+                step_rate: 2,
+                index: None,
+            }],
         });
         round_trip(&RuntimeDependency {
             fact: RuntimeFact::StorageTextureFormat {
@@ -944,6 +989,7 @@ mod bind_serde_round_trips {
                     max_anisotropy: 1,
                     compare_function: metal::CompareFunction::Never,
                     reduction_mode: metal::SamplerReductionMode::WeightedAverage,
+                    lod_bias: 1.5,
                 },
                 resource_id: None,
             },
@@ -955,6 +1001,7 @@ mod bind_serde_round_trips {
         round_trip(&BindState {
             stages,
             view_base_alignment: 64,
+            uniform_views_at_residual: true,
             used_resources: vec![UsedResource {
                 class: ResourceClass::Heap,
                 gpu_address: Some(0x2_0000_0000),
@@ -965,6 +1012,8 @@ mod bind_serde_round_trips {
                 token: 7,
                 resource_id: None,
             }],
+            used_in_token_order: true,
+            resident_apart: true,
             vertex_amplification: VertexAmplification::new(2, vec![ViewMapping::new(0, 3)]),
             imageblock_size: ImageblockSize::new(16, 8),
             render_target_array_length: 6,
@@ -1009,6 +1058,10 @@ mod bind_serde_round_trips {
             depth_clamp_range: Some([0.25, 0.5]),
             rotated_weights: true,
             mesh_last_first: true,
+            line_band: Some((
+                crate::pipeline::BandPrimitive::Triangles,
+                [8.0, -8.0, 1.75, -1.0],
+            )),
             resident_ranges: vec![crate::bind::ResidentRange::new(0x9_0000, 0x3_0000, 100)],
             interlocked_colors: BTreeSet::from([0, 3]),
             fragment_tests: crate::bind::FragmentTests::Depth { writes: true },
@@ -1023,6 +1076,9 @@ mod bind_serde_round_trips {
             primitive_id_indices: Some(metal::IndexType::UInt16),
             quad_primitive_ids: true,
             private_list: true,
+            far_vertex_buffers: BTreeSet::from([2]),
+            region_viewports: true,
+            region_fan_out: Some((crate::pipeline::RegionFanOut::Probe, 9)),
         });
         let mut shape = StageShape::default();
         shape.buffers.insert(
@@ -1077,6 +1133,7 @@ mod bind_serde_round_trips {
             depth_clamp_range: true,
             rotated_weights: true,
             mesh_last_first: true,
+            line_band: Some(crate::pipeline::BandPrimitive::Lines),
             interlocked_colors: BTreeSet::from([0, 3]),
             fragment_tests: crate::bind::FragmentTests::Pass,
             extended_shadows: BTreeSet::from([0]),
@@ -1084,6 +1141,9 @@ mod bind_serde_round_trips {
             primitive_id_indices: Some(metal::IndexType::UInt32),
             quad_primitive_ids: true,
             private_list: true,
+            far_vertex_buffers: BTreeSet::from([1, 30]),
+            region_viewports: true,
+            region_fan_out: Some(crate::pipeline::RegionFanOut::Draw),
         });
     }
 

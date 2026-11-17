@@ -5,7 +5,7 @@
 //! Where the device enables `VK_EXT_graphics_pipeline_library` and links its libraries fast
 //! (`graphicsPipelineLibraryFastLinking`; `device/create.rs`), a render variant's `VkPipeline` of
 //! a graphics key is linked, without link-time optimization, from four libraries, one per part
-//! of the pipeline's state (`graphics.rs`, [`GraphicsContent`]): its vertex input, its
+//! of the pipeline's state (`graphics.rs`, [`GraphicsContent`](super::graphics::GraphicsContent)): its vertex input, its
 //! pre-rasterization shaders, its fragment shader and its fragment output. Each part's library is
 //! the device's, found by the exact content of its part ([`Part`], a digest of everything its
 //! create info holds: the layout's description, each stage's words, the constants its stages
@@ -18,23 +18,42 @@
 //!
 //! - **Same pipeline.** The libraries are made from the very create infos the whole pipeline's
 //!   making takes, split by part; linking them is the driver's, so a linked pipeline is the
-//!   whole pipeline the same state describes. Nothing an answer depends on changes.
+//!   whole pipeline the same state describes. Nothing an answer depends on changes. Not on a
+//!   driver whose fast link leaves a fragment shader's interlock unordered
+//!   (`RuntimeDriverDefect::FastLinkedInterlocksUnordered`, RADV): a variant whose fragment stage
+//!   interlocks is made whole there (`graphics.rs`'s `GraphicsContent::links`).
 //! - **The device's, by content** (`content_keyed.rs`). A program's call (a draw, a state's
 //!   creation) claims each part's library, inserting it where the device has none; a pool piece
 //!   only looks up, and on a miss makes one of its own that no lookup finds. A claimed library is
 //!   made by the first caller that needs it made ([`Library::made`]); a caller meanwhile waits for
 //!   that making, and one after a failed making makes its own attempt, as a draw's own making does
 //!   (`making.rs`).
-//! - **Alive while linked.** A linked pipeline holds its four libraries ([`Linked`]), and a kept
-//!   pipeline keeps them (`kept.rs`): the device's map destroys a library only once nothing holds
-//!   it, at a program's settle or the device's teardown, after every pipeline it linked.
+//! - **One linked pipeline per link.** A linked pipeline is the device's too, found by exactly
+//!   what its linking takes ([`Link`]): its four libraries, by their parts' names, and the pipeline
+//!   layout it is linked with, which no variant of another layout definition shares
+//!   (`shared_layouts.rs`). So render states whose whole key is equal, each a variant of its own
+//!   (compiled pipelines of their own whose stages come out as the same words, such as
+//!   descriptors that differ only in the call stack depth of a function that recurses through no
+//!   visible function), share one `VkPipeline`: the first links it, and every later one takes it
+//!   with no driver call (`WorkCounts::linked_pipelines_shared`). Claimed and made as a library
+//!   is (below).
+//! - **Alive while linked.** A linked pipeline holds its four libraries and its layout ([`Link`]),
+//!   each variant's pipeline holds the link ([`Linked`]), and a kept pipeline keeps it
+//!   (`kept.rs`): the device's map destroys a linked pipeline only once nothing holds it, and a
+//!   library only after every pipeline it linked, at a program's settle or the device's teardown,
+//!   so no variant destroys one another variant draws with.
 //! - **Cached across processes.** Each library of shaders (pre-rasterization, fragment shader) is
-//!   made through the device's shader cache under a record named by its part
-//!   (`shader_cache/driver.rs`), as a whole pipeline is; the vertex input and fragment output
-//!   libraries hold no shader and keep no record.
+//!   made through the device's shader cache under its part's record (`shader_cache/driver.rs`),
+//!   as a whole pipeline is: its part's name but for what reaches no stage's conversion, the
+//!   pass's attachment formats and the depth bias (`GraphicsContent::record_parts`). So a part's
+//!   libraries made against passes that differ only in an attachment's format, each a library of
+//!   its own, share one record and one `VkPipelineCache`, where the driver finds the stages the
+//!   first compiled. The vertex input and fragment output libraries hold no shader and keep no
+//!   record.
 
 use super::budget;
-use super::content_keyed::{program_call, ContentKeyed, Gone, Owned};
+use super::content_keyed::{program_call, ContentKeyed, Owned};
+use super::shared_layouts::SharedLayout;
 use crate::device::{lock, DeviceShared};
 use crate::error::Error;
 use crate::release;
@@ -71,7 +90,7 @@ impl Part {
     }
 
     /// Whether its library compiles shaders: the pre-rasterization and fragment shader parts.
-    /// Only those are made through the device's shader cache, each under a record of its own
+    /// Only those are made through the device's shader cache, each under its part's record
     /// (`shader_cache/driver.rs`); the vertex input and fragment output libraries hold no shader,
     /// and are made without a pipeline cache.
     pub(crate) fn holds_shaders(self) -> bool {
@@ -194,23 +213,61 @@ impl Owned<DeviceShared> for Library {
     }
 }
 
-/// The four libraries a linked pipeline was linked from, held while it lives.
-#[derive(Clone)]
-pub(crate) struct Linked(pub(crate) [Arc<Library>; 4]);
+/// What a linked pipeline's linking takes, exactly: the names of its four parts' libraries, in
+/// [`Part::ALL`]'s order, and the pipeline layout it is linked with. The layout goes by its
+/// handle, which its [`Link`] holds, so no other layout takes that handle while the link is in
+/// the map.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct LinkKey {
+    names: [Hash256; 4],
+    layout: vk::PipelineLayout,
+}
 
-/// The device's libraries, by part and content (`DeviceShared::libraries`).
+/// A linked pipeline: the device's, by its [`LinkKey`], made once by the first caller that needs
+/// it ([`Library::made`], as a library is), holding what it was linked from while it lives.
+pub(crate) struct Link {
+    pipeline: Library,
+    /// Its four libraries, in [`Part::ALL`]'s order.
+    parts: [Arc<Library>; 4],
+    /// The layout it is linked with: Vulkan may read a pipeline's creation's objects for as long
+    /// as the pipeline lives.
+    layout: Arc<SharedLayout>,
+}
+
+impl Owned<DeviceShared> for Link {
+    fn destroy(&self, shared: &DeviceShared) {
+        // As a library's: the map lets it go only when no variant's pipeline, kept pipeline or
+        // command buffer holds it, or at the device's teardown.
+        self.pipeline.destroy(shared);
+    }
+}
+
+/// The linked pipeline of a variant's key, with the libraries it is linked from, held while the
+/// variant's pipeline lives: the device's, which other variants of the same link share.
+#[derive(Clone)]
+pub(crate) struct Linked(Arc<Link>);
+
+/// The device's libraries, by part and content, and its linked pipelines, by link
+/// (`DeviceShared::libraries`).
 #[derive(Default)]
 pub(crate) struct Libraries {
     parts: [Mutex<ContentKeyed<Hash256, Library>>; 4],
+    links: Mutex<ContentKeyed<LinkKey, Link>>,
 }
 
 impl Libraries {
     /// The libraries of the four parts `names` names (each its part's digest, in
-    /// [`Part::ALL`]'s order): the device's, inserted where it holds none in a program's call
-    /// (`content_keyed::program_call`), else a caller's own on a miss. Each map sweeps.
-    pub(crate) fn claim(&self, shared: &DeviceShared, names: &[Hash256; 4]) -> Linked {
+    /// [`Part::ALL`]'s order), and the pipeline linked from them with `layout`: the device's,
+    /// inserted where it holds none in a program's call (`content_keyed::program_call`), else a
+    /// caller's own on a miss. Each map sweeps.
+    pub(crate) fn claim(
+        &self,
+        shared: &DeviceShared,
+        names: &[Hash256; 4],
+        layout: &Arc<SharedLayout>,
+    ) -> Linked {
         let program = program_call();
-        let claimed = std::array::from_fn(|at| {
+        let parts: [Arc<Library>; 4] = std::array::from_fn(|at| {
             let mut map = lock(&self.parts[at]);
             let (library, _) = match map.get_or_make(names[at], program, || {
                 Ok::<Library, std::convert::Infallible>(Library::new())
@@ -228,47 +285,95 @@ impl Libraries {
             );
             library
         });
-        Linked(claimed)
+        let key = LinkKey {
+            names: *names,
+            layout: layout.layout(),
+        };
+        let mut map = lock(&self.links);
+        let (link, _) = match map.get_or_make(key, program, || {
+            Ok::<Link, std::convert::Infallible>(Link {
+                pipeline: Library::new(),
+                parts,
+                layout: Arc::clone(layout),
+            })
+        }) {
+            Ok(found) => found,
+            Err(never) => match never {},
+        };
+        let gone = map.sweep();
+        drop(map);
+        gone.destroy(shared);
+        (link.pipeline.claimed).store(
+            crate::census::now_secs(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Linked(link)
     }
 
-    /// Let go of the libraries nothing holds any more: in a program's call, as the device's
-    /// modules are (`objects.rs`).
+    /// Let go of the linked pipelines nothing holds any more, then of the libraries no pipeline
+    /// holds: in a program's call, as the device's modules are (`objects.rs`).
     pub(crate) fn settle(&self, shared: &DeviceShared) {
+        let gone = lock(&self.links).settle();
+        gone.destroy(shared);
         for part in &self.parts {
             let gone = lock(part).settle();
             gone.destroy(shared);
         }
     }
 
-    /// x86Sim RAM 8: destroy the libraries nothing but the map holds that no caller claimed for
-    /// `idle` (a long-lived consumer's trim thread): those whose linked pipelines are all gone
-    /// (released states, kept pipelines trimmed). The map otherwise lets them go only at a
-    /// program's settle, which an idle program never reaches. A linked pipeline must keep its
-    /// libraries: NVIDIA 615's fast-linked pipeline reads them as it is bound (a segfault in
-    /// vkCmdBindPipeline's recording when they went at its creation). Returns how many were
-    /// destroyed.
+    /// x86Sim RAM 8: destroy the linked pipelines, then the libraries, nothing but the maps hold
+    /// that no caller claimed for `idle` (a long-lived consumer's trim thread): links no variant's
+    /// pipeline, kept pipeline or command buffer holds, then libraries no link holds. The maps
+    /// otherwise let them go only at a program's settle, which an idle program never reaches. A
+    /// linked pipeline keeps its libraries: NVIDIA 615's fast-linked pipeline reads them as it is
+    /// bound (a segfault in vkCmdBindPipeline's recording when they went at its creation).
+    /// Returns how many were destroyed.
     pub(crate) fn trim_idle(&self, shared: &DeviceShared, idle: std::time::Duration) -> usize {
         let now = crate::census::now_secs();
-        let mut destroyed = 0;
+        let stale = |library: &Library| {
+            let claimed = library.claimed.load(std::sync::atomic::Ordering::Relaxed);
+            now.saturating_sub(claimed) >= idle.as_secs()
+                && !matches!(*lock(&library.state), Slot::Making)
+        };
+        let gone = lock(&self.links).take_idle(|link| stale(&link.pipeline));
+        let mut destroyed = gone.len();
+        gone.destroy(shared);
         for part in &self.parts {
-            let gone = lock(part).take_idle(|library| {
-                let claimed = library.claimed.load(std::sync::atomic::Ordering::Relaxed);
-                now.saturating_sub(claimed) >= idle.as_secs()
-                    && !matches!(*lock(&library.state), Slot::Making)
-            });
+            let gone = lock(part).take_idle(|library| stale(library));
             destroyed += gone.len();
             gone.destroy(shared);
         }
         destroyed
     }
 
-    /// Every library, at the device's teardown, after the kept pipelines it linked.
-    pub(crate) fn drain(&self) -> Vec<Gone<Library>> {
-        self.parts.iter().map(|part| lock(part).drain()).collect()
+    /// Destroy every linked pipeline, then every library: the device's teardown, after the kept
+    /// pipelines.
+    pub(crate) fn drain(&self, shared: &DeviceShared) {
+        let gone = lock(&self.links).drain();
+        gone.destroy(shared);
+        for part in &self.parts {
+            let gone = lock(part).drain();
+            gone.destroy(shared);
+        }
     }
 }
 
 impl Linked {
+    /// Its libraries, in [`Part::ALL`]'s order.
+    pub(crate) fn parts(&self) -> &[Arc<Library>; 4] {
+        &self.0.parts
+    }
+
+    /// Its linked pipeline, made once by the first caller that needs it ([`Library::made`]).
+    pub(crate) fn pipeline(&self) -> &Library {
+        &self.0.pipeline
+    }
+
+    /// The pipeline layout its pipeline is linked with.
+    pub(crate) fn layout(&self) -> vk::PipelineLayout {
+        self.0.layout.layout()
+    }
+
     /// Whether the libraries of its shaders, its pre-rasterization and fragment shader parts,
     /// are made: a key whose shaders' libraries are made links on the caller's thread, where its
     /// vertex input and fragment output libraries, which hold no shader, are made in well under a
@@ -279,7 +384,7 @@ impl Linked {
         Part::ALL
             .into_iter()
             .filter(|part| part.holds_shaders())
-            .all(|part| self.0[part as usize].is_made())
+            .all(|part| self.0.parts[part as usize].is_made())
     }
 }
 

@@ -207,7 +207,8 @@ fn kernel_roles_decode() {
     assert_eq!(
         e.stage,
         Stage::Kernel {
-            max_total_threads: None
+            max_total_threads: None,
+            work_group_size: None
         }
     );
     assert!(e.outputs.is_empty());
@@ -268,6 +269,167 @@ fn unknown_key_is_refused() {
     expect_abi(k.decode(), AbiError::UnknownKey);
 }
 
+/// The location of an `UnknownKey` refusal, and what it names as read there.
+fn unknown_at<T: std::fmt::Debug>(r: Result<T, Error>) -> (Location, Option<DiagName>) {
+    match r.expect_err("decode must fail") {
+        Error::InvalidInput(i) if i.kind == InputErrorKind::Abi(AbiError::UnknownKey) => {
+            (i.at, i.saw)
+        }
+        other => panic!("not UnknownKey: {other:?}"),
+    }
+}
+
+/// An `UnknownKey` names what it read where a key was due, at every place that reads one: a
+/// string the ABI does not define (an argument's role or attribute, a visible function's, a
+/// node's tag, a compile option, a signature's kind, a module flag), cut past 64 bytes, and an
+/// operand left over or stating no key by its shape. A known key a place does not take is named
+/// as the location's key.
+#[test]
+fn an_unknown_key_names_what_it_read() {
+    let at = |entry: Option<&str>, arg: Option<u32>, key: Option<&'static str>| {
+        Location::metadata(entry.map(DiagName::new), arg, key)
+    };
+    let saw = |l: Location, what: &str| (l, Some(DiagName::new(what)));
+    // An argument's attribute and role (`args::key_of`).
+    let mut buf = buffer_arg(0);
+    buf.push(S("air.no_such_key"));
+    let k = Kernel::with(&[buf, texture_arg(1), sampler_arg(2), gid_arg(3)]);
+    let refused = k.decode().expect_err("an unknown key");
+    assert_eq!(
+        refused.to_string(),
+        "invalid input: Abi(UnknownKey) at metadata of entry k, argument 0, saw \"air.no_such_key\""
+    );
+    assert_eq!(
+        unknown_at::<()>(Err(refused)),
+        saw(at(Some("k"), Some(0), None), "air.no_such_key")
+    );
+    let long = "x".repeat(100);
+    let k = Kernel::with(&[
+        buffer_arg(0),
+        vec![I(1), S(&long)],
+        sampler_arg(2),
+        gid_arg(3),
+    ]);
+    let cut = format!("{}...", &long[..64]);
+    assert_eq!(
+        unknown_at(k.decode()),
+        saw(at(Some("k"), Some(1), None), &cut)
+    );
+    // An operand left over (`Ops::finish`), by its shape: an integer, and a node by its first
+    // operands.
+    let option = |extra: fn(&mut ModuleBuilder) -> O<'static>| {
+        module_with(|b| {
+            let extra = extra(b);
+            let n = node(b, &[S("air.compile.fast_math_enable"), extra]);
+            b.named_md("air.compile_options", &[n]);
+        })
+    };
+    assert_eq!(
+        unknown_at(option(|_| I(1))),
+        saw(at(None, None, None), "i32 1")
+    );
+    let nested = |b: &mut ModuleBuilder| {
+        let empty = node(b, &[]);
+        N(node(b, &[S("x"), I(2), N(empty), Z, I(5), I(6)]))
+    };
+    assert_eq!(
+        unknown_at(option(nested)),
+        saw(
+            at(None, None, None),
+            "!{!\"x\", i32 2, !{..}, null, 2 more}"
+        )
+    );
+    // An entry attribute that states no key (`stage_attribute`).
+    assert_eq!(
+        unknown_at(kernel_with_attribute(|_| I(1))),
+        saw(at(Some("k"), None, None), "i32 1")
+    );
+    assert_eq!(
+        unknown_at(kernel_with_attribute(|b| N(node(b, &[I(1)])))),
+        saw(at(Some("k"), None, None), "!{i32 1}")
+    );
+    // A visible function's input key (`visible::role`), a role its output does not take, and a
+    // stitching node's tag (`visible::tag`).
+    let visible =
+        |input: &'static [O<'static>], output: &'static [O<'static>], tag: Option<&'static str>| {
+            visible_module(move |b, f, _| {
+                let o = node(b, output);
+                let outputs = node(b, &[N(o)]);
+                let x = node(b, input);
+                let pad = node(b, &[I(1), S("air.visible_padding")]);
+                let inputs = node(b, &[N(x), N(pad)]);
+                let mut entry = vec![F(f), N(outputs), N(inputs)];
+                if let Some(tag) = tag {
+                    entry.push(N(node(b, &[S(tag), Z])));
+                }
+                vec![node(b, &entry)]
+            })
+        };
+    let input: &'static [O<'static>] = &[I(0), S("air.visible_input")];
+    let output: &'static [O<'static>] = &[S("air.visible_output")];
+    assert_eq!(
+        unknown_at(visible(
+            &[I(0), S("air.visible_input"), S("air.not_a_key")],
+            output,
+            None
+        )),
+        saw(at(Some("f"), Some(0), None), "air.not_a_key")
+    );
+    assert_eq!(
+        unknown_at(visible(input, &[S("air.visible_input")], None)),
+        (at(Some("f"), None, Some("air.visible_input")), None)
+    );
+    assert_eq!(
+        unknown_at(visible(input, output, Some("air.stitching"))),
+        saw(
+            at(Some("f"), None, Some("air.stitching_info")),
+            "air.stitching"
+        )
+    );
+    // A module list's tag, option, kind or flag.
+    let module = |list: &'static str, entry: fn(&mut ModuleBuilder) -> Vec<O<'static>>| {
+        unknown_at(module_with(|b| {
+            let ops = entry(b);
+            let n = node(b, &ops);
+            b.named_md(list, &[n]);
+        }))
+    };
+    assert_eq!(
+        module("air.sampler_states", |b| {
+            let g = sampler_global(b, &[0, 0]);
+            vec![S("air.sampler"), G(g)]
+        }),
+        saw(at(None, None, Some("air.sampler_state")), "air.sampler")
+    );
+    assert_eq!(
+        module("air.visible_function_references", |b| {
+            let void = b.void();
+            let ty = b.fn_ty(void, &[]);
+            let f = b.declare("surface", ty);
+            vec![S("air.visible_function_ref"), F(f), S("surface")]
+        }),
+        saw(
+            at(None, None, Some("air.visible_function_reference")),
+            "air.visible_function_ref"
+        )
+    );
+    assert_eq!(
+        module("air.compile_options", |_| vec![S("air.compile.other")]),
+        saw(
+            at(None, None, Some("air.compile_options")),
+            "air.compile.other"
+        )
+    );
+    assert_eq!(
+        module("air.signature", |_| vec![S("air.other_signature")]),
+        saw(at(None, None, Some("air.signature")), "air.other_signature")
+    );
+    assert_eq!(
+        module("llvm.module.flags", |_| vec![I(8), S("PIC Level"), I(2)]),
+        saw(at(None, None, Some("llvm.module.flags")), "PIC Level")
+    );
+}
+
 /// MSL 3.2's program-scope bindings (`!air.global_bindings`) decode to their global and the
 /// binding of their argument node, a parameter node of index -1; a malformed entry is refused.
 #[test]
@@ -314,6 +476,138 @@ fn missing_key_is_refused() {
     let sampler = vec![I(2), S("air.sampler")];
     let k = Kernel::with(&[buffer_arg(0), texture_arg(1), sampler, gid_arg(3)]);
     expect_abi(k.decode(), AbiError::MissingKey);
+}
+
+/// An argument Apple's OpenCL compiler passes by value at location `location`, `size` bytes
+/// (`air.constant`, as written for a `float k` or a `struct S s` parameter), with the extra
+/// operands `extra` before its type name.
+fn constant_arg<'a>(i: u64, location: u64, size: u64, extra: &[O<'a>]) -> Vec<O<'a>> {
+    let mut ops = vec![
+        I(i),
+        S("air.constant"),
+        S("air.location_index"),
+        I(location),
+        I(1),
+    ];
+    ops.extend_from_slice(extra);
+    ops.extend([
+        S("air.arg_type_size"),
+        I(size),
+        S("air.arg_type_align_size"),
+        I(4),
+        S("air.arg_type_name"),
+        S("S"),
+        S("air.arg_name"),
+        S("s"),
+    ]);
+    ops
+}
+
+/// A by-value argument (`air.constant`) is a read-only constant buffer at its location holding
+/// exactly its own bytes, its layout the struct's where it states one. Its node states no access
+/// and no address space and takes neither; it needs its size; it is a constant-space pointer; and
+/// only a kernel takes one.
+#[test]
+fn a_by_value_argument_is_a_constant_buffer_of_its_own_size() {
+    let slot = |i| Slot {
+        index: AbiInt::Const(i),
+        count: AbiInt::Const(1),
+    };
+    let k = Kernel::with(&[
+        buffer_arg(0),
+        texture_arg(1),
+        constant_arg(2, 4, 8, &[]),
+        gid_arg(3),
+    ]);
+    let abi = k.decode().expect("a by-value argument decodes");
+    let p = &abi.entries[0].params[2];
+    assert_eq!(
+        p.role,
+        ParamRole::Buffer(BufferArg {
+            location: slot(4),
+            access: Access::Read,
+            space: AddrSpace::Constant,
+            buffer_size: Some(8),
+            layout: None,
+            raster_order_group: None,
+        })
+    );
+    assert_eq!((p.ty.size, p.ty.align), (Some(8), Some(4)));
+    assert_eq!(p.name, Some(DiagName::new("s")));
+    // A struct's members are its layout.
+    let mut b = ModuleBuilder::new();
+    let params = kernel_params(&mut b);
+    let void = b.void();
+    let f = entry_fn(&mut b, "k", void, &params);
+    let leaf = leaf_layout(&mut b);
+    let args = [
+        buffer_arg(0),
+        texture_arg(1),
+        constant_arg(2, 4, 4, &[S("air.struct_type_info"), N(leaf)]),
+        gid_arg(3),
+    ];
+    let arg_nodes: Vec<_> = args.iter().map(|a| N(node(&mut b, a))).collect();
+    let inputs = node(&mut b, &arg_nodes);
+    let outputs = node(&mut b, &[]);
+    let e = node(&mut b, &[F(f), N(outputs), N(inputs)]);
+    b.named_md("air.kernel", &[e]);
+    let abi = decode(&b.finish().unwrap(), &PointeeTable::default(), &mut meter())
+        .expect("a by-value struct decodes");
+    let ParamRole::Buffer(arg) = &abi.entries[0].params[2].role else {
+        panic!("{:?}", abi.entries[0].params[2])
+    };
+    let layout = arg
+        .layout
+        .and_then(|r| abi.struct_info(r))
+        .expect("its layout");
+    assert_eq!(layout.members.len(), 1);
+    assert_eq!(arg.buffer_size, Some(4));
+    // An access or an address space is a key the role does not take.
+    for extra in [&[S("air.read")][..], &[S("air.address_space"), I(2)]] {
+        let k = Kernel::with(&[
+            buffer_arg(0),
+            texture_arg(1),
+            constant_arg(2, 4, 8, extra),
+            gid_arg(3),
+        ]);
+        expect_abi(k.decode(), AbiError::UnknownKey);
+    }
+    // Without its size it holds no known bytes.
+    let sizeless: Vec<_> = constant_arg(2, 4, 8, &[])
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !(5..=6).contains(i))
+        .map(|(_, o)| o)
+        .collect();
+    let k = Kernel::with(&[buffer_arg(0), texture_arg(1), sizeless, gid_arg(3)]);
+    expect_abi(k.decode(), AbiError::MissingKey);
+    // A device pointer is not one.
+    let k = Kernel::with(&[
+        constant_arg(0, 4, 8, &[]),
+        texture_arg(1),
+        sampler_arg(2),
+        gid_arg(3),
+    ]);
+    expect_abi(k.decode(), AbiError::RoleTypeMismatch);
+    // A vertex function takes none, where a kernel's same node reaches the type check.
+    let by_value: &[O<'_>] = &[
+        I(0),
+        S("air.constant"),
+        S("air.location_index"),
+        I(0),
+        I(1),
+        S("air.arg_type_size"),
+        I(4),
+    ];
+    let position: &[O<'_>] = &[S("air.position")];
+    expect_abi(
+        single_io("air.vertex", by_value, Some(position)),
+        AbiError::UnknownKey,
+    );
+    expect_abi(
+        single_io("air.kernel", by_value, None),
+        AbiError::RoleTypeMismatch,
+    );
 }
 
 /// `buffer_arg(i)` without its `air.address_space` key and value, as an older compiler writes a
@@ -417,6 +711,57 @@ fn role_must_match_parameter_type() {
     expect_abi(k.decode(), AbiError::RoleTypeMismatch);
 }
 
+/// A `device` buffer declared `air.read` on a `constant`-space pointer, as Apple's compiler
+/// declares a by-value argument (a one-byte `char`), is the buffer it declares; written or read and
+/// written, it is still a mismatch, as is a `constant` buffer on a `device` pointer.
+#[test]
+fn a_read_only_device_buffer_may_be_a_constant_pointer() {
+    // Parameter 2, the standard kernel's constant pointer, as `[[buffer(1)]]`.
+    let declared = |access: &'static str| -> Vec<O<'static>> {
+        vec![
+            I(2),
+            S("air.buffer"),
+            S("air.location_index"),
+            I(1),
+            I(1),
+            S(access),
+            S("air.address_space"),
+            I(1),
+            S("air.arg_type_size"),
+            I(1),
+            S("air.arg_type_align_size"),
+            I(1),
+            S("air.arg_type_name"),
+            S("char"),
+            S("air.arg_name"),
+            S("transform"),
+        ]
+    };
+    let with = |buffer: Vec<O<'static>>, third: Vec<O<'static>>| {
+        Kernel::with(&[buffer, texture_arg(1), third, gid_arg(3)]).decode()
+    };
+    let abi = with(buffer_arg(0), declared("air.read"))
+        .expect("a read-only device buffer on a constant pointer decodes");
+    let p = &abi.entries[0].params[2];
+    let ParamRole::Buffer(b) = &p.role else {
+        panic!("{:?}", p.role);
+    };
+    assert_eq!((b.space, b.access), (AddrSpace::Device, Access::Read));
+    for access in ["air.write", "air.read_write"] {
+        expect_abi(
+            with(buffer_arg(0), declared(access)),
+            AbiError::RoleTypeMismatch,
+        );
+    }
+    let mut constant_on_device = buffer_arg(0);
+    constant_on_device[5] = S("air.read");
+    constant_on_device[7] = I(2);
+    expect_abi(
+        with(constant_on_device, declared("air.read")),
+        AbiError::RoleTypeMismatch,
+    );
+}
+
 #[test]
 fn every_parameter_needs_exactly_one_binding() {
     let k = Kernel::with(&[buffer_arg(0), texture_arg(1), sampler_arg(2)]);
@@ -483,7 +828,8 @@ fn kernel_attributes_and_predicates() {
     assert_eq!(
         e.stage,
         Stage::Kernel {
-            max_total_threads: Some(64)
+            max_total_threads: Some(64),
+            work_group_size: None
         }
     );
     assert_eq!(
@@ -557,8 +903,60 @@ fn an_unread_stage_attribute_is_refused_by_its_key() {
     assert_eq!(
         abi.entries[0].stage,
         Stage::Kernel {
-            max_total_threads: Some(32)
+            max_total_threads: Some(32),
+            work_group_size: None
         }
+    );
+}
+
+/// OpenCL C's `reqd_work_group_size(64, 1, 1)` (`air.work_group_size`, as Apple's OpenCL compiler
+/// writes it after the kernel's argument list) is the kernel's required size. Each dimension is
+/// at least 1, it is stated once, and only a kernel states it.
+#[test]
+fn a_kernel_s_required_work_group_size_decodes() {
+    let size = |b: &mut ModuleBuilder, x| N(node(b, &[S("air.work_group_size"), I(x), I(1), I(1)]));
+    let abi = kernel_with_attribute(|b| size(b, 64)).expect("a required size decodes");
+    assert_eq!(
+        abi.entries[0].stage,
+        Stage::Kernel {
+            max_total_threads: None,
+            work_group_size: Some([64, 1, 1]),
+        }
+    );
+    assert_eq!(abi.entries[0].stage.work_group_size(), Some([64, 1, 1]));
+    expect_abi(kernel_with_attribute(|b| size(b, 0)), AbiError::BadValue);
+    let mut b = ModuleBuilder::new();
+    let params = kernel_params(&mut b);
+    let void = b.void();
+    let f = entry_fn(&mut b, "k", void, &params);
+    let args = [buffer_arg(0), texture_arg(1), sampler_arg(2), gid_arg(3)];
+    let arg_nodes: Vec<_> = args.iter().map(|a| N(node(&mut b, a))).collect();
+    let inputs = node(&mut b, &arg_nodes);
+    let outputs = node(&mut b, &[]);
+    let [once, twice] = [size(&mut b, 64), size(&mut b, 32)];
+    let e = node(&mut b, &[F(f), N(outputs), N(inputs), once, twice]);
+    b.named_md("air.kernel", &[e]);
+    let m = b.finish().unwrap();
+    expect_abi(
+        decode(&m, &PointeeTable::default(), &mut meter()),
+        AbiError::BadValue,
+    );
+    let position: &[O<'_>] = &[S("air.position")];
+    let mut b = ModuleBuilder::new();
+    let i32t = b.int(32);
+    let ret = b.float();
+    let f = entry_fn(&mut b, "v", ret, &[i32t]);
+    let out = node(&mut b, position);
+    let outs = node(&mut b, &[N(out)]);
+    let id = node(&mut b, &[I(0), S("air.vertex_id")]);
+    let ins = node(&mut b, &[N(id)]);
+    let attr = size(&mut b, 64);
+    let e = node(&mut b, &[F(f), N(outs), N(ins), attr]);
+    b.named_md("air.vertex", &[e]);
+    let m = b.finish().unwrap();
+    expect_abi(
+        decode(&m, &PointeeTable::default(), &mut meter()),
+        AbiError::UnknownStageAttribute(DiagName::new("air.work_group_size")),
     );
 }
 
@@ -1366,7 +1764,7 @@ fn a_vertex_input_s_location_may_carry_its_user_key() {
         );
     }
     let key = S("generated(__air_placeholder__)");
-    let refused: [&[O<'_>]; 4] = [
+    let refused: [&[O<'_>]; 3] = [
         // A second string after the location.
         &[
             I(0),
@@ -1379,15 +1777,7 @@ fn a_vertex_input_s_location_may_carry_its_user_key() {
         ],
         // The string after another attribute.
         &input(None, &[key]),
-        // The string after a stage-in member's or a buffer's location.
-        &[
-            I(0),
-            S("air.stage_in"),
-            S("air.location_index"),
-            I(3),
-            I(1),
-            key,
-        ],
+        // The string after a buffer's location.
         &[
             I(0),
             S("air.buffer"),
@@ -1403,6 +1793,46 @@ fn a_vertex_input_s_location_may_carry_its_user_key() {
             single_io("air.vertex", ops, Some(position)),
             AbiError::UnknownKey,
         );
+    }
+}
+
+/// Apple's OpenGL front end follows a kernel's stage-in attribute's location with the attribute's
+/// name (`attrib_0`), as it does a vertex input's. A stage-in attribute binds by its location, so
+/// the key is read and dropped; a second string, or one after another attribute, stays an unknown
+/// key.
+#[test]
+fn a_stage_in_attribute_s_location_may_carry_its_user_key() {
+    let input = |key: Option<&'static str>, more: &[O<'static>]| {
+        let mut ops = vec![I(0), S("air.stage_in"), S("air.location_index"), I(2), I(1)];
+        ops.extend(key.map(S));
+        ops.extend([S("air.arg_type_name"), S("int"), S("air.arg_name"), S("a")]);
+        ops.extend_from_slice(more);
+        ops
+    };
+    let unkeyed = single_io("air.kernel", &input(None, &[]), None).unwrap();
+    let keyed = single_io("air.kernel", &input(Some("attrib_0"), &[]), None).unwrap();
+    assert_eq!(keyed, unkeyed);
+    assert_eq!(
+        keyed.entries[0].params[0].role,
+        ParamRole::StageIn {
+            location: Slot {
+                index: AbiInt::Const(2),
+                count: AbiInt::Const(1),
+            }
+        }
+    );
+    let key = S("attrib_0");
+    let twice: &[O<'_>] = &[
+        I(0),
+        S("air.stage_in"),
+        S("air.location_index"),
+        I(2),
+        I(1),
+        key,
+        key,
+    ];
+    for ops in [twice, &input(None, &[key])] {
+        expect_abi(single_io("air.kernel", ops, None), AbiError::UnknownKey);
     }
 }
 
@@ -1469,6 +1899,75 @@ fn interpolation_must_be_complete() {
         };
         assert_eq!(v.interpolation, want, "{keys:?}");
     }
+}
+
+/// An `interpolant` fragment input (`air.interpolation_function` with its perspective key) is an
+/// opaque device-space handle, sampled where each interpolation function says: no sampling key
+/// and no `air.flat` beside it, and a pointer parameter, as no other fragment input is.
+#[test]
+fn an_interpolant_is_a_device_handle_with_its_perspective() {
+    let fragment_input = |pointer: bool, keys: &[&'static str]| {
+        let mut b = ModuleBuilder::new();
+        let ty = if pointer {
+            b.ptr(AddrSpace::Device)
+        } else {
+            let f32t = b.float();
+            b.vector(f32t, 4)
+        };
+        let void = b.void();
+        let fs = entry_fn(&mut b, "fs", void, &[ty]);
+        let mut ops = vec![I(0), S("air.fragment_input"), S("generated(1pDv4_f)")];
+        ops.extend(keys.iter().map(|&k| S(k)));
+        let arg = node(&mut b, &ops);
+        let ins = node(&mut b, &[N(arg)]);
+        let outs = node(&mut b, &[]);
+        let e = node(&mut b, &[F(fs), N(outs), N(ins)]);
+        b.named_md("air.fragment", &[e]);
+        let m = b.finish().unwrap();
+        decode(&m, &PointeeTable::default(), &mut meter())
+    };
+    for (keys, perspective) in [
+        (&["air.interpolation_function", "air.perspective"][..], true),
+        (&["air.interpolation_function", "air.no_perspective"], false),
+    ] {
+        let abi = fragment_input(true, keys).unwrap_or_else(|e| panic!("{keys:?}: {e:?}"));
+        let role = &abi.entries[0].params[0].role;
+        let ParamRole::FragmentInput(v) = role else {
+            panic!("{keys:?}: a fragment input")
+        };
+        let want = Interpolation::Smooth {
+            sampling: Sampling::Interpolant,
+            perspective,
+        };
+        assert_eq!(v.interpolation, want, "{keys:?}");
+        assert!(v.interpolation.is_interpolant());
+        assert_eq!(role.handle(), Some(AbiHandle::Interpolant), "{keys:?}");
+    }
+    for keys in [
+        &["air.interpolation_function"][..],
+        &[
+            "air.interpolation_function",
+            "air.center",
+            "air.perspective",
+        ],
+        &[
+            "air.interpolation_function",
+            "air.sample",
+            "air.perspective",
+        ],
+        &["air.interpolation_function", "air.flat"],
+    ] {
+        expect_abi(fragment_input(true, keys), AbiError::BadValue);
+    }
+    // A value parameter is no interpolant, and a pointer is no plain varying.
+    expect_abi(
+        fragment_input(false, &["air.interpolation_function", "air.perspective"]),
+        AbiError::RoleTypeMismatch,
+    );
+    expect_abi(
+        fragment_input(true, &["air.center", "air.perspective"]),
+        AbiError::RoleTypeMismatch,
+    );
 }
 
 // ---- Struct layouts ----
@@ -2157,7 +2656,9 @@ fn deeply_nested_layouts_are_refused_without_recursing() {
             [top, leaf_layout(b)]
         })
         .unwrap();
-        assert_eq!(abi.structs.len() as u64, cap + 1);
+        // The second parameter's leaf decodes like the chain's innermost layout, so it is that
+        // entry: the chain's `cap` layouts are the whole table.
+        assert_eq!(abi.structs.len() as u64, cap);
         assert_eq!(
             layout_kernel(|b| {
                 let top = layout_chain(b, cap + 1, wrap);
@@ -2205,10 +2706,11 @@ fn layouts_at_the_nesting_cap_decode_on_a_small_stack() {
                 .join()
                 .unwrap()
         });
+        // The second parameter's leaf is the chain's innermost layout's entry.
         assert_eq!(
             decoded,
             (
-                Ok(cap as usize + 1),
+                Ok(cap as usize),
                 Err(Error::LimitExceeded(Limit::LayoutNesting))
             )
         );
@@ -2286,9 +2788,54 @@ fn pointee_size_and_layout_checks() {
         check(&fields, &param(Some(8), Some(4), Some(8), s0), st),
         Ok(())
     );
-    // Size disagrees with the pointee.
+    // Size disagrees with the pointee whose fields the layout describes.
     assert_eq!(
         check(&fields, &param(Some(12), Some(4), None, s0), st),
+        Err(AbiError::TypeSizeMismatch)
+    );
+    // A plain buffer with no layout states its declared type, which need not be the pointee:
+    // OpenGL's byte buffer behind a `float *`, a by-value argument's one `char` behind its struct.
+    // Its buffer size is a multiple of the declared size, and its alignment still a power of two.
+    let plain = abi(vec![]);
+    for (pointee, size) in [(f32t, 1), (st, 1), (i32t, 16)] {
+        assert_eq!(
+            check(&plain, &param(Some(size), Some(1), None, None), pointee),
+            Ok(()),
+            "{size}"
+        );
+    }
+    assert_eq!(
+        check(&plain, &param(Some(16), Some(16), Some(48), None), f32t),
+        Ok(())
+    );
+    for bad in [
+        param(Some(16), Some(16), Some(40), None),
+        param(Some(1), Some(3), None, None),
+        param(Some(0), None, Some(4), None),
+    ] {
+        assert_eq!(
+            check(&plain, &bad, f32t),
+            Err(AbiError::TypeSizeMismatch),
+            "{bad:?}"
+        );
+    }
+    // With no stated size, the pointee is the declared type.
+    assert_eq!(
+        check(&plain, &param(None, None, Some(12), None), f32t),
+        Ok(())
+    );
+    assert_eq!(
+        check(&plain, &param(None, None, Some(6), None), f32t),
+        Err(AbiError::TypeSizeMismatch)
+    );
+    // An argument buffer's stated size is its element stride, which is the pointee's.
+    let mut argument = param(Some(1), Some(1), None, None);
+    let ParamRole::Buffer(arg) = argument.role else {
+        unreachable!("a buffer")
+    };
+    argument.role = ParamRole::ArgumentBuffer(arg);
+    assert_eq!(
+        check(&plain, &argument, f32t),
         Err(AbiError::TypeSizeMismatch)
     );
     // Alignment is not a power of two.
@@ -2418,6 +2965,47 @@ fn module_level_metadata_decodes() {
     assert_eq!(abi.producer, Some(DiagName::new("producer")));
 }
 
+/// A module Metal links at run time from several (Core Image's kernels) merges their option
+/// lists, so an option may repeat; each repeat states the option it already stated.
+#[test]
+fn a_repeated_compile_option_states_it_once() {
+    let options = |list: &[&str]| {
+        module_with(|b| {
+            let nodes: Vec<_> = list.iter().map(|&o| node(b, &[S(o)])).collect();
+            b.named_md("air.compile_options", &nodes);
+        })
+        .map(|abi| abi.compile)
+    };
+    let once = [
+        "air.compile.denorms_disable",
+        "air.compile.fast_math_enable",
+        "air.compile.framebuffer_fetch_disable",
+    ];
+    let twice: Vec<&str> = once.iter().chain(once.iter()).copied().collect();
+    let want = CompileOptions {
+        fast_math: Some(true),
+        denorms_disable: true,
+        framebuffer_fetch: Some(false),
+    };
+    assert_eq!(options(&once).unwrap(), want);
+    assert_eq!(options(&twice).unwrap(), want);
+    // Repeated next to each other, and each kind of option alone.
+    assert_eq!(
+        options(&[
+            "air.compile.fast_math_disable",
+            "air.compile.fast_math_disable",
+            "air.compile.denorms_disable",
+            "air.compile.denorms_disable",
+        ])
+        .unwrap(),
+        CompileOptions {
+            fast_math: Some(false),
+            denorms_disable: true,
+            framebuffer_fetch: None,
+        }
+    );
+}
+
 #[test]
 fn closed_module_level_sets() {
     // Unknown named metadata.
@@ -2436,19 +3024,30 @@ fn closed_module_level_sets() {
         }),
         AbiError::UnknownKey,
     );
-    // Contradictory compile options.
-    expect_abi(
-        module_with(|b| {
-            let a = node(b, &[S("air.compile.fast_math_enable")]);
-            let c = node(b, &[S("air.compile.fast_math_disable")]);
-            b.named_md("air.compile_options", &[a, c]);
-        }),
-        AbiError::BadValue,
-    );
+    // Contradictory compile options, alone and after a repeat of the first.
+    for list in [
+        &[
+            "air.compile.fast_math_enable",
+            "air.compile.fast_math_disable",
+        ][..],
+        &[
+            "air.compile.framebuffer_fetch_disable",
+            "air.compile.framebuffer_fetch_disable",
+            "air.compile.framebuffer_fetch_enable",
+        ],
+    ] {
+        expect_abi(
+            module_with(|b| {
+                let nodes: Vec<_> = list.iter().map(|&o| node(b, &[S(o)])).collect();
+                b.named_md("air.compile_options", &nodes);
+            }),
+            AbiError::BadValue,
+        );
+    }
     // Unknown module flag.
     expect_abi(
         module_with(|b| {
-            let n = node(b, &[I(1), S("Debug Info Version"), I(3)]);
+            let n = node(b, &[I(8), S("PIC Level"), I(2)]);
             b.named_md("llvm.module.flags", &[n]);
         }),
         AbiError::UnknownKey,
@@ -2460,6 +3059,76 @@ fn closed_module_level_sets() {
             b.named_md("air.language_version", &[n]);
         }),
         AbiError::BadValue,
+    );
+}
+
+/// What `-gline-tables-only` and `-frecord-sources` add to a module (Xcode's
+/// `MTL_ENABLE_DEBUG_INFO`): the compile units, the two debug-info module flags and, in an unlinked
+/// `.air`, the command line, the working directory and the recorded sources. The module decodes to
+/// the ABI it has without them.
+#[test]
+fn debug_info_and_recorded_sources_leave_the_abi_unchanged() {
+    let textures = |b: &mut ModuleBuilder| node(b, &[I(7), S("air.max_textures"), I(128)]);
+    let plain = module_with(|b| {
+        let f = textures(b);
+        b.named_md("llvm.module.flags", &[f]);
+    })
+    .unwrap();
+    let debug = module_with(|b| {
+        let dwarf = node(b, &[I(7), S("Dwarf Version"), I(4)]);
+        let version = node(b, &[I(2), S("Debug Info Version"), I(3)]);
+        let f = textures(b);
+        b.named_md("llvm.module.flags", &[dwarf, version, f]);
+        let unit = b.md(Md::Debug);
+        b.named_md("llvm.dbg.cu", &[unit]);
+        let line = node(
+            b,
+            &[S("metal -c -gline-tables-only -frecord-sources a.metal")],
+        );
+        b.named_md("llvm.commandline", &[line]);
+        let dir = node(b, &[S("/src")]);
+        b.named_md("llvm_utils.workingdir", &[dir]);
+        let source = node(b, &[S("/src/a.metal"), S("#include \"a.h\"")]);
+        let header = node(b, &[S("/src/a.h"), S("")]);
+        let files = node(b, &[N(source), N(header)]);
+        b.named_md("llvm_utils.sources", &[files]);
+    })
+    .unwrap();
+    assert_eq!(debug, plain);
+}
+
+/// The debug-info and recorded-source lists are read by their shapes: a compile unit that is not a
+/// debug-info record, a recorded source without its text, or a file that is not a node is refused.
+#[test]
+fn debug_info_and_recorded_sources_have_closed_shapes() {
+    expect_abi(
+        module_with(|b| {
+            let n = node(b, &[S("not a compile unit")]);
+            b.named_md("llvm.dbg.cu", &[n]);
+        }),
+        AbiError::BadValue,
+    );
+    expect_abi(
+        module_with(|b| {
+            let file = node(b, &[S("/src/a.metal")]);
+            let files = node(b, &[N(file)]);
+            b.named_md("llvm_utils.sources", &[files]);
+        }),
+        AbiError::MissingKey,
+    );
+    expect_abi(
+        module_with(|b| {
+            let files = node(b, &[S("/src/a.metal"), S("")]);
+            b.named_md("llvm_utils.sources", &[files]);
+        }),
+        AbiError::BadValue,
+    );
+    expect_abi(
+        module_with(|b| {
+            let n = node(b, &[S("metal"), S("-c")]);
+            b.named_md("llvm.commandline", &[n]);
+        }),
+        AbiError::UnknownKey,
     );
 }
 
@@ -3837,6 +4506,106 @@ fn control_point_fetches_are_exposed() {
     );
 }
 
+/// A patch control-point input belongs to a post-tessellation vertex function alone. Metal's
+/// compiler writes `air.patch_control_point_input` for no kernel, and Metal makes no compute
+/// pipeline of a kernel that takes one: an M3 Max under macOS 27.0.1 makes the library and the
+/// function, and refuses the pipeline ("Internal compiler error.") under every compute step
+/// function. The same input, function and fields decode on a post-tessellation vertex function and
+/// are refused on a kernel, at the argument and the key.
+#[test]
+fn a_kernel_takes_no_control_point_input() {
+    let decoded = |list: &'static str| {
+        module_with(|b| {
+            let ptr = b.ptr(AddrSpace::Thread);
+            let void = b.void();
+            let i32t = b.int(32);
+            let f32t = b.float();
+            let float2 = b.vector(f32t, 2);
+            let float4 = b.vector(f32t, 4);
+            // The fetch `metal` declares for a post-tessellation vertex function's control
+            // points: `{ T0, .. } (i32 index, ptr input)`, one member per field, never defined.
+            let point = b.struct_ty(&[float2, float4]);
+            let fetch_ty = b.fn_ty(point, &[i32t, ptr]);
+            let fetch = b.declare("fetch", fetch_ty);
+            let f = entry_fn(b, "entry", void, &[ptr, i32t]);
+            let function = node(b, &[S("air.patch_control_point_function"), F(fetch)]);
+            let field = |b: &mut ModuleBuilder, location, ty, name| {
+                node(
+                    b,
+                    &[
+                        S("air.location_index"),
+                        I(location),
+                        I(1),
+                        S("air.arg_type_name"),
+                        S(ty),
+                        S("air.arg_name"),
+                        S(name),
+                    ],
+                )
+            };
+            let p = field(b, 0, "float2", "p");
+            let q = field(b, 1, "float4", "q");
+            let input = node(
+                b,
+                &[
+                    I(0),
+                    S("air.patch_control_point_input"),
+                    N(function),
+                    N(p),
+                    N(q),
+                ],
+            );
+            // The index each stage has: a kernel's grid position, a patch's id.
+            let builtin = if list == "air.kernel" {
+                "air.thread_position_in_grid"
+            } else {
+                "air.patch_id"
+            };
+            let index = node(
+                b,
+                &[
+                    I(1),
+                    S(builtin),
+                    S("air.arg_type_name"),
+                    S("uint"),
+                    S("air.arg_name"),
+                    S("i"),
+                ],
+            );
+            let inputs = node(b, &[N(input), N(index)]);
+            let outputs = node(b, &[]);
+            let e = if list == "air.kernel" {
+                node(b, &[F(f), N(outputs), N(inputs)])
+            } else {
+                let patch = node(
+                    b,
+                    &[
+                        S("air.patch"),
+                        S("quad"),
+                        S("air.patch_control_point"),
+                        I(4),
+                    ],
+                );
+                node(b, &[F(f), N(outputs), N(inputs), N(patch)])
+            };
+            b.named_md(list, &[e]);
+        })
+    };
+    let abi = decoded("air.vertex").expect("a post-tessellation vertex function's control points");
+    assert!(matches!(
+        abi.entries[0].params[0].role,
+        ParamRole::PatchInput(PatchInput::ControlPoints { .. })
+    ));
+    let Err(Error::InvalidInput(e)) = decoded("air.kernel") else {
+        panic!("a kernel's control-point input must be refused");
+    };
+    assert_eq!(e.kind, InputErrorKind::Abi(AbiError::UnknownKey));
+    let (entry, arg, key) = e.at.in_metadata().expect("an ABI-metadata location");
+    assert_eq!(entry.map(ToString::to_string).as_deref(), Some("entry"));
+    assert_eq!(arg, Some(0));
+    assert_eq!(key, Some(Key::PatchControlPointInput.name()));
+}
+
 /// A post-tessellation vertex function's `air.patch` with each count form: `[[patch(quad, 4)]]`
 /// states its count, `[[patch(quad)]]` none (the node ends at the kind), and a count key without a
 /// count is malformed.
@@ -3975,7 +4744,7 @@ fn container_metadata_is_cross_checked() {
     // Unmodeled stages are unsupported, not a mismatch.
     for (stage, tag) in [
         (FunctionStage::Intersection, 6),
-        (FunctionStage::Other(5), 5),
+        (FunctionStage::Other(9), 9),
     ] {
         let err = check(&mut abi, &m, &library_function(stage, vec![])).unwrap_err();
         let Error::InvalidInput(i) = err else {
@@ -4480,6 +5249,7 @@ fn reach_entry(roles: Vec<ParamRole>) -> EntryPoint {
         func: FuncId::new(0),
         stage: Stage::Kernel {
             max_total_threads: None,
+            work_group_size: None,
         },
         params: roles
             .into_iter()

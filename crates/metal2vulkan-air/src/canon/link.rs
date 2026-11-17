@@ -3,23 +3,37 @@
 //! A module calls a `[[visible]]` function it does not define through a stub declaration, which
 //! `!air.visible_function_references` maps to the function's name, the Metal linker's symbol. A
 //! pipeline supplies the functions it links (`MTLLinkedFunctions`) as [`LinkedModule`]s. This step,
-//! run right after entry selection, resolves every stub whose name one linked function has: that
+//! run right after entry selection, resolves every stub whose name one linked function a reference
+//! resolves to has ([`LinkedName::resolves_references`]: a function of `functions` or
+//! `privateFunctions`, never one only `binaryFunctions` lists, which only a table reaches, as Metal
+//! resolves no reference against it): that
 //! function is imported into the module with everything it reaches (its helpers, globals,
 //! constants, types, and declarations; its own stubs are resolved in turn, against the same linked
 //! functions), and every direct call to the stub is redirected to the imported definition, which
-//! inlining then takes like any other callee. A call cycle through linked functions is inlining's
-//! `Recursion`. Types map as LLVM's IR linker maps them: the definition's type pairs with the
-//! stub's structurally, identified structs by body whatever their names (the Metal compiler numbers
-//! a struct `%struct.T.153` in one module and `%struct.T` in another), and any other identified
-//! struct is the module's first struct of the same body.
+//! inlining then takes like any other callee. The reference resolves whatever the definition's
+//! type is, as Metal's does: where it differs from the stub's, the calls are redirected to an
+//! adapter of the stub's type that calls the definition with the arguments by position
+//! ([`super::adapt`]). A call cycle through linked functions is inlining's `Recursion`. Types map
+//! as LLVM's IR linker maps them: the definition's type pairs with the stub's structurally, by
+//! position (its return type and each parameter the two share), identified structs by body
+//! whatever their names (the Metal compiler numbers a struct `%struct.T.153` in one module and
+//! `%struct.T` in another), and any other identified struct is the module's first struct of the
+//! same body.
+//!
+//! A linked module's linkage signature (`!air.signature`) is read as the entry module's is: it
+//! describes how a closed module was produced, and the module's own code is what is imported. A
+//! function Metal's stitcher made (`newLibraryWithStitchedDescriptor:`) is such a module's visible
+//! function, its graph's nodes inlined into its body, and links like any other (a probe,
+//! `stitched_function_linked.m`: linked privately or not, it computes its graph).
 //!
 //! Nothing here refuses: a call to a stub may be dead once constants are bound, and Metal links
 //! what the specialized function calls. Each stub that is not resolved keeps a [`Stub`] state,
 //! and the post-check refuses a call to it that survives SCCP: `NeedsInput(LinkedFunction)` when
 //! no linked function has its name, and otherwise the reason the named function cannot resolve
-//! it (another function type, a function that is not visible, two linked functions of that name,
-//! another data layout, or a module feature linking does not implement yet: function constants,
-//! a static initializer, a linkage signature, or a global it only declares and does not import).
+//! it (a function that is not visible, two linked functions of that name, another data layout, a
+//! function constant an unspecialized function reaches, or a module feature linking does not
+//! implement yet: a type no adapter passes the arguments of, a linked-constants signature on a
+//! module that still declares constants, or a global it only declares and does not import).
 //!
 //! When the entry takes a visible-function table, every function the pipeline can place in one (a
 //! [`LinkedName`] with a table word) is imported the same way, after the stubs, as a [`Candidate`]
@@ -44,18 +58,23 @@
 //! import no library exports is refused at a surviving use, `NeedsInput(DynamicSymbol)`. A
 //! declaration no flat table names is no import: a call to it is still `Linking`, not implemented.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use crate::abi::{AirAbi, SamplerState, StaticSampler, VisibleSymbol};
-use crate::budget::Meter;
-use crate::error::{DiagName, Location};
+use crate::budget::{vec_bytes, Meter};
+use crate::error::{DiagName, Limit, Location};
 use crate::error::{Error, Feature, LinkProblem, MissingInput, RequestError, Unsupported};
 use crate::ir::{Arena, Callee, Const, ConstId, ConstTable, DataLayout, FuncId, Function, Global};
-use crate::ir::{GlobalId, Idx, InstKind, Linkage, Module, ModuleParts, Section, Symbols};
-use crate::ir::{TypeId, TypeTable, Visibility};
+use crate::ir::{GlobalId, Idx, InstKind, Linkage, Module, ModuleParts, Section, Sym, Symbols};
+use crate::ir::{Type, TypeId, TypeTable, Visibility};
 
+use super::adapt;
+use super::fc;
+use super::fold::Folder;
 use super::renumber::{bodies, inst_refs, isomorphism, Bodies, Renumber, Syms};
 use super::rewrite::{filled, invariant, scoped};
+use super::sccp::{self, FcState, Undefined};
+use super::static_init::{self, Unevaluable};
 use super::ConstValue;
 
 /// One module the pipeline links functions from, as canonicalization takes it: the functions
@@ -70,12 +89,22 @@ pub struct LinkedModule {
 }
 
 /// One function the pipeline links: the name it links it under (its Metal function name, which a
-/// visible-function reference names) and the function-constant values it was specialized with by
-/// index, or why those values do not apply to its module (refused only at a surviving call).
+/// visible-function reference names), the name of its definition in its module, and the
+/// function-constant values it was specialized with by index, or why those values do not apply to
+/// its module (refused only at a surviving call).
 #[derive(Clone, Debug)]
 pub struct LinkedName {
-    /// The Metal function name it links under.
+    /// The Metal function name it links under, which a visible-function reference names: its
+    /// specialized name where it was made with one (`MTLFunctionDescriptor.specializedName`), else
+    /// `function`.
     pub name: Box<[u8]>,
+    /// The name of its definition in its module, a visible function of the module.
+    pub function: Box<[u8]>,
+    /// The function was made specialized (`newFunctionWithName:constantValues:`, or
+    /// `newFunctionWithDescriptor:` with or without values), as against `newFunctionWithName:`:
+    /// a constant of its module without a value is then undefined rather than unresolved. A
+    /// function with constant values is specialized whatever this says.
+    pub specialized: bool,
     /// The function-constant values it was specialized with, by index, or why they do not apply
     /// to its module.
     pub constants: Result<BTreeMap<u32, ConstValue>, Error>,
@@ -83,6 +112,12 @@ pub struct LinkedName {
     /// (the translator's `FunctionHandle`), when the pipeline can place it in
     /// a visible-function table (it is in `functions` or `binary_functions`).
     pub handle: Option<u32>,
+    /// A visible-function reference to `name` resolves to this function: the pipeline lists it in
+    /// `functions` or `private_functions`. A function only `binary_functions` lists resolves none
+    /// (only a table reaches it), as Metal's creation fails over a reference only such a function
+    /// names ("unresolved visible function reference"), so it is never ambiguous beside a function
+    /// of its name that does.
+    pub resolves_references: bool,
 }
 
 /// A function a call through a visible-function table may call: its table word, its name
@@ -147,8 +182,15 @@ impl DynamicLinks {
 /// What linking made of one stub declaration.
 #[derive(Clone, Debug)]
 pub(super) enum Stub {
-    /// Its calls now call this imported definition.
-    Resolved(FuncId),
+    /// It resolves to the imported definition `def`, and its calls now call `call`: `def` where
+    /// the stub's type is the definition's, else an adapter of the stub's type that calls `def`
+    /// with the arguments by position ([`super::adapt`]).
+    Resolved {
+        /// The linked function's imported definition.
+        def: FuncId,
+        /// The function a call to the stub calls.
+        call: FuncId,
+    },
     /// No linked function has the name it references.
     Missing(VisibleSymbol),
     /// The linked function of its name cannot resolve it: a surviving call is refused with this.
@@ -183,11 +225,12 @@ impl Stubs {
         self.of.get(&f)
     }
 
-    /// The function a call to `f` calls: the definition a stub or a function import of that id
-    /// was resolved to, or `f`.
+    /// The function a call to `f` calls: what a call to a stub of that id calls (its definition,
+    /// or the definition's adapter), the definition a function import of that id was resolved to,
+    /// or `f`.
     pub fn target(&self, f: FuncId) -> FuncId {
         match self.of.get(&f) {
-            Some(Stub::Resolved(def)) => *def,
+            Some(Stub::Resolved { call, .. }) => *call,
             _ => self.dynamic.get(&f).copied().unwrap_or(f),
         }
     }
@@ -215,10 +258,11 @@ impl Stubs {
         })
     }
 
-    /// The linked definitions the stubs resolved to.
+    /// The linked definitions the stubs resolved to (not their adapters, which Metal inlines as
+    /// it inlines a function that is not visible).
     pub fn resolved(&self) -> impl Iterator<Item = FuncId> + '_ {
         self.of.values().filter_map(|s| match s {
-            Stub::Resolved(f) => Some(*f),
+            Stub::Resolved { def, .. } => Some(*def),
             Stub::Missing(_) | Stub::Refused(_) => None,
         })
     }
@@ -517,7 +561,7 @@ fn link_in(
                         Ok(def) => Ok(def),
                         Err(error) => Err(Unimported {
                             error,
-                            ty: source_type(l, &f.name, m)?.map(|t| (i, t)),
+                            ty: source_type(l, &f.function, m)?.map(|t| (i, t)),
                         }),
                     };
                     m.charge(std::mem::size_of::<Candidate>() + f.name.len())?;
@@ -538,7 +582,7 @@ fn link_in(
             l.functions
                 .iter()
                 .enumerate()
-                .filter(|(_, f)| *f.name == *symbol.0)
+                .filter(|(_, f)| f.resolves_references && *f.name == *symbol.0)
                 .map(move |(j, f)| ((i, j), l, f))
         });
         let state = match (named.next(), named.next()) {
@@ -577,23 +621,28 @@ fn link_in(
                 match def {
                     Err(refusal) => Stub::Refused(refusal),
                     Ok(def) => {
-                        let ty = |f: FuncId| {
+                        let decl = |f: FuncId| {
                             funcs
                                 .get(f)
-                                .map(|f| f.ty)
+                                .map(|f| (f.name, f.ty))
                                 .ok_or_else(|| invariant("a linked function out of range"))
                         };
-                        let (want, got) = (ty(stub)?, ty(def)?);
-                        let types = (&tables.types, &tables.types);
+                        let ((name, want), (_, got)) = (decl(stub)?, decl(def)?);
                         if want == got {
-                            Stub::Resolved(def)
-                        } else if isomorphism(types, (got, want), |_| None, m)?.is_some() {
-                            // Another reference to a definition already imported for a reference
-                            // of a different but isomorphic type (two identified structs of one
-                            // body): the call would need the value converted between them.
-                            Stub::Refused(not_implemented(&symbol.0, "type"))
+                            Stub::Resolved { def, call: def }
                         } else {
-                            Stub::Refused(link_problem(&symbol.0, LinkProblem::Signature))
+                            // Metal passes the arguments by position whatever the two types are.
+                            // A difference no adapter passes (a pointer for a value, another
+                            // address space, an aggregate of another type, two identified
+                            // structs of one body) is not implemented.
+                            let interned = (&mut tables.types, &mut tables.consts);
+                            match adapt::adapter((name, want), (def, got), interned, m)? {
+                                Some(adapter) => Stub::Resolved {
+                                    def,
+                                    call: funcs.push(adapter, m)?,
+                                },
+                                None => Stub::Refused(not_implemented(&symbol.0, "type")),
+                            }
                         }
                     }
                 }
@@ -674,13 +723,14 @@ fn unimported_samplers(
                     src_imports.insert(items)
                 }
             };
-            let plan = match plan(code, f, src_imports, layout, m, held)? {
-                Ok(plan) => plan,
+            let (source, plan) = match plan(code, f, src_imports, layout, m, held)? {
+                Ok(planned) => planned,
                 Err(_) => {
                     unknown = true;
                     continue;
                 }
             };
+            source.release(m);
             let mut states = Vec::new();
             for s in &code.abi.static_samplers {
                 m.tick(1)?;
@@ -746,18 +796,20 @@ fn import_linked(
     };
     let src_imports = imports(code.module.parts(), m)?;
     *held += src_imports.len() * std::mem::size_of::<Item>();
-    let plan = match plan(code, f, &src_imports, brought.layout, m, held)? {
+    let (source, plan) = match plan(code, f, &src_imports, brought.layout, m, held)? {
         Err(refusal) => return Ok((Err(refusal), tables)),
-        Ok(plan) => plan,
+        Ok(planned) => planned,
     };
-    let (root, t) = bring(
-        (code, &plan, want, None, &src_imports),
+    let brought = bring(
+        (source.code(), &plan, want, None, &src_imports),
         tables,
         dest,
         brought,
         m,
         held,
-    )?;
+    );
+    source.release(m);
+    let (root, t) = brought?;
     match root {
         Item::Func(def) => Ok((Ok(def), t)),
         Item::Global(_) => Err(invariant("a linked function imported as a variable")),
@@ -772,62 +824,73 @@ struct Plan {
     keep_f: Vec<bool>,
 }
 
-/// Decide the import of `f` from `l` (whose dynamic-library imports are `imports`): `Ok(Err(refusal))`
-/// when it cannot be linked (the stub's state), an outer error for a budget stop. The
-/// destination ids are assigned by [`import`].
-fn plan(
-    l: &LinkedCode,
+/// The code an import of a linked function reads: its module as decoded, or a copy of it
+/// specialized with the function's values ([`specialize`]), with the ledger bytes the copy holds.
+enum Source<'c> {
+    Module(&'c LinkedCode),
+    Specialized(Box<LinkedCode>, usize),
+}
+
+impl Source<'_> {
+    fn code(&self) -> &LinkedCode {
+        match self {
+            Source::Module(code) => code,
+            Source::Specialized(code, _) => code,
+        }
+    }
+
+    /// Drop the source, returning a specialized copy's bytes to the ledger.
+    fn release(self, m: &mut Meter) {
+        if let Source::Specialized(code, bytes) = self {
+            drop(code);
+            m.release(bytes);
+        }
+    }
+}
+
+/// `e` as a linked function's refusal (`Ok(Err)`), raised only at a surviving call; a budget stop,
+/// a cancellation, an attempt-wide cap or an internal error returns at once.
+fn refusal<T>(e: Error) -> Result<Result<T, Error>, Error> {
+    match e {
+        Error::Budget(_)
+        | Error::Cancelled
+        | Error::Internal(_)
+        | Error::LimitExceeded(Limit::WorkUnits | Limit::LedgerBytes) => Err(e),
+        e => Ok(Err(e)),
+    }
+}
+
+/// Decide the import of `f` from `l` (whose dynamic-library imports are `imports`): the code it
+/// imports from and what it brings, `Ok(Err(refusal))` when it cannot be linked (the stub's
+/// state), an outer error for a budget stop. Its definition is the visible function of `l` named
+/// `f.function`, whatever name it links under. A linkage signature refuses only where it has no
+/// reading (`unread_signature`). A module that declares function constants or defines a static
+/// initializer is specialized for `f` first ([`specialize`]). The destination ids are assigned by
+/// [`import`].
+fn plan<'c>(
+    l: &'c LinkedCode,
     f: &LinkedName,
     imports: &[Item],
     layout: &DataLayout,
     m: &mut Meter,
     held: &mut usize,
-) -> Result<Result<Plan, Error>, Error> {
+) -> Result<Result<(Source<'c>, Plan), Error>, Error> {
     let name = &*f.name;
-    if l.abi.linkage_signature.is_some() {
+    if super::unread_signature(&l.abi) {
         return Ok(Err(not_implemented(name, "air.signature")));
-    }
-    // Metal links a function from a module that declares function constants: what it refuses is
-    // an UNRESOLVED constant the linked code reaches. Measured on an Apple M3 Max under macOS
-    // 27.0.1, one compute pipeline per shape, the visible function in
-    // `MTLLinkedFunctions.functions` and the linked module declaring `[[function_constant(0)]]`:
-    //
-    //   the visible function does not read it, `newFunctionWithName:`                created, ran
-    //   the visible function does not read it, `newFunctionWithName:constantValues:`  created, ran
-    //   the visible function reads it, `newFunctionWithName:`                         refused,
-    //       "error: cannot lower module with unresolved function constants"
-    //   the visible function reads it, `newFunctionWithName:constantValues:`          created, ran
-    //
-    // A specialized `MTLFunction` therefore resolves the module's constants before linking, and a
-    // constant nothing the import reaches reads costs nothing. This refuses on the module
-    // declaring any constant at all, which is wider than Metal in three of those four shapes. The
-    // values are already here (`LinkedName::constants`, the specialized function's); closing the
-    // gap means binding them and folding the linked module before the import, then refusing only
-    // a constant `reach` keeps with no value bound.
-    if !l.abi.function_constants.is_empty() {
-        return Ok(Err(not_implemented(name, "air.function_constants")));
     }
     let constants = match &f.constants {
         Ok(c) => c,
         Err(e) => return Ok(Err(e.clone())),
     };
-    if let Some(&index) = constants.keys().next() {
-        // The module declares no constant (the check above), so no index is declared.
-        return Ok(Err(Error::InvalidRequest(
-            RequestError::FunctionConstantIndex { index },
-        )));
-    }
     if l.module.data_layout() != layout {
         return Ok(Err(link_problem(name, LinkProblem::DataLayout)));
-    }
-    if static_initializer(l) {
-        return Ok(Err(not_implemented(name, "air.static_init")));
     }
     let visible = l.abi.visible_functions.iter().find(|v| {
         l.module
             .func(v.func)
             .and_then(|f| l.module.symbols().get(f.name))
-            == Some(name)
+            == Some(&*f.function)
     });
     let Some(func) = visible.map(|v| v.func) else {
         return Ok(Err(link_problem(name, LinkProblem::NotVisible)));
@@ -835,10 +898,20 @@ fn plan(
     if l.module.func(func).is_none_or(|f| f.body.is_none()) {
         return Ok(Err(link_problem(name, LinkProblem::NotVisible)));
     }
-    reach(l, Item::Func(func), imports, m, held)
+    if l.abi.function_constants.is_empty() && !static_initializer(l) {
+        if let Some(&index) = constants.keys().next() {
+            // The module declares no constant, so no index is declared.
+            return Ok(Err(Error::InvalidRequest(
+                RequestError::FunctionConstantIndex { index },
+            )));
+        }
+        let plan = reach(l.module.parts(), Item::Func(func), imports, m, held)?;
+        return Ok(plan.map(|plan| (Source::Module(l), plan)));
+    }
+    specialize((l, f, constants, func), imports, m, held)
 }
 
-/// Whether `l` defines a static initializer, which linking does not run.
+/// Whether `l` defines a static initializer.
 fn static_initializer(l: &LinkedCode) -> bool {
     l.module
         .parts()
@@ -847,18 +920,218 @@ fn static_initializer(l: &LinkedCode) -> bool {
         .any(|f| f.section == Some(Section::StaticInit) && f.body.is_some())
 }
 
-/// Mark what `root` of `l` reaches: the functions it calls or takes the address of,
+/// The import of `f`, the visible function `func` of `l`, from a copy of `l` specialized as Metal
+/// specializes an `MTLFunction` before it links it: `constants` bound to the module's function
+/// constants and its static initializer run over them, which is where the compiler copies each
+/// constant into the global its functions read. Measured on an Apple M3 Max under macOS 27.0.1
+/// (`linked_function_specialized_name.m`), a visible function reading `[[function_constant(0)]]`
+/// through that copy, one compute pipeline linking it per shape:
+///
+/// - made specialized ([`LinkedName::specialized`]: `newFunctionWithName:constantValues:` or
+///   `newFunctionWithDescriptor:`), with the value: the pipeline computes with it; without it
+///   (empty values, or a descriptor with none): the pipeline is made, and the constant's reads are
+///   undefined (the kernel's store of the result did not land);
+/// - made with `newFunctionWithName:`: the creation fails, "cannot lower module with unresolved
+///   function constants", even where only an `is_function_constant_defined` guard reaches the
+///   constant; a function that reaches no constant links.
+///
+/// So a specialized function's copy has what the values decide folded (SCCP over each function
+/// the import reaches), a constant without a value reading as the entry's undefined constants
+/// read; an unspecialized function's copy folds nothing, and a constant the import reaches
+/// without a value, or a global the static initializer computed from one, refuses it
+/// ([`LinkProblem::UnresolvedConstant`], the lowest index). The copy's ids are the module's, so
+/// the plan's marks name the module's globals and functions too.
+fn specialize<'c>(
+    (l, f, constants, func): (&LinkedCode, &LinkedName, &BTreeMap<u32, ConstValue>, FuncId),
+    imports: &[Item],
+    m: &mut Meter,
+    held: &mut usize,
+) -> Result<Result<(Source<'c>, Plan), Error>, Error> {
+    let (pending, mut fcs) = match fc::check(&l.module, &l.abi, constants, m) {
+        Ok(checked) => checked,
+        Err(e) => return refusal(e),
+    };
+    let mut charged = copy_bytes(l.module.parts());
+    m.charge(charged)?;
+    let made = specialized_copy(
+        (l, f, &pending, &mut fcs),
+        func,
+        imports,
+        &mut charged,
+        m,
+        held,
+    );
+    m.release(vec_bytes(&pending) + fcs.len() * std::mem::size_of::<(GlobalId, FcState)>() * 2);
+    match made {
+        Ok(Ok((code, plan))) => Ok(Ok((Source::Specialized(Box::new(code), charged), plan))),
+        Ok(Err(refused)) => {
+            m.release(charged);
+            Ok(Err(refused))
+        }
+        Err(e) => {
+            m.release(charged);
+            Err(e)
+        }
+    }
+}
+
+/// [`specialize`]'s copy of `l` and the plan of `f`'s import from it. The bodies SCCP builds are
+/// added to `charged`.
+fn specialized_copy(
+    (l, f, pending, fcs): (
+        &LinkedCode,
+        &LinkedName,
+        &[fc::Pending<'_>],
+        &mut HashMap<GlobalId, FcState>,
+    ),
+    func: FuncId,
+    imports: &[Item],
+    charged: &mut usize,
+    m: &mut Meter,
+    held: &mut usize,
+) -> Result<Result<(LinkedCode, Plan), Error>, Error> {
+    let mut parts = l.module.parts().clone();
+    if let Err(e) = fc::bind(
+        &parts.types,
+        &mut parts.consts,
+        &mut parts.globals,
+        pending,
+        m,
+    ) {
+        return refusal(e);
+    }
+    let evaluated = match static_init::evaluate(&mut parts, fcs, Unevaluable::Refuse, m) {
+        Ok(evaluated) => evaluated,
+        Err(e) => return refusal(e),
+    };
+    for (g, index) in evaluated.derived {
+        m.charge(std::mem::size_of::<(GlobalId, FcState)>() * 2)?;
+        fcs.insert(
+            g,
+            FcState {
+                index,
+                supplied: false,
+                decl: false,
+            },
+        );
+    }
+    let root = Item::Func(func);
+    let plan = match reach(&parts, root, imports, m, held)? {
+        Ok(plan) => plan,
+        Err(refused) => return Ok(Err(refused)),
+    };
+    // Values come only with a specialized function.
+    let plan = if f.specialized || !pending.is_empty() {
+        for (k, &kept) in plan.keep_f.iter().enumerate() {
+            m.tick(1)?;
+            if !kept {
+                continue;
+            }
+            let id = FuncId::from_index(k).ok_or_else(|| invariant("ids"))?;
+            let ModuleParts {
+                types,
+                consts,
+                globals,
+                funcs,
+                ..
+            } = &mut parts;
+            let Some(body) = funcs.get(id).and_then(|f| f.body.as_ref()) else {
+                continue;
+            };
+            let mut cx = sccp::Context {
+                folder: Folder {
+                    types,
+                    consts,
+                    held: 0,
+                },
+                globals,
+                fcs,
+                name: diag(&f.name),
+            };
+            let solved = match sccp::run(body, &mut cx, m) {
+                Ok(solved) => solved,
+                Err(e) => return refusal(e),
+            };
+            *charged += solved.body.footprint();
+            if let Some(func) = funcs.get_mut(id) {
+                func.body = Some(solved.body);
+            }
+        }
+        match reach(&parts, root, imports, m, held)? {
+            Ok(plan) => plan,
+            Err(refused) => return Ok(Err(refused)),
+        }
+    } else {
+        let unresolved = plan
+            .keep_g
+            .iter()
+            .enumerate()
+            .filter(|&(_, &kept)| kept)
+            .filter_map(|(k, _)| GlobalId::from_index(k).and_then(|g| fcs.get(&g)))
+            .filter(|state| !state.supplied)
+            .filter_map(|state| match state.index {
+                Undefined::Constant(index) => Some(index),
+                Undefined::Ir => None,
+            })
+            .min();
+        if let Some(index) = unresolved {
+            return Ok(Err(link_problem(
+                &f.name,
+                LinkProblem::UnresolvedConstant { index },
+            )));
+        }
+        plan
+    };
+    let module = match Module::new(parts, m) {
+        Ok(module) => module,
+        Err(e) => return refusal(e),
+    };
+    let abi = l.abi.clone();
+    Ok(Ok((LinkedCode { module, abi }, plan)))
+}
+
+/// The ledger bytes a copy of `parts` holds: its function bodies
+/// ([`crate::ir::Body::footprint`]), its arenas, and its interned constants, types and strings,
+/// each stored twice (in its arena and as its lookup key).
+fn copy_bytes(parts: &ModuleParts) -> usize {
+    let bodies = parts
+        .funcs
+        .values()
+        .filter_map(|f| f.body.as_ref())
+        .fold(0usize, |n, b| n.saturating_add(b.footprint()));
+    let consts = parts.consts.iter().fold(0usize, |n, (_, c)| {
+        n.saturating_add(
+            std::mem::size_of::<crate::ir::Constant>() + std::mem::size_of_val(c.value.children()),
+        )
+    });
+    let strings = (0..parts.symbols.len())
+        .filter_map(Sym::from_index)
+        .filter_map(|s| parts.symbols.get(s))
+        .fold(0usize, |n, b| n.saturating_add(b.len()));
+    let types = parts
+        .types
+        .len()
+        .saturating_mul(std::mem::size_of::<Type>() * 2 + 1);
+    bodies
+        .saturating_add(parts.funcs.capacity_bytes())
+        .saturating_add(parts.globals.capacity_bytes())
+        .saturating_add(parts.metadata.capacity_bytes())
+        .saturating_add(consts.saturating_mul(2))
+        .saturating_add(strings.saturating_mul(2))
+        .saturating_add(types)
+}
+
+/// Mark what `root` of the module `parts` reaches: the functions it calls or takes the address of,
 /// transitively, and the constants and globals their bodies and initializers name. A global the
 /// module only declares and does not import (`imports`) is refused (`Ok(Err)`): it is defined
 /// nowhere linking reads.
 fn reach(
-    l: &LinkedCode,
+    parts: &ModuleParts,
     root: Item,
     imports: &[Item],
     m: &mut Meter,
     held: &mut usize,
 ) -> Result<Result<Plan, Error>, Error> {
-    let parts = l.module.parts();
     let mut keep_f = filled(m, held, parts.funcs.len(), false)?;
     let mut keep_g = filled(m, held, parts.globals.len(), false)?;
     let mut keep_c = filled(m, held, parts.consts.len(), false)?;
@@ -912,7 +1185,7 @@ fn reach(
                             // Any other global the module only declares is defined nowhere
                             // linking reads.
                             Some((None, gname)) => {
-                                let gname = l.module.symbols().get(gname).unwrap_or(b"?");
+                                let gname = parts.symbols.get(gname).unwrap_or(b"?");
                                 return Ok(Err(not_implemented(gname, "global")));
                             }
                             None => return Err(invariant("global out of range")),
@@ -1137,17 +1410,34 @@ fn bring(
     )?;
     let parts = code.module.parts();
     // The root's type is the reference's when they are isomorphic (the check that follows the
-    // import compares them), and a variable's definition takes its declaration's type.
+    // import compares them), and a variable's definition takes its declaration's type. A
+    // function's pairs by position, as a call passes its arguments: its return type and each
+    // parameter the reference shares with it take the reference's types where they are
+    // isomorphic, whatever the rest of the two types are.
     let mut pairs = Vec::new();
     if let Some(want) = want {
         let root = match plan.root {
             Item::Func(f) => parts.funcs.get(f).map(|f| f.ty),
             Item::Global(g) => parts.globals.get(g).map(|g| g.value_ty),
         };
-        pairs.push((
-            root.ok_or_else(|| invariant("the root out of range"))?,
-            want,
-        ));
+        let root = root.ok_or_else(|| invariant("the root out of range"))?;
+        match (parts.types.get(root), tables.types.get(want)) {
+            (
+                Some(Type::Function { ret, params, .. }),
+                Some(Type::Function {
+                    ret: want_ret,
+                    params: want_params,
+                    ..
+                }),
+            ) => {
+                let n = 1 + params.len().min(want_params.len());
+                m.charge(n * std::mem::size_of::<(TypeId, TypeId)>())?;
+                *held += n * std::mem::size_of::<(TypeId, TypeId)>();
+                pairs.push((*ret, *want_ret));
+                pairs.extend(params.iter().copied().zip(want_params.iter().copied()));
+            }
+            _ => pairs.push((root, want)),
+        }
     }
     for (k, place) in places.globals.iter().enumerate() {
         if let Place::Into(d) = place {
@@ -1657,7 +1947,7 @@ fn resolve(
                     let code = libs.code(i)?;
                     let src_imports = imports(code.module.parts(), m)?;
                     *held += src_imports.len() * std::mem::size_of::<Item>();
-                    let plan = match reach(code, def, &src_imports, m, held)? {
+                    let plan = match reach(code.module.parts(), def, &src_imports, m, held)? {
                         Ok(plan) => plan,
                         Err(e) => return refuse_import(stubs, item, e, tables, m),
                     };
@@ -1714,7 +2004,7 @@ fn resolve(
             }
             let src_imports = imports(parts, m)?;
             *held += src_imports.len() * std::mem::size_of::<Item>();
-            let plan = match reach(code, def, &src_imports, m, held)? {
+            let plan = match reach(code.module.parts(), def, &src_imports, m, held)? {
                 Ok(plan) => plan,
                 Err(e) => return refuse_import(stubs, item, e, tables, m),
             };
@@ -1764,7 +2054,7 @@ fn redirect(
     stubs: &Stubs,
     m: &mut Meter,
 ) -> Result<(), Error> {
-    let resolves = |s: &Stub| matches!(s, Stub::Resolved(_));
+    let resolves = |s: &Stub| matches!(s, Stub::Resolved { .. });
     if !stubs.of.values().any(resolves) && stubs.dynamic.is_empty() {
         return Ok(());
     }

@@ -16,7 +16,9 @@
 //! - **Descriptor sets and push constants.** Kept while they are bound or pushed with the same
 //!   `VkPipelineLayout` (the same layout is compatible for every set and for the push constants);
 //!   a bind or push with another layout forgets what the earlier one held. A draw's push
-//!   constants are left out only where they are the same writes, in order, as the last ones.
+//!   constants carry, of the same writes in order as the last push's (each write's stages, offset
+//!   and length), only those whose bytes differ, and each later one that overlaps one of those
+//!   for a stage both name; of other writes, every one ([`Bound::pushes`]).
 //! - **A pushed set 0** (`pipeline::objects::pushes_set_zero`). Kept while pushed with the same
 //!   layout: a push of the same bindings and elements, in order, carries only the writes that
 //!   differ from those set 0 holds (none: left out), as the descriptors it does not write keep
@@ -63,6 +65,13 @@
 //! Only draws record these commands into the command buffer; its other commands (barriers and
 //! queries) disturb none of them. A record follows one command buffer: a draw into another
 //! begins it again, empty.
+//!
+//! A record counts the recordings recorded through it and its beginnings again
+//! ([`Bound::records`]): where the count is what it was just after a draw's recording, nothing
+//! was recorded into the command buffer through it since, so it holds that draw's pipeline and
+//! dynamic states as the draw set them. A draw rebound after it, of the same pipeline and states,
+//! then compares none of the states a value here holds (`render/draw_again/rebound.rs`), each of
+//! whose compares would answer that it holds them.
 
 use ash::vk;
 
@@ -101,11 +110,22 @@ impl std::ops::AddAssign for Recorded {
 }
 
 impl Recorded {
+    /// Whether the draw recorded no state command and pushed no write: its Vulkan draw alone.
+    pub(super) fn draw_alone(&self) -> bool {
+        self.states == 0 && self.writes_pushed == 0 && self.equal_shapes == EqualShapes::default()
+    }
+
     /// Add them to `counts` (`WorkCounts::draw_states_recorded`, `set_zero_writes_pushed`,
     /// `set_zero_equal_shape_switches` and kin).
-    pub(super) fn count(self, counts: &crate::work_counts::Counters) {
+    pub(super) fn count(self, counts: crate::work_counts::Counting<'_>) {
         counts.draw_states_recorded(self.states);
         counts.set_zero_writes_pushed(self.writes_pushed);
+        self.count_equal_shapes(counts);
+    }
+
+    /// Add its pushes that carried set 0 whole to `counts` (`set_zero_equal_shape_switches` and
+    /// kin): what [`count`](Self::count) adds but its states and writes pushed.
+    pub(super) fn count_equal_shapes(self, counts: crate::work_counts::Counting<'_>) {
         let EqualShapes {
             switches,
             carried,
@@ -139,10 +159,17 @@ pub(super) struct Bound {
     /// The writes the last push that set 0 held the bindings of carried ([`Bound::pushed_set`]).
     changed: Vec<SetWrite>,
     /// The layout the last push constants were pushed with, and their writes: each write's
-    /// stages, offset and length, its bytes one after another in `push_bytes`.
+    /// stages, offset and length, and the later writes that overlap it for a stage both name, a
+    /// bit each (what a push of it pushes again after it, [`Bound::pushes`], a function of the
+    /// writes' stages, offsets and lengths alone), its bytes one after another in `push_bytes`.
+    /// The overlaps lie beside the shapes, so the record allocates no list for them.
     push_layout: vk::PipelineLayout,
-    pushes: Vec<(vk::ShaderStageFlags, u32, usize)>,
+    pushes: Vec<(vk::ShaderStageFlags, u32, usize, u64)>,
     push_bytes: Vec<u8>,
+    /// `push_bytes` before the last push (builds with debug assertions: [`check_pushed`]), its
+    /// storage kept from push to push, so a draw allocates as many times as without them.
+    #[cfg(debug_assertions)]
+    push_before: Vec<u8>,
     /// Each vertex buffer binding: its buffer, offset and, bound with the strides dynamic, its
     /// stride.
     vertex: Vec<(u32, vk::Buffer, u64, Option<u64>)>,
@@ -151,6 +178,23 @@ pub(super) struct Bound {
     /// The dynamic states set that still hold, and their values.
     set: States,
     values: Option<Values>,
+    /// The recordings recorded through it and its beginnings again (the module docs), from its
+    /// first; only ever counted up.
+    records: u64,
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// The compares of a dynamic state's value with a record's this thread made
+    /// ([`Bound::dynamic`]), in builds with debug assertions.
+    static DYNAMIC_COMPARES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many dynamic states' values this thread compared with a record's so far
+/// ([`Bound::dynamic`]).
+#[cfg(all(test, debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) fn dynamic_compares() -> u64 {
+    DYNAMIC_COMPARES.with(std::cell::Cell::get)
 }
 
 /// Dynamic states whose values [`Values`] holds, a bit each: a draw tests and notes each of its
@@ -220,6 +264,68 @@ pub(super) struct Now<'a> {
 
 // The checks a draw makes here, at every draw, are inline: they join `Recording::record` in
 // whichever codegen unit it lands in, as the state they test is matched there too.
+/// Which writes of a draw's push constants its push carries ([`Bound::pushes`]): by index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Pushed(u64);
+
+impl Pushed {
+    /// Every write.
+    const ALL: Pushed = Pushed(u64::MAX);
+    /// The most writes a push leaves any out of: of more, every one is pushed.
+    const MOST: usize = 64;
+
+    /// Whether the push carries any write.
+    pub(super) fn any(self) -> bool {
+        self.0 != 0
+    }
+
+    /// Whether the push carries write `at`.
+    pub(super) fn has(self, at: usize) -> bool {
+        self == Pushed::ALL || self.0 >> at & 1 != 0
+    }
+}
+
+/// That pushing `pushed` of `writes` over push constants that hold the last push's writes, whose
+/// bytes were `before` (one after another, each write's stages, offset and length those of
+/// `writes`), leaves every stage reading what pushing every write leaves it: at each byte a write
+/// sets for a stage, the last pushed write that sets it, else the last push's, is the last write
+/// that sets it. Nothing allocated.
+#[cfg(debug_assertions)]
+fn check_pushed(writes: &[PushWrite], before: &[u8], pushed: Pushed) {
+    let sets = |write: &PushWrite, bit: u32, byte: usize| {
+        let start = write.1 as usize;
+        write.0.as_raw() >> bit & 1 != 0 && start <= byte && byte < start + write.2.len()
+    };
+    for write in writes {
+        for bit in (0..32).filter(|bit| write.0.as_raw() >> bit & 1 != 0) {
+            for byte in write.1 as usize..write.1 as usize + write.2.len() {
+                let last = (writes.iter().rev()).find(|w| sets(w, bit, byte));
+                let every = last.map(|w| w.2[byte - w.1 as usize]);
+                let carried = match (writes.iter().enumerate().rev())
+                    .find(|&(at, w)| pushed.has(at) && sets(w, bit, byte))
+                {
+                    Some((_, w)) => Some(w.2[byte - w.1 as usize]),
+                    None => {
+                        let (mut at, mut held) = (0, None);
+                        for w in writes {
+                            if sets(w, bit, byte) {
+                                held = Some(before[at + byte - w.1 as usize]);
+                            }
+                            at += w.2.len();
+                        }
+                        held
+                    }
+                };
+                assert_eq!(
+                    every, carried,
+                    "a push of some of a draw's push-constant writes leaves stage bit {bit} \
+                     reading another byte {byte} than a push of all of them"
+                );
+            }
+        }
+    }
+}
+
 impl Bound {
     /// Follow `command_buffer`: where the record is another's, it begins again, empty.
     #[inline]
@@ -227,9 +333,29 @@ impl Bound {
         if self.command_buffer != command_buffer {
             *self = Bound {
                 command_buffer,
+                records: self.records + 1,
                 ..Bound::default()
             };
         }
+    }
+
+    /// The recordings recorded through it and its beginnings again so far (the module docs).
+    #[inline]
+    pub(super) fn records(&self) -> u64 {
+        self.records
+    }
+
+    /// Count a recording recorded through it (`render::Recording::record`).
+    #[inline]
+    pub(super) fn recorded(&mut self) {
+        self.records += 1;
+    }
+
+    /// Whether a value here holds dynamic `state` ([`dynamic`](Self::dynamic) compares it), else
+    /// a draw that makes it dynamic sets it at every draw.
+    #[inline]
+    pub(super) fn holds_value(state: vk::DynamicState) -> bool {
+        States::bit(state).is_some()
     }
 
     /// Whether binding `pipeline`, which holds the dynamic states `dynamic` (the module docs),
@@ -256,6 +382,25 @@ impl Bound {
         true
     }
 
+    /// Whether the record holds `sets` bound from set number `first` with `layout`, set 0 with the
+    /// dynamic offsets `offsets`: binding them again sets nothing ([`sets`](Self::sets)).
+    #[inline]
+    pub(super) fn holds_sets(
+        &self,
+        layout: vk::PipelineLayout,
+        first: u32,
+        (sets, offsets): (&[vk::DescriptorSet], &[u32]),
+    ) -> bool {
+        let first = first as usize;
+        let held = |at: usize| self.sets.get(at).copied().flatten();
+        self.sets_layout == layout
+            && sets
+                .iter()
+                .enumerate()
+                .all(|(i, &set)| held(first + i) == Some(set))
+            && (first > 0 || self.offsets == offsets)
+    }
+
     /// Whether binding `sets` from set number `first` with `layout` and the dynamic offsets
     /// `offsets` sets anything: noted as bound where it does. A set holds its dynamic offsets as
     /// it was bound with them, so set 0 bound again with other offsets sets them. Only set 0
@@ -267,17 +412,10 @@ impl Bound {
         first: u32,
         (sets, offsets): (&[vk::DescriptorSet], &[u32]),
     ) -> bool {
-        let first = first as usize;
-        let held = |at: usize| self.sets.get(at).copied().flatten();
-        if self.sets_layout == layout
-            && sets
-                .iter()
-                .enumerate()
-                .all(|(i, &set)| held(first + i) == Some(set))
-            && (first > 0 || self.offsets == offsets)
-        {
+        if self.holds_sets(layout, first, (sets, offsets)) {
             return false;
         }
+        let first = first as usize;
         if first == 0 {
             self.offsets.clear();
             self.offsets.extend_from_slice(offsets);
@@ -381,33 +519,90 @@ impl Bound {
         Some(changed.max(u64::from(self.forgotten)))
     }
 
-    /// Whether pushing `writes` with `layout` sets anything: noted as pushed where it does.
+    /// Which of `writes`, a draw's push-constant writes with `layout`, its push carries: noted as
+    /// pushed. All of them where the last push was of another layout or of other writes (their
+    /// count, or a write's stages, offset or length); else those whose bytes differ from the last
+    /// push's, and each write after one of those that shares a stage and a byte with it, which a
+    /// push of all of them would leave its own bytes over. Push constants are updated
+    /// incrementally (`vkCmdPushConstants`: "causing shader stages in stageFlags to read the new
+    /// data from pValues for push constants modified by this command, while still reading the
+    /// previous data for push constants not modified by this command"), so the stages read what
+    /// a push of every write would leave them (checked in builds with debug assertions).
     #[inline]
-    pub(super) fn pushes(&mut self, layout: vk::PipelineLayout, writes: &[PushWrite]) -> bool {
-        let same = self.push_layout == layout
+    pub(super) fn pushes(&mut self, layout: vk::PipelineLayout, writes: &[PushWrite]) -> Pushed {
+        let same_writes = self.push_layout == layout
             && self.pushes.len() == writes.len()
-            && self
-                .pushes
-                .iter()
-                .zip(writes)
-                .all(|(&(stages, offset, length), write)| {
-                    (stages, offset, length) == (write.0, write.1, write.2.len())
-                })
-            && writes
-                .iter()
-                .flat_map(|write| write.2.iter())
-                .eq(self.push_bytes.iter());
-        if same {
-            return false;
+            && writes.len() <= Pushed::MOST
+            && (self.pushes.iter().zip(writes)).all(|(&(stages, offset, length, _), write)| {
+                (stages, offset, length) == (write.0, write.1, write.2.len())
+            });
+        // A later write a changed one overlaps for a stage both name, pushed again after it.
+        let overlaps = |a: &PushWrite, b: &PushWrite| {
+            let (a_end, b_end) = (a.1 as usize + a.2.len(), b.1 as usize + b.2.len());
+            a.0.intersects(b.0) && (a.1 as usize) < b_end && (b.1 as usize) < a_end
+        };
+        if !same_writes {
+            self.push_layout = layout;
+            self.pushes.clear();
+            self.push_bytes.clear();
+            for (i, write) in writes.iter().enumerate() {
+                let (stages, offset, bytes) = write;
+                let later = (writes.iter().enumerate().skip(i + 1))
+                    .filter(|(_, later)| overlaps(write, later))
+                    .fold(0u64, |bits, (j, _)| {
+                        bits | 1u64.checked_shl(j as u32).unwrap_or(0)
+                    });
+                self.pushes.push((*stages, *offset, bytes.len(), later));
+                self.push_bytes.extend_from_slice(bytes);
+            }
+            return Pushed::ALL;
         }
-        self.push_layout = layout;
-        self.pushes.clear();
-        self.push_bytes.clear();
-        for (stages, offset, bytes) in writes {
-            self.pushes.push((*stages, *offset, bytes.len()));
-            self.push_bytes.extend_from_slice(bytes);
+        #[cfg(debug_assertions)]
+        {
+            self.push_before.clear();
+            self.push_before.extend_from_slice(&self.push_bytes);
         }
-        true
+        let mut changed = 0u64;
+        let mut at = 0;
+        for (i, write) in writes.iter().enumerate() {
+            let held = &mut self.push_bytes[at..at + write.2.len()];
+            if *held != write.2[..] {
+                held.copy_from_slice(&write.2);
+                changed |= 1 << i;
+            }
+            at += write.2.len();
+        }
+        // Each pushed write's later overlapping ones, as the shapes held say, in order: a write
+        // pushed again pushes those after it again too.
+        let (mut pushed, mut rest) = (changed, changed);
+        while rest != 0 {
+            let i = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            let again = self.pushes.get(i).map_or(0, |held| held.3) & !pushed;
+            pushed |= again;
+            rest |= again;
+        }
+        #[cfg(debug_assertions)]
+        {
+            let mut every = changed;
+            for i in 0..writes.len() {
+                if every >> i & 1 == 0 {
+                    continue;
+                }
+                for (j, later) in writes.iter().enumerate().skip(i + 1) {
+                    if overlaps(&writes[i], later) {
+                        every |= 1 << j;
+                    }
+                }
+            }
+            assert_eq!(
+                pushed, every,
+                "a push's held overlaps differ from its writes'"
+            );
+        }
+        #[cfg(debug_assertions)]
+        check_pushed(writes, &self.push_before, Pushed(pushed));
+        Pushed(pushed)
     }
 
     /// Whether binding `buffer` at `offset` to vertex buffer `binding` (with `stride`, where the
@@ -457,6 +652,8 @@ impl Bound {
         let Some(bit) = States::bit(state) else {
             return true;
         };
+        #[cfg(debug_assertions)]
+        DYNAMIC_COMPARES.with(|compares| compares.set(compares.get() + 1));
         let values = self.values.get_or_insert_with(|| Values::of(now));
         let held = self.set.0 & bit != 0;
         if held && values.holds(state, now) == Some(true) {
@@ -621,7 +818,7 @@ fn rect(rect: &vk::Rect2D) -> [i64; 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::Bound;
+    use super::{Bound, Pushed};
     use crate::binding::{Info, SetWrite};
     use ash::vk::{self, Handle};
 
@@ -637,6 +834,78 @@ mod tests {
                 range: 64,
             }),
         }
+    }
+
+    /// A record counts the recordings through it and its beginnings again: following the
+    /// command buffer it follows counts nothing, following another begins it again, empty, and
+    /// counts that.
+    #[test]
+    fn a_record_counts_its_recordings_and_its_beginnings_again() {
+        let mut bound = Bound::default();
+        assert_eq!(bound.records(), 0);
+        bound.follow(vk::CommandBuffer::from_raw(2));
+        assert_eq!(bound.records(), 1);
+        assert!(bound.pipeline(vk::Pipeline::from_raw(3), &[], false));
+        bound.recorded();
+        bound.follow(vk::CommandBuffer::from_raw(2));
+        assert_eq!(bound.records(), 2);
+        assert!(!bound.pipeline(vk::Pipeline::from_raw(3), &[], false));
+        bound.follow(vk::CommandBuffer::from_raw(4));
+        assert_eq!(bound.records(), 3);
+        assert!(
+            bound.pipeline(vk::Pipeline::from_raw(3), &[], false),
+            "begun again"
+        );
+    }
+
+    /// A push of the same writes as the last one carries those whose bytes changed, and each
+    /// later one that overlaps one of those for a shared stage; a push of another layout or of
+    /// other writes carries every one.
+    #[test]
+    fn a_push_carries_the_writes_that_changed() {
+        let (vertex, fragment) = (vk::ShaderStageFlags::VERTEX, vk::ShaderStageFlags::FRAGMENT);
+        let (a, b) = (
+            vk::PipelineLayout::from_raw(1),
+            vk::PipelineLayout::from_raw(2),
+        );
+        let carried =
+            |pushed: Pushed, n: usize| (0..n).filter(|&at| pushed.has(at)).collect::<Vec<_>>();
+        let mut bound = Bound::default();
+        bound.follow(vk::CommandBuffer::from_raw(2));
+        let apart = |v: u8, f: u8| vec![(vertex, 0, vec![v; 16]), (fragment, 16, vec![f; 16])];
+        assert_eq!(carried(bound.pushes(a, &apart(1, 2)), 2), [0, 1]);
+        assert!(!bound.pushes(a, &apart(1, 2)).any(), "the same bytes");
+        assert_eq!(
+            carried(bound.pushes(a, &apart(3, 2)), 2),
+            [0],
+            "the vertex write"
+        );
+        assert_eq!(
+            carried(bound.pushes(a, &apart(3, 4)), 2),
+            [1],
+            "the fragment write"
+        );
+        assert_eq!(
+            carried(bound.pushes(b, &apart(3, 4)), 2),
+            [0, 1],
+            "another layout"
+        );
+        let longer = vec![(vertex, 0, vec![3; 32]), (fragment, 32, vec![4; 16])];
+        assert_eq!(
+            carried(bound.pushes(b, &longer), 2),
+            [0, 1],
+            "other lengths"
+        );
+        // A write of both stages, then one of the fragment stage over its second half.
+        let both = vertex | fragment;
+        let over = |w: u8, f: u8| vec![(both, 0, vec![w; 16]), (fragment, 8, vec![f; 8])];
+        assert_eq!(carried(bound.pushes(a, &over(1, 2)), 2), [0, 1]);
+        assert_eq!(
+            carried(bound.pushes(a, &over(5, 2)), 2),
+            [0, 1],
+            "pushed again after"
+        );
+        assert_eq!(carried(bound.pushes(a, &over(5, 6)), 2), [1]);
     }
 
     /// A push after a pipeline bind of the same layout carries only the writes that changed, the

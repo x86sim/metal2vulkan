@@ -100,6 +100,28 @@ pub(super) struct Affected {
 ///   known broken through 26.2.4. Nothing is refused but a memoryless attachment at another
 ///   layer (`resolve.rs`).
 ///
+/// `VolumeResolveFirstPlane`:
+/// - Mesa's RADV (`MESA_RADV`): a render pass's color resolve into a 2D view of a 3D image
+///   (made `VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT`) whose first layer is depth plane 3 of a
+///   4x4x4 `R8G8B8A8_UNORM` volume wrote plane 0, the volume's first byte holding the resolve,
+///   three runs alike at each of two commits, on the Radeon 780M (Phoenix, `deviceID` 0x15bf),
+///   where a draw into the same kind of view writes its plane and the validation layer reports
+///   nothing (`runtime_lane::view_attachments::a_resolve_writes_the_volume_plane_it_names`).
+///   Valid usage: such a view "can be used as a framebuffer attachment that refers only to the
+///   specified range of slices" (`VkImageSubresourceRange`), and of a resolve attachment Vulkan
+///   refuses only a 3D view (`VUID-VkRenderingAttachmentInfo-resolveImageView-12471`). Nothing is
+///   refused: a color resolve into a 3D texture's planes past its first, or into more than one,
+///   goes into a scratch image of the pass's layers, copied into the planes after the pass
+///   (`resolve.rs`). Every RADV GPU takes the copy until a probe finds it clean.
+/// - NVIDIA's (`NVIDIA_PROPRIETARY`): the same resolve, of a 4x multisampled `R8G8B8A8_UNORM`
+///   attachment, into the 2D view of a 4x4x4 or a 4x4x8 volume whose first layer is depth plane 1
+///   wrote no plane, every byte of the volume as before; into the view beginning at plane 0, 2 or
+///   3 it wrote that plane alone, in any order of the four and three times over into plane 1, on
+///   the RTX 5080 Laptop GPU (`deviceID` 0x2c19, 615.71.09; 3 runs of
+///   `runtime_lane::view_attachments::a_resolve_writes_the_volume_plane_it_names` and a probe of
+///   the orders), where a draw into plane 1 through such a view writes it and the validation layer
+///   reports nothing. The same copy; every NVIDIA GPU takes it until a probe finds it clean.
+///
 /// `PipelineCacheDataCompiledAtLoad`:
 /// - MoltenVK (`MOLTENVK`): `vkCreatePipelineCache` with initial data reads each shader module's
 ///   converted MSL back (`MVKPipelineCache::readData`) through
@@ -250,6 +272,22 @@ pub(super) struct Affected {
 ///   image of a height that is no multiple of 4 is made there (`dma_buf.rs`'s
 ///   `explicit_plane_rows`), and the texture takes its shadow.
 ///
+/// `ExplicitPlanePitchMisread`:
+/// - NVIDIA's (`NVIDIA_PROPRIETARY`): a `DRM_FORMAT_MOD_LINEAR` image made for host allocations
+///   or the device's own memory with an explicit plane of 64 x 64 `B8G8R8A8_UNORM` texels at rows
+///   272 bytes apart, which the driver makes and reports at rows 272 apart
+///   (`vkGetImageSubresourceLayout`), is read by a kernel at rows 256 apart and copied out at 272;
+///   at rows 288, 320, 384 and 1024 apart both read its rows
+///   (`tests::read_twin_device::textures_at_padded_rows_read_their_bytes`). Valid usage: the
+///   implementation validates an explicit plane layout and refuses one it cannot use
+///   (`VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`, `VkImageDrmFormatModifierExplicitCreateInfoEXT`).
+///   Measured on 615.71.09 on the RTX 5080 Laptop GPU (`deviceID` 0x2c19) and on 620.70.06 on the
+///   RTX 3090 (0x2204), alike, their own linear images laying rows at multiples of 128 bytes on
+///   both: known broken through 620.70.06. Nothing is refused: no such image at rows a number of bytes apart that is no
+///   multiple of 32 is made there (`dma_buf.rs`'s `explicit_plane_pitch`), and the texture takes
+///   its shadow, or binds its rows as a texel buffer for a slot that only reads. Every NVIDIA GPU
+///   and release takes it until a probe finds it clean.
+///
 /// `OcclusionCountPerColorOutput`:
 /// - Mesa's ANV (`INTEL_OPEN_SOURCE_MESA`): a precise occlusion query counts each passing sample
 ///   once per color output the fragment shader writes, where Vulkan's Sample Counting counts it
@@ -306,9 +344,11 @@ pub(super) struct Affected {
 ///   normalized storage write (`runtime_lane::norm_storage_writes`), and wrote nothing through a
 ///   device without robustness's in-shader bounds (`runtime_lane::executions`), where binding set
 ///   0 passes each. Read in 1.4.1's source and measured on 1.4.1 (driverVersion 10401): known
-///   broken through 1.4.1. Nothing is refused: the device takes no push command there
-///   (`device/mod.rs`), and every draw and dispatch binds set 0 from its command buffer's pools,
-///   as on a device without the command.
+///   broken through 1.4.1. Nothing is refused: there a variant pushes set 0 only where its stages
+///   read no buffer's length and its fragment stage writes a storage buffer of set 0 inside its
+///   interlock (`InterlockedBoundBuffersUnordered`, `pipeline/objects.rs`'s `pushes_set_zero`),
+///   and no runtime kernel pushes (`owned_kernel.rs`): every other draw and dispatch binds set 0
+///   from its command buffer's pools, as on a device without the command.
 ///
 /// `PushedDescriptorsStaleAfterPipelineBinds`:
 /// - Mesa's ANV (`INTEL_OPEN_SOURCE_MESA`): draws of one layout that push set 0 alike, a
@@ -323,6 +363,48 @@ pub(super) struct Affected {
 ///   no push after the bind, 3 of 3 right with the one write): known broken through 26.2.4.
 ///   Nothing is refused: the first draw after each pipeline bind pushes at least one write, those
 ///   that changed or else set 0's first (`render/bound.rs`).
+///
+/// `InterlockedBoundBuffersUnordered`:
+/// - MoltenVK (`MOLTENVK`): binding through Metal argument buffers, the state
+///   `device/argument_buffers.rs` reads from the device's limits (on: a device without them is
+///   refused at device open), it makes each pooled descriptor set one Metal argument buffer: the
+///   Metal it writes for a fragment stage of the runtime's (`MVK_CONFIG_SHADER_DUMP_DIR`) takes
+///   set 0 as `spvDescriptorSetBuffer0` at `[[buffer(0)]]`, and each storage buffer the stage
+///   reaches inside its interlock as a member of it in `raster_order_group(0)`. Metal leaves such
+///   a member unordered where the function also reads another buffer member of the argument
+///   buffer: on an M3 Max with macOS 27.0.1, of 96 passes of 64 overlapping primitives each
+///   applying a map that does not commute to a pixel's word, a Metal function reading and
+///   writing such a member beside a member it reads the width from lost earlier fragments' writes
+///   in 96, in 8x4 groups, where one reading the width from a buffer of its own lost none, a
+///   texture member in the group beside the width's member none, and the member alone in its
+///   argument buffer none; the stage's own Metal from the dump lost writes in 48 of 48 passes,
+///   and the same with the buffer as a discrete `[[buffer(4), raster_order_group(0)]]` none of
+///   48. A push descriptor set layout is discrete (`pickArgumentBufferMode` takes no argument
+///   buffer for it): through the runtime on 1.4.2 (driverVersion 10402) on the same machine,
+///   `runtime_lane::interlocked_primitive_order`'s raster order group buffer lost writes in 96 of
+///   96 passes with set 0 bound, and none of 96 with it pushed. Known broken through 1.4.2.
+///   Nothing is refused: a render variant whose fragment stage writes a storage buffer of set 0
+///   inside its interlock pushes set 0 there (`pipeline/objects.rs`'s `pushes_set_zero`, where
+///   the variant's stages read no buffer's length, `PushedBufferSizesUnset`), and binds it,
+///   announced, where it cannot. Keyed on the driver: a pushed set is discrete in either of
+///   MoltenVK's modes, so the push holds however the device binds.
+///
+/// `FastLinkedInterlocksUnordered`:
+/// - Mesa's RADV (`MESA_RADV`): a fragment shader library made without the fragment output
+///   interface ends in a jump to a separate epilog that writes the colors, and ACO waits for the
+///   shader's storage writes before its final export only where that export is the shader's
+///   own: in `RADV_DEBUG=shaders`, a whole pipeline's interlocked `image_store` is followed by
+///   `s_waitcnt_vscnt` and the `done` export, a fast-linked one's by `s_setpc_b64` into the
+///   epilog with no wait. The GPU ends the ordered section at that export, so the next
+///   overlapping fragment reads the image before the write lands. On the Radeon RX 7900 XTX
+///   (Navi 31) with 26.2.6: a bare-Vulkan program of 12 instances of one quad in one draw, each
+///   fragment doubling a counter inside `PixelInterlockOrderedEXT`, left 62 of 72 counters wrong
+///   (7192 texels one step short) linked from four libraries without link-time optimization and
+///   none made whole; `tests::lone_fetch`'s layers left 35 of 72 targets wrong, and none under
+///   `RADV_DEBUG=nogpl`. Known broken through 26.2.6. Every RADV GPU takes it; the other GPUs
+///   are unmeasured. Nothing is refused: a render variant whose
+///   fragment stage declares an interlock execution mode is made whole there
+///   (`pipeline/graphics.rs`'s `GraphicsContent::links`).
 ///
 /// `ImmutableSamplersLostAfterCopies`:
 /// - Mesa's lavapipe (`MESA_LLVMPIPE`): a compute dispatch recorded after a copy in the same
@@ -483,6 +565,98 @@ pub(super) struct Affected {
 ///   import fails, a copy of them, as where a pointer import fails (`copied.rs`,
 ///   `copied-host-pages`); a RAM's chunk over them is not imported, and its objects take their
 ///   own paths to the same end.
+///
+/// `VolumeBlitsUnfiltered`:
+/// - MoltenVK (`MOLTENVK`): `vkCmdBlitImage` with `VK_FILTER_LINEAR` from level 0 of an
+///   `R8G8B8A8_UNORM` 3D image of 8 x 8 x 4 random texels into level 1 (4 x 4 x 2) answers
+///   texels that are not the average of the eight around each destination texel's centre, as
+///   Vulkan's linear filter of a halving blit is: of the level's 128 bytes, 4 lie within a code
+///   of that average, 67 within a code of the average of the four of source slice `2z + 1` alone,
+///   2 of slice `2z` alone (`runtime_lane::mipmap_chains` on the M3 Max under macOS 27.0.1).
+///   The same blits of 2D, 2D array and cube images filter as Vulkan states, and NVIDIA's
+///   615.71.09 on the RTX 5080 Laptop GPU filters the 3D image as Vulkan states. Measured on 1.4.2
+///   (driverVersion 10402): known broken through 1.4.2. Nothing is refused:
+///   `generate_mipmaps` of a 3D texture takes the runtime's compute filter there
+///   (`mipmap_plan.rs`, `mipmap_filter.rs`) where it computes the format, and the device's blit
+///   chain, announced as everywhere (`device-filtered-mipmaps`), elsewhere.
+///
+/// `AliasedImportBlitsUnordered`:
+/// - MoltenVK (`MOLTENVK`): a pipeline barrier between two blits records no barrier there (it
+///   ends the Metal blit encoder, `tracker.rs`) and leaves their order to Metal's hazard
+///   tracking, which is per `MTLBuffer`, and each import of host pages is an `MTLBuffer` of its
+///   own (`host_aliases.rs`). So in one blit encoder a fill through a buffer bound in an import of one
+///   run of a guest RAM's chunk, a barrier, then a copy of the same bytes through a buffer bound
+///   in the chunk's import read the bytes from before the fill (measured on the M3 Max under
+///   macOS 27.0.1, MoltenVK 1.4.2, driverVersion 10402: known broken through 1.4.2). NVIDIA's 615.71.09 on the RTX 5080 Laptop GPU orders them, in one encoder, two
+///   encoders and across queues. Nothing is refused: a copy over a chunk not yet imported takes
+///   the chunk's import, which it makes or waits for, never an import of its ranges alone
+///   (`host_ram.rs`'s `RamOnDevice::for_copy`).
+/// - Mesa's ANV (`INTEL_OPEN_SOURCE_MESA`): in one command buffer, a fill through a buffer bound in
+///   one import of a guest RAM's pages, a global memory barrier from the transfer write to the
+///   transfer read, then a copy of the same bytes through a buffer bound in another import of them
+///   read none of the fill (0 of 4096 bytes), in one blit encoder and in two, whichever of a run's
+///   import and the chunk's the fill went through, where the CPU then saw all 4096. Two command
+///   buffers of one queue, a wait for the fill's before the copy's commit, and two queues each
+///   ordered them (all 4096), and so did every way through one import (one chunk-bound buffer to
+///   another). Measured on Iris Xe Graphics (Raptor Lake-P) under Mesa 26.2.6, a probe of each way
+///   run twice; and a buffer bound in a run's import ordered against one in the chunk's, and
+///   against a copy of its pages, failed there in each of two runs. Nothing is refused, as on
+///   MoltenVK. (A run of a RAM whose chunks are imports of their pointer is never imported alone
+///   on any device, `RamOnDevice::runs_alone`; one whose chunks are dma-bufs is, as one more.)
+///
+/// `TrimmedCommandBufferFailsResubmission`:
+/// - Mesa's ANV (`INTEL_OPEN_SOURCE_MESA`): a submission's command buffers are chained into one
+///   batch, each one's end jumping to the first batch buffer object of the next
+///   (`anv_cmd_buffer_record_chain_submit` in `anv_batch_chain.c`), and under i915 that jump adds
+///   the next one's buffer object to those its last batch buffer object names, which only its
+///   reset or begin clears (`anv_batch_bo_start`). A command buffer submitted again as recorded,
+///   as a batch's kept barriers are (`command_buffer/kept_barriers.rs`), so names at each
+///   submission the first batch buffer object of every command buffer that ever came next after
+///   it. A freed command buffer stays in its pool, its first batch buffer object with it, for the
+///   pool's later allocations (`vk_command_pool.c`), until `vkTrimCommandPool` destroys it; a
+///   batch buffer object is a slice of a larger one (`anv_slab_bo.c`), whose handle is released
+///   once every slice of it is free. The next submission that names such a handle fails:
+///   `DRM_IOCTL_I915_GEM_EXECBUFFER2` returns `ENOENT`, its object list holding an object of
+///   handle 0 (`INTEL_DEBUG=submit`), and `vkQueueSubmit` returns `VK_ERROR_DEVICE_LOST`.
+///   Measured on Iris Xe Graphics (Raptor Lake-P) under Mesa 26.2.6 on i915:
+///   `runtime_lane::predication::streams_run_what_metal_ran`, under the validation layer, which
+///   reported nothing, failed so in each of 10 runs where a spare pool's frees, uncapped on the
+///   device's free thread (`spares.rs`), trimmed the pool, and passed in each of 8 runs whose
+///   frees did not trim, 2 that freed nothing, and 3 whose kept barriers were begun with
+///   `VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT`, which ANV never chains; and
+///   `tests::spares::device::kept_barriers_run_again_after_the_command_buffers_after_them_were_freed`
+///   failed so at its 16th command buffer in each of 4 runs that trimmed, and passed in each of 3
+///   that did not. Read in Mesa main's source of 2026-11-09. Nothing is refused: a spare pool's
+///   command buffers are freed without trimming the pool there, so its later command buffers take
+///   them again; what each holds of its recording the driver releases as it frees it. The pools are
+///   trimmed in rounds instead, each once every kept barrier command buffer was marked to be
+///   recorded again (`spares.rs`), as a begin clears what it names. One burst's frees untrimmed
+///   cost no memory measured on the Iris Xe (a probe, 2 runs of each way): after a command buffer
+///   of 1024 blit encoders whose command buffers then went past its pool's recent uses, the
+///   process's resident memory (156.9 to 157.8 MB, 82.6 MB of it anonymous, 73 MB more than before
+///   the burst) and its buffer objects (`drm-total-system0` in the DRM file's fdinfo, 398,320 KiB
+///   in every run) were the same whether the command buffers were kept (as before the frees), freed
+///   and trimmed, or freed untrimmed: the trim returned none of what the burst grew. Under the xe
+///   kernel driver ANV names no such objects (`uses_relocs`), but no GPU of it is measured, so
+///   every ANV GPU takes the path.
+///
+/// `VertexFetchWrapsPast4GiB`:
+/// - Mesa's lavapipe (`MESA_LLVMPIPE`): a `uint` attribute fetched in fixed function at stride 4
+///   or 12 from a 64-byte buffer bound at offset 0 read, for each element past `2^32` bytes (a
+///   vertex start, base vertex, index or base instance past `2^30`), the word at its
+///   displacement's low 32 bits (element `2^30` at stride 4 read word 0), where the device reports
+///   `robustBufferAccess2` and Vulkan reads zero outside the bound range; Metal reads zero there
+///   (an Apple M3 Max under macOS 27.0.1). Measured on Mesa 26.2.6 (LLVM 23.1.4) and 26.2.4
+///   (LLVM 23.1.1) by the
+///   conformance case `vertex-fetch-past-4gib-small-buffer` (24 elements of the six far draws at
+///   strides 4 and 12, the stride-6 draws pulled reading zero), and by
+///   `runtime_lane::far_vertex_fetches` on every device it runs on (an indexed draw of 32-bit
+///   indices past `2^30` under the default policy reads the wrapped word on lavapipe alone).
+///   RADV on the Radeon 780M (Mesa 26.2.6) and MoltenVK 1.4.2 on the M3 Max read zero there.
+///   Nothing is refused: a
+///   draw whose own values may fetch a fixed-function layout past `2^32` bytes pulls it
+///   (`render/vertex_reach.rs`), and one whose indices or arguments state the reach pulls it under
+///   `VertexReachPolicy::Exact`, announced otherwise (`vertex-fetch-may-wrap`).
 pub(super) const AFFECTED: &[Affected] = &[
     Affected {
         defect: RuntimeDriverDefect::HostTransferImagesCopiedAtBind,
@@ -521,6 +695,16 @@ pub(super) const AFFECTED: &[Affected] = &[
         clean: &[],
     },
     Affected {
+        defect: RuntimeDriverDefect::VolumeResolveFirstPlane,
+        driver: DriverId::MESA_RADV,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::VolumeResolveFirstPlane,
+        driver: DriverId::NVIDIA_PROPRIETARY,
+        clean: &[],
+    },
+    Affected {
         defect: RuntimeDriverDefect::LazilyAllocatedVolumePlaneViews,
         driver: DriverId::MOLTENVK,
         clean: &[],
@@ -556,6 +740,11 @@ pub(super) const AFFECTED: &[Affected] = &[
         clean: &[],
     },
     Affected {
+        defect: RuntimeDriverDefect::ExplicitPlanePitchMisread,
+        driver: DriverId::NVIDIA_PROPRIETARY,
+        clean: &[],
+    },
+    Affected {
         defect: RuntimeDriverDefect::OcclusionCountPerColorOutput,
         driver: DriverId::INTEL_OPEN_SOURCE_MESA,
         clean: &[],
@@ -584,6 +773,16 @@ pub(super) const AFFECTED: &[Affected] = &[
     Affected {
         defect: RuntimeDriverDefect::PushedDescriptorsStaleAfterPipelineBinds,
         driver: DriverId::INTEL_OPEN_SOURCE_MESA,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::InterlockedBoundBuffersUnordered,
+        driver: DriverId::MOLTENVK,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::FastLinkedInterlocksUnordered,
+        driver: DriverId::MESA_RADV,
         clean: &[],
     },
     Affected {
@@ -624,6 +823,31 @@ pub(super) const AFFECTED: &[Affected] = &[
     Affected {
         defect: RuntimeDriverDefect::UnpinnablePagesBreakHostMemory,
         driver: DriverId::NVIDIA_PROPRIETARY,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::VolumeBlitsUnfiltered,
+        driver: DriverId::MOLTENVK,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::AliasedImportBlitsUnordered,
+        driver: DriverId::MOLTENVK,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::AliasedImportBlitsUnordered,
+        driver: DriverId::INTEL_OPEN_SOURCE_MESA,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::TrimmedCommandBufferFailsResubmission,
+        driver: DriverId::INTEL_OPEN_SOURCE_MESA,
+        clean: &[],
+    },
+    Affected {
+        defect: RuntimeDriverDefect::VertexFetchWrapsPast4GiB,
+        driver: DriverId::MESA_LLVMPIPE,
         clean: &[],
     },
 ];

@@ -1,16 +1,23 @@
 //! Visibility results (`setVisibilityResultMode:offset:`).
 //!
 //! Metal writes, at the end of a pass, one 64-bit result at each offset the encoder set a mode at:
-//! in `Boolean` mode 1 when any sample of the draws while it was set passed and 0 otherwise, in
-//! `Counting` mode the samples that passed; an offset set with no draw after it gets 0, an offset
-//! the encoder never set keeps its bytes, and a later pass rewrites only its own offsets (measured
-//! on an M4 with macOS 27.0.1).
+//! in `Boolean` mode a nonzero value when any sample of the draws while it was set passed and 0
+//! otherwise, in `Counting` mode the samples that passed; an offset set with no draw after it gets
+//! 0, an offset the encoder never set keeps its bytes, and a later pass rewrites only its own
+//! offsets (Metal's answers on an Apple M3 Max with macOS 27.0.1, which the conformance suite's
+//! `visibility` cases record). The nonzero `Boolean` value is the device's: an Apple M3 Max writes
+//! 1, Metal on the AMD Radeon Pro 5300M and the Intel UHD Graphics 630 (macOS 26.7.1) the samples
+//! that passed, and the runtime the device's occlusion query's result
+//! (`Degradation::DeviceBooleanVisibility`).
 //!
 //! - **Queries.** Each mode set is an occlusion query of the encoder's own pools, begun in the
 //!   draws' secondary command buffer when the mode is set and ended when the next one is set, at
 //!   `Disabled`, or at `end_encoding`: one query spans every draw of its offset. A `Counting`
 //!   query is precise (`VK_QUERY_CONTROL_PRECISE_BIT`): its result is the samples that passed,
-//!   Metal's count. A `Boolean` query is imprecise: its count is only ever zero or not.
+//!   Metal's count. A `Boolean` query is imprecise: Vulkan states its result only as zero or not
+//!   ("When any samples are passed, boolean queries will return a non-zero result value,
+//!   otherwise a result value of zero is returned", `occlusionQueryPrecise`), which is Metal's
+//!   `Boolean` contract, so its result is the offset's word as the device writes it.
 //!   `end_encoding` resets the pools before the pass (query commands run in submission order, so
 //!   the queries begun later see the reset).
 //! - **Continuations.** A query begins and ends in one subpass, so where the pass splits into
@@ -26,13 +33,22 @@
 //!   (`vkCmdCopyQueryPoolResults` waiting for each), consecutive ones in one copy, and every
 //!   continuation's to a word of an upload region, whose words one dispatch of the crate-owned
 //!   `bind::visibility_combine_module` combines into their offsets'
-//!   (`bind::VisibilityCombine::plan`): summed for a `Counting` offset, ORed for a `Boolean` one,
-//!   since an imprecise query's count is any nonzero value. A `Counting` result is then as
-//!   copied; the `Boolean` offsets are made Metal's 1 or 0 in place by one dispatch of the
-//!   crate-owned `bind::visibility_resolve_module` (more only where the offsets span more than
-//!   one storage binding reaches, `bind::VisibilityResolve::plan`), whose targets are uploaded.
-//!   Where a no-copy buffer's bytes start at no multiple of 8 of its `VkBuffer`, the results land
-//!   in an upload region first and are copied on (`Landing`).
+//!   (`bind::VisibilityCombine::plan`; more only where the offsets span more than one storage
+//!   binding reaches): summed for a `Counting` offset, ORed for a `Boolean` one, since an
+//!   imprecise query's count is any nonzero value and a sum of such counts could wrap to zero. A
+//!   pass with no continuation records no dispatch. Where a no-copy buffer's bytes start at no
+//!   multiple of 8 of its `VkBuffer`, the results land in an upload region first and are copied on
+//!   (`Landing`).
+//! - **`Accumulate`** (`MTLVisibilityResultTypeAccumulate`, the pass descriptor's
+//!   `visibility_result_type`): no query is copied to its offset; every one, the first included,
+//!   is copied to the upload region and the combine takes them into the word as it stands, so a
+//!   `Counting` word's low 32 bits gain the pass's count, wrapping there, its high 32 bits kept, a
+//!   `Boolean` word ORs the device's results into it, and an offset set with no draw after it
+//!   keeps its word: an Apple M3 Max's answers (macOS 27.0.1, conformance cases
+//!   `visibility-counting-accumulate*` and `visibility-boolean-accumulate`: 100 and a covering
+//!   draw of 16 samples write 116, 0xffff_fff8 and 16 write 8, 0xffff_ffff_ffff_fff8 and 16 write
+//!   0xffff_ffff_0000_0008). Where the results land in an upload region, the words are copied into
+//!   it before the combine.
 //! - **Refusals** (`Invalid`, measured): a pass without a visibility result buffer, an offset
 //!   whose 8 bytes run past the buffer, and an offset the encoder took before in the other mode.
 //!   `Counting` needs a precise query: `Unsupported`, naming `occlusionQueryPrecise`, where the
@@ -41,7 +57,19 @@
 //!   ANV): its precise query counts each sample once for every color output the fragment shader
 //!   writes. A draw counted by a `Counting` query whose fragment variant writes more than one
 //!   color attachment runs, and the device announces `Degradation::VisibilityCountPerColor`: its
-//!   result is the samples times those colors, not divided back. `Boolean` results are exact.
+//!   result is the samples times those colors, not divided back. `Boolean` results keep their
+//!   contract: zero where no sample passed.
+//! - **A device that may count after a fragment function's mask** (no
+//!   `earlyFragmentMultisampleCoverageAfterSampleCounting`, ANV): a draw under a visibility
+//!   result whose fragment function declares `[[early_fragment_tests]]` and writes its
+//!   `SampleMask` output (Metal's private sample mask or coverage, which the function applies
+//!   itself there, or its own `[[sample_mask]]` return) runs, counted in
+//!   `WorkCounts::draws_counted_past_early_masks`, and the device announces
+//!   `Degradation::VisibilityPastEarlyMask`: Metal counts every sample the early tests pass, and
+//!   the device's query may leave out those the mask drops. Keeping Metal's count would take a
+//!   second draw of each counted draw without the mask, as every form that masks the colors
+//!   alone (the `SampleMask` output, a discard) is a fragment operation such a device may count
+//!   after.
 //! - **An offset taken again in its mode** stops Metal's validation ("using the same offset ...
 //!   twice in the same command encoder is not allowed"); plain Metal adds the draws since to its
 //!   result: `Counting` sums them (16 and 16 write 32), `Boolean` writes 1 when either passed a
@@ -65,13 +93,12 @@ use super::exit_guard;
 use super::owned_kernel::{OwnedModule, OwnedSets};
 use super::release;
 use super::tracker::{Access, Barrier, Use, UseRange};
-use super::upload::Upload;
 use super::{Buffer, Device};
 use ash::vk;
-use metal2vulkan::bind::{ContinuedResult, VisibilityCombine, VisibilityResolve};
+use metal2vulkan::bind::{ContinuedResult, VisibilityCombine};
 use metal2vulkan::device::VkFeature;
 use metal2vulkan::error::{Capability, Feature, Unsupported};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// `MTLVisibilityResultMode`.
 #[non_exhaustive]
@@ -80,10 +107,59 @@ pub enum VisibilityResultMode {
     /// `MTLVisibilityResultModeDisabled`: the draws write no result.
     #[default]
     Disabled,
-    /// `MTLVisibilityResultModeBoolean`: 1 when any sample passed, else 0.
+    /// `MTLVisibilityResultModeBoolean`: nonzero when any sample passed, else 0. The nonzero value
+    /// is the device's occlusion query's, where an Apple M3 Max writes 1
+    /// (`Degradation::DeviceBooleanVisibility`).
     Boolean,
     /// `MTLVisibilityResultModeCounting`: the samples that passed.
     Counting,
+}
+
+/// `MTLVisibilityResultType`: whether a pass's visibility results replace the words at their
+/// offsets or are taken into them (the module docs). The pass descriptor's
+/// [`visibility_result_type`](crate::RenderPassDescriptor::visibility_result_type).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum VisibilityResultType {
+    /// `MTLVisibilityResultTypeReset`, Metal's default: each offset the encoder set a mode at
+    /// takes the pass's result in place of its word.
+    #[default]
+    Reset,
+    /// `MTLVisibilityResultTypeAccumulate`: each offset the encoder set a mode at keeps its word
+    /// and takes the pass's result into it, a `Counting` result added to the word's low 32 bits
+    /// (wrapping there, its high 32 bits kept) and a `Boolean` one ORed, so an offset set with no
+    /// draw after it keeps its word.
+    ///
+    /// As an Apple M3 Max answers it (macOS 27.0.1). Metal on the AMD Radeon Pro 5300M and the
+    /// Intel UHD Graphics 630 (macOS 26.7.1) answers it as `Reset`.
+    Accumulate,
+}
+
+impl VisibilityResultType {
+    /// Metal's raw value.
+    pub fn raw(self) -> i64 {
+        match self {
+            VisibilityResultType::Reset => 0,
+            VisibilityResultType::Accumulate => 1,
+        }
+    }
+
+    /// The type of Metal's raw value `raw`.
+    pub fn from_raw(raw: i64) -> Result<VisibilityResultType, Error> {
+        Ok(match raw {
+            0 => VisibilityResultType::Reset,
+            1 => VisibilityResultType::Accumulate,
+            raw => {
+                return Err(invalid(
+                    "VisibilityResultType::from_raw",
+                    Problem::UndefinedValue {
+                        ty: "MTLVisibilityResultType",
+                        raw: raw as u64,
+                    },
+                ))
+            }
+        })
+    }
 }
 
 impl VisibilityResultMode {
@@ -647,10 +723,16 @@ impl Visibility {
         Ok((self.pools.len() - 1, 0))
     }
 
-    /// The results' copies and resolves, planned before anything of the pass records: `None`
-    /// when the encoder took no offset. The draws' command buffer must have ended its query
-    /// ([`Visibility::end`]).
-    pub(super) fn plan(self, core: &mut EncoderCore) -> Result<Option<Results>, Error> {
+    /// The results' copies and combine, planned before anything of the pass records: `None`
+    /// when the encoder took no offset. Under `kind` `Reset` each offset's first query is copied
+    /// to its word and its continuations combined into it; under `Accumulate` every query of an
+    /// offset is combined into the word as it stands. The draws' command buffer must have ended
+    /// its query ([`Visibility::end`]).
+    pub(super) fn plan(
+        self,
+        core: &mut EncoderCore,
+        kind: VisibilityResultType,
+    ) -> Result<Option<Results>, Error> {
         let Visibility {
             buffer,
             pools,
@@ -667,101 +749,79 @@ impl Visibility {
         let Some(buffer) = buffer.filter(|_| !taken.is_empty()) else {
             return Ok(None);
         };
-        let device = core.device().clone();
-        let landing = Landing::new(core, &buffer, &taken)?;
-        // Consecutive queries of one pool at consecutive offsets copy at once. The copies and
-        // resolves address the landing region; the uses, the Metal buffer.
+        let accumulate = kind == VisibilityResultType::Accumulate;
+        let landing = Landing::new(core, &buffer, &taken, accumulate)?;
+        // Consecutive queries of one pool at consecutive offsets copy at once. The copies and the
+        // combine address the landing region; the uses, the Metal buffer.
         let mut copies: Vec<ResultCopy> = Vec::new();
-        for t in &taken {
-            push_copy(
-                &mut copies,
-                pools[t.pool].raw,
-                t.query,
-                landing.raw,
-                landing.at(t.offset),
-            );
-        }
-        let combine = combine(core, &pools, &taken, &continued, &landing, &mut copies)?;
-        let booleans: Vec<u64> = taken
-            .iter()
-            .filter(|t| t.boolean)
-            .map(|t| landing.at(t.offset))
-            .collect();
-        let limits = &device.properties().description.limits;
-        let resolves = VisibilityResolve::plan(
-            &booleans,
-            limits.min_storage_buffer_offset_alignment,
-            limits.max_storage_buffer_range,
-            limits.max_compute_work_group_count[0],
-        )
-        .ok_or_else(|| internal("visibility offsets the resolve cannot bind"))?;
-        let resolve = if resolves.is_empty() {
-            None
+        let mut sources = continued;
+        if accumulate {
+            // Every query is a source the combine takes into the word: the first ones too.
+            sources.extend(taken.iter().enumerate().map(|(index, t)| Continued {
+                taken: index,
+                pool: t.pool,
+                query: t.query,
+            }));
         } else {
-            let kernel = device.owned_kernel(OwnedModule::VisibilityResolve)?;
-            let mut uploads: Vec<Upload> = Vec::with_capacity(resolves.len());
-            {
-                let mut state = core.command_buffer().state();
-                for r in &resolves {
-                    let bytes = r.target_bytes();
-                    uploads.push(state.uploads.upload(&device, &bytes, bytes.len() as u64)?);
-                }
+            for t in &taken {
+                push_copy(
+                    &mut copies,
+                    pools[t.pool].raw,
+                    t.query,
+                    landing.raw,
+                    landing.at(t.offset),
+                );
             }
-            let target = landing.raw;
-            let ranges: Vec<Vec<(vk::Buffer, u64, u64)>> = resolves
-                .iter()
-                .zip(&uploads)
-                .map(|(r, upload)| {
-                    vec![
-                        (upload.raw(), upload.offset(), 4 * r.targets.len() as u64),
-                        (target, r.dest_range.offset, r.dest_range.range),
-                    ]
-                })
-                .collect();
-            let sets = OwnedSets::write(&device, &kernel, &ranges)?;
-            let groups = resolves.iter().map(|r| r.group_count).collect();
-            Some(Dispatches {
-                pipeline: kernel.pipeline,
-                layout: kernel.layout,
-                sets,
-                groups,
-            })
-        };
+        }
+        let combine = combine(
+            core,
+            (&pools, &taken, &sources),
+            &landing,
+            accumulate,
+            &mut copies,
+        )?;
+        // The offsets whose words the combine reads and writes in place.
+        let combined: BTreeSet<usize> = sources.iter().map(|c| c.taken).collect();
+        let landed = !landing.onward.is_empty();
+        let transfer = |access| Access::new(vk::PipelineStageFlags2::TRANSFER, access);
         let mut uses = Vec::with_capacity(taken.len());
-        for t in &taken {
+        for (index, t) in taken.iter().enumerate() {
             let (identity, range) = buffer.tracked(t.offset..t.offset + RESULT_BYTES);
             let range = UseRange::Bytes(range);
-            let copy = Access::new(
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            );
-            uses.push(Use::writes(
-                identity.key,
-                identity.tracked,
-                range.clone(),
-                copy,
-            ));
-            if t.boolean {
+            let (key, tracked) = (identity.key, identity.tracked);
+            // Into the word: its first query's copy (`Reset`) or the onward copy.
+            if !accumulate || landed {
+                let write = transfer(vk::AccessFlags2::TRANSFER_WRITE);
+                uses.push(Use::writes(key, tracked, range.clone(), write));
+            }
+            // Out of it, into the landing region (`Accumulate`).
+            if accumulate && landed {
+                let read = transfer(vk::AccessFlags2::TRANSFER_READ);
+                uses.push(Use::reads(key, tracked, range.clone(), read));
+            }
+            // The combine, in place.
+            if combined.contains(&index) && !landed {
                 let shader = Access::new(
                     vk::PipelineStageFlags2::COMPUTE_SHADER,
                     vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
                 );
                 uses.push(Use {
-                    key: identity.key,
-                    tracked: identity.tracked,
+                    key,
+                    tracked,
                     range,
                     read: shader,
                     write: shader,
                 });
             }
         }
+        let boolean = taken.iter().find(|t| t.boolean).map(|t| t.offset);
         Ok(Some(Results {
             pools: QueryPools(pools),
             buffer,
             landing,
             copies,
             combine,
-            resolve,
+            boolean,
             uses,
         }))
     }
@@ -770,7 +830,8 @@ impl Visibility {
 /// Where a pass's results land, at multiples of 8 as Vulkan copies them: in the buffer's
 /// `VkBuffer`, or, where a no-copy buffer's bytes start past such a multiple (`Buffer::base`), in
 /// an upload region laid out as the buffer from the first offset taken, whence one more copy, which
-/// takes any offset, moves each result into the buffer after the resolve.
+/// takes any offset, moves each result into the buffer after the combine. Under `Accumulate` a copy
+/// before the combine brings each word into the region.
 struct Landing {
     /// The `VkBuffer` the results land in.
     raw: vk::Buffer,
@@ -782,12 +843,20 @@ struct Landing {
     to: vk::Buffer,
     /// The copies of the results on into the buffer, where `raw` is an upload's.
     onward: Vec<vk::BufferCopy>,
+    /// The copies of the words into the upload region before the combine, where `raw` is an
+    /// upload's and the results accumulate.
+    inward: Vec<vk::BufferCopy>,
 }
 
 impl Landing {
-    /// Where the results of `taken` (not empty) land, for `buffer`; the upload region is
-    /// `core`'s command buffer's.
-    fn new(core: &EncoderCore, buffer: &Buffer, taken: &[Taken]) -> Result<Landing, Error> {
+    /// Where the results of `taken` (not empty) land, for `buffer`, taken into its words where
+    /// they `accumulate`; the upload region is `core`'s command buffer's.
+    fn new(
+        core: &EncoderCore,
+        buffer: &Buffer,
+        taken: &[Taken],
+        accumulate: bool,
+    ) -> Result<Landing, Error> {
         let first = taken.iter().map(|t| t.offset).min().unwrap_or(0);
         let (to, start) = buffer.at(first);
         if start.is_multiple_of(RESULT_BYTES) {
@@ -797,6 +866,7 @@ impl Landing {
                 first,
                 to,
                 onward: Vec::new(),
+                inward: Vec::new(),
             });
         }
         let end = taken.iter().map(|t| t.offset + RESULT_BYTES).max();
@@ -807,7 +877,7 @@ impl Landing {
             .state()
             .uploads
             .upload(device, &[], len)?;
-        let onward = taken
+        let onward: Vec<vk::BufferCopy> = taken
             .iter()
             .map(|t| vk::BufferCopy {
                 src_offset: region.offset() + (t.offset - first),
@@ -815,6 +885,18 @@ impl Landing {
                 size: RESULT_BYTES,
             })
             .collect();
+        let inward = if accumulate {
+            onward
+                .iter()
+                .map(|c| vk::BufferCopy {
+                    src_offset: c.dst_offset,
+                    dst_offset: c.src_offset,
+                    size: RESULT_BYTES,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         device.degrade(Degradation::LandedVisibilityResults, || {
             let object = format!("visibility results from offset {first}");
             let reason = format!(
@@ -829,6 +911,7 @@ impl Landing {
             first,
             to,
             onward,
+            inward,
         })
     }
 
@@ -888,16 +971,17 @@ fn push_copy(
     });
 }
 
-/// The continuations' copies, added to `copies`, into an upload region of `core`'s command
-/// buffer, one word each, those of one offset consecutive, and the combine dispatches that OR
-/// them into their `Boolean` results' landed words and sum them into their `Counting` ones:
-/// `None` without continuations.
+/// The copies of the queries `continued` of `pools` (continuations, and where the results
+/// `accumulate` every query) of the offsets `taken`, added to `copies`, into an upload region of
+/// `core`'s command buffer, one word each, those of one offset consecutive, and the combine
+/// dispatches that OR them into their `Boolean` results' landed words and sum them into their
+/// `Counting` ones, into the low half alone where they accumulate (as an Apple M3 Max writes it,
+/// `bind::visibility_combine_module`): `None` without queries.
 fn combine(
     core: &mut EncoderCore,
-    pools: &[QueryPool],
-    taken: &[Taken],
-    continued: &[Continued],
+    (pools, taken, continued): (&[QueryPool], &[Taken], &[Continued]),
     landing: &Landing,
+    accumulate: bool,
     copies: &mut Vec<ResultCopy>,
 ) -> Result<Option<Dispatches>, Error> {
     if continued.is_empty() {
@@ -924,7 +1008,11 @@ fn combine(
             _ => {
                 let first =
                     u32::try_from(word).map_err(|_| internal("too many continuation queries"))?;
-                results.push(ContinuedResult::new(offset, first, 1, !result.boolean));
+                let combined = ContinuedResult::new(offset, first, 1, !result.boolean);
+                results.push(match accumulate && !result.boolean {
+                    true => combined.in_low_half(),
+                    false => combined,
+                });
             }
         }
     }
@@ -937,13 +1025,13 @@ fn combine(
     )
     .ok_or_else(|| internal("visibility continuations the combine cannot bind"))?;
     let kernel = device.owned_kernel(OwnedModule::VisibilityCombine)?;
-    let mut ranges: Vec<Vec<(vk::Buffer, u64, u64)>> = Vec::with_capacity(combines.len());
+    let mut ranges: Vec<[(vk::Buffer, u64, u64); 3]> = Vec::with_capacity(combines.len());
     {
         let mut state = core.command_buffer().state();
         for c in &combines {
             let bytes = c.table_bytes();
             let table = state.uploads.upload(&device, &bytes, bytes.len() as u64)?;
-            ranges.push(vec![
+            ranges.push([
                 (table.raw(), table.offset(), bytes.len() as u64),
                 (landing.raw, c.dest_range.offset, c.dest_range.range),
                 (sources.raw(), sources.offset(), words),
@@ -959,7 +1047,7 @@ fn combine(
     }))
 }
 
-/// The dispatches of one crate-owned kernel after a pass: the combine's or the resolve's.
+/// The dispatches of the crate-owned combine after a pass.
 struct Dispatches {
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
@@ -974,7 +1062,9 @@ pub(super) struct Results {
     landing: Landing,
     copies: Vec<ResultCopy>,
     combine: Option<Dispatches>,
-    resolve: Option<Dispatches>,
+    /// The first offset taken in `Boolean` mode, whose word is the device's own nonzero value
+    /// where a sample passed (`Degradation::DeviceBooleanVisibility`).
+    boolean: Option<u64>,
     uses: Vec<Use<super::resource::ResourceKey>>,
 }
 
@@ -991,8 +1081,9 @@ impl Results {
         }
     }
 
-    /// Record the copies and resolves in `core`'s command buffer after the pass, between barriers
-    /// from everything before and to everything after, and hold their objects until it completes.
+    /// Record the copies and the combine in `core`'s command buffer after the pass, between
+    /// barriers from everything before and to everything after, and hold their objects until it
+    /// completes.
     pub(super) fn record(self, core: &mut EncoderCore) {
         let Results {
             pools,
@@ -1000,11 +1091,22 @@ impl Results {
             landing,
             copies,
             combine,
-            resolve,
+            boolean,
             uses,
         } = self;
+        if let Some(offset) = boolean {
+            core.device()
+                .degrade(Degradation::DeviceBooleanVisibility, || {
+                    let object = format!("the Boolean visibility result at offset {offset}");
+                    let reason = "a Boolean result is the device's occlusion query result, which \
+                                  Vulkan states only as zero or not without \
+                                  VK_QUERY_CONTROL_PRECISE_BIT"
+                        .to_owned();
+                    (object, reason)
+                });
+        }
         let mut stages = vk::PipelineStageFlags2::TRANSFER;
-        if combine.is_some() || resolve.is_some() {
+        if combine.is_some() {
             stages |= vk::PipelineStageFlags2::COMPUTE_SHADER;
         }
         core.device().shared().counts.pool_compiled(
@@ -1017,9 +1119,14 @@ impl Results {
             // pass that ended every query; the pools, the buffer, the sets and the uploads are
             // live until it completes (retained below, and with the command buffer); each copy
             // lies in the landing region or the continuations' upload region at a multiple of 8,
-            // and each onward copy in the landing region and in the buffer (checked when the
-            // offset was set).
+            // and each onward and inward copy in the landing region and in the buffer (checked
+            // when the offset was set).
             unsafe {
+                // The words the results accumulate into, into the landing region; the combine
+                // reads them after the barrier before it.
+                if !landing.inward.is_empty() {
+                    raw.cmd_copy_buffer(command_buffer, landing.to, landing.raw, &landing.inward);
+                }
                 for copy in &copies {
                     raw.cmd_copy_query_pool_results(
                         command_buffer,
@@ -1032,8 +1139,8 @@ impl Results {
                         vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
                     );
                 }
-                // The continuations ORed into their results, then the `Boolean` ones resolved.
-                for dispatches in [&combine, &resolve].into_iter().flatten() {
+                // The continuations combined into their results.
+                if let Some(dispatches) = &combine {
                     Barrier::everything().record(raw, command_buffer);
                     raw.cmd_bind_pipeline(
                         command_buffer,
@@ -1060,7 +1167,7 @@ impl Results {
         });
         core.barrier(Barrier::everything());
         core.retain(pools);
-        for dispatches in [combine, resolve].into_iter().flatten() {
+        if let Some(dispatches) = combine {
             core.retain(dispatches.sets);
         }
         core.retain(buffer);
@@ -1069,7 +1176,7 @@ impl Results {
 
 #[cfg(test)]
 mod tests {
-    use super::VisibilityResultMode;
+    use super::{VisibilityResultMode, VisibilityResultType};
 
     /// Metal's raw values round trip, and an undefined one is refused.
     #[test]
@@ -1086,5 +1193,25 @@ mod tests {
             [Ok(0), Ok(1), Ok(2)]
         );
         assert!(VisibilityResultMode::from_raw(3).is_err());
+    }
+
+    /// `MTLVisibilityResultType`'s raw values round trip, `Reset` is the default, and an undefined
+    /// value is refused.
+    #[test]
+    fn types_take_metals_raw_values() {
+        for kind in [
+            VisibilityResultType::Reset,
+            VisibilityResultType::Accumulate,
+        ] {
+            assert_eq!(VisibilityResultType::from_raw(kind.raw()), Ok(kind));
+        }
+        assert_eq!(
+            [0, 1].map(|raw| VisibilityResultType::from_raw(raw).map(|t| t.raw())),
+            [Ok(0), Ok(1)]
+        );
+        assert_eq!(VisibilityResultType::default(), VisibilityResultType::Reset);
+        for raw in [-1, 2] {
+            assert!(VisibilityResultType::from_raw(raw).is_err(), "{raw}");
+        }
     }
 }

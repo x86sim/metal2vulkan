@@ -7,9 +7,10 @@
 //! - [`function_key`] (`FunctionCompileKey`): the function's AIR hash, its entry name, the
 //!   function-constant values **as supplied** (by index and by name), the profile fingerprint
 //!   (policy included), the canonical lowering inputs ([`canonical_inputs`]), and, when the stage
-//!   links functions, each linked function's list, name, AIR hash, and constant values. A stage
-//!   without linked functions keeps the key it had before linking existed, and one compiled without
-//!   `emulated_simdgroups`, `dropped_vertex_layer`, `storage_view_slots`,
+//!   links functions, each linked function's list, name, specialized name, specialization, AIR
+//!   hash, and constant values. A stage without linked functions keeps the key it had before
+//!   linking existed, and one
+//!   compiled without `emulated_simdgroups`, `one_row`, `dropped_vertex_layer`, `storage_view_slots`,
 //!   `signed_color_attachments`, `multisampled`, `replay_bindings`, or `framebuffer_fetch` the key
 //!   it had before those inputs existed. A stage that links dynamic libraries records each library
 //!   its imports are searched in, in order (install name and content hash), and the install name
@@ -28,14 +29,52 @@ use crate::pipeline::descriptor::{
     StageInputDescriptor, StageSource, TessellationDescriptor,
 };
 
-/// What a compile key records of one linked function: the list it is in, its name, its AIR hash,
-/// and the constant values it was specialized with.
+/// What a compile key records of one linked function: the list it is in, its name, the
+/// specialized name it was made under, whether it was made specialized, its AIR hash, and the
+/// constant values it was specialized with.
 #[derive(Clone, Copy, Debug)]
 pub struct LinkedKey<'a> {
     pub list: LinkedList<'a>,
+    /// Its library function's name, which names its definition.
     pub name: &'a str,
+    /// Its specialized name (`MTLFunctionDescriptor.specializedName`), where it is another name
+    /// than `name`.
+    pub specialized_name: Option<&'a str>,
+    /// It was made specialized (`LinkedFunction::specialized`).
+    pub specialized: bool,
     pub air_hash: Hash256,
     pub constants: &'a FunctionConstantValues,
+}
+
+impl<'a> LinkedKey<'a> {
+    /// The name the function links under, which a visible-function reference names: its
+    /// specialized name, else its own.
+    pub fn link_name(&self) -> &'a str {
+        self.specialized_name.unwrap_or(self.name)
+    }
+
+    /// Whether `other` is the same function: the same AIR, name, specialized name, constant
+    /// values and specialization, in whichever list.
+    pub fn same_function(&self, other: &LinkedKey<'_>) -> bool {
+        self.air_hash == other.air_hash
+            && self.name == other.name
+            && self.specialized_name == other.specialized_name
+            && self.specialized == other.specialized
+            && self.constants == other.constants
+    }
+
+    /// Whether Metal answers `self`'s handle for `other` (`functionHandleWithFunction:`): the same
+    /// AIR, name, specialized name and constant values, whichever way each was made. Plain Metal
+    /// answers a stage's handle for a function object made by name, by descriptor or compiled to
+    /// a binary alike, whichever of them the stage linked, and nil for another function (an M3
+    /// Max under macOS 27.0.1), where [`LinkedKey::same_function`] tells their specialization
+    /// apart for the compile.
+    pub fn same_definition(&self, other: &LinkedKey<'_>) -> bool {
+        self.air_hash == other.air_hash
+            && self.name == other.name
+            && self.specialized_name == other.specialized_name
+            && self.constants == other.constants
+    }
 }
 
 /// What a compile key records of the dynamic libraries a stage links: each library its imports are
@@ -157,6 +196,9 @@ pub fn function_key(
     if inputs.emulated_simdgroups {
         h.bytes(b"emulated-simdgroups");
     }
+    if inputs.one_row {
+        h.bytes(b"one-row");
+    }
     if inputs.dropped_vertex_layer {
         h.bytes(b"dropped-vertex-layer");
     }
@@ -219,6 +261,11 @@ pub fn function_key(
             .bytes(format!("{:?}", inputs.ycbcr_planes_sampled).as_bytes());
     }
     // Appended only when set, as `storage_view_slots`.
+    if !inputs.texel_rows.is_empty() {
+        h.bytes(b"texel-rows")
+            .bytes(format!("{:?}", inputs.texel_rows).as_bytes());
+    }
+    // Appended only when set, as `storage_view_slots`.
     if !inputs.extended_range.is_empty() {
         h.bytes(b"extended-range")
             .bytes(format!("{:?}", inputs.extended_range).as_bytes());
@@ -271,8 +318,16 @@ pub fn function_key(
         h.bytes(b"max-call-stack-depth").u64(u64::from(k));
     }
     // Appended only when set.
+    if inputs.open_cl_mode {
+        h.bytes(b"open-cl-mode");
+    }
+    // Appended only when set.
     if inputs.flat_grid {
         h.bytes(b"flat-grid");
+    }
+    // Appended only when set.
+    if inputs.call_threadgroups {
+        h.bytes(b"call-threadgroups");
     }
     // Appended only when set.
     if inputs.render_target_array_index_varying {
@@ -337,6 +392,10 @@ pub fn function_key(
     if inputs.folded_groups {
         h.bytes(b"folded-groups");
     }
+    // Appended only when set.
+    if inputs.partial_threadgroups {
+        h.bytes(b"partial-threadgroups");
+    }
     // Appended only when set, in its derived `Debug` form (an ordered map of integers and plain
     // enums, a total encoding as `inputs_encoding`'s).
     if !inputs.zeroed_colors.is_empty() {
@@ -386,6 +445,11 @@ pub fn function_key(
     if let Some(function) = inputs.alpha_test {
         h.bytes(b"alpha-test")
             .bytes(&function.as_raw().to_le_bytes());
+    }
+    // Appended only when set.
+    if let Some(op) = inputs.logic_operation {
+        h.bytes(b"logic-operation")
+            .bytes(&op.as_raw().to_le_bytes());
     }
     // Appended only when set.
     if inputs.depth_compare_clamp_mask != 0 {
@@ -468,6 +532,18 @@ pub fn function_key(
     if let Some(bytes) = inputs.object_payload {
         h.bytes(b"object-payload").u64(u64::from(bytes));
     }
+    // Appended only when set.
+    if inputs.region_viewports {
+        h.bytes(b"region-viewports");
+    }
+    // Appended only when set.
+    if inputs.region_copies {
+        h.bytes(b"region-copies");
+    }
+    // Appended only when set.
+    if inputs.unit_axes != 0 {
+        h.bytes(b"unit-axes").u64(u64::from(inputs.unit_axes));
+    }
     // Appended only when present, so a stage that links nothing keeps its key: the tag's length
     // prefix keeps the encoding unambiguous.
     if !linked.is_empty() {
@@ -480,6 +556,11 @@ pub fn function_key(
                 LinkedList::Group(name) => h.u64(3).bytes(name.as_bytes()),
             };
             h.bytes(&l.air_hash).bytes(l.name.as_bytes());
+            match l.specialized_name {
+                None => h.u64(0),
+                Some(name) => h.u64(1).bytes(name.as_bytes()),
+            };
+            h.u64(u64::from(l.specialized));
             constants(&mut h, l.constants);
         }
     }
@@ -537,6 +618,15 @@ pub(crate) fn mesh_descriptor_key(
         alpha_to_one,
         support_indirect_command_buffers,
         texture_write_rounding_mode,
+        max_total_threads_per_object_threadgroup,
+        max_total_threads_per_mesh_threadgroup,
+        max_total_threadgroups_per_mesh_grid,
+        object_threadgroup_size_is_multiple_of_thread_execution_width,
+        mesh_threadgroup_size_is_multiple_of_thread_execution_width,
+        payload_memory_length,
+        max_vertex_amplification_count,
+        required_threads_per_object_threadgroup,
+        required_threads_per_mesh_threadgroup,
     } = d;
     let mut h = KeyHasher::new(b"metal2vulkan/mesh-descriptor-key/v1");
     h.bytes(profile);
@@ -559,6 +649,18 @@ pub(crate) fn mesh_descriptor_key(
         format!("{raster_sample_count} {alpha_to_coverage} {alpha_to_one}"),
         format!("{rasterization_enabled} {support_indirect_command_buffers}"),
         format!("{texture_write_rounding_mode:?}"),
+        format!(
+            "{max_total_threads_per_object_threadgroup:?} {max_total_threads_per_mesh_threadgroup:?} \
+             {max_total_threadgroups_per_mesh_grid:?}"
+        ),
+        format!(
+            "{object_threadgroup_size_is_multiple_of_thread_execution_width} \
+             {mesh_threadgroup_size_is_multiple_of_thread_execution_width}"
+        ),
+        format!("{payload_memory_length:?} {max_vertex_amplification_count}"),
+        format!(
+            "{required_threads_per_object_threadgroup:?} {required_threads_per_mesh_threadgroup:?}"
+        ),
     ];
     h.u64(fields.len() as u64);
     for field in &fields {
@@ -621,6 +723,7 @@ pub(crate) fn render_descriptor_key(
         needs_custom_border_color_samplers,
         vertex_amplification_mode,
         explicit_visibility_group_id,
+        open_gl_mode_enabled,
     } = private;
     let mut h = KeyHasher::new(b"metal2vulkan/render-descriptor-key/v1");
     h.bytes(profile);
@@ -655,12 +758,16 @@ pub(crate) fn render_descriptor_key(
              {clip_distance_enable_mask} {point_smooth_enabled} {point_coord_lower_left} \
              {point_size_output_vs} {two_side_enabled} {vertex_depth_compare_clamp_mask} \
              {fragment_depth_compare_clamp_mask} {depth_stencil_write_disabled} \
-             {needs_custom_border_color_samplers}{}",
+             {needs_custom_border_color_samplers}{}{}",
             sample_coverage.to_bits(),
             // Appended only past Metal's defaults, so every other descriptor keeps its key.
             match (*vertex_amplification_mode, *explicit_visibility_group_id) {
                 (0, u32::MAX) => String::new(),
                 (mode, group) => format!(" {mode} {group}"),
+            },
+            match open_gl_mode_enabled {
+                true => " opengl",
+                false => "",
             }
         ),
     ];

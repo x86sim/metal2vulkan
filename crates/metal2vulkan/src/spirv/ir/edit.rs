@@ -405,6 +405,8 @@ impl TypedModule {
         };
         let values = &self.values;
         self.non_uniform.retain(|v| !removed(v, values));
+        self.measured_roundings.retain(|v| !removed(v, values));
+        self.stored_texels.retain(|v| !removed(v, values));
         self.loops.retain(|l| at(&bmap, l.header.index()).is_some());
         for l in &mut self.loops {
             l.header = block(l.header);
@@ -646,6 +648,7 @@ impl TypedModule {
             entry: &self.entry,
             enabling: &self.enabling,
             per_primitive: &self.per_primitive,
+            offsets_from_seven_sixteenths: self.offsets_from_seven_sixteenths,
         };
         let (iface, reqs) = (interface(&view)?, recorded(&view, &self.subgroup)?);
         self.interface = iface;

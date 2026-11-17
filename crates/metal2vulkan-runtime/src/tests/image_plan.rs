@@ -7,8 +7,10 @@ use super::super::copy_plan::{copy_unit, BlitOption, ImageRegion};
 use super::super::driver_defects;
 use super::super::image_plan::{
     block_family, check_image_limits, compatible, cube_compatible, holds_srgb_twin, plan_image,
-    sample_count, srgb_twin, DepthImageFacts, ImageFacts, ImagePlan, ImageRefusal,
+    reordered_views, sample_count, srgb_twin, takes_views_of, view_formats, AnyViews,
+    DepthImageFacts, ImageFacts, ImagePlan, ImageRefusal, VIEWED_USAGES,
 };
+use super::super::linear_plan::linear_lack;
 use super::super::memory::MemoryClass;
 use super::super::pvrtc::{holds_blocks, image_buffer_region, image_region, CARRIERS};
 use super::super::sharing::Sharing;
@@ -31,11 +33,11 @@ use metal2vulkan::vk::{
     DriverId, Format, FormatFeatureFlags2, ImageAspectFlags, ImageCreateFlags, ImageType,
     ImageUsageFlags, SampleCountFlags,
 };
-use std::path::PathBuf;
+use std::collections::BTreeSet;
 
 /// Every committed profile's description and compile device (`validation/profiles/`).
 pub(super) fn committed() -> Vec<(String, DeviceDescription, Device)> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../metal2vulkan-validation/profiles");
+    let dir = metal2vulkan_devtools::validation_dir().join("profiles");
     let mut out: Vec<(String, DeviceDescription, Device)> = std::fs::read_dir(&dir)
         .expect("validation/profiles is readable")
         .map(|e| e.expect("directory entry").path())
@@ -60,6 +62,8 @@ pub(super) fn facts<'a>(desc: &'a DeviceDescription, device: &'a Device) -> Imag
         storage_multisample: desc.has(VkFeature::ShaderStorageImageMultisample),
         depth_images: DepthImageFacts::of(&desc.driver_facts()),
         linear_attachments: false,
+        // The facts outlive the call: each call's table of `device`'s views, kept for the test.
+        any_views: Box::leak(Box::default()),
     }
 }
 
@@ -201,16 +205,17 @@ fn check_plan(
         // Or, with extended usage, through the view of the format's word.
         let word = WordAttachment::of(pf, profile).map(|w| w.word_format());
         assert!(
-            supports(FormatUsage::ColorAttachment) || (extended && word.is_some_and(&viewable)),
+            supports(FormatUsage::ColorAttachment) || (extended && word.is_some_and(viewable)),
             "{what}"
         );
     }
     // A color attachment is an input attachment exactly where the device's framebuffer fetch
-    // reads input attachments.
+    // reads input attachments: in rasterization order, or, with neither ordered form, between
+    // draws.
     assert_eq!(
         plan.usage.contains(ImageUsageFlags::INPUT_ATTACHMENT),
         plan.usage.contains(ImageUsageFlags::COLOR_ATTACHMENT)
-            && profile.fragment().rasterization_order_color_access,
+            && crate::framebuffer_fetch::through_inputs(profile),
         "{what}"
     );
     if plan
@@ -613,6 +618,58 @@ fn srgb_twins_share_one_mutable_image() {
                 | ImageUsageFlags::TRANSFER_DST,
             "{name}"
         );
+    }
+}
+
+/// A texture of an 8-bit four-channel format that renders lists the views of its channel-order
+/// sibling and the sibling's twin (`BGRA8Unorm` and `BGRA8Unorm_sRGB` of an `RGBA8Unorm` texture),
+/// which Metal makes without `PixelFormatView` usage, where the device renders them directly: its
+/// image takes them, and a pass renders into such a view through a view of the image itself,
+/// unless their linear tiling lacks the texture's usages where its other formats' holds them: the
+/// plan then lists none of them, and its linear image lacks nothing. One that renders nothing
+/// takes none of them, nor does a format without a sibling.
+#[test]
+fn render_targets_take_their_channel_order_sibling_s_views() {
+    use PixelFormat as P;
+    let rt = TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET;
+    for (name, desc, device) in committed() {
+        let facts = facts(&desc, &device);
+        let profile = device.profile();
+        for (pf, sibling) in [
+            (P::RGBA8Unorm, P::BGRA8Unorm),
+            (P::BGRA8Unorm, P::RGBA8Unorm),
+            (P::RGBA8UnormSRGB, P::BGRA8UnormSRGB),
+            (P::BGRA8UnormSRGB, P::RGBA8UnormSRGB),
+        ] {
+            let what = format!("{name}: {pf:?}");
+            let views = reordered_views(pf);
+            assert_eq!(views, [sibling, srgb_twin(sibling).unwrap()], "{what}");
+            let l = layout(TextureType::Type2D, pf, 1, 1);
+            let Ok(plan) = plan_image(&l, rt, false, &facts) else {
+                continue;
+            };
+            check_plan(&name, pf, rt, &plan, &facts);
+            for &view in &views {
+                let direct = WordAttachment::of(view, profile).is_none();
+                let listed = view_formats(view, plan.usage, profile)
+                    .iter()
+                    .all(|&f| compatible(plan.format, f, true));
+                let what = format!("{what}: {view:?} -> {plan:?}");
+                if takes_views_of(&plan, view, profile) {
+                    assert!(direct && listed, "{what}");
+                } else if direct && listed {
+                    // Left out for the texture's linear image, which holds every other format.
+                    assert!(linear_lack(&plan, &facts).is_none(), "{what}");
+                    eprintln!("{what}: left out, its linear tiling lacks the texture's usages");
+                }
+            }
+            let read = plan_image(&l, TextureUsage::SHADER_READ, false, &facts).expect(&what);
+            assert!(!takes_views_of(&read, sibling, profile), "{what}: {read:?}");
+        }
+        let l = layout(TextureType::Type2D, P::RGBA16Float, 1, 1);
+        assert!(reordered_views(P::RGBA16Float).is_empty());
+        let plan = plan_image(&l, rt, false, &facts).expect(&name);
+        assert!(plan.view_formats.is_empty(), "{name}: {plan:?}");
     }
 }
 
@@ -1385,33 +1442,67 @@ fn compressed_formats_are_compatible_only_within_their_family() {
     assert_eq!(block_family(PixelFormat::R32Float), PixelFormat::R32Float);
 }
 
-/// A texture of ASTC's 4x2 or 8x4 formats, which Metal makes and no Vulkan block holds, is
-/// refused `NotImplemented(Format)` on every committed device, sampled or rendered to.
+/// A texture of ASTC's 4x2 or 8x4 formats, which Metal makes and no Vulkan block holds, plans its
+/// blocks in a carrier on every committed device that copies one (MoltenVK's among them), of
+/// every type Metal makes of one and every usage (`ShaderWrite` and `RenderTarget` unavailable),
+/// its decoded twin the profile's: 8-bit codes (`R8G8B8A8_UNORM`) for an LDR or sRGB form, halves
+/// (`R16G16B16A16_SFLOAT`) for an HDR one.
 #[test]
-fn astc_4x2_and_8x4_textures_are_refused_typed() {
+fn astc_4x2_and_8x4_textures_plan_in_a_carrier() {
+    use super::super::astc::{decode_of, CARRIERS as ASTC_CARRIERS};
+    use super::super::texture::decoded_twin::{twin_plan, TwinDecode};
+    use metal2vulkan::bind::{AstcDecode, AstcTexels};
     use PixelFormat as P;
+    let mut carried = 0;
     for (name, desc, device) in committed() {
         let facts = facts(&desc, &device);
-        for pf in [
-            P::ASTC4x2LDR,
-            P::ASTC4x2SRGB,
-            P::ASTC4x2HDR,
-            P::ASTC8x4LDR,
-            P::ASTC8x4SRGB,
-            P::ASTC8x4HDR,
+        let copies = FormatFeatureFlags2::TRANSFER_SRC | FormatFeatureFlags2::TRANSFER_DST;
+        if !(ASTC_CARRIERS.iter()).any(|&f| facts.optimal(f).contains(copies)) {
+            continue;
+        }
+        for (pf, twin) in [
+            (P::ASTC4x2LDR, Format::R8G8B8A8_UNORM),
+            (P::ASTC4x2SRGB, Format::R8G8B8A8_UNORM),
+            (P::ASTC4x2HDR, Format::R16G16B16A16_SFLOAT),
+            (P::ASTC8x4LDR, Format::R8G8B8A8_UNORM),
+            (P::ASTC8x4SRGB, Format::R8G8B8A8_UNORM),
+            (P::ASTC8x4HDR, Format::R16G16B16A16_SFLOAT),
         ] {
-            let l = layout(TextureType::Type2D, pf, 1, 1);
-            for usage in [TextureUsage::SHADER_READ, TextureUsage::RENDER_TARGET] {
-                match plan_image(&l, usage, false, &facts) {
-                    Err(ImageRefusal::Unsupported(u)) => {
-                        assert_eq!(u.feature, Feature::Format, "{name}: {pf:?}");
-                        assert_eq!(u.needs, Needs::NotImplemented, "{name}: {pf:?}: {u:?}");
-                    }
-                    other => panic!("{name}: {pf:?} {usage:?}: {other:?}"),
-                }
+            let decode = AstcDecode::of(pf).expect("a decode");
+            for ty in [
+                TextureType::Type2D,
+                TextureType::Type2DArray,
+                TextureType::Cube,
+                TextureType::Type3D,
+            ] {
+                let what = format!("{name} {pf:?} {ty:?}");
+                let l = layout(ty, pf, 1, 1);
+                let usage = TextureUsage::SHADER_READ
+                    | TextureUsage::SHADER_WRITE
+                    | TextureUsage::RENDER_TARGET;
+                let plan = plan_image(&l, usage, false, &facts).expect(&what);
+                assert!(
+                    ASTC_CARRIERS.contains(&plan.format),
+                    "{what}: {:?}",
+                    plan.format
+                );
+                assert_eq!(decode_of(&plan), Some(decode), "{what}");
+                assert!(
+                    plan.unavailable
+                        .contains(TextureUsage::SHADER_WRITE | TextureUsage::RENDER_TARGET),
+                    "{what}: {:?}",
+                    plan.unavailable
+                );
+                let texels = TwinDecode::Astc(decode, decode.form(AstcTexels::Unorm8));
+                assert_eq!(twin_plan(&plan, &l, texels, false).format, twin, "{what}");
             }
         }
+        carried += 1;
     }
+    assert!(
+        carried >= 5,
+        "{carried} committed devices hold them in a carrier"
+    );
 }
 
 /// Apple's extended-range formats are held raw in the unsigned integer format of their bytes,
@@ -1876,6 +1967,68 @@ fn a_block_writes_only_texture_s_image_is_a_shader_write_one_s() {
     assert!(stored > 100, "{stored}");
 }
 
+/// A multisample colour texture of `ShaderWrite` usage without `PixelFormatView` whose image takes
+/// no storage usage (the device stores no samples of it) is the image of the texture without
+/// `ShaderWrite`, on every committed profile and for every pixel format: its views listed, not a
+/// mutable image of any format (`image_plan.rs`'s `any_format`), so a driver that clears a
+/// multisample image fast only where its views are listed (ANV) clears it so. Where the device
+/// stores the samples, its image takes storage usage.
+#[test]
+fn a_multisample_shader_write_image_lists_its_views() {
+    let read = TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET;
+    let written = read | TextureUsage::SHADER_WRITE;
+    let (mut listed, mut stored) = (0, 0);
+    for (name, desc, device) in committed() {
+        let facts = facts(&desc, &device);
+        for &pf in PixelFormat::ALL {
+            if metal2vulkan::metal::format::is_depth_stencil(pf) {
+                continue;
+            }
+            let l = layout(TextureType::Type2DMultisample, pf, 4, 1);
+            let what = format!("{name}: {pf:?}");
+            let (Ok(r), Ok(w)) = (
+                plan_image(&l, read, false, &facts),
+                plan_image(&l, written, false, &facts),
+            ) else {
+                continue;
+            };
+            check_plan(&name, pf, written, &w, &facts);
+            if w.usage.contains(ImageUsageFlags::STORAGE) {
+                stored += 1;
+                continue;
+            }
+            assert_eq!(
+                (w.format, w.usage, w.flags, &w.view_formats),
+                (r.format, r.usage, r.flags, &r.view_formats),
+                "{what}"
+            );
+            assert!(
+                !w.flags.contains(ImageCreateFlags::MUTABLE_FORMAT) || !w.view_formats.is_empty(),
+                "{what}: {w:?}"
+            );
+            listed += 1;
+        }
+    }
+    assert!(listed > 100, "{listed}");
+    // The Iris Xe's 4x `RGBA8Unorm` one, which an ANV walk cleared slowly as a mutable image of
+    // any format.
+    let anv = committed()
+        .into_iter()
+        .find(|(name, _, _)| name == "intel-irisxe-rplp-anv")
+        .expect("the Iris Xe's profile");
+    let facts = facts(&anv.1, &anv.2);
+    let l = layout(
+        TextureType::Type2DMultisample,
+        PixelFormat::RGBA8Unorm,
+        4,
+        1,
+    );
+    let w = plan_image(&l, written, false, &facts).expect("4x RGBA8Unorm");
+    assert!(!w.usage.contains(ImageUsageFlags::STORAGE), "{w:?}");
+    assert!(!w.view_formats.is_empty(), "{w:?}");
+    eprintln!("multisample ShaderWrite images listed {listed}, stored {stored}");
+}
+
 /// A texture of `R10Unorm_X6` or `RG10Unorm_X12` (or of their `_sRGB` twins) holds its words raw
 /// in `R16_UINT` or `R16G16_UINT` for every usage, on every committed device, in memory of its own
 /// as much as over memory it is given: one plan for both, as Metal makes it from either
@@ -2073,4 +2226,128 @@ fn astc_carriers_hold_each_level_s_blocks() {
         }
     }
     assert!(carried > 0, "no committed device holds ASTC in a carrier");
+}
+
+/// Every ASTC HDR format's texture, of every type Metal makes of one (2D, 2D array, cube, cube
+/// array, 3D) and every usage (`ShaderWrite` and `RenderTarget` too, unavailable), plans on every
+/// committed device that holds ASTC LDR in a carrier: in its own `SFLOAT` block where the device
+/// samples it (MoltenVK on the M3 Max, its `textureCompressionASTC_HDR`), else its blocks in a
+/// carrier whose decoded twin holds Metal's halves (`R16G16B16A16_SFLOAT`), the RTX 5080's among
+/// them. (ASTC's 4x2 and 8x4 HDR formats, which no Vulkan block has, lie in a carrier everywhere:
+/// `astc_4x2_and_8x4_textures_plan_in_a_carrier`.)
+#[test]
+fn astc_hdr_textures_plan_natively_or_in_a_carrier() {
+    use super::super::astc::{decode_of, CARRIERS as ASTC_CARRIERS};
+    use super::super::texture::decoded_twin::{twin_plan, TwinDecode};
+    use metal2vulkan::bind::{AstcDecode, AstcTexels};
+    let hdr: Vec<PixelFormat> = (PixelFormat::ALL.iter().copied())
+        .filter(|&pf| AstcDecode::of(pf).is_some_and(|d| d.hdr) && direct_format(pf).is_some())
+        .collect();
+    assert_eq!(hdr.len(), 14);
+    let (mut native, mut carried) = (Vec::new(), Vec::new());
+    for (name, desc, device) in committed() {
+        let facts = facts(&desc, &device);
+        let copies = FormatFeatureFlags2::TRANSFER_SRC | FormatFeatureFlags2::TRANSFER_DST;
+        if !(ASTC_CARRIERS.iter()).any(|&f| facts.optimal(f).contains(copies)) {
+            continue;
+        }
+        for &pf in &hdr {
+            let decode = AstcDecode::of(pf).expect("a decode");
+            let block = direct_format(pf).expect("an SFLOAT block");
+            let own = facts
+                .optimal(block)
+                .contains(FormatFeatureFlags2::SAMPLED_IMAGE);
+            for ty in [
+                TextureType::Type2D,
+                TextureType::Type2DArray,
+                TextureType::Cube,
+                TextureType::CubeArray,
+                TextureType::Type3D,
+            ] {
+                let what = format!("{name} {pf:?} {ty:?}");
+                let l = layout(ty, pf, 1, if ty == TextureType::CubeArray { 6 } else { 1 });
+                let usage = TextureUsage::SHADER_READ
+                    | TextureUsage::SHADER_WRITE
+                    | TextureUsage::RENDER_TARGET;
+                let plan = plan_image(&l, usage, false, &facts).expect(&what);
+                assert!(
+                    plan.unavailable
+                        .contains(TextureUsage::SHADER_WRITE | TextureUsage::RENDER_TARGET),
+                    "{what}: {:?}",
+                    plan.unavailable
+                );
+                if own {
+                    assert_eq!(plan.format, block, "{what}");
+                    assert_eq!(decode_of(&plan), None, "{what}");
+                    continue;
+                }
+                assert!(
+                    ASTC_CARRIERS.contains(&plan.format),
+                    "{what}: {:?}",
+                    plan.format
+                );
+                assert_eq!(decode_of(&plan), Some(decode), "{what}");
+                let twin = TwinDecode::Astc(decode, decode.form(AstcTexels::Unorm8));
+                let twin = twin_plan(&plan, &l, twin, false);
+                assert_eq!(twin.format, Format::R16G16B16A16_SFLOAT, "{what}");
+                assert_eq!(twin.pixel_format, PixelFormat::RGBA16Float, "{what}");
+            }
+            match own {
+                true => native.push(name.clone()),
+                false => carried.push(name.clone()),
+            }
+        }
+    }
+    assert!(native.contains(&"moltenvk-m3".to_owned()), "{native:?}");
+    assert!(!carried.contains(&"moltenvk-m3".to_owned()), "{carried:?}");
+    for profile in [
+        "nvidia-rtx5080-laptop",
+        "lavapipe",
+        "amd-780m-radv",
+        "intel-arl-anv",
+    ] {
+        assert_eq!(
+            carried.iter().filter(|name| *name == profile).count(),
+            14,
+            "{profile}: {carried:?}"
+        );
+    }
+}
+
+/// A device's table of every format the runtime views a texture of any pixel format as
+/// (`AnyViews`, which a plan whose views take any compatible format is checked against at each
+/// making): each set of the usages of `VIEWED_USAGES` is worked out once and kept, and lists
+/// what each pixel format's views list for it (`view_formats`), which no other usage changes.
+#[test]
+fn a_device_works_out_the_formats_of_any_view_once() {
+    let others = ImageUsageFlags::TRANSFER_SRC
+        | ImageUsageFlags::TRANSFER_DST
+        | ImageUsageFlags::INPUT_ATTACHMENT
+        | ImageUsageFlags::TRANSIENT_ATTACHMENT;
+    for (name, _, device) in committed() {
+        let profile = device.profile();
+        let table = AnyViews::default();
+        for set in 0..1usize << VIEWED_USAGES.len() {
+            let usage = (VIEWED_USAGES.iter().enumerate())
+                .filter(|&(n, _)| set & 1 << n != 0)
+                .fold(ImageUsageFlags::empty(), |usage, (_, &bit)| usage | bit);
+            let mut each = BTreeSet::new();
+            for &pf in PixelFormat::ALL {
+                let views = view_formats(pf, usage, profile);
+                assert_eq!(
+                    view_formats(pf, usage | others, profile),
+                    views,
+                    "{name}: {pf:?} for {usage:?}"
+                );
+                each.extend(views);
+            }
+            let first = table.of(usage | others, profile);
+            let each: Vec<Format> = each.into_iter().collect();
+            assert_eq!(first, each.as_slice(), "{name}: {usage:?}");
+            assert!(
+                std::ptr::eq(first, table.of(usage, profile)),
+                "{name}: the views of {usage:?} were worked out again"
+            );
+        }
+    }
 }

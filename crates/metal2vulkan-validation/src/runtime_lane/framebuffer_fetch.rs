@@ -113,6 +113,10 @@
 //!   one minus the source alpha, fetched by `fbl_fetch_blend16`'s functions, which return a loaded
 //!   `half4` or `float4`: Metal's blend in every channel. In the pixel interlock
 //!   the function computes it, no Vulkan blend applying to the storage write.
+//! - **A read the constants make dead** (`dead_reads.rs`): `dfk_dead_fetch`'s functions,
+//!   specialized so their read of a blended `BGRA8Unorm` target folds away, draw as plain
+//!   pipelines on every device (no storage form, no input attachment, no fetch notice, the device's
+//!   blend: Metal's texels within one code); specialized live, they take the device's fetch form.
 //! - **A BGRA-order target** (`bgra.rs`): a `BGRA8Unorm` target (and `RGBA8Unorm` beside it)
 //!   whose channels take every byte, halved by `fetch_ordered` one to three times in a pass,
 //!   single-sampled and at 4x, under a mask of every channel and of red and alpha, beside an
@@ -138,10 +142,12 @@
 //!   planes' split before it and merge after it.
 
 mod beside_depth;
+mod between_draws;
 mod bgra;
 mod blend16;
 mod blend8;
 mod coverage_chain;
+mod dead_reads;
 mod generic_blend;
 mod planes;
 mod returned_depth;
@@ -163,20 +169,24 @@ use super::resolves::{lane, quiet, Lane, Shape, FULL, ONE, WHITE};
 use super::Messages;
 use crate::air_library::AirLibrary;
 use crate::runtime_lane::{buffer_with, pipelines_settled, read_buffer, WAIT};
-use metal2vulkan::device::{DriverFact, VkFeature};
+use metal2vulkan::device::{DriverFact, FormatUsage, VkFeature};
+use metal2vulkan::error::Feature;
 use metal2vulkan::metal::{
     BlendFactor, IndexType, IndirectCommandType, PixelFormat, PrimitiveType, TextureType,
     TextureUsage,
 };
-use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
+use metal2vulkan::pipeline::{
+    ColorAttachmentDescriptor, PrecisionNote, RenderPipelineDescriptor, StageSource,
+};
+use metal2vulkan::vk;
 use metal2vulkan_devtools::llvm_assemble;
 use metal2vulkan_runtime::{
-    BlitOption, Buffer, ClearColor, Degradation, Error, IndirectCommandBufferDescriptor, Library,
-    LoadAction, PipelineOptions, RenderPassDescriptor, RenderPipelineState, ResourceOptions, Size,
-    StoreAction, Texture, TextureDescriptor, VisibilityResultMode, VkImageLayouts,
+    BlitOption, Buffer, ClearColor, Degradation, Device, Error, IndirectCommandBufferDescriptor,
+    Library, LoadAction, PipelineOptions, RenderPassDescriptor, RenderPipelineState,
+    ResourceOptions, Size, StoreAction, Texture, TextureDescriptor, VisibilityResultMode,
+    VkImageLayouts,
 };
 use std::collections::BTreeSet;
-use std::path::Path;
 
 /// The fullscreen triangle's depth.
 const Z: f32 = 0.5;
@@ -186,11 +196,53 @@ const TEXELS: usize = 16;
 
 /// The engine fixture `stem`'s library on `lane`'s device.
 fn library(lane: &Lane, stem: &str) -> Library {
-    let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/public/engine")
-        .join(format!("{stem}.ll"));
+    fixture(&lane.device, stem)
+}
+
+/// The engine fixture `stem`'s library on `device`.
+fn fixture(device: &Device, stem: &str) -> Library {
+    let ll = metal2vulkan_devtools::engine_dir().join(format!("{stem}.ll"));
     let bitcode = llvm_assemble(&ll).unwrap();
-    lane.device.new_library_with_air(&bitcode).unwrap()
+    device.new_library_with_air(&bitcode).unwrap()
+}
+
+/// Whether `device` takes a framebuffer fetch in an ordered form: the gate every lane test of an
+/// ordered fetch opens with, skipping where it answers false. A device whose profile has a form
+/// that orders a fetch within a draw, rasterization-order color attachment access (input
+/// attachments) or the fragment shader pixel interlock (the storage form), answers true and makes
+/// nothing, so a test's count of makings is its own (`degrade_notices::assert_made_once`). One with
+/// neither (RADV on the RX 550, GCN4) fetches through input attachments ordered between draws
+/// alone, whose answers `between_draws.rs` tests: it must make a fetching pipeline
+/// (`fragment_fetch`'s `fetch_scalar`) whose fragment stage records
+/// `PrecisionNote::UnorderedFetchWithinDraw`, printed as a `FETCH-BETWEEN-DRAWS` line before it
+/// answers false. Any other answer there fails the test.
+pub(super) fn fetches(device: &Device) -> bool {
+    let fragment = device.compile_device().profile().fragment();
+    if fragment.rasterization_order_color_access || fragment.pixel_interlock {
+        return true;
+    }
+    let vertices = fixture(device, "rt6_resolves");
+    let fetch = fixture(device, "fragment_fetch");
+    let descriptor = pipeline_descriptor(
+        &vertices,
+        (&fetch, "fetch_scalar"),
+        &[PixelFormat::R32Float],
+        1,
+    );
+    let name = device.name();
+    let note = Degradation::from_precision_note(PrecisionNote::UnorderedFetchWithinDraw);
+    assert!(
+        made_render_kinds(device, &descriptor).contains(&note),
+        "{name}: a fetch without an ordered form records no {}",
+        note.code()
+    );
+    match device.new_render_pipeline_state(&descriptor, &PipelineOptions::default()) {
+        Ok(_) => {
+            println!("FETCH-BETWEEN-DRAWS on {name}: input attachments ordered between draws");
+            false
+        }
+        Err(error) => panic!("{name}: a fetching pipeline was refused: {error}"),
+    }
 }
 
 /// A pipeline of the fullscreen triangle (of `vertices`) and `fragment` of `library`, drawing
@@ -318,13 +370,37 @@ fn blended_descriptor(vertices: &Library, colors: &[PixelFormat]) -> RenderPipel
 }
 
 /// Whether the device's framebuffer fetch reads input attachments: it has rasterization-order
-/// color attachment access, which the compile layer orders such reads with.
+/// color attachment access, which the compile layer orders such reads with, or neither that nor
+/// the pixel interlock, where barriers order them between draws alone.
 pub(super) fn through_inputs(lane: &Lane) -> bool {
-    lane.device
-        .compile_device()
-        .profile()
-        .fragment()
-        .rasterization_order_color_access
+    let fragment = lane.device.compile_device().profile().fragment();
+    fragment.rasterization_order_color_access || !fragment.pixel_interlock
+}
+
+/// Whether a single-sampled pass on the lane's device holds an extended-range color's `half`
+/// shadow (`metal2vulkan_runtime`'s `render/extended_shadow.rs`): every device that fetches in the
+/// pixel interlock, whose storage form reads and writes it, and one that fetches through input
+/// attachments where its functions read and write the shadow beside them in the interlock, with
+/// fragment stores and the shadow's `R16G16B16A16_SFLOAT` as a storage image (lavapipe).
+pub(super) fn holds_extended_shadows(lane: &Lane) -> bool {
+    let profile = lane.device.compile_device().profile();
+    !through_inputs(lane)
+        || (profile.fragment().pixel_interlock
+            && (profile.enabled().features).contains(&VkFeature::FragmentStoresAndAtomics)
+            && profile.supports_format(vk::Format::R16G16B16A16_SFLOAT, FormatUsage::StorageImage))
+}
+
+/// Whether the device splits a pass before a draw that reads and writes a color through the
+/// pixel interlock after an earlier draw of its instance wrote it: in the pixel interlock, on a
+/// driver whose such draws race under load (`DriverFact::InterlockedDrawsRaceUnderLoad`) and
+/// that is not measured to order them by the interlock alone (`DriverFact::InterlockOrdersDraws`).
+/// Such a split is announced (`render-pass-split`, and `memoryless-backed` for the backing it
+/// gives a memoryless attachment) on every device.
+fn splits_interlocked_writes(lane: &Lane) -> bool {
+    let facts = &lane.device.properties().driver_facts;
+    !through_inputs(lane)
+        && !facts.contains(&DriverFact::InterlockOrdersDraws)
+        && facts.contains(&DriverFact::InterlockedDrawsRaceUnderLoad)
 }
 
 /// Whether the device announces a split the interlock alone makes (`render-pass-split`, and
@@ -446,6 +522,9 @@ fn multisampled(lane: &Lane, name: &str, ran: Result<Vec<u8>, Error>, texels: &[
 #[test]
 fn fetches_read_every_earlier_fragment_of_the_pixel() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let vertices = library(&lane, "rt6_resolves");
     let fetch = library(&lane, "fragment_fetch");
     let pf = PixelFormat::R32Float;
@@ -482,10 +561,45 @@ fn fetches_read_every_earlier_fragment_of_the_pixel() {
     quiet(lane, &messages);
 }
 
+/// A pass's first draw that fetches its color reads what the pass's load wrote: the clear, in a
+/// pass that clears a target holding other texels from before it. `fetch_scalar` halves what it
+/// fetched, so the pass before, cleared to 0.5, leaves 0.25, and the pass that clears it to 0.75
+/// leaves 0.375, where a fetch of the texels from before the pass would leave 0.125.
+#[test]
+fn a_first_fetch_after_a_clear_reads_the_clear() {
+    let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
+    let vertices = library(&lane, "rt6_resolves");
+    let fetch = library(&lane, "fragment_fetch");
+    let pf = PixelFormat::R32Float;
+    let ran = (|| {
+        let halve = pipeline(&lane, &vertices, (&fetch, "fetch_scalar"), &[pf], 1)?;
+        let target = lane.texture(pf, ONE, TextureUsage::RENDER_TARGET);
+        for clear in [0.5, 0.75] {
+            let targets = [(
+                &target,
+                ClearColor::new(clear, 0.0, 0.0, 0.0),
+                StoreAction::Store,
+            )];
+            steps(&lane, &pass(&targets, None), &[&halve])?;
+        }
+        Ok(lane.read(&target, (0, 0), 4, BlitOption::None))
+    })();
+    let halved = 0.375f32.to_le_bytes().repeat(TEXELS);
+    expect(&lane, "a first fetch after a clear", ran, &halved);
+    drop(cache);
+    quiet(lane, &messages);
+}
+
 /// Three integer read-modify-writes of the pixel, one a draw, in order (the module docs).
 #[test]
 fn integer_read_modify_writes_follow_draw_order() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let vertices = library(&lane, "rt6_resolves");
     let count = library(&lane, "exf_fetch_count");
     let pf = PixelFormat::RGBA32Uint;
@@ -513,6 +627,9 @@ fn integer_read_modify_writes_follow_draw_order() {
 #[test]
 fn memoryless_attachments_are_fetched() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let vertices = library(&lane, "rt6_resolves");
     let unwritten = library(&lane, "exf2_fetch_unwritten");
     let pf = PixelFormat::RGBA32Uint;
@@ -560,6 +677,9 @@ fn memoryless_attachments_are_fetched() {
 #[test]
 fn a_dont_care_memoryless_attachment_reads_zero() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let vertices = library(&lane, "rt6_resolves");
     let unwritten = library(&lane, "exf2_fetch_unwritten");
     let pf = PixelFormat::RGBA32Uint;
@@ -617,6 +737,9 @@ fn a_dont_care_memoryless_attachment_reads_zero() {
 #[test]
 fn a_memoryless_attachment_stepped_after_an_inline_read_starts_from_zero() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let vertices = library(&lane, "rt6_resolves");
     let unwritten = library(&lane, "exf2_fetch_unwritten");
     let stepping = library(&lane, "mli_memoryless_step");
@@ -706,6 +829,9 @@ fn a_memoryless_attachment_stepped_after_an_inline_read_starts_from_zero() {
 #[test]
 fn a_left_out_color_s_framebuffer_view_is_a_placeholder() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let vertices = library(&lane, "rt6_resolves");
     let unwritten = library(&lane, "exf2_fetch_unwritten");
     let pf = PixelFormat::RGBA32Uint;
@@ -789,20 +915,33 @@ fn a_left_out_color_s_framebuffer_view_is_a_placeholder() {
 /// first fold, whose draws read and write the colors as storage images, the memoryless one's
 /// backing arriving with it; through input attachments before the first step, a write of the
 /// memoryless color (`WorkCounts::inline_memoryless_write_splits`). The instance after the split
-/// records inline too, after the backing is cleared (`render/inline_splits.rs`).
+/// records inline too, after the backing is cleared (`render/inline_splits.rs`). Where the device
+/// splits before a draw that reads and writes a color an earlier draw of its instance wrote in the
+/// interlock ([`splits_interlocked_writes`]), each pass splits before its two steps and its second
+/// fold too. Which of the instances after those record inline is the inline rule's and is not held
+/// here: on the M3 Max the first pass's recorded in secondaries and the second's inline.
 #[test]
 fn a_memoryless_attachment_fetched_after_a_plain_inline_draw_starts_from_zero() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let vertices = library(&lane, "rt6_resolves");
     let unwritten = library(&lane, "exf2_fetch_unwritten");
     let stepping = library(&lane, "mli_memoryless_step");
     let pf = PixelFormat::RGBA32Uint;
+    // A pass's passes inline, splits before a write of the memoryless color, instances inline
+    // after a split, and splits before a draw after interlocked writes.
     let counted = || {
         let counts = lane.device.work_counts();
-        let splits = counts.inline_memoryless_write_splits;
-        (counts.inline_passes, splits, counts.inline_split_instances)
+        [
+            counts.inline_passes,
+            counts.inline_memoryless_write_splits,
+            counts.inline_split_instances,
+            counts.instance_splits_interlocked_writes,
+        ]
     };
-    let before = counted();
+    let mut counts = Vec::new();
     let ran = (|| {
         let seed = pipeline(
             &lane,
@@ -836,12 +975,14 @@ fn a_memoryless_attachment_fetched_after_a_plain_inline_draw_starts_from_zero() 
         unloaded.color_attachments[1].load_action = LoadAction::DontCare;
         let mut read = Vec::new();
         for _ in 0..2 {
+            let before = counted();
             steps(&lane, &unloaded, &[&seed, &fold, &step, &step, &fold])?;
+            let after = counted();
+            counts.push([0, 1, 2, 3].map(|i| after[i] - before[i]));
             read.extend(lane.read(&count, (0, 0), 16, BlitOption::None));
         }
         Ok(read)
     })();
-    let (inline, splits, later) = counted();
     let texel: Vec<u8> = (1u32..=4).flat_map(|c| (c * 11).to_le_bytes()).collect();
     expect(
         &lane,
@@ -849,22 +990,30 @@ fn a_memoryless_attachment_fetched_after_a_plain_inline_draw_starts_from_zero() 
         ran,
         &texel.repeat(2 * TEXELS),
     );
-    let (inline, splits) = (inline - before.0, splits - before.1);
-    let later = later - before.2;
     eprintln!(
-        "a memoryless attachment fetched after a plain inline draw on {}: {inline} passes \
-         inline, {splits} split before a write of it, {later} instances inline after a split",
+        "a memoryless attachment fetched after a plain inline draw on {}: each pass's passes \
+         inline, splits before a write of it, instances inline after a split and splits before \
+         a draw after interlocked writes {counts:?}",
         lane.device.name()
     );
-    let written = match through_inputs(&lane) {
-        true => 2,
+    let written = u64::from(through_inputs(&lane));
+    let raced = match splits_interlocked_writes(&lane) {
+        true => 3,
         false => 0,
     };
-    assert_eq!(
-        (inline, splits, later),
-        (2, written, 2),
-        "inline, and split into an instance inline too"
-    );
+    for &[inline, splits, later, races] in &counts {
+        assert_eq!(
+            (inline, splits, races),
+            (1, written, raced),
+            "inline, split before a write of the memoryless color, and before draws after \
+             interlocked writes: {counts:?}"
+        );
+        assert!(
+            (1..=1 + raced).contains(&later),
+            "split into an instance inline too: {counts:?}"
+        );
+    }
+    assert_eq!(counts.len(), 2, "the passes counted");
     drop(cache);
     quiet(lane, &messages);
 }
@@ -904,6 +1053,9 @@ fn passes(
 #[test]
 fn a_queue_keeps_one_memoryless_backing_for_its_passes() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let vertices = library(&lane, "rt6_resolves");
     let unwritten = library(&lane, "exf2_fetch_unwritten");
     let pf = PixelFormat::RGBA32Uint;
@@ -979,6 +1131,9 @@ fn a_queue_keeps_one_memoryless_backing_for_its_passes() {
 fn a_queue_keeps_a_memoryless_backing_for_each_shape_it_renders() {
     const SIDES: u64 = 12;
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let vertices = library(&lane, "rt6_resolves");
     let unwritten = library(&lane, "exf2_fetch_unwritten");
     let pf = PixelFormat::RGBA32Uint;
@@ -1041,6 +1196,9 @@ fn a_queue_keeps_a_memoryless_backing_for_each_shape_it_renders() {
 fn visibility_results_span_split_passes() {
     use VisibilityResultMode::{Boolean, Counting, Disabled};
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let precise = lane
         .device
         .properties()
@@ -1106,11 +1264,23 @@ fn visibility_results_span_split_passes() {
         want.extend(&pattern[24..]);
         eprintln!("refused: Counting across a split on {device}: no occlusionQueryPrecise");
     }
-    assert_eq!(
-        read_buffer(&results, 0, 32).unwrap(),
-        want,
-        "the results on {device}"
-    );
+    // The three `Boolean` words by their contract (`visibility::by_contract`): nonzero where a
+    // sample passed, the device's own value.
+    let read = read_buffer(&results, 0, 32).unwrap();
+    let words: Vec<u64> = read
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|w| u64::from_le_bytes(*w))
+        .collect();
+    let unwritten = u64::from_le_bytes(pattern[..8].try_into().unwrap());
+    let mut read: Vec<u8> =
+        super::visibility::by_contract(words[..3].to_vec(), &[0, 1, 2], unwritten)
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+    read.extend(words[3].to_le_bytes());
+    assert_eq!(read, want, "the results on {device}");
     let ran = Ok(lane.read(&target, (0, 0), 4, BlitOption::None));
     let texel = if precise { 0.5f32 } else { 0.25 };
     expect(
@@ -1134,7 +1304,10 @@ pub(super) const FETCHES: [Degradation; 3] = [
 /// `exf_fetch_count` three times; a `SIDE`² `R32Float` one drawn white under a blend
 /// ([`blended_white`]), then fetched by `fetch_scalar`; and the memoryless pass above. Through the pixel interlock the second
 /// splits (announced but where the device runs such a split no slower than whole), the third backs
-/// its memoryless attachment, and each is announced once. A fetched texture renders into a scratch
+/// its memoryless attachment, and each is announced once. Where the device splits before a draw
+/// that reads and writes a color an earlier draw of its instance wrote in the interlock
+/// ([`splits_interlocked_writes`]), the first and third split before their second and third
+/// draws, which is announced too. A fetched texture renders into a scratch
 /// image only where the device lays its image out otherwise with `STORAGE`, the device's own
 /// answer, which the lane does not foresee: where it does, the scratch is announced once, naming
 /// one of the two fetched textures, the first the device met so. Measured at `caea7050`: MoltenVK
@@ -1143,6 +1316,9 @@ pub(super) const FETCHES: [Degradation; 3] = [
 #[test]
 fn fetches_degrade_once_per_kind() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let device = lane.device.name().to_owned();
     let vertices = library(&lane, "rt6_resolves");
     let fetch = library(&lane, "fragment_fetch");
@@ -1205,7 +1381,9 @@ fn fetches_degrade_once_per_kind() {
         .into_iter()
         .filter(|&kind| match kind {
             Degradation::FetchThroughScratch => scratch.is_some(),
-            Degradation::RenderPassSplit => announces_interlock_splits(&lane),
+            Degradation::RenderPassSplit => {
+                announces_interlock_splits(&lane) || splits_interlocked_writes(&lane)
+            }
             _ => interlock,
         })
         .collect();
@@ -1277,6 +1455,9 @@ fn sampled(lane: &Lane, texture: &Texture) -> Vec<u8> {
 #[test]
 fn fetched_textures_load_store_and_reach_later_passes() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let device = lane.device.name();
     let vertices = library(&lane, "rt6_resolves");
     let fetch = library(&lane, "fragment_fetch");
@@ -1341,6 +1522,9 @@ fn fetched_textures_load_store_and_reach_later_passes() {
 #[test]
 fn a_callers_image_without_the_fetch_usage_fetches_through_a_scratch() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let device = lane.device.name().to_owned();
     let vertices = library(&lane, "rt6_resolves");
     let fetch = library(&lane, "fragment_fetch");
@@ -1528,10 +1712,14 @@ fn a_callers_image_without_the_fetch_usage_fetches_through_a_scratch() {
 /// white under a blend ([`blended_white`]), then `fetch_scalar`, holds 0.5 too, and in the pixel
 /// interlock splits there too. A split is announced, and the backing, once each (at the plain
 /// draws' pass), but on a device whose driver runs such a split no slower than whole, where
-/// neither is.
+/// neither is unless the device also splits before the last `fetch_scalar`, which reads and
+/// writes the color the one before it wrote in the interlock ([`splits_interlocked_writes`]).
 #[test]
 fn a_plain_draw_before_a_fetch_takes_the_devices_faster_form() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let device = lane.device.name().to_owned();
     let vertices = library(&lane, "rt6_resolves");
     let fetch = library(&lane, "fragment_fetch");
@@ -1587,7 +1775,8 @@ fn a_plain_draw_before_a_fetch_takes_the_devices_faster_form() {
     expect(&lane, "after an indexed plain draw", indexed, &texels(0.5));
     let interlock = !through_inputs(&lane);
     let announced_split = |splits: bool| -> Vec<Degradation> {
-        let announced = splits && announces_interlock_splits(&lane);
+        let announced =
+            splits && (announces_interlock_splits(&lane) || splits_interlocked_writes(&lane));
         split.into_iter().filter(|_| announced).collect()
     };
     let kinds = announced_split(interlock);
@@ -1659,6 +1848,9 @@ fn a_plain_draw_before_a_fetch_takes_the_devices_faster_form() {
 #[test]
 fn a_callers_multisampled_image_without_the_fetch_usage_fetches_through_a_scratch() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let device = lane.device.name().to_owned();
     let vertices = library(&lane, "rt6_resolves");
     let fetch = library(&lane, "fragment_fetch");
@@ -1794,6 +1986,37 @@ fn cleared(lane: &Lane, texture: &Texture, clear: ClearColor, bytes: u64) -> Vec
     lane.read(texture, (0, 0), bytes, BlitOption::None)
 }
 
+/// Whether `got`, a fetched attachment's texels of `pf` cleared to `clear`, holds the clear as
+/// `reference` holds it (a pass that only clears, [`cleared`]): byte for byte, but where the
+/// device's clear is not Metal's conversion (no `DriverFact::ColorClearIsMetals`) an 8-bit unorm
+/// channel may hold, in each, either of the two codes nearest the clear's scaled value, which
+/// Vulkan lets a clear store (the RTX 5080 Laptop GPU's load operation of a pass with a draw
+/// stores `RG8Unorm`'s 0.5, 127.5 codes, as 127, and its pass without one as 128).
+fn clears_alike(
+    lane: &Lane,
+    pf: PixelFormat,
+    clear: ClearColor,
+    got: &[u8],
+    reference: &[u8],
+) -> bool {
+    let metals = (lane.device.properties().driver_facts).contains(&DriverFact::ColorClearIsMetals);
+    let channels = match pf {
+        PixelFormat::RG8Unorm => 2,
+        PixelFormat::RGBA8Unorm => 4,
+        _ => return got == reference,
+    };
+    if metals || got.len() != reference.len() {
+        return got == reference;
+    }
+    let values = [clear.red, clear.green, clear.blue, clear.alpha];
+    let near = |code: u8, i: usize| {
+        let r = f64::from((values[i % channels] as f32).clamp(0.0, 1.0)) * 255.0;
+        (f64::from(code) - r).abs() < 1.0
+    };
+    (got.iter().zip(reference).enumerate())
+        .all(|(i, (&g, &r))| g == r || (near(g, i) && near(r, i)))
+}
+
 /// Bytes of one texel of the formats `fetched_attachments_clear_as_the_load_action_does` clears.
 fn texel_bytes(pf: PixelFormat) -> u64 {
     match pf {
@@ -1805,7 +2028,9 @@ fn texel_bytes(pf: PixelFormat) -> u64 {
 }
 
 /// A fetched attachment the function only reads, cleared and stored by a pass of one draw,
-/// holds the texels the clear stores as a load operation, for each format (the module docs).
+/// holds the texels the clear stores as a load operation, for each format (the module docs; an
+/// 8-bit unorm channel of a device whose clear is not Metal's, either code nearest the clear:
+/// [`clears_alike`]).
 /// A format the device does not store, which the interlock form needs, is refused at the
 /// pipeline (`Unsupported`), printed.
 #[test]
@@ -1920,10 +2145,12 @@ fn fetched_attachments_clear_as_the_load_action_does() {
             },
         )
         .unwrap();
-        assert_eq!(
-            lane.read(&extra, (0, 0), bytes, BlitOption::None),
-            reference,
-            "the cleared extra of {pf:?} on {device}"
+        let got = lane.read(&extra, (0, 0), bytes, BlitOption::None);
+        assert!(
+            clears_alike(&lane, pf, extra_clear, &got, &reference),
+            "the cleared extra of {pf:?} on {device}: {:02x?}, the clear alone {:02x?}",
+            &got[..got.len().min(16)],
+            &reference[..reference.len().min(16)]
         );
         eprintln!(
             "framebuffer fetch of a cleared {pf:?} on {device} through {}: the load action's texels",
@@ -1981,6 +2208,9 @@ fn indirect_pipeline_at(
 #[test]
 fn indirect_render_commands_fetch_as_the_encoder_s_draws() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let vertices = library(&lane, "rt6_resolves");
     let fetch = library(&lane, "fragment_fetch");
     let pf = PixelFormat::R32Float;
@@ -2161,6 +2391,9 @@ fn execute_between(
 #[test]
 fn indirect_render_commands_fetch_multisampled_attachments_as_the_encoder_s_draws() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let vertices = library(&lane, "rt6_resolves");
     let fetch = library(&lane, "fragment_fetch");
     let pf = PixelFormat::R32Float;
@@ -2244,6 +2477,9 @@ fn indirect_render_commands_fetch_multisampled_attachments_as_the_encoder_s_draw
 #[test]
 fn indirect_render_commands_fetch_a_callers_image_through_a_scratch() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let device = lane.device.name().to_owned();
     let vertices = library(&lane, "rt6_resolves");
     let fetch = library(&lane, "fragment_fetch");
@@ -2368,9 +2604,12 @@ fn halves(lanes: &[f32]) -> Vec<u8> {
 /// checks the blend's bytes against Metal's).
 #[test]
 fn a_guests_fetching_pipeline_blends_an_extended_range_attachment() {
-    use metal2vulkan::error::{Feature, Needs};
+    use metal2vulkan::error::Needs;
     use metal2vulkan::metal::{BlendFactor, ColorWriteMask};
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let vertices = library(&lane, "rt6_resolves");
     let coverage = library(&lane, "con_fetch_coverage");
     let device = lane.device.name();
@@ -2524,10 +2763,13 @@ fn a_guests_fetching_pipeline_blends_an_extended_range_attachment() {
 /// input attachments. A device whose fetch is neither refuses the pipeline by the format, printed.
 #[test]
 fn a_discarding_fetch_stores_only_what_metals_later_tests_keep() {
-    use metal2vulkan::error::{BindError, Feature, Needs};
+    use metal2vulkan::error::{BindError, Needs};
     use metal2vulkan::metal::state::DepthStencilDescriptor;
     use metal2vulkan::metal::{BlendFactor, ColorWriteMask, CompareFunction};
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let vertices = library(&lane, "rt6_resolves");
     let tested = library(&lane, "tsw_fetch_discard");
     let device = lane.device.name();
@@ -2797,10 +3039,13 @@ fn a_discarding_fetch_stores_only_what_metals_later_tests_keep() {
 /// refuses the pipeline by the format, printed.
 #[test]
 fn a_state_storing_before_its_tests_makes_its_first_draw_s_pipeline_at_creation() {
-    use metal2vulkan::error::{Feature, Needs};
+    use metal2vulkan::error::Needs;
     use metal2vulkan::metal::state::DepthStencilDescriptor;
     use metal2vulkan::metal::{BlendFactor, ColorWriteMask, CompareFunction};
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let vertices = library(&lane, "rt6_resolves");
     let tested = library(&lane, "tsw_fetch_discard");
     let device = lane.device.name();
@@ -2960,6 +3205,9 @@ fn a_state_storing_before_its_tests_makes_its_first_draw_s_pipeline_at_creation(
 fn masked_fetched_writes_keep_the_channels_the_mask_leaves_out() {
     use metal2vulkan::metal::{BlendFactor, ColorWriteMask};
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let vertices = library(&lane, "rt6_resolves");
     let coverage = library(&lane, "con_fetch_coverage");
     let device = lane.device.name();

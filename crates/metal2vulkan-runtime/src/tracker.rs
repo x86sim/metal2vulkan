@@ -7,7 +7,7 @@
 //!   encoder's dispatches run in encoded order: `MTLDispatchTypeSerial` "dispatches are executed
 //!   in dispatched order", and a memory barrier on a serial encoder is "allowed, but ignored", so
 //!   the order covers untracked resources too (Metal's headers; documented, not measured). Before
-//!   each command, [`EncoderUses::barrier`] compares its uses with the encoder's earlier commands:
+//!   each command, [`EncoderUses::order`] compares its uses with the encoder's earlier commands:
 //!   tracked resources per resource and range. Untracked memory may alias across resources, so
 //!   it orders by what a command's uses say of it ([`Reach`]). A command whose uses name every
 //!   byte of untracked memory it touches (a blit's, a shadow's copy) orders per key and range
@@ -80,6 +80,7 @@
 //! `VkQueue`'s listed in its submission order as their plans were applied, not every resource the
 //! state holds.
 
+use super::binding::ResidentPrefix;
 use crate::device::functions::Vk;
 use crate::key_hash::KeyMap;
 use ash::vk;
@@ -126,7 +127,7 @@ impl Access {
     }
 
     /// Whether every stage and access type of `other` is in this side.
-    fn covers(self, other: Access) -> bool {
+    pub(super) fn covers(self, other: Access) -> bool {
         self.stages.contains(other.stages) && self.access.contains(other.access)
     }
 }
@@ -153,12 +154,74 @@ pub(super) enum UseRange {
     /// Bytes `start..end`.
     Bytes(Range<u64>),
     /// Aspects, mip levels and array layers of an image. 3D depth slices are not separate, since
-    /// Vulkan's barriers cannot name them.
+    /// Vulkan's barriers cannot name them. `place` is where the image lies in the memory its key
+    /// names ([`ImagePlace`]).
     Image {
         aspects: vk::ImageAspectFlags,
         levels: Range<u32>,
         layers: Range<u32>,
+        place: ImagePlace,
     },
+}
+
+/// Where an image's uses lie in the memory of the key they name ([`UseRange::Image`]): the whole
+/// of it ([`ImagePlace::WHOLE`]) for an image whose key is its own, the bytes an image bound in
+/// an automatic or placement heap takes of the heap's, whose key every resource of the heap shares
+/// (`texture/heap.rs`), or the bytes of a buffer an image over them takes, whose key every image
+/// over the buffer shares with it (`Texels::place`), in the offsets the buffer's uses name
+/// (`Buffer::tracked`, a heap buffer's in its heap's).
+///
+/// Hazard tracking does not read it: Metal tracks a tracked heap's resources as one ("at the
+/// granularity of the heap", `heap.rs`), and so do [`UseRange::overlaps`] and the tracker. What
+/// asks whether two uses touch the same memory reads it ([`UseRange::shares_memory`],
+/// [`ImagePlace::meets`]): a draw that reads a texture placed apart from its attachment in the
+/// attachment's heap, or made over the attachment's buffer at other bytes, reads no memory the
+/// attachment renders.
+///
+/// It holds the bytes in [`PLACE_GRANULE`]s, rounded out (its start down, its end up), so a
+/// [`UseRange`] stays 32 bytes, which every use of every command copies and compares. Rounding
+/// out only adds bytes, so two places whose bytes meet meet; two that share a granule alone (a
+/// texture of 16-byte alignment, a linear one's, placed right after another) are taken to meet,
+/// which costs at most a barrier or a copy no byte needed, never one missed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(super) struct ImagePlace {
+    start: u32,
+    end: u32,
+}
+
+/// The bytes of a heap's memory one unit of an [`ImagePlace`] counts: offsets to 256 GiB fit.
+const PLACE_GRANULE: u64 = 64;
+
+impl ImagePlace {
+    /// The whole of the key's memory: an image whose key is its own, or one whose place is not
+    /// known.
+    pub(super) const WHOLE: ImagePlace = ImagePlace { start: 0, end: 0 };
+
+    /// The bytes `bytes` of the key's memory, rounded out to granules; [`WHOLE`](Self::WHOLE)
+    /// for an empty range, and for one past what the granules count.
+    pub(super) fn bytes(bytes: Range<u64>) -> ImagePlace {
+        let start = u32::try_from(bytes.start / PLACE_GRANULE);
+        let end = u32::try_from(bytes.end.div_ceil(PLACE_GRANULE));
+        match (bytes.is_empty(), start, end) {
+            (false, Ok(start), Ok(end)) => ImagePlace { start, end },
+            _ => ImagePlace::WHOLE,
+        }
+    }
+
+    /// Its bytes, rounded out, where it names some.
+    fn range(self) -> Option<Range<u64>> {
+        let bytes = |granules: u32| u64::from(granules) * PLACE_GRANULE;
+        (self != ImagePlace::WHOLE).then(|| bytes(self.start)..bytes(self.end))
+    }
+
+    /// Whether an image here and one at `other`, of the same key, may share memory: always, but
+    /// for two placed at bytes that do not meet.
+    pub(super) fn meets(self, other: ImagePlace) -> bool {
+        match (self.range(), other.range()) {
+            (Some(a), Some(b)) => meet(&a, &b),
+            _ => true,
+        }
+    }
 }
 
 impl UseRange {
@@ -175,12 +238,15 @@ impl UseRange {
                 aspects,
                 levels,
                 layers,
+                ..
             } => aspects.is_empty() || levels.is_empty() || layers.is_empty(),
         }
     }
 
-    /// Whether the two ranges share memory. Ranges of different kinds on one key are taken to
-    /// share it, which is always correct.
+    /// Whether the two ranges share memory, as hazard tracking orders them. Ranges of different
+    /// kinds on one key are taken to share it, which is always correct. An image's place is not
+    /// read: a heap's images, one key, order as one resource, as Metal tracks a tracked heap
+    /// ([`ImagePlace`]).
     pub(super) fn overlaps(&self, other: &UseRange) -> bool {
         match (self, other) {
             (UseRange::Bytes(a), UseRange::Bytes(b)) => meet(a, b),
@@ -189,14 +255,51 @@ impl UseRange {
                     aspects: a,
                     levels: a_levels,
                     layers: a_layers,
+                    ..
                 },
                 UseRange::Image {
                     aspects: b,
                     levels: b_levels,
                     layers: b_layers,
+                    ..
                 },
             ) => a.intersects(*b) && meet(a_levels, b_levels) && meet(a_layers, b_layers),
             _ => true,
+        }
+    }
+
+    /// Whether the two ranges, of one key, touch the same memory: as [`overlaps`](Self::overlaps)
+    /// answers, but that an image placed in a heap ([`ImagePlace`]) meets a range of the heap's
+    /// bytes, or another image placed at other bytes, only where their bytes meet. Two uses of
+    /// one image (the same place) meet where their aspects, levels and layers do; an image whose
+    /// place is not known meets every range of another kind.
+    pub(super) fn shares_memory(&self, other: &UseRange) -> bool {
+        let place = |range: &UseRange| match range {
+            UseRange::Image { place, .. } => place.range(),
+            UseRange::Bytes(_) => None,
+        };
+        match (self, other) {
+            (UseRange::Image { place: a, .. }, UseRange::Image { place: b, .. }) if a != b => {
+                match (a.range(), b.range()) {
+                    (Some(a), Some(b)) => meet(&a, &b),
+                    _ => self.overlaps(other),
+                }
+            }
+            (image @ UseRange::Image { .. }, UseRange::Bytes(bytes))
+            | (UseRange::Bytes(bytes), image @ UseRange::Image { .. }) => {
+                place(image).is_none_or(|placed| meet(&placed, bytes))
+            }
+            _ => self.overlaps(other),
+        }
+    }
+
+    /// The bytes of its key's memory an image's range lies in, as
+    /// [`shares_memory`](Self::shares_memory) takes them: its place's, rounded out, or all of them
+    /// where its place is not known. `None` for a range of bytes.
+    pub(super) fn image_bytes(&self) -> Option<Range<u64>> {
+        match self {
+            UseRange::Image { place, .. } => Some(place.range().unwrap_or(0..u64::MAX)),
+            UseRange::Bytes(_) => None,
         }
     }
 
@@ -209,11 +312,13 @@ impl UseRange {
                     aspects: a,
                     levels: a_levels,
                     layers: a_layers,
+                    ..
                 },
                 UseRange::Image {
                     aspects: b,
                     levels: b_levels,
                     layers: b_layers,
+                    ..
                 },
             ) => a.contains(*b) && within(a_levels, b_levels) && within(a_layers, b_layers),
             _ => false,
@@ -221,7 +326,7 @@ impl UseRange {
     }
 
     /// The smallest range of the same kind holding both, or `None` across kinds.
-    fn hull(&self, other: &UseRange) -> Option<UseRange> {
+    pub(super) fn hull(&self, other: &UseRange) -> Option<UseRange> {
         match (self, other) {
             (UseRange::Bytes(a), UseRange::Bytes(b)) => Some(UseRange::Bytes(hull(a, b))),
             (
@@ -229,16 +334,23 @@ impl UseRange {
                     aspects: a,
                     levels: a_levels,
                     layers: a_layers,
+                    place: a_place,
                 },
                 UseRange::Image {
                     aspects: b,
                     levels: b_levels,
                     layers: b_layers,
+                    place: b_place,
                 },
             ) => Some(UseRange::Image {
                 aspects: *a | *b,
                 levels: hull(a_levels, b_levels),
                 layers: hull(a_layers, b_layers),
+                // Two images' hull is of no one place.
+                place: match a_place == b_place {
+                    true => *a_place,
+                    false => ImagePlace::WHOLE,
+                },
             }),
             _ => None,
         }
@@ -253,11 +365,18 @@ impl fmt::Debug for UseRange {
                 aspects,
                 levels,
                 layers,
-            } => write!(
-                f,
-                "Image {{ aspects: {:#x}, levels: {levels:?}, layers: {layers:?} }}",
-                aspects.as_raw()
-            ),
+                place,
+            } => {
+                write!(
+                    f,
+                    "Image {{ aspects: {:#x}, levels: {levels:?}, layers: {layers:?}",
+                    aspects.as_raw()
+                )?;
+                match place.range() {
+                    Some(bytes) => write!(f, ", place: {bytes:?} }}"),
+                    None => write!(f, " }}"),
+                }
+            }
         }
     }
 }
@@ -311,8 +430,27 @@ impl<K> Use<K> {
         }
     }
 
+    /// Whether this use of bytes holds `other`: of the same resource, tracking, reads and writes,
+    /// over a range holding `other`'s. Noting or gathering `other` after it changes nothing that
+    /// takes uses by overlap (an image's use holds none but its equal).
+    pub(super) fn covers(&self, other: &Use<K>) -> bool
+    where
+        K: PartialEq,
+    {
+        let bytes = matches!(
+            (&self.range, &other.range),
+            (UseRange::Bytes(_), UseRange::Bytes(_))
+        );
+        bytes
+            && self.key == other.key
+            && self.tracked == other.tracked
+            && self.read == other.read
+            && self.write == other.write
+            && self.range.contains(&other.range)
+    }
+
     /// Whether the use touches nothing: an empty range, or neither a read nor a write.
-    fn is_nothing(&self) -> bool {
+    pub(super) fn is_nothing(&self) -> bool {
         self.range.is_empty() || (self.read.is_empty() && self.write.is_empty())
     }
 
@@ -419,9 +557,11 @@ impl Barrier {
         }
     }
 
-    /// A compute encoder's memory barrier (`memoryBarrierWithScope:` and
-    /// `memoryBarrierWithResources:`): every shader write of the earlier dispatches before every
-    /// shader, uniform and indirect-argument access of the later ones.
+    /// Every shader write of the earlier dispatches before every shader, uniform and
+    /// indirect-argument access of the later ones: what a compute encoder's memory barrier
+    /// (`memoryBarrierWithScope:`, `memoryBarrierWithResources:`) makes visible, and the barrier
+    /// the runtime records between dispatches of its own, whose later ones read arguments an
+    /// earlier one wrote (`indirect_dispatch.rs`, `gpu_execute.rs`).
     pub(super) fn between_dispatches() -> Barrier {
         Barrier {
             src: Access::new(
@@ -434,6 +574,22 @@ impl Barrier {
                     | vk::AccessFlags2::SHADER_WRITE
                     | vk::AccessFlags2::UNIFORM_READ
                     | vk::AccessFlags2::INDIRECT_COMMAND_READ,
+            ),
+        }
+    }
+
+    /// What a compute encoder's memory barrier records: every shader write of the earlier
+    /// dispatches before every shader read and write of the later ones, in the compute stage,
+    /// the least barrier Vulkan states for those. The rest of what Metal makes visible
+    /// ([`between_dispatches`](Barrier::between_dispatches)'s destination: uniform reads and
+    /// indirect arguments) is owed to the later commands of the encoder whose uses make such
+    /// accesses, each recording it before itself ([`Owed`]).
+    pub(super) fn memory_barrier() -> Barrier {
+        Barrier {
+            src: Barrier::between_dispatches().src,
+            dst: Access::new(
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
             ),
         }
     }
@@ -490,6 +646,69 @@ impl Barrier {
             dst_stages: legacy_stages(self.dst.stages, vk::PipelineStageFlags::BOTTOM_OF_PIPE),
             dst_access: legacy_access(self.dst.access),
         }
+    }
+}
+
+/// What a compute encoder's memory barriers still owe its later commands. A memory barrier records
+/// [`Barrier::memory_barrier`], which covers every access a shader makes on its own (storage,
+/// sampled and storage-image reads and writes, through bindings, addresses, argument buffers and
+/// resident resources alike). Metal's barrier also makes the earlier writes visible to the
+/// accesses of [`OWED`], uniform reads and indirect arguments, which a command makes only of what
+/// its uses name: a uniform buffer's slot, the buffer an indirect command reads its arguments
+/// from. A later command of the encoder whose uses make one of them takes, before itself, a
+/// barrier from the earlier shader writes to those stages and access types, unless a barrier since
+/// the encoder's last memory barrier made them visible ([`pay`](Owed::pay)). A barrier recorded
+/// later orders every write before the memory barrier too, as its first scope holds every command
+/// earlier in submission order. So the encoder's commands see what
+/// [`Barrier::between_dispatches`] would have made visible, and a dispatch that reads neither
+/// waits only for the compute stage's shader writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Owed {
+    /// What the barriers since the encoder's last memory barrier made visible of [`OWED`];
+    /// `None` before its first.
+    visible: Option<Access>,
+}
+
+/// The access types a compute encoder's memory barrier makes visible beyond what it records
+/// ([`Owed`]): with [`Barrier::memory_barrier`]'s destination, [`Barrier::between_dispatches`]'s.
+pub(super) const OWED: Access = Access::new(
+    vk::PipelineStageFlags2::from_raw(
+        vk::PipelineStageFlags2::COMPUTE_SHADER.as_raw()
+            | vk::PipelineStageFlags2::DRAW_INDIRECT.as_raw(),
+    ),
+    vk::AccessFlags2::from_raw(
+        vk::AccessFlags2::UNIFORM_READ.as_raw() | vk::AccessFlags2::INDIRECT_COMMAND_READ.as_raw(),
+    ),
+);
+
+impl Owed {
+    /// Note a memory barrier recorded ([`Barrier::memory_barrier`]): every access of [`OWED`]
+    /// is owed again, to what it made visible of the writes since.
+    pub(super) fn memory_barrier(&mut self) {
+        self.visible = Some(Access::NONE);
+    }
+
+    /// The barrier a command whose uses are `uses` takes before itself for what the encoder's
+    /// memory barriers owe it: from every earlier shader write to the stages and access types of
+    /// [`OWED`] its uses name that no barrier since the last memory barrier made visible. `None`
+    /// where none is owed it. Noted as recorded.
+    pub(super) fn pay<K>(&mut self, uses: &[Use<K>]) -> Option<Barrier> {
+        let visible = self.visible.as_mut()?;
+        let mut owed = Access::NONE;
+        for used in uses {
+            let access = used.read.union(used.write).intersection(OWED);
+            if !access.stages.is_empty() && !access.access.is_empty() {
+                owed = owed.union(access);
+            }
+        }
+        if owed.is_empty() || visible.covers(owed) {
+            return None;
+        }
+        *visible = visible.union(owed);
+        Some(Barrier {
+            src: Barrier::memory_barrier().src,
+            dst: owed,
+        })
     }
 }
 
@@ -1041,27 +1260,32 @@ fn coalesce(entries: &mut Vec<Entry>) {
     }
 }
 
-/// The uses one per key and range, sorted by key, without the ones that touch nothing.
-fn merged<S: Copy + Ord + Hash>(uses: impl IntoIterator<Item = Use<S>>) -> Vec<Use<S>> {
-    let mut merged: Vec<Use<S>> = Vec::new();
-    let mut index: KeyMap<(S, UseRange), usize> = KeyMap::default();
-    for used in uses {
-        if used.is_nothing() {
-            continue;
+/// `uses` (none of which touches nothing) one per key and range, sorted by key, each key's ranges
+/// in the order they first came, the reads and writes of a range's uses joined: in place, in their
+/// own storage.
+pub(super) fn merge<S: Copy + Ord>(uses: &mut Vec<Use<S>>) {
+    // Stable: a key's uses keep their order.
+    uses.sort_by_key(|used| used.key);
+    // `uses[..kept]` are merged, `uses[group..kept]` those of the key at hand.
+    let mut kept = 0;
+    let mut group = 0;
+    for at in 0..uses.len() {
+        if group < kept && uses[group].key != uses[at].key {
+            group = kept;
         }
-        match index.get(&(used.key, used.range.clone())) {
-            Some(&at) => {
-                merged[at].read = merged[at].read.union(used.read);
-                merged[at].write = merged[at].write.union(used.write);
+        match (group..kept).find(|&k| uses[k].range == uses[at].range) {
+            Some(k) => {
+                let (read, write) = (uses[at].read, uses[at].write);
+                uses[k].read = uses[k].read.union(read);
+                uses[k].write = uses[k].write.union(write);
             }
             None => {
-                index.insert((used.key, used.range.clone()), merged.len());
-                merged.push(used);
+                uses.swap(kept, at);
+                kept += 1;
             }
         }
     }
-    merged.sort_by_key(|used| used.key);
-    merged
+    uses.truncate(kept);
 }
 
 /// How far a command's uses say which untracked memory it touches, inside an encoder Metal orders
@@ -1115,6 +1339,19 @@ pub(super) struct EncoderUses<K> {
     held: Vec<K>,
     /// A use of a held image but as a depth/stencil attachment was recorded after its hold.
     broke: bool,
+    /// The last command's uses as the encoder orders them ([`inside_uses`]): to compare with the
+    /// earlier commands', and as it keeps them where those differ (a command with an untracked
+    /// use). Each command's are written over the last one's storage.
+    compared: Vec<Use<Class<K>>>,
+    kept: Vec<Use<Class<K>>>,
+    /// The uses of the current part's first command, and how far they say what untracked memory
+    /// it touches, while nothing else is in the part's order: ordered after nothing, it needs no
+    /// barrier, and the part's order takes it in only once a later command orders after it
+    /// ([`take_in_first`](Self::take_in_first)), so a part of one command builds no order at all.
+    /// The reach is `None` where none waits; the list's storage is kept for the next part's.
+    first: (Vec<Use<K>>, Option<Reach>),
+    /// How many commands the part's orders took in so far (`WorkCounts::commands_ordered_inside`).
+    taken_in: u64,
 }
 
 /// A fence an encoder waits for or updates, and the stages of its draws the call names: a render
@@ -1186,6 +1423,10 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
             updates: Vec::new(),
             held: Vec::new(),
             broke: false,
+            compared: Vec::new(),
+            kept: Vec::new(),
+            first: (Vec::new(), None),
+            taken_in: 0,
         }
     }
 
@@ -1196,41 +1437,117 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
 
     /// The barrier a command with `uses`, which say what untracked memory it touches as `reach`
     /// does, needs after the encoder's earlier commands: none in an encoder whose commands are
-    /// not ordered. Nothing changes until [`EncoderUses::record`].
-    pub(super) fn barrier(&self, uses: &[Use<K>], reach: Reach) -> Option<Barrier> {
+    /// not ordered, nor after none. What the encoder orders by changes only as it takes in a
+    /// part's first command its order left out ([`take_in_first`](Self::take_in_first)), which
+    /// orders the same, until [`EncoderUses::order`].
+    pub(super) fn barrier(&mut self, uses: &[Use<K>], reach: Reach) -> Option<Barrier> {
         if !self.ordered {
             return None;
         }
+        self.take_in_first();
+        if self.inside.is_empty() {
+            return None;
+        }
+        inside_uses(uses, reach, false, &mut self.compared);
         // One encoder runs on one queue: its commands need barriers, never waits.
-        depend(
-            &self.inside,
-            &inside_uses(uses, reach, false),
-            (Point::default(), 0),
-        )
-        .barrier
-        .needed()
+        depend(&self.inside, &self.compared, (Point::default(), 0))
+            .barrier
+            .needed()
+    }
+
+    /// Order a command whose `uses` say what untracked memory it touches as `reach` does after the
+    /// encoder's earlier commands, and note it recorded, in `stages`, after the barrier it needs
+    /// ([`barrier`](Self::barrier)), which this answers. The command's uses as the encoder compares
+    /// them are those it keeps where every use is tracked ([`inside_uses`]), so they are made once.
+    /// A command ordered after nothing waits to be taken in ([`wait_first`](Self::wait_first)).
+    pub(super) fn order(
+        &mut self,
+        stages: vk::PipelineStageFlags2,
+        uses: &[Use<K>],
+        reach: Reach,
+    ) -> Option<Barrier> {
+        let barrier = self.barrier(uses, reach);
+        if self.ordered && !self.wait_first(uses, reach) {
+            let kept = match uses.iter().all(|used| used.tracked) {
+                true => &self.compared,
+                false => {
+                    inside_uses(uses, reach, true, &mut self.kept);
+                    &self.kept
+                }
+            };
+            admit(&mut self.inside, kept, barrier, &[], Point::default());
+            self.taken_in += 1;
+        }
+        self.note(stages, uses);
+        barrier
     }
 
     /// Note a recorded command that may touch untracked memory its uses do not name
-    /// ([`Reach::Unnamed`]): it ran in `stages`, with `uses`, after `barrier`.
+    /// ([`Reach::Unnamed`]): it ran in `stages`, with `uses`, after `barrier`. One recorded after
+    /// nothing waits to be taken in ([`wait_first`](Self::wait_first)).
     pub(super) fn record(
         &mut self,
         stages: vk::PipelineStageFlags2,
         uses: &[Use<K>],
         barrier: Option<Barrier>,
     ) {
-        self.record_reaching(stages, uses, barrier, Reach::Unnamed);
+        if self.ordered {
+            self.take_in_first();
+            if !self.wait_first(uses, Reach::Unnamed) {
+                inside_uses(uses, Reach::Unnamed, true, &mut self.kept);
+                admit(&mut self.inside, &self.kept, barrier, &[], Point::default());
+                self.taken_in += 1;
+            }
+        }
+        self.note(stages, uses);
     }
 
-    /// [`record`](Self::record) of a command whose `uses` say what untracked memory it touches
-    /// as `reach` does.
-    pub(super) fn record_reaching(
-        &mut self,
-        stages: vk::PipelineStageFlags2,
-        uses: &[Use<K>],
-        barrier: Option<Barrier>,
-        reach: Reach,
-    ) {
+    /// Keep a command's `uses` and `reach` out of the part's order while nothing is in it (no
+    /// command of the part, or none that touches anything): a command ordered after nothing needs
+    /// no barrier, and taken in now it would make the same entries as taken in at the next
+    /// command, the first that compares with it ([`take_in_first`](Self::take_in_first)). Taking a
+    /// command into an empty order orders no entry by its barrier (`admit`). Whether it was kept
+    /// out.
+    fn wait_first(&mut self, uses: &[Use<K>], reach: Reach) -> bool {
+        if !self.inside.is_empty() {
+            return false;
+        }
+        let (waiting, at) = &mut self.first;
+        debug_assert!(at.is_none(), "a part's first command waits behind another");
+        waiting.clear();
+        waiting.extend_from_slice(uses);
+        *at = Some(reach);
+        true
+    }
+
+    /// Take the part's first command, kept out of its order ([`wait_first`](Self::wait_first)),
+    /// into it, where one waits: before anything compares with or adds to the order. Its list is
+    /// made in the storage the next command compares in, which it writes over after.
+    fn take_in_first(&mut self) {
+        let (waiting, at) = &mut self.first;
+        let Some(reach) = at.take() else {
+            return;
+        };
+        inside_uses(waiting, reach, true, &mut self.compared);
+        admit(
+            &mut self.inside,
+            &self.compared,
+            None,
+            &[],
+            Point::default(),
+        );
+        self.taken_in += 1;
+    }
+
+    /// How many commands its parts' orders took in so far: none of a part of one command
+    /// (`WorkCounts::commands_ordered_inside`).
+    pub(super) fn taken_in(&self) -> u64 {
+        self.taken_in
+    }
+
+    /// Note a command the encoder orders recorded, in `stages`, with `uses`: its held images'
+    /// holds, its part's stages and tracked uses.
+    fn note(&mut self, stages: vk::PipelineStageFlags2, uses: &[Use<K>]) {
         if !self.held.is_empty() {
             let held = &self.held;
             self.broke |= uses.iter().any(|used| {
@@ -1242,16 +1559,6 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
         part.stages |= uses.iter().fold(stages, |all, used| {
             all | used.read.stages | used.write.stages
         });
-        if self.ordered {
-            admit(
-                &mut self.inside,
-                &inside_uses(uses, reach, true),
-                barrier,
-                &[],
-                Point::default(),
-            );
-        }
-        let part = self.current();
         // Room for a few resources at once, made at the part's first: grown from nothing, the map
         // would allocate again at its fourth and eighth.
         if part.tracked.capacity() == 0 {
@@ -1344,6 +1651,11 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
         add_fence(&mut self.waits, FenceUse { fence, draws });
     }
 
+    /// Whether the encoder waits for or updates a fence.
+    pub(super) fn fenced(&self) -> bool {
+        !self.waits.is_empty() || !self.updates.is_empty()
+    }
+
     /// `update_fence`: the fence is updated after the encoder's work; after the draw stages
     /// `draws` alone where `Some` ([`FenceUse`]): a later wait orders after the encoder's draws in
     /// those stages and its commands outside its draws, not after its draws' other stages.
@@ -1382,18 +1694,23 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
         self.parts.last_mut().expect("an encoder has a part")
     }
 
+    /// The ranges of `key` its tracked uses so far write, in every part: what a copy out decided
+    /// as it is encoded takes of its encoder's commands before it (`managed_sync.rs`).
+    pub(super) fn written_ranges(&self, key: K) -> impl Iterator<Item = &UseRange> + '_ {
+        (self.parts.iter())
+            .filter_map(move |part| part.tracked.get(&key))
+            .flat_map(Few::iter)
+            .filter(|used| !used.write.is_empty())
+            .map(|used| &used.range)
+    }
+
     /// End the current part: the commands after this run in a part of their own, after
     /// everything before it completed, so they need no barrier after the commands before.
     pub(super) fn split(&mut self) {
         self.inside.clear();
+        // The part's first command, ordered after nothing, orders nothing after it any more.
+        self.first.1 = None;
         self.parts.push(Part::new());
-    }
-
-    /// Note a [`Barrier::everything`] recorded after the commands so far: every stage's every
-    /// access before it happens before every later command's, so a later command needs no barrier
-    /// after them. The part goes on: its summary keeps their uses.
-    pub(super) fn ordered_everything(&mut self) {
-        self.inside.clear();
     }
 
     /// The summary of the ended encoder, its parts joined (an encoder of one part: its part's).
@@ -1419,12 +1736,15 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
         let mut summaries: Vec<Summary<K>> = parts
             .into_iter()
             .map(|part| {
-                // Sized once: a flattened map's iterator tells no length, which would grow the
-                // vector use by use.
+                // By key, each resource's uses in the order they were recorded, as a stable sort
+                // of the uses by key leaves them: a resource's uses are one list, so ordering
+                // the resources orders them, and only their keys, each once, are sorted, each
+                // beside its list where the part holds it (`by_key`).
+                // Sized once: a flattened iterator tells no length, which would grow the vector
+                // use by use.
                 let count = part.tracked.values().map(Few::len).sum();
                 let mut uses: Vec<Use<K>> = Vec::with_capacity(count);
-                uses.extend(part.tracked.into_values().flatten());
-                uses.sort_by_key(|used| used.key);
+                by_key(&part.tracked, |few| uses.extend(few.iter().cloned()));
                 Summary {
                     uses,
                     stages: part.stages,
@@ -1441,6 +1761,28 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
         }
         summaries
     }
+}
+
+/// The most resources of an encoder's part whose keys [`by_key`] orders on the stack: an encoder
+/// that names no more takes no allocation to order them.
+const ORDERED_INLINE: usize = 16;
+
+/// Each of `tracked`'s lists, in the order of their keys. Up to [`ORDERED_INLINE`] keys are
+/// sorted in place on the stack, more in a vector of their own.
+fn by_key<K: Copy + Ord, V, S>(tracked: &HashMap<K, V, S>, mut each: impl FnMut(&V)) {
+    if tracked.len() <= ORDERED_INLINE {
+        let mut inline: [Option<(K, &V)>; ORDERED_INLINE] = [None; ORDERED_INLINE];
+        for (slot, (&key, value)) in inline.iter_mut().zip(tracked) {
+            *slot = Some((key, value));
+        }
+        let order = &mut inline[..tracked.len()];
+        order.sort_unstable_by_key(|entry| entry.map(|(key, _)| key));
+        order.iter().flatten().for_each(|&(_, value)| each(value));
+        return;
+    }
+    let mut order: Vec<(K, &V)> = tracked.iter().map(|(&key, value)| (key, value)).collect();
+    order.sort_unstable_by_key(|&(key, _)| key);
+    order.iter().for_each(|&(_, value)| each(value));
 }
 
 impl<K> fmt::Debug for EncoderUses<K> {
@@ -1460,6 +1802,10 @@ impl<K> fmt::Debug for EncoderUses<K> {
 /// as [`EncoderUses`] merges its own, which claims more and stays exact.
 pub(super) struct UnorderedWrites<K> {
     writes: KeyMap<K, Vec<Use<K>>>,
+    /// The identity and count of the uses of what the encoder made resident the last
+    /// [`add_draw`](Self::add_draw) since the last [`clear`](Self::clear) began with
+    /// (`binding::ResidentPrefix`): each of their writes is held, merged or not, until it clears.
+    added: Option<(u64, usize)>,
 }
 
 impl<K: Copy + Ord + Hash> UnorderedWrites<K> {
@@ -1467,15 +1813,18 @@ impl<K: Copy + Ord + Hash> UnorderedWrites<K> {
     pub(super) fn new() -> UnorderedWrites<K> {
         UnorderedWrites {
             writes: KeyMap::default(),
+            added: None,
         }
+    }
+
+    /// Whether [`add`](Self::add) adds `used`: a tracked write of something.
+    fn adds(used: &Use<K>) -> bool {
+        used.tracked && !used.write.is_empty() && !used.range.is_empty()
     }
 
     /// Add the tracked writes of a command with `uses`.
     pub(super) fn add(&mut self, uses: &[Use<K>]) {
-        for used in uses
-            .iter()
-            .filter(|used| used.tracked && !used.write.is_empty() && !used.range.is_empty())
-        {
+        for used in uses.iter().filter(|used| Self::adds(used)) {
             let ranges = self.writes.entry(used.key).or_default();
             ranges.push(Use {
                 read: Access::NONE,
@@ -1487,9 +1836,44 @@ impl<K: Copy + Ord + Hash> UnorderedWrites<K> {
         }
     }
 
+    /// [`add`](Self::add) a draw's `uses`, which begin with the uses of what its encoder made
+    /// resident of the identity `prefix`: those not again where the last call of this since the
+    /// last [`clear`](Self::clear) began with the same, whose writes it holds as they were added
+    /// (two draws' uses of one identity begin with the same uses, each of the same key, range,
+    /// stages and access types: `binding::ResidentPrefix`). Whether it walked them.
+    pub(super) fn add_draw(&mut self, (uses, prefix): (&[Use<K>], ResidentPrefix)) -> bool {
+        let now = Some((prefix.id, prefix.len));
+        let past = match self.added == now {
+            true => prefix.len,
+            false => 0,
+        };
+        #[cfg(debug_assertions)]
+        for used in &uses[..past] {
+            assert!(
+                self.holds(used),
+                "an encoder added a draw's writes by their identity less than its uses"
+            );
+        }
+        self.add(&uses[past..]);
+        self.added = now;
+        past == 0
+    }
+
+    /// Whether it holds `used`'s write, where [`add`](Self::add) adds it: adding it again changes
+    /// nothing a query reads (builds with debug assertions: [`add_draw`](Self::add_draw)'s
+    /// check).
+    #[cfg(debug_assertions)]
+    fn holds(&self, used: &Use<K>) -> bool {
+        let held =
+            |known: &Use<K>| known.range.contains(&used.range) && known.write.covers(used.write);
+        !Self::adds(used)
+            || (self.writes.get(&used.key)).is_some_and(|known| known.iter().any(held))
+    }
+
     /// A memory barrier orders every write so far before the commands after it.
     pub(super) fn clear(&mut self) {
         self.writes.clear();
+        self.added = None;
     }
 
     /// Whether one of the writes overlaps memory one of `uses` reads, as
@@ -1520,6 +1904,10 @@ impl<K: Copy + Ord + Hash> KeptUses<K> {
         }
     }
 
+    fn is_empty(&self) -> bool {
+        self.uses.is_empty()
+    }
+
     fn push(&mut self, used: Use<K>) {
         if used.range.is_empty() {
             return;
@@ -1531,12 +1919,28 @@ impl<K: Copy + Ord + Hash> KeptUses<K> {
         }
     }
 
+    /// Whether one of the kept uses of `used`'s resource is `held` (builds with debug assertions:
+    /// the checks of what adds a draw's uses by their identity).
+    #[cfg(debug_assertions)]
+    fn holds(&self, used: &Use<K>, held: impl Fn(&Use<K>) -> bool) -> bool {
+        (self.uses.get(&used.key)).is_some_and(|known| known.iter().any(held))
+    }
+
     /// The kept uses of `used`'s resource whose ranges overlap its range.
     fn meeting<'a>(&'a self, used: &'a Use<K>) -> impl Iterator<Item = &'a Use<K>> + 'a {
-        let known = self.uses.get(&used.key).map(Vec::as_slice).unwrap_or(&[]);
+        self.meeting_at(&used.key, &used.range)
+    }
+
+    /// The kept uses of `key` whose ranges overlap `range`.
+    fn meeting_at<'a>(
+        &'a self,
+        key: &K,
+        range: &'a UseRange,
+    ) -> impl Iterator<Item = &'a Use<K>> + 'a {
+        let known = self.uses.get(key).map(Vec::as_slice).unwrap_or(&[]);
         known
             .iter()
-            .filter(move |known| known.range.overlaps(&used.range))
+            .filter(move |known| known.range.overlaps(range))
     }
 }
 
@@ -1547,6 +1951,10 @@ impl<K: Copy + Ord + Hash> KeptUses<K> {
 #[derive(Clone)]
 pub(super) struct IndirectReads<K> {
     reads: KeptUses<K>,
+    /// The identity and count of the uses of what the encoder made resident the last
+    /// [`add_draw`](Self::add_draw) began with (`binding::ResidentPrefix`): each of their reads is
+    /// held, merged or not, while the instance lasts.
+    added: Option<(u64, usize)>,
 }
 
 impl<K: Copy + Ord + Hash> IndirectReads<K> {
@@ -1554,21 +1962,53 @@ impl<K: Copy + Ord + Hash> IndirectReads<K> {
     pub(super) fn new() -> IndirectReads<K> {
         IndirectReads {
             reads: KeptUses::new(),
+            added: None,
         }
+    }
+
+    /// Whether it holds no read.
+    pub(super) fn is_empty(&self) -> bool {
+        self.reads.is_empty()
+    }
+
+    /// Whether [`add`](Self::add) adds `used`: a read of indirect arguments.
+    fn adds(used: &Use<K>) -> bool {
+        (used.read.stages).intersects(vk::PipelineStageFlags2::DRAW_INDIRECT)
     }
 
     /// Add the indirect argument reads of a draw with `uses`.
     pub(super) fn add(&mut self, uses: &[Use<K>]) {
-        for used in uses.iter().filter(|used| {
-            used.read
-                .stages
-                .intersects(vk::PipelineStageFlags2::DRAW_INDIRECT)
-        }) {
+        for used in uses.iter().filter(|used| Self::adds(used)) {
             self.reads.push(Use {
                 write: Access::NONE,
                 ..used.clone()
             });
         }
+    }
+
+    /// [`add`](Self::add) a draw's `uses`, which begin with the uses of what its encoder made
+    /// resident of the identity `prefix`: those not again where the last call of this began with
+    /// the same, whose reads it holds as they were added (two draws' uses of one identity begin
+    /// with the same uses, each of the same key, range, stages and access types:
+    /// `binding::ResidentPrefix`). Whether it walked them.
+    pub(super) fn add_draw(&mut self, (uses, prefix): (&[Use<K>], ResidentPrefix)) -> bool {
+        let now = Some((prefix.id, prefix.len));
+        let past = match self.added == now {
+            true => prefix.len,
+            false => 0,
+        };
+        #[cfg(debug_assertions)]
+        for used in &uses[..past] {
+            let held =
+                |known: &Use<K>| known.range.contains(&used.range) && known.read.covers(used.read);
+            assert!(
+                !Self::adds(used) || self.reads.holds(used, held),
+                "an instance added a draw's indirect reads by their identity less than its uses"
+            );
+        }
+        self.add(&uses[past..]);
+        self.added = now;
+        past == 0
     }
 
     /// The stages in which a later draw with `uses` writes memory one of the reads read: empty
@@ -1602,6 +2042,38 @@ pub(super) const PRE_RASTERIZATION_WRITES: vk::PipelineStageFlags2 =
 #[derive(Clone)]
 pub(super) struct GeometryWrites<K> {
     writes: KeptUses<K>,
+    /// The identity and count of the uses of what the encoder made resident the last
+    /// [`add_draw`](Self::add_draw) began with (`binding::ResidentPrefix`): each of their writes
+    /// before their fragments is held, merged or not, while the instance lasts.
+    added: Option<(u64, usize)>,
+    /// What [`barrier_before_draw`](Self::barrier_before_draw) found of the uses of what the
+    /// encoder made resident the last call of it began with.
+    checked: Option<PrefixChecked<K>>,
+}
+
+/// The uses of what an encoder made resident of one identity and count (`binding::ResidentPrefix`)
+/// that a draw's fragment shader reads or writes, by key, each its range and its access there
+/// (`fragments`); the dependency they need after the writes before earlier draws' fragments, as
+/// [`GeometryWrites::barrier_before_draw`] last found it (`found`, source and destination); and
+/// the keys among those written since, which it checks again (`written`, at most `of`'s count).
+#[derive(Clone)]
+struct PrefixChecked<K> {
+    of: (u64, usize),
+    fragments: KeyMap<K, Vec<(UseRange, Access)>>,
+    found: (Access, Access),
+    written: Vec<K>,
+}
+
+impl<K: Copy + Ord + Hash> PrefixChecked<K> {
+    /// Note a write of `key` since: whether it is still checked again alone, else (more keys
+    /// written since than the uses it was found of) it is to be found whole again.
+    fn wrote(&mut self, key: K) -> bool {
+        if !self.fragments.contains_key(&key) {
+            return true;
+        }
+        self.written.push(key);
+        self.written.len() <= self.of.1
+    }
 }
 
 impl<K: Copy + Ord + Hash> GeometryWrites<K> {
@@ -1609,7 +2081,14 @@ impl<K: Copy + Ord + Hash> GeometryWrites<K> {
     pub(super) fn new() -> GeometryWrites<K> {
         GeometryWrites {
             writes: KeptUses::new(),
+            added: None,
+            checked: None,
         }
+    }
+
+    /// Whether it holds no write.
+    pub(super) fn is_empty(&self) -> bool {
+        self.writes.is_empty()
     }
 
     /// Add the writes before its fragments of a draw with `uses`: a use that writes in one of
@@ -1617,16 +2096,53 @@ impl<K: Copy + Ord + Hash> GeometryWrites<K> {
     /// claims more and stays exact.
     pub(super) fn add(&mut self, uses: &[Use<K>]) {
         for used in uses {
-            let stages = used.write.stages & PRE_RASTERIZATION_WRITES;
-            if stages.is_empty() {
+            let Some(write) = Self::adds(used) else {
                 continue;
+            };
+            if let Some(checked) = &mut self.checked {
+                if !checked.wrote(used.key) {
+                    self.checked = None;
+                }
             }
             self.writes.push(Use {
                 read: Access::NONE,
-                write: Access::new(stages, used.write.access),
+                write,
                 ..used.clone()
             });
         }
+    }
+
+    /// What [`add`](Self::add) adds of `used`: its write in the stages before its fragments,
+    /// `None` where it writes in none.
+    fn adds(used: &Use<K>) -> Option<Access> {
+        let stages = used.write.stages & PRE_RASTERIZATION_WRITES;
+        (!stages.is_empty()).then(|| Access::new(stages, used.write.access))
+    }
+
+    /// [`add`](Self::add) a draw's `uses`, which begin with the uses of what its encoder made
+    /// resident of the identity `prefix`: those not again where the last call of this began with
+    /// the same, whose writes it holds as they were added (two draws' uses of one identity begin
+    /// with the same uses, each of the same key, range, stages and access types:
+    /// `binding::ResidentPrefix`). Whether it walked them.
+    pub(super) fn add_draw(&mut self, (uses, prefix): (&[Use<K>], ResidentPrefix)) -> bool {
+        let now = Some((prefix.id, prefix.len));
+        let past = match self.added == now {
+            true => prefix.len,
+            false => 0,
+        };
+        #[cfg(debug_assertions)]
+        for used in &uses[..past] {
+            let held = |write: Access| {
+                move |known: &Use<K>| known.range.contains(&used.range) && known.write.covers(write)
+            };
+            assert!(
+                Self::adds(used).is_none_or(|write| self.writes.holds(used, held(write))),
+                "an instance added a draw's geometry writes by their identity less than its uses"
+            );
+        }
+        self.add(&uses[past..]);
+        self.added = now;
+        past == 0
     }
 
     /// The memory dependency a later draw with `uses` needs before its fragment shader reads or
@@ -1634,27 +2150,119 @@ impl<K: Copy + Ord + Hash> GeometryWrites<K> {
     /// fragment shader and the later draw's access types there. `None` where its fragment
     /// shader touches none of it.
     pub(super) fn barrier_before(&self, uses: &[Use<K>]) -> Option<Barrier> {
-        const FRAGMENT: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::FRAGMENT_SHADER;
-        let mut src = Access::NONE;
-        let mut dst = Access::NONE;
-        for used in uses {
-            let mut fragment = Access::NONE;
-            if used.read.stages.intersects(FRAGMENT) {
-                fragment = fragment.union(Access::new(FRAGMENT, used.read.access));
-            }
-            if used.write.stages.intersects(FRAGMENT) {
-                fragment = fragment.union(Access::new(FRAGMENT, used.write.access));
-            }
-            if fragment.is_empty() {
-                continue;
-            }
-            for known in self.writes.meeting(used) {
-                src = src.union(known.write);
-                dst = dst.union(fragment);
-            }
+        // Where it holds no write, no use meets one: it walks none of them.
+        if self.writes.is_empty() {
+            return None;
         }
-        (!src.is_empty()).then_some(Barrier { src, dst })
+        let mut found = (Access::NONE, Access::NONE);
+        for used in uses {
+            let fragment = Self::fragment(used);
+            meet_writes(&self.writes, (&used.key, &used.range), fragment, &mut found);
+        }
+        dependency(found)
     }
+
+    /// [`barrier_before`](Self::barrier_before) a draw's `uses`, which begin with the uses of what
+    /// its encoder made resident of the identity `prefix`: those found once where the last call
+    /// of this began with others, else checked again only for the keys written since (the writes
+    /// only grow while the instance lasts: a use that met one meets it still, or the entry it
+    /// merged into, whose access types hold its own). So a draw of a large resident set walks
+    /// its own uses and those of keys written since, not the set. And how many of the uses of
+    /// what the encoder made resident it walked (`WorkCounts::resident_uses_geometry_checked`).
+    pub(super) fn barrier_before_draw(
+        &mut self,
+        (uses, prefix): (&[Use<K>], ResidentPrefix),
+    ) -> (Option<Barrier>, usize) {
+        // Where it holds no write, no use meets one: it walks none of them.
+        if self.writes.is_empty() {
+            return (None, 0);
+        }
+        let (resident, own) = uses.split_at(prefix.len);
+        let now = (prefix.id, prefix.len);
+        let mut walked = 0;
+        if self
+            .checked
+            .as_ref()
+            .is_none_or(|checked| checked.of != now)
+        {
+            let mut fragments: KeyMap<K, Vec<(UseRange, Access)>> = KeyMap::default();
+            let mut found = (Access::NONE, Access::NONE);
+            for used in resident {
+                let fragment = Self::fragment(used);
+                if fragment.is_empty() {
+                    continue;
+                }
+                meet_writes(&self.writes, (&used.key, &used.range), fragment, &mut found);
+                let ranges = fragments.entry(used.key).or_default();
+                ranges.push((used.range.clone(), fragment));
+            }
+            walked = resident.len();
+            self.checked = Some(PrefixChecked {
+                of: now,
+                fragments,
+                found,
+                written: Vec::new(),
+            });
+        }
+        let mut found = (Access::NONE, Access::NONE);
+        if let Some(checked) = &mut self.checked {
+            for key in &checked.written {
+                for (range, fragment) in checked.fragments.get(key).into_iter().flatten() {
+                    walked += 1;
+                    meet_writes(&self.writes, (key, range), *fragment, &mut checked.found);
+                }
+            }
+            checked.written.clear();
+            found = checked.found;
+        }
+        for used in own {
+            let fragment = Self::fragment(used);
+            meet_writes(&self.writes, (&used.key, &used.range), fragment, &mut found);
+        }
+        let barrier = dependency(found);
+        debug_assert_eq!(
+            barrier,
+            self.barrier_before(uses),
+            "a draw's dependency before its fragments by its identity other than its uses'"
+        );
+        (barrier, walked)
+    }
+
+    /// What `used` reads and writes in the fragment stage.
+    fn fragment(used: &Use<K>) -> Access {
+        const FRAGMENT: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::FRAGMENT_SHADER;
+        let mut fragment = Access::NONE;
+        if used.read.stages.intersects(FRAGMENT) {
+            fragment = fragment.union(Access::new(FRAGMENT, used.read.access));
+        }
+        if used.write.stages.intersects(FRAGMENT) {
+            fragment = fragment.union(Access::new(FRAGMENT, used.write.access));
+        }
+        fragment
+    }
+}
+
+/// Add to `found` (a dependency's source and destination) the writes of `writes` that a use of
+/// `key` and `range` touching `fragment` in the fragment stage meets, and `fragment`, where it
+/// meets one.
+fn meet_writes<K: Copy + Ord + Hash>(
+    writes: &KeptUses<K>,
+    (key, range): (&K, &UseRange),
+    fragment: Access,
+    (src, dst): &mut (Access, Access),
+) {
+    if fragment.is_empty() {
+        return;
+    }
+    for known in writes.meeting_at(key, range) {
+        *src = src.union(known.write);
+        *dst = dst.union(fragment);
+    }
+}
+
+/// The barrier of the source and destination `found`: `None` where the source is empty.
+fn dependency((src, dst): (Access, Access)) -> Option<Barrier> {
+    (!src.is_empty()).then_some(Barrier { src, dst })
 }
 
 /// Whether `known`, a use of earlier commands, touches in one of `stages` memory `used` touches
@@ -1693,18 +2301,20 @@ fn coalesce_uses<K>(uses: &mut Vec<Use<K>>) {
     }
 }
 
-/// The uses of a command of `reach` as the encoder orders them ([`Class`]): to compare with the
-/// earlier commands' (`recorded` false), or as it keeps them (`recorded` true). A tracked use is
-/// its key's. An untracked use of a [`Reach::Named`] command compares with its key's and with
-/// the accesses of the commands that do not name theirs, and is kept as its key's and as an
-/// access of all untracked memory; one of a [`Reach::Unnamed`] command compares with every
-/// untracked access, and is kept as an access of all untracked memory, and of the commands that
-/// do not name theirs.
-fn inside_uses<K: Copy + Ord + Hash>(
+/// The uses of a command of `reach` as the encoder orders them ([`Class`]), written over `into`:
+/// to compare with the earlier commands' (`recorded` false), or as it keeps them (`recorded`
+/// true), one per class and range, sorted by class, without those that touch nothing ([`merge`]).
+/// A tracked use is its key's, either way. An untracked use of a [`Reach::Named`] command compares
+/// with its key's and with the accesses of the commands that do not name theirs, and is kept as
+/// its key's and as an access of all untracked memory; one of a [`Reach::Unnamed`] command
+/// compares with every untracked access, and is kept as an access of all untracked memory, and of
+/// the commands that do not name theirs.
+fn inside_uses<K: Copy + Ord>(
     uses: &[Use<K>],
     reach: Reach,
     recorded: bool,
-) -> Vec<Use<Class<K>>> {
+    into: &mut Vec<Use<Class<K>>>,
+) {
     let class = |used: &Use<K>, key: Class<K>, range: UseRange| Use {
         key,
         tracked: used.tracked,
@@ -1712,7 +2322,8 @@ fn inside_uses<K: Copy + Ord + Hash>(
         read: used.read,
         write: used.write,
     };
-    merged(uses.iter().flat_map(|used| {
+    into.clear();
+    for used in uses {
         let (first, second) = match (used.tracked, reach, recorded) {
             (true, _, _) => (Class::Key(used.key), None),
             (false, Reach::Named, false) => (Class::Key(used.key), Some(Class::Unnamed)),
@@ -1724,11 +2335,13 @@ fn inside_uses<K: Copy + Ord + Hash>(
             Class::Key(_) => used.range.clone(),
             Class::Untracked | Class::Unnamed => UseRange::UNTRACKED,
         };
-        [Some(class(used, first, range))]
+        let classes = [Some(class(used, first, range))]
             .into_iter()
             .chain([second.map(|key| class(used, key, UseRange::UNTRACKED))])
-            .flatten()
-    }))
+            .flatten();
+        into.extend(classes.filter(|used| !used.is_nothing()));
+    }
+    merge(into);
 }
 
 /// What one ended encoder hands to its queue's tracker at commit.
@@ -1768,6 +2381,27 @@ impl<K: Copy + Ord> Summary<K> {
         }
     }
 
+    /// The summary of what work of no stage of its own may make: `uses` of the resources Metal
+    /// tracks, one per resource and range. Joined to an encoder's summary
+    /// ([`join`](Self::join)), it widens none of the stages the encoder's fences cover: a
+    /// command buffer's writes through its residency, which may lie in any of its encoders
+    /// (`State::resident_writes` in `command_buffer/mod.rs`).
+    pub(super) fn of_no_stage(mut uses: Vec<Use<K>>) -> Summary<K> {
+        uses.retain(|used| used.tracked && !used.is_nothing());
+        merge(&mut uses);
+        Summary {
+            uses,
+            stages: vk::PipelineStageFlags2::NONE,
+            waits: Vec::new(),
+            updates: Vec::new(),
+        }
+    }
+
+    /// Whether it holds no use, no wait and no update.
+    pub(super) fn is_empty(&self) -> bool {
+        self.uses.is_empty() && self.waits.is_empty() && self.updates.is_empty()
+    }
+
     /// The summary of a resource state encoder, which records no command: it waits for the fences
     /// `waits` and updates `updates`, in every stage, so a wait on its queue orders after all of
     /// its batch's work before it, which its sparse binding precedes.
@@ -1789,51 +2423,92 @@ impl<K: Copy + Ord> Summary<K> {
         Summary::of_fences(fences(&self.waits), fences(&self.updates))
     }
 
+    /// Whether it updates a fence.
+    pub(super) fn has_updates(&self) -> bool {
+        !self.updates.is_empty()
+    }
+
+    /// Split it in two: its uses, stages and fence waits, and its fence updates alone, in its
+    /// stages. A compute encoder recorded into the `VkCommandBuffer` of the encoders before it
+    /// (`encoder_fold.rs`) joins the first to their first part's summary, where the work it
+    /// orders lies, and keeps the second in its own place, after theirs.
+    pub(super) fn split_updates(self) -> (Summary<K>, Summary<K>) {
+        let Summary {
+            uses,
+            stages,
+            waits,
+            updates,
+        } = self;
+        let updated = Summary {
+            uses: Vec::new(),
+            stages: match updates.is_empty() {
+                true => vk::PipelineStageFlags2::NONE,
+                false => stages,
+            },
+            waits: Vec::new(),
+            updates,
+        };
+        let worked = Summary {
+            uses,
+            stages,
+            waits,
+            updates: Vec::new(),
+        };
+        (worked, updated)
+    }
+
     /// The resources of the tracked uses, in order, each once per range.
     pub(super) fn keys(&self) -> impl Iterator<Item = K> + '_ {
         self.uses.iter().map(|used| used.key)
     }
 
+    /// The resources the tracked uses write, in order, each once per range written.
+    pub(super) fn written_keys(&self) -> impl Iterator<Item = K> + '_ {
+        (self.uses.iter())
+            .filter(|used| !used.write.is_empty())
+            .map(|used| used.key)
+    }
+
+    /// Its tracked uses that write, each with its range: what the copies out of buffers with a
+    /// host copy take (`managed_sync.rs`).
+    pub(super) fn writes(&self) -> impl Iterator<Item = (K, &UseRange)> + '_ {
+        (self.uses.iter())
+            .filter(|used| !used.write.is_empty())
+            .map(|used| (used.key, &used.range))
+    }
+
+    /// Whether a tracked use writes one of `keys`.
+    pub(super) fn writes_any(&self, keys: &[K]) -> bool {
+        self.written_keys().any(|key| keys.contains(&key))
+    }
+
     /// Join `other`, the summary of work recorded apart that runs inside the same encoder (an
     /// indirect command buffer's commands, recorded at commit): its stages, fences and tracked
     /// uses, one per resource and range. A resource past [`ENTRIES_PER_KEY`] ranges takes a new
-    /// range into one of the same kind, which claims more and stays exact.
+    /// range into one of the same kind, which claims more and stays exact. Both lists are sorted
+    /// by resource, so each of `other`'s uses meets the known uses of its own resource alone,
+    /// found by a binary search, and those of it joined before it ([`join_use`]): a join costs
+    /// about the uses' count, not their product (`tests::tracker`).
     pub(super) fn join(&mut self, other: Summary<K>) {
         self.stages |= other.stages;
-        for used in other.uses {
-            if let Some(known) = self
-                .uses
-                .iter_mut()
-                .find(|known| known.key == used.key && known.range == used.range)
-            {
-                known.read = known.read.union(used.read);
-                known.write = known.write.union(used.write);
-                continue;
-            }
-            let ranges = self
-                .uses
-                .iter()
-                .filter(|known| known.key == used.key)
-                .count();
-            let hull = (ranges >= ENTRIES_PER_KEY)
-                .then(|| {
-                    self.uses.iter_mut().find_map(|known| {
-                        let range = (known.key == used.key)
-                            .then(|| known.range.hull(&used.range))
-                            .flatten()?;
-                        Some((known, range))
-                    })
-                })
-                .flatten();
-            match hull {
-                Some((known, range)) => {
-                    known.range = range;
-                    known.read = known.read.union(used.read);
-                    known.write = known.write.union(used.write);
-                }
-                None => self.uses.push(used),
+        debug_assert!(other.uses.is_sorted_by_key(|used| used.key));
+        let known = self.uses.len();
+        let mut added = Vec::new();
+        let mut uses = other.uses.into_iter().peekable();
+        while let Some(first) = uses.next() {
+            let key = first.key;
+            let start = self.uses[..known].partition_point(|used| used.key < key);
+            let end = start + self.uses[start..known].partition_point(|used| used.key == key);
+            let from = added.len();
+            let mut next = Some(first);
+            while let Some(used) = next {
+                join_use((&mut self.uses[start..end], &mut added, from), used);
+                next = uses.next_if(|used| used.key == key);
             }
         }
+        // After the known uses, each resource's in the order they were added, as a stable sort
+        // of the uses added after them leaves them.
+        self.uses.append(&mut added);
         self.uses.sort_by_key(|used| used.key);
         for used in other.waits {
             add_fence(&mut self.waits, used);
@@ -1844,6 +2519,55 @@ impl<K: Copy + Ord> Summary<K> {
     }
 }
 
+/// Join `used` into the uses of its resource a summary knows (`known`'s, then `added`'s from
+/// `from` on, in that order: [`Summary::join`]): the first of its range takes it; else, where the
+/// resource has [`ENTRIES_PER_KEY`] ranges or more, the first whose range a hull of both is of the
+/// same kind; else it is added. Only uses of its resource are joined into, as a scan of every
+/// known use would find them.
+fn join_use<K: Copy + PartialEq>(
+    (known, added, from): (&mut [Use<K>], &mut Vec<Use<K>>, usize),
+    used: Use<K>,
+) {
+    #[cfg(test)]
+    JOIN_LOOKED_AT.with(|at| at.set(at.get() + (known.len() + added.len() - from) as u64));
+    let key = used.key;
+    let into = |known: &mut Use<K>| {
+        known.read = known.read.union(used.read);
+        known.write = known.write.union(used.write);
+    };
+    let mut theirs = (known.iter_mut()).chain(added[from..].iter_mut());
+    if let Some(same) = theirs.find(|known| known.key == key && known.range == used.range) {
+        into(same);
+        return;
+    }
+    let ranges = (known.iter()).chain(&added[from..]);
+    if ranges.filter(|known| known.key == key).count() >= ENTRIES_PER_KEY {
+        let mut theirs = (known.iter_mut()).chain(added[from..].iter_mut());
+        let hull = theirs.find_map(|known| {
+            let range = (known.key == key).then(|| known.range.hull(&used.range))??;
+            Some((known, range))
+        });
+        if let Some((known, range)) = hull {
+            known.range = range;
+            into(known);
+            return;
+        }
+    }
+    added.push(used);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The known uses [`join_use`] looked at on this thread, in tests.
+    static JOIN_LOOKED_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many known uses joins looked at on this thread so far ([`join_use`]).
+#[cfg(test)]
+pub(super) fn join_looked_at() -> u64 {
+    JOIN_LOOKED_AT.with(std::cell::Cell::get)
+}
+
 impl<K: Copy + Ord + Hash> EncoderUses<K> {
     /// The room its current part's list of `key`'s uses has past the first, where it tracks it.
     #[cfg(test)]
@@ -1851,17 +2575,22 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
         let part = self.parts.iter().last()?;
         part.tracked.get(&key).map(|few| few.rest.capacity())
     }
+
+    /// Where the storage of the lists its last command was ordered by lies, and its room: the
+    /// list compared with the earlier commands', then the one kept apart ([`inside_uses`]).
+    #[cfg(test)]
+    pub(super) fn ordered_storage(&self) -> [(usize, usize); 2] {
+        [&self.compared, &self.kept].map(|list| (list.as_ptr().addr(), list.capacity()))
+    }
 }
 
 impl<K> Summary<K> {
     /// The tracked uses.
-    #[cfg(test)]
     pub(super) fn uses(&self) -> &[Use<K>] {
         &self.uses
     }
 
     /// Every stage the encoder's commands ran in.
-    #[cfg(test)]
     pub(super) fn stages(&self) -> vk::PipelineStageFlags2 {
         self.stages
     }
@@ -1882,6 +2611,28 @@ impl<K: Copy + Ord> Footprint<K> {
     where
         K: 'a,
     {
+        Footprint::gathered(summaries).sorted()
+    }
+
+    /// The footprint of `uses` alone, as one command that makes them in every stage records them,
+    /// naming no fence: what a host step reads on the host, for the scheduler's order across
+    /// queues (`scheduler/mod.rs`'s `place_of`), where a later write of it waits behind the step.
+    pub(super) fn of_uses(uses: &[Use<K>]) -> Footprint<K>
+    where
+        K: Hash,
+    {
+        let mut recorded = EncoderUses::new(false);
+        recorded.record(vk::PipelineStageFlags2::ALL_COMMANDS, uses, None);
+        Footprint::of([&recorded.finish()])
+    }
+
+    /// What these summaries' footprint holds, copied out of them, its uses not sorted yet
+    /// ([`sorted`](Self::sorted)): a caller that must not hold the summaries' lock while it
+    /// sorts gathers under it and sorts after.
+    pub(super) fn gathered<'a>(summaries: impl IntoIterator<Item = &'a Summary<K>>) -> Footprint<K>
+    where
+        K: 'a,
+    {
         let mut footprint = Footprint {
             uses: Vec::new(),
             waits: Vec::new(),
@@ -1896,8 +2647,19 @@ impl<K: Copy + Ord> Footprint<K> {
                 .updates
                 .extend(summary.updates.iter().map(|used| used.fence));
         }
-        footprint.uses.sort_by_key(|used| used.key);
         footprint
+    }
+
+    /// Its tracked uses, sorted by resource: a device test's (`tests::kept_heap_uses`).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(super) fn uses(&self) -> &[Use<K>] {
+        &self.uses
+    }
+
+    /// The footprint [`gathered`](Self::gathered) made, its uses sorted by resource.
+    pub(super) fn sorted(mut self) -> Footprint<K> {
+        self.uses.sort_by_key(|used| used.key);
+        self
     }
 
     /// Whether a tracked use of the batch names a resource `named` answers for.
@@ -1915,12 +2677,7 @@ impl<K: Copy + Ord> Footprint<K> {
     /// each shares a resource's range and one of them writes it, or one updates a fence the
     /// other waits for or updates.
     fn conflicts(&self, later: &Footprint<K>) -> bool {
-        let fences = |updates: &[K], other: &Footprint<K>| {
-            updates
-                .iter()
-                .any(|fence| other.waits.contains(fence) || other.updates.contains(fence))
-        };
-        if fences(&self.updates, later) || fences(&later.updates, self) {
+        if self.fences_meet(later) {
             return true;
         }
         later.uses.iter().any(|used| {
@@ -1933,6 +2690,21 @@ impl<K: Copy + Ord> Footprint<K> {
                         && !(earlier.write.is_empty() && used.write.is_empty())
                 })
         })
+    }
+
+    /// Whether one of `self` and `other` updates a fence the other waits for or updates.
+    fn fences_meet(&self, other: &Footprint<K>) -> bool {
+        let fences = |updates: &[K], other: &Footprint<K>| {
+            updates
+                .iter()
+                .any(|fence| other.waits.contains(fence) || other.updates.contains(fence))
+        };
+        fences(&self.updates, other) || fences(&other.updates, self)
+    }
+
+    /// Whether it waits for or updates a fence.
+    fn names_a_fence(&self) -> bool {
+        !self.waits.is_empty() || !self.updates.is_empty()
     }
 }
 
@@ -1947,6 +2719,22 @@ pub(super) fn ordered<K: Copy + Ord>(
     match (earlier, later) {
         (Some(earlier), Some(later)) => earlier.conflicts(later),
         (None, Some(known)) | (Some(known), None) => !known.is_empty(),
+        (None, None) => true,
+    }
+}
+
+/// Whether a batch whose footprint is `earlier`, committed first and held unsubmitted for its host
+/// step (`scheduler/order.rs`'s **Held batches give way**), and one whose footprint is `later`
+/// must still run in that order across queues: one updates a fence the other waits for or
+/// updates. `None` is a batch whose uses are not known yet, which may name any fence the other
+/// names.
+pub(super) fn fenced<K: Copy + Ord>(
+    earlier: Option<&Footprint<K>>,
+    later: Option<&Footprint<K>>,
+) -> bool {
+    match (earlier, later) {
+        (Some(earlier), Some(later)) => earlier.fences_meet(later),
+        (None, Some(known)) | (Some(known), None) => known.names_a_fence(),
         (None, None) => true,
     }
 }
@@ -2228,6 +3016,39 @@ impl<K: Copy + Ord + Hash> Tracker<K> {
                 }
             }
         }
+    }
+
+    /// The batches of `at`'s `VkQueue` before it that the host had not seen complete as of the
+    /// last [`Tracker::completed`] of that queue: the value a plan at `at` retires by, so a plan
+    /// orders after the work of exactly these batches (`WorkCounts::batches_with_none_pending` and
+    /// kin count them).
+    pub(super) fn pending_before(&self, at: Point) -> u64 {
+        let through = self.completed.get(at.queue).copied().unwrap_or(0);
+        at.value.saturating_sub(1).saturating_sub(through)
+    }
+
+    /// Per `VkQueue`, of `queues`: the timeline value of the last batch there that wrote what
+    /// `reads` read, of the writes the state holds (0 where it holds none there). Once each queue
+    /// completed its value, every write a submitted batch made to those bytes completed and
+    /// reached the host (each batch ends with [`Barrier::to_host`]): the state forgets only what
+    /// completed, and a write it let an older one's entry go for waited for that one. `None`
+    /// where one of `reads` is of a resource Metal does not track, whose writes the state does not
+    /// hold, or names a queue past `queues`.
+    pub(super) fn last_writes(&self, reads: &[Use<K>], queues: usize) -> Option<Vec<u64>> {
+        let mut values = vec![0; queues];
+        for read in reads {
+            if !read.tracked {
+                return None;
+            }
+            let entries = self.resources.get(&read.key).into_iter().flatten();
+            for entry in entries.filter(|entry| entry.range.overlaps(&read.range)) {
+                for writer in entry.writers.iter() {
+                    let value = values.get_mut(writer.at.queue)?;
+                    *value = (*value).max(writer.at.value);
+                }
+            }
+        }
+        Some(values)
     }
 
     /// The barriers before the `encoders` of the batch submitted next, at `at`, and its waits.

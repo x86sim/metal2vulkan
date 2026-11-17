@@ -33,7 +33,7 @@ use super::super::device::lock;
 use super::super::error::Error;
 use super::super::values::StorageMode;
 use super::super::PurgeableState;
-use super::{Image, Owner, Storage, Texture};
+use super::{Image, Owner, Storage, Stored, Texture};
 use metal2vulkan::vk::ImageType;
 use std::sync::Mutex;
 
@@ -67,6 +67,7 @@ impl Texture {
     /// `NonVolatile` to every request and change nothing, as plain Metal answers where its
     /// validation stops each, a query included.
     pub fn set_purgeable_state(&self, state: PurgeableState) -> Result<PurgeableState, Error> {
+        let _held = self.hold();
         if self.heap().is_some() {
             return Ok(PurgeableState::NonVolatile);
         }
@@ -82,13 +83,32 @@ impl Texture {
         })
     }
 
+    /// Give `link`, the texture's parts on the generation its device's recovery carries it to
+    /// (`texture/carry.rs`), the purgeable state its own parts keep, where both keep one.
+    pub(super) fn carry_purgeable_state(&self, link: &Texture) {
+        if let (Some(Kept::Image(from)), Some(Kept::Image(to))) = (self.kept(), link.kept()) {
+            let state = *lock(from);
+            *lock(to) = state;
+        }
+    }
+
     /// Where the texture's purgeable state is kept: `None` for a texture Metal answers
     /// `NonVolatile` for (the module docs).
     fn kept(&self) -> Option<Kept<'_>> {
         if self.0.parent.is_some() {
             return None;
         }
-        match &self.0.storage {
+        // A texture with two faces keeps its state with its own image, whichever face it
+        // presents (`texture/faces.rs`).
+        let parts = self.s();
+        let storage = match (parts.faces.get(), self.stored()) {
+            (Some(_), _) => parts.storage.made()?,
+            (None, Stored::Made(storage)) => storage,
+            // A shadow left unmade (`texture/lazy_shadow.rs`), Metal's `NonVolatile` as a
+            // shadow's.
+            (None, Stored::Unmade(_)) => return None,
+        };
+        match storage {
             Storage::Image(image) => match &image.owner {
                 Owner::Runtime {
                     shareable,

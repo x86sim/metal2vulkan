@@ -25,14 +25,22 @@
 //! Metal's answer: the SHA-256 of each output, the same on an Apple M3 Max (macOS 26.7) and an
 //! Apple M4 (macOS 27.0.1), plain and under Metal's validation layer alike: the textures' and the
 //! plane views' from our probes, which keep the bytes. A differing output is
-//! printed whole, on one `XR-TWO-PLANES-DIFFERS` line.
+//! printed whole, on one `XR-TWO-PLANES-DIFFERS` line. Plane 1's stores are Metal's code of each
+//! lane written: clamped to `[0, 1]`, scaled by 255 and rounded to nearest even, NaN 0 (the
+//! digests of the buffer's bytes after the `half` writes are those codes'). A store the device
+//! took as the other of the two codes nearest the scaled value, which Vulkan's conversion lets it
+//! take, where it announced `device-color-conversion`, is replaced by Metal's code in the buffer's
+//! bytes and in plane 1's reads after it ([`plane_1_as_metal`], counted on an
+//! `XR-TWO-PLANES` line): the RTX 5080 Laptop GPU stored the `half` 0x1820 (0.514 codes) as 0.
 
 use super::degrade_notices::{counts, on_device};
 use super::extended_range_targets::{half_bits, half_value};
 use super::pixel_samplers::metal_sampler;
+use super::xr_codes::{as_metal_reads, assert_announced, assert_counted, codes, texel_within};
 use super::{buffer_with, converted_holds, half_within, read_buffer};
 use crate::air_library::AirLibrary;
 use metal2vulkan::error::Feature;
+use metal2vulkan::metal::format::ExtendedRange;
 use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
 use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
 use metal2vulkan_devtools::{engine_dir, llvm_assemble};
@@ -556,6 +564,61 @@ fn floats(n: usize, step: usize) -> Vec<u8> {
         .collect()
 }
 
+/// The codes Metal's kernel write of `values` (`half4`s where `half`, else `float4`s, one a grid
+/// thread `w` wide) stores in a texture of `form`, by thread: those of the threads within the
+/// `width` x `height` texture (`ExtendedRange::write_code`), `None` past it and for a channel the
+/// form lacks (`BGR10_XR`'s alpha).
+fn written_codes(
+    form: ExtendedRange,
+    (values, half): (&[u8], bool),
+    w: usize,
+    (width, height): (usize, usize),
+) -> Vec<[Option<u32>; 4]> {
+    let lanes: Vec<f32> = match half {
+        true => values
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|h| half_value(u16::from_le_bytes(*h)))
+            .collect(),
+        false => values
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|f| f32::from_le_bytes(*f))
+            .collect(),
+    };
+    let alpha = matches!(form, ExtendedRange::Planes { .. });
+    lanes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+        .map(|(t, v)| {
+            let inside = t % w < width && t / w < height;
+            std::array::from_fn(|c| {
+                (inside && (c < 3 || alpha)).then(|| form.write_code(v[c], c == 3).unwrap())
+            })
+        })
+        .collect()
+}
+
+/// Checks the reads `h` and `f` of a texture of `form` that holds Metal's codes `codes` against
+/// Metal's digests of output `what` (`{what}H` and `{what}F` by `metal`), each lane the device's
+/// conversion within its bound replaced by Metal's read first ([`as_metal_reads`]), and counts the
+/// texels it moved into `moved`.
+fn check_reads(
+    (wrong, moved): (&mut Vec<String>, &mut usize),
+    (form, codes): (ExtendedRange, &[[Option<u32>; 4]]),
+    (what, metal): (String, impl Fn(&str) -> &'static str),
+    [h, f]: [Vec<u8>; 2],
+) {
+    let (f, h, n) = as_metal_reads(form, (&f, &h), codes);
+    *moved += n;
+    check(wrong, format!("{what}H"), metal("H"), &h);
+    check(wrong, format!("{what}F"), metal("F"), &f);
+}
+
 /// The SHA-256 of `bytes`, in hex.
 pub(super) fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -599,40 +662,38 @@ pub(super) fn texture(device: &Device, format: PixelFormat, width: u64, height: 
 /// `half` pattern and of a dense `float` grid, and in the consumer's shape.
 #[test]
 fn two_plane_textures_read_and_write_as_metal_does() {
-    on_device(|device, _| {
+    on_device(|device, messages| {
         let queue = device.new_command_queue().unwrap();
         let kernels = Kernels::new(device);
-        let mut wrong = Vec::new();
+        let (mut wrong, mut moved) = (Vec::new(), 0);
         let side = 256;
         let texels = Dispatch::Texels(side, side);
         let count = texels.threads();
         for format in [PixelFormat::RGB10A82PXR10, PixelFormat::RGB10A82PXR10SRGB] {
-            let metal = |tag: &str| {
-                TEXTURES
-                    .iter()
-                    .find(|m| m.0 == format && m.1 == tag)
-                    .map(|m| m.2)
-                    .unwrap()
+            let form = ExtendedRange::of(format).expect("a two-plane format");
+            let metal = |tag: String| {
+                move |lanes: &str| {
+                    TEXTURES
+                        .iter()
+                        .find(|m| m.0 == format && m.1 == format!("{tag}{lanes}"))
+                        .map(|m| m.2)
+                        .unwrap()
+                }
             };
             let t = texture(device, format, side, side);
             let steps = [
                 ("HR", halves(count, |n, c| n + 16384 * c), true),
                 ("FR", floats(count, 1), false),
             ];
+            let all = (side as usize, side as usize);
             for (tag, values, half) in steps {
                 write(device, &queue, &kernels, &t, (&values, half), texels);
-                let [h, f] = reads(device, &queue, &kernels, &t, texels);
-                check(
-                    &mut wrong,
-                    format!("{format:?} {tag}H"),
-                    metal(&format!("{tag}H")),
-                    &h,
-                );
-                check(
-                    &mut wrong,
-                    format!("{format:?} {tag}F"),
-                    metal(&format!("{tag}F")),
-                    &f,
+                let codes = written_codes(form, (&values, half), side as usize, all);
+                check_reads(
+                    (&mut wrong, &mut moved),
+                    (form, &codes),
+                    (format!("{format:?} {tag}"), metal(tag.to_owned())),
+                    reads(device, &queue, &kernels, &t, texels),
                 );
             }
             let t = texture(device, format, 64, 4);
@@ -645,11 +706,20 @@ fn two_plane_textures_read_and_write_as_metal_does() {
                 (&values, true),
                 Dispatch::Consumer,
             );
-            let [h, f] = reads(device, &queue, &kernels, &t, Dispatch::Consumer);
-            check(&mut wrong, format!("{format:?} ORH"), metal("ORH"), &h);
-            check(&mut wrong, format!("{format:?} ORF"), metal("ORF"), &f);
+            let codes = written_codes(form, (&values, true), GRID_WIDTH as usize, (64, 4));
+            check_reads(
+                (&mut wrong, &mut moved),
+                (form, &codes),
+                (format!("{format:?} OR"), metal("OR".to_owned())),
+                reads(device, &queue, &kernels, &t, Dispatch::Consumer),
+            );
         }
+        println!(
+            "XR-TWO-PLANES {}: {moved} texels' reads within the device's conversion of Metal's",
+            device.name()
+        );
         report(device, &wrong);
+        assert_announced(messages, moved, "the two-plane textures' reads");
     });
 }
 
@@ -672,12 +742,13 @@ fn two_plane_heap_textures_read_and_write_as_metal_does() {
     on_device(|device, messages| {
         let queue = device.new_command_queue().unwrap();
         let kernels = Kernels::new(device);
-        let mut wrong = Vec::new();
+        let (mut wrong, mut moved) = (Vec::new(), 0);
         for format in [PixelFormat::RGB10A82PXR10, PixelFormat::RGB10A82PXR10SRGB] {
-            let metal = |tag: &str| {
+            let form = ExtendedRange::of(format).expect("a two-plane format");
+            let metal = |lanes: &str| {
                 TEXTURES
                     .iter()
-                    .find(|m| m.0 == format && m.1 == tag)
+                    .find(|m| m.0 == format && m.1 == format!("OR{lanes}"))
                     .map(|m| m.2)
                     .unwrap()
             };
@@ -716,15 +787,19 @@ fn two_plane_heap_textures_read_and_write_as_metal_does() {
                         (&values, true),
                         Dispatch::Consumer,
                     );
-                    let [h, f] = reads(device, &queue, &kernels, &t, Dispatch::Consumer);
-                    let what = format!("{format:?} {options:?} {heap_type:?}");
-                    check(&mut wrong, format!("{what} ORH"), metal("ORH"), &h);
-                    check(&mut wrong, format!("{what} ORF"), metal("ORF"), &f);
+                    let codes = written_codes(form, (&values, true), GRID_WIDTH as usize, (64, 4));
+                    check_reads(
+                        (&mut wrong, &mut moved),
+                        (form, &codes),
+                        (format!("{format:?} {options:?} {heap_type:?} OR"), metal),
+                        reads(device, &queue, &kernels, &t, Dispatch::Consumer),
+                    );
                 }
             }
         }
         report(device, &wrong);
         let notices = counts(&messages.take_notices());
+        assert_counted(&notices, moved, "the heap textures' reads");
         assert_eq!(notices.get(&HEAP_PLANES[0]), None, "{notices:?}");
         assert_eq!(
             notices.get(&HEAP_PLANES[1]).copied(),
@@ -1945,7 +2020,9 @@ fn two_plane_surface_textures_keep_their_texels_in_the_surface_s_planes() {
 /// texture unit, a read of plane 1 is the device's conversion of its codes (announced
 /// `device-texel-conversion`): one that differs from Metal's holds where each value within the
 /// conversion's bound of a code's Metal value, replaced by it, gives Metal's output
-/// ([`as_metal_codes`]), counted.
+/// ([`as_metal_codes`]), counted. A plane 1 store the device took as the other code nearest the
+/// value written, where it announced `device-color-conversion`, holds as Metal's code in the
+/// buffer's bytes and in the reads after ([`plane_1_as_metal`]), counted.
 #[test]
 fn plane_views_over_a_buffer_read_and_write_as_metal_does() {
     on_device(|device, messages| {
@@ -1953,13 +2030,15 @@ fn plane_views_over_a_buffer_read_and_write_as_metal_does() {
         let kernels = Kernels::new(device);
         let exact = metal_sampler(device);
         let mut converted = Vec::new();
-        let mut wrong = Vec::new();
+        let (mut wrong, mut moved, mut stored) = (Vec::new(), 0, 0);
         let steps = [
             (halves(GRID, |n, c| 32 * n + 16384 * c + 7 * c), true),
             (floats(GRID, 32), false),
         ];
         for plane0 in [PixelFormat::BGR10XR, PixelFormat::BGR10XRSRGB] {
+            let form = ExtendedRange::of(plane0).expect("an extended-range format");
             for (g, (width, height, row)) in GEOMETRIES.into_iter().enumerate() {
+                let view_texels = (width as usize, height as usize);
                 let metal = |tag: &str| {
                     VIEWS
                         .iter()
@@ -1980,11 +2059,46 @@ fn plane_views_over_a_buffer_read_and_write_as_metal_does() {
                 };
                 let planes = [view(plane0, 0), view(PixelFormat::ARGB8Unorm, PLANE_1)];
                 let mut outputs = Vec::new();
-                for (p, plane) in planes.iter().enumerate() {
-                    let [h, f] = reads(device, &queue, &kernels, plane, Dispatch::Consumer);
-                    outputs.push((format!("R0P{p}H"), h));
-                    outputs.push((format!("R0P{p}F"), f));
-                }
+                // Plane 0's reads, each lane the device's conversion within its bound of Metal's
+                // codes `codes` replaced by Metal's read (`as_metal_reads`); plane 1's as read. The
+                // texels the bound moved.
+                let push_reads = |outputs: &mut Vec<(String, Vec<u8>)>,
+                                  s: usize,
+                                  codes: &[[Option<u32>; 4]],
+                                  stored: &[Stored]| {
+                    let mut moved = 0;
+                    for (p, plane) in planes.iter().enumerate() {
+                        let [mut h, mut f] =
+                            reads(device, &queue, &kernels, plane, Dispatch::Consumer);
+                        let (f, h) = match p {
+                            0 => {
+                                let (f, h, n) = as_metal_reads(form, (&f, &h), codes);
+                                moved += n;
+                                (f, h)
+                            }
+                            _ => {
+                                // Metal's read of each code its store took (`plane_1_as_metal`).
+                                for &(t, c, code) in stored {
+                                    let at = 4 * t + c;
+                                    let value = f32::from(code) / 255.0;
+                                    h[2 * at..2 * at + 2]
+                                        .copy_from_slice(&half_bits(value).to_le_bytes());
+                                    f[4 * at..4 * at + 4].copy_from_slice(&value.to_le_bytes());
+                                }
+                                (f, h)
+                            }
+                        };
+                        outputs.push((format!("R{s}P{p}H"), h));
+                        outputs.push((format!("R{s}P{p}F"), f));
+                    }
+                    moved
+                };
+                moved += push_reads(
+                    &mut outputs,
+                    0,
+                    &view_codes(form, &initial, view_texels, row),
+                    &[],
+                );
                 for (s, (values, half)) in steps.iter().enumerate() {
                     let s = s + 1;
                     for plane in &planes {
@@ -1997,15 +2111,28 @@ fn plane_views_over_a_buffer_read_and_write_as_metal_does() {
                             Dispatch::Consumer,
                         );
                     }
-                    outputs.push((
-                        format!("W{s}BUF"),
-                        read_buffer(&buffer, 0, VIEW_BUFFER).unwrap(),
-                    ));
-                    for (p, plane) in planes.iter().enumerate() {
-                        let [h, f] = reads(device, &queue, &kernels, plane, Dispatch::Consumer);
-                        outputs.push((format!("R{s}P{p}H"), h));
-                        outputs.push((format!("R{s}P{p}F"), f));
+                    // Metal's codes of plane 0 after the write; the buffer's plane 0 words each the
+                    // device's encode within a code of Metal's replaced by Metal's word.
+                    let codes =
+                        written_codes(form, (values, *half), GRID_WIDTH as usize, view_texels);
+                    let mut bytes = read_buffer(&buffer, 0, VIEW_BUFFER).unwrap();
+                    for (t, texel) in codes.iter().enumerate() {
+                        let [Some(r), Some(g), Some(b), _] = *texel else {
+                            continue;
+                        };
+                        let (x, y) = (t as u64 % GRID_WIDTH, t as u64 / GRID_WIDTH);
+                        let at = (y * row + 4 * x) as usize;
+                        let metal = (0xc000_0000 | r << 20 | g << 10 | b).to_le_bytes();
+                        let word = &mut bytes[at..at + 4];
+                        if *word != metal && texel_within(form, word, &metal) {
+                            word.copy_from_slice(&metal);
+                            moved += 1;
+                        }
                     }
+                    let took = plane_1_as_metal(&mut bytes, (values, *half), view_texels, row);
+                    stored += took.len();
+                    outputs.push((format!("W{s}BUF"), bytes));
+                    moved += push_reads(&mut outputs, s, &codes, &took);
                 }
                 for (tag, bytes) in outputs {
                     let plane_1_read = tag.contains("P1");
@@ -2031,15 +2158,104 @@ fn plane_views_over_a_buffer_read_and_write_as_metal_does() {
             device.name(),
             converted.len()
         );
+        println!(
+            "XR-TWO-PLANES {}: {moved} plane 0 texels within the device's conversion of Metal's",
+            device.name()
+        );
+        println!(
+            "XR-TWO-PLANES {}: {stored} plane 1 stores the other code nearest the value",
+            device.name()
+        );
+        let notices = counts(&messages.take_notices());
         if !converted.is_empty() {
-            let notices = counts(&messages.take_notices());
             assert!(
                 notices.contains_key(&Degradation::DeviceTexelConversion),
                 "{notices:?}"
             );
         }
+        if stored > 0 {
+            assert!(
+                notices.contains_key(&Degradation::DeviceColorConversion),
+                "{stored} plane 1 stores off Metal's code, unannounced: {notices:?}"
+            );
+        }
         report(device, &wrong);
+        assert_counted(&notices, moved, "the plane views");
     });
+}
+
+/// A plane 1 store [`plane_1_as_metal`] replaced: the grid thread, the lane (red, green, blue,
+/// alpha) and Metal's code.
+type Stored = (usize, usize, u8);
+
+/// Metal's code of an 8-bit normalized lane written `v`: clamped to `[0, 1]`, scaled by 255 and
+/// rounded to nearest even; NaN 0 (the module docs).
+fn unorm8_code(v: f32) -> u8 {
+    match v.is_nan() {
+        true => 0,
+        false => (v.clamp(0.0, 1.0) * 255.0).round_ties_even() as u8,
+    }
+}
+
+/// Plane 1's bytes in `bytes`, the plane views' buffer (`ARGB8Unorm` at [`PLANE_1`], `width` x
+/// `height` texels with rows `row` bytes apart) after the grid wrote `values` (`half4`s where
+/// `half`, else `float4`s, by grid thread): each byte the device stored as the other of the two
+/// codes nearest its lane's scaled value, which Vulkan's conversion to a normalized code lets a
+/// store take, replaced by Metal's code ([`unorm8_code`]); the stores replaced.
+fn plane_1_as_metal(
+    bytes: &mut [u8],
+    (values, half): (&[u8], bool),
+    (width, height): (usize, usize),
+    row: u64,
+) -> Vec<Stored> {
+    let lane = |t: usize, c: usize| match half {
+        true => half_value(u16::from_le_bytes([
+            values[8 * t + 2 * c],
+            values[8 * t + 2 * c + 1],
+        ])),
+        false => f32::from_le_bytes(std::array::from_fn(|i| values[16 * t + 4 * c + i])),
+    };
+    let mut took = Vec::new();
+    for t in 0..GRID {
+        let (x, y) = (t % GRID_WIDTH as usize, t / GRID_WIDTH as usize);
+        if x >= width || y >= height {
+            continue;
+        }
+        let at = PLANE_1 as usize + y * row as usize + 4 * x;
+        // `ARGB8Unorm`'s bytes: alpha, red, green, blue.
+        for (byte, c) in [3, 0, 1, 2].into_iter().enumerate() {
+            let v = lane(t, c);
+            let (metal, got) = (unorm8_code(v), bytes[at + byte]);
+            let scaled = v.clamp(0.0, 1.0) * 255.0;
+            if got != metal && !v.is_nan() && (f32::from(got) - scaled).abs() < 1.0 {
+                bytes[at + byte] = metal;
+                took.push((t, c, metal));
+            }
+        }
+    }
+    took
+}
+
+/// The codes of a `BGR10_XR` (or `_sRGB`) view of `width` x `height` texels over `bytes` with rows
+/// `row` bytes apart, by grid thread (`GRID_WIDTH` wide): red, green and blue of the texel a thread
+/// within the view reads, `None` past it and for alpha.
+fn view_codes(
+    form: ExtendedRange,
+    bytes: &[u8],
+    (width, height): (usize, usize),
+    row: u64,
+) -> Vec<[Option<u32>; 4]> {
+    (0..GRID)
+        .map(|t| {
+            let (x, y) = (t % GRID_WIDTH as usize, t / GRID_WIDTH as usize);
+            if x >= width || y >= height {
+                return [None; 4];
+            }
+            let at = y * row as usize + 4 * x;
+            let (c, _) = codes(form, &bytes[at..at + 4]);
+            [Some(c[0]), Some(c[1]), Some(c[2]), None]
+        })
+        .collect()
 }
 
 /// `bytes`, a read of an 8-bit normalized view (`half4`s where `half`, else `float4`s), with each

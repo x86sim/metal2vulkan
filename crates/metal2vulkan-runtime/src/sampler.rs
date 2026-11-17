@@ -62,7 +62,20 @@
 //! refused where it is used, `Unsupported` (`samplerAnisotropy`), since a function reading it
 //! there knows not its anisotropy. A minimum or maximum reduction reads the weighted average, as
 //! on an Apple M4 without Metal's validation layer (which refuses one), and
-//! `DeviceProperties::supports_sampler_reduction_mode` answers no.
+//! `DeviceProperties::supports_sampler_reduction_mode` answers no. Metal takes any `lodBias`, its
+//! validation layer too (an M3 Max on macOS 27.0.1: -100 to 100, ±16 and past them, NaN and the
+//! infinities), and a state of another bias is another state ([`SamplerKey`]). What the bias
+//! changes is the GPU's, so the runtime samples it as the Mac the device presents does
+//! (`MacClass`; `SamplerDescriptor::lod_bias`). On an Apple silicon Mac every sample reads the
+//! level a bias of 0 reads (the M3 Max, Apple9): a state samples with a bias of 0
+//! ([`taken_descriptor`]). A Mac with an Intel or AMD GPU adds the bias to every sample's level,
+//! explicit, gradient and implicit alike, and clamps the sum into the texture's levels (an AMD
+//! Radeon Pro 5300M and an Intel UHD 630, the consumer's probes): a state's binds hand the device
+//! its bias as `mipLodBias` (`SamplerUse::lod_bias`, [`SamplerState::bound_use`]), which Vulkan
+//! adds to every level, an explicit one's included. A bias the device's samplers cannot take as
+//! it is, past its `maxSamplerLodBias`, NaN, or where its portability subset withholds
+//! `samplerMipLodBias`, samples with the nearest they take (`metal::sampler::device_lod_bias`),
+//! announced once (`Degradation::CappedLodBias`).
 //!
 //! A min or mag filter `Cubic` (`MTLSamplerMinMagFilterCubic`, raw value 2) is made. Without a
 //! mip filter, Metal samples through such a state as through a constexpr `filter::bicubic`
@@ -72,26 +85,39 @@
 //! reduction, anisotropy, or through an argument buffer, the dispatch or draw that samples through
 //! it is refused `NotImplemented(SamplerBicubicFilter)`: Metal's level rule through it is not
 //! modelled, and the others are not measured.
+//!
+//! **Across a recovery** (`device/carry.rs`). A state is the same state on the generation its
+//! device's recovery made ([`SamplerState::carry`]): its descriptor, ID and element, held line-wide,
+//! go on, and it is placed there as at its making, in every heap set and sampler table and in the
+//! map of live states an equal request shares. A bind makes its Vulkan samplers on the generation
+//! it writes for, and keeps them for the generation the state was carried to last alone: a write
+//! of another generation's (a command buffer of the lost one, recording after the carry) holds the
+//! neutral sampler, as that command buffer fails as its device's lost one does.
 
 use super::degradation::Degradation;
+use super::device::carry::{LineDevice, LostParts};
 use super::device::lock;
 use super::error::{Error, SamplerLimit};
 use super::exit_guard;
-use super::key_hash::KeyMap;
+use super::key_hash::{KeyHasher, KeyMap};
 use super::resource_ids::{ElementHold, Holder, IdHold, IdPlacement, IdSpace, ResourceId};
 use super::retained::HeldBy;
 use super::Device;
+use super::MacClass;
 use crate::release;
 use ash::vk;
 use metal2vulkan::bind::SamplerDescriptor;
 use metal2vulkan::device::VkFeature;
 use metal2vulkan::error::DriverDeviation;
-use metal2vulkan::metal::sampler::{check_sampler, SamplerUse};
+use metal2vulkan::metal::sampler::{check_sampler, device_lod_bias, DeviceLodBias, SamplerUse};
 use metal2vulkan::metal::{
     CompareFunction, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter,
     SamplerReductionMode,
 };
 use std::any::Any;
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -112,8 +138,11 @@ pub struct SamplerStateOptions {
 
 /// What decides whether two requests share one state (probe 5, an M3 Max and an M4: each
 /// descriptor field changed alone, and `supportArgumentBuffers`, gave another state; the
-/// resource index never did): every field of the descriptor, its LOD clamps by their bits, and
-/// argument-buffer support. Metal's label decides too; the runtime's states have none.
+/// resource index never did): every field of the descriptor, its LOD clamps by their bits, its
+/// LOD bias by its bits with `-0.0` taken as `0.0`, and argument-buffer support. The bias as an
+/// M3 Max on macOS 27.0.1 keys it, with and without API validation: biases 0 and 1, 1 and
+/// 1.0001, and 20 and 30 gave two states each; 0 and -0, and two NaNs of one encoding, one.
+/// Metal's label decides too; the runtime's states have none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct SamplerKey {
     filters: (SamplerMinMagFilter, SamplerMinMagFilter, SamplerMipFilter),
@@ -125,6 +154,7 @@ pub(super) struct SamplerKey {
     max_anisotropy: u32,
     compare_function: CompareFunction,
     reduction_mode: SamplerReductionMode,
+    lod_bias: u32,
     support_argument_buffers: bool,
 }
 
@@ -141,8 +171,63 @@ impl SamplerKey {
             max_anisotropy: d.max_anisotropy,
             compare_function: d.compare_function,
             reduction_mode: d.reduction_mode,
+            // Adding `0.0` takes `-0.0` to `0.0` and keeps the bits of every other number and of
+            // a quiet NaN.
+            lod_bias: (d.lod_bias + 0.0).to_bits(),
             support_argument_buffers: options.support_argument_buffers,
         }
+    }
+}
+
+/// The device's live sampler states, by what decides whether a request shares one
+/// ([`SamplerKey`]): an equal request gets the live state, as Metal's does, and an entry whose
+/// state is gone answers none. Such an entry stays until a creation prunes the map, which one
+/// does where the map has grown to twice what the last prune left, and at least to
+/// [`PRUNE_FROM`]: so each creation's share of the prunes is a few entries however many states
+/// live, and the map holds at most twice the states live at its last prune, or `PRUNE_FROM`
+/// entries, whichever is more (each entry of a state gone a `Weak`, holding its allocation).
+#[derive(Default)]
+pub(super) struct LiveSamplers {
+    states: HashMap<SamplerKey, Weak<SamplerShared>>,
+    /// The length at which a creation prunes first.
+    prune_at: usize,
+    /// The entries the prunes have looked at (the device tests: `tests/sampler_prunes.rs`).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    looked_at: usize,
+}
+
+/// The least length at which a creation prunes the live states' map.
+const PRUNE_FROM: usize = 64;
+
+impl LiveSamplers {
+    /// `key`'s live state, where one lives.
+    fn live(&self, key: &SamplerKey) -> Option<Arc<SamplerShared>> {
+        self.states.get(key).and_then(Weak::upgrade)
+    }
+
+    /// Keep `state` as `key`'s, first dropping the entries of the states gone where the map has
+    /// grown to its bound. Dropping one lets go of a `Weak` alone: no state is dropped under the
+    /// map's lock.
+    fn keep(&mut self, key: SamplerKey, state: &Arc<SamplerShared>) {
+        if self.states.len() >= self.prune_at.max(PRUNE_FROM) {
+            #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+            {
+                self.looked_at += self.states.len();
+            }
+            self.states.retain(|_, state| state.strong_count() > 0);
+            self.prune_at = 2 * self.states.len();
+        }
+        self.states.insert(key, Arc::downgrade(state));
+    }
+}
+
+impl Device {
+    /// The length of the device's map of live sampler states and the entries its prunes have
+    /// looked at (the device tests).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn live_sampler_entries(&self) -> (usize, usize) {
+        let live = lock(&self.shared().samplers);
+        (live.states.len(), live.looked_at)
     }
 }
 
@@ -211,21 +296,35 @@ impl SamplerCount {
     }
 }
 
+/// Metal's `maxArgumentBufferSamplerCount` on a device whose set-1 sampler arrays have at most
+/// `elements` elements (`metal2vulkan::pipeline::heap_sampler_capacity`, which link sizes every
+/// heap array by, and [`Device::sampler_array`] answers) and whose live Vulkan samplers are held
+/// to `limit` (`maxSamplerAllocationCount`, the [`SamplerCount`] the device makes): one fewer
+/// than the smaller, since an array's element 0 and one of the device's samplers are the neutral
+/// sampler's, and each state the array holds takes an element and a sampler of its own
+/// ([`DeviceProperties::max_argument_buffer_sampler_count`](crate::DeviceProperties::max_argument_buffer_sampler_count)).
+/// 0 where `elements` is: no function reads a set-1 sampler array there.
+pub(super) fn argument_buffer_sampler_count(elements: u32, limit: u32) -> u64 {
+    u64::from(elements.min(limit).saturating_sub(1))
+}
+
 /// The Vulkan samplers a sampler state made for its binds, each by its description.
 ///
 /// Every bind of the state asks it for the sampler of one description --- a separate sampler
 /// slot's, a heap set's sampler array's, an argument buffer's ([`SamplerState::vk_sampler`]) ---
 /// so the encoding thread reads this at every draw and dispatch that samples through the state.
 /// It is a map ([`KeyMap`], whose keys are descriptions of Vulkan objects as its docs describe),
-/// not a list walked from the least recently bound: a bind pays one hash of the description
+/// not a list walked from the least recently bound: a bind pays one probe of the description
 /// however many samplers the state keeps, so the state can keep enough of them for a workload
 /// cycling its descriptions to find them all rather than make and destroy a `VkSampler` at every
-/// bind. Making room is the only walk, on a bind that makes a sampler with the cache full.
+/// bind. Making room is the only walk, on a bind that makes a sampler with the cache full. A
+/// description comes hashed ([`HashedDesc`]): a render encoder's binds keep the ones they worked
+/// out (`binding::BindMemo`), so a bind that finds its description there hashes nothing.
 ///
 /// `T` is [`OwnedSampler`]; the tests drive these rules over a value of their own.
 pub(super) struct KeptSamplers<T> {
     /// The samplers kept, each with the bind that last read it.
-    kept: KeyMap<metal2vulkan::vk::SamplerDesc, Kept<T>>,
+    kept: KeyMap<HashedDesc, Kept<T>>,
     /// The binds that read the cache so far: what stamps the sampler a bind reads or makes.
     binds: u64,
     /// What the cache has done ([`KeptCounts`]). Only the tests that measure the cache read it, so
@@ -248,6 +347,37 @@ pub(super) struct KeptCounts {
     pub(super) forgot: u64,
 }
 
+/// A Vulkan sampler's description and its hash under the maps' hasher ([`KeyMap`]), worked out
+/// once: the key of a state's cache ([`KeptSamplers`]), which hashes the hash alone. Two are
+/// equal where their descriptions are (`SamplerDesc`'s equality, the floats by their bits).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HashedDesc {
+    hash: u64,
+    desc: metal2vulkan::vk::SamplerDesc,
+}
+
+impl HashedDesc {
+    /// `desc`, hashed.
+    pub(crate) fn new(desc: metal2vulkan::vk::SamplerDesc) -> HashedDesc {
+        let hash = BuildHasherDefault::<KeyHasher>::default().hash_one(desc);
+        HashedDesc { hash, desc }
+    }
+}
+
+impl PartialEq for HashedDesc {
+    fn eq(&self, other: &HashedDesc) -> bool {
+        self.hash == other.hash && self.desc == other.desc
+    }
+}
+
+impl Eq for HashedDesc {}
+
+impl Hash for HashedDesc {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
 /// A Vulkan sampler a state keeps ([`KeptSamplers`]).
 struct Kept<T> {
     sampler: Arc<T>,
@@ -268,7 +398,7 @@ impl<T> KeptSamplers<T> {
 
     /// The sampler of `desc` this bind asks for, where the cache keeps it, read now so that it is
     /// the last the cache forgets. Counts the bind, found or not.
-    pub(super) fn found(&mut self, desc: &metal2vulkan::vk::SamplerDesc) -> Option<Arc<T>> {
+    pub(super) fn found(&mut self, desc: &HashedDesc) -> Option<Arc<T>> {
         self.binds += 1;
         let read_at = self.binds;
         let kept = self.kept.get_mut(desc)?;
@@ -324,7 +454,7 @@ impl<T> KeptSamplers<T> {
     }
 
     /// Keep `sampler`, the one this bind made of `desc`.
-    pub(super) fn keep(&mut self, desc: metal2vulkan::vk::SamplerDesc, sampler: &Arc<T>) {
+    pub(super) fn keep(&mut self, desc: HashedDesc, sampler: &Arc<T>) {
         #[cfg(test)]
         {
             self.counts.made += 1;
@@ -336,6 +466,11 @@ impl<T> KeptSamplers<T> {
                 read_at: self.binds,
             },
         );
+    }
+
+    /// Forget every sampler kept: handed back, to drop once the cache's lock is free.
+    fn forget_all(&mut self) -> Vec<Arc<T>> {
+        self.kept.drain().map(|(_, kept)| kept.sampler).collect()
     }
 
     /// The samplers kept now.
@@ -400,19 +535,35 @@ pub fn sampler_border_color(raw: u64) -> SamplerBorderColor {
     }
 }
 
-/// The descriptor a state of `descriptor` samples with (the module's rules): `descriptor` itself
-/// with plain Metal's anisotropy ([`metal_anisotropy`]) and LOD clamps ([`metal_lod_clamps`]),
-/// and for a pixel-coordinate one its repeat and mirrored-repeat axes `ClampToEdge`, its `r`
-/// axis's `MirrorClampToEdge` too (`r` addresses nothing such a sampler samples), mip filter
-/// `NotMipmapped` and anisotropy 1, as plain Metal samples it. A pixel-coordinate
-/// `MirrorClampToEdge` `s` or `t` axis keeps its mode, which Metal mirrors once by texel index and
-/// then clamps.
-pub(super) fn taken_descriptor(descriptor: &SamplerDescriptor) -> SamplerDescriptor {
+/// The LOD bias a state of `lod_bias` samples with on a device presenting a Mac of `class` (the
+/// module's rules): none on an Apple silicon Mac, whatever its own; on a Mac with an Intel or AMD
+/// GPU its own, `-0` as `0` and a NaN as none (what such a GPU samples for it is not measured,
+/// announced as the state is made).
+pub(super) fn taken_lod_bias(lod_bias: f32, class: MacClass) -> f32 {
+    match class {
+        MacClass::IntelOrAmd if !lod_bias.is_nan() => lod_bias + 0.0,
+        _ => 0.0,
+    }
+}
+
+/// The descriptor a state of `descriptor` samples with on a device presenting a Mac of `class`
+/// (the module's rules): `descriptor` itself with plain Metal's anisotropy
+/// ([`metal_anisotropy`]) and LOD clamps ([`metal_lod_clamps`]), the LOD bias that class samples
+/// with ([`taken_lod_bias`]), and for a pixel-coordinate one its repeat and mirrored-repeat axes
+/// `ClampToEdge`, its `r` axis's `MirrorClampToEdge` too (`r` addresses nothing such a sampler
+/// samples), mip filter `NotMipmapped` and anisotropy 1, as plain Metal samples it. A
+/// pixel-coordinate `MirrorClampToEdge` `s` or `t` axis keeps its mode, which Metal mirrors once
+/// by texel index and then clamps.
+pub(super) fn taken_descriptor(
+    descriptor: &SamplerDescriptor,
+    class: MacClass,
+) -> SamplerDescriptor {
     use SamplerAddressMode as A;
     let mut taken = *descriptor;
     taken.max_anisotropy = metal_anisotropy(descriptor.max_anisotropy);
     [taken.lod_min_clamp, taken.lod_max_clamp] =
         metal_lod_clamps([descriptor.lod_min_clamp, descriptor.lod_max_clamp]);
+    taken.lod_bias = taken_lod_bias(descriptor.lod_bias, class);
     if !descriptor.normalized_coordinates {
         for mode in [&mut taken.s_address_mode, &mut taken.t_address_mode] {
             if matches!(*mode, A::Repeat | A::MirrorRepeat) {
@@ -458,20 +609,55 @@ impl Drop for OwnedSampler {
     }
 }
 
+/// A carried sampler state's placement on a lost generation, in its heap sets and sampler tables
+/// (`heap_sets.rs`), taken out once none of the generation's command buffers may record, as the
+/// state's going takes it out (`heap_sets::sampler_gone`): the Vulkan samplers its sets hold at the
+/// state's element go, and with them their holds of the lost generation.
+struct LostPlacement {
+    device: Device,
+    id: u64,
+    serial: u64,
+    element: u64,
+}
+
+impl LostParts for LostPlacement {
+    fn release(self: Box<Self>) {
+        let LostPlacement {
+            device,
+            id,
+            serial,
+            element,
+        } = *self;
+        // As the state's going: one without an ID was placed nowhere.
+        if id != 0 {
+            super::heap_sets::sampler_gone(&device, id, serial, element);
+        }
+    }
+}
+
 /// A Metal sampler state (`MTLSamplerState`). Cheap to clone (a retain); `Send + Sync`. Two
 /// handles are equal when they are the same state.
 #[derive(Clone)]
 pub struct SamplerState(Arc<SamplerShared>);
 
 pub(super) struct SamplerShared {
-    device: Device,
+    /// The device: the generation the state was made on, then each one its device's recoveries
+    /// carried it to ([`SamplerState::carry`]), which its binds are checked against.
+    device: LineDevice,
+    /// What an equal request shares the state by ([`SamplerKey`]): the map of live states of each
+    /// generation it is carried to holds it so.
+    key: SamplerKey,
     /// The descriptor the state samples with ([`taken_descriptor`]).
     descriptor: SamplerDescriptor,
+    /// Its binds add its LOD bias to every sample's level: the device presents a Mac with an
+    /// Intel or AMD GPU ([`SamplerState::bound_use`]).
+    lod_bias: bool,
     /// The state's `gpuResourceID`.
     id: IdHold,
     /// The state's element of the set-1 sampler arrays (`resource_ids.rs`).
     element: ElementHold,
-    /// The Vulkan samplers made for binds, by their description ([`KeptSamplers`]).
+    /// The Vulkan samplers made for binds on the generation it was carried to last, by their
+    /// description ([`KeptSamplers`]).
     kept: Mutex<KeptSamplers<OwnedSampler>>,
     /// The encoder core that holds it from an argument table's retain (`retained::HeldBy`).
     held_by: HeldBy,
@@ -483,10 +669,12 @@ impl Drop for SamplerShared {
     /// buffers that may still read them (`heap_sets::sampler_gone`), before its element is given
     /// back.
     fn drop(&mut self) {
+        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+        going::run();
         let id = self.id.id().0;
         if id != 0 {
             super::heap_sets::sampler_gone(
-                &self.device,
+                self.device.generation(),
                 id,
                 self.id.serial(),
                 self.element.element(),
@@ -533,6 +721,14 @@ impl Device {
     /// pixel-coordinate one's included). A minimum or maximum reduction reads the weighted
     /// average.
     pub fn new_sampler_state(&self, descriptor: &SamplerDescriptor) -> Result<SamplerState, Error> {
+        self.at_serving(|device| device.new_sampler_state_now(descriptor))
+    }
+
+    /// [`Device::new_sampler_state`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn new_sampler_state_now(
+        &self,
+        descriptor: &SamplerDescriptor,
+    ) -> Result<SamplerState, Error> {
         self.sampler_state(
             "new_sampler_state",
             descriptor,
@@ -554,6 +750,15 @@ impl Device {
         descriptor: &SamplerDescriptor,
         options: SamplerStateOptions,
     ) -> Result<SamplerState, Error> {
+        self.at_serving(|device| device.new_sampler_state_with_options_now(descriptor, options))
+    }
+
+    /// [`Device::new_sampler_state_with_options`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn new_sampler_state_with_options_now(
+        &self,
+        descriptor: &SamplerDescriptor,
+        options: SamplerStateOptions,
+    ) -> Result<SamplerState, Error> {
         self.sampler_state("new_sampler_state_with_options", descriptor, options)
     }
 
@@ -563,7 +768,8 @@ impl Device {
         descriptor: &SamplerDescriptor,
         options: SamplerStateOptions,
     ) -> Result<SamplerState, Error> {
-        let taken = taken_descriptor(descriptor);
+        let class = self.properties().mac_class();
+        let taken = taken_descriptor(descriptor, class);
         // The LOD clamps are checked where they are used: a bind's clamps replace them.
         let mut shape_of = taken;
         shape_of.lod_min_clamp = 0.0;
@@ -621,43 +827,90 @@ impl Device {
                 )
             });
         }
+        // A Mac with an Intel or AMD GPU adds the bias to every sample's level; the device's
+        // samplers add the nearest they take (`metal::sampler::device_lod_bias`).
+        let lod_bias = class == MacClass::IntelOrAmd;
+        if lod_bias {
+            let bias = descriptor.lod_bias;
+            let why = match device_lod_bias(bias, profile) {
+                DeviceLodBias::Capped(limit) => Some(format!(
+                    "the device's samplers add at most {} (maxSamplerLodBias), so its samples add \
+                     {limit}",
+                    limit.abs()
+                )),
+                DeviceLodBias::Withheld => Some(
+                    "the device's portability subset withholds samplerMipLodBias, so its samples \
+                     add none"
+                        .to_owned(),
+                ),
+                DeviceLodBias::NotANumber => Some(
+                    "its samples add none; what a Mac with an Intel or AMD GPU samples for a NaN \
+                     bias is not measured"
+                        .to_owned(),
+                ),
+                _ => None,
+            };
+            if let Some(why) = why {
+                self.degrade(Degradation::CappedLodBias, || {
+                    (
+                        format!(
+                            "a sampler state of lodBias {bias} on a device presenting a Mac with \
+                             an Intel or AMD GPU, which adds it to every sample's level"
+                        ),
+                        why,
+                    )
+                });
+            }
+        }
         let shared = self.shared();
         let key = SamplerKey::of(descriptor, options);
+        // The ID a state the program released held is back, whichever thread let go of it last
+        // (`resource_ids.rs`, **Passing holds**); before the map's lock, which a state's going
+        // takes.
+        shared.passing_holds.wait();
         // Under the map's lock, so equal requests on two threads get one state.
         let mut live = lock(&shared.samplers);
-        if let Some(state) = live.get(&key).and_then(std::sync::Weak::upgrade) {
+        if let Some(state) = live.live(&key) {
             return Ok(SamplerState(state));
         }
         let id = IdHold::take(&shared.resource_ids, IdSpace::Sampler, options.placement);
         let element = ElementHold::take(&shared.resource_ids);
         let state = SamplerState(Arc::new(SamplerShared {
-            device: self.clone(),
+            device: LineDevice::unkept(self),
+            key,
             descriptor: taken,
+            lod_bias,
             id,
             element,
             kept: Mutex::new(KeptSamplers::new()),
             held_by: HeldBy::default(),
         }));
-        live.retain(|_, state| state.strong_count() > 0);
-        live.insert(key, Arc::downgrade(&state.0));
+        live.keep(key, &state.0);
         let hold = &state.0.id;
         // Sampler slots have no readers: the device counts the command buffers that list them.
         hold.hold(Holder::Sampler(Arc::downgrade(&state.0)));
         drop(live);
         // Every heap set holds it, and the sampler tables map its ID to it (`heap_sets.rs`).
         super::heap_sets::place_sampler(self, &state);
+        // Kept for the device's recovery to carry, or carried now where a recovery took the
+        // generation's objects before.
+        if shared.carry.sampler_state(&state) {
+            self.carry_late(|serving| Ok::<_, Infallible>(state.carry(serving)));
+        }
         let id = hold.id().0;
         let element = state.heap_element();
-        let (available, limit) = self.sampler_array();
-        if element >= available {
+        // A device with no set-1 sampler array refuses every function reading one, so no array
+        // leaves the state out.
+        let available = u64::from(self.sampler_array());
+        if available > 0 && element >= available {
             self.degrade(Degradation::UnlistedArgumentSampler, || {
                 (
                     format!("sampler state at resource ID {id}"),
                     format!(
                         "more sampler states live than a set-1 sampler array of the device \
-                         holds ({limit:?} is {available}), so none holds its element {element}, \
-                         and a function reading it through an argument buffer while it lives \
-                         reads the neutral sampler"
+                         holds ({available} elements, the neutral sampler's among them), so none \
+                         holds its element {element}, and a function reading it through an \
+                         argument buffer while it lives reads the neutral sampler"
                     ),
                 )
             });
@@ -672,7 +925,7 @@ impl Device {
     }
 
     /// [`argument_samplers`](Self::argument_samplers), with the count of the sampler IDs' slots'
-    /// changes they are live at ([`sampler_slots_changed`](Self::sampler_slots_changed)).
+    /// changes they are live at (`DeviceShared::sampler_slots_changed`).
     pub(super) fn argument_samplers_at(&self) -> (u64, Vec<SamplerState>) {
         let (changed, states) = lock(&self.shared().resource_ids).samplers();
         (changed, states.into_iter().map(SamplerState).collect())
@@ -684,14 +937,15 @@ impl Device {
         self.shared().counts.argument_samplers_taken();
         self.argument_samplers_at()
     }
+}
 
-    /// The count of the changes of the sampler IDs' slots so far: while it holds, the live
-    /// sampler states are the ones [`argument_samplers`](Self::argument_samplers) answered at it.
-    pub(super) fn sampler_slots_changed(&self) -> u64 {
-        self.shared()
-            .sampler_ids
-            .slots_changed
-            .load(Ordering::Acquire)
+impl crate::device::DeviceShared {
+    /// The count of the changes of the sampler IDs' slots so far, a listing that found a state
+    /// going among them (`ResourceIds::samplers`): while it holds,
+    /// `Device::argument_samplers` answers the states it answered at it. Read at each draw, so
+    /// of the generation its command buffer holds (`CommandBuffer::generation`).
+    pub(crate) fn sampler_slots_changed(&self) -> u64 {
+        self.sampler_ids.slots_changed.load(Ordering::Acquire)
     }
 }
 
@@ -770,14 +1024,31 @@ impl SamplerState {
         self.0.clone()
     }
 
+    /// The address of what [`held`](Self::held) refers to: no other object's while it lives
+    /// (`retained.rs`).
+    pub(super) fn address(&self) -> usize {
+        Arc::as_ptr(&self.0).cast::<()>().addr()
+    }
+
     /// The encoder core that holds it from an argument table's retain (`retained::HeldBy`).
     pub(super) fn held_by(&self) -> &HeldBy {
         &self.0.held_by
     }
 
-    /// `device`: the device that made the state.
-    pub fn device(&self) -> &Device {
-        &self.0.device
+    /// `device`: a generation handle of the device, owned, as Metal's `device` answers a retained
+    /// device: of the generation the state was made on, then of each one the device's recoveries
+    /// carried the state to. The handle is the caller's: it keeps meaning that generation while
+    /// held, past a recovery that carries the state on, its raw handles that generation's
+    /// `VkDevice`'s, kept alive while held.
+    pub fn device(&self) -> Device {
+        self.generation().clone()
+    }
+
+    /// The generation handle [`device`](Self::device) answers a clone of, borrowed for the
+    /// runtime's own reads: a caller's handle is `device`'s, as a recovery lets go of the
+    /// object's handle of a lost generation at that generation's rest (`device/carry.rs`).
+    pub(crate) fn generation(&self) -> &Device {
+        self.0.device.generation()
     }
 
     /// `gpuResourceID`: what an argument buffer holds to name the state (`resource_ids.rs`).
@@ -802,6 +1073,11 @@ impl SamplerState {
         Arc::downgrade(&self.0)
     }
 
+    /// Whether `weak` holds this state.
+    pub(super) fn is(&self, weak: &Weak<SamplerShared>) -> bool {
+        std::ptr::eq(Weak::as_ptr(weak), Arc::as_ptr(&self.0))
+    }
+
     /// The state `weak` holds, where it lives.
     pub(super) fn upgrade(weak: &Weak<SamplerShared>) -> Option<SamplerState> {
         weak.upgrade().map(SamplerState)
@@ -813,6 +1089,16 @@ impl SamplerState {
         &self.0.descriptor
     }
 
+    /// `use_` as a bind of this state hands it to `bind::sampler_desc`: adding the descriptor's
+    /// LOD bias to every sample's level where the device presents a Mac whose GPU adds it
+    /// (`SamplerUse::lod_bias`, `MacClass::IntelOrAmd`). Every bind of a state makes its Vulkan
+    /// samplers through it, a slot's, an argument buffer's and a heap set's sampler array's, and
+    /// so does the reckoning of the levels a draw samples of an attachment's texture
+    /// (`render/attached_levels.rs`).
+    pub(super) fn bound_use(&self, use_: SamplerUse) -> SamplerUse {
+        use_.with_lod_bias(self.0.lod_bias)
+    }
+
     /// Whether an access through an argument buffer that names this state may hand the device a
     /// pixel coordinate scaled by the texture's size (`Device::degrade_argument_pixel_samplers`):
     /// its coordinates are pixels. Every gather, comparison and sample through such a state but a
@@ -821,26 +1107,34 @@ impl SamplerState {
         !self.0.descriptor.normalized_coordinates
     }
 
-    /// The Vulkan sampler of `desc` (one of this state's binds, its view mapping included): the
-    /// one the state keeps, else a new one, kept once the cache has room for it ([`KeptSamplers`],
-    /// at most [`KEPT`] and at most as many as the device allows live). Where the device already
-    /// holds as many samplers as it allows, one this state keeps that no command buffer holds goes
-    /// to make room; `Error::SamplerLimit` is the answer only where every one it keeps is held
-    /// ([`SamplerCount`]).
+    /// The Vulkan sampler of `desc` (one of this state's binds, its view mapping included) on
+    /// `device`, the generation the bind writes for: the one the state keeps, else a new one,
+    /// kept once the cache has room for it ([`KeptSamplers`], at most [`KEPT`] and at most as many
+    /// as the device allows live). Where the device already holds as many samplers as it allows,
+    /// one this state keeps that no command buffer holds goes to make room, else a released
+    /// variant's kept instance that holds immutable samplers (`pipeline/kept.rs`);
+    /// `Error::SamplerLimit` is the answer only where every one it keeps is held and no kept
+    /// instance holds one ([`SamplerCount`]). `None` where `device` is not the generation the
+    /// state was carried to last: the bind writes the neutral sampler (the module docs). Read
+    /// under the cache's lock, which the state's carry forgets the lost generation's under.
     pub(super) fn vk_sampler(
         &self,
-        desc: &metal2vulkan::vk::SamplerDesc,
-    ) -> Result<Arc<OwnedSampler>, Error> {
-        let device = &self.0.device;
+        device: &Device,
+        desc: &HashedDesc,
+    ) -> Result<Option<Arc<OwnedSampler>>, Error> {
         let mut kept = lock(&self.0.kept);
+        // The generation the sampler would be made on, a root handle's the one serving.
+        if !std::ptr::eq(self.0.device.generation().shared(), device.shared()) {
+            return Ok(None);
+        }
         if let Some(sampler) = kept.found(desc) {
-            return Ok(sampler);
+            return Ok(Some(sampler));
         }
         kept.make_room(KEPT.min(device.shared().sampler_count.limit() as usize));
         let mut reduction = vk::SamplerReductionModeCreateInfo::default();
         let mut border = vk::SamplerBorderColorComponentMappingCreateInfoEXT::default();
         let info =
-            metal2vulkan::ash_interop::sampler_create_info(desc, &mut reduction, &mut border);
+            metal2vulkan::ash_interop::sampler_create_info(&desc.desc, &mut reduction, &mut border);
         let raw = loop {
             // SAFETY: the create info is valid for the device: `check_sampler` admitted its
             // features, its LOD range is ordered (`bind::sampler_desc`), and a border mapping is
@@ -848,7 +1142,14 @@ impl SamplerState {
             // (`metal::sampler::opaque_black_border`).
             match unsafe { device.shared().create_sampler(&info) } {
                 Ok(raw) => break raw,
-                Err(limit @ Error::SamplerLimit(_)) if !kept.forget_spare() => return Err(limit),
+                // Room is made by one this state keeps that no command buffer holds, else by a
+                // released variant's kept instance that holds immutable samplers (`kept.rs`).
+                Err(limit @ Error::SamplerLimit(_))
+                    if !kept.forget_spare()
+                        && !crate::pipeline::objects::evict_kept_for_samplers(device) =>
+                {
+                    return Err(limit)
+                }
                 Err(Error::SamplerLimit(_)) => {}
                 Err(error) => return Err(error),
             }
@@ -858,7 +1159,48 @@ impl SamplerState {
             raw,
         });
         kept.keep(*desc, &sampler);
-        Ok(sampler)
+        Ok(Some(sampler))
+    }
+
+    /// Carry the state, made on a generation of its device that a recovery leaves, to `to`, the
+    /// generation that recovery made (the module docs): its handle of the device linked to `to`'s,
+    /// the Vulkan samplers it kept forgotten, and the state placed there as at its making, then
+    /// kept there for a later recovery to carry on. Its placement on the lost generation goes at
+    /// that generation's rest ([`LostPlacement`]). `None` where it was carried there already;
+    /// `Some(false)` where it stays the lost generation's, `to` compiling otherwise than it
+    /// (`pipeline/carry.rs`'s `compiles_alike`): its binds there are refused
+    /// (`MadeBeforeRecovery`).
+    pub(crate) fn carry(&self, to: &Device) -> Option<bool> {
+        let shared = &self.0;
+        let from = shared.device.generation().clone();
+        if from.same(to) {
+            return None;
+        }
+        if !crate::pipeline::carry::compiles_alike(&from, to) {
+            return Some(false);
+        }
+        // Linked under the cache's lock, which a bind reads the state's generation under: no
+        // bind keeps a sampler of the lost generation from now on, nor finds one (`vk_sampler`).
+        let (handle, forgotten) = {
+            let mut kept = lock(&shared.kept);
+            let handle = shared.device.link_unkept(to)?;
+            (handle, kept.forget_all())
+        };
+        drop(forgotten);
+        from.shared().carry.lost(from.shared(), handle);
+        lock(&to.shared().samplers).keep(shared.key, shared);
+        super::heap_sets::place_sampler(to, self);
+        let placement = LostPlacement {
+            device: from.clone(),
+            id: shared.id.id().0,
+            serial: shared.id.serial(),
+            element: shared.element.element(),
+        };
+        from.shared().carry.lost(from.shared(), Box::new(placement));
+        if to.shared().carry.sampler_state(self) {
+            to.carry_late(|serving| Ok::<_, Infallible>(self.carry(serving)));
+        }
+        Some(true)
     }
 
     /// What its cache of Vulkan samplers has done ([`KeptCounts`]), and how many it keeps now: the
@@ -867,5 +1209,28 @@ impl SamplerState {
     pub(crate) fn kept_counts(&self) -> (KeptCounts, usize) {
         let kept = lock(&self.0.kept);
         (kept.counts(), kept.samplers_kept())
+    }
+}
+
+/// A step a test runs on a thread where a sampler state starts going there: its last handle gone,
+/// before its ID's slot is given back (`tests/sampler_release.rs`).
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+pub(super) mod going {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static STEP: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Run `step` where the next sampler state to go on this thread starts going.
+    pub(crate) fn at_next(step: impl FnOnce() + 'static) {
+        STEP.with(|kept| *kept.borrow_mut() = Some(Box::new(step)));
+    }
+
+    /// The step kept for this thread, once.
+    pub(super) fn run() {
+        if let Some(step) = STEP.with(|kept| kept.borrow_mut().take()) {
+            step();
+        }
     }
 }

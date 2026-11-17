@@ -16,6 +16,8 @@
 //!   encoder of the command buffer used misses, counted in the execution report;
 //! - commands a kernel writes (`icb_render_replay_encode_draw_only`) are drawn by a host step,
 //!   announced once;
+//! - a record the GPU wrote naming a state the CPU set on none of the executed commands draws it,
+//!   its `VkPipeline` made by the host step and counted;
 //! - what Metal's validation stops, and a buffer of compute commands, is refused at the call;
 //! - indexed commands draw their indices as the encoder's indexed draws do, and patch commands (the
 //!   owned `rt6_patch_index` fixture) with their own factor buffer and their pipeline's control
@@ -31,10 +33,13 @@
 //!   and counts a sampler set of its own;
 //! - a host step drawing a state made after the commit, whose fragment samples through its argument
 //!   buffer, binds the neutrals the state's creation made, and makes none.
+//! - a frame whose host step waits for an event that a command buffer of another queue, committed
+//!   after it, signals (ahead of the frame on its queue, or at its start) ends, and so does one
+//!   whose signaller first reads what the frame writes (the buffer its draws write, or a texture
+//!   over the `Private` buffer its color target lies over), reading it as it stood before.
 
-use super::degrade_notices::{
-    assert_made_once, forced, made_render_kinds, on_device, on_device_with, shared_in_system_memory,
-};
+use super::apart_writes::{layer_reported_nothing_but_apart_writes, NotedWrites};
+use super::degrade_notices::{assert_made_once, made_render_kinds, on_device, on_device_with};
 use super::indirect_command_buffers::{render_template_descriptor, render_template_state};
 use super::indirect_host_steps::{self, complete, param, HOST_STEPS};
 use super::patch_indices::Lane;
@@ -43,26 +48,31 @@ use super::render_arguments::{output, Members, SAMPLED};
 use super::render_state::texture;
 use super::renders::public_render;
 use super::resource_ids::{distinct_sampler_states, UNLISTED};
-use super::{buffer_with, pipelines_settled, read_buffer, WAIT};
+use super::{at_plan, buffer_with, pipelines_settled, read_buffer, WAIT};
+use crate::air_library::AirLibrary;
 use crate::candidate::engine::graphics::Assembly;
 use crate::candidate::engine::resources::pixel_format;
 use crate::candidate::runtime_case::render_pipeline_descriptor;
 use crate::case::indirect_commands::metal_primitive_type;
 use metal2vulkan::bind::DrawCall;
 use metal2vulkan::bind::ReplayFaults;
+use metal2vulkan::device::VkFeature;
 use metal2vulkan::metal::TextureUsage;
 use metal2vulkan::metal::{
     IndexType, IndirectCommandType, PixelFormat, PrimitiveType, RenderStages, ResourceUsage,
     TessellationControlPointIndexType, TessellationFactorStepFunction,
 };
-use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RuntimeFact};
+use metal2vulkan::pipeline::{
+    ColorAttachmentDescriptor, RenderPipelineDescriptor, RuntimeFact, StageSource,
+};
+use metal2vulkan_devtools::{engine_dir, llvm_assemble_text};
 use metal2vulkan_runtime::{
     Attachment, Buffer, CommandBuffer, CommandBufferError, CommandBufferStatus, Degradation,
     Device, DrawPrimitiveType, DrawProblem, Error, EventRef, ExecutedPipeline, Execution, Heap,
     HeapDescriptor, HeapType, IndirectCommandBuffer, IndirectCommandBufferDescriptor,
-    IndirectCommandBufferProblem, IndirectRenderCommand, Invalid, PipelineOptions, Problem, Region,
-    RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions, RuntimeGap,
-    Size,
+    IndirectCommandBufferProblem, IndirectRenderCommand, IndirectRule, Invalid, PipelineOptions,
+    Problem, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState,
+    ResourceOptions, RuntimeGap, Size,
 };
 use metal2vulkan_runtime::{LoadAction, StoreAction, TextureDescriptor};
 
@@ -203,6 +213,23 @@ pub(super) struct Drawn {
     pub(super) base: usize,
 }
 
+impl Drawn {
+    /// The bytes of `out` the draw writes, from its first word to its last: the layer takes each
+    /// draw as writing `out` from its window on ([`layer_reported_nothing_but_apart_writes`]).
+    pub(super) fn bytes(&self) -> std::ops::Range<u64> {
+        let word = |iid: usize, vid: usize| (self.window * WINDOW + 16 * iid + vid) as u64 * 4;
+        let last = (self.base + self.instances - 1, self.start + self.count - 1);
+        word(self.base, self.start)..word(last.0, last.1) + 4
+    }
+}
+
+/// The bytes of `out`'s window `window`: what a draw over it writes, of fewer than 16 vertices
+/// and 4 instances.
+pub(super) fn window_bytes(window: usize) -> std::ops::Range<u64> {
+    let start = (window * WINDOW * 4) as u64;
+    start..start + (WINDOW * 4) as u64
+}
+
 /// `out` after `draws`, zero where none wrote.
 pub(super) fn expected(draws: &[Drawn]) -> Vec<u32> {
     let mut out = vec![0; WINDOWS * WINDOW];
@@ -248,15 +275,13 @@ pub(super) fn pass() -> RenderPassDescriptor {
 }
 
 /// The kinds a test's steps force beside its own, where the device has not announced them: the
-/// makings of the pipeline states of `made`, and the `Shared` buffers' system memory.
+/// makings of the pipeline states of `made`, and what its `Shared` storage forces
+/// ([`shared_kinds`](super::shared_kinds)).
 pub(super) fn forced_with(
     device: &Device,
     made: &[metal2vulkan::pipeline::RenderPipelineDescriptor],
 ) -> std::collections::BTreeSet<Degradation> {
-    let mut kinds = forced(&[(
-        Degradation::SharedInSystemMemory,
-        shared_in_system_memory(device),
-    )]);
+    let mut kinds = super::shared_kinds(device);
     for descriptor in made {
         kinds.extend(made_render_kinds(device, descriptor));
     }
@@ -329,7 +354,25 @@ fn commands_draw_as_their_records_stand_at_commit() {
             .command(&icb, 3, 2)
             .draw_primitives(PrimitiveType::Point, 2, 3, 2, 1)
             .unwrap();
+        // Each draw's own words: the encoder's two over window 3, commands 0 and 3.
+        let mut writes = NotedWrites::new(messages);
+        for (window, start, count, instances, base) in [
+            (3, 0, 2, 1, 0),
+            (0, 0, 4, 1, 0),
+            (2, 2, 3, 2, 1),
+            (3, 2, 2, 1, 0),
+        ] {
+            let drawn = Drawn {
+                window,
+                start,
+                count,
+                instances,
+                base,
+            };
+            writes.drew(&setup.out, drawn.bytes());
+        }
         complete(&command_buffer);
+        layer_reported_nothing_but_apart_writes(messages, "the execution's draws", &writes);
         let draws = [
             Drawn {
                 window: 0,
@@ -368,8 +411,9 @@ fn commands_draw_as_their_records_stand_at_commit() {
 /// (`an_execution_under_a_state_without_support_faults_its_encoder`).
 #[test]
 fn inheriting_commands_draw_with_the_encoder_s_state_at_the_call() {
-    on_device(|device, _| {
+    on_device(|device, messages| {
         let setup = Setup::new(device);
+        let mut writes = NotedWrites::new(messages);
         let mut inheriting = IndirectCommandBufferDescriptor::new();
         inheriting.command_types = IndirectCommandType::DRAW;
         inheriting.inherit_pipeline_state = true;
@@ -419,6 +463,11 @@ fn inheriting_commands_draw_with_the_encoder_s_state_at_the_call() {
                 base: 0,
             },
         ];
+        // The command's draw and the encoder's, each its own words.
+        for drawn in &draws {
+            writes.drew(&setup.out, drawn.bytes());
+        }
+        layer_reported_nothing_but_apart_writes(messages, "the execution's draws", &writes);
         assert_eq!(setup.output(), expected(&draws));
     });
 }
@@ -542,10 +591,15 @@ fn both_draws() -> IndirectCommandBufferDescriptor {
 /// draw). Windows 0 and 1 are the commands', 2 and 3 the encoder's own draws after them.
 #[test]
 fn commands_of_private_types_draw_as_the_encoder_s_draws() {
-    on_device(|device, _| {
+    on_device_with(at_plan, |device, messages| {
         let indices = permuted(device);
         for (primitive_type, reached) in PRIVATE {
             let setup = Setup::new(device);
+            // Each draw writes in a window of its own.
+            let mut writes = NotedWrites::new(messages);
+            for window in 0..4 {
+                writes.drew(&setup.out, window_bytes(window));
+            }
             let icb = icb(device, &both_draws(), 2);
             setup
                 .command(&icb, 0, 0)
@@ -576,6 +630,8 @@ fn commands_of_private_types_draw_as_the_encoder_s_draws() {
                 .unwrap();
             encoder.end_encoding().unwrap();
             complete(&command_buffer);
+            let claim = format!("{primitive_type:?}'s draws");
+            layer_reported_nothing_but_apart_writes(messages, &claim, &writes);
             let direct: Vec<usize> = (0..reached).collect();
             let indexed: Vec<usize> = PERMUTED[..reached]
                 .iter()
@@ -603,10 +659,12 @@ fn commands_of_private_types_draw_as_the_encoder_s_draws() {
 /// count faults it (`PageFault`), its encoder and every one after it running nothing, the command
 /// before it included, and the encoder before running; a direct one of 2 vertices draws nothing,
 /// and the rest runs. Window 3 is the encoder's before, 0 the command before the draw, 1 the
-/// draw's, 2 the encoder's after; each on a queue of its own (a queue's second fault revokes it).
+/// draw's, 2 the encoder's after (its first two vertices) and the next encoder's (the two after
+/// them); each on a queue of its own (a queue's second fault revokes it). Each draw writes its own
+/// bytes of `out` ([`layer_reported_nothing_but_apart_writes`]).
 #[test]
 fn a_command_of_type_nine_fails_its_command_buffer_as_the_encoder_s_draw_does() {
-    on_device(|device, _| {
+    on_device_with(at_plan, |device, messages| {
         let indices = permuted(device);
         let nine = DrawPrimitiveType::Nine;
         let cases = [
@@ -629,6 +687,25 @@ fn a_command_of_type_nine_fails_its_command_buffer_as_the_encoder_s_draw_does() 
         ];
         for (label, indexed, error) in cases {
             let setup = Setup::new(device);
+            let window = |window, start, count| Drawn {
+                window,
+                start,
+                count,
+                instances: 1,
+                base: 0,
+            };
+            // The encoders' draws and the command before the draw, each its own words; the
+            // draw's, which runs nothing, its window.
+            let mut writes = NotedWrites::new(messages);
+            for drawn in [
+                window(3, 0, 2),
+                window(0, 0, 4),
+                window(2, 0, 2),
+                window(2, 2, 2),
+            ] {
+                writes.drew(&setup.out, drawn.bytes());
+            }
+            writes.drew(&setup.out, window_bytes(1));
             let icb = icb(device, &both_draws(), 2);
             setup
                 .command(&icb, 0, 0)
@@ -652,7 +729,7 @@ fn a_command_of_type_nine_fails_its_command_buffer_as_the_encoder_s_draw_does() 
             .unwrap();
             let queue = device.new_command_queue().unwrap();
             let command_buffer = queue.command_buffer().unwrap();
-            let points = |window: usize, execute: bool| {
+            let points = |window: usize, start: u32, execute: bool| {
                 let mut encoder = command_buffer.render_command_encoder(&pass()).unwrap();
                 setup.resident(&mut encoder);
                 encoder
@@ -668,24 +745,18 @@ fn a_command_of_type_nine_fails_its_command_buffer_as_the_encoder_s_draw_does() 
                 }
                 setup.bind(&mut encoder, window);
                 encoder
-                    .draw_primitives(PrimitiveType::Point, 0, 2, 1, 0)
+                    .draw_primitives(PrimitiveType::Point, start, 2, 1, 0)
                     .unwrap();
                 encoder.end_encoding().unwrap();
             };
-            points(3, false);
-            points(2, true);
-            points(2, false);
+            points(3, 0, false);
+            points(2, 0, true);
+            points(2, 2, false);
             command_buffer.commit().unwrap();
             command_buffer.wait_until_completed_for(WAIT).unwrap();
             let label = format!("{label} on {}", device.name());
+            layer_reported_nothing_but_apart_writes(messages, &label, &writes);
             assert_eq!(command_buffer.error(), error, "{label}");
-            let window = |window, count| Drawn {
-                window,
-                start: 0,
-                count,
-                instances: 1,
-                base: 0,
-            };
             let drawn = match error {
                 Some(_) => {
                     assert_eq!(
@@ -693,7 +764,7 @@ fn a_command_of_type_nine_fails_its_command_buffer_as_the_encoder_s_draw_does() 
                         CommandBufferStatus::Error,
                         "{label}"
                     );
-                    expected(&[window(3, 2)])
+                    expected(&[window(3, 0, 2)])
                 }
                 None => {
                     assert_eq!(
@@ -701,7 +772,7 @@ fn a_command_of_type_nine_fails_its_command_buffer_as_the_encoder_s_draw_does() 
                         CommandBufferStatus::Completed,
                         "{label}"
                     );
-                    expected(&[window(3, 2), window(0, 4), window(2, 2)])
+                    expected(&[window(3, 0, 2), window(0, 0, 4), window(2, 0, 4)])
                 }
             };
             assert_eq!(setup.output(), drawn, "{label}");
@@ -814,7 +885,7 @@ fn commands_reach_what_any_encoder_of_their_command_buffer_made_resident() {
 /// kind, as plain Metal draws it, where Metal's validation stops the setter.
 #[test]
 fn a_draw_into_a_buffer_whose_records_hold_it_draws_as_on_its_own() {
-    on_device(|device, _| {
+    on_device_with(at_plan, |device, _| {
         for types in [
             IndirectCommandType::DRAW_INDEXED,
             IndirectCommandType::DRAW_PATCHES,
@@ -907,6 +978,227 @@ fn commands_a_kernel_writes_are_drawn_by_a_host_step() {
     });
 }
 
+/// How long a command buffer of [`a_frame_waiting_for_a_later_signal_ends`] may take before the
+/// test takes it as stuck.
+const CYCLE_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// What the signaller of [`a_frame_waiting_for_a_later_signal_ends`] reads before it signals.
+#[derive(Clone, Copy, Debug)]
+enum Touches {
+    /// Nothing.
+    Nothing,
+    /// The buffer the frame's draws write.
+    Written,
+    /// A texture over the one `Private` buffer the frame's color target lies over too, as a host's
+    /// cache of surfaces places a compositor's texture and a page's canvas.
+    SharedBuffer,
+}
+
+/// The width of [`Touches::SharedBuffer`]'s textures, `RGBA8Unorm` in rows of 256 bytes, and their
+/// height.
+const SURFACE_WIDTH: u64 = 64;
+const SURFACE_HEIGHT: u64 = 4;
+
+/// A frame whose commands a kernel may write, so a host step records them, waits for an event that
+/// a command buffer of another queue committed after it signals: in a command buffer ahead of the
+/// frame on its own queue, and then at the frame's start. Metal orders command buffers of two
+/// queues through events alone, so it schedules the signaller first and both complete; where the
+/// signaller first reads what the frame writes (`touches`), it reads it as it stood before the
+/// frame, which is scheduled after the signal. Each command buffer ends within [`CYCLE_BOUND`],
+/// with no context closed; one stuck past it is released by the CPU's signal of the event, and the
+/// test fails.
+fn a_frame_waiting_for_a_later_signal_ends(device: &Device, touches: Touches) {
+    let shared = matches!(touches, Touches::SharedBuffer);
+    let own = Setup::new(device);
+    // A frame into a color target draws with the template's state of that color.
+    let setup = match shared {
+        true => Setup {
+            state: colored_template_state(device, PixelFormat::RGBA8Unorm),
+            ..own
+        },
+        false => own,
+    };
+    let writer = indirect_host_steps::state(device, "icb_render_replay_encode_draw_only", false);
+    let commands = 8;
+    let icb = icb(device, &descriptor(), commands);
+    for index in 0..commands {
+        setup.command(&icb, index, 0);
+    }
+    let arguments = buffer_with(device, &icb.gpu_resource_id().0.to_le_bytes()).unwrap();
+    let (frames, others) = (
+        device.new_command_queue().unwrap(),
+        device.new_command_queue().unwrap(),
+    );
+    let row = SURFACE_WIDTH * 4;
+    // The `Private` buffer, the frame's color target over it and the compositor's texture.
+    let surfaces = shared.then(|| {
+        let under = device
+            .new_buffer(row * SURFACE_HEIGHT, ResourceOptions::private())
+            .unwrap();
+        let mut surface = TextureDescriptor::texture_2d(
+            PixelFormat::RGBA8Unorm,
+            SURFACE_WIDTH,
+            SURFACE_HEIGHT,
+            false,
+        );
+        surface.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+        surface.resource_options = ResourceOptions::private();
+        let target = under.new_texture(&surface, 0, row).unwrap();
+        let compositor = under.new_texture(&surface, 0, row).unwrap();
+        (under, target, compositor)
+    });
+    let mut frame_pass = pass();
+    if let Some((_, target, _)) = &surfaces {
+        frame_pass.render_target_width = SURFACE_WIDTH;
+        frame_pass.render_target_height = SURFACE_HEIGHT;
+        let color = &mut frame_pass.color_attachments[0];
+        color.texture = Some(target.clone());
+        color.load_action = LoadAction::Clear;
+        color.clear_color = metal2vulkan_runtime::ClearColor::new(1.0, 1.0, 1.0, 1.0);
+        color.store_action = StoreAction::Store;
+    }
+    let length = match touches {
+        Touches::SharedBuffer => row * SURFACE_HEIGHT,
+        Touches::Nothing | Touches::Written => setup.out.length(),
+    };
+    for gate in [true, false] {
+        pipelines_settled(device);
+        let out = setup.out.contents().expect("a Shared buffer");
+        // SAFETY: `out` holds its length's bytes, and no command buffer uses it now.
+        unsafe { std::ptr::write_bytes(out.as_ptr(), 0, setup.out.length() as usize) };
+        if let Some((under, ..)) = &surfaces {
+            let zeroed = frames.command_buffer().unwrap();
+            let mut blit = zeroed.blit_command_encoder().unwrap();
+            blit.fill_buffer(under, 0..under.length(), 0).unwrap();
+            blit.end_encoding().unwrap();
+            complete(&zeroed);
+        }
+        let event = device.new_shared_event().unwrap();
+        let ahead = gate.then(|| {
+            let ahead = frames.command_buffer().unwrap();
+            ahead.encode_wait_for_event((&event).into(), 1).unwrap();
+            ahead.commit().unwrap();
+            ahead
+        });
+        let frame = frames.command_buffer().unwrap();
+        if !gate {
+            frame.encode_wait_for_event((&event).into(), 1).unwrap();
+        }
+        let mut writing = frame.compute_command_encoder().unwrap();
+        writing.set_compute_pipeline_state(&writer).unwrap();
+        writing.set_buffer(Some(&arguments), 0, 0).unwrap();
+        writing.set_buffer(Some(&setup.params), 0, 1).unwrap();
+        writing.set_buffer(Some(&setup.out), 0, 2).unwrap();
+        writing
+            .use_resource(icb.as_resource(), ResourceUsage::WRITE)
+            .unwrap();
+        let threads = Size::new(commands, 1, 1);
+        writing.dispatch_threads(threads, threads).unwrap();
+        writing.end_encoding().unwrap();
+        let mut encoder = frame.render_command_encoder(&frame_pass).unwrap();
+        setup.resident(&mut encoder);
+        encoder
+            .execute_commands_in_buffer(&icb, 0..commands)
+            .unwrap();
+        encoder.end_encoding().unwrap();
+        frame.commit().unwrap();
+        let read = buffer_with(device, &vec![0xff; length as usize]).unwrap();
+        let signaller = others.command_buffer().unwrap();
+        let mut blit = signaller.blit_command_encoder().unwrap();
+        match (touches, &surfaces) {
+            (Touches::Written, _) => blit
+                .copy_from_buffer_to_buffer(&setup.out, 0, &read, 0, length)
+                .unwrap(),
+            (Touches::SharedBuffer, Some((_, _, compositor))) => blit
+                .copy_from_texture_to_buffer(
+                    compositor,
+                    0,
+                    0,
+                    metal2vulkan_runtime::Origin::new(0, 0, 0),
+                    Size::new(SURFACE_WIDTH, SURFACE_HEIGHT, 1),
+                    &read,
+                    0,
+                    row,
+                    0,
+                    metal2vulkan_runtime::BlitOption::None,
+                )
+                .unwrap(),
+            (Touches::Nothing | Touches::SharedBuffer, _) => {}
+        }
+        blit.end_encoding().unwrap();
+        signaller.encode_signal_event((&event).into(), 1).unwrap();
+        signaller.commit().unwrap();
+        let all: Vec<&CommandBuffer> = [&signaller]
+            .into_iter()
+            .chain(&ahead)
+            .chain([&frame])
+            .collect();
+        let ended: Vec<bool> = all
+            .iter()
+            .map(|command_buffer| command_buffer.wait_until_completed_for(CYCLE_BOUND).is_ok())
+            .collect();
+        if ended.contains(&false) {
+            event.set_signaled_value(1);
+            for command_buffer in &all {
+                command_buffer.wait_until_completed_for(WAIT).unwrap();
+            }
+        }
+        assert!(
+            ended.iter().all(|&ended| ended),
+            "gate {gate}, {touches:?}: the signaller{}, the frame: ended {ended:?}",
+            if gate { ", the gate" } else { "" }
+        );
+        for command_buffer in &all {
+            assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
+        }
+        let drawn = Drawn {
+            window: 0,
+            start: 0,
+            count: 4 * commands as usize,
+            instances: 1,
+            base: 0,
+        };
+        assert_eq!(
+            setup.output(),
+            expected(&[drawn]),
+            "gate {gate}, {touches:?}"
+        );
+        if !matches!(touches, Touches::Nothing) {
+            let before = read_buffer(&read, 0, length).unwrap();
+            assert!(
+                before.iter().all(|&byte| byte == 0),
+                "gate {gate}, {touches:?}: read after the frame"
+            );
+        }
+    }
+}
+
+/// A host step's frame waiting for a later signal of another queue ends
+/// ([`a_frame_waiting_for_a_later_signal_ends`]).
+#[test]
+fn a_host_step_waiting_for_a_later_signal_of_another_queue_ends() {
+    on_device_with(at_plan, |device, _| {
+        a_frame_waiting_for_a_later_signal_ends(device, Touches::Nothing)
+    });
+}
+
+/// So does one whose signaller first reads the buffer the frame's draws write.
+#[test]
+fn a_host_step_waiting_for_a_later_signal_that_reads_its_writes_ends() {
+    on_device_with(at_plan, |device, _| {
+        a_frame_waiting_for_a_later_signal_ends(device, Touches::Written)
+    });
+}
+
+/// So does one whose signaller first reads a texture over the `Private` buffer the frame's color
+/// target lies over.
+#[test]
+fn a_host_step_waiting_for_a_later_signal_that_reads_its_target_s_buffer_ends() {
+    on_device_with(at_plan, |device, _| {
+        a_frame_waiting_for_a_later_signal_ends(device, Touches::SharedBuffer)
+    });
+}
+
 /// A host step draws on what its commit compiled: commands a kernel writes, drawn by a host step
 /// that waits for an event the test signals once the commit returned, draw as Metal's on a
 /// variant in the large-buffer form (one that reaches the commands' buffers at their device
@@ -914,7 +1206,8 @@ fn commands_a_kernel_writes_are_drawn_by_a_host_step() {
 /// completion, so the step compiled nothing; the commit settled the draws' pipeline with no
 /// buffer of the commands bound. Nor does it count one across the commit (the coordinator's ruling
 /// of 2026-10-07): the state's creation compiled the variant, and the commit only looked it up. The
-/// same commands the CPU wrote, drawn at commit, take the bound form.
+/// same commands the CPU wrote, drawn at commit, take the bound form. Each command's draw writes
+/// its own words of `out` ([`layer_reported_nothing_but_apart_writes`]).
 #[test]
 fn a_host_step_draws_on_what_its_commit_compiled() {
     on_device(|device, messages| {
@@ -928,6 +1221,21 @@ fn a_host_step_draws_on_what_its_commit_compiled() {
             count: 4 * commands as usize,
             instances: 1,
             base: 0,
+        };
+        // Command `i` draws vertices `4i..4i + 4` of window 0.
+        let note = |out: &Buffer| {
+            let mut writes = NotedWrites::new(messages);
+            for index in 0..commands as usize {
+                let command = Drawn {
+                    window: 0,
+                    start: 4 * index,
+                    count: 4,
+                    instances: 1,
+                    base: 0,
+                };
+                writes.drew(out, command.bytes());
+            }
+            writes
         };
         let queue = device.new_command_queue().unwrap();
         // Whether each command's draw reached its buffers at their device addresses.
@@ -947,6 +1255,7 @@ fn a_host_step_draws_on_what_its_commit_compiled() {
                 .draw_primitives(PrimitiveType::Point, 4 * index, 4, 1, 0)
                 .unwrap();
         }
+        let writes = note(&setup.out);
         let command_buffer = queue.command_buffer().unwrap();
         let mut encoder = command_buffer.render_command_encoder(&pass()).unwrap();
         setup.resident(&mut encoder);
@@ -955,6 +1264,7 @@ fn a_host_step_draws_on_what_its_commit_compiled() {
             .unwrap();
         encoder.end_encoding().unwrap();
         complete(&command_buffer);
+        layer_reported_nothing_but_apart_writes(messages, "the CPU's records' draws", &writes);
         assert_eq!(setup.output(), expected(&[drawn()]), "drawn at commit");
         assert_eq!(large(&command_buffer), vec![false; commands as usize]);
 
@@ -966,6 +1276,7 @@ fn a_host_step_draws_on_what_its_commit_compiled() {
         }
         let arguments = buffer_with(device, &icb.gpu_resource_id().0.to_le_bytes()).unwrap();
         let event = device.new_shared_event().unwrap();
+        let writes = note(&setup.out);
         let command_buffer = queue.command_buffer().unwrap();
         command_buffer
             .encode_wait_for_event(EventRef::from(&event), 1)
@@ -997,6 +1308,7 @@ fn a_host_step_draws_on_what_its_commit_compiled() {
         );
         event.set_signaled_value(1);
         indirect_host_steps::wait(&command_buffer);
+        layer_reported_nothing_but_apart_writes(messages, "the kernel's records' draws", &writes);
         let completed = device.shader_cache_statistics();
         assert_eq!(
             (completed.hits, completed.misses),
@@ -1010,6 +1322,84 @@ fn a_host_step_draws_on_what_its_commit_compiled() {
         );
         assert_eq!(large(&command_buffer), vec![true; commands as usize]);
         assert_made_once(messages, &HOST_STEPS, &forced_with(device, &[]));
+    });
+}
+
+/// A state of [`render_template_state`]'s function under another name, made with
+/// `supportIndirectCommandBuffers`: it draws as the template's, from a variant of its own, so no
+/// `VkPipeline` of the template's serves its draws.
+fn renamed_template_state(device: &Device) -> RenderPipelineState {
+    const NAME: &str = "icb_render_replay_template";
+    let text = std::fs::read_to_string(engine_dir().join(format!("{NAME}.ll"))).unwrap();
+    let renamed = format!("{NAME}_renamed");
+    let bitcode = llvm_assemble_text(&text.replace(NAME, &renamed)).unwrap();
+    let library = device.new_library_with_air(&bitcode).unwrap();
+    let function = library.new_function_with_name(&renamed).unwrap();
+    let mut descriptor =
+        RenderPipelineDescriptor::new(StageSource::Function(function.function_descriptor()));
+    descriptor.rasterization_enabled = false;
+    descriptor.support_indirect_command_buffers = true;
+    device
+        .new_render_pipeline_state(&descriptor, &PipelineOptions::default())
+        .unwrap()
+}
+
+/// A record the GPU wrote naming a state the CPU set on none of the executed commands: the commit
+/// settles the states the CPU set (command 0's), and the host step makes the other state's
+/// `VkPipeline` itself, on the steps' thread, counted in `WorkCounts::host_step_pipelines_made`
+/// with the step in `host_steps_recorded` and `host_step_nanos`. A blit of an earlier command
+/// buffer copies another buffer's command, of its own state over window 1, into command 1. Both
+/// draw as Metal's, and the host step is announced once.
+#[test]
+fn a_host_step_makes_the_pipeline_of_a_state_only_a_gpu_written_record_names() {
+    on_device(|device, messages| {
+        let setup = Setup::new(device);
+        let other = renamed_template_state(device);
+        let queue = device.new_command_queue().unwrap();
+        let source = icb(device, &descriptor(), 1);
+        let copied = setup.command(&source, 0, 1);
+        copied.set_render_pipeline_state(&other).unwrap();
+        copied
+            .draw_primitives(PrimitiveType::Point, 0, 4, 1, 0)
+            .unwrap();
+        let target = icb(device, &descriptor(), 2);
+        setup
+            .command(&target, 0, 0)
+            .draw_primitives(PrimitiveType::Point, 0, 4, 1, 0)
+            .unwrap();
+        let copying = queue.command_buffer().unwrap();
+        let mut blit = copying.blit_command_encoder().unwrap();
+        blit.copy_indirect_command_buffer(&source, 0..1, &target, 1)
+            .unwrap();
+        blit.end_encoding().unwrap();
+        complete(&copying);
+        pipelines_settled(device);
+        let before = device.work_counts();
+        let command_buffer = queue.command_buffer().unwrap();
+        let mut encoder = command_buffer.render_command_encoder(&pass()).unwrap();
+        setup.resident(&mut encoder);
+        encoder.execute_commands_in_buffer(&target, 0..2).unwrap();
+        encoder.end_encoding().unwrap();
+        complete(&command_buffer);
+        let after = device.work_counts();
+        let drawn = |window| Drawn {
+            window,
+            start: 0,
+            count: 4,
+            instances: 1,
+            base: 0,
+        };
+        assert_eq!(setup.output(), expected(&[drawn(0), drawn(1)]));
+        assert_eq!(after.host_steps_recorded - before.host_steps_recorded, 1);
+        assert!(after.host_step_nanos > before.host_step_nanos);
+        assert!(
+            after.host_step_pipelines_made > before.host_step_pipelines_made,
+            "the step made the other state's pipeline: {} then {}",
+            before.host_step_pipelines_made,
+            after.host_step_pipelines_made
+        );
+        assert_made_once(messages, &HOST_STEPS, &forced_with(device, &[]));
+        drop(other);
     });
 }
 
@@ -1119,7 +1509,9 @@ fn what_metal_stops_is_refused_at_the_call() {
         );
         assert_eq!(
             encoder.execute_commands_in_buffer(&compute, 0..1).err(),
-            Some(Error::NotImplemented(RuntimeGap::IndirectRenderCommands))
+            Some(Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                IndirectRule::OtherEncoderKind
+            )))
         );
         encoder.execute_commands_in_buffer(&icb, 2..2).unwrap();
         encoder.execute_commands_in_buffer(&mixed, 0..2).unwrap();
@@ -1190,11 +1582,22 @@ fn an_indexed_draw_reads_from_its_offset_s_low_32_bits() {
 /// beside a draw of primitives. An index buffer no encoder made resident draws, as Metal's did
 /// there (a buffer of its own, which the command buffer's resident set holds); one placed in a heap
 /// no encoder of the command buffer used misses: that command runs nothing, its neighbour runs, and
-/// the execution report counts it.
+/// the execution report counts it. Each command's draw writes its own words of `out`, from its
+/// first vertex to its last ([`layer_reported_nothing_but_apart_writes`]).
 #[test]
 fn indexed_commands_draw_their_indices() {
     on_device(|device, messages| {
         let setup = Setup::new(device);
+        let over = |window, start, count, instances, base| {
+            let drawn = Drawn {
+                window,
+                start,
+                count,
+                instances,
+                base,
+            };
+            drawn.bytes()
+        };
         let mut descriptor = descriptor();
         descriptor.command_types =
             IndirectCommandType::DRAW.union(IndirectCommandType::DRAW_INDEXED);
@@ -1235,6 +1638,15 @@ fn indexed_commands_draw_their_indices() {
             .command(&icb, 2, 2)
             .draw_primitives(PrimitiveType::Point, 0, 2, 1, 0)
             .unwrap();
+        // Vertices 1, 3 and 5 of instances 1 and 2; 2, 5 and 9 of instance 0; 0 and 1.
+        let mut writes = NotedWrites::new(messages);
+        for bytes in [
+            over(0, 1, 5, 2, 1),
+            over(1, 2, 8, 1, 0),
+            over(2, 0, 2, 1, 0),
+        ] {
+            writes.drew(&setup.out, bytes);
+        }
         let queue = device.new_command_queue().unwrap();
         let command_buffer = queue.command_buffer().unwrap();
         let mut encoder = command_buffer.render_command_encoder(&pass()).unwrap();
@@ -1251,6 +1663,7 @@ fn indexed_commands_draw_their_indices() {
         encoder.execute_commands_in_buffer(&icb, 0..3).unwrap();
         encoder.end_encoding().unwrap();
         complete(&command_buffer);
+        layer_reported_nothing_but_apart_writes(messages, "the indexed commands' draws", &writes);
         let drawn = expected_vertices(&[
             (0, &[5, 1, 3], 1..3),
             (1, &[5, 2, 9], 0..1),
@@ -1275,6 +1688,11 @@ fn indexed_commands_draw_their_indices() {
                     0,
                 )
                 .unwrap();
+            // Vertices 0 to 2 of window 3, where the command draws; 0 and 1 of window 2.
+            let mut writes = NotedWrites::new(messages);
+            for bytes in [over(3, 0, 3, 1, 0), over(2, 0, 2, 1, 0)] {
+                writes.drew(&setup.out, bytes);
+            }
             let command_buffer = queue.command_buffer().unwrap();
             let mut encoder = command_buffer.render_command_encoder(&pass()).unwrap();
             setup.resident(&mut encoder);
@@ -1284,6 +1702,7 @@ fn indexed_commands_draw_their_indices() {
             command_buffer.commit().unwrap();
             command_buffer.wait_until_completed_for(WAIT).unwrap();
             assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
+            layer_reported_nothing_but_apart_writes(messages, "a stray command's draws", &writes);
             command_buffer.execution_report().unwrap()
         };
         let report = run_stray(&placed(&heap, &stray_words));
@@ -1733,7 +2152,7 @@ fn run_indirect(
 /// encoder wrote. A host step records the pass, announced once.
 #[test]
 fn a_render_execution_reads_its_range_from_a_buffer_as_metal_s_does() {
-    on_device(|device, messages| {
+    on_device_with(at_plan, |device, messages| {
         for (location, length, ran) in [
             (0u32, 4u32, 0..4),
             (1, 2, 1..3),
@@ -1815,7 +2234,9 @@ fn a_render_execution_s_range_is_refused_where_metal_s_read_is_not_the_copy_s() 
             encoder
                 .execute_commands_in_buffer_indirect(&compute, &range, 8)
                 .err(),
-            Some(Error::NotImplemented(RuntimeGap::IndirectRenderCommands))
+            Some(Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                IndirectRule::OtherEncoderKind
+            )))
         );
         // A draw that writes the range's bytes: the template writes words 0 and 1 of its `out`.
         encoder.set_render_pipeline_state(&setup.state).unwrap();
@@ -1830,7 +2251,9 @@ fn a_render_execution_s_range_is_refused_where_metal_s_read_is_not_the_copy_s() 
             encoder
                 .execute_commands_in_buffer_indirect(&icb, &range, 8)
                 .err(),
-            Some(Error::NotImplemented(RuntimeGap::IndirectRenderCommands))
+            Some(Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                IndirectRule::RangeWrittenByDraw
+            )))
         );
         encoder.end_encoding().unwrap();
         complete(&command_buffer);
@@ -1841,8 +2264,8 @@ fn a_render_execution_s_range_is_refused_where_metal_s_read_is_not_the_copy_s() 
 /// One command of [`indexed_patch_commands_draw_as_metal_s_did`]: the pipeline's index type
 /// (`None`: no index type), whether it is indexed (with its control-point index buffer's words,
 /// 16-bit where `half`, the bytes before them and its offset, `None` for a null buffer) or plain,
-/// its control points, patch start and count, and its patch index buffer's words and the bytes
-/// before them, its offset.
+/// its control points, patch start and count, its patch index buffer's words and the bytes
+/// before them, its offset, and the bytes of the marks it may write.
 struct PatchCommand {
     index_type: TessellationControlPointIndexType,
     points: Option<Option<(&'static [u32], bool, u64)>>,
@@ -1851,10 +2274,12 @@ struct PatchCommand {
     count: u64,
     patch_indices: Option<&'static [u32]>,
     patch_pad: u64,
+    marks: std::ops::Range<u64>,
 }
 
 impl PatchCommand {
-    /// An indexed command of a 32-bit pipeline: two patches through `points` from 0.
+    /// An indexed command of a 32-bit pipeline: two patches through `points` from 0, which may
+    /// write every mark.
     const fn indexed(points: &'static [u32]) -> PatchCommand {
         PatchCommand {
             index_type: TessellationControlPointIndexType::UInt32,
@@ -1864,6 +2289,7 @@ impl PatchCommand {
             count: 2,
             patch_indices: None,
             patch_pad: 0,
+            marks: 0..16,
         }
     }
 }
@@ -1884,7 +2310,10 @@ const REVERSED: &[u32] = &[9, 10, 11, 6, 7, 8, 3, 4, 5, 0, 1, 2];
 /// an M4 alike), and a patch index offset that is not a multiple of 4 reads them from the offset
 /// rounded down to one. A control-point index buffer of its own that no encoder made resident is
 /// reached; one placed in a heap no encoder of the command buffer used misses. A device without
-/// tessellation shaders refuses the pipeline, reported as its refusal.
+/// tessellation shaders refuses the pipeline, reported as its refusal. The side-by-side commands
+/// write marks of their own, which the layer takes as one buffer's bound range: the test notes
+/// each command's marks, a draw's where the device tessellates and a patch draw's where it
+/// emulates ([`layer_reported_nothing_but_apart_writes`]).
 #[test]
 fn indexed_patch_commands_draw_as_metal_s_did() {
     indexed_patch_commands_draw_as_metal_s_did_on(Path::Native);
@@ -1898,8 +2327,11 @@ fn emulated_indexed_patch_commands_draw_as_metal_s_did() {
 
 fn indexed_patch_commands_draw_as_metal_s_did_on(path: Path) {
     use TessellationControlPointIndexType as T;
-    on_device_with(options_of(path), |device, _| {
+    on_device_with(options_of(path), |device, messages| {
         let lane = Lane::new(device.clone());
+        let tessellates = (device.compile_device().profile().enabled().features)
+            .contains(&VkFeature::TessellationShader);
+        let mut writes = NotedWrites::new(messages);
         let mut states = Vec::new();
         for index_type in [T::None, T::UInt16, T::UInt32] {
             let mut descriptor = lane.descriptor(index_type);
@@ -1938,9 +2370,12 @@ fn indexed_patch_commands_draw_as_metal_s_did_on(path: Path) {
             IndirectCommandType::DRAW_PATCHES.union(IndirectCommandType::DRAW_INDEXED_PATCHES);
         descriptor.inherit_buffers = true;
         // Run `commands` in one execution, `resident` saying whether their buffers are made
-        // resident, their control-point index buffers placed in `heap` where it is given: the
-        // marks and the execution report.
-        let run = |commands: &[PatchCommand], resident: bool, heap: Option<&Heap>| {
+        // resident, their control-point index buffers placed in `heap` where it is given, their
+        // marks noted in `writes`: the marks and the execution report.
+        let run = |commands: &[PatchCommand],
+                   resident: bool,
+                   heap: Option<&Heap>,
+                   writes: &mut NotedWrites| {
             let icb = icb(device, &descriptor, commands.len() as u64);
             let mut buffers = vec![factors.clone()];
             for (index, c) in commands.iter().enumerate() {
@@ -2035,6 +2470,13 @@ fn indexed_patch_commands_draw_as_metal_s_did_on(path: Path) {
             command_buffer.commit().unwrap();
             command_buffer.wait_until_completed_for(WAIT).unwrap();
             assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
+            for c in commands {
+                match tessellates {
+                    true => writes.drew(&marks, c.marks.clone()),
+                    false => writes.drew_patches(&marks, c.marks.clone()),
+                }
+            }
+            writes.next_command_buffer();
             let bytes = read_buffer(&marks, 0, 16).unwrap();
             let marks: Vec<String> = bytes
                 .as_chunks::<4>()
@@ -2134,10 +2576,12 @@ fn indexed_patch_commands_draw_as_metal_s_did_on(path: Path) {
                         points: None,
                         start: 2,
                         count: 1,
+                        marks: 8..12,
                         ..PatchCommand::indexed(REVERSED)
                     },
                     PatchCommand {
                         count: 1,
+                        marks: 12..16,
                         ..PatchCommand::indexed(REVERSED)
                     },
                 ],
@@ -2160,7 +2604,7 @@ fn indexed_patch_commands_draw_as_metal_s_did_on(path: Path) {
             ),
         ];
         for (name, commands, expected) in cases {
-            let (marks, report) = run(&commands, true, None);
+            let (marks, report) = run(&commands, true, None, &mut writes);
             assert_eq!(marks, expected, "{name}");
             assert!(!report.replay_fault, "{name}");
             assert_eq!(report.resident_misses, 0, "{name}");
@@ -2173,19 +2617,21 @@ fn indexed_patch_commands_draw_as_metal_s_did_on(path: Path) {
             points: Some(Some((&[0, 9, 0, 10, 0, 11, 0, 6, 0, 7, 0, 8], true, 2))),
             ..PatchCommand::indexed(REVERSED)
         };
-        let (marks, report) = run(&[misaligned], true, None);
+        let (marks, report) = run(&[misaligned], true, None, &mut writes);
         assert_eq!(marks, ["a000009a", "0", "0", "a1010b67"]);
         assert!(!report.replay_fault);
         assert_eq!(report.resident_misses, 0);
         // A control-point index buffer of its own that no encoder made resident is reached; one
         // placed in a heap no encoder used misses.
-        let (marks, report) = run(&[PatchCommand::indexed(REVERSED)], false, None);
+        let (marks, report) = run(&[PatchCommand::indexed(REVERSED)], false, None, &mut writes);
         assert_eq!(marks, ["0", "0", "a1010678", "a00009ab"]);
         assert_eq!(report.resident_misses, 0);
         let heap = shared_heap(device);
-        let (marks, report) = run(&[PatchCommand::indexed(REVERSED)], false, Some(&heap));
+        let one = [PatchCommand::indexed(REVERSED)];
+        let (marks, report) = run(&one, false, Some(&heap), &mut writes);
         assert_eq!(marks, ["0"; 4]);
         assert_eq!(report.resident_misses, 1);
+        layer_reported_nothing_but_apart_writes(messages, "the patch commands' draws", &writes);
     });
 }
 
@@ -2669,7 +3115,7 @@ fn a_host_step_s_variant_of_a_state_made_after_the_commit_shares_the_state_s_sam
 /// samples a texture through a sampler state its argument buffer holds (the committed public case
 /// `render_arguments::SAMPLED`), binds the device's neutrals its plan names (its set 1's heap
 /// array's neutral element and its argument samplers' neutrals), which the state's creation made
-/// on the program's thread: the step, on the scheduler's thread inside the exit guard's section,
+/// on the program's thread: the step, on the steps' thread inside the exit guard's section,
 /// makes no image, memory or submission of its own. The buffer's records are the GPU's to write (an earlier blit copied one),
 /// so its execution is a host step's; the command buffer waits for an event, and once the commit
 /// returned the test makes the state, encodes command 0 with it and the argument buffer on the

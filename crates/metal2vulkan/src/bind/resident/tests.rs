@@ -113,11 +113,10 @@ fn the_outermost_allocation_wins_and_overlaps_are_trimmed() {
 }
 
 /// Coalescing counts entries after merging, duplicates of one allocation once; a set of more
-/// than 2¹⁶ disjoint allocations, the search's unrolled reach, is made whole (2¹⁶ was its cap
-/// before).
+/// than 2¹⁷ disjoint allocations is made whole.
 #[test]
-fn a_set_past_the_unrolled_search_is_made_whole() {
-    let past = (1u64 << crate::memory::roots::SEARCH_STEPS) * 2 + 3;
+fn a_large_set_is_made_whole() {
+    let past = (1u64 << 17) + 3;
     let e = |i: u64| RootEntry {
         host: i * 32,
         guest: i * 32,
@@ -442,4 +441,168 @@ fn replay_bytes_are_the_binders_set_then_its_extents() {
         extents_bytes(extents_of(allocations, &entries)),
         bytes[set.bytes().len()..]
     );
+}
+
+/// Under `BindState::resident_apart` a root table's own resident set is the bound buffers' alone,
+/// and without it the whole set; and a resident set made of a table's ranges and of the used
+/// resources' and listed ranges (as a consumer that points its tables at one makes it) is the same
+/// either way, resolving every address alike, over pseudo-random states whose bound buffers, used buffers and heaps and listed
+/// ranges nest, overlap, touch and repeat.
+#[test]
+fn a_state_resident_apart_keeps_the_used_resources_out_of_its_tables() {
+    use crate::bind::state::{StageTable, UsedResource};
+    use crate::bind::{ResidentRange, ResidentSet};
+    use crate::pipeline::sym::Stage;
+    let mut rng = Rng(0x5eed_0fa9_a7c3);
+    for _ in 0..300 {
+        let delta = 0x10_0000;
+        let mut state = BindState::default();
+        let (mut vertex, mut fragment) = (StageTable::default(), StageTable::default());
+        for (i, e) in one_mapping(&mut rng, delta).into_iter().enumerate() {
+            let length = e.size.saturating_sub(rng.below(16));
+            match rng.below(4) {
+                0 | 1 => {
+                    let table = match rng.below(2) {
+                        0 => &mut vertex,
+                        _ => &mut fragment,
+                    };
+                    let buffer = BoundBuffer::Buffer {
+                        length,
+                        offset: 0,
+                        gpu_address: e.guest,
+                        device_address: Some(e.host),
+                        attribute_stride: None,
+                    };
+                    table.buffers.insert(i as u32, buffer);
+                }
+                2 => {
+                    let class = match rng.below(2) {
+                        0 => ResourceClass::Buffer,
+                        _ => ResourceClass::Heap,
+                    };
+                    let mut used = UsedResource::new(class, i as u32);
+                    used.gpu_address = Some(e.guest);
+                    used.device_address = Some(e.host);
+                    used.length = length;
+                    state.used_resources.push(used);
+                }
+                _ => {
+                    let range = ResidentRange::new(e.host, e.guest, length);
+                    state.resident_ranges.push(range);
+                }
+            }
+        }
+        state.stages.insert(Stage::Vertex, vertex);
+        state.stages.insert(Stage::Fragment, fragment);
+        let mut apart = state.clone();
+        apart.resident_apart = true;
+        assert_eq!(table_entries(&state), resident_entries(&state));
+        let bound_only = BindState {
+            used_resources: Vec::new(),
+            resident_ranges: Vec::new(),
+            ..state.clone()
+        };
+        assert_eq!(table_entries(&apart), resident_entries(&bound_only));
+        let ranges = |entries: Vec<RootEntry>| {
+            let table = stage_root_table(&[], 2, &entries);
+            let used = state.used_resources.iter().filter_map(|u| {
+                Some(ResidentRange::new(
+                    u.device_address?,
+                    u.gpu_address?,
+                    u.length,
+                ))
+            });
+            let listed = state.resident_ranges.iter().copied();
+            ResidentSet::new(
+                table
+                    .resident_ranges()
+                    .into_iter()
+                    .chain(used)
+                    .chain(listed),
+            )
+        };
+        let (pointed, whole) = (ranges(table_entries(&apart)), ranges(table_entries(&state)));
+        let entries = |set: ResidentSet| -> Vec<RootEntry> {
+            let word =
+                |e: &[u8], k: usize| u64::from_le_bytes(e[8 * k..8 * k + 8].try_into().unwrap());
+            (set.bytes().chunks(32))
+                .map(|e| entry(word(e, 0), word(e, 1), word(e, 2)))
+                .collect()
+        };
+        let (pointed, whole) = (&entries(pointed)[..], &entries(whole)[..]);
+        for byte in 0x1_0000..0x1_0000 + 16 * (256 + 40) {
+            let resolved =
+                |set: &[RootEntry]| covers(set, byte).map(|e| e.host.wrapping_add(byte - e.guest));
+            assert_eq!(resolved(pointed), resolved(whole), "{byte:#x}");
+        }
+        assert_eq!(apart.shape(), state.shape());
+    }
+}
+
+/// Ranges of every shape a list of buffers holds, in an order a list may take: clustered so that
+/// nesting, partial overlap, one start shared at different lengths and hosts, empty ones and
+/// records past `RECORDS_ADDRESS_BASE` all occur; sorted by Metal address where `sorted`, else
+/// with some starting below the ones before them, as a no-copy buffer's range starts below its
+/// address.
+fn list_ranges(rng: &mut Rng, sorted: bool) -> Vec<crate::bind::ResidentRange> {
+    use crate::bind::ResidentRange;
+    let n = rng.below(120) as usize;
+    let mut ranges: Vec<ResidentRange> = (0..n)
+        .map(|_| {
+            let base = match rng.below(8) {
+                0 => RECORDS_ADDRESS_BASE,
+                _ => 0x1_0000,
+            };
+            let guest = base + 8 * rng.below(512);
+            let length = match rng.below(6) {
+                0 => 0,
+                1 => 8 * rng.below(400),
+                _ => 1 + rng.below(96),
+            };
+            let host = match rng.below(3) {
+                0 => rng.next(),
+                _ => guest.wrapping_add(0x40_0000),
+            };
+            ResidentRange::new(host, guest, length)
+        })
+        .collect();
+    if sorted {
+        ranges.sort_by_key(|range| range.guest);
+    }
+    ranges
+}
+
+/// The property a consumer's cached parts rest on: the set joined of parts
+/// (`ResidentSet::of_parts`), each made of a run of consecutive ranges of a list, is the set made
+/// of the whole list (`ResidentSet::new`), entry for entry: parts in order, parts whose ranges
+/// interleave, empty parts, shared starts at different hosts (where the order of the list
+/// decides), and records.
+#[test]
+fn a_set_joined_of_parts_is_the_set_of_their_ranges() {
+    use crate::bind::{ResidentPart, ResidentSet};
+    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    let mut interleaved = 0;
+    for case in 0..4000 {
+        let ranges = list_ranges(&mut rng, case % 2 == 0);
+        let mut parts = Vec::new();
+        // The greatest start of a range before the part, and whether a part's starts below it.
+        let (mut greatest, mut below) = (0, false);
+        let mut at = 0;
+        while at < ranges.len() {
+            let take = (rng.below(10) as usize).min(ranges.len() - at);
+            let part = &ranges[at..at + take];
+            let starts = part.iter().filter(|range| range.length > 0);
+            below |= starts.clone().any(|range| range.guest < greatest);
+            greatest = starts.map(|range| range.guest).fold(greatest, u64::max);
+            parts.push(ResidentPart::new(part.iter().copied()));
+            at += take;
+        }
+        if rng.below(4) == 0 {
+            parts.push(ResidentPart::new([]));
+        }
+        let want = ResidentSet::new(ranges.iter().copied());
+        assert_eq!(ResidentSet::of_parts(&parts), want, "case {case}");
+        interleaved += usize::from(below);
+    }
+    assert!(interleaved > 1000, "{interleaved} cases interleave");
 }

@@ -23,11 +23,12 @@
 //!   a resolve into it, and a depth or a stencil attachment in a heap made with the bit all end
 //!   their command buffer with `MTLCommandBufferErrorDomain` /
 //!   `kIOGPUCommandBufferCallbackErrorPageFault`, on the first command buffer of a fresh process,
-//!   every time — and **every later command buffer in that process then errors too**. None of those
-//!   is a case here, for exactly that reason: a case that faults on every run and poisons its own
-//!   process's queue would take every case after it down with it. They are measured in the probe
-//!   and recorded in its header; `no_row_writes_through_an_attachment_or_a_resolve` holds this
-//!   family to it.
+//!   every time; the command buffers after it run. None of those is a case here: a case that
+//!   faults the GPU on every run would put a fault beside the cases around it, and Metal's
+//!   recovery from a fault fails work in flight beside it as a victim, and a queue's second
+//!   fault revokes the queue. They are measured in the probes and recorded in the runtime's
+//!   `read_only_view.rs`; `no_row_writes_through_an_attachment_or_a_resolve` holds this family to
+//!   it.
 //!
 //! So the two cases here are the two benign shapes a committed fixture can reach: a **pass's
 //! visibility result** written into read-only memory, and a **kernel's stores** into it.
@@ -441,28 +442,25 @@ impl Case for HostPageWrite {
         // vertex function, which is the fixture, not this family's subject) is the suite's
         // (`crate::replay::NATIVE_NOTES`), declared by no row.
         //
-        // `private-resource-option` **has** its venue now, which is what the earlier reading of
-        // this comment was waiting for. On macOS a no-copy buffer with bit 24 announces nothing:
-        // the runtime imports the pages through a read-only alias of them and
-        // `Device::no_copy_options` returns without announcing. Off macOS the GPU's writes reach
-        // the pages and the notice fires, and it fired on two drivers at once -- the RTX 5080
-        // Laptop (615.71.09) and llvmpipe (Mesa 26.2.4) -- for
-        // `host-page-writes-visibility-read-only` and `host-page-writes-kernel-store-read-only`
-        // and for neither writable row (replay-nvidia.log, replay-llvmpipe.log). So it is declared
-        // from `Row::read_only`, which is the bit it is about.
+        // `copied-host-pages` is the read-only rows' alone, declared from `Row::read_only`, which
+        // is the bit it is about. On macOS a no-copy buffer with bit 24 announces nothing: the
+        // runtime imports the pages through a read-only view of them. Off macOS no import keeps
+        // the GPU's writes out, so the buffer is made over a copy of the pages whose GPU writes are
+        // dropped at each batch's completion (the runtime's `copied.rs`), and that copy is
+        // announced. It never fires on MoltenVK, which is why it is declared rather than relied
+        // on.
         //
         // `shared-in-system-memory` is every row's and belongs to the venue, not to this family:
         // each row reads its pages back through a `Shared` buffer
         // (`crate::replay::shared_memory_notice`). Announced by all four on the 5080.
         //
-        // **None of these loosens a byte**, and that matters most here: the read-only rows' pages
-        // really do differ on both drivers (`case/bytes-the-cpu-reads-bytes`, 8 bytes, Metal 171
-        // against ours 16), which is this family's whole subject. Those bytes stay compared
-        // exactly and those rows stay divergent on them.
+        // **None of these loosens a byte**, and that matters most here: the read-only rows' pages,
+        // and what a later command buffer reads of them, are this family's whole subject. Those
+        // bytes stay compared exactly.
         let mut named = vec![crate::replay::shared_memory_notice()];
         if self.row.read_only {
             named.push(crate::replay::notice_allowance(
-                metal2vulkan_runtime::Degradation::PrivateResourceOption.code(),
+                metal2vulkan_runtime::Degradation::CopiedHostPages.code(),
             ));
         }
         named
@@ -677,8 +675,8 @@ mod tests {
     ///
     /// Measured on this M3 Max: a colour attachment over such memory, a resolve into it, and a
     /// depth or stencil attachment in a heap made with the bit all end their command buffer with
-    /// `kIOGPUCommandBufferCallbackErrorPageFault`, and every later command buffer in the same
-    /// process then errors too. So a case of one would take every case after it down with it. Held
+    /// `kIOGPUCommandBufferCallbackErrorPageFault`. So a case of one would fault the GPU on every
+    /// run, beside the cases around it (the module docs). Held
     /// by a test because the way such a shape gets in is somebody adding a row, not somebody
     /// changing the vocabulary: a row's attachment is the device's own memory
     /// ([`Row::target`]) or there is no attachment at all, and nothing here names the host buffer

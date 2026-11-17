@@ -231,10 +231,22 @@ impl Case for FetchOrdered {
         // nothing else (replay-nvidia.log). On MoltenVK, where
         // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
         // recording of this suite declares it.
+        //
+        // Every row fetches in the pixel interlock draw after draw, so on a driver whose such draws
+        // race under load each draw after the first begins a render pass instance of its own
+        // (`crate::replay::interlocked_split_notice` holds the reason and the run it rests on).
+        //
+        // A venue with neither ordered fetch form (no rasterization-order attachment access, no
+        // pixel interlock) reads the input attachment ordered between draws alone and announces
+        // `unordered-fetch-within-draw`, a precision note of what it leaves unordered: overlapping
+        // fragments of one draw. Each draw here is one fullscreen triangle, which overlaps itself
+        // nowhere, so every byte still compares exactly.
         std::iter::once(crate::replay::shared_memory_notice())
-            .chain([crate::replay::notice_allowance(
-                Degradation::FetchThroughScratch.code(),
-            )])
+            .chain([
+                crate::replay::notice_allowance(Degradation::FetchThroughScratch.code()),
+                crate::replay::interlocked_split_notice(),
+                crate::replay::notice_allowance(Degradation::UnorderedFetchWithinDraw.code()),
+            ])
             .collect()
     }
 

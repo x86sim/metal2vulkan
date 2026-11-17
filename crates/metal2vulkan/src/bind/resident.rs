@@ -13,6 +13,7 @@
 use crate::bind::instantiate::{padded, RootTable};
 use crate::bind::state::{BindState, BoundBuffer, ResourceClass};
 use crate::indirect_commands::RECORDS_ADDRESS_BASE;
+use std::cmp::Ordering;
 
 /// One root-table entry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -34,35 +35,121 @@ pub(crate) struct RootEntry {
 /// (from `RECORDS_ADDRESS_BASE`, where no Metal allocation lies) are kept whole, one for each
 /// start (the largest): an ID's records may run past later IDs' starts, and a kernel searches
 /// them only at their start, so each start must stay an entry's.
-pub(crate) fn resident_set(mut all: Vec<RootEntry>) -> Vec<RootEntry> {
+pub(crate) fn resident_set(all: Vec<RootEntry>) -> Vec<RootEntry> {
+    coalesced_of_sorted(&sorted(all))
+}
+
+/// `all` as a resident set takes its allocations: the empty ones dropped, the rest sorted by guest
+/// address, the larger first at one address, else in their order (a stable sort).
+pub(crate) fn sorted(mut all: Vec<RootEntry>) -> Vec<RootEntry> {
     all.retain(|e| e.size > 0);
-    all.sort_by(|a, b| a.guest.cmp(&b.guest).then(b.size.cmp(&a.size)));
+    all.sort_by(order);
+    all
+}
+
+/// The order [`sorted`] takes allocations in.
+fn order(a: &RootEntry, b: &RootEntry) -> Ordering {
+    a.guest.cmp(&b.guest).then(b.size.cmp(&a.size))
+}
+
+/// The resident set of `sorted`, allocations in [`sorted`]'s order.
+pub(crate) fn coalesced_of_sorted(sorted: &[RootEntry]) -> Vec<RootEntry> {
+    let mut out: Vec<RootEntry> = Vec::with_capacity(sorted.len());
+    for &e in sorted {
+        coalesce(&mut out, e);
+    }
+    out
+}
+
+/// Add `e`, an allocation at or after every one `out` was made of in [`sorted`]'s order, to `out`,
+/// the resident set of those: dropped where it lies inside the last entry, or a record's at the
+/// last entry's start; trimmed of its head where it overlaps the last entry; else whole. Whether
+/// it went in whole.
+fn coalesce(out: &mut Vec<RootEntry>, mut e: RootEntry) -> bool {
     let end = |e: &RootEntry| u128::from(e.guest) + u128::from(e.size);
-    let mut out: Vec<RootEntry> = Vec::with_capacity(all.len());
-    for mut e in all {
-        if let Some(last) = out.last() {
-            if e.guest >= RECORDS_ADDRESS_BASE {
-                if e.guest == last.guest {
-                    continue;
-                }
-                e.bind_offset = 0;
-                out.push(e);
-                continue;
+    e.bind_offset = 0;
+    let Some(last) = out.last() else {
+        out.push(e);
+        return true;
+    };
+    if e.guest >= RECORDS_ADDRESS_BASE {
+        if e.guest == last.guest {
+            return false;
+        }
+        out.push(e);
+        return true;
+    }
+    let last_end = end(last);
+    if end(&e) <= last_end {
+        return false;
+    }
+    if u128::from(e.guest) >= last_end {
+        out.push(e);
+        return true;
+    }
+    // `last_end - e.guest < e.size`, so the cut fits in `u64`.
+    let cut = (last_end - u128::from(e.guest)) as u64;
+    e.guest += cut;
+    e.host = e.host.wrapping_add(cut);
+    e.size -= cut;
+    out.push(e);
+    false
+}
+
+/// [`resident_set`] of the allocations of `parts` in their order, each part `(sorted, set)`: its
+/// allocations as [`sorted`] gives them and their resident set. Where no part's allocations sort
+/// before another's ahead of it, the parts' sets are joined as they are, each coalesced with the
+/// ones before it only at its head: an entry of a part's set that goes in whole leaves the rest of
+/// that set whole too, as the set is sorted and disjoint. Parts whose allocations interleave are
+/// sorted and coalesced together again, as one.
+pub(crate) fn joined<'a>(
+    parts: impl IntoIterator<Item = (&'a [RootEntry], &'a [RootEntry])>,
+) -> Vec<RootEntry> {
+    let parts: Vec<(&[RootEntry], &[RootEntry])> = parts
+        .into_iter()
+        .filter(|(sorted, _)| !sorted.is_empty())
+        .collect();
+    // Runs of parts, each `(first, end, greatest)`: its parts, and its greatest allocation in
+    // `order`, at or below every allocation of the runs after it.
+    let mut runs: Vec<(usize, usize, RootEntry)> = Vec::with_capacity(parts.len());
+    for (at, (sorted, _)) in parts.iter().enumerate() {
+        let (Some(&least), Some(&greatest)) = (sorted.first(), sorted.last()) else {
+            continue;
+        };
+        let mut run = (at, at + 1, greatest);
+        while let Some(&(first, _, before)) = runs.last() {
+            if order(&before, &least) != Ordering::Greater {
+                break;
             }
-            let last_end = end(last);
-            if end(&e) <= last_end {
-                continue;
-            }
-            if u128::from(e.guest) < last_end {
-                // `last_end - e.guest < e.size`, so the cut fits in `u64`.
-                let cut = (last_end - u128::from(e.guest)) as u64;
-                e.guest += cut;
-                e.host = e.host.wrapping_add(cut);
-                e.size -= cut;
+            runs.pop();
+            run.0 = first;
+            if order(&before, &run.2) == Ordering::Greater {
+                run.2 = before;
             }
         }
-        e.bind_offset = 0;
-        out.push(e);
+        runs.push(run);
+    }
+    let len = parts.iter().map(|(_, set)| set.len()).sum();
+    let mut out: Vec<RootEntry> = Vec::with_capacity(len);
+    for (first, end, _) in runs {
+        let merged;
+        let set = match end - first {
+            1 => parts[first].1,
+            _ => {
+                let all = parts[first..end]
+                    .iter()
+                    .flat_map(|(sorted, _)| sorted.iter());
+                let mut together: Vec<RootEntry> = all.copied().collect();
+                together.sort_by(order);
+                merged = coalesced_of_sorted(&together);
+                &merged[..]
+            }
+        };
+        let whole = set
+            .iter()
+            .position(|&e| coalesce(&mut out, e))
+            .map_or(set.len(), |at| at + 1);
+        out.extend_from_slice(&set[whole..]);
     }
     out
 }
@@ -70,7 +157,22 @@ pub(crate) fn resident_set(mut all: Vec<RootEntry>) -> Vec<RootEntry> {
 /// The coalesced resident set of `state`: every bound buffer with a device address (every stage)
 /// and every `Buffer`/`Heap` used resource with both addresses, at their padded sizes.
 pub(crate) fn resident_entries(state: &BindState) -> Vec<RootEntry> {
-    let all = resident_allocations(state)
+    coalesced(resident_allocations(state))
+}
+
+/// The coalesced resident set a root table of `state` holds: [`resident_entries`], or, where the
+/// consumer points its root tables at a set holding the used resources and the listed ranges
+/// (`BindState::resident_apart`), the bound buffers' alone.
+pub(crate) fn table_entries(state: &BindState) -> Vec<RootEntry> {
+    match state.resident_apart {
+        true => coalesced(bound_allocations(state)),
+        false => resident_entries(state),
+    }
+}
+
+/// The resident set of `allocations`, each `(host, guest, length)`, at their padded sizes.
+fn coalesced(allocations: impl Iterator<Item = (u64, u64, u64)>) -> Vec<RootEntry> {
+    let all = allocations
         .map(|(host, guest, length)| RootEntry {
             host,
             guest,
@@ -85,17 +187,6 @@ pub(crate) fn resident_entries(state: &BindState) -> Vec<RootEntry> {
 /// its own length (before the padding): the bound buffers, the used buffers and heaps, and the
 /// ranges listed apart (`BindState::resident_ranges`).
 fn resident_allocations(state: &BindState) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
-    let bound = state.stages.values().flat_map(|stage_table| {
-        stage_table.buffers.values().filter_map(|b| match *b {
-            BoundBuffer::Buffer {
-                length,
-                gpu_address,
-                device_address: Some(host),
-                ..
-            } => Some((host, gpu_address, length)),
-            _ => None,
-        })
-    });
     let used = state.used_resources.iter().filter_map(|u| {
         match (u.class, u.gpu_address, u.device_address) {
             (ResourceClass::Buffer | ResourceClass::Heap, Some(guest), Some(host)) => {
@@ -108,7 +199,23 @@ fn resident_allocations(state: &BindState) -> impl Iterator<Item = (u64, u64, u6
         .resident_ranges
         .iter()
         .map(|range| (range.host, range.guest, range.length));
-    bound.chain(used).chain(listed)
+    bound_allocations(state).chain(used).chain(listed)
+}
+
+/// The bound buffers of `state` with a device address (every stage), as `(host, guest, length)`
+/// at their own lengths.
+fn bound_allocations(state: &BindState) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
+    state.stages.values().flat_map(|stage_table| {
+        stage_table.buffers.values().filter_map(|b| match *b {
+            BoundBuffer::Buffer {
+                length,
+                gpu_address,
+                device_address: Some(host),
+                ..
+            } => Some((host, gpu_address, length)),
+            _ => None,
+        })
+    })
 }
 
 /// The unpadded extent of each entry of `resident` (`state`'s resident set,

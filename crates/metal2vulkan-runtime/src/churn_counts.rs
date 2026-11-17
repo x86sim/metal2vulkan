@@ -15,12 +15,19 @@
 //!   `vkBindBufferMemory` calls of the whole process, by entry point and by the place in the
 //!   runtime that asked for one (`creation.rs`, their one door). What a texture or buffer
 //!   creation made the driver do is then a count of that call's own work, not an inference from a
-//!   driver floor timed apart, and a count holds under any load where a time does not.
+//!   driver floor timed apart, and a count holds under any load where a time does not. Each is
+//!   also counted for the thread that made it, and a pooled block made ahead for the thread of
+//!   the call that waited for it, where one did (`ObjectChurn`'s `_this_thread` counts): the
+//!   device's thread that makes blocks ahead (`memory/ready.rs`) makes them when the device's
+//!   queue uses pause, so the process's counts over a call take whatever such making fell
+//!   within it.
 //! - **Shadow keeps.** The keeps of merged-back shadows (`shadow_merge.rs`) by the encoder that
 //!   planned them (a render pass's attachments, a compute dispatch's bindings, a blit), cut to a
 //!   rectangle or of every texel, and the texels they copy.
 
+use crate::step_aside::counted_apart;
 use crate::work_counts::{CopySite, CopySites, COPY_SITES};
+use std::cell::Cell;
 use std::panic::Location;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
@@ -36,6 +43,15 @@ static VK_MAKINGS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// The places in the runtime that made those, the first [`COPY_SITES`] met.
 static MAKING_SITES: LazyLock<CopySites> = LazyLock::new(CopySites::default);
+
+/// The releases of [`VK_RELEASES`]'s entry points made on a thread of a device's checks
+/// (`step_aside.rs`), which it leaves out: the checks' work, never the program's
+/// (`WorkCounts::device_checks`).
+static CHECK_RELEASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The makings of [`VK_MAKINGS`]'s entry points made on a thread of a device's checks, which it
+/// leaves out.
+static CHECK_MAKINGS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// An entry point [`VK_RELEASES`] counts.
 #[derive(Clone, Copy)]
@@ -58,8 +74,13 @@ pub(crate) enum VkMaking {
     BufferBinding = 5,
 }
 
-/// A release of `what` (`release::object`), called `at`.
+/// A release of `what` (`release::object`), called `at`: a check's where a device's check made
+/// it ([`CHECK_RELEASES`]).
 pub(crate) fn vk_released(what: VkRelease, at: &Location<'static>) {
+    if counted_apart() {
+        CHECK_RELEASES[what as usize].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     VK_RELEASES[what as usize].fetch_add(1, Ordering::Relaxed);
     let command = match what {
         VkRelease::Image => "vkDestroyImage",
@@ -70,10 +91,50 @@ pub(crate) fn vk_released(what: VkRelease, at: &Location<'static>) {
     RELEASE_SITES.count(command, at, 0);
 }
 
-/// A making of `what` (`creation.rs`), called `at`.
+thread_local! {
+    /// Of [`VK_MAKINGS`], those this thread made, and those another thread made for a call of
+    /// this thread that waited for them ([`count_on_this_thread`]).
+    static THIS_THREAD: [Cell<u64>; 6] = const { [const { Cell::new(0) }; 6] };
+}
+
+/// A making of `what` (`creation.rs`), called `at`: a check's where a device's check made it
+/// ([`CHECK_MAKINGS`]).
 pub(crate) fn vk_made(what: VkMaking, at: &Location<'static>) {
+    if counted_apart() {
+        CHECK_MAKINGS[what as usize].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     VK_MAKINGS[what as usize].fetch_add(1, Ordering::Relaxed);
+    THIS_THREAD.with(|counts| {
+        let count = &counts[what as usize];
+        count.set(count.get() + 1);
+    });
     MAKING_SITES.count(what.command(), at, 0);
+}
+
+/// This thread's makings so far, by [`VkMaking`] ([`THIS_THREAD`]).
+pub(crate) fn this_thread_makings() -> [u64; 6] {
+    THIS_THREAD.with(|counts| counts.each_ref().map(Cell::get))
+}
+
+/// Count `makings` (by [`VkMaking`]), which another thread made while a call of this one waited
+/// for them (a pooled block made ahead, `memory/ready.rs`), as this thread's.
+pub(crate) fn count_on_this_thread(makings: [u64; 6]) {
+    THIS_THREAD.with(|counts| {
+        for (count, made) in counts.iter().zip(makings) {
+            count.set(count.get() + made);
+        }
+    });
+}
+
+/// The process's devices' checks' makings of `what` so far.
+pub(crate) fn checks_made(what: VkMaking) -> u64 {
+    CHECK_MAKINGS[what as usize].load(Ordering::Relaxed)
+}
+
+/// The process's devices' checks' releases of `what` so far.
+pub(crate) fn checks_released(what: VkRelease) -> u64 {
+    CHECK_RELEASES[what as usize].load(Ordering::Relaxed)
 }
 
 impl VkMaking {
@@ -135,8 +196,16 @@ pub(crate) struct ChurnCounters {
     /// By [`Recycled`]: the objects a making took from a recycler, parked there, and let go of
     /// past its bounds (`recycle.rs`).
     recycled: [[AtomicU64; 3]; 2],
-    /// No-copy buffers that imported their pages where a live import holds them all.
+    /// Images swapped out of their textures that left the image recycler's book as they went.
+    swapped_out_forgotten: AtomicU64,
+    /// Imports made over host addresses a live import holds some of.
     imports_inside_live: AtomicU64,
+    /// Imports of dma-bufs made beside live imports of dma-bufs of some of the same pages.
+    dma_buf_imports_beside_live: AtomicU64,
+    /// No-copy buffers bound inside a live import's memory, with no import of their own.
+    buffers_bound_in_import: AtomicU64,
+    /// Imports of a no-copy object's own pages whose guest RAM pages a live chunk import holds.
+    imports_over_ram_chunk_pages: AtomicU64,
     /// By [`KeepBy`], then cut or whole: the keeps, then their texels.
     keeps: [[AtomicU64; 4]; 3],
 }
@@ -147,9 +216,25 @@ impl ChurnCounters {
         self.owned[owned as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A no-copy buffer imported its pages where a live import holds them all.
+    /// An import was made over host addresses a live import holds some of.
     pub(crate) fn import_inside_live(&self) {
         self.imports_inside_live.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An import of dma-bufs was made beside live imports of dma-bufs of some of its pages.
+    pub(crate) fn dma_buf_import_beside_live(&self) {
+        (self.dma_buf_imports_beside_live).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A no-copy buffer was bound inside a live import's memory, with no import of its own.
+    pub(crate) fn buffer_bound_in_import(&self) {
+        self.buffers_bound_in_import.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A no-copy object imported its own pages, some of whose guest RAM pages a live chunk
+    /// import holds.
+    pub(crate) fn import_over_ram_chunk_pages(&self) {
+        (self.imports_over_ram_chunk_pages).fetch_add(1, Ordering::Relaxed);
     }
 
     /// A making took a parked object of `what`.
@@ -167,6 +252,12 @@ impl ChurnCounters {
         self.recycled[what as usize][2].fetch_add(count as u64, Ordering::Relaxed);
     }
 
+    /// An image swapped out of its texture, which the image recycler's book held as live, left
+    /// the book as it went (`recycle.rs`, "The book").
+    pub(crate) fn swapped_out_forgotten(&self) {
+        self.swapped_out_forgotten.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A keep planned `by`, cut to a rectangle or not, of `texels`.
     pub(crate) fn kept(&self, by: KeepBy, cut: bool, texels: u64) {
         let row = &self.keeps[by as usize];
@@ -180,6 +271,8 @@ impl ChurnCounters {
         let owned = |o: Owned| self.owned[o as usize].load(Ordering::Relaxed);
         let vk = |r: VkRelease| VK_RELEASES[r as usize].load(Ordering::Relaxed);
         let made = |m: VkMaking| VK_MAKINGS[m as usize].load(Ordering::Relaxed);
+        let this_thread = this_thread_makings();
+        let mine = |m: VkMaking| this_thread[m as usize];
         let keep = |by: KeepBy, at: usize| self.keeps[by as usize][at].load(Ordering::Relaxed);
         let recycled =
             |what: Recycled, at: usize| self.recycled[what as usize][at].load(Ordering::Relaxed);
@@ -195,6 +288,12 @@ impl ChurnCounters {
                 vk_memory_allocations: made(VkMaking::Memory),
                 vk_image_bindings: made(VkMaking::ImageBinding),
                 vk_buffer_bindings: made(VkMaking::BufferBinding),
+                vk_images_made_this_thread: mine(VkMaking::Image),
+                vk_buffers_made_this_thread: mine(VkMaking::Buffer),
+                vk_image_views_made_this_thread: mine(VkMaking::ImageView),
+                vk_memory_allocations_this_thread: mine(VkMaking::Memory),
+                vk_image_bindings_this_thread: mine(VkMaking::ImageBinding),
+                vk_buffer_bindings_this_thread: mine(VkMaking::BufferBinding),
                 making_sites: MAKING_SITES.read(),
                 making_sites_dropped: MAKING_SITES.dropped(),
                 images_own_memory: owned(Owned::ImageOwnMemory),
@@ -209,10 +308,17 @@ impl ChurnCounters {
                 images_recycled: recycled(Recycled::Image, 0),
                 images_parked: recycled(Recycled::Image, 1),
                 images_evicted: recycled(Recycled::Image, 2),
+                swapped_out_images_forgotten: self.swapped_out_forgotten.load(Ordering::Relaxed),
                 buffers_recycled: recycled(Recycled::Buffer, 0),
                 buffers_parked: recycled(Recycled::Buffer, 1),
                 buffers_evicted: recycled(Recycled::Buffer, 2),
                 imports_inside_live: self.imports_inside_live.load(Ordering::Relaxed),
+                dma_buf_imports_beside_live: (self.dma_buf_imports_beside_live)
+                    .load(Ordering::Relaxed),
+                buffers_bound_in_import: self.buffers_bound_in_import.load(Ordering::Relaxed),
+                imports_over_ram_chunk_pages: self
+                    .imports_over_ram_chunk_pages
+                    .load(Ordering::Relaxed),
                 release_sites: RELEASE_SITES.read(),
                 release_sites_dropped: RELEASE_SITES.dropped(),
             },
@@ -264,6 +370,24 @@ pub struct ObjectChurn {
     pub vk_image_bindings: u64,
     /// `vkBindBufferMemory` calls of the process.
     pub vk_buffer_bindings: u64,
+    /// Of `vk_images_made`, those of the thread that read these counts: its own calls', and
+    /// those another thread made while a call of it waited for them (a pooled block made ahead
+    /// that a creation call found none of and waited for, `memory/ready.rs`), counted on the
+    /// thread that took the block. What that thread's calls had the driver make, without what
+    /// the device's other threads made meanwhile, such as a block made ahead for a pool that
+    /// grew, which no call waited for. Each thread reads its own.
+    pub vk_images_made_this_thread: u64,
+    /// As `vk_images_made_this_thread`, of `vk_buffers_made` (a block of buffers made ahead
+    /// carries one where its buffers take device addresses).
+    pub vk_buffers_made_this_thread: u64,
+    /// As `vk_images_made_this_thread`, of `vk_image_views_made`.
+    pub vk_image_views_made_this_thread: u64,
+    /// As `vk_images_made_this_thread`, of `vk_memory_allocations` (a block made ahead is one).
+    pub vk_memory_allocations_this_thread: u64,
+    /// As `vk_images_made_this_thread`, of `vk_image_bindings`.
+    pub vk_image_bindings_this_thread: u64,
+    /// As `vk_images_made_this_thread`, of `vk_buffer_bindings`.
+    pub vk_buffer_bindings_this_thread: u64,
     /// The device's images that went, of memory of their own.
     pub images_own_memory: u64,
     /// Linear images in buffers' memory.
@@ -288,15 +412,55 @@ pub struct ObjectChurn {
     pub images_parked: u64,
     /// Parked images destroyed past the recycler's bounds.
     pub images_evicted: u64,
+    /// Images swapped out of their textures (a texture's first image, which its storage form
+    /// replaced, `texture/storage_form.rs`) that the recycler's book of live images held and that
+    /// left it as they were destroyed (`recycle.rs`, "The book"): each a handle that, left there,
+    /// would have named the next image the driver made at it as the old one's making.
+    pub swapped_out_images_forgotten: u64,
     /// The runtime's buffers a making took from the recycler, rather than making one.
     pub buffers_recycled: u64,
     /// Buffers that went to the recycler as their last holder went, rather than being destroyed.
     pub buffers_parked: u64,
     /// Parked buffers destroyed past the recycler's bounds.
     pub buffers_evicted: u64,
-    /// No-copy buffers that imported their pages where a live import of another no-copy buffer
-    /// held all of them (`host_aliases.rs`): imports a buffer could have lain in, at an offset.
+    /// Imports made over host addresses a live import held some of all the same
+    /// (`host_aliases.rs`, "One page, one import"): a no-copy buffer's or heap's own import (a
+    /// heap's own buffer's among them) over a live import of another no-copy buffer or heap, or
+    /// over a live import of a guest RAM's chunk (`host_ram.rs`), and a chunk's import over a
+    /// live import of a no-copy buffer or heap made as the chunk's was being made (a chunk such an
+    /// import held pages of before is not imported, `WorkCounts::host_ram_chunks_held_back`, but
+    /// beside imports of dma-bufs, `dma_buf_imports_beside_live`). A
+    /// page imported twice, which
+    /// `VK_EXT_external_memory_host` leaves undefined for a host pointer; every other buffer
+    /// over pages a live import holds lies inside it (`buffers_bound_in_import`, or a chunk's
+    /// `WorkCounts::chunk_bound_buffers_made`), imports dma-bufs of its own beside imports of
+    /// dma-bufs (`dma_buf_imports_beside_live`), or is a copy
+    /// (`WorkCounts::copied_over_live_imports`). Counted by host address, after each import is
+    /// made: two made at once over the same pages, each looking before the other's was noted,
+    /// count. A listed RAM's run imported alone while its chunk's import is made (two dma-bufs of
+    /// the same pages, `WorkCounts::run_imports_live`) does not.
     pub imports_inside_live: u64,
+    /// No-copy buffers' and heaps' own imports of dma-bufs of their pages, made where live
+    /// imports of another no-copy buffer's or heap's pages, each of dma-bufs, held some of them
+    /// (`host_aliases.rs`, "One page, one import"), and guest RAM chunks' imports of one dma-buf
+    /// of the RAM's source made where such imports held some of their pages (`host_ram.rs`, a
+    /// listed plan's): two dma-bufs of the same pages, which Vulkan aliases as any two imports of
+    /// external memory, on a device whose barriers order blits through two imports of the same
+    /// pages (no `RuntimeDriverDefect::AliasedImportBlitsUnordered`). Each object's made where
+    /// the pages were a copy before (`WorkCounts::copied_over_live_imports`); each chunk's where
+    /// it was held back (`WorkCounts::host_ram_chunks_held_back`).
+    pub dma_buf_imports_beside_live: u64,
+    /// No-copy buffers bound inside the memory of a live import that holds all their pages, at
+    /// their offset, with no import of their own (`host_aliases.rs`, "One page, one import"):
+    /// over part of another no-copy buffer's or heap's bytes.
+    pub buffers_bound_in_import: u64,
+    /// Evidence, not a defect count: no-copy buffers' and heaps' own imports of their pages at
+    /// addresses other than their guest RAM's (a view of scattered runs, `HostMemory::with_runs`)
+    /// where a live import of one of the RAM's chunks held some of the same RAM pages at the
+    /// RAM's own addresses as the object's import was made. The same physical pages mapped for
+    /// the device twice, at two host addresses; counted at the object's import, not at a chunk's
+    /// import made later over the pages of a live view's.
+    pub imports_over_ram_chunk_pages: u64,
     /// The places that released the images, buffers, buffer views and memory counted above, each
     /// with its calls (`regions` unused): the first 32 the process met.
     pub release_sites: [CopySite; COPY_SITES],
@@ -342,4 +506,62 @@ pub struct ShadowKeeps {
     pub blit_whole: u64,
     /// Their texels.
     pub blit_whole_texels: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A device check's makings and releases, on its thread, are counted as the checks' alone, so
+    /// the process's counts (`ObjectChurn`), which a program's or a case's cost reads, carry none
+    /// of them. The test's own thread is marked: each test has a thread of its own.
+    #[test]
+    fn a_check_s_makings_and_releases_are_its_alone() {
+        let process = || {
+            let churn = ChurnCounters::default().snapshot().0;
+            (churn.vk_memory_allocations, churn.vk_memory_freed)
+        };
+        let checks = || {
+            (
+                checks_made(VkMaking::Memory),
+                checks_released(VkRelease::Memory),
+            )
+        };
+        let (before, before_checks) = (process(), checks());
+        crate::step_aside::mark_a_check_s_thread(crate::step_aside::Counted::Apart);
+        vk_made(VkMaking::Memory, Location::caller());
+        vk_released(VkRelease::Memory, Location::caller());
+        assert_eq!(
+            process(),
+            before,
+            "the process's counts took a check's work"
+        );
+        assert_eq!(checks(), (before_checks.0 + 1, before_checks.1 + 1));
+    }
+
+    /// The in-place check's thread, whose paths carry the program's work too, counts its makings
+    /// and releases as the process's (`step_aside::Counted::AsTheDevice`).
+    #[test]
+    fn a_check_s_makings_through_the_program_s_paths_are_the_process_s() {
+        let process = || {
+            let churn = ChurnCounters::default().snapshot().0;
+            (churn.vk_memory_allocations, churn.vk_memory_freed)
+        };
+        let checks = || {
+            (
+                checks_made(VkMaking::Memory),
+                checks_released(VkRelease::Memory),
+            )
+        };
+        let (before, before_checks) = (process(), checks());
+        crate::step_aside::mark_a_check_s_thread(crate::step_aside::Counted::AsTheDevice);
+        vk_made(VkMaking::Memory, Location::caller());
+        vk_released(VkRelease::Memory, Location::caller());
+        assert_eq!(process(), (before.0 + 1, before.1 + 1));
+        assert_eq!(
+            checks(),
+            before_checks,
+            "the checks' counts took the device's work"
+        );
+    }
 }

@@ -32,7 +32,7 @@ use crate::bind::{BindState, BoundBuffer, Dispatch, StageTable};
 use crate::budget::Budget;
 use crate::cache::VariantKey;
 use crate::device::profile::DeviceProfile;
-use crate::device::subgroup::{SubgroupRequirement, Tier};
+use crate::device::subgroup::{OpBits, SimdClass, SubgroupRequirement, Tier};
 use crate::device::{Device, DeviceDescription, DevicePolicy};
 use crate::error::{BindError, Error, Feature};
 use crate::library::Library;
@@ -1428,10 +1428,24 @@ fn arena_kernel(words: u32) -> Option<Vec<u8>> {
     assemble_text(&format!("arena-{words}"), &text)
 }
 
+/// Metal reports a kernel's static threadgroup memory rounded up to 16 bytes: an arena of 257
+/// words (1028 bytes) answers 1040, as `threadgroup uint a[256]; threadgroup uint b;` does on the
+/// M3 Max (macOS 27.0.1).
+#[test]
+fn the_static_length_is_rounded_up_to_16_bytes_as_metal_reports_it() {
+    let Some(bc) = arena_kernel(257) else {
+        return;
+    };
+    let dev = lavapipe();
+    let pipe = pipeline(&dev, &bc, "barrier_k");
+    assert_eq!(pipe.metal_info.static_threadgroup_memory_length, 1040);
+}
+
 /// The scratch takes 128 bytes per simdgroup and word beside the kernel's threadgroup memory. A
 /// kernel whose arena leaves less than one simdgroup's scratch is refused at compile time;
-/// otherwise the pipeline reports the threads whose scratch fits as its maximum, and the planner
-/// refuses a larger threadgroup as `ThreadgroupMemorySize`.
+/// otherwise the pipeline reports the threads whose scratch fits as its maximum and its own
+/// threadgroup memory as its static length, as Metal reports it, and the planner refuses a larger
+/// threadgroup as `ThreadgroupMemorySize`.
 #[test]
 fn the_scratch_must_fit_beside_the_threadgroup_memory() {
     // vk12-floor: 16 KiB. An arena of exactly 16 KiB leaves nothing for the scratch.
@@ -1453,14 +1467,14 @@ fn the_scratch_must_fit_beside_the_threadgroup_memory() {
         other => panic!("{other:?}"),
     }
     // lavapipe: 32 KiB. An arena of 31 KiB leaves 1 KiB, the scratch of 8 simdgroups, which the
-    // reported static length counts.
+    // reported static length, the kernel's own 31 KiB, does not count.
     let Some(bc) = arena_kernel(31 * 256) else {
         return;
     };
     let dev = lavapipe();
     let pipe = pipeline(&dev, &bc, "barrier_k");
     assert_eq!(pipe.metal_info.max_total_threads_per_threadgroup, 256);
-    assert_eq!(pipe.metal_info.static_threadgroup_memory_length, 32 * 1024);
+    assert_eq!(pipe.metal_info.static_threadgroup_memory_length, 31 * 1024);
     let state = bind_state(None);
     let plan = pipe.plan(&dev, &state.shape()).expect("plan");
     assert!(plan.instantiate_dispatch(&state, &threads(256)).is_ok());
@@ -1470,8 +1484,10 @@ fn the_scratch_must_fit_beside_the_threadgroup_memory() {
 /// A kernel that reads a `[[threadgroup(0)]]` region declares the threadgroup arena, a `u32` array
 /// of at least `MIN_ARENA_BYTES` even when the region is empty, beside the scratch. `region_k`
 /// publishes eight words per lane (1 KiB per simdgroup): lavapipe's 32 KiB fits 31 simdgroups
-/// beside the 32-byte arena, not 32. The reported static length counts the arena and the scratch of
-/// the most threads, so the remainder a Metal client gives the region fits.
+/// beside the 32-byte arena, not 32. The reported static length is the kernel's own, 0, as Metal
+/// reports it: neither the arena's minimum nor the scratch, which the planner still counts, so the
+/// remainder a Metal client gives the region beside that length is refused at the most threads
+/// (the device's gap, `ThreadgroupMemorySize`), and a region that fits beside the scratch runs.
 #[test]
 fn an_empty_region_declares_the_arena_beside_the_scratch() {
     let Some(bc) = assemble("simd_uniform") else {
@@ -1487,13 +1503,18 @@ fn an_empty_region_declares_the_arena_beside_the_scratch() {
     );
     assert!(plan.instantiate_dispatch(&state, &threads(31 * 32)).is_ok());
     assert_eq!(pipe.metal_info.max_total_threads_per_threadgroup, 31 * 32);
-    assert_eq!(
-        pipe.metal_info.static_threadgroup_memory_length,
-        32 + 31 * 1024
-    );
-    // The remainder beside the reported static length, at the most threads.
+    assert_eq!(pipe.metal_info.static_threadgroup_memory_length, 0);
+    // The remainder beside the reported static length, at the most threads: the arena and the
+    // scratch of 31 simdgroups do not fit beside it.
     let remainder = 32 * 1024 - pipe.metal_info.static_threadgroup_memory_length;
     let state = bind_state(Some(remainder));
+    let plan = pipe.plan(&dev, &state.shape()).expect("plan");
+    match plan.instantiate_dispatch(&state, &threads(31 * 32)) {
+        Err(BindError::Unsupported(u)) => assert_eq!(u.feature, Feature::ThreadgroupMemorySize),
+        other => panic!("{other:?}"),
+    }
+    // A region that fits beside the arena and the scratch runs.
+    let state = bind_state(Some(32 * 1024 - 32 - 31 * 1024));
     let plan = pipe.plan(&dev, &state.shape()).expect("plan");
     assert!(plan.instantiate_dispatch(&state, &threads(31 * 32)).is_ok());
 }
@@ -1650,6 +1671,82 @@ fn emulated_key() -> VariantKey {
     let mut key = VariantKey::new();
     key.emulated_simdgroups = true;
     key
+}
+
+fn one_row_key() -> VariantKey {
+    let mut key = VariantKey::new();
+    key.one_row = true;
+    key
+}
+
+/// `simd_divergent`'s `guard_k` (a simdgroup sum in divergent control flow) followed by `stages`
+/// diamonds of plain arithmetic, each a branch on a per-thread value and a phi: a large body whose
+/// predicated walk synchronizes in one block.
+fn large_body(stages: u32) -> Option<Vec<u8>> {
+    let text = std::fs::read_to_string(engine_dir().join("simd_divergent.ll")).expect("read");
+    let start = text.find("define void @guard_k(").expect("guard_k");
+    let merge = start + text[start..].find("\n16:").expect("guard_k's merge") + 1;
+    let end = merge + text[merge..].find("\n}\n").expect("guard_k's end") + 1;
+    let mut body = String::from("16:\n  br label %s0\n");
+    let mut prev = String::from("%2");
+    for i in 0..stages {
+        let next = i + 1;
+        body += &format!(
+            "s{i}:\n  %k{i} = and i32 {prev}, 7\n  %c{i} = icmp ult i32 %k{i}, 3\n  \
+             br i1 %c{i}, label %a{i}, label %b{i}\n\
+             a{i}:\n  %y{i} = mul i32 {prev}, 3\n  br label %m{i}\n\
+             b{i}:\n  %z{i} = add i32 {prev}, {next}\n  br label %m{i}\n\
+             m{i}:\n  %w{i} = phi i32 [ %y{i}, %a{i} ], [ %z{i}, %b{i} ]\n  br label %s{next}\n"
+        );
+        prev = format!("%w{i}");
+    }
+    body += &format!(
+        "s{stages}:\n  %at = zext i32 %2 to i64\n  \
+         %out = getelementptr inbounds i32, ptr addrspace(1) %0, i64 %at\n  \
+         store i32 {prev}, ptr addrspace(1) %out, align 4\n  ret void\n"
+    );
+    let text = format!("{}{body}{}", &text[..merge], &text[end..]);
+    assemble_text(&format!("large-body-{stages}"), &text)
+}
+
+/// A large body under the emulated-simdgroups input ([`large_body`]): its estimate bounds the
+/// words it emits and stays within a small multiple of them (the walk is charged per construct it
+/// emits), so it compiles under a words cap of that multiple of its emitted size.
+#[test]
+fn a_large_predicated_body_compiles_under_a_cap_it_fits() {
+    let Some(bc) = large_body(256) else {
+        return;
+    };
+    let p = profile("lavapipe", DevicePolicy::default()).expect("profile");
+    let inputs = emulated_inputs();
+    let (plan, _) = typed_module_with(&bc, "guard_k", &p, &inputs).expect("plan");
+    assert!(
+        plan.families.simd.predication.is_some(),
+        "walked predicated"
+    );
+    let a = crate::pipeline::testing::compile_with(&bc, "guard_k", &p, &inputs).expect("compile");
+    let emitted = a.module.words.len() as u64;
+    assert!(
+        plan.estimate.words >= emitted,
+        "estimate {} < emitted {emitted}",
+        plan.estimate.words
+    );
+    let cap = 8 * emitted;
+    let capped = crate::pipeline::compile::compile_bitcode(
+        &bc,
+        crate::pipeline::compile::EntryRef::Name("guard_k"),
+        &crate::library::FunctionConstantValues::defaults(),
+        &p,
+        &inputs,
+        &mut crate::pipeline::testing::meter(),
+        cap,
+    );
+    assert!(
+        capped.is_ok(),
+        "estimate {} under cap {cap} (emitted {emitted}): {:?}",
+        plan.estimate.words,
+        capped.err()
+    );
 }
 
 /// `kernel` of `bc` on `DIRECT`: its own tier is `Direct` with a multiple-of-32 constraint, and
@@ -2077,5 +2174,661 @@ fn an_emulated_exchange_reaches_a_word_with_one_access_chain() {
                 "{stem}: a scratch word addressed through a product: {c:?}"
             );
         }
+    }
+}
+
+/// `kernel void name(device uint *b [[buffer(0)]], constant uint &n [[buffer(1)]], uint gid
+/// [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]])`: `if (gid < n)
+/// b[index] = b[index] * 3 + extra`, `index` and `extra` the instructions `index` and `extra`
+/// compute (`%x`, an `i64`, and `%e`, an `i32`) from `%gid` and `%lane`. The read and the write
+/// of one word stand where only some threads of a simdgroup run, so the lockstep pass orders
+/// them with a simdgroup barrier, a tangle barrier on the RTX 5080's maximal reconvergence.
+fn row_kernel(name: &str, index: &str, extra: &str) -> String {
+    format!(
+        r#"target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.0.0"
+
+define void @{name}(ptr addrspace(1) %b, ptr addrspace(2) %np, i32 %gid, i32 %lane) #0 {{
+entry:
+  %n = load i32, ptr addrspace(2) %np, align 4
+  %in = icmp ult i32 %gid, %n
+  br i1 %in, label %then, label %end
+then:
+  {index}
+  {extra}
+  %p = getelementptr inbounds i32, ptr addrspace(1) %b, i64 %x
+  %v = load i32, ptr addrspace(1) %p, align 4
+  %m = mul i32 %v, 3
+  %w = add i32 %m, %e
+  store i32 %w, ptr addrspace(1) %p, align 4
+  br label %end
+end:
+  ret void
+}}
+
+attributes #0 = {{ convergent mustprogress nounwind willreturn }}
+
+!air.kernel = !{{!0}}
+!air.version = !{{!7}}
+!air.language_version = !{{!8}}
+
+!0 = !{{ptr @{name}, !1, !2}}
+!1 = !{{}}
+!2 = !{{!3, !4, !5, !6}}
+!3 = !{{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"b"}}
+!4 = !{{i32 1, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"n"}}
+!5 = !{{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}}
+!6 = !{{i32 3, !"air.thread_index_in_simdgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"lane"}}
+!7 = !{{i32 2, i32 8, i32 0}}
+!8 = !{{!"Metal", i32 4, i32 0, i32 0}}
+"#
+    )
+}
+
+/// Buffers 0 and 1 bound.
+fn two_buffers() -> BindState {
+    let mut state = bind_state(None);
+    if let Some(table) = state.stages.get_mut(&Stage::Kernel) {
+        table.buffers.insert(
+            1,
+            BoundBuffer::Buffer {
+                length: 4,
+                offset: 0,
+                gpu_address: 0x2_0000,
+                device_address: None,
+                attribute_stride: None,
+            },
+        );
+    }
+    state
+}
+
+/// A kernel whose only simdgroup semantics are the barrier its lockstep order took, between a
+/// read and a write of `b[gid]` that two threads of one simdgroup meet at only where the
+/// simdgroup spans two rows of its threadgroup (the shape of OpenCL C's `if (i < n) b[i] *= k`),
+/// keeps the RTX 5080's `Direct` tier and records `RowLockstep`. A threadgroup of one row (1, 16
+/// or 48 threads, or a whole 32) asks for its one-row variant (`VariantKey::one_row`), and the
+/// planned pipeline still runs one without whole subgroups: no emulated-simdgroups variant is
+/// compiled, so none is announced. A threadgroup of two rows that is not whole subgroups still
+/// asks for the emulated variant. The same kernel at `b[gid >> 1]` (two threads of a row meet) or
+/// reading its simdgroup lane keeps every partial threadgroup on the emulated variant and a whole
+/// one on its pinned pipeline.
+#[test]
+fn a_row_of_a_lockstep_only_kernel_takes_one_compile() {
+    let x = "%x = zext i32 %gid to i64";
+    let none = "%e = add i32 0, 0";
+    let kernels = [
+        ("row_scale", x, none, true),
+        (
+            "row_scale_pairs",
+            "%h = lshr i32 %gid, 1\n  %x = zext i32 %h to i64",
+            none,
+            false,
+        ),
+        ("row_scale_lane", x, "%e = add i32 %lane, 0", false),
+    ];
+    let dev = device("nvidia-rtx5080-laptop");
+    let p = dev.profile();
+    let state = two_buffers();
+    let shape = state.shape();
+    for (name, index, extra, rows) in kernels {
+        let Some(bc) = assemble_text(name, &row_kernel(name, index, extra)) else {
+            return;
+        };
+        let (own, _) = typed_module(&bc, name, p).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(own.simd.1, Tier::Direct, "{name}");
+        assert!(
+            own.facts
+                .contains(&RuntimeFact::LocalSizeConstraint { multiple: 32 }),
+            "{name}"
+        );
+        assert_eq!(
+            own.facts.contains(&RuntimeFact::RowLockstep),
+            rows,
+            "{name}"
+        );
+        let base = pipeline(&dev, &bc, name);
+        let plan = base.plan(&dev, &shape).expect("plan");
+        for n in [1, 16, 48] {
+            let want = if rows { one_row_key() } else { emulated_key() };
+            assert_eq!(
+                plan.dispatch_variant(&threads(n)),
+                Ok(want),
+                "{name} at {n}"
+            );
+        }
+        for n in [32, 64] {
+            let want = if rows {
+                one_row_key()
+            } else {
+                VariantKey::new()
+            };
+            assert_eq!(
+                plan.dispatch_variant(&threads(n)),
+                Ok(want),
+                "{name} at {n}"
+            );
+        }
+        let two_rows = Dispatch::Threadgroups {
+            groups: [1, 1, 1],
+            threads_per_group: [8, 2, 1],
+        };
+        assert_eq!(
+            plan.dispatch_variant(&two_rows),
+            Ok(emulated_key()),
+            "{name}"
+        );
+        if rows {
+            let c = plan
+                .instantiate_dispatch(&state, &threads(16))
+                .expect("one row on the planned pipeline");
+            assert_eq!(
+                c.regions[0].stage_flags,
+                vk::PipelineShaderStageCreateFlags::empty()
+            );
+            assert_eq!(c.regions[0].required_subgroup_size, Some(32));
+            let c = plan
+                .instantiate_dispatch(&state, &threads(32))
+                .expect("whole subgroups");
+            assert!(c.regions[0]
+                .stage_flags
+                .contains(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS));
+        }
+    }
+}
+
+/// `kernel void name(device uint *out [[buffer(0)]], uint2 tid [[thread_position_in_threadgroup]],
+/// uint t [[thread_index_in_threadgroup]])`, a tile's shape as a compiler spells it:
+///
+/// - every thread stores `t` at word `t` of `@nb`, and after a barrier reads word `t ^ 8` and
+///   overwrites its own with 100 in the same interval, in workgroup-uniform flow (a pair the
+///   lockstep pass orders with a threadgroup barrier, in every threadgroup shape);
+/// - then, where `run` holds (`x >= 32` in row 0, `x < 16` in row 1, where only some threads of a
+///   simdgroup run), it stores `t << 4 | k` at word `(x & 31) + 4 (x & -32) + 32 k` of `@grid`
+///   and `t << 4 | 8 | k` 512 words on, `k` below 4. Two threads' anchors differ by a multiple of
+///   128 words plus at most 31: the rows `k` never meet, and the halves meet only where two
+///   threads of one simdgroup share a lane and lie 128 apart in `x`, as in a threadgroup 144 wide
+///   and 2 tall (row 0's `x` 128 to 143 and row 1's 0 to 15 are simdgroup 4), a pair a simdgroup
+///   barrier orders and no row of a threadgroup holds;
+/// - after a barrier, `out[t]` is its own word `k = 0` of the tile where it ran (0 elsewhere),
+///   with what it read from `@nb` 20 bits up.
+///
+/// `extra` and `decl` add an instruction to the entry and its declaration.
+fn row_tile_kernel(name: &str, extra: &str, decl: &str) -> String {
+    format!(
+        r#"target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.0.0"
+
+@grid = internal unnamed_addr addrspace(3) global [2048 x i32] undef, align 4
+@nb = internal unnamed_addr addrspace(3) global [512 x i32] undef, align 4
+
+define void @{name}(ptr addrspace(1) %out, <2 x i32> %tid, i32 %t) #0 {{
+entry:
+  {extra}
+  %tz = zext i32 %t to i64
+  %own = getelementptr inbounds [512 x i32], ptr addrspace(3) @nb, i64 0, i64 %tz
+  store i32 %t, ptr addrspace(3) %own, align 4
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  %t8 = xor i32 %t, 8
+  %t8z = zext i32 %t8 to i64
+  %other = getelementptr inbounds [512 x i32], ptr addrspace(3) @nb, i64 0, i64 %t8z
+  %nv = load i32, ptr addrspace(3) %other, align 4
+  store i32 100, ptr addrspace(3) %own, align 4
+  %x = extractelement <2 x i32> %tid, i64 0
+  %y = extractelement <2 x i32> %tid, i64 1
+  %lane = and i32 %x, 31
+  %high = and i32 %x, -32
+  %l = zext i32 %lane to i64
+  %h4 = shl nuw nsw i32 %high, 2
+  %h = zext i32 %h4 to i64
+  %col = getelementptr inbounds i32, ptr addrspace(3) @grid, i64 %l
+  %at = getelementptr inbounds i32, ptr addrspace(3) %col, i64 %h
+  %row0 = icmp eq i32 %y, 0
+  %right = icmp uge i32 %x, 32
+  %left = icmp ult i32 %x, 16
+  %run = select i1 %row0, i1 %right, i1 %left
+  br i1 %run, label %fill, label %done
+fill:
+  %v0 = shl i32 %t, 4
+  store i32 %v0, ptr addrspace(3) %at, align 4
+  %a1 = getelementptr inbounds i32, ptr addrspace(3) %at, i64 32
+  %v1 = or i32 %v0, 1
+  store i32 %v1, ptr addrspace(3) %a1, align 4
+  %a2 = getelementptr inbounds i32, ptr addrspace(3) %at, i64 64
+  %v2 = or i32 %v0, 2
+  store i32 %v2, ptr addrspace(3) %a2, align 4
+  %a3 = getelementptr inbounds i32, ptr addrspace(3) %at, i64 96
+  %v3 = or i32 %v0, 3
+  store i32 %v3, ptr addrspace(3) %a3, align 4
+  %b0 = getelementptr inbounds i32, ptr addrspace(3) %at, i64 512
+  %w0 = or i32 %v0, 8
+  store i32 %w0, ptr addrspace(3) %b0, align 4
+  %b1 = getelementptr inbounds i32, ptr addrspace(3) %at, i64 544
+  %w1 = or i32 %v0, 9
+  store i32 %w1, ptr addrspace(3) %b1, align 4
+  %b2 = getelementptr inbounds i32, ptr addrspace(3) %at, i64 576
+  %w2 = or i32 %v0, 10
+  store i32 %w2, ptr addrspace(3) %b2, align 4
+  %b3 = getelementptr inbounds i32, ptr addrspace(3) %at, i64 608
+  %w3 = or i32 %v0, 11
+  store i32 %w3, ptr addrspace(3) %b3, align 4
+  br label %done
+done:
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  br i1 %run, label %read, label %write
+read:
+  %got = load i32, ptr addrspace(3) %at, align 4
+  br label %write
+write:
+  %word = phi i32 [ %got, %read ], [ 0, %done ]
+  %up = shl i32 %nv, 20
+  %both = or i32 %word, %up
+  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %tz
+  store i32 %both, ptr addrspace(1) %o, align 4
+  ret void
+}}
+
+declare void @air.wg.barrier(i32, i32) #1
+{decl}
+
+attributes #0 = {{ convergent mustprogress nounwind willreturn }}
+attributes #1 = {{ convergent mustprogress nounwind willreturn }}
+
+!air.kernel = !{{!0}}
+!air.version = !{{!6}}
+!air.language_version = !{{!7}}
+
+!0 = !{{ptr @{name}, !1, !2}}
+!1 = !{{}}
+!2 = !{{!3, !4, !5}}
+!3 = !{{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}}
+!4 = !{{i32 1, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"uint2", !"air.arg_name", !"tid"}}
+!5 = !{{i32 2, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"t"}}
+!6 = !{{i32 2, i32 8, i32 0}}
+!7 = !{{!"Metal", i32 4, i32 0, i32 0}}
+"#
+    )
+}
+
+/// The words [`row_tile_kernel`] leaves in one threadgroup of `local` threads, as an Apple M3
+/// Max runs it: a thread where it ran reads its own tile word, but in row 0 at `x` 128 to 143 of
+/// a threadgroup of two rows, where row 1's thread `x - 128` (one simdgroup with it) stores its
+/// second half there one instruction later, which lockstep leaves; each reads `t ^ 8` from
+/// `@nb` before its neighbour overwrites it.
+fn row_tile_words(local: [u32; 3]) -> Vec<u32> {
+    let w = local[0];
+    (0..local[0] * local[1])
+        .map(|t| {
+            let (x, y) = (t % w, t / w);
+            let run = if y == 0 { x >= 32 } else { x < 16 };
+            let word = if !run {
+                0
+            } else if y == 0 && local[1] > 1 && (128..144).contains(&x) {
+                ((w + x - 128) << 4) | 8
+            } else {
+                t << 4
+            };
+            word | ((t ^ 8) << 20)
+        })
+        .collect()
+}
+
+/// Every word of buffer 0 after one threadgroup of `local` threads ran `m` (planned as `plan`)
+/// with `lanes`-wide subgroups, in both scheduling orders, its local size also flattened (the
+/// pinned tiers' Vulkan workgroup).
+fn run_local(plan: &Plan, m: &TypedModule, local: [u32; 3], lanes: SubgroupSize) -> Vec<u32> {
+    let mut spec = BTreeMap::new();
+    for (a, v) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip(local) {
+        spec.insert(SpecKey::LocalSize(a), u64::from(v));
+    }
+    let n: u32 = local.iter().product();
+    spec.insert(SpecKey::FlatLocalSize, u64::from(n));
+    let res = Resources {
+        buffers: vec![Buffer {
+            slot: Some(ResourceSlot {
+                stage: Stage::Kernel,
+                kind: ResourceKind::Buffer,
+                index: 0,
+            }),
+            address: None,
+            bytes: vec![0; n as usize * 4],
+        }],
+        push: vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)],
+        spec,
+    };
+    words(&run_orders(m, lanes, &res)[0])
+}
+
+/// A threadgroup of one row runs a tile whose halves meet only across rows without its lockstep
+/// simdgroup barrier ([`row_tile_kernel`], on the Iris Xe, whose maximal reconvergence on
+/// 32-lane subgroups makes that barrier a tangle barrier). Its own pipeline keeps the barrier,
+/// takes `CrossLane(BASIC)` and `Direct` (32 lanes pinned), records `RowLockstep`, and leaves
+/// Metal's words in a threadgroup 144 wide and 2 tall, which runs on it, the shared lane's word
+/// included. A dispatch of one row (128 or 48 threads) asks for the one-row variant, which keeps
+/// the threadgroup barrier the `@nb` pair takes, has no simdgroup barrier, no simd class and no
+/// pinned subgroup, states `OneRow`, and leaves Metal's words at every width; its plan sends a
+/// threadgroup of two rows back. The same kernel with a simdgroup sum keeps its pinned pipeline
+/// for every threadgroup of whole simdgroups, one row or not.
+#[test]
+fn a_one_row_dispatch_drops_the_lockstep_simdgroup_barriers() {
+    let dev = device("intel-irisxe-rplp-anv");
+    let p = dev.profile();
+    let name = "row_tile";
+    let Some(bc) = assemble_text(name, &row_tile_kernel(name, "", "")) else {
+        return;
+    };
+    let wide = [144, 2, 1];
+
+    // The kernel's own pipeline.
+    let (own, m) = typed_module(&bc, name, p).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let uses = |plan: &Plan, k: &str| plan.census().get(k).map_or(0, |u| u.0);
+    assert!(
+        uses(&own, "barrier.lockstep.simdgroup") > 0,
+        "{:?}",
+        own.census()
+    );
+    assert_eq!(
+        uses(&own, "barrier.lockstep.threadgroup"),
+        1,
+        "{:?}",
+        own.census()
+    );
+    assert_eq!(
+        own.simd,
+        (SimdClass::CrossLane(OpBits::BASIC), Tier::Direct)
+    );
+    assert!(own.facts.contains(&RuntimeFact::RowLockstep));
+    assert!(!own.facts.contains(&RuntimeFact::OneRow));
+    assert_eq!(
+        run_local(&own, &m, wide, SubgroupSize::W32),
+        row_tile_words(wide)
+    );
+
+    // The one-row variant.
+    let mut inputs = LoweringInputs::new();
+    inputs.one_row = true;
+    let (row, rm) =
+        typed_module_with(&bc, name, p, &inputs).unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert_eq!(
+        uses(&row, "barrier.lockstep.simdgroup"),
+        0,
+        "{:?}",
+        row.census()
+    );
+    assert_eq!(
+        uses(&row, "barrier.lockstep.threadgroup"),
+        1,
+        "{:?}",
+        row.census()
+    );
+    assert_eq!(row.simd, (SimdClass::None, Tier::NoSubgroup));
+    assert_eq!(row.subgroup, SubgroupRequirement::NONE);
+    assert!(row.facts.contains(&RuntimeFact::OneRow));
+    assert!(!row.facts.contains(&RuntimeFact::RowLockstep));
+    for local in [[128, 1, 1], [48, 1, 1]] {
+        for lanes in [SubgroupSize::W8, SubgroupSize::W16, SubgroupSize::W32] {
+            assert_eq!(
+                run_local(&row, &rm, local, lanes),
+                row_tile_words(local),
+                "{local:?} at {lanes:?}"
+            );
+        }
+    }
+
+    // The binder's choice.
+    let state = bind_state(None);
+    let shape = state.shape();
+    let plan = pipeline(&dev, &bc, name).plan(&dev, &shape).expect("plan");
+    let two_rows = Dispatch::Threadgroups {
+        groups: [1, 1, 1],
+        threads_per_group: wide,
+    };
+    assert_eq!(plan.dispatch_variant(&threads(128)), Ok(one_row_key()));
+    assert_eq!(plan.dispatch_variant(&threads(48)), Ok(one_row_key()));
+    assert_eq!(plan.dispatch_variant(&two_rows), Ok(VariantKey::new()));
+    let f = Library::from_air(&bc)
+        .ok()
+        .and_then(|lib| lib.function(name).ok())
+        .expect("kernel");
+    let budget = Budget::standard();
+    let compiled = dev
+        .compile_function(
+            &FunctionDescriptor::new(f),
+            &one_row_key().lowering_inputs(Stage::Kernel),
+            &budget,
+        )
+        .expect("variant");
+    let variant = dev
+        .compile_compute_pipeline(
+            &ComputePipelineDescriptor::new(StageSource::Compiled(compiled)),
+            &budget,
+        )
+        .expect("variant pipeline");
+    assert_eq!(variant.stage.required_subgroup_size, None);
+    let vplan = variant.plan(&dev, &shape).expect("variant plan");
+    assert_eq!(
+        vplan.variant,
+        one_row_key(),
+        "the variant's plan states its key"
+    );
+    assert_eq!(vplan.dispatch_variant(&threads(128)), Ok(one_row_key()));
+    assert!(vplan.instantiate_dispatch(&state, &threads(48)).is_ok());
+    assert_eq!(vplan.dispatch_variant(&two_rows), Ok(VariantKey::new()));
+    assert_eq!(
+        vplan.instantiate_dispatch(&state, &two_rows),
+        Err(BindError::NeedsVariant {
+            variant: Box::new(VariantKey::new())
+        })
+    );
+
+    // With a simdgroup operation of its own the kernel keeps its pinned pipeline.
+    let summed = "row_tile_sum";
+    let Some(bc) = assemble_text(
+        summed,
+        &row_tile_kernel(
+            summed,
+            "%s = tail call i32 @air.simd_sum.u.i32(i32 %t)",
+            "declare i32 @air.simd_sum.u.i32(i32) #1",
+        ),
+    ) else {
+        return;
+    };
+    let (own, _) = typed_module(&bc, summed, p).unwrap_or_else(|e| panic!("{summed}: {e}"));
+    assert_eq!(own.simd.1, Tier::Direct);
+    assert!(!own.facts.contains(&RuntimeFact::RowLockstep));
+    let plan = pipeline(&dev, &bc, summed)
+        .plan(&dev, &shape)
+        .expect("plan");
+    for d in [threads(32), threads(128), two_rows] {
+        assert_eq!(plan.dispatch_variant(&d), Ok(VariantKey::new()), "{d:?}");
+    }
+}
+
+/// A wave64-only device: the committed RDNA3 description, which reconverges maximally, with its
+/// subgroup size range narrowed to 64, where a simdgroup is half a subgroup (`Cluster32`).
+fn wave64() -> Device {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../metal2vulkan-validation/profiles/amd-rdna3-radv.json");
+    let text = std::fs::read_to_string(path).expect("profile");
+    let narrowed = text.replace("\"minSubgroupSize\": 32", "\"minSubgroupSize\": 64");
+    assert_ne!(narrowed, text, "the description names minSubgroupSize");
+    let desc = DeviceDescription::from_khronos_json(&narrowed, None).expect("description");
+    Device::new(desc, DevicePolicy::default()).expect("device")
+}
+
+/// `kernel void name(texture2d_ms<uint> t [[texture(0)]], device uint *out [[buffer(0)]], uint2
+/// g [[thread_position_in_grid]])`, `wsm_samples`'s `wsm_read_u` as the Metal compiler emits it:
+/// `n = t.get_num_samples()`, and where `g` is inside the texture and `guard` holds (`%iny`, `g.y`
+/// inside, and `%some`, `n != 0`), `for (s = 0; ; s++) { out[s + q] = t.read(g, s).r; if (tested
+/// == n) break; }` with `q = (g.y * width + g.x) * mult`. The compiler's own spelling is `guard`
+/// `select i1 %iny, i1 %some, i1 false`, `mult` `%n` and `tested` `%next` (`s + 1`).
+fn cells_kernel(name: &str, guard: &str, mult: &str, tested: &str) -> String {
+    format!(
+        r#"target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.0.0"
+
+define void @{name}(ptr addrspace(1) %t, ptr addrspace(1) %out, <2 x i32> %g) #0 {{
+entry:
+  %n = tail call i32 @air.get_num_samples_texture_2d_ms(ptr addrspace(1) %t)
+  %x = extractelement <2 x i32> %g, i64 0
+  %w = tail call i32 @air.get_width_texture_2d_ms(ptr addrspace(1) %t)
+  %inx = icmp ult i32 %x, %w
+  br i1 %inx, label %row, label %end
+row:
+  %y = extractelement <2 x i32> %g, i64 1
+  %h = tail call i32 @air.get_height_texture_2d_ms(ptr addrspace(1) %t)
+  %iny = icmp ult i32 %y, %h
+  %some = icmp ne i32 %n, 0
+  %go = {guard}
+  br i1 %go, label %pre, label %end
+pre:
+  %yw = mul i32 %w, %y
+  %p = add i32 %yw, %x
+  %q = mul i32 %p, {mult}
+  br label %loop
+loop:
+  %s = phi i32 [ 0, %pre ], [ %next, %loop ]
+  %smp = tail call ptr addrspace(2) @air.get_read_sampler()
+  %r = tail call {{ <4 x i32>, i8 }} @air.read_texture_2d_ms.u.v4i32(ptr addrspace(1) %t, ptr addrspace(2) %smp, <2 x i32> %g, i32 %s, i32 1)
+  %rv = extractvalue {{ <4 x i32>, i8 }} %r, 0
+  %v = extractelement <4 x i32> %rv, i64 0
+  %i = add i32 %s, %q
+  %iz = zext i32 %i to i64
+  %at = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %iz
+  store i32 %v, ptr addrspace(1) %at, align 4
+  %next = add nuw i32 %s, 1
+  %done = icmp eq i32 {tested}, %n
+  br i1 %done, label %end, label %loop
+end:
+  ret void
+}}
+
+declare i32 @air.get_num_samples_texture_2d_ms(ptr addrspace(1))
+declare i32 @air.get_width_texture_2d_ms(ptr addrspace(1))
+declare i32 @air.get_height_texture_2d_ms(ptr addrspace(1))
+declare ptr addrspace(2) @air.get_read_sampler()
+declare {{ <4 x i32>, i8 }} @air.read_texture_2d_ms.u.v4i32(ptr addrspace(1), ptr addrspace(2), <2 x i32>, i32, i32)
+
+attributes #0 = {{ convergent mustprogress nounwind willreturn }}
+
+!air.kernel = !{{!0}}
+!air.version = !{{!6}}
+!air.language_version = !{{!7}}
+
+!0 = !{{ptr @{name}, !1, !2}}
+!1 = !{{}}
+!2 = !{{!3, !4, !5}}
+!3 = !{{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d_ms<uint, read>", !"air.arg_name", !"t"}}
+!4 = !{{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}}
+!5 = !{{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"g"}}
+!6 = !{{i32 2, i32 8, i32 0}}
+!7 = !{{!"Metal", i32 4, i32 0, i32 0}}
+"#
+    )
+}
+
+/// A multisampled texture of four samples in `format` bound at texture 0 for reading, and
+/// buffer 0.
+fn samples_state(format: crate::metal::PixelFormat) -> BindState {
+    let mut state = bind_state(None);
+    let mut facts =
+        crate::bind::TextureFacts::new(crate::metal::TextureType::Type2DMultisample, format);
+    facts.sample_count = 4;
+    facts.usage = crate::metal::TextureUsage::SHADER_READ;
+    if let Some(table) = state.stages.get_mut(&Stage::Kernel) {
+        table.textures.insert(
+            0,
+            crate::bind::BoundTexture::Texture {
+                facts,
+                resource_id: None,
+            },
+        );
+    }
+    state
+}
+
+/// A texel's samples read into a buffer, `out[(y * w + x) * n + s]` over `s < n` with `n` the
+/// texture's sample count (`wsm_samples`'s kernels, as the Metal compiler emits them): the store
+/// meets itself in a later iteration only where two threads of a simdgroup share a pixel, which
+/// the analysis cannot rule out where a simdgroup spans two rows of its threadgroup (a grid deeper
+/// than one gives two threads one `(x, y)`), so on a wave64 device the kernel keeps its barrier, a
+/// `Cluster32` tier, and a multiple of 64 threads. In a row its threads' `x` differ and their `y`
+/// are equal, and each thread's cells `(y * w + x) * n + s` lie below the next pixel's, `s` a
+/// counter that starts at 0 below `n` (the branch before the loop tested `n != 0`, as a `select`
+/// or an `and`) and leaves the loop on reaching it: the kernel records `RowLockstep`, and a
+/// threadgroup of one row (1, 16, 32 or 48 threads) asks for its one-row variant, not the
+/// emulated-simdgroups variant. Two rows of 16 still ask for the latter. Negative controls keep
+/// every partial threadgroup on the variant: the row scaled by the width rather than by `n`
+/// (cells of two pixels may meet), the latch testing the counter rather than the next value (the
+/// body runs at `s == n`, the next pixel's first cell), and the loop entered without the `n != 0`
+/// test (at `n == 0` every pixel writes cell 0).
+#[test]
+fn a_texel_s_samples_in_a_row_need_no_emulated_simdgroups_on_wave64() {
+    let compiler = "select i1 %iny, i1 %some, i1 false";
+    let mut kernels: Vec<(String, Vec<u8>, crate::metal::PixelFormat, bool)> = Vec::new();
+    let Some(fixture) = assemble("wsm_samples") else {
+        return;
+    };
+    for (name, format) in [
+        ("wsm_read_f", crate::metal::PixelFormat::RGBA32Float),
+        ("wsm_read_u", crate::metal::PixelFormat::R32Uint),
+    ] {
+        kernels.push((name.into(), fixture.clone(), format, true));
+    }
+    for (name, guard, mult, tested, rows) in [
+        ("cells", compiler, "%n", "%next", true),
+        ("cells_and", "and i1 %iny, %some", "%n", "%next", true),
+        ("cells_by_width", compiler, "%w", "%next", false),
+        ("cells_through_n", compiler, "%n", "%s", false),
+        (
+            "cells_unguarded",
+            "select i1 %iny, i1 true, i1 false",
+            "%n",
+            "%next",
+            false,
+        ),
+    ] {
+        let Some(bc) = assemble_text(name, &cells_kernel(name, guard, mult, tested)) else {
+            return;
+        };
+        kernels.push((name.into(), bc, crate::metal::PixelFormat::R32Uint, rows));
+    }
+    let dev = wave64();
+    let p = dev.profile();
+    for (name, bc, format, rows) in kernels {
+        let (own, _) = typed_module(&bc, &name, p).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(own.simd.1, Tier::Cluster32, "{name}");
+        assert!(
+            own.facts
+                .contains(&RuntimeFact::LocalSizeConstraint { multiple: 64 }),
+            "{name}: {:?}",
+            own.facts
+        );
+        assert_eq!(
+            own.facts.contains(&RuntimeFact::RowLockstep),
+            rows,
+            "{name}"
+        );
+        let state = samples_state(format);
+        let plan = pipeline(&dev, &bc, &name)
+            .plan(&dev, &state.shape())
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        let want = if rows { one_row_key() } else { emulated_key() };
+        for n in [1, 16, 32, 48] {
+            assert_eq!(
+                plan.dispatch_variant(&threads(n)),
+                Ok(want.clone()),
+                "{name} at {n}"
+            );
+        }
+        let two_rows = Dispatch::Threadgroups {
+            groups: [1, 1, 1],
+            threads_per_group: [16, 2, 1],
+        };
+        assert_eq!(
+            plan.dispatch_variant(&two_rows),
+            Ok(emulated_key()),
+            "{name}"
+        );
     }
 }

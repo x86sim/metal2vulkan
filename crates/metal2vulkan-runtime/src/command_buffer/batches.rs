@@ -89,6 +89,15 @@ impl<E, S> Batches<E, S> {
         self.split();
     }
 
+    /// The next encoder goes in a batch of its own, where the current one holds an encoder
+    /// already: the encoder trail's (`encoder_trail.rs`), whose batches hold one encoder each.
+    /// The current batch's waits stay with it, and so does the encoder where it holds none.
+    pub(crate) fn alone(&mut self) {
+        if self.encoders > 0 {
+            self.split();
+        }
+    }
+
     /// The next encoder is a resource state encoder: its updates bind before its batch's work, so
     /// it starts a batch unless the current one holds only such encoders and no signal.
     pub(crate) fn sparse(&mut self) {
@@ -101,6 +110,12 @@ impl<E, S> Batches<E, S> {
     /// The batches, in order: at least one.
     pub(crate) fn all(&self) -> &[Batch<E, S>] {
         &self.batches
+    }
+
+    /// Whether the current batch signals, so the next encoder starts a batch of its own
+    /// ([`encoder`](Self::encoder)).
+    pub(crate) fn signals_pending(&self) -> bool {
+        self.batches.last().is_some_and(Batch::signals_any)
     }
 
     /// The event waits and the event signals encoded so far, each call counted, binary

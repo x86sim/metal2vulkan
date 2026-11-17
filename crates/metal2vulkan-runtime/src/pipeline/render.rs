@@ -50,13 +50,15 @@ use super::tile::TileState;
 use super::BufferForms;
 use super::NoteEntries;
 use super::{compile_error, stand_in, PipelineOptions, PIPELINES, PLANS, VARIANTS};
-use crate::argument_table::AtBindViews;
+use crate::argument_table::{AtBindViews, ReadSlots};
 use crate::binary_archive::{self, Used};
 use crate::color_reformat::Routing;
 use crate::degradation::{BoundFormats, CompiledPipeline, Degradation, Occurrence};
-use crate::device::{device_error, lock};
+use crate::device::carry::{CallHold, LetGo, PartsCalls};
+use crate::device::{device_error, lock, shared_draw_lock};
 use crate::error::{internal, invalid, ArchivedPipeline, Error, Problem, RuntimeGap};
 use crate::released_programs::KeptProgram;
+use crate::render::{KeptShapes, PlanFacts};
 use crate::render_pass::MAX_COLOR_ATTACHMENTS;
 use crate::render_target::RenderPassObject;
 use crate::residency::{every_render_stage, handle_stages};
@@ -67,23 +69,27 @@ use crate::resource_ids::{
 use crate::shader_cache::VariantStages;
 use crate::unique_identifier::UniqueIdentifier;
 use crate::values::Size;
+use crate::work_counts::Counting;
 use crate::Device;
 use metal2vulkan::bind::{BindShape, BindState, BindingPlan, FragmentTests};
 use metal2vulkan::cache::{Hash256, PipelineKey, SpecializationKey, VariantKey};
 use metal2vulkan::device::PipelineWaitPolicy;
+use metal2vulkan::error::Feature;
 use metal2vulkan::library::{CompiledFunction, FunctionCompileKey};
 use metal2vulkan::metal::{BindingAccess, PixelFormat, PrimitiveTopologyClass, RenderStages};
 use metal2vulkan::pipeline::{
-    ColorAttachmentDescriptor, CommandWrites, MeshPipelineDescriptor, PipelineInterface,
-    RenderPipeline, RenderPipelineDescriptor, RuntimeFact, SpecKey, StageEntries, StageModule,
-    StageSource, TessellationDescriptor,
+    BandPrimitive, ColorAttachmentDescriptor, CommandWrites, MeshPipelineDescriptor,
+    MeshPipelineMetalInfo, PipelineInterface, RenderPipeline, RenderPipelineDescriptor,
+    RuntimeFact, SpecKey, Stage, StageEntries, StageModule, StageSource, TessellationDescriptor,
 };
 use metal2vulkan::reflection::{LinkedUseAnswers, RenderPipelineReflection};
 use std::any::Any;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
+mod carry;
 mod residual;
 
 /// The general form of a key, which `tests::general_form` reads from IDs and meanings alone.
@@ -123,7 +129,42 @@ impl WeakRenderPipelineState {
             .upgrade()
             .map(|state| RenderPipelineState(Kind::Graphics(GraphicsState(state))))
     }
+
+    /// Whether it names `state`: the same drawing state, whose allocation it keeps, so no other
+    /// state lies at its address while it is kept.
+    pub(crate) fn names(&self, state: &RenderPipelineState) -> bool {
+        match &state.0 {
+            Kind::Graphics(graphics) => self.is(graphics),
+            Kind::Tile(_) => false,
+        }
+    }
+
+    /// Whether it names `state` ([`names`](Self::names) of a drawing state).
+    pub(crate) fn is(&self, state: &GraphicsState) -> bool {
+        std::ptr::eq(self.0.as_ptr(), Arc::as_ptr(&state.0))
+    }
+
+    /// Whether the state it names lives still.
+    pub(crate) fn lives(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+
+    /// The drawing state, while the program holds it ([`upgrade`](Self::upgrade)'s).
+    pub(crate) fn graphics(&self) -> Option<GraphicsState> {
+        self.0.upgrade().map(GraphicsState)
+    }
 }
+
+/// The same drawing state ([`WeakRenderPipelineState::names`]'s identity).
+impl PartialEq for WeakRenderPipelineState {
+    fn eq(&self, other: &WeakRenderPipelineState) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// A drawing state's program, named without holding it ([`GraphicsState::program_name`]): its
+/// allocation outlives the name, so no other program lies at its address while the name is kept.
+pub(crate) struct ProgramName(Weak<Program>);
 
 /// What a drawing state runs, held without its ID: an indirect render command keeps the program
 /// of the state set on it past the program's last release of the state, as Metal's runs it,
@@ -139,7 +180,12 @@ impl RenderProgram {
             id: None,
             identifier: None,
             _samplers: Vec::new(),
-            program: Arc::clone(&self.0),
+            label: self.0.label.clone(),
+            program: LetGo::new(Arc::clone(&self.0)),
+            next: OnceLock::new(),
+            carried: AtomicBool::new(false),
+            remake_failed: AtomicBool::new(false),
+            calls: PartsCalls::default(),
         }))))
     }
 }
@@ -155,13 +201,53 @@ pub(crate) struct StateShared {
     /// The sampler IDs the state numbered as it was made (`resource_ids/numbered.rs`), held
     /// while it lives.
     _samplers: Vec<Arc<Numbered>>,
-    program: Arc<Program>,
+    /// `label`: its program's (`PipelineOptions::label`), the state's own, so the borrow its
+    /// `label` answers outlives its program on a lost generation (`pipeline/carry.rs`).
+    label: Option<String>,
+    /// Its program on the generation it was made on, let go of at that generation's rest where a
+    /// recovery carried the state on (`pipeline/carry.rs`'s `LostProgram`).
+    program: LetGo<Arc<Program>>,
+    /// Its program on each generation its device's recoveries carried it to, in turn
+    /// (`pipeline/carry.rs`), which its reaches take from then on ([`StateShared::program`]).
+    next: super::carry::ProgramLinks<Program>,
+    /// `next` is set: one load before a reach walks it.
+    carried: AtomicBool,
+    /// Its making on the generation a recovery made failed: a bind of it is refused
+    /// (`RuntimeGap::RemadeAfterRecoveryFailed`).
+    remake_failed: AtomicBool,
+    /// The calls outside command buffers' work under way on the state, which hold the programs
+    /// they reach (`pipeline/carry.rs`'s `Programs::calls`).
+    calls: PartsCalls,
+}
+
+impl super::carry::Programs for StateShared {
+    type Program = Program;
+
+    fn programs(&self) -> (&LetGo<Arc<Program>>, &super::carry::ProgramLinks<Program>) {
+        (&self.program, &self.next)
+    }
+
+    fn calls(&self) -> &PartsCalls {
+        &self.calls
+    }
 }
 
 impl std::ops::Deref for StateShared {
     type Target = Program;
     fn deref(&self) -> &Program {
-        &self.program
+        self.program()
+    }
+}
+
+impl StateShared {
+    /// The program this reach of the state takes (`pipeline/carry.rs`): the one it was made
+    /// with, until a recovery carried it.
+    #[inline]
+    fn program(&self) -> &Arc<Program> {
+        match self.carried.load(Ordering::Acquire) {
+            false => &self.program,
+            true => super::carry::reached(&self.program, &self.next),
+        }
     }
 }
 
@@ -172,7 +258,7 @@ impl Drop for StateShared {
         let Some(id) = self.id.as_ref().filter(|id| id.id().0 != 0) else {
             return;
         };
-        let program = &self.program;
+        let program = self.program();
         program
             .device
             .shared()
@@ -244,8 +330,12 @@ pub(crate) struct Program {
     /// Its part of the pipeline creation log, while the log is on (`creation_log.rs`).
     log: Option<StateLog>,
     /// What its last [`SETTLED`] settles of other shapes settled, in which buffer forms, the
-    /// latest used first (`GraphicsState::settle_shape`).
-    settled: Mutex<VecDeque<(BufferForms, Settled)>>,
+    /// latest used first, each with its shape's key beside its used resources
+    /// (`BindShape::key_beside_used`; `GraphicsState::settle_shape`).
+    settled: Mutex<VecDeque<(BufferForms, u64, Settled)>>,
+    /// Whether it made a visible function table (`GraphicsState::function_tables`): set once,
+    /// at the first, never cleared.
+    made_tables: AtomicBool,
     /// The `VkPipeline`s its last draws found made in their variants' memos, the latest found
     /// first, at most [`LAST_PIPELINES`] (`RenderVariant::begin_graphics_pipeline`).
     last_pipelines: Mutex<VecDeque<LastPipeline>>,
@@ -257,6 +347,12 @@ pub(crate) struct Program {
     /// Its buffer slots whose bind offset class tells the device's view base alignment apart
     /// (`argument_table::AtBindViews`), of its base's interface.
     at_bind_views: AtBindViews,
+    /// Whether the translator refuses its band variant of lines, then of triangles
+    /// ([`GraphicsState::band_refused`]): `None` until a draw first asks.
+    band_refusals: Mutex<[Option<bool>; 2]>,
+    /// The shapes its draws derived, with the values each was derived from, which a later
+    /// encoder's draw of the same values takes (`render/draw_shape.rs`).
+    kept_shapes: KeptShapes,
 }
 
 /// The state's release returns at once: it lets go of what its pool pieces held on its own
@@ -305,6 +401,8 @@ pub(crate) struct Settled {
     pub(crate) shape: Arc<BindShape>,
     pub(crate) variant: Arc<RenderVariant>,
     pub(crate) plan: Arc<BindingPlan>,
+    /// What a draw asks of the plan's descriptor writes, worked out with the settle.
+    pub(crate) facts: Arc<PlanFacts>,
 }
 
 /// The most settles a state keeps (`GraphicsState::settle_shape`). A window server's draws of one
@@ -320,6 +418,7 @@ const LAST_PIPELINES: usize = 4;
 
 impl std::fmt::Debug for RenderPipelineState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _held = self.hold();
         match &self.0 {
             Kind::Graphics(state) => f
                 .debug_struct("RenderPipelineState")
@@ -356,20 +455,48 @@ pub(crate) enum StateDescriptor {
 }
 
 impl StateDescriptor {
+    /// Its functions, in pipeline order.
+    fn stages(&self) -> Vec<&StageSource> {
+        match self {
+            StateDescriptor::Vertex(descriptor) => vertex_stages(descriptor).collect(),
+            StateDescriptor::Mesh(descriptor) => mesh_stages(descriptor).collect(),
+        }
+    }
+
     /// Its functions' names, in pipeline order (`stage_name`).
     fn function_names(&self) -> Vec<String> {
-        let stages: Vec<&StageSource> = match self {
-            StateDescriptor::Vertex(descriptor) => std::iter::once(&descriptor.vertex)
-                .chain(&descriptor.fragment)
-                .collect(),
-            StateDescriptor::Mesh(descriptor) => descriptor
-                .object
-                .iter()
-                .chain(std::iter::once(&descriptor.mesh))
-                .chain(&descriptor.fragment)
-                .collect(),
+        self.stages().into_iter().map(stage_name).collect()
+    }
+
+    /// What the pipeline creation log names a state of this descriptor by
+    /// (`creation_log.rs`): each function's name, the SHA-256 of its bitcode
+    /// (`FunctionInfo::air_hash`; a precompiled function's key) and the constant values it was
+    /// made with, by index and by name, each as its type and its bytes; each color attachment's
+    /// format, blend and write mask; the depth and stencil formats; and the raster samples.
+    fn logged(&self) -> String {
+        let functions: Vec<String> = self
+            .stages()
+            .into_iter()
+            .map(|source| match source {
+                StageSource::Function(descriptor) => logged_function(descriptor),
+                StageSource::Compiled(compiled) => format!("{:?}", compiled.key()),
+            })
+            .collect();
+        let colors: Vec<String> = (self.color_attachments().iter().enumerate())
+            .filter_map(|(index, color)| {
+                color.map(|a| format!("{index}: {:?} {}", a.pixel_format, blend_text(&a)))
+            })
+            .collect();
+        let (depth, stencil) = match self {
+            StateDescriptor::Vertex(d) => (d.depth_format, d.stencil_format),
+            StateDescriptor::Mesh(d) => (d.depth_format, d.stencil_format),
         };
-        stages.into_iter().map(stage_name).collect()
+        format!(
+            "functions [{}]; colors [{}]; depth {depth:?}; stencil {stencil:?}; raster samples {}",
+            functions.join("; "),
+            colors.join("; "),
+            self.raster_sample_count()
+        )
     }
 
     /// A draw of a state of this descriptor at color `index`, in words for a notice: its
@@ -390,18 +517,7 @@ impl StateDescriptor {
             .copied()
             .flatten();
         let state = match color {
-            Some(a) if a.blending_enabled => format!(
-                "color {index} blended: color {:?} {:?} {:?}, alpha {:?} {:?} {:?}, write mask \
-                 {:?}",
-                a.source_rgb_blend_factor,
-                a.rgb_blend_operation,
-                a.destination_rgb_blend_factor,
-                a.source_alpha_blend_factor,
-                a.alpha_blend_operation,
-                a.destination_alpha_blend_factor,
-                a.write_mask
-            ),
-            Some(a) => format!("color {index} unblended, write mask {:?}", a.write_mask),
+            Some(a) => format!("color {index} {}", blend_text(&a)),
             None => format!("no color {index}"),
         };
         format!("a draw of {function} ({state})")
@@ -619,8 +735,20 @@ impl Device {
     /// ([`Device::new_compute_pipeline_state`]). A fragment function that reads a program-scope
     /// `thread_index_in_quadgroup` is `Unsupported{GlobalBuiltinInFragment}` with
     /// `Needs::MetalRefuses` (an M3 Max and an M4) on a device that does not claim Apple10, as
-    /// Metal's creation refuses it there, and `NotImplemented` on one that does.
+    /// Metal's creation refuses it there, and `NotImplemented` on one that does. A vertex or
+    /// fragment function made by `Library::new_function_with_name` whose function declares
+    /// function constants is `Invalid(UnspecializedFunction)`, as plain Metal ends its process at
+    /// its creation.
     pub fn new_render_pipeline_state(
+        &self,
+        descriptor: &RenderPipelineDescriptor,
+        options: &PipelineOptions,
+    ) -> Result<RenderPipelineState, Error> {
+        self.at_serving(|device| device.new_render_pipeline_state_now(descriptor, options))
+    }
+
+    /// [`Device::new_render_pipeline_state`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn new_render_pipeline_state_now(
         &self,
         descriptor: &RenderPipelineDescriptor,
         options: &PipelineOptions,
@@ -636,6 +764,18 @@ impl Device {
     /// [`RenderPipelineDescriptor::reflection`]'s, under the creation's budget; what it refuses
     /// refuses the call (`Unsupported`, `Compile`).
     pub fn new_render_pipeline_state_with_reflection(
+        &self,
+        descriptor: &RenderPipelineDescriptor,
+        options: &PipelineOptions,
+    ) -> Result<(RenderPipelineState, Option<RenderPipelineReflection>), Error> {
+        self.at_serving(|device| {
+            device.new_render_pipeline_state_with_reflection_now(descriptor, options)
+        })
+    }
+
+    /// [`Device::new_render_pipeline_state_with_reflection`] on the generation that serves
+    /// (`device/line.rs`).
+    pub(crate) fn new_render_pipeline_state_with_reflection_now(
         &self,
         descriptor: &RenderPipelineDescriptor,
         options: &PipelineOptions,
@@ -673,17 +813,42 @@ impl Device {
     /// compile the mesh render pipeline `descriptor` (an object function where it has one, a
     /// mesh function, and a fragment function where it rasterizes) into a pipeline state under
     /// `options`, as the compile layer's `Device::compile_mesh_pipeline` compiles it. Its draws
-    /// are the encoder's mesh draws ([`RenderCommandEncoder::draw_mesh_threadgroups`]). A device
-    /// without `VK_EXT_mesh_shader`, or without its stage's feature (`meshShader`, `taskShader`
-    /// for an object function), is `Unsupported{MeshShading}` naming them: no emulation draws a
-    /// mesh function's primitives in Metal's order on it. What the compile refuses otherwise is
+    /// are the encoder's mesh draws ([`RenderCommandEncoder::draw_mesh_threadgroups`]). On a
+    /// device that enables `VK_EXT_mesh_shader` and `meshShader` the object and mesh functions are
+    /// task and mesh stages, and an object function without `taskShader` is
+    /// `Unsupported{MeshShading}` naming it; on every other device both run as compute work whose
+    /// records a synthesized vertex stage draws, each draw announced `emulated-mesh-draws`
+    /// (`DeviceProfile::emulates_mesh_shading`, `render/mesh.rs`). A thread maximum, required
+    /// threadgroup size or payload length Metal refuses, as an M3 Max refuses it, is
+    /// `Compile(InvalidDescriptor(MeshPipeline))` naming Metal's rule (`MeshPipelineProblem`),
+    /// where Metal answers an error or its descriptor validation ends the process; a
+    /// `maxVertexAmplificationCount` of 0 is `Compile(InvalidDescriptor(VertexAmplificationCount))`
+    /// and one above 1, which Metal makes, `Unsupported{VertexAmplification}` (not built). The
+    /// thread maxima, mesh-grid maximum and required sizes are what the state answers
+    /// ([`RenderPipelineState::max_total_threads_per_object_threadgroup`] and the rest), and its
+    /// draws are not held to them. What the compile refuses otherwise is
     /// `Compile` or `Unsupported`, as [`Device::new_render_pipeline_state`] says, and so is an
-    /// archive of another device; no binary archive holds a mesh render pipeline, so
-    /// `FAIL_ON_BINARY_ARCHIVE_MISS` with archives listed is `BinaryArchiveMiss`. Each stage's
-    /// imports come from its own dynamic libraries, as a render state's do.
+    /// archive of another device. `FAIL_ON_BINARY_ARCHIVE_MISS` with archives listed is
+    /// `BinaryArchiveMiss` unless one holds an add of an equal descriptor
+    /// ([`BinaryArchive::add_mesh_render_pipeline_functions`], whose key holds every field, as
+    /// Metal's mesh key is not measured). Each stage's
+    /// imports come from its own dynamic libraries, as a render state's do. An object, mesh or
+    /// fragment function made by `Library::new_function_with_name` whose function declares
+    /// function constants is `Invalid(UnspecializedFunction)`, as plain Metal ends its process at
+    /// its creation, before the device's mesh shading is asked.
     ///
     /// [`RenderCommandEncoder::draw_mesh_threadgroups`]: crate::RenderCommandEncoder::draw_mesh_threadgroups
+    /// [`BinaryArchive::add_mesh_render_pipeline_functions`]: crate::BinaryArchive::add_mesh_render_pipeline_functions
     pub fn new_mesh_render_pipeline_state(
+        &self,
+        descriptor: &MeshPipelineDescriptor,
+        options: &PipelineOptions,
+    ) -> Result<RenderPipelineState, Error> {
+        self.at_serving(|device| device.new_mesh_render_pipeline_state_now(descriptor, options))
+    }
+
+    /// [`Device::new_mesh_render_pipeline_state`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn new_mesh_render_pipeline_state_now(
         &self,
         descriptor: &MeshPipelineDescriptor,
         options: &PipelineOptions,
@@ -703,6 +868,18 @@ impl Device {
     /// (`Device::mesh_descriptor_key`), so every state of one descriptor shares one answer rather
     /// than decoding the three stages' AIR again.
     pub fn new_mesh_render_pipeline_state_with_reflection(
+        &self,
+        descriptor: &MeshPipelineDescriptor,
+        options: &PipelineOptions,
+    ) -> Result<(RenderPipelineState, Option<RenderPipelineReflection>), Error> {
+        self.at_serving(|device| {
+            device.new_mesh_render_pipeline_state_with_reflection_now(descriptor, options)
+        })
+    }
+
+    /// [`Device::new_mesh_render_pipeline_state_with_reflection`] on the generation that serves
+    /// (`device/line.rs`).
+    pub(crate) fn new_mesh_render_pipeline_state_with_reflection_now(
         &self,
         descriptor: &MeshPipelineDescriptor,
         options: &PipelineOptions,
@@ -748,17 +925,52 @@ impl RenderPipelineState {
         &self.0
     }
 
-    /// `device`.
-    pub fn device(&self) -> &Device {
+    /// `device`: a generation handle of the device, owned, as Metal's `device` answers a retained
+    /// device: of the generation the state was made on, then of each one the device's recoveries
+    /// carried the state to. The handle is the caller's: it keeps meaning that generation while
+    /// held, past a recovery that carries the state on, its raw handles that generation's
+    /// `VkDevice`'s, kept alive while held.
+    pub fn device(&self) -> Device {
+        let _held = self.hold();
         match &self.0 {
-            Kind::Graphics(state) => &state.0.device,
+            Kind::Graphics(state) => state.0.device.clone(),
             Kind::Tile(state) => state.kernel().device(),
+        }
+    }
+
+    /// A call outside command buffers' work on the state, from now until the hold goes: the
+    /// programs it reaches stay, their release at a lost generation's rest waiting for it
+    /// (`pipeline/carry.rs`), a tile pipeline's its kernel's.
+    pub(crate) fn hold(&self) -> CallHold<'_> {
+        match &self.0 {
+            Kind::Graphics(state) => state.hold(),
+            Kind::Tile(state) => state.kernel().hold(),
+        }
+    }
+
+    /// The device of the program this reach of the state takes (`pipeline/carry.rs`), a tile
+    /// pipeline's its kernel's: a borrow for a command buffer's work, or a call that holds the
+    /// state ([`hold`](Self::hold)).
+    pub(crate) fn generation(&self) -> &Device {
+        match &self.0 {
+            Kind::Graphics(state) => state.device(),
+            Kind::Tile(state) => state.kernel().generation(),
+        }
+    }
+
+    /// The device a bind of the state checks it against: its program's; refused where its
+    /// making on the generation a recovery made failed (`pipeline/carry.rs`).
+    pub(crate) fn bound_device(&self) -> Result<&Device, Error> {
+        match &self.0 {
+            Kind::Graphics(state) => state.bound_device(),
+            Kind::Tile(state) => state.kernel().bound_device(),
         }
     }
 
     /// `supportIndirectCommandBuffers`: a drawing state's descriptor's; false for a tile
     /// pipeline's, whose descriptor has no such field.
     pub fn support_indirect_command_buffers(&self) -> bool {
+        let _held = self.hold();
         match &self.0 {
             Kind::Graphics(state) => state.0.descriptor.support_indirect_command_buffers(),
             Kind::Tile(state) => state.kernel().support_indirect_command_buffers(),
@@ -777,6 +989,7 @@ impl RenderPipelineState {
     /// reads `[[barycentric_coord]]`, which this does not count
     /// ([`reads_barycentric_coord`](Self::reads_barycentric_coord) states it).
     pub fn has_flat_fragment_inputs(&self) -> bool {
+        let _held = self.hold();
         match &self.0 {
             Kind::Graphics(state) => state.base().graphics.flat_fragment_inputs,
             Kind::Tile(_) => false,
@@ -795,6 +1008,7 @@ impl RenderPipelineState {
     /// shows only where this or [`has_flat_fragment_inputs`](Self::has_flat_fragment_inputs)
     /// answers `true`.
     pub fn reads_barycentric_coord(&self) -> bool {
+        let _held = self.hold();
         match &self.0 {
             Kind::Graphics(state) => state.base().graphics.reads_barycentric_coord,
             Kind::Tile(_) => false,
@@ -812,6 +1026,7 @@ impl RenderPipelineState {
     /// consumer that draws a primitive's vertices another number of times (a re-indexed list in
     /// place of a strip or a fan) changes what a draw writes only where this answers `true`.
     pub fn vertex_writes_memory(&self) -> bool {
+        let _held = self.hold();
         match &self.0 {
             Kind::Graphics(state) => state.base().graphics.vertex_writes_memory,
             Kind::Tile(_) => false,
@@ -829,6 +1044,7 @@ impl RenderPipelineState {
     /// class (`Problem::PointSizeTopology`), and draws a point of size 1 only under the point
     /// class for one that does not (docs/API.md section 4).
     pub fn writes_point_size(&self) -> bool {
+        let _held = self.hold();
         match &self.0 {
             Kind::Graphics(state) => state.base().graphics.writes_point_size,
             Kind::Tile(_) => false,
@@ -848,6 +1064,7 @@ impl RenderPipelineState {
     /// consumer that draws a primitive's vertices in another order changes where such a draw lands
     /// whether or not the fragment function reads the index.
     pub fn writes_render_target_array_index(&self) -> bool {
+        let _held = self.hold();
         match &self.0 {
             Kind::Graphics(state) => state.vertex_chooses_slice(),
             Kind::Tile(_) => false,
@@ -866,6 +1083,7 @@ impl RenderPipelineState {
     /// the encoder holds more than one viewport is refused, `Unsupported(LayeredRendering)` needing
     /// `multiViewport`.
     pub fn writes_viewport_array_index(&self) -> bool {
+        let _held = self.hold();
         match &self.0 {
             Kind::Graphics(state) => state.base().graphics.writes_viewport_index,
             Kind::Tile(_) => false,
@@ -883,9 +1101,19 @@ impl RenderPipelineState {
     /// copy indirect commands, so `false` is proven; one may answer `true` and never do so (a
     /// command buffer a function takes and does not touch).
     pub fn can_encode_indirect_commands(&self) -> bool {
+        let _held = self.hold();
         match &self.0 {
             Kind::Graphics(state) => state.base().interface.reaches_command_buffers,
             Kind::Tile(state) => state.kernel().can_encode_indirect_commands(),
+        }
+    }
+
+    /// Its functions' names, in pipeline order (a tile state's, its tile function's), for a
+    /// notice.
+    pub(crate) fn function_names(&self) -> Vec<String> {
+        match &self.0 {
+            Kind::Graphics(state) => state.descriptor().function_names(),
+            Kind::Tile(state) => vec![state.kernel().function_name().to_owned()],
         }
     }
 
@@ -893,11 +1121,13 @@ impl RenderPipelineState {
     /// runtime extension, with no Metal counterpart. It is the compiled pipeline's
     /// `PipelineInterface::command_writes` (a tile pipeline's, its tile function's), read from
     /// the functions' AIR, of the functions their constants specialized ([`CommandWrites`]: the
-    /// indirect-command operations their bodies may call, and the primitive types their draws
-    /// may pass, every type where a draw's is not a constant). A clear bit is proven: no function
+    /// indirect-command operations their bodies may call, the primitive types their draws may
+    /// pass, every type where a draw's is not a constant, and the kinds of command they write,
+    /// render or compute). A clear bit is proven: no function
     /// of the state writes such a record field. Empty where
     /// [`can_encode_indirect_commands`](Self::can_encode_indirect_commands) answers `false`.
     pub fn indirect_command_writes(&self) -> CommandWrites {
+        let _held = self.hold();
         match &self.0 {
             Kind::Graphics(state) => state.base().interface.command_writes,
             Kind::Tile(state) => state.kernel().indirect_command_writes(),
@@ -921,6 +1151,7 @@ impl RenderPipelineState {
     /// [`object_writes_textures`](Self::object_writes_textures) and
     /// [`mesh_writes_textures`](Self::mesh_writes_textures)), and for a tile pipeline's state.
     pub fn vertex_writes_textures(&self) -> bool {
+        let _held = self.hold();
         self.stage_writes_textures(metal2vulkan::pipeline::Stage::Vertex)
     }
 
@@ -929,6 +1160,7 @@ impl RenderPipelineState {
     /// function's. `false` for a state without a fragment function and for a tile pipeline's
     /// state.
     pub fn fragment_writes_textures(&self) -> bool {
+        let _held = self.hold();
         self.stage_writes_textures(metal2vulkan::pipeline::Stage::Fragment)
     }
 
@@ -936,6 +1168,7 @@ impl RenderPipelineState {
     /// extension, decided as [`vertex_writes_textures`](Self::vertex_writes_textures) decides
     /// the vertex function's. `false` for a state without an object function.
     pub fn object_writes_textures(&self) -> bool {
+        let _held = self.hold();
         self.stage_writes_textures(metal2vulkan::pipeline::Stage::Object)
     }
 
@@ -943,6 +1176,7 @@ impl RenderPipelineState {
     /// extension, decided as [`vertex_writes_textures`](Self::vertex_writes_textures) decides
     /// the vertex function's. `false` for any other state.
     pub fn mesh_writes_textures(&self) -> bool {
+        let _held = self.hold();
         self.stage_writes_textures(metal2vulkan::pipeline::Stage::Mesh)
     }
 
@@ -952,6 +1186,7 @@ impl RenderPipelineState {
     /// [`ComputePipelineState::writes_textures`](crate::ComputePipelineState::writes_textures)).
     /// `false` for any other state.
     pub fn tile_writes_textures(&self) -> bool {
+        let _held = self.hold();
         match &self.0 {
             Kind::Graphics(_) => false,
             Kind::Tile(state) => state.kernel().writes_textures(),
@@ -976,6 +1211,7 @@ impl RenderPipelineState {
     /// the attachments through the imageblock rather than as color outputs. A mesh pipeline's
     /// state answers for its fragment function.
     pub fn fragment_color_outputs(&self) -> Vec<u32> {
+        let _held = self.hold();
         let mask = match &self.0 {
             Kind::Graphics(state) => state.base().graphics.color_outputs,
             Kind::Tile(_) => 0,
@@ -1027,6 +1263,7 @@ impl RenderPipelineState {
         stages: RenderStages,
         index: u64,
     ) -> Result<Option<BindingAccess>, Error> {
+        let _held = self.hold();
         let accesses = match &self.0 {
             Kind::Graphics(state) => state.texture_accesses()?,
             Kind::Tile(state) => state.texture_accesses()?,
@@ -1046,6 +1283,7 @@ impl RenderPipelineState {
     /// creation's reflection is (`Unsupported` with `Feature::Reflection` for an argument whose
     /// answer Metal's has not been measured for, `Compile` for the decode's errors).
     pub fn compiled_reflection(&self) -> Result<RenderPipelineReflection, Error> {
+        let _held = self.hold();
         let budget = metal2vulkan::Budget::standard();
         match &self.0 {
             Kind::Graphics(state) => state.reflection(&budget),
@@ -1103,14 +1341,15 @@ impl RenderPipelineState {
     /// are not Metal's; any other, a tile pipeline's included, a value of one process-wide count
     /// past them, where Metal's is an address that differs from run to run. No state's is measured
     /// to be Metal's number: the first answer announces, once a device,
-    /// [`Degradation::PlainStateUniqueIdentifier`](crate::Degradation::PlainStateUniqueIdentifier)
+    /// [`Degradation::PlainStateUniqueIdentifier`]
     /// for a plain state (a tile state's included) and
-    /// [`Degradation::UnmeasuredUniqueIdentifier`](crate::Degradation::UnmeasuredUniqueIdentifier)
+    /// [`Degradation::UnmeasuredUniqueIdentifier`]
     /// for one with indirect command buffer support.
     pub fn unique_identifier(&self) -> u64 {
+        let _held = self.hold();
         match &self.0 {
             Kind::Graphics(state) => match &state.0.identifier {
-                Some(identifier) => identifier.answer(self.device(), "a render pipeline state"),
+                Some(identifier) => identifier.answer(self.generation(), "a render pipeline state"),
                 None => 0,
             },
             Kind::Tile(tile) => tile.kernel().unique_identifier(),
@@ -1187,7 +1426,10 @@ impl RenderPipelineState {
     /// What a drawing state runs, held without its ID; `None` for a tile pipeline's.
     pub(crate) fn program(&self) -> Option<RenderProgram> {
         match &self.0 {
-            Kind::Graphics(state) => Some(RenderProgram(Arc::clone(&state.0.program))),
+            Kind::Graphics(state) => {
+                let held = state.hold();
+                Some(state.program_held(&held))
+            }
             Kind::Tile(_) => None,
         }
     }
@@ -1204,17 +1446,83 @@ impl RenderPipelineState {
     }
 
     /// `maxTotalThreadsPerThreadgroup`: 0 for a drawing state, as Metal answers (measured on an
-    /// M3 Max and an M4); a tile pipeline's compile's (`tile.rs`).
+    /// M3 Max and an M4). A tile state answers as its tile function's compute state does
+    /// (`ComputePipelineState::max_total_threads_per_threadgroup`, `tile.rs`): a required size's
+    /// threads, else the compiled pipeline's limit.
     pub fn max_total_threads_per_threadgroup(&self) -> u32 {
+        let _held = self.hold();
         match &self.0 {
             Kind::Graphics(_) => 0,
             Kind::Tile(state) => state.kernel().max_total_threads_per_threadgroup(),
         }
     }
 
+    /// The compiled pipeline's answers to Metal's mesh queries: a mesh state's; `None` for a
+    /// render state of a vertex function and a tile state.
+    fn mesh_info(&self) -> Option<MeshPipelineMetalInfo> {
+        match &self.0 {
+            Kind::Graphics(state) => state.base().mesh_info,
+            Kind::Tile(_) => None,
+        }
+    }
+
+    /// `maxTotalThreadsPerObjectThreadgroup`: a mesh state's
+    /// ([`MeshPipelineMetalInfo::max_total_threads_per_object_threadgroup`]): the least of the
+    /// descriptor's maximum, the object function's `[[max_total_threads_per_threadgroup(n)]]`,
+    /// the threads of the required object size and 1024, as an M3 Max answers on a first compile,
+    /// held to this device's limit for the stage where that is lower (the task stage's
+    /// invocations with `VK_EXT_mesh_shader`, else the compute stage's), as a compute state's
+    /// `maxTotalThreadsPerThreadgroup` is. 0 for a mesh state without an object function, where
+    /// an M3 Max answers 3 (docs/API.md, accepted differences), and for any other state. A draw
+    /// is not held to it.
+    pub fn max_total_threads_per_object_threadgroup(&self) -> u32 {
+        let _held = self.hold();
+        self.mesh_info()
+            .map_or(0, |i| i.max_total_threads_per_object_threadgroup)
+    }
+
+    /// `maxTotalThreadsPerMeshThreadgroup`: a mesh state's
+    /// ([`MeshPipelineMetalInfo::max_total_threads_per_mesh_threadgroup`]), of the mesh stage as
+    /// [`max_total_threads_per_object_threadgroup`](Self::max_total_threads_per_object_threadgroup)
+    /// is of the object stage. 0 for any other state.
+    pub fn max_total_threads_per_mesh_threadgroup(&self) -> u32 {
+        let _held = self.hold();
+        self.mesh_info()
+            .map_or(0, |i| i.max_total_threads_per_mesh_threadgroup)
+    }
+
+    /// `objectThreadExecutionWidth`: 32 for a mesh state with an object function, the width of
+    /// the simdgroups the runtime runs it in, as an M3 Max answers; 0 without one, where an M3 Max
+    /// answers 32 (docs/API.md, accepted differences), and for any other state.
+    pub fn object_thread_execution_width(&self) -> u32 {
+        let _held = self.hold();
+        self.mesh_info()
+            .map_or(0, |i| i.object_thread_execution_width)
+    }
+
+    /// `meshThreadExecutionWidth`: 32 for a mesh state, as Metal answers; 0 for any other state.
+    pub fn mesh_thread_execution_width(&self) -> u32 {
+        let _held = self.hold();
+        self.mesh_info()
+            .map_or(0, |i| i.mesh_thread_execution_width)
+    }
+
+    /// `maxTotalThreadgroupsPerMeshGrid`: a mesh state's
+    /// ([`MeshPipelineMetalInfo::max_total_threadgroups_per_mesh_grid`]): the descriptor's
+    /// maximum, else 2^20, as an M3 Max answers whatever the object function's
+    /// `[[max_total_threadgroups_per_mesh_grid(n)]]`, held to the device's
+    /// `maxMeshWorkGroupTotalCount` where it runs mesh functions natively and that is lower. An object function's grid is not held to it. 0
+    /// for any other state.
+    pub fn max_total_threadgroups_per_mesh_grid(&self) -> u32 {
+        let _held = self.hold();
+        self.mesh_info()
+            .map_or(0, |i| i.max_total_threadgroups_per_mesh_grid)
+    }
+
     /// `threadgroupSizeMatchesTileSize`: a tile pipeline's descriptor's; false for a drawing
     /// state.
     pub fn threadgroup_size_matches_tile_size(&self) -> bool {
+        let _held = self.hold();
         match &self.0 {
             Kind::Graphics(_) => false,
             Kind::Tile(state) => state.descriptor().threadgroup_size_matches_tile_size,
@@ -1231,6 +1539,7 @@ impl RenderPipelineState {
     /// whose descriptor gives a color format without a texel size (one no pass has) is not
     /// measured (`NotImplemented(Render)`).
     pub fn imageblock_sample_length(&self) -> Result<u64, Error> {
+        let _held = self.hold();
         match &self.0 {
             Kind::Graphics(state) => {
                 let formats = state.0.descriptor.color_formats();
@@ -1258,6 +1567,7 @@ impl RenderPipelineState {
     /// raster sample count; neither rounded. Refused as
     /// [`imageblock_sample_length`](Self::imageblock_sample_length) is.
     pub fn imageblock_memory_length_for_dimensions(&self, dimensions: Size) -> Result<u64, Error> {
+        let _held = self.hold();
         let samples = match &self.0 {
             Kind::Graphics(state) => u64::from(state.0.descriptor.raster_sample_count()),
             Kind::Tile(_) => 1,
@@ -1320,11 +1630,9 @@ impl GraphicsState {
         let _noted = NoteEntries(device);
         let requested = descriptor;
         let mut loaded = descriptor.clone();
-        loaded.vertex = crate::dynamic_library::stage_with_dependencies(&loaded.vertex);
-        loaded.fragment = loaded
-            .fragment
-            .as_ref()
-            .map(crate::dynamic_library::stage_with_dependencies);
+        loaded.vertex = crate::dynamic_library::stage_with_dependencies(device, &loaded.vertex);
+        loaded.fragment = (loaded.fragment.as_ref())
+            .map(|stage| crate::dynamic_library::stage_with_dependencies(device, stage));
         let descriptor = &loaded;
         // Metal's descriptor validation stops an attachment in a format Metal describes none
         // of, first (`attachment_formats.rs`).
@@ -1337,6 +1645,25 @@ impl GraphicsState {
         // Metal answers nil for a `rasterSampleCount` an Apple GPU does not take, whatever the
         // device rasterizes (`raster_samples.rs`).
         super::raster_samples::check("new_render_pipeline_state", descriptor.raster_sample_count)?;
+        // Metal's descriptor validation ends the process for a stage function made by name whose
+        // function declares function constants (`unspecialized.rs`).
+        let budget = options.budget();
+        super::unspecialized::check(
+            device,
+            "new_render_pipeline_state",
+            Stage::Vertex,
+            &descriptor.vertex,
+            &budget,
+        )?;
+        if let Some(fragment) = &descriptor.fragment {
+            super::unspecialized::check(
+                device,
+                "new_render_pipeline_state",
+                Stage::Fragment,
+                fragment,
+                &budget,
+            )?;
+        }
         let scaled = descriptor
             .tessellation
             .as_ref()
@@ -1347,9 +1674,12 @@ impl GraphicsState {
                 Problem::IndirectScaledTessellation,
             ));
         }
-        super::additions::check_render(descriptor, "new_render_pipeline_state")?;
         // Metal answers nil with an `NSError` for a state with rasterization disabled whose vertex
-        // function returns a value (`unrasterized.rs`), before it compiles anything.
+        // function returns a value, and for a rasterizing one whose vertex function returns none
+        // outside OpenGL mode, which makes it rasterizing nothing (`unrasterized.rs`), before it
+        // compiles anything. The second's answer outside OpenGL mode is the compile's, which reads
+        // it from the vertex entry it specializes anyway (`DescriptorError::RasterizedVoidVertex`),
+        // so only the others ask.
         // Each answer below is the one a creation of a descriptor of the same key worked out, where
         // one kept it in memory or in the cache directory (`shader_cache/creation.rs`), else worked
         // out now; kept where this creation worked one out and every question has its answer.
@@ -1365,18 +1695,18 @@ impl GraphicsState {
         // earlier creation read reads its entries and its plain answers rather than decoding and
         // specializing them again (`pipeline/memo.rs`).
         let entries = cache.memo.stage_entries();
-        if !descriptor.rasterization_enabled {
-            let returns = match known.vertex_returns_value {
+        let returns =
+            super::unrasterized::asks(descriptor).then(|| match known.vertex_returns_value {
                 Some(returns) => Ok(returns),
                 None => {
                     learned = true;
                     device.shared().counts.linked_use_question_asked();
                     descriptor.vertex_returns_value(&options.budget(), entries)
                 }
-            };
-            answers.vertex_returns_value = returns.as_ref().ok().copied();
-            super::unrasterized::check("new_render_pipeline_state", returns)?;
-        }
+            });
+        answers.vertex_returns_value = returns.as_ref().and_then(|r| r.as_ref().ok().copied());
+        let rasterizes =
+            super::unrasterized::rasterizes("new_render_pipeline_state", descriptor, returns)?;
         // Metal links the fragment function whether or not the pipeline rasterizes, and answers
         // nil with an `NSError`, in this order, for a fragment function writing depth without a
         // depth attachment, a function using a direct texture or sampler with indirect command
@@ -1392,7 +1722,10 @@ impl GraphicsState {
             }
         };
         answers.fragment_writes_depth_unattached = writes.as_ref().ok().copied();
-        super::linked_fragment::check_depth("new_render_pipeline_state", writes)?;
+        // OpenGL mode makes the first (`linked_fragment.rs`).
+        if !descriptor.private.open_gl_mode_enabled {
+            super::linked_fragment::check_depth("new_render_pipeline_state", writes)?;
+        }
         if descriptor.support_indirect_command_buffers {
             let uses = match known.stages_using_direct_arguments {
                 Some(uses) => Ok(uses),
@@ -1421,20 +1754,24 @@ impl GraphicsState {
         }
         let rasterized;
         // The descriptor the state is made from, and its key: the one the checks above asked
-        // their questions under, where it is the same descriptor. Dropping the fragment stage
-        // makes another descriptor, which the key reads as one (a stage no descriptor names is
-        // written apart from any stage), so that creation builds the one other key it needs.
-        let (descriptor, made_key) =
-            match descriptor.fragment.is_some() && !descriptor.rasterization_enabled {
-                true => {
-                    let mut unrasterized = descriptor.clone();
-                    unrasterized.fragment = None;
-                    rasterized = unrasterized;
-                    let key = render_descriptor_key(device, &rasterized);
-                    (&rasterized, key)
-                }
-                false => (descriptor, descriptor_key),
-            };
+        // their questions under, where it is the same descriptor. Dropping the fragment stage of a
+        // state that rasterizes nothing, and rasterization where the descriptor asks for it and
+        // the state rasterizes nothing (`unrasterized.rs`), makes another descriptor, which the key
+        // reads as one (a stage no descriptor names is written apart from any stage), so that
+        // creation builds the one other key it needs.
+        let (descriptor, made_key) = match !rasterizes
+            && (descriptor.fragment.is_some() || descriptor.rasterization_enabled)
+        {
+            true => {
+                let mut unrasterized = descriptor.clone();
+                unrasterized.fragment = None;
+                unrasterized.rasterization_enabled = false;
+                rasterized = unrasterized;
+                let key = render_descriptor_key(device, &rasterized);
+                (&rasterized, key)
+            }
+            false => (descriptor, descriptor_key),
+        };
         // The reflection of the descriptor the state is made from: kept, else worked out on a
         // thread of its own beside the rest of the creation, which it shares nothing with. Under
         // the key the compile and the state read, which the creation built once.
@@ -1462,7 +1799,8 @@ impl GraphicsState {
                 (descriptor, options, used, added_unsupported),
                 entries,
                 &made_key,
-            )?;
+            )
+            .map_err(|e| super::unrasterized::compiled("new_render_pipeline_state", e))?;
             let reflected = match (kept, making) {
                 (Some(Some(reflection)), _) => Some(Reflected::Kept(reflection)),
                 (_, Some((key, making))) => Some(Reflected::Made(
@@ -1521,6 +1859,9 @@ impl GraphicsState {
             RenderVariant::compiled(&sources, descriptor, key, entries, descriptor_key)
         })
         .map_err(|error| compile_error(device, error))?;
+        // Metal fails the creation over a binary function not compiled to a binary once the
+        // stages link, after a reference they leave unresolved (`additions.rs`).
+        super::additions::check_render("new_render_pipeline_state", descriptor)?;
         let sized_class = matches!(
             descriptor.input_primitive_topology,
             PrimitiveTopologyClass::Line | PrimitiveTopologyClass::Triangle
@@ -1536,7 +1877,9 @@ impl GraphicsState {
             ));
         }
         let stand_in = !key.storage_images.is_empty();
-        let base = RenderVariant::of(device, key, found)?;
+        let base = RenderVariant::of(device, key, found, || {
+            pipeline_names(vertex_stages(descriptor))
+        })?;
         if binary_archive::combines_stages(device, options, descriptor) {
             device.degrade(Degradation::CombinedArchiveStages, || {
                 (
@@ -1597,11 +1940,16 @@ impl GraphicsState {
             added_unsupported,
             Some(*descriptor_key),
         )?;
+        // The kernels its executions' draw replay records, begun first on the device's pool,
+        // where Metal compiles (`owned_kernel.rs`).
+        if state.0.descriptor.support_indirect_command_buffers() {
+            device.begin_draw_replay_kernels();
+        }
         state.make_neutrals();
         // Its first draw's predicted `VkPipeline`, made where Metal compiles (`predicted.rs`):
         // a state drawn in color groups draws as its twins, which predict their own.
         if grouped.is_none() {
-            state.make_at_creation();
+            state.make_at_creation(true);
         }
         // The pipelines its tested draws' depth stand-in copies by, made where Metal compiles.
         state.make_stand_in_copies();
@@ -1633,7 +1981,7 @@ impl GraphicsState {
                     None,
                 )?;
                 made.make_neutrals();
-                made.make_at_creation();
+                made.make_at_creation(true);
                 made.make_stand_in_copies();
                 twins.push(made);
             }
@@ -1643,6 +1991,7 @@ impl GraphicsState {
                 .set(twins)
                 .map_err(|_| internal("a state's color groups made twice"))?;
         }
+        state.kept(device);
         Ok(state)
     }
 
@@ -1666,6 +2015,18 @@ impl GraphicsState {
             descriptor.stencil_format,
         )?;
         super::raster_samples::check(CALL, descriptor.raster_sample_count)?;
+        // Metal's descriptor validation ends the process for a stage function made by name whose
+        // function declares function constants (`unspecialized.rs`).
+        let budget = options.budget();
+        if let Some(object) = &descriptor.object {
+            super::unspecialized::check(device, CALL, Stage::Object, object, &budget)?;
+        }
+        super::unspecialized::check(device, CALL, Stage::Mesh, &descriptor.mesh, &budget)?;
+        if let Some(fragment) = &descriptor.fragment {
+            super::unspecialized::check(device, CALL, Stage::Fragment, fragment, &budget)?;
+        }
+        // And for binary functions an object or mesh stage links (`additions.rs`).
+        super::additions::check_mesh(CALL, descriptor)?;
         // A state an indirect command buffer's commands may set takes its ID where the options
         // place it, as a render state's does.
         let placement = if descriptor.support_indirect_command_buffers {
@@ -1674,23 +2035,21 @@ impl GraphicsState {
             IdPlacement::Any
         };
         let mut loaded = descriptor.clone();
-        loaded.object = loaded
-            .object
-            .as_ref()
-            .map(crate::dynamic_library::stage_with_dependencies);
-        loaded.mesh = crate::dynamic_library::stage_with_dependencies(&loaded.mesh);
-        loaded.fragment = loaded
-            .fragment
-            .as_ref()
-            .map(crate::dynamic_library::stage_with_dependencies);
+        loaded.object = (loaded.object.as_ref())
+            .map(|stage| crate::dynamic_library::stage_with_dependencies(device, stage));
+        loaded.mesh = crate::dynamic_library::stage_with_dependencies(device, &loaded.mesh);
+        loaded.fragment = (loaded.fragment.as_ref())
+            .map(|stage| crate::dynamic_library::stage_with_dependencies(device, stage));
         let descriptor = &loaded;
-        // No binary archive holds a mesh render pipeline (`BinaryArchive` adds render, compute
-        // and tile pipelines): under `FAIL_ON_BINARY_ARCHIVE_MISS` every listed archive misses
-        // its mesh function.
-        binary_archive::check(device, options, CALL, ArchivedPipeline::Render, |_, _| {
-            Some(&descriptor.mesh)
-        })?;
-        let budget = options.budget();
+        // Under `FAIL_ON_BINARY_ARCHIVE_MISS`, refused naming the mesh function where no listed
+        // archive holds the descriptor's key (`BinaryArchive::add_mesh_render_pipeline_functions`).
+        binary_archive::check(
+            device,
+            options,
+            CALL,
+            ArchivedPipeline::Render,
+            binary_archive::mesh_missing(descriptor),
+        )?;
         // As a render state's, in Metal's order: a fragment function writing
         // depth without a depth attachment, the indirect command buffers' refusal, then the
         // fragment function's stage inputs the linking keeps that the mesh function does not
@@ -1721,11 +2080,19 @@ impl GraphicsState {
             compile.compile_mesh_variant(descriptor, key, &budget)
         })
         .map_err(|error| compile_error(device, error))?;
+        // A fragment stage's binary function not compiled to a binary, as a render state's
+        // (`additions.rs`).
+        super::additions::check_precompiled(
+            CALL,
+            super::additions::Made::Render,
+            &descriptor.fragment,
+        )?;
         let stand_in = !key.storage_images.is_empty();
         let base = RenderVariant::of(
             device,
             key,
             CompiledVariant::found(Remembered::Compiled(Arc::new(pipeline))),
+            || pipeline_names(mesh_stages(descriptor)),
         )?;
         let descriptor = StateDescriptor::Mesh(descriptor.clone());
         device.degrade_absent_reads(&base.shared_pipeline().dependencies, |stage| {
@@ -1740,6 +2107,7 @@ impl GraphicsState {
             None,
         )?;
         state.make_neutrals();
+        state.kept(device);
         // The creation's record, as the program asked for it (`warm/record.rs`).
         device.record_pipeline(|| crate::warm::Pipeline::Mesh(requested.clone()));
         Ok(state)
@@ -1809,10 +2177,13 @@ impl GraphicsState {
             )?),
         };
         let samplers = descriptor.number_samplers(device, &base.shared_pipeline().interface);
-        let at_bind_views = AtBindViews::new(device, &base.shared_pipeline().interface);
+        let read = ReadSlots::of(base.shared_pipeline(), indirect);
+        let at_bind_views = AtBindViews::new(device, &base.shared_pipeline().interface, read);
         let log = match warming {
             true => None,
-            false => StateLog::new(label.as_deref(), &descriptor.function_names()),
+            false => StateLog::new(label.as_deref(), &descriptor.function_names(), || {
+                descriptor.logged()
+            }),
         };
         Ok(GraphicsState(Arc::new_cyclic(|state| {
             // The state holds its ID's slot, which lists it among the states an indirect render
@@ -1826,6 +2197,7 @@ impl GraphicsState {
                         StateKind::Render,
                         identifier.value(),
                     );
+                    device.shared().keepers.taken(id.id().0);
                     Some(id)
                 }
                 _ => None,
@@ -1848,16 +2220,24 @@ impl GraphicsState {
                 descriptor_key: key.map_or_else(OnceLock::new, OnceLock::from),
                 compiled_key: OnceLock::new(),
                 settled: Mutex::new(VecDeque::with_capacity(SETTLED)),
+                made_tables: AtomicBool::new(false),
                 last_pipelines: Mutex::new(VecDeque::with_capacity(LAST_PIPELINES)),
                 routed: Mutex::new(None),
                 pieces: PieceHolds::new(),
                 at_bind_views,
+                band_refusals: Mutex::new([None; 2]),
+                kept_shapes: KeptShapes::default(),
             };
             StateShared {
                 id,
                 identifier,
                 _samplers: samplers,
-                program: Arc::new(program),
+                label: program.label.clone(),
+                program: LetGo::new(Arc::new(program)),
+                next: OnceLock::new(),
+                carried: AtomicBool::new(false),
+                remake_failed: AtomicBool::new(false),
+                calls: PartsCalls::default(),
             }
         })))
     }
@@ -2028,15 +2408,59 @@ impl GraphicsState {
             .any(|d| matches!(d.fact, RuntimeFact::SampleCount))
     }
 
-    /// `device`.
+    /// The device of the program this reach of the state takes (`pipeline/carry.rs`): a borrow
+    /// for a command buffer's work, or a call that holds the state ([`hold`](Self::hold)).
     pub(crate) fn device(&self) -> &Device {
         &self.0.device
+    }
+
+    /// A call outside command buffers' work on the state, from now until the hold goes: the
+    /// programs it reaches stay, their release at a lost generation's rest waiting for it
+    /// (`pipeline/carry.rs`).
+    pub(crate) fn hold(&self) -> CallHold<'_> {
+        self.0.calls.hold()
     }
 
     /// Whether `other` is this state (a clone of it, or the state a command runs once the
     /// program released it, `RenderProgram::state`), not another state alike.
     pub(crate) fn is(&self, other: &GraphicsState) -> bool {
-        Arc::ptr_eq(&self.0.program, &other.0.program)
+        Arc::ptr_eq(self.0.program(), other.0.program())
+    }
+
+    /// Note that it made a visible function table (`function_table.rs`).
+    pub(crate) fn made_a_table(&self) {
+        self.0.made_tables.store(true, Ordering::Release);
+    }
+
+    /// Whether it made a visible function table, ever: a state that made none has none live
+    /// (`GraphicsState::function_tables`).
+    pub(crate) fn made_tables(&self) -> bool {
+        self.0.made_tables.load(Ordering::Acquire)
+    }
+
+    /// It, named without holding it: what a draw's encoder keeps the bind state its last draw
+    /// left under (`live_bind.rs`), which [`WeakRenderPipelineState::is`] tells apart.
+    pub(crate) fn downgrade(&self) -> WeakRenderPipelineState {
+        WeakRenderPipelineState(Arc::downgrade(&self.0))
+    }
+
+    /// What it runs, held without its ID ([`RenderPipelineState::program`]), under `_held`, the
+    /// caller's hold of it ([`hold`](Self::hold)): a call that reads more of the state under one
+    /// hold.
+    pub(crate) fn program_held(&self, _held: &CallHold<'_>) -> RenderProgram {
+        RenderProgram(Arc::clone(self.0.program()))
+    }
+
+    /// Its program, named without holding it: what a draw's encoder keeps the state's last
+    /// settle under (`live_bind.rs`), which [`runs`](Self::runs) tells apart.
+    pub(crate) fn program_name(&self) -> ProgramName {
+        ProgramName(Arc::downgrade(self.0.program()))
+    }
+
+    /// Whether it runs the program `name` names, as [`is`](Self::is) tells states apart, without
+    /// touching either's counts.
+    pub(crate) fn runs(&self, name: &ProgramName) -> bool {
+        std::ptr::eq(Arc::as_ptr(self.0.program()), name.0.as_ptr())
     }
 
     /// How many of `stage`'s function's last `binary_functions` were added without the stage's
@@ -2082,6 +2506,12 @@ impl GraphicsState {
     /// Whether `other` is this state: the same object, not an equal one.
     pub(crate) fn same(&self, other: &GraphicsState) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// The state's address, while the program holds it: what a reader of its draws is known by
+    /// across passes (`render/coverage.rs`).
+    pub(crate) fn address(&self) -> usize {
+        Arc::as_ptr(&self.0).addr()
     }
 
     /// Another reference to the state, which a command buffer holds it by
@@ -2180,52 +2610,75 @@ impl GraphicsState {
     /// ([`settle_shape`](Self::settle_shape)), compared with the state in place
     /// (`BindState::position_of_shape`, which makes the shape of the resources it lists at most
     /// once for all of them): what a draw of `state` settles where it has one, and finds there,
-    /// without its shape made (`live_bind.rs`).
-    pub(crate) fn kept_shape(&self, state: &BindState) -> Option<Arc<BindShape>> {
+    /// without its shape made (`live_bind.rs`). Only those of `key`, the state's key beside its
+    /// used resources (`BindState::shape_key_beside_used`), are compared, each counted in
+    /// `counts`: a shape of another key is not the state's.
+    pub(crate) fn kept_shape(
+        &self,
+        state: &BindState,
+        key: u64,
+        counts: Counting<'_>,
+    ) -> Option<Arc<BindShape>> {
         let settled = lock(&self.0.settled);
-        let at = state.position_of_shape(settled.iter().map(|(_, last)| &*last.shape))?;
-        Some(Arc::clone(&settled[at].1.shape))
+        let of_key = || {
+            (settled.iter())
+                .filter(|(_, kept, _)| *kept == key)
+                .map(|(_, _, last)| &last.shape)
+        };
+        let at = state.position_of_shape(of_key().map(|shape| &**shape));
+        let compared = at.map_or_else(|| of_key().count(), |at| at + 1);
+        counts.draw_shapes_compared(compared as u64);
+        of_key().nth(at?).cloned()
     }
 
     /// What a draw of bind shape `shape` runs on in `forms` ([`settle`](Self::settle)'s answer),
     /// through what the state settled last for its latest [`SETTLED`] shapes: a draw of an equal
     /// shape in the same forms (the very one, which its encoder kept, `live_bind.rs`, looked for
-    /// first by identity, or an equal one, compared whole where none is the very one) settles as
-    /// it did, not planned again; any other settles, and is kept in place of the
-    /// one used least lately. Exact: what `settle` answers is a function of the shape and `forms`
-    /// alone. A refused settle keeps nothing, and is answered as `settle` refuses it.
+    /// first by identity, or an equal one, compared whole where none is the very one, which then
+    /// holds the draw's shape) settles as it did, not planned again, answering the draw's very
+    /// shape; any other settles, and is kept in place of the one used least lately. Exact: what
+    /// `settle` answers is a function of the shape and `forms` alone. A refused settle keeps
+    /// nothing, and is answered as `settle` refuses it.
     pub(crate) fn settle_shape(
         &self,
         shape: &Arc<BindShape>,
         forms: BufferForms,
     ) -> Result<Settled, Error> {
         {
-            let mut kept = lock(&self.0.settled);
+            let mut kept = shared_draw_lock(&self.0.settled);
             // The very shape first, as a draw's encoder keeps the one it found here; else an
             // equal one, compared whole.
             let found = (kept.iter())
-                .position(|(kept, last)| *kept == forms && Arc::ptr_eq(&last.shape, shape))
+                .position(|(kept, _, last)| *kept == forms && Arc::ptr_eq(&last.shape, shape))
                 .or_else(|| {
-                    (kept.iter()).position(|(kept, last)| *kept == forms && last.shape == *shape)
+                    (kept.iter()).position(|(kept, _, last)| *kept == forms && last.shape == *shape)
                 });
-            if let Some(entry) = found.and_then(|at| kept.remove(at)) {
-                let last = entry.1.clone();
+            if let Some(mut entry) = found.and_then(|at| kept.remove(at)) {
+                // An equal shape holds the draw's own from now on, which its encoder keeps and
+                // finds its settle by (`LiveBind::settled`, by identity): a shape another
+                // pipeline state's draws made, which an encoder took with its bind state
+                // (`SpareLiveBinds`), would otherwise find this settle again by value at every
+                // draw, and no draw of its encoder rebound.
+                entry.2.shape = Arc::clone(shape);
+                let last = entry.2.clone();
                 kept.push_front(entry);
                 return Ok(last);
             }
         }
-        self.0.device.shared().counts.draw_settled();
+        self.0.device.shared().counts.thread().draw_settled();
         let (variant, plan) = self.settle(shape, forms)?;
         let settled = Settled {
             shape: Arc::clone(shape),
             variant,
+            facts: Arc::new(PlanFacts::of(&plan)),
             plan,
         };
+        let key = shape.key_beside_used();
         let mut kept = lock(&self.0.settled);
         if kept.len() == SETTLED {
             kept.pop_back();
         }
-        kept.push_front((forms, settled.clone()));
+        kept.push_front((forms, key, settled.clone()));
         Ok(settled)
     }
 
@@ -2282,6 +2735,46 @@ impl GraphicsState {
         (plan.variant == base.key && !self.0.stand_in).then_some((base, plan))
     }
 
+    /// The shapes its draws derived (`render/draw_shape.rs`).
+    pub(crate) fn kept_shapes(&self) -> &KeptShapes {
+        &self.0.kept_shapes
+    }
+
+    /// Whether the translator refuses the state's band variant of `primitive`
+    /// (`VariantKey::line_band`, `render/line_width.rs`), whose draws then take the nearest width:
+    /// asked once per primitive, the first time a draw would take the band, by compiling the
+    /// variant of the base's key that draws bands of it, which a draw whose own key is that one
+    /// then finds compiled. A compile that fails otherwise refuses no band: the draw that needs
+    /// the variant meets the failure. Answered `true` from then on where a draw's own band variant
+    /// was refused ([`refuse_band`](Self::refuse_band)).
+    pub(crate) fn band_refused(&self, primitive: BandPrimitive) -> bool {
+        let at = band_index(primitive);
+        if let Some(refused) = lock(&self.0.band_refusals)[at] {
+            return refused;
+        }
+        let mut key = self.0.base.key.clone();
+        key.line_band = Some(primitive);
+        let refused = matches!(
+            self.variant(&key),
+            Err(Error::Unsupported(u)) if u.feature == Feature::WideLines
+        );
+        lock(&self.0.band_refusals)[at] = Some(refused);
+        refused
+    }
+
+    /// Whether the translator has refused the state's band variant of `primitive`, as far as its
+    /// draws asked ([`band_refused`](Self::band_refused)); compiling nothing.
+    pub(crate) fn refused_band(&self, primitive: BandPrimitive) -> bool {
+        lock(&self.0.band_refusals)[band_index(primitive)] == Some(true)
+    }
+
+    /// The translator refused a draw's band variant of `primitive`, past the one
+    /// [`band_refused`](Self::band_refused) compiled: that draw, routed again, and the state's
+    /// later draws of it take the nearest width (`render/line_width.rs`).
+    pub(crate) fn refuse_band(&self, primitive: BandPrimitive) {
+        lock(&self.0.band_refusals)[band_index(primitive)] = Some(true);
+    }
+
     /// The variant of `key`: the large-buffer form's compiled at creation, or another compiled
     /// when first needed.
     fn variant(&self, key: &VariantKey) -> Result<Arc<RenderVariant>, Error> {
@@ -2311,9 +2804,18 @@ impl GraphicsState {
                 .map(|pipeline| CompiledVariant::found(Remembered::Compiled(Arc::new(pipeline)))),
         }
         .map_err(|error| compile_error(&self.0.device, error))?;
-        let variant = RenderVariant::of(&self.0.device, key.clone(), found)?;
+        let names = || pipeline_names(self.0.descriptor.stages());
+        let variant = RenderVariant::of(&self.0.device, key.clone(), found, names)?;
         others.insert(key.clone(), Arc::clone(&variant), 1);
         Ok(variant)
+    }
+}
+
+/// The place of `primitive`'s answer among a state's band refusals (`Program::band_refusals`).
+fn band_index(primitive: BandPrimitive) -> usize {
+    match primitive {
+        BandPrimitive::Lines => 0,
+        BandPrimitive::Triangles => 1,
     }
 }
 
@@ -2351,7 +2853,8 @@ fn group_bases(
         .map_err(|error| compile_error(device, error))?;
         key.color_group = group;
         let stand_in = !key.storage_images.is_empty();
-        Ok((RenderVariant::of(device, key, found)?, stand_in))
+        let names = || pipeline_names(vertex_stages(descriptor));
+        Ok((RenderVariant::of(device, key, found, names)?, stand_in))
     });
     std::iter::once(Ok((Arc::clone(base), stand_in)))
         .chain(later)
@@ -2396,18 +2899,22 @@ fn large_form(
         descriptor_key,
     )
     .ok()?;
-    RenderVariant::of(device, key, found).ok()
+    RenderVariant::of(device, key, found, || {
+        pipeline_names(vertex_stages(descriptor))
+    })
+    .ok()
 }
 
 /// Whether `answers` holds an answer to every linked-use question a creation of `descriptor`
 /// asks (`GraphicsState::create_adding`): whether its vertex function returns a value where it
-/// does not rasterize, the stages using a direct argument where it supports indirect command
-/// buffers, and always the fragment's depth write and the unwritten fragment inputs.
+/// asks that (`unrasterized::asks`), the stages using a direct argument where it supports
+/// indirect command buffers, and always the fragment's depth write and the unwritten fragment
+/// inputs.
 fn answers_every_question(
     answers: &LinkedUseAnswers,
     descriptor: &RenderPipelineDescriptor,
 ) -> bool {
-    (descriptor.rasterization_enabled || answers.vertex_returns_value.is_some())
+    (!super::unrasterized::asks(descriptor) || answers.vertex_returns_value.is_some())
         && answers.fragment_writes_depth_unattached.is_some()
         && (!descriptor.support_indirect_command_buffers
             || answers.stages_using_direct_arguments.is_some())
@@ -2434,11 +2941,69 @@ fn mesh_descriptor_key(device: &Device, d: &MeshPipelineDescriptor) -> PipelineK
 }
 
 /// A stage's function name, or the compile key of a stage compiled already.
+/// A color attachment's blend state, in words: its operation and factors for color and alpha, or
+/// unblended, and its write mask, as the descriptor states them.
+fn blend_text(a: &ColorAttachmentDescriptor) -> String {
+    match a.blending_enabled {
+        true => format!(
+            "blended: color {:?} {:?} {:?}, alpha {:?} {:?} {:?}, write mask {:?}",
+            a.source_rgb_blend_factor,
+            a.rgb_blend_operation,
+            a.destination_rgb_blend_factor,
+            a.source_alpha_blend_factor,
+            a.alpha_blend_operation,
+            a.destination_alpha_blend_factor,
+            a.write_mask
+        ),
+        false => format!("unblended, write mask {:?}", a.write_mask),
+    }
+}
+
+/// The functions of a vertex render pipeline of `descriptor`, in pipeline order.
+fn vertex_stages(descriptor: &RenderPipelineDescriptor) -> impl Iterator<Item = &StageSource> {
+    std::iter::once(&descriptor.vertex).chain(&descriptor.fragment)
+}
+
+/// The functions of a mesh render pipeline of `descriptor`, in pipeline order.
+fn mesh_stages(descriptor: &MeshPipelineDescriptor) -> impl Iterator<Item = &StageSource> {
+    (descriptor.object.iter())
+        .chain(std::iter::once(&descriptor.mesh))
+        .chain(&descriptor.fragment)
+}
+
+/// What the layers' messages name the `VkPipeline`s of a state of the functions `stages` by
+/// (`VariantObjects::name_pipelines`): their names, in pipeline order, joined by ` + `.
+fn pipeline_names<'s>(stages: impl IntoIterator<Item = &'s StageSource>) -> String {
+    let names: Vec<String> = stages.into_iter().map(stage_name).collect();
+    names.join(" + ")
+}
+
 fn stage_name(source: &StageSource) -> String {
     match source {
         StageSource::Function(descriptor) => descriptor.function.info().name.to_string(),
         StageSource::Compiled(compiled) => format!("{:?}", compiled.key()),
     }
+}
+
+/// What the pipeline creation log names a function of a render or compute state by
+/// (`creation_log.rs`): its name, the SHA-256 of its bitcode (`FunctionInfo::air_hash`) and the
+/// constant values it was made with, by index and by name, each as its type and its bytes.
+pub(super) fn logged_function(descriptor: &metal2vulkan::pipeline::FunctionDescriptor) -> String {
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let info = descriptor.function.info();
+    let constants = &descriptor.constants;
+    let by_index = (constants.by_index.iter()).map(|(index, value)| (index.to_string(), value));
+    let by_name = (constants.by_name.iter()).map(|(name, value)| (name.to_string(), value));
+    let values: Vec<String> = by_index
+        .chain(by_name)
+        .map(|(at, value)| format!("{at}: {:?} {}", value.ty, hex(&value.bytes)))
+        .collect();
+    format!(
+        "`{}` air {} constants {{{}}}",
+        info.name,
+        hex(&info.air_hash),
+        values.join(", ")
+    )
 }
 
 /// What a render variant's compile gives back ([`RenderVariant::compiled`]): the pipeline, and
@@ -2619,11 +3184,13 @@ impl RenderVariant {
     }
 
     /// The variant of `key` of what the memo or a compile `found`: the live variant, or one made
-    /// of the pipeline, its objects made, which the memo then knows live.
+    /// of the pipeline, its objects made, which the memo then knows live, their `VkPipeline`s
+    /// named by `names` (its functions' names, `VariantObjects::name_pipelines`).
     fn of(
         device: &Device,
         key: VariantKey,
         compiled: CompiledVariant,
+        names: impl FnOnce() -> String,
     ) -> Result<Arc<RenderVariant>, Error> {
         let CompiledVariant {
             remembered,
@@ -2656,7 +3223,7 @@ impl RenderVariant {
         });
         // Where the creation log is on, the stages' SPIR-V it names hashed on a thread of its
         // own while the objects are made: the hash its first line reads, off the creation's path.
-        let (objects, kept) = std::thread::scope(|scope| {
+        let (mut objects, kept) = std::thread::scope(|scope| {
             if creation_log::enabled() && logged_spirv.get().is_none() {
                 // A thread that cannot be made leaves the hash to the log's first line.
                 let _ = crate::exit_guard::spawn_scoped(
@@ -2676,6 +3243,7 @@ impl RenderVariant {
                 digests.as_deref(),
             )
         })?;
+        objects.name_pipelines(names);
         let stages = handle_stages(&pipeline.layout, every_render_stage());
         let census = crate::census::CountedVariant::new(pipeline.footprint());
         let variant = Arc::new(RenderVariant {
@@ -2799,10 +3367,8 @@ impl RenderVariant {
         render_pass: &Arc<RenderPassObject>,
         (state, formats): (&GraphicsState, crate::degradation::BoundFormats<'_>),
     ) -> Result<Arc<RawPipeline>, Error> {
-        self.objects
-            .device
-            .shared()
-            .counts
+        (self.objects.device.shared().counts)
+            .thread()
             .graphics_pipeline_looked_up();
         self.made_or_make(key, render_pass, (state, formats))
             .map(|(made, _)| made)
@@ -2812,8 +3378,8 @@ impl RenderVariant {
     /// (`render/executions.rs`), against `render_pass`: from the memo, the making in flight for
     /// it, or begun now as a draw's is ([`begin_graphics_pipeline`](Self::begin_graphics_pipeline):
     /// linked here where its shaders' libraries are made, else handed to `device`'s pool), so the
-    /// commit compiles nothing on the program's thread; the host step's draw of the key waits for
-    /// it until its command buffer's bound at most (`render.rs`). Under
+    /// commit compiles nothing on the program's thread; the host step records the draw of the key
+    /// once it is made (`render.rs`). Under
     /// `PipelineWaitPolicy::Exact` made now ([`graphics_pipeline`](Self::graphics_pipeline)).
     pub(crate) fn settle_graphics_pipeline(
         self: &Arc<Self>,
@@ -2827,7 +3393,11 @@ impl RenderVariant {
                 .graphics_pipeline(key, render_pass, (state, formats))
                 .map(DrawPipeline::Made);
         }
-        device.shared().counts.graphics_pipeline_looked_up();
+        device
+            .shared()
+            .counts
+            .thread()
+            .graphics_pipeline_looked_up();
         Ok(match self.pipelines.begin_at(key) {
             (Begun::Made(made), _) => DrawPipeline::Made(made),
             (Begun::Pending(pending), _) => DrawPipeline::Making(pending),
@@ -2869,17 +3439,18 @@ impl RenderVariant {
         Ok((made, true))
     }
 
-    /// The libraries of `key`'s parts (`libraries.rs`), claimed on this thread: the device's
-    /// where this is a program's call. `None` where the device makes its pipelines whole, where
+    /// The libraries of `key`'s parts and the pipeline linked from them (`libraries.rs`), claimed
+    /// on this thread: the device's where this is a program's call. `None` where the device makes its pipelines whole, where
     /// `key`'s pipeline is made whole, or where its state cannot be described (its making then
     /// says why).
     pub(crate) fn claim_libraries(&self, key: &GraphicsKey) -> Option<Linked> {
         let shared = self.objects.device.shared();
         let libraries = shared.libraries.as_ref()?;
         let content = self.objects.graphics_content(&self.pipeline, key).ok()?;
-        content
-            .links()
-            .then(|| libraries.claim(shared, &content.names(&self.objects, &self.pipeline, key)))
+        content.links().then(|| {
+            let names = content.names(&self.objects, &self.pipeline, key);
+            libraries.claim(shared, &names, self.objects.shared_layout())
+        })
     }
 
     /// The `VkPipeline`s of `keys`, each against its pass (a pass of the key's `pass`), begun at
@@ -2889,7 +3460,8 @@ impl RenderVariant {
     /// before. Under `PipelineWaitPolicy::Bounded` (the default) each making is handed to the
     /// device's pool, kept by the state's piece holds as a draw's is ([`pooled`](Self::pooled)),
     /// and the creation waits for them the policy's `pipeline_creation_wait` (4.5 s by default) at
-    /// most, one deadline for all of them, as Metal compiles in its creation: a driver's cold
+    /// most, one deadline for all of them, and within it for each settled piece to give back what
+    /// it took (its trail, `trails.rs`), as Metal compiles in its creation: a driver's cold
     /// compile (seconds on MoltenVK with a cold Metal compiler service) holds the thread creating
     /// the state, which a host may create inside a command buffer's encoding, no longer; a draw
     /// that finds the making in flight takes it (`render/pending.rs`), its command buffer waiting a
@@ -2901,11 +3473,14 @@ impl RenderVariant {
     /// driver and settles its entries. The makings of `ahead`'s keys (a predicted key whose general
     /// form is among `keys`, `render/residual.rs`) are handed to the pool right after, under either
     /// policy, at the rank nothing waits for, and not waited for. Their specialized notices wait
-    /// for their first draws ([`first_use`](Self::first_use)). Each key is its variant's.
+    /// for their first draws ([`first_use`](Self::first_use)). Each key is its variant's. Not
+    /// `waited` (a recovery's making again of the state, `render/carry.rs`), those handed to the
+    /// pool under `PipelineWaitPolicy::Bounded` are not waited for at all.
     pub(crate) fn make_at_creation(
         keys: Vec<(Arc<RenderVariant>, GraphicsKey, RenderPassObject)>,
         ahead: Vec<(Arc<RenderVariant>, GraphicsKey, RenderPassObject)>,
         state: &GraphicsState,
+        waited: bool,
     ) {
         let device = &state.0.device;
         let joined = device.compile_device().policy().pipeline_waits == PipelineWaitPolicy::Exact;
@@ -2989,12 +3564,27 @@ impl RenderVariant {
             drop(variant.pooled(state, (key, Arc::new(pass), ticket), (line, claimed), true));
         }
         // Those handed to the pool, waited for a bound at most: a making still running then goes
-        // on for the draws that take it.
+        // on for the draws that take it. None where not `waited`: each goes on for its draws.
+        let handed = match waited {
+            true => handed,
+            false => Vec::new(),
+        };
         let deadline = Instant::now() + device.compile_device().policy().pipeline_creation_wait;
         for making in &handed {
             if making.wait_until(deadline).is_none() {
                 device.shared().counts.creation_left_making();
             }
+        }
+        // And, as a command buffer's waiter waits (`trails.rs`), until each piece that settled its
+        // making gave back what it took, within the same bound: the trail it opened before the
+        // settle closes once the state keeps what it gave back. So no pool thread holds the device
+        // for a making this creation waited for once it returns, and a program that then lets go
+        // of the state and the device tears the device down on its own thread, before its last
+        // drop returns, its shader cache's writes done.
+        if !handed.is_empty() {
+            let trails = &device.shared().trails;
+            // At the bound the piece goes on and gives back as a draw's does.
+            let _ = trails.wait_below(trails.mark(), Some(deadline));
         }
         // The full join: every key begun here is settled before the creation returns.
         if pieces.is_empty() {
@@ -3060,7 +3650,11 @@ impl RenderVariant {
         if let Some(made) = self.last_made(state, key) {
             return (DrawPipeline::Made(made), true);
         }
-        device.shared().counts.graphics_pipeline_looked_up();
+        device
+            .shared()
+            .counts
+            .thread()
+            .graphics_pipeline_looked_up();
         let key = &key.key();
         match self.pipelines.begin_at(key) {
             (Begun::Made(made), at) => {
@@ -3073,7 +3667,7 @@ impl RenderVariant {
             // (`render/residual.rs`).
             (Begun::Pending(pending), _) => match self.general_made(key) {
                 Some(drawn) => {
-                    device.shared().counts.residual_form_drawn();
+                    device.shared().counts.thread().residual_form_drawn();
                     (DrawPipeline::Made(drawn), false)
                 }
                 None => (DrawPipeline::Making(pending), false),
@@ -3084,8 +3678,8 @@ impl RenderVariant {
                     // and nothing waits for the making (`render/residual.rs`).
                     DrawPipeline::Making(pending) => match self.general_made(key) {
                         Some(drawn) => {
-                            device.shared().counts.residual_form_making();
-                            device.shared().counts.residual_form_drawn();
+                            device.shared().counts.thread().residual_form_making();
+                            device.shared().counts.thread().residual_form_drawn();
                             (DrawPipeline::Made(drawn), false)
                         }
                         None => (DrawPipeline::Making(pending), false),
@@ -3116,7 +3710,11 @@ impl RenderVariant {
         if let Some(made) = self.last_made(state, key) {
             return Ok((made, true));
         }
-        device.shared().counts.graphics_pipeline_looked_up();
+        device
+            .shared()
+            .counts
+            .thread()
+            .graphics_pipeline_looked_up();
         let key = &key.key();
         if let Some((made, at)) = self.pipelines.made_with_at(key) {
             self.keep_last(state, key, at);
@@ -3273,11 +3871,13 @@ impl RenderVariant {
                 counts.creation_pipeline_made(crate::work_counts::Predicted::Render);
             }
             // Its callers take it from the making: from the settle, the batches that wait
-            // for it may run and complete while this piece still holds the variant and the
-            // pass, and the device with them, until it gave them back. A trail spans that
-            // (`trails.rs`).
+            // for it, and the creation that waits for it, may go on while this piece still holds
+            // the variant and the pass, and the device with them, until it gave them back. A
+            // trail spans that (`trails.rs`).
             let trail = variant.objects.device.shared().trails.open();
             drop(ticket.settle(made));
+            #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+            super::pool::held::settled();
             lease.give_back(
                 PieceHeld::Drawn {
                     _variant: variant,

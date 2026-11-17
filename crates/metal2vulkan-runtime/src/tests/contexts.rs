@@ -102,10 +102,83 @@ fn ready_lines_are_taken_in_the_order_they_became_ready() {
     assert_eq!(taken, [3, 1, 2]);
 }
 
+/// An item behind a gate keeps its place in its line and holds the line's later items until every
+/// closing of the gate is opened, whenever the item was pushed; other lines go on meanwhile, and
+/// no caller takes its line whole.
+#[test]
+fn an_item_behind_a_gate_holds_its_line_until_every_closing_is_opened() {
+    let plain = |_: &&str| true;
+    let mut lines = Lines::default();
+    lines.push(1, "a1");
+    lines.close_new(7);
+    assert!(lines.close(7), "closed again while closed");
+    lines.push_behind(1, "a2", 7);
+    lines.push(1, "a3");
+    lines.push(2, "b1");
+    assert_eq!(lines.take(), Some((1, "a1")));
+    lines.done(1);
+    // a2 leads line 1 behind its gate: only line 2 is ready.
+    assert_eq!(lines.take(), Some((2, "b1")));
+    lines.done(2);
+    assert_eq!(lines.take(), None);
+    assert_eq!(lines.take_plain(1, plain), None);
+    lines.open(1, 7);
+    assert_eq!(lines.take(), None, "one closing is left");
+    lines.open(1, 7);
+    assert!(!lines.close(7), "open");
+    assert_eq!(lines.take(), Some((1, "a2")));
+    lines.done(1);
+    assert_eq!(lines.take(), Some((1, "a3")));
+    lines.done(1);
+    assert!(lines.is_empty());
+    // A gate opened before its item is pushed: the item goes as any.
+    lines.close_new(8);
+    lines.close(8);
+    lines.open(3, 8);
+    lines.push_behind(3, "c1", 8);
+    assert_eq!(lines.take(), None);
+    lines.open(3, 8);
+    assert_eq!(lines.take(), Some((3, "c1")));
+    lines.done(3);
+    lines.close_new(9);
+    lines.open(3, 9);
+    lines.push_behind(3, "c2", 9);
+    assert_eq!(lines.take(), Some((3, "c2")));
+    lines.done(3);
+    assert!(lines.is_empty());
+}
+
+/// An item leads its line where it is the first and no thread runs the line, or where it was
+/// pushed, a thread runs the line and no item left is it (the thread runs it); one not pushed yet
+/// leads no running line.
+#[test]
+fn an_item_leads_its_line_with_nothing_before_it() {
+    let mut lines = Lines::default();
+    let leads =
+        |lines: &Lines<&str>, name: &str, posted| lines.leads(1, |item| *item == name, posted);
+    assert!(!leads(&lines, "a2", true), "no line");
+    lines.push(1, "a1");
+    assert!(leads(&lines, "a1", true));
+    assert_eq!(lines.take(), Some((1, "a1")));
+    // a1 runs: it leads; a2, not pushed yet, does not.
+    assert!(leads(&lines, "a1", true));
+    assert!(!leads(&lines, "a2", false));
+    lines.push(1, "a2");
+    assert!(!leads(&lines, "a2", true), "a2 waits behind a1");
+    lines.done(1);
+    assert!(leads(&lines, "a2", true));
+    assert_eq!(lines.take(), Some((1, "a2")));
+    assert!(leads(&lines, "a2", true));
+    lines.done(1);
+    assert!(lines.is_empty());
+}
+
 /// A plain item.
 struct Job(Box<dyn FnOnce() + Send>);
 
 impl Run for Job {
+    type Held = ();
+
     fn run(self) {
         (self.0)();
     }
@@ -115,13 +188,16 @@ fn job(f: impl FnOnce() + Send + 'static) -> Job {
     Job(Box::new(f))
 }
 
-/// An item that says whether it is plain.
+/// An item that says whether it is plain, and whether it runs where its completion was seen.
 struct Said {
     run: Box<dyn FnOnce() + Send>,
     plain: bool,
+    seen: bool,
 }
 
 impl Run for Said {
+    type Held = ();
+
     fn run(self) {
         (self.run)();
     }
@@ -129,12 +205,27 @@ impl Run for Said {
     fn plain(&self) -> bool {
         self.plain
     }
+
+    fn runs_where_seen(&self) -> bool {
+        self.plain || self.seen
+    }
 }
 
 fn said(plain: bool, f: impl FnOnce() + Send + 'static) -> Said {
     Said {
         run: Box::new(f),
         plain,
+        seen: false,
+    }
+}
+
+/// An item that is not plain but runs where its completion was seen (a transition whose only code
+/// of the program's is its completion-seen handlers).
+fn seen(f: impl FnOnce() + Send + 'static) -> Said {
+    Said {
+        run: Box::new(f),
+        plain: false,
+        seen: true,
     }
 }
 
@@ -180,7 +271,7 @@ fn a_plain_item_runs_here_after_its_context_s_plain_items_and_before_later_ones(
             note(&log, "here")();
         }
     };
-    assert!(contexts.run_here(1, said(true, later)).is_ok());
+    assert!(contexts.run_here(1, said(true, later), Said::plain).is_ok());
     assert_eq!(
         *log.lock().unwrap(),
         [("earlier", true), ("here", true)],
@@ -188,9 +279,15 @@ fn a_plain_item_runs_here_after_its_context_s_plain_items_and_before_later_ones(
     );
     // A context holding an item that is not plain, and one a thread runs: given back.
     contexts.post(2, said(false, || {}));
-    assert!(contexts.run_here(2, said(true, || {})).is_err());
-    assert!(contexts.run_here(9, said(true, || {})).is_err());
-    assert!(contexts.run_here(3, said(false, || {})).is_err());
+    assert!(contexts
+        .run_here(2, said(true, || {}), Said::plain)
+        .is_err());
+    assert!(contexts
+        .run_here(9, said(true, || {}), Said::plain)
+        .is_err());
+    assert!(contexts
+        .run_here(3, said(false, || {}), Said::plain)
+        .is_err());
     release.send(()).unwrap();
     finished.recv_timeout(WAIT).unwrap();
     assert_eq!(
@@ -198,6 +295,56 @@ fn a_plain_item_runs_here_after_its_context_s_plain_items_and_before_later_ones(
         [("earlier", true), ("here", true), ("later", false)],
         "the item posted meanwhile ran after it, on the pool's thread"
     );
+    contexts.stop();
+}
+
+/// An item whose only code of the program's is its completion-seen handlers runs on the calling
+/// thread where that thread may run them (`Run::runs_where_seen`), after its context's items that
+/// may run there too; where it may run only plain items (a thread blocking in a wait), it is
+/// given back, and so is any item behind an earlier one of its context that runs elsewhere.
+#[test]
+fn an_item_that_runs_where_seen_runs_here_only_where_the_thread_may_run_it() {
+    let contexts: Contexts<Said> = Contexts::start(1).unwrap();
+    let here = std::thread::current().id();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let note = move |log: &Arc<Mutex<Vec<(&'static str, bool)>>>, name: &'static str| {
+        let log = Arc::clone(log);
+        move || {
+            let on_here = std::thread::current().id() == here;
+            log.lock().unwrap().push((name, on_here));
+        }
+    };
+    // Plain items only: given back, changing nothing.
+    assert!(contexts
+        .run_here(1, seen(note(&log, "refused")), Said::plain)
+        .is_err());
+    // Where the thread may run completion-seen handlers: after the context's earlier one of the
+    // same kind, on this thread.
+    let (release, released) = mpsc::channel::<()>();
+    let (started, starts) = mpsc::channel::<()>();
+    contexts.post(
+        9,
+        said(false, move || {
+            started.send(()).unwrap();
+            released.recv_timeout(WAIT).unwrap();
+        }),
+    );
+    starts.recv_timeout(WAIT).unwrap();
+    contexts.post(1, seen(note(&log, "earlier")));
+    assert!(contexts
+        .run_here(1, seen(note(&log, "here")), Said::runs_where_seen)
+        .is_ok());
+    assert_eq!(
+        *log.lock().unwrap(),
+        [("earlier", true), ("here", true)],
+        "the context's earlier item, then the item, on this thread"
+    );
+    // Behind an item that runs only on the pool's threads: given back.
+    contexts.post(2, said(false, || {}));
+    assert!(contexts
+        .run_here(2, seen(|| {}), Said::runs_where_seen)
+        .is_err());
+    release.send(()).unwrap();
     contexts.stop();
 }
 
@@ -263,6 +410,106 @@ fn a_plain_item_runs_alone_only_where_its_context_is_idle() {
         [("here", true), ("later", false)],
         "the item posted meanwhile ran after it, on the pool's thread"
     );
+    contexts.stop();
+}
+
+/// An item whose end the test sees: what it holds once it ran ([`Told`]) says so as it goes, then
+/// waits for the test to go on, as a transition's hold opens its command buffer's gate as it goes
+/// (`Run::Held`). Plain, so a thread that runs its context itself may run it.
+struct Ends {
+    name: &'static str,
+    told: Option<Tell>,
+}
+
+/// Whom an [`Ends`] tells as what it held goes, and where it waits for the test then.
+struct Tell {
+    ended: mpsc::Sender<()>,
+    go_on: mpsc::Receiver<()>,
+}
+
+/// What an [`Ends`] holds once it ran.
+struct Told(Option<Tell>);
+
+impl Drop for Told {
+    fn drop(&mut self) {
+        if let Some(Tell { ended, go_on }) = &self.0 {
+            let _ = ended.send(());
+            let _ = go_on.recv_timeout(WAIT);
+        }
+    }
+}
+
+impl Run for Ends {
+    type Held = Told;
+
+    fn run(self) -> Told {
+        Told(self.told)
+    }
+
+    fn plain(&self) -> bool {
+        true
+    }
+}
+
+/// An [`Ends`] that tells, with the test's ends of its channels: told as it ends, and the go-on.
+fn telling(name: &'static str) -> (Ends, mpsc::Receiver<()>, mpsc::Sender<()>) {
+    let (ended, ends) = mpsc::channel();
+    let (go_on, goes_on) = mpsc::channel();
+    let told = Some(Tell {
+        ended,
+        go_on: goes_on,
+    });
+    (Ends { name, told }, ends, go_on)
+}
+
+/// An item's context is done with it before what it still holds goes (`Run::Held`), on the
+/// pool's thread, on a thread that runs the context itself with an earlier item of it
+/// ([`Contexts::run_here`]) and alone ([`Contexts::run_alone`]): a thread that sees what it held
+/// go (a command buffer's waiter, whose gate a transition's hold opens as it goes) finds the
+/// context running nothing of it, however long the thread that ran it stays there, so the item
+/// posted next leads the context (`command_buffer/follow.rs`). The pool's one thread stays in
+/// the first item's end meanwhile, so what is posted waits.
+#[test]
+fn an_item_s_context_is_done_with_it_before_what_it_held_goes() {
+    let contexts: Contexts<Ends> = Contexts::start(1).unwrap();
+    let leads =
+        |queue, name: &'static str| contexts.leads(queue, |item: &Ends| item.name == name, true);
+    let quiet = |name| Ends { name, told: None };
+    let (first, ends, go_on) = telling("first");
+    contexts.post(1, first);
+    ends.recv_timeout(WAIT).unwrap();
+    contexts.post(1, quiet("next"));
+    assert!(
+        leads(1, "next"),
+        "the pool's thread holds the context still"
+    );
+    for (queue, alone) in [(2, false), (3, true)] {
+        let (item, ends, item_goes_on) = telling("here");
+        let (earlier, earlier_ends, earlier_goes_on) = telling("earlier");
+        let here = {
+            let contexts = contexts.clone();
+            std::thread::spawn(move || match alone {
+                true => contexts.run_alone(queue, item).is_ok(),
+                false => {
+                    contexts.post(queue, earlier);
+                    contexts.run_here(queue, item, Ends::plain).is_ok()
+                }
+            })
+        };
+        if !alone {
+            earlier_ends.recv_timeout(WAIT).unwrap();
+            earlier_goes_on.send(()).unwrap();
+        }
+        ends.recv_timeout(WAIT).unwrap();
+        contexts.post(queue, quiet("next"));
+        assert!(
+            leads(queue, "next"),
+            "the thread that ran it holds the context still (alone: {alone})"
+        );
+        item_goes_on.send(()).unwrap();
+        assert!(here.join().unwrap(), "it ran there (alone: {alone})");
+    }
+    go_on.send(()).unwrap();
     contexts.stop();
 }
 

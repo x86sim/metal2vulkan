@@ -9,11 +9,13 @@ use std::fmt;
 /// Why an ended encoder kept no log a rebind encodes it again from (`replay.rs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Unlogged {
-    /// It logged no calls: the device had no buffer over host pages as it opened, or it is of a
-    /// kind that logs none (a resource state encoder's).
+    /// It logged no calls: a blit or render encoder that opened while the device had no buffer
+    /// over host pages, a compute encoder that recorded a loop of command predication
+    /// (`predication.rs`), or one of a kind that logs none (a resource state encoder's).
     NoCalls,
     /// It left work for later that an encoding again does not record at once: a host step's (a
-    /// GPU-written indirect dispatch's), or a scrub's (`Segment::records_again`).
+    /// GPU-written indirect dispatch's, a scatter into a guest RAM staged through the CPU's,
+    /// `host_ram/copy.rs`), or a scrub's (`Segment::records_again`).
     Segments,
     /// The command buffer's failure fails it, or a fault of its own, as it commits.
     Fails,
@@ -65,8 +67,9 @@ impl fmt::Display for Unlogged {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Unlogged::NoCalls => {
-                "it logged no calls (no buffer over host pages as it opened, or a kind that \
-                 logs none)"
+                "it logged no calls (a blit or render encoder opened with no buffer over host \
+                 pages, a compute encoder that recorded a predicated loop, or a kind that logs \
+                 none)"
             }
             Unlogged::Segments => "it left work for later an encoding again does not record",
             Unlogged::Fails => "its command buffer fails it as it commits",

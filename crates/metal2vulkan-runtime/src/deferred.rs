@@ -6,20 +6,24 @@
 
 use super::command_buffer::rerun::LoopCheck;
 use super::command_buffer::CommandBuffer;
+use super::commit_times::{self, Phase};
 use super::device::lock;
 use super::encoder::RecordedSegment;
 use super::error::{internal, Error};
 use super::gpu_execute::{self, Rerecord};
+use super::host_ram::copy::{StagedGather, StagedScatter};
 use super::indirect_dispatch::ArgumentDispatch;
 use super::indirect_execute::{self, Execute, Settled, Unforeseen};
+use super::pass_runs::RunMerge;
 use super::pending_dispatch::PendingDispatch;
 use super::pipeline::ComputePipelineState;
 use super::render::DeferredPass;
 use super::resource::ResourceKey;
 use super::shadow::GatedCopyIn;
 use super::sparse::emulated::Scrub;
-use super::tracker::Summary;
+use super::tracker::{EncoderUses, Summary, Use};
 use super::Device;
+use super::IndirectCommandBuffer;
 use crate::pipeline::budget::Urgency;
 use std::any::Any;
 use std::sync::Arc;
@@ -39,6 +43,10 @@ pub(super) enum Deferred {
     /// a scrub, neither `commit` nor a host step records it, but its batch's submission, once the
     /// commit's stamp is published (`shadow::GatedCopyIn`, `dirty_pages.rs`).
     GatedCopyIn(Arc<GatedCopyIn>),
+    /// The merge of a run's pass over a linear attachment rendered apart, or over a shadowed
+    /// texture merged back (`pass_runs.rs`): as with a scrub, neither `commit` nor a host step
+    /// records it, but its batch's submission, unless a later pass of the run took it over.
+    RunMerge(Arc<RunMerge>),
     /// A render pass that executes render commands (`render/executions.rs`).
     RenderPass(Arc<DeferredPass>),
     /// A compute encoder's dispatch whose pipelines were being made (`pending_dispatch.rs`).
@@ -46,7 +54,50 @@ pub(super) enum Deferred {
     /// The check after a predicated loop's laying, which runs it again while the loop would run
     /// on (`command_buffer/rerun.rs`): it records nothing, and its batch waits for it.
     Loop(Arc<LoopCheck>),
+    /// A gather from a guest RAM staged through the CPU (`host_ram/copy.rs`,
+    /// [`StagedGather::stage`]): its batch's host step takes the staging, fills it by the CPU and
+    /// records the GPU's copy from it, so the staging's memory is not made on the encoding thread;
+    /// it waits for the work before it only where the GPU may write the pages it reads.
+    GatherStage(Arc<StagedGather>),
+    /// A scatter into a guest RAM staged through the CPU, its GPU's copy into the staging
+    /// (`host_ram/copy.rs`, [`StagedScatter::stage`]): its batch's host step records it, waiting
+    /// for no work on the GPU, so the staging's memory is not made on the encoding thread.
+    ScatterStage(Arc<StagedScatter>),
+    /// The same scatter's CPU copy from the staging into the pages
+    /// ([`StagedScatter::drain`]): the host step of a batch of its own records nothing, once the
+    /// work before it completed.
+    ScatterDrain(Arc<StagedScatter>),
 }
+
+// SAFETY: a `Deferred` holds one `Arc` of its variant's work, which is `Send` and `Sync` for every
+// work that is both; the constant below makes the compiler prove that of each variant's work, its
+// match naming every variant (one added fails it until its work is proved too), so these impls
+// claim nothing it does not check. Written out, they end the compiler's walk of a segment's work
+// where a program's crate proves its own objects' `Send` and `Sync`: the walk from an encoder's
+// segments down the work's types runs past rustc's default recursion limit
+// (`recursion_depth_exceeding_limit`), which a program's crate keeps
+// (`tests/consumer_auto_traits.rs`).
+unsafe impl Send for Deferred {}
+// SAFETY: as for `Send` above.
+unsafe impl Sync for Deferred {}
+
+// The compiler's proof of what `Deferred`'s `Send` and `Sync` impls rest on: each variant's work.
+const _: fn(&Deferred) = |work| {
+    fn shared<T: Send + Sync>(_: &T) {}
+    match work {
+        Deferred::Execute(work) => shared(work),
+        Deferred::Dispatch(work) => shared(work),
+        Deferred::SparseScrub(work) => shared(work),
+        Deferred::GatedCopyIn(work) => shared(work),
+        Deferred::RunMerge(work) => shared(work),
+        Deferred::RenderPass(work) => shared(work),
+        Deferred::Pending(work) => shared(work),
+        Deferred::Loop(work) => shared(work),
+        Deferred::GatherStage(work) => shared(work),
+        Deferred::ScatterStage(work) => shared(work),
+        Deferred::ScatterDrain(work) => shared(work),
+    }
+};
 
 /// What `commit` left a segment for its host step.
 #[derive(Clone)]
@@ -67,6 +118,8 @@ pub(super) enum StepInputs {
     RenderPass,
     /// A loop's check: nothing past the check itself.
     Loop,
+    /// A staged gather's or scatter's copies: nothing past the work itself.
+    Staged,
     /// An execution `commit` recorded on the GPU alone with no barrier between its commands, which
     /// its batch's submission records again with them where a route encoded since may set a
     /// barrier in a record (`gpu_execute::Rerecord`); no work on the GPU is waited for.
@@ -95,6 +148,30 @@ pub(super) struct Prepared {
     /// `commit` left its recording to a host step for the pipelines it records, being made (or
     /// failed) then (`render/pending.rs`).
     pub(super) pipelines: bool,
+    /// Where its host step records it for what the GPU may write, what the step's recording may
+    /// use that Metal orders (`Segment::bound`).
+    pub(super) bound: Option<Summary<ResourceKey>>,
+    /// `commit`'s recording of it was refused, though a route met later may write the records it
+    /// read first ([`Deferred::prepare`]): its host step records it once the work before it
+    /// completed (`Segment::host`).
+    pub(super) held: bool,
+}
+
+/// Whether `commit`'s refused recording of an execution of `executed`, buffers read from the CPU's
+/// records, is held for its host step: where its command buffer made one of them resident for
+/// writing (`residency`, its), as a route met after the commit may still write the records before
+/// the work runs (another queue's command buffer it waits for through an event, encoded after this
+/// commit: the probe `crates/metal2vulkan-conformance/probes/icb_cross_queue_writes.m`), and Metal
+/// runs what that route wrote. The step records the work from the records as they stand once the
+/// work before it completed, and fails the command buffer, at the batch's submission, only where
+/// they are still refused (`WorkCounts::commit_refusals_held`). A refusal of another buffer's
+/// records stands at `commit`.
+fn held<'a>(
+    residency: &crate::residency::Residency,
+    executed: impl IntoIterator<Item = &'a IndirectCommandBuffer>,
+) -> bool {
+    let writable = residency.writable_indirect_command_buffers();
+    executed.into_iter().any(|icb| writable.contains(icb))
 }
 
 impl Deferred {
@@ -105,9 +182,13 @@ impl Deferred {
             (Deferred::Dispatch(a), Deferred::Dispatch(b)) => Arc::ptr_eq(a, b),
             (Deferred::SparseScrub(a), Deferred::SparseScrub(b)) => Arc::ptr_eq(a, b),
             (Deferred::GatedCopyIn(a), Deferred::GatedCopyIn(b)) => Arc::ptr_eq(a, b),
+            (Deferred::RunMerge(a), Deferred::RunMerge(b)) => Arc::ptr_eq(a, b),
             (Deferred::RenderPass(a), Deferred::RenderPass(b)) => Arc::ptr_eq(a, b),
             (Deferred::Pending(a), Deferred::Pending(b)) => Arc::ptr_eq(a, b),
             (Deferred::Loop(a), Deferred::Loop(b)) => Arc::ptr_eq(a, b),
+            (Deferred::GatherStage(a), Deferred::GatherStage(b)) => Arc::ptr_eq(a, b),
+            (Deferred::ScatterStage(a), Deferred::ScatterStage(b)) => Arc::ptr_eq(a, b),
+            (Deferred::ScatterDrain(a), Deferred::ScatterDrain(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -118,32 +199,49 @@ impl Deferred {
     /// before it and back as the encoder ends (`render/shadows.rs`).
     /// Nor is a dispatch whose pipelines were being made: its shadowed textures were copied in
     /// at the dispatch, and its writes are its encoder's to copy back. Nor is a gated copy in,
-    /// which is one of the encoder's shadow copies.
+    /// which is one of the encoder's shadow copies, nor a run's merge (`pass_runs.rs`): a linear
+    /// attachment's touches no shadowed texture, and a shadowed texture's is the copy back its
+    /// encoder took out of its shadows to leave there. A staged copy's do: a gather's writes the
+    /// buffer, a scatter's reads it and writes the pages, after every command before them.
     pub(super) fn leaves_shadows(&self) -> bool {
         match self {
             Deferred::Execute(_)
             | Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
-            | Deferred::Loop(_) => true,
-            Deferred::RenderPass(_) | Deferred::Pending(_) | Deferred::GatedCopyIn(_) => false,
+            | Deferred::Loop(_)
+            | Deferred::GatherStage(_)
+            | Deferred::ScatterStage(_)
+            | Deferred::ScatterDrain(_) => true,
+            Deferred::RenderPass(_)
+            | Deferred::Pending(_)
+            | Deferred::GatedCopyIn(_)
+            | Deferred::RunMerge(_) => false,
         }
     }
 
     /// Whether the GPU may write what the work reads now: a host step records it, before its
-    /// batch is submitted. For an execution, whether its buffer was made resident for writing
-    /// (`IndirectCommandBuffer::gpu_written`, for good), or it reads its range from a buffer
+    /// batch is submitted. For an execution, whether a route that may write its buffer's records
+    /// met it (`IndirectCommandBuffer::gpu_written`, for good), or it reads its range from a buffer
     /// (`Execute::indirect`), or it lies inside a block of command predication, whose counter its
     /// host step reads (`Execute::predicated`); an indirect dispatch's arguments always are GPU
     /// memory the work
-    /// before it may write. A render pass's, whether an encoder made the buffer of one of its
-    /// executions resident for writing, or one of them reads its range from a buffer.
+    /// before it may write. A render pass's, whether such a route met the buffer of one of its
+    /// executions, or one of them reads its range from a buffer. A staged scatter's CPU copy
+    /// reads the staging the GPU's copy before it wrote; a staged gather's, over a guest RAM chunk
+    /// that takes no import, reads pages a command before it may write
+    /// (`StagedGather::after_the_gpu`).
     pub(super) fn gpu_written(&self) -> bool {
         match self {
             Deferred::Execute(execute) => {
                 execute.icb.gpu_written() || execute.indirect() || execute.predicated()
             }
-            Deferred::Dispatch(_) | Deferred::Loop(_) => true,
-            Deferred::SparseScrub(_) | Deferred::GatedCopyIn(_) | Deferred::Pending(_) => false,
+            Deferred::Dispatch(_) | Deferred::Loop(_) | Deferred::ScatterDrain(_) => true,
+            Deferred::GatherStage(gather) => gather.after_the_gpu(),
+            Deferred::SparseScrub(_)
+            | Deferred::GatedCopyIn(_)
+            | Deferred::RunMerge(_)
+            | Deferred::Pending(_)
+            | Deferred::ScatterStage(_) => false,
             Deferred::RenderPass(pass) => pass.gpu_written(),
         }
     }
@@ -190,6 +288,8 @@ impl Deferred {
                         inputs,
                         retained,
                         pipelines: false,
+                        bound: None,
+                        held: false,
                     });
                 }
                 let residency = command_buffer.residency()?.kernel();
@@ -201,10 +301,34 @@ impl Deferred {
                     inputs: StepInputs::Settled(states),
                     retained: Some(Box::new(variants)),
                     pipelines: false,
+                    bound: execute.bound(&residency),
+                    held: false,
                 })
             }
             Deferred::Execute(execute) => {
-                let recorded = execute.record(command_buffer, None)?;
+                let recorded = match execute.record(command_buffer, None) {
+                    Ok(recorded) => recorded,
+                    // Held for its host step (`held`).
+                    Err(error) => {
+                        let residency = command_buffer.residency()?;
+                        if !held(&residency, [&execute.icb]) {
+                            return Err(error);
+                        }
+                        device.shared().counts.commit_refusal_held();
+                        let residency = residency.kernel();
+                        let Settled { states, variants } =
+                            execute.settle(device, execute.states(device), &residency);
+                        return Ok(Prepared {
+                            recorded: None,
+                            for_good: false,
+                            inputs: StepInputs::Settled(states),
+                            retained: Some(Box::new(variants)),
+                            pipelines: false,
+                            bound: execute.bound(&residency),
+                            held: true,
+                        });
+                    }
+                };
                 let residency = command_buffer.residency()?.kernel();
                 let unforeseen = Unforeseen::new(device, execute, residency);
                 execute.icb.watch(&unforeseen);
@@ -214,6 +338,8 @@ impl Deferred {
                     inputs: StepInputs::Unforeseen(unforeseen),
                     retained: None,
                     pipelines: false,
+                    bound: None,
+                    held: false,
                 })
             }
             Deferred::Dispatch(dispatch) if step => Ok(Prepared {
@@ -224,17 +350,23 @@ impl Deferred {
                     dispatch.settle(device, &command_buffer.residency()?.kernel()),
                 )),
                 pipelines: false,
+                bound: None,
+                held: false,
             }),
             Deferred::Dispatch(_) => Err(internal(
                 "an indirect dispatch recorded before the work it waits for completed",
             )),
-            Deferred::SparseScrub(_) | Deferred::GatedCopyIn(_) => Ok(Prepared {
-                recorded: None,
-                for_good: false,
-                inputs: StepInputs::None,
-                retained: None,
-                pipelines: false,
-            }),
+            Deferred::SparseScrub(_) | Deferred::GatedCopyIn(_) | Deferred::RunMerge(_) => {
+                Ok(Prepared {
+                    recorded: None,
+                    for_good: false,
+                    inputs: StepInputs::None,
+                    retained: None,
+                    pipelines: false,
+                    bound: None,
+                    held: false,
+                })
+            }
             // Recorded now for good where every execution whose records the GPU may write runs
             // on the GPU alone (`render/executions/gpu.rs`). Otherwise its step's draws compile
             // what `commit` cannot foresee alone: it settles their variants and pipelines now
@@ -249,6 +381,8 @@ impl Deferred {
                         inputs,
                         retained: None,
                         pipelines: false,
+                        bound: None,
+                        held: false,
                     });
                 }
                 pass.make_ahead(command_buffer);
@@ -258,31 +392,63 @@ impl Deferred {
                     inputs: StepInputs::RenderPass,
                     retained: Some(Box::new(pass.settle(command_buffer))),
                     pipelines: pass.making() || pass.failed(),
+                    bound: pass.bound(device, &command_buffer.residency()?),
+                    held: false,
                 })
             }
             // A pass of draws whose pipelines are being made, or one of which failed, is
             // recorded by a host step once they are made, which drops the draw of a failed one
-            // (`render/pending.rs`). One whose executions read the CPU's records as
-            // they stand now waits for them first.
+            // (`render/pending.rs`). One whose executions read the CPU's records as they stand now
+            // waits for them first, until the command buffer's bound at most; so does its
+            // executions' replay for a making it begins itself, which leaves the pass to the host
+            // step past that bound (`DeferredPass::left_for_makings`).
             Deferred::RenderPass(pass) => {
+                let left = Prepared {
+                    recorded: None,
+                    for_good: false,
+                    inputs: StepInputs::RenderPass,
+                    retained: None,
+                    pipelines: true,
+                    bound: None,
+                    held: false,
+                };
                 if pass.reads_at_commit() {
-                    pass.wait_made(command_buffer.making_deadline());
+                    let deadline = command_buffer.making_deadline();
+                    commit_times::phase(Phase::PipelineWait, || pass.wait_made(deadline));
                 }
                 if pass.making() || pass.failed() {
-                    return Ok(Prepared {
-                        recorded: None,
-                        for_good: false,
-                        inputs: StepInputs::RenderPass,
-                        retained: None,
-                        pipelines: true,
-                    });
+                    return Ok(left);
                 }
+                let recorded = match pass.record(command_buffer, false) {
+                    Ok(recorded) => recorded,
+                    Err(_) if pass.left_for_makings(command_buffer) => return Ok(left),
+                    // Held for its host step (`held`), as a step's pass is prepared above.
+                    Err(error) => {
+                        let residency = command_buffer.residency()?;
+                        if !held(&residency, pass.executed()) {
+                            return Err(error);
+                        }
+                        device.shared().counts.commit_refusal_held();
+                        pass.make_ahead(command_buffer);
+                        return Ok(Prepared {
+                            recorded: None,
+                            for_good: false,
+                            inputs: StepInputs::RenderPass,
+                            retained: Some(Box::new(pass.settle(command_buffer))),
+                            pipelines: false,
+                            bound: pass.bound(device, &residency),
+                            held: true,
+                        });
+                    }
+                };
                 Ok(Prepared {
-                    recorded: Some(pass.record(command_buffer, false)?),
+                    recorded: Some(recorded),
                     for_good: false,
                     inputs: StepInputs::RenderPass,
                     retained: None,
                     pipelines: false,
+                    bound: None,
+                    held: false,
                 })
             }
             // Its host step reads the unit's halt word once the laying completed.
@@ -292,7 +458,27 @@ impl Deferred {
                 inputs: StepInputs::Loop,
                 retained: None,
                 pipelines: false,
+                bound: None,
+                held: false,
             }),
+            // Recorded by host steps: a gather's and a scatter's GPU copy by its batch's
+            // (`records_at_its_step`); a scatter's CPU copy, which records nothing on the GPU,
+            // once the work before it completed. Their uses are their encoder's, noted at the call
+            // (`host_ram/copy.rs`): the steps' recordings name none of their own.
+            Deferred::GatherStage(_) | Deferred::ScatterStage(_) | Deferred::ScatterDrain(_) => {
+                Ok(Prepared {
+                    recorded: None,
+                    for_good: false,
+                    inputs: StepInputs::Staged,
+                    retained: None,
+                    pipelines: false,
+                    bound: match self {
+                        Deferred::ScatterDrain(_) => Some(EncoderUses::new(true).finish()),
+                        _ => None,
+                    },
+                    held: false,
+                })
+            }
             // Recorded now where its pipelines are made; else by a host step once they are,
             // which makes again one whose making failed.
             Deferred::Pending(dispatch) => {
@@ -306,8 +492,67 @@ impl Deferred {
                     inputs: StepInputs::Dispatch,
                     retained: None,
                     pipelines: later,
+                    bound: None,
+                    held: false,
                 })
             }
+        }
+    }
+
+    /// Whether it is a run's pass's merge (`pass_runs.rs`), which an encoding again of its pass
+    /// replaces with that pass's own merge (`command_buffer/reencode.rs`).
+    pub(super) fn joins_a_run(&self) -> bool {
+        matches!(self, Deferred::RunMerge(_))
+    }
+
+    /// Whether `commit` leaves its recording to its batch's host step, which waits for no work on
+    /// the GPU but where [`steps_after_the_gpu_now`](Self::steps_after_the_gpu_now) says: a
+    /// staged gather's or scatter's GPU copy, whose region of the arena that step takes, so its
+    /// memory is made on neither the encoding nor the committing thread (`host_ram/copy.rs`).
+    pub(super) fn records_at_its_step(&self) -> bool {
+        matches!(self, Deferred::GatherStage(_) | Deferred::ScatterStage(_))
+    }
+
+    /// Whether its host step, not yet run, waits for the work submitted before it to complete
+    /// though the work is not GPU-written for good ([`gpu_written`](Self::gpu_written)): a staged
+    /// gather's where the GPU may write the pages it reads now (`StagedGather::waits_for_the_gpu`).
+    pub(super) fn steps_after_the_gpu_now(&self, device: &Device) -> bool {
+        match self {
+            Deferred::GatherStage(gather) => gather.waits_for_the_gpu(device),
+            _ => false,
+        }
+    }
+
+    /// What its host step reads on the host of what the GPU may write, where that is all the
+    /// step waits for of the work before it (`CommandBufferShared::step_reads`): an execution's
+    /// records and range (`ExecutionRange::host_reads`), outside a block of command predication,
+    /// whose counter its step reads too; a render pass's executions'. `None` for every other
+    /// work, whose step waits for all the work submitted before it.
+    pub(super) fn host_reads(&self) -> Option<Vec<Use<ResourceKey>>> {
+        match self {
+            Deferred::Execute(execute) => execute.host_reads(),
+            Deferred::RenderPass(pass) => Some(pass.host_reads()),
+            Deferred::Dispatch(_)
+            | Deferred::SparseScrub(_)
+            | Deferred::GatedCopyIn(_)
+            | Deferred::RunMerge(_)
+            | Deferred::Pending(_)
+            | Deferred::Loop(_)
+            | Deferred::GatherStage(_)
+            | Deferred::ScatterStage(_)
+            | Deferred::ScatterDrain(_) => None,
+        }
+    }
+
+    /// Whether a rebind's encoding again of its encoder records it at once in its place, leaving
+    /// no segment of it (`command_buffer/reencode.rs`): a staged gather, which an encoder encoded
+    /// again copies through the imports (`host_ram/copy.rs`), but one over a chunk that takes no
+    /// import (`StagedGather::encoded_again_through_imports`), whose encoder keeps no log. The
+    /// encoding again's parts are the first's: such a gather's segment starts none.
+    pub(super) fn recorded_by_an_encoding_again(&self) -> bool {
+        match self {
+            Deferred::GatherStage(gather) => gather.encoded_again_through_imports(),
+            _ => false,
         }
     }
 
@@ -344,12 +589,17 @@ impl Deferred {
             Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
             | Deferred::GatedCopyIn(_)
+            | Deferred::RunMerge(_)
             | Deferred::Pending(_)
-            | Deferred::Loop(_) => Ok(None),
+            | Deferred::Loop(_)
+            | Deferred::GatherStage(_)
+            | Deferred::ScatterStage(_)
+            | Deferred::ScatterDrain(_) => Ok(None),
         }
     }
 
-    /// Its host step, on the scheduler's thread with no lock of `command_buffer` held: its
+    /// Its host step, on the steps' thread (`scheduler/steps.rs`) with no lock of `command_buffer`
+    /// held: its
     /// recording from what it reads now and `inputs`. An execution's records name their states
     /// among those `commit` settled, or for one `commit` recorded from the CPU's records, those
     /// `use_resource` settled since. An indirect dispatch's arguments state its size. A render
@@ -379,7 +629,8 @@ impl Deferred {
                     StepInputs::Dispatch
                     | StepInputs::None
                     | StepInputs::RenderPass
-                    | StepInputs::Loop => {
+                    | StepInputs::Loop
+                    | StepInputs::Staged => {
                         return Err(internal("an execution's host step without its states"));
                     }
                 };
@@ -390,9 +641,13 @@ impl Deferred {
             Deferred::Dispatch(dispatch) => dispatch.record(command_buffer),
             Deferred::SparseScrub(_) => Err(internal("a sparse scrub's host step")),
             Deferred::GatedCopyIn(_) => Err(internal("a gated copy in's host step")),
+            Deferred::RunMerge(_) => Err(internal("a run's merge's host step")),
             Deferred::RenderPass(pass) => pass.record(command_buffer, true),
             Deferred::Pending(dispatch) => dispatch.record(command_buffer),
             Deferred::Loop(check) => check.step(command_buffer),
+            Deferred::GatherStage(gather) => gather.stage(command_buffer),
+            Deferred::ScatterStage(scatter) => scatter.stage(command_buffer),
+            Deferred::ScatterDrain(scatter) => scatter.drain(command_buffer.device()),
         }
     }
 
@@ -408,8 +663,12 @@ impl Deferred {
             Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
             | Deferred::GatedCopyIn(_)
+            | Deferred::RunMerge(_)
             | Deferred::Pending(_)
-            | Deferred::Loop(_) => false,
+            | Deferred::Loop(_)
+            | Deferred::GatherStage(_)
+            | Deferred::ScatterStage(_)
+            | Deferred::ScatterDrain(_) => false,
         }
     }
 
@@ -424,8 +683,12 @@ impl Deferred {
             Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
             | Deferred::GatedCopyIn(_)
+            | Deferred::RunMerge(_)
             | Deferred::Pending(_)
-            | Deferred::Loop(_) => false,
+            | Deferred::Loop(_)
+            | Deferred::GatherStage(_)
+            | Deferred::ScatterStage(_)
+            | Deferred::ScatterDrain(_) => false,
         }
     }
 
@@ -434,12 +697,27 @@ impl Deferred {
     pub(super) fn holds(&self) -> bool {
         match self {
             Deferred::Loop(check) => check.running(),
+            Deferred::GatherStage(_) | Deferred::ScatterStage(_) | Deferred::ScatterDrain(_) => {
+                false
+            }
             Deferred::Execute(_)
             | Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
             | Deferred::GatedCopyIn(_)
+            | Deferred::RunMerge(_)
             | Deferred::RenderPass(_)
             | Deferred::Pending(_) => false,
+        }
+    }
+
+    /// Whether it is a render pass left for its draws' or tile dispatches' pipelines alone, made
+    /// since or not (`DeferredPass::left_for_pipelines`): an encoding again records those draws
+    /// where it finds their pipelines made, and leaves a segment of its own where they are still
+    /// being made, so it takes such a pass's place (`State::splice_replay`).
+    pub(super) fn left_for_pipelines(&self) -> bool {
+        match self {
+            Deferred::RenderPass(pass) => pass.left_for_pipelines(),
+            _ => false,
         }
     }
 
@@ -452,7 +730,11 @@ impl Deferred {
             | Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
             | Deferred::GatedCopyIn(_)
-            | Deferred::Loop(_) => false,
+            | Deferred::RunMerge(_)
+            | Deferred::Loop(_)
+            | Deferred::GatherStage(_)
+            | Deferred::ScatterStage(_)
+            | Deferred::ScatterDrain(_) => false,
         }
     }
 
@@ -461,13 +743,20 @@ impl Deferred {
     /// command buffer's execution and a render pass that executes render commands, whose
     /// commands its step resolves from records, an indirect dispatch and a scrub, which their
     /// steps or submissions record. A dispatch whose pipelines were being made records the uses
-    /// its encoding noted, a gated copy in writes the shadow it names, and a loop's check records
-    /// nothing.
+    /// its encoding noted, a gated copy in writes the shadow it names, a run's merge
+    /// the bytes its pass noted it writes, a loop's check records nothing, and a staged copy's
+    /// steps write the runtime's staging and the buffer or pages its call noted.
     pub(super) fn reaches_unnamed(&self) -> bool {
         match self {
             Deferred::Execute(_) | Deferred::Dispatch(_) | Deferred::SparseScrub(_) => true,
             Deferred::RenderPass(pass) => pass.executes(),
-            Deferred::GatedCopyIn(_) | Deferred::Pending(_) | Deferred::Loop(_) => false,
+            Deferred::GatedCopyIn(_)
+            | Deferred::RunMerge(_)
+            | Deferred::Pending(_)
+            | Deferred::Loop(_)
+            | Deferred::GatherStage(_)
+            | Deferred::ScatterStage(_)
+            | Deferred::ScatterDrain(_) => false,
         }
     }
 
@@ -479,11 +768,19 @@ impl Deferred {
     /// what its encoding resolved (`pending_dispatch.rs`), and so does a render pass `commit`
     /// left for the pipelines its draws and tile dispatches record (`pipelines`) that executes no
     /// render commands, whose instances' commands its calls recorded
-    /// (`render/pending_tile.rs`). Everything else its step resolves as it records: a rebind
-    /// meanwhile is refused.
+    /// (`render/pending_tile.rs`). So does a run's merge (`pass_runs.rs`), which writes only the
+    /// bytes its encoder's commands named (a linear attachment's, none over host pages; a
+    /// shadowed texture's truth, whose uses its pass noted): a rebind of them encodes that
+    /// encoder again, the merge with it. So do a staged copy's steps, between the buffer its call
+    /// resolved (`blit_at`) and the pages it named. Everything else its step resolves as it
+    /// records: a rebind meanwhile is refused.
     pub(super) fn resolved_at_its_calls(&self, pipelines: bool) -> bool {
         match self {
-            Deferred::Pending(_) => true,
+            Deferred::Pending(_)
+            | Deferred::RunMerge(_)
+            | Deferred::GatherStage(_)
+            | Deferred::ScatterStage(_)
+            | Deferred::ScatterDrain(_) => true,
             Deferred::RenderPass(pass) => pipelines && !pass.executes(),
             Deferred::Execute(_)
             | Deferred::Dispatch(_)
@@ -506,7 +803,11 @@ impl Deferred {
             | Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
             | Deferred::GatedCopyIn(_)
-            | Deferred::Loop(_) => false,
+            | Deferred::RunMerge(_)
+            | Deferred::Loop(_)
+            | Deferred::GatherStage(_)
+            | Deferred::ScatterStage(_)
+            | Deferred::ScatterDrain(_) => false,
         }
     }
 
@@ -514,16 +815,22 @@ impl Deferred {
     /// (`DeferredPass::known_summary`): a render pass's that executes no render commands. `None`
     /// for the rest, whose uses their recording finds: an execution's or an indirect dispatch's
     /// from the records and arguments it reads, a scrub's at its submission; a loop's check's are
-    /// its laying's (`CommandBufferShared::footprint`).
+    /// its laying's (`CommandBufferShared::footprint`). A staged copy's GPU copy uses none past
+    /// what its call noted in its encoder's part.
     pub(super) fn known_summary(&self, device: &Device) -> Option<Summary<ResourceKey>> {
         match self {
             Deferred::RenderPass(pass) => pass.known_summary(device),
             Deferred::Pending(dispatch) => Some(dispatch.known_summary()),
+            Deferred::GatherStage(_) | Deferred::ScatterStage(_) => {
+                Some(EncoderUses::new(true).finish())
+            }
             Deferred::Execute(_)
             | Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
             | Deferred::GatedCopyIn(_)
-            | Deferred::Loop(_) => None,
+            | Deferred::RunMerge(_)
+            | Deferred::Loop(_)
+            | Deferred::ScatterDrain(_) => None,
         }
     }
 
@@ -536,7 +843,11 @@ impl Deferred {
             | Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
             | Deferred::GatedCopyIn(_)
-            | Deferred::Loop(_) => {}
+            | Deferred::RunMerge(_)
+            | Deferred::Loop(_)
+            | Deferred::GatherStage(_)
+            | Deferred::ScatterStage(_)
+            | Deferred::ScatterDrain(_) => {}
         }
     }
 
@@ -550,7 +861,11 @@ impl Deferred {
             | Deferred::Dispatch(_)
             | Deferred::SparseScrub(_)
             | Deferred::GatedCopyIn(_)
-            | Deferred::Loop(_) => {}
+            | Deferred::RunMerge(_)
+            | Deferred::Loop(_)
+            | Deferred::GatherStage(_)
+            | Deferred::ScatterStage(_)
+            | Deferred::ScatterDrain(_) => {}
         }
     }
 
@@ -561,8 +876,12 @@ impl Deferred {
             Deferred::Dispatch(dispatch) => dispatch.degrade(device),
             Deferred::SparseScrub(_)
             | Deferred::GatedCopyIn(_)
+            | Deferred::RunMerge(_)
             | Deferred::Pending(_)
-            | Deferred::Loop(_) => {}
+            | Deferred::Loop(_)
+            | Deferred::GatherStage(_)
+            | Deferred::ScatterStage(_)
+            | Deferred::ScatterDrain(_) => {}
             Deferred::RenderPass(pass) => pass.degrade(device),
         }
     }

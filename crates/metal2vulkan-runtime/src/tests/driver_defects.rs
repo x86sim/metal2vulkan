@@ -4,7 +4,6 @@ use super::super::driver_defects::{among, of, Affected, AFFECTED};
 use metal2vulkan::device::DeviceDescription;
 use metal2vulkan::error::RuntimeDriverDefect;
 use metal2vulkan::vk::DriverId;
-use std::path::PathBuf;
 
 const COPIES: RuntimeDriverDefect = RuntimeDriverDefect::MultisampledDepthStencilColourCopies;
 const STENCIL_COPIES: RuntimeDriverDefect = RuntimeDriverDefect::MultisampledStencilColourCopies;
@@ -18,12 +17,16 @@ const NAN_COPIES: RuntimeDriverDefect = RuntimeDriverDefect::MultisampledCopiesC
 const LATE_READS: RuntimeDriverDefect = RuntimeDriverDefect::ReadsCommandBuffersAfterTheirSignal;
 const PREPROCESS: RuntimeDriverDefect = RuntimeDriverDefect::ImplicitPreprocessAfterExecutionSet;
 const PAST_HEIGHT: RuntimeDriverDefect = RuntimeDriverDefect::ExplicitPlaneRowsPastHeight;
+const PITCH_MISREAD: RuntimeDriverDefect = RuntimeDriverDefect::ExplicitPlanePitchMisread;
 const COUNTS: RuntimeDriverDefect = RuntimeDriverDefect::OcclusionCountPerColorOutput;
 const FREES: RuntimeDriverDefect = RuntimeDriverDefect::FreedAddressMemoryFailsPendingWork;
 const DESTROYS: RuntimeDriverDefect = RuntimeDriverDefect::DestroyedAddressBufferFailsSubmission;
 const PUSHES: RuntimeDriverDefect = RuntimeDriverDefect::PushedBufferSizesUnset;
 const STALE_PUSHES: RuntimeDriverDefect =
     RuntimeDriverDefect::PushedDescriptorsStaleAfterPipelineBinds;
+const BOUND_INTERLOCKS: RuntimeDriverDefect = RuntimeDriverDefect::InterlockedBoundBuffersUnordered;
+const FAST_LINKED_INTERLOCKS: RuntimeDriverDefect =
+    RuntimeDriverDefect::FastLinkedInterlocksUnordered;
 const BAKED_SAMPLERS: RuntimeDriverDefect = RuntimeDriverDefect::ImmutableSamplersLostAfterCopies;
 const SET_SUPPORT: RuntimeDriverDefect = RuntimeDriverDefect::SetLayoutSupportUnderstated;
 const PART_VIEWS: RuntimeDriverDefect = RuntimeDriverDefect::LazilyAllocatedSubresourceViews;
@@ -32,34 +35,48 @@ const LOST_SIGNALS: RuntimeDriverDefect = RuntimeDriverDefect::WaitForAnyObjectL
 const CHROMA: RuntimeDriverDefect = RuntimeDriverDefect::TwoPlaneChromaMisplaced;
 const TEN_BIT_WORDS: RuntimeDriverDefect = RuntimeDriverDefect::TenBitCodesReadAsWords;
 const UNPINNABLE: RuntimeDriverDefect = RuntimeDriverDefect::UnpinnablePagesBreakHostMemory;
+const VOLUME_BLITS: RuntimeDriverDefect = RuntimeDriverDefect::VolumeBlitsUnfiltered;
+const ALIASED_BLITS: RuntimeDriverDefect = RuntimeDriverDefect::AliasedImportBlitsUnordered;
+const VOLUME_RESOLVES: RuntimeDriverDefect = RuntimeDriverDefect::VolumeResolveFirstPlane;
+const TRIMS: RuntimeDriverDefect = RuntimeDriverDefect::TrimmedCommandBufferFailsResubmission;
+const WRAPS: RuntimeDriverDefect = RuntimeDriverDefect::VertexFetchWrapsPast4GiB;
 
 /// Every committed profile's driver has its defects at every release and GPU but those a probe
 /// found clean: MoltenVK the multisampled depth/stencil colour copies, the inexact depths past
 /// `[0, 1]`, the crashing 2D views of a 3D image in lazily allocated memory, the pipeline cache
 /// compiled at load, the copies of compressed images that rewrite texels, the reads of command
 /// buffers after their signal, the frees that fail pending work, the destroys that fail a
-/// submission encoding meanwhile, the pushed sets' unset buffer sizes, the set layouts its support
+/// submission encoding meanwhile, the pushed sets' unset buffer sizes, the interlocked storage
+/// buffers of a bound set it does not order, the set layouts its support
 /// query refuses though it runs them, the textureless views of some of a lazily allocated image's
 /// levels or layers, the block-compressed image it copies out of host memory at bind time with a
-/// one-block row pitch, the signal its wait for any of several objects loses and the misplaced
-/// chroma of its two-plane Y′CbCr conversions; lavapipe the
+/// one-block row pitch, the signal its wait for any of several objects loses, the misplaced
+/// chroma of its two-plane Y′CbCr conversions, the 3D image's blits it does not filter as
+/// Vulkan states and the blits through two imports of the same host pages a barrier does not
+/// order; lavapipe the
 /// colour copies, the depth/stencil resolve of the first layer and level, the explicit plane's
-/// rows past its height, the baked samplers lost after a copy and the 10-bit codes its Y′CbCr
-/// conversion reads as words;
-/// RADV the multisampled copies that convert float NaNs, the 10-bit codes its Y′CbCr conversion
-/// reads as words, and the implicit
+/// rows past its height, the baked samplers lost after a copy, the 10-bit codes its Y′CbCr
+/// conversion reads as words and the fixed-function vertex fetch that wraps past 4 GiB;
+/// RADV the multisampled copies that convert float NaNs, the interlock its fast-linked pipelines
+/// do not order, the 10-bit codes its Y′CbCr conversion
+/// reads as words, the color resolve into a 3D image's first plane whatever plane its view begins
+/// at, and the implicit
 /// preprocessing after an execution set on every GPU but the 780M (Phoenix's and Hawk Point's),
 /// measured clean; ANV
-/// the compressed image's short size, the occlusion count per color output and the pushed
-/// descriptors a pipeline bind leaves stale on every GPU (Arrow Lake's, not measured, too);
+/// the compressed image's short size, the occlusion count per color output, the pushed
+/// descriptors a pipeline bind leaves stale, the blits through two imports of the same host
+/// pages a barrier does not order and the submission again of a command buffer that a trimmed one
+/// came after on every GPU (Arrow Lake's, not measured, too);
 /// NVIDIA's the
 /// stencil colour copies on every GPU but the RTX 5080 Laptop GPU, measured clean (the GTX 1060 and
-/// the RTX 5080 desktop GPU, not measured, take them), the 10-bit codes its Y′CbCr conversion reads
-/// with their unused bits and the host memory a failed import of unpinnable pages breaks on every
-/// GPU; SwiftShader none.
+/// the RTX 5080 desktop GPU, not measured, take them), the explicit plane's pitch its shaders
+/// misread, the 10-bit codes its Y′CbCr conversion reads
+/// with their unused bits, the host memory a failed import of unpinnable pages breaks and the color
+/// resolve into a 3D image it writes where the view begins only at the first plane on every GPU;
+/// SwiftShader none.
 #[test]
 fn the_committed_profiles_drivers_have_their_defects() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../metal2vulkan-validation/profiles");
+    let dir = metal2vulkan_devtools::validation_dir().join("profiles");
     let mut drivers = 0;
     for path in std::fs::read_dir(&dir).expect("validation/profiles is readable") {
         let path = path.expect("directory entry").path();
@@ -80,26 +97,59 @@ fn the_committed_profiles_drivers_have_their_defects() {
                     FREES,
                     DESTROYS,
                     PUSHES,
+                    BOUND_INTERLOCKS,
                     SET_SUPPORT,
                     PART_VIEWS,
                     BIND_COPIES,
                     LOST_SIGNALS,
                     CHROMA,
+                    VOLUME_BLITS,
+                    ALIASED_BLITS,
                 ]
             }
             Some(DriverId::MESA_LLVMPIPE) => {
-                vec![COPIES, RESOLVES, PAST_HEIGHT, BAKED_SAMPLERS, TEN_BIT_WORDS]
+                vec![
+                    COPIES,
+                    RESOLVES,
+                    PAST_HEIGHT,
+                    BAKED_SAMPLERS,
+                    TEN_BIT_WORDS,
+                    WRAPS,
+                ]
             }
             // The 780M, under Phoenix's `deviceID` and Hawk Point's.
             Some(DriverId::MESA_RADV) if matches!(desc.device_id, 0x15bf | 0x1900) => {
-                vec![NAN_COPIES, TEN_BIT_WORDS]
+                vec![
+                    NAN_COPIES,
+                    FAST_LINKED_INTERLOCKS,
+                    TEN_BIT_WORDS,
+                    VOLUME_RESOLVES,
+                ]
             }
-            Some(DriverId::MESA_RADV) => vec![NAN_COPIES, PREPROCESS, TEN_BIT_WORDS],
-            Some(DriverId::INTEL_OPEN_SOURCE_MESA) => vec![COMPRESSION, COUNTS, STALE_PUSHES],
+            Some(DriverId::MESA_RADV) => {
+                vec![
+                    NAN_COPIES,
+                    PREPROCESS,
+                    FAST_LINKED_INTERLOCKS,
+                    TEN_BIT_WORDS,
+                    VOLUME_RESOLVES,
+                ]
+            }
+            Some(DriverId::INTEL_OPEN_SOURCE_MESA) => {
+                vec![COMPRESSION, COUNTS, STALE_PUSHES, ALIASED_BLITS, TRIMS]
+            }
             Some(DriverId::NVIDIA_PROPRIETARY) if desc.device_id == 0x2c19 => {
-                vec![TEN_BIT_WORDS, UNPINNABLE]
+                vec![PITCH_MISREAD, TEN_BIT_WORDS, UNPINNABLE, VOLUME_RESOLVES]
             }
-            Some(DriverId::NVIDIA_PROPRIETARY) => vec![STENCIL_COPIES, TEN_BIT_WORDS, UNPINNABLE],
+            Some(DriverId::NVIDIA_PROPRIETARY) => {
+                vec![
+                    STENCIL_COPIES,
+                    PITCH_MISREAD,
+                    TEN_BIT_WORDS,
+                    UNPINNABLE,
+                    VOLUME_RESOLVES,
+                ]
+            }
             _ => Vec::new(),
         };
         let defects: Vec<_> = of(&desc).into_iter().collect();
@@ -130,9 +180,11 @@ fn a_clean_gpu_alone_lacks_the_defect() {
 
 /// NVIDIA's stencil colour-copy defect, measured on the RTX 3090 (`deviceID` 0x2204), is every
 /// NVIDIA GPU's but the RTX 5080 Laptop GPU's (0x2c19), measured clean: the RTX 3070 (0x2484) and
-/// an Ada GPU (0x2684) take it; a device that runs another driver has none. The unpinnable pages'
-/// defect and the 10-bit codes read with their unused bits, measured on the 5080, are every NVIDIA
-/// GPU's; no other driver has the unpinnable pages'.
+/// an Ada GPU (0x2684) take it; a device that runs another driver has none. The explicit plane's
+/// misread pitch, the unpinnable pages' defect, the 10-bit codes read with their unused bits and
+/// the volume resolve written where the view begins only at the first plane, measured on the 5080
+/// (the misread pitch on the 3090 too), are every NVIDIA GPU's; no other driver has the unpinnable
+/// pages'.
 #[test]
 fn nvidia_s_colour_copies_are_clean_on_the_gpu_measured_alone() {
     let nvidia = Some(DriverId::NVIDIA_PROPRIETARY);
@@ -140,13 +192,19 @@ fn nvidia_s_colour_copies_are_clean_on_the_gpu_measured_alone() {
     for device in [0x2204, 0x2484, 0x2684] {
         assert_eq!(
             of(device).into_iter().collect::<Vec<_>>(),
-            vec![STENCIL_COPIES, TEN_BIT_WORDS, UNPINNABLE],
+            vec![
+                STENCIL_COPIES,
+                PITCH_MISREAD,
+                TEN_BIT_WORDS,
+                UNPINNABLE,
+                VOLUME_RESOLVES
+            ],
             "{device:#x}"
         );
     }
     assert_eq!(
         of(0x2c19).into_iter().collect::<Vec<_>>(),
-        vec![TEN_BIT_WORDS, UNPINNABLE]
+        vec![PITCH_MISREAD, TEN_BIT_WORDS, UNPINNABLE, VOLUME_RESOLVES]
     );
     let radv = among(AFFECTED, Some(DriverId::MESA_RADV), 0x2204);
     assert!(!radv.contains(&COPIES) && !radv.contains(&STENCIL_COPIES));
@@ -173,6 +231,26 @@ fn radv_s_preprocessing_is_clean_on_the_gpu_measured_alone() {
     assert!(!nvidia.contains(&PREPROCESS));
 }
 
+/// RADV's fast-linked interlock, measured broken on the RX 7900 XTX (0x744c), is every RADV GPU's,
+/// the unmeasured ones too (the 780M, 0x15bf; a Navi 21, 0x73bf); a device that runs another
+/// driver has none.
+#[test]
+fn radv_s_fast_linked_interlock_is_every_gpu_s() {
+    for device in [0x744c, 0x15bf, 0x73bf] {
+        assert!(
+            among(AFFECTED, Some(DriverId::MESA_RADV), device).contains(&FAST_LINKED_INTERLOCKS)
+        );
+    }
+    for driver in [
+        DriverId::MESA_LLVMPIPE,
+        DriverId::INTEL_OPEN_SOURCE_MESA,
+        DriverId::NVIDIA_PROPRIETARY,
+        DriverId::MOLTENVK,
+    ] {
+        assert!(!among(AFFECTED, Some(driver), 0x744c).contains(&FAST_LINKED_INTERLOCKS));
+    }
+}
+
 /// lavapipe's baked samplers lost after a copy, measured broken at 26.0.8, are lavapipe's at every
 /// release. A device that runs another driver has none.
 #[test]
@@ -184,8 +262,8 @@ fn lavapipe_s_baked_samplers_are_every_release_s() {
 }
 
 /// Hawk Point's Radeon 780M (`deviceID` 0x1900) is Phoenix's GPU (0x15bf): it takes Phoenix's
-/// driver facts and defects, the implicit preprocessing measured clean among them, at every
-/// release. A neighbouring `deviceID` (0x1901) is another GPU, which works the preprocessing
+/// driver facts and defects, the implicit preprocessing measured clean among them and the
+/// fast-linked interlock every RADV GPU's, at every release. A neighbouring `deviceID` (0x1901) is another GPU, which works the preprocessing
 /// around.
 #[test]
 fn hawk_points_780m_is_phoenixs_gpu() {
@@ -202,12 +280,22 @@ fn hawk_points_780m_is_phoenixs_gpu() {
     assert_eq!(properties.driver_defects, measured.driver_defects);
     assert_eq!(
         of(&hawk_point).into_iter().collect::<Vec<_>>(),
-        [NAN_COPIES, TEN_BIT_WORDS]
+        [
+            NAN_COPIES,
+            FAST_LINKED_INTERLOCKS,
+            TEN_BIT_WORDS,
+            VOLUME_RESOLVES
+        ]
     );
     hawk_point.driver_version += 1;
     assert_eq!(
         of(&hawk_point).into_iter().collect::<Vec<_>>(),
-        [NAN_COPIES, TEN_BIT_WORDS]
+        [
+            NAN_COPIES,
+            FAST_LINKED_INTERLOCKS,
+            TEN_BIT_WORDS,
+            VOLUME_RESOLVES
+        ]
     );
     let mut neighbour = phoenix;
     neighbour.device_id = 0x1901;
@@ -251,7 +339,7 @@ fn the_scheduler_waits_on_the_gpu_where_no_signal_is_lost() {
 /// Each clean GPU is a committed profile's GPU of the driver.
 #[test]
 fn every_clean_gpu_is_a_committed_profiles() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../metal2vulkan-validation/profiles");
+    let dir = metal2vulkan_devtools::validation_dir().join("profiles");
     let mut committed = Vec::new();
     for path in std::fs::read_dir(&dir).expect("validation/profiles is readable") {
         let path = path.expect("directory entry").path();
@@ -320,7 +408,7 @@ fn a_set_past_the_drivers_support_is_among_its_variants_kinds() {
     use metal2vulkan::pipeline::{ComputePipelineDescriptor, FunctionDescriptor, StageSource};
     use metal2vulkan::Budget;
 
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../metal2vulkan-validation");
+    let root = metal2vulkan_devtools::validation_dir();
     let ll = root.join("fixtures/public/engine/hsw_storage_writes.ll");
     let bitcode = metal2vulkan_devtools::llvm_assemble(&ll).expect("llvm-as");
     let text = std::fs::read_to_string(root.join("profiles/moltenvk-m3.json")).expect("profile");
@@ -346,7 +434,11 @@ fn a_set_past_the_drivers_support_is_among_its_variants_kinds() {
     );
     let stages = [pipeline.stage.clone()];
     for understated in [true, false] {
-        let kinds = Kinds::of(&stages, CompiledPipeline::Kernel(&pipeline), understated);
+        let kinds = Kinds::of(
+            &stages,
+            CompiledPipeline::Kernel(&pipeline),
+            (understated, false),
+        );
         assert_eq!(
             kinds.holds(Degradation::SetPastLayoutSupport),
             understated,

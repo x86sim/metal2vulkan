@@ -13,8 +13,15 @@
 //! is zero, as a heap read's. A comparison samples a heap depth texture of the depth-comparison
 //! class through a comparison heap sampler. A runtime `[[sampler(n)]]` beside a heap image is a
 //! heap sampler binding without an immutable sampler, which the binder writes with the sampler
-//! bound at slot `n` made for the use, as a combined binding's runtime sampler. Several sampler
-//! candidates beside a heap image are not implemented (`ArgumentBufferTextures`).
+//! bound at slot `n` made for the use, as a combined binding's runtime sampler. A sampler of
+//! several constexpr candidates beside a heap image (a table of constexpr samplers read at an index
+//! the run knows), their handles consecutive, each candidate's sampling the same but for its
+//! sampler, is one sampling through a set-0 array of their samplers (`ResourceKind::SamplerArray`,
+//! one immutable sampler per candidate, its element `NonUniform` and at the handle's distance from
+//! the first candidate's; a handle outside it reads zero), where the device indexes a sampler array
+//! by a value that may differ between invocations (`shaderSampledImageArrayNonUniformIndexing`).
+//! Any other sampler of several static candidates beside a heap image is a switch-at-use over
+//! them, one arm per candidate, each the heap element through that candidate's heap sampler.
 //!
 //! **Argument buffers' samplers** (the sampler half). A heap image sampled through a sampler loaded
 //! from an argument buffer reads `OpSampledImage` of its heap element and of the heap sampler's
@@ -81,20 +88,35 @@
 //! ([`Lod::Base`]), and `calculate_*_lod` is undefined in Metal (`NotRepresentable`). Gradients,
 //! explicit levels, and gathers (which read the base level) are not tangled.
 //!
-//! **Pixel coordinates**. Vulkan unnormalized samplers, which take no gather, offset, comparison,
-//! array, 3D image or level of detail, are never used: the plane coordinate (and any gradient) is
-//! divided by the level-0 size in the shader, always for a constexpr pixel sampler, and selected by
-//! the word of the slot's `SamplerState` specialization for a runtime sampler, so the one sampling
-//! instruction reads either coordinate. The device's sampler reads its texels from that scaled
-//! coordinate in its own arithmetic, which near a texel edge or a filter step's edge may read
-//! another texel or weight than Metal's at the coordinate as given
-//! (`PrecisionNote::PixelSamplerScaling`, `PrecisionNote::ArgumentPixelSamplerScaling`). A
-//! constexpr pixel sampler with nearest filtering and clamp-to-edge addressing instead fetches its
-//! texel, `OpImageFetch(clamp(floor(coord) + offset))` ([`SampleOp::PixelFetch`]), which also
-//! takes a dynamic offset on any profile. An argument buffer's sampler is known only at run time:
-//! a sample through one without comparison emits both the scaled sample and that fetch, and
-//! selects the fetch where its table entry's word states the state
-//! (`metal::sampler::SamplerWord::exact_fetch`); gathers and comparisons stay scaled.
+//! **Pixel coordinates**. Metal reads a pixel sampler's coordinate `x` as it is given: its nearest
+//! texel is `floor(x)`, and its linear filter's footprint and weights, and its gather's block, are
+//! its sampler's own reading of `x`. What the device is handed of `x` is the access's
+//! [`PixelPosition`]:
+//!
+//! - A sample or gather without comparison through a constexpr pixel sampler, of a 1D or 2D
+//!   texture that is no array and whose residency the function does not observe, hands `x` itself,
+//!   moved by its texel offset, to the device's unnormalized sampler at level 0
+//!   ([`PixelPosition::Unnormalized`]): the device's own sampler reads its texel, footprint and
+//!   weights from `x`, as Metal's does.
+//! - Elsewhere the device's normalized sampler reads the coordinate over the level-0 size, always
+//!   for a constexpr pixel sampler, and selected by the word of the slot's `SamplerState`
+//!   specialization for a runtime sampler or of its table entry for an argument buffer's. A nearest
+//!   sample is handed the centre of its texel, `(floor(x) + 0.5) / N`, half a texel from every
+//!   edge, where the device reads exactly that texel, adds its offset and applies its own address
+//!   mode and border ([`PixelPosition::Texel`]); through a runtime sampler where the slot's
+//!   `NearestPixelSampler` specialization states a nearest pixel sampler
+//!   ([`PixelPosition::TexelBySpec`]), through an argument buffer's where its table entry's word
+//!   does (`SamplerWord::nearest_pixel`, [`PixelPosition::TexelByWord`]). The `floor` reads a
+//!   subnormal `x` as the device does (`PrecisionNote::DeviceDenormals`).
+//! - Every other access is handed `x / N`, from which the device reads its texels and weights in
+//!   its own arithmetic ([`PixelPosition::Scaled`], `PrecisionNote::PixelSamplerScaling`,
+//!   `PrecisionNote::ArgumentPixelSamplerScaling`): a linear filter's sample or a gather through a
+//!   runtime or argument buffer's sampler, or of an array or a texture whose residency the function
+//!   observes; a comparison's linear filter; and a level query.
+//!
+//! A constexpr pixel sampler with nearest filtering and clamp-to-edge addressing instead fetches
+//! its texel, `OpImageFetch(clamp(floor(coord) + offset))` ([`SampleOp::PixelFetch`]), which also
+//! takes a dynamic offset on any profile.
 //!
 //! **Texel offsets**. Metal reads each component of an offset as the two's-complement value of its
 //! low four bits ([`metal_offset`]), which is the identity on its documented range
@@ -148,6 +170,7 @@ mod select;
 mod shared;
 
 pub use constexpr::{address_modes, constexpr_desc, state_of, state_words};
+pub(crate) use emit::sampler_word;
 pub use emit::{hoisted_gradients, sampling_value};
 pub use select::{select_heap_sampling, select_sampling};
 pub(crate) use shared::{shared_value, Candidates};
@@ -214,12 +237,15 @@ impl FamilyStrategy for SamplerStrategy {
 }
 
 /// One combined image-sampler binding of the function, before its texture's numeric type is
-/// final: the texture slot index, the sampler, and whether it samples with comparison.
+/// final: the texture slot index, the sampler, whether it samples with comparison, and whether it
+/// reads a pixel sampler's texel coordinates through the device's unnormalized sampler
+/// ([`PixelPosition::unnormalized`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BindingKey {
     pub texture: u32,
     pub sampler: SamplerRef,
     pub compare: bool,
+    pub unnormalized: bool,
 }
 
 /// One separate heap sampler use: heap group `group` sampled through `sampler`, with comparison or
@@ -240,6 +266,51 @@ pub struct HeapSamplerKey {
     pub compare: bool,
 }
 
+/// One use of a constexpr sampler array: heap group `group` sampled, with comparison or without,
+/// through the element of array `array` ([`SamplerPlan::arrays`]) a sampler handle chooses. Its
+/// binding is final once the group's numeric type is ([`finish`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HeapArrayKey {
+    pub group: u32,
+    pub compare: bool,
+    pub array: u32,
+}
+
+/// The constexpr samplers a sampler handle chooses among in one heap sampling: element `i` is the
+/// candidate of handle `first + i` (`memory::handles::CONSTEXPR_SAMPLER_BASE` plus the entry's
+/// ordinal), every handle of `first..first + samplers.len()` one candidate's.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConstexprArray {
+    pub first: u32,
+    /// Each element's canonical state words (`SamplerRef::Constexpr`).
+    pub samplers: Vec<[u64; 2]>,
+    /// Each element's sampler word (`metal::sampler::SamplerWord`), which a sampling reads where
+    /// the element's state decides what it does (`heap_raw::State::Table`,
+    /// `texture::OneTexel::Table`).
+    pub words: Vec<u32>,
+}
+
+/// The SPIR-V words of one element of a constexpr sampler array's word selection
+/// (`emit::array_word`): its comparison, its select, and their constants.
+const TABLE_ELEMENT_WORDS: u32 = 5 + 6 + 2 * 4;
+
+/// The SPIR-V words of a constexpr sampler array's word (`emit::array_word`) over `elements`
+/// elements: the element index, read again, and the word's selection.
+pub(crate) fn table_words(elements: u32) -> u32 {
+    ELEMENT_WORDS.saturating_add(TABLE_ELEMENT_WORDS.saturating_mul(elements))
+}
+
+/// The SPIR-V words of one reading of a constexpr sampler array's element index
+/// (`emit::array_element`): the handle less the first candidate's, its range test, and the select
+/// of a valid index.
+pub(crate) const ELEMENT_WORDS: u32 = 5 + 5 + 6;
+
+/// The SPIR-V words a sampling through a constexpr sampler array adds to a heap element's: the
+/// element index read for the sampler and again for the result, their constants (the first
+/// handle, the length, zero), the access chain and the sampler's load, and the select of the
+/// result or zero (a handle outside the array is the switch's null arm) with its constant.
+pub(crate) const ARRAY_WORDS: u32 = 2 * ELEMENT_WORDS + 3 * 4 + 5 + 4 + 6 + 4;
+
 /// An upper estimate of the SPIR-V words of an argument-buffer sampler's cubic test past its
 /// entry's word: the mask, the test, the selection construct, and the status mark (the push field's
 /// load, the address, the pointer, the bit, and the atomic `OR`).
@@ -259,6 +330,15 @@ pub enum Source {
         handle: ValueId,
         sampler: ValueId,
         key: HeapSamplerKey,
+    },
+    /// Element `handle` of the heap array of `key.group`, through element `sampler - first` (a
+    /// constexpr sampler handle's value, [`ConstexprArray::first`]) of the constexpr sampler array
+    /// of `key`, whose elements are the candidates' samplers. A handle outside the array reads
+    /// zero, as a switch over the candidates' null arm does.
+    HeapArray {
+        handle: ValueId,
+        sampler: ValueId,
+        key: HeapArrayKey,
     },
 }
 
@@ -525,16 +605,60 @@ pub enum SampleOp {
 pub enum Pixel {
     /// Normalized.
     None,
-    /// A constexpr pixel-coordinate sampler: always scaled.
+    /// A constexpr pixel-coordinate sampler: always in pixels.
     Always,
-    /// A runtime sampler in slot `n`: scaled when its `SamplerState` specialization's word states
-    /// pixel coordinates.
+    /// A runtime sampler in slot `n`: in pixels where its `SamplerState` specialization's word
+    /// states pixel coordinates.
     Spec(u32),
     /// An argument buffer's sampler of heap handle `handle`, the index of its sampler table
-    /// entry: scaled when the entry's word states pixel coordinates; a sample without comparison is
-    /// fetched exactly instead where the word states what
-    /// `metal::sampler::SamplerWord::exact_fetch` tests for its image.
+    /// entry: in pixels where the entry's word states pixel coordinates.
     Heap(ValueId),
+}
+
+/// What the device's sampler is handed of a pixel coordinate `x` (where [`Sampling::pixel`] says it
+/// is one), over the texture's level-0 size `N` to a normalized sampler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PixelPosition {
+    /// `x / N`: the device reads its texels and weights from the quotient in its own arithmetic
+    /// (`PrecisionNote::PixelSamplerScaling`, `PrecisionNote::ArgumentPixelSamplerScaling`). A
+    /// linear filter's sample and a gather the device's unnormalized sampler does not take, and a
+    /// level query.
+    Scaled,
+    /// `(floor(x) + 0.5) / N`, the centre of the texel Metal's nearest filter reads at `x`: a
+    /// sample through a sampler that filters nearest (or of an integer texture, which every filter
+    /// reads nearest), whose device reads exactly that texel, plus any offset, under its own
+    /// address mode and border.
+    Texel,
+    /// A runtime sampler slot's sample: [`Texel`](Self::Texel) where the slot's
+    /// `NearestPixelSampler` specialization states a nearest pixel sampler of one isotropic level,
+    /// [`Scaled`](Self::Scaled) where its `SamplerState` word states another pixel sampler.
+    TexelBySpec,
+    /// An argument buffer's sampler's sample: [`Texel`](Self::Texel) where the table entry's word
+    /// states a nearest pixel sampler of one isotropic level (`SamplerWord::nearest_pixel`),
+    /// [`Scaled`](Self::Scaled) where it states another pixel sampler.
+    TexelByWord,
+    /// `x` itself, moved by any texel offset (`x + k` in the device's `float` add, exact wherever
+    /// it is a float), to the device's unnormalized sampler (`VkSamplerCreateInfo::
+    /// unnormalizedCoordinates`) at level 0 of a view of the texture's first level: the device's
+    /// own sampler reads its texel, footprint and weights from `x`. A sample or gather without
+    /// comparison through a constexpr pixel sampler that sampler reads as it is
+    /// (`metal::sampler::unnormalized_reads`), of a 1D or 2D texture that is no array, whose
+    /// residency the function does not observe ([`BindingKey::unnormalized`]), but a nearest
+    /// sample with an offset ([`UnnormalizedTexel`](Self::UnnormalizedTexel)).
+    Unnormalized,
+    /// `floor(x) + 0.5 + k`, the centre of the texel Metal's nearest filter reads at `x` moved by
+    /// the sample's offset `k` (Metal adds it to the texel, where `x + k` in `float` may round
+    /// across the texel's edge), to the device's unnormalized sampler as at
+    /// [`Unnormalized`](Self::Unnormalized): a nearest sample with an offset (or any filter's of an
+    /// integer texture) that would otherwise take `x` itself.
+    UnnormalizedTexel,
+}
+
+impl PixelPosition {
+    /// Whether the device's unnormalized sampler takes the coordinate.
+    pub fn unnormalized(self) -> bool {
+        matches!(self, Self::Unnormalized | Self::UnnormalizedTexel)
+    }
 }
 
 /// A sampling operation on a combined image sampler, or on a heap element through a heap sampler.
@@ -554,6 +678,8 @@ pub struct Sampling {
     /// The lowered type of the result (`{T, i8}` or the LOD query's `float`).
     pub result: DemoteTy,
     pub pixel: Pixel,
+    /// What the device is handed of the coordinate where it is in pixels.
+    pub position: PixelPosition,
     /// The function observes bit 0 of the result's status word: on a slot with a sparse arm a
     /// sample, gather, or fetch takes its sparse form under the slot's `SparseTexture`
     /// specialization; otherwise (and for a bicubic sample, which has none) the word is 0.
@@ -743,6 +869,16 @@ impl Sampling {
                 SampleOp::QueryLevel { .. } => "sampler.argument_sampler.query_level",
             };
         }
+        if let Source::HeapArray { .. } = self.source {
+            return match &self.op {
+                SampleOp::Sample { .. } => "sampler.sampler_array.sample",
+                SampleOp::PixelFetch { .. } => "sampler.sampler_array.pixel_fetch",
+                SampleOp::Bicubic(_) => "sampler.sampler_array.bicubic",
+                SampleOp::Gather { .. } => "sampler.sampler_array.gather",
+                SampleOp::Lod { .. } => "sampler.sampler_array.query_lod",
+                SampleOp::QueryLevel { .. } => "sampler.sampler_array.query_level",
+            };
+        }
         if let Source::Heap { .. } = self.source {
             return match &self.op {
                 SampleOp::Sample { .. } => "sampler.heap.sample",
@@ -752,6 +888,22 @@ impl Sampling {
                 SampleOp::Lod { .. } => "sampler.heap.query_lod",
                 SampleOp::QueryLevel { .. } => "sampler.heap.query_level",
             };
+        }
+        // A constexpr pixel sampler's sample and gather of `x` itself through the device's
+        // unnormalized sampler, and its nearest sample at its texel's centre.
+        match (&self.op, self.pixel, self.position) {
+            (
+                SampleOp::Sample { .. },
+                Pixel::Always,
+                PixelPosition::Unnormalized | PixelPosition::UnnormalizedTexel,
+            ) => return "sampler.pixel_unnormalized",
+            (SampleOp::Gather { .. }, Pixel::Always, PixelPosition::Unnormalized) => {
+                return "sampler.pixel_unnormalized_gather"
+            }
+            (SampleOp::Sample { .. }, Pixel::Always, PixelPosition::Texel) => {
+                return "sampler.pixel_texel"
+            }
+            _ => {}
         }
         match &self.op {
             SampleOp::Sample {
@@ -809,8 +961,8 @@ impl Sampling {
     /// sampled image, and null select, the sparse arm, a bias past the limit's derivatives,
     /// `bias_gradients`, and (for a dynamic bias) the test, the selection, and the second sample, a
     /// `half` texel's call of its conversion routine or its exact rounding outside the bicubic
-    /// filter, an sRGB texel's raw decode, a cube gradient's footprint, an argument buffer's pixel
-    /// sampler's flagged fetch, the positions of an observed footprint, the lanes Metal reads as
+    /// filter, an sRGB texel's raw decode, a cube gradient's footprint, a pixel coordinate's texel
+    /// or block centre, the positions of an observed footprint, the lanes Metal reads as
     /// constants, a cube direction's broken ties, and a raw heap sample's decode.
     pub fn words(&self) -> u32 {
         // A swizzled slot's sampling: its swizzle, and a gather's of each component.
@@ -873,6 +1025,14 @@ impl Sampling {
         let heap = match self.source {
             Source::Combined(_) => 0,
             Source::Heap { .. } => 32,
+            // A one-texel test the element's word decides reads that word.
+            Source::HeapArray { .. } => {
+                let table = match self.one_texel {
+                    crate::lower::texture::OneTexel::Table(n) => table_words(n),
+                    _ => 0,
+                };
+                32 + ARRAY_WORDS + table
+            }
             Source::HeapSampler { .. } => 56 + 2 * ENTRY_FIELD_WORDS + CUBIC_REACH_WORDS,
         };
         let residency = if self.residency {
@@ -888,7 +1048,9 @@ impl Sampling {
             // A heap color texture's call reads the class its handle carries first.
             (_, Some(f)) if f.conv == crate::lower::texture::TexelConv::F16 => {
                 let class = match self.source {
-                    Source::Heap { .. } | Source::HeapSampler { .. } if !self.depth => {
+                    Source::Heap { .. } | Source::HeapSampler { .. } | Source::HeapArray { .. }
+                        if !self.depth =>
+                    {
                         crate::lower::texture::HEAP_CLASS_WORDS
                     }
                     _ => 0,
@@ -897,17 +1059,25 @@ impl Sampling {
             }
             (_, Some(f)) => f.read_words(),
         };
-        // An argument buffer's sampler also fetches the texel the rule names: the size query, the
-        // floor, the clamp, the fetch (with its own dynamic offset), and the flags' test and
-        // selection.
-        let fetch = match (&self.pixel, &self.op) {
-            (Pixel::Heap(_), SampleOp::Sample { dref: None, .. }) => 96 + 32 + wrap,
-            _ => 0,
+        // A pixel coordinate's texel centre: the floor, the shift, and their constants; by a
+        // runtime slot's specialization or an argument buffer's word, also the test and the
+        // selection. Unnormalized coordinates' offset: its conversion and the add.
+        let centre = match (self.pixel, self.position) {
+            (Pixel::None, _) | (_, PixelPosition::Scaled) => 0,
+            (
+                _,
+                PixelPosition::Texel
+                | PixelPosition::Unnormalized
+                | PixelPosition::UnnormalizedTexel,
+            ) => 24,
+            (_, PixelPosition::TexelBySpec | PixelPosition::TexelByWord) => 24 + 32,
         };
         // An argument buffer's sampler reads its entry's word for each test of it: its pixel
-        // coordinates and its exact fetch.
+        // coordinates and its nearest filters.
         let word = match self.pixel {
-            Pixel::Heap(_) => (1 + u32::from(fetch != 0)) * ENTRY_FIELD_WORDS,
+            Pixel::Heap(_) => {
+                (1 + u32::from(self.position == PixelPosition::TexelByWord)) * ENTRY_FIELD_WORDS
+            }
             _ => 0,
         };
         // The position of each axis of Metal's footprint of an observed sample or gather.
@@ -931,13 +1101,17 @@ impl Sampling {
             + heap
             + residency
             + half
-            + fetch
+            + centre
             + word
             + footprint
             + parent
             + unmapped
             + if self.cube { face::TIE_WORDS } else { 0 }
-            + if self.pixel == Pixel::None { 0 } else { 48 }
+            + match (self.pixel, self.position) {
+                (Pixel::None, _) => 0,
+                (_, p) if p.unnormalized() => 0,
+                _ => 48,
+            }
             + self.heap_raw.as_ref().map_or(0, heap_raw::HeapRaw::words)
     }
 }
@@ -960,6 +1134,10 @@ pub struct RuntimeSlot {
     /// A coordinate-sensitive operation uses it (`SamplerCoordinates`): the function reads its
     /// word's pixel coordinates.
     pub coordinates: bool,
+    /// A pixel sample through it reads its texel's centre where its sampler is a nearest pixel
+    /// sampler ([`PixelPosition::TexelBySpec`]): the function reads its `SpecKey::NearestPixelSampler`
+    /// specialization.
+    pub nearest: bool,
     /// An extended-range or heap raw texture's emulated filter reads it: the function reads its
     /// word's filter, coordinates, address modes, and border color.
     pub linear: bool,
@@ -980,6 +1158,9 @@ pub struct RuntimeSlot {
     /// An emulated anisotropic sample reads it ([`anisotropic`]): the function reads its word's
     /// anisotropy and mip filter and its `SpecKey::SamplerAnisotropy` specialization.
     pub emulated: bool,
+    /// A Metal 4.1 read through it addresses its texel by its word (`texture::Through`): the
+    /// function reads its word's address modes, border color, and mip filter.
+    pub reads: bool,
 }
 
 impl RuntimeSlot {
@@ -1004,6 +1185,9 @@ impl RuntimeSlot {
         }
         if self.texels {
             fields |= SamplerWord::LINEAR_FILTER;
+        }
+        if self.reads {
+            fields |= SamplerWord::READ_STATE;
         }
         fields
     }
@@ -1052,6 +1236,13 @@ pub struct SamplerPlan {
     pub heap_samplers: BTreeSet<HeapSamplerKey>,
     /// The sampler array each reads, by its use, set by [`finish`].
     pub heap_sampler_decls: BTreeMap<HeapSamplerKey, SamplerUse>,
+    /// The constexpr sampler arrays heap samplings choose among, by [`HeapArrayKey::array`].
+    pub arrays: Vec<ConstexprArray>,
+    /// Every use of a constexpr sampler array.
+    pub heap_arrays: BTreeSet<HeapArrayKey>,
+    /// The use each one's binding is made for, set by [`finish`]: one binding per distinct array
+    /// and use.
+    pub heap_array_decls: BTreeMap<HeapArrayKey, SamplerUse>,
     /// The texture slots a bicubic sample reads, each with its `BicubicTexels` specialization.
     pub bicubic: BTreeSet<u32>,
     /// The bicubic routines the samples call, by dimension, an extended-range sample's among them.
@@ -1111,6 +1302,8 @@ pub struct Declared {
     pub heap: BTreeMap<HeapKey, GlobalId>,
     /// The set-1 sampler array of each use of an argument buffer's sampler.
     pub heap_samplers: BTreeMap<HeapSamplerKey, GlobalId>,
+    /// The constexpr sampler array variable of each use of one.
+    pub heap_arrays: BTreeMap<HeapArrayKey, GlobalId>,
     /// The `SamplerState` specialization constant (`u32`) of each runtime sampler slot whose
     /// word the function reads, masked by [`RuntimeSlot::fields`].
     pub words: BTreeMap<u32, SValue>,
@@ -1120,6 +1313,9 @@ pub struct Declared {
     /// The `SamplerAnisotropy` specialization constant (`u32`) of each runtime sampler slot an
     /// emulated anisotropic sample reads ([`anisotropic`]).
     pub degrees: BTreeMap<u32, SValue>,
+    /// The `NearestPixelSampler` specialization constant (`bool`) of each runtime sampler slot a
+    /// sample at its texel's centre reads ([`PixelPosition::TexelBySpec`]).
+    pub nearest: BTreeMap<u32, SValue>,
     /// The `BicubicTexels` specialization constant (`u32`) of each texture slot a bicubic sample
     /// reads.
     pub bicubic: BTreeMap<u32, ConstId>,
@@ -1150,7 +1346,8 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             .shape
             .ok_or_else(|| invariant("a sampled texture slot without a shape"))?;
         let texel = crate::lower::texture::image_class(cx.inputs, s);
-        let sampler = CombinedSampler::new(key.sampler, key.compare, texel != TexelClass::Float);
+        let sampler = CombinedSampler::new(key.sampler, key.compare, texel != TexelClass::Float)
+            .with_unnormalized(key.unnormalized);
         if let SamplerRef::Constexpr(words) = key.sampler {
             constexpr_desc(words, sampler.sampler_use(), cx.profile)?;
         }
@@ -1177,6 +1374,7 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             x_channel: false,
             in_place: false,
             planes_sampler: None,
+            rows: false,
         };
         let symbol = ResourceSlot {
             stage: cx.stage,
@@ -1213,18 +1411,53 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     // One heap sampler binding per distinct sampler use (`declare`).
     let heap_samplers: BTreeSet<CombinedSampler> = heap_decls.values().copied().collect();
     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    // One constexpr sampler array binding per distinct array and use (`declare`), each element a
+    // sampler of the stage.
+    let mut heap_array_decls = BTreeMap::new();
+    for key in &cx.families.sampler.heap_arrays {
+        let h = cx
+            .families
+            .texture
+            .heap
+            .get(&key.group)
+            .filter(|h| h.decl.is_some())
+            .ok_or_else(|| invariant("a constexpr sampler array of an undeclared heap group"))?;
+        let texel = h.texel.unwrap_or(TexelClass::Float);
+        let use_ = SamplerUse::new(key.compare, texel != TexelClass::Float);
+        let array = usize::try_from(key.array)
+            .ok()
+            .and_then(|a| cx.families.sampler.arrays.get(a))
+            .ok_or_else(|| invariant("a constexpr sampler array out of range"))?;
+        for words in &array.samplers {
+            constexpr_desc(*words, use_, cx.profile)?;
+        }
+        heap_array_decls.insert(*key, use_);
+    }
+    let array_bindings: BTreeSet<(u32, SamplerUse)> = heap_array_decls
+        .iter()
+        .map(|(k, u)| (k.array, *u))
+        .collect();
+    let array_samplers = array_bindings
+        .iter()
+        .filter_map(|(a, _)| usize::try_from(*a).ok())
+        .filter_map(|a| cx.families.sampler.arrays.get(a))
+        .fold(0u32, |n, a| n.saturating_add(count(a.samplers.len())));
     // Each combined binding is one sampled image and one sampler. Where they are more samplers than
     // the stage may have, the stage takes them apart: the same sampled image per binding, and one
     // separate sampler per distinct use, which counts as one sampler however many textures it
     // samples. The sampled images, and every other count, are the same in both forms, so this is
     // the one limit the separate form relieves; one it still exceeds is the stage's refusal
     // (`select`).
-    let combined = count(decls.len()).saturating_add(count(heap_samplers.len()));
+    let combined = count(decls.len())
+        .saturating_add(count(heap_samplers.len()))
+        .saturating_add(array_samplers);
     let limit = cx.profile.fields().limits.max_per_stage_descriptor_samplers;
     let separate = combined > limit;
     let uses: BTreeSet<CombinedSampler> = decls.values().map(|d| d.sampler).collect();
     counts.samplers = if separate {
-        count(uses.len()).saturating_add(count(heap_samplers.len()))
+        count(uses.len())
+            .saturating_add(count(heap_samplers.len()))
+            .saturating_add(array_samplers)
     } else {
         combined
     };
@@ -1280,6 +1513,7 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     cx.families.sampler.separate = separate;
     cx.families.sampler.heap_decls = heap_decls;
     cx.families.sampler.heap_sampler_decls = heap_sampler_decls;
+    cx.families.sampler.heap_array_decls = heap_array_decls;
     cx.descriptors = cx.descriptors.plus(&counts);
     Ok(())
 }
@@ -1297,6 +1531,48 @@ pub fn heap_layout_features(plan: &Plan) -> Vec<crate::device::requirements::VkF
         VkFeature::DescriptorBindingPartiallyBound,
         VkFeature::DescriptorBindingSampledImageUpdateAfterBind,
     ]
+}
+
+/// The binding symbol of constexpr sampler array `array` of `stage` made for use `use_`.
+fn array_slot(stage: crate::pipeline::sym::Stage, array: u32, use_: SamplerUse) -> ResourceSlot {
+    ResourceSlot {
+        stage,
+        kind: ResourceKind::SamplerArray {
+            compare: use_.compare,
+            integer: use_.integer_texture,
+        },
+        index: array,
+    }
+}
+
+/// The constexpr sampler arrays `plan` declares (`StageInterface::sampler_arrays`): each binding's
+/// samplers in element order, which link bakes into the layout.
+pub fn sampler_arrays(plan: &Plan) -> Vec<crate::pipeline::interface::SamplerArray> {
+    let bindings: BTreeSet<(u32, SamplerUse)> = plan
+        .families
+        .sampler
+        .heap_array_decls
+        .iter()
+        .map(|(k, u)| (k.array, *u))
+        .collect();
+    bindings
+        .into_iter()
+        .filter_map(|(array, use_)| {
+            let a = plan
+                .families
+                .sampler
+                .arrays
+                .get(usize::try_from(array).ok()?)?;
+            Some(crate::pipeline::interface::SamplerArray {
+                slot: array_slot(plan.stage, array, use_),
+                samplers: a
+                    .samplers
+                    .iter()
+                    .map(|w| SamplerRef::Constexpr(*w))
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 /// Declare the combined bindings, or their separate textures and samplers, and the runtime
@@ -1388,6 +1664,45 @@ pub fn declare(
         };
         d.heap_samplers.insert(*key, g);
     }
+    // One constexpr sampler array per distinct array and use: a sized array of samplers.
+    let mut constexpr_arrays: BTreeMap<(u32, SamplerUse), GlobalId> = BTreeMap::new();
+    for (key, use_) in &plan.families.sampler.heap_array_decls {
+        let g = match constexpr_arrays.get(&(key.array, *use_)) {
+            Some(g) => *g,
+            None => {
+                let missing = crate::spirv::error::BuildError::Global(
+                    crate::spirv::error::GlobalRule::ResourceType,
+                );
+                let len = usize::try_from(key.array)
+                    .ok()
+                    .and_then(|a| plan.families.sampler.arrays.get(a))
+                    .map(|a| a.samplers.len())
+                    .ok_or(missing)?;
+                let u32_ = mb.ty(SType::Int {
+                    width: 32,
+                    signed: false,
+                })?;
+                let len = mb.constant(crate::spirv::ir::Constant::Scalar {
+                    ty: u32_,
+                    bits: ConstBits(u64::try_from(len).unwrap_or(u64::MAX)),
+                })?;
+                let sampler = mb.ty(SType::Sampler)?;
+                let array = mb.ty(SType::Array {
+                    elem: sampler,
+                    len,
+                    stride: None,
+                })?;
+                let g = mb.resource(
+                    array_slot(plan.stage, key.array, *use_),
+                    StorageClass::UniformConstant,
+                    array,
+                )?;
+                constexpr_arrays.insert((key.array, *use_), g);
+                g
+            }
+        };
+        d.heap_arrays.insert(*key, g);
+    }
     for (n, r) in &plan.families.sampler.slots {
         let fields = r.fields();
         if fields != 0 {
@@ -1417,6 +1732,11 @@ pub fn declare(
             })?;
             let c = mb.spec(SpecKey::SamplerAnisotropy(r.slot), u, ConstBits(0))?;
             d.degrees.insert(*n, mb.const_value(c)?);
+        }
+        if r.nearest {
+            let b = mb.ty(SType::Bool)?;
+            let c = mb.spec(SpecKey::NearestPixelSampler(r.slot), b, ConstBits(0))?;
+            d.nearest.insert(*n, mb.const_value(c)?);
         }
     }
     for index in &plan.families.sampler.bicubic {
@@ -1485,12 +1805,14 @@ pub fn select_param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<(), Error
                 slot,
                 compare: false,
                 coordinates: false,
+                nearest: false,
                 linear: false,
                 fetch_levels: false,
                 anisotropy: false,
                 texels: false,
                 min_level: false,
                 emulated: false,
+                reads: false,
             });
     }
     Ok(())

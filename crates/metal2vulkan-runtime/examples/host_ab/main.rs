@@ -16,17 +16,27 @@
 //! Workloads (`--only a,b,...`; all by default):
 //!
 //! - `encode`: CPU cost of encoding. A render pass of `--draws` small textured draws into a
-//!   512x512 `BGRA8Unorm` target, `static` (nothing set between draws), `bind` (each draw another
+//!   512x512 `BGRA8Unorm` target, `static` (nothing set between draws), `offset` (each draw the
+//!   vertex buffer's offset alone, `setVertexBufferOffset:atIndex:`), `bind` (each draw another
 //!   vertex buffer and offset, and another fragment texture), `pipeline` (as `bind`, and the
-//!   pipeline state switched between two) and `passes` (as `pipeline`, in render passes of three
-//!   draws, as a window server draws), and a compute encoder of as many single-threadgroup
+//!   pipeline state switched between two), `passes` (as `pipeline`, in render passes of three
+//!   draws, as a window server draws) and `compositor` (as `bind`, in render passes of 300 draws,
+//!   each run of 10 draws by the next of three pipeline states, as a window server's frame
+//!   draws) and `host` (each draw the vertex buffer bound at the next 256 bytes of no-copy
+//!   buffers of 64 KiB over host pages, as a guest's `setVertexBytes:` reaches its upload
+//!   chunks), and a compute encoder of as many single-threadgroup
 //!   dispatches, `static`, `offsets` (both buffers' offsets each dispatch) and `churn` (the
 //!   pipeline state and both buffers' offsets each dispatch). Per draw and dispatch: the encoding thread's wall time from the command buffer's
 //!   creation through `endEncoding`, and the whole process's CPU time until the wait returned.
 //!   Then `dispatch_resident_*`: as many dispatches of the tiny kernel after one
 //!   `useResources:count:usage:` of 0, 1, 256 or 4096 buffers, or of one buffer 4096 times
-//!   (`same_4096`); per variant the `useResources` call, and per dispatch the encoding thread's
-//!   wall time after it and the process's CPU time.
+//!   (`same_4096`); per variant the `useResources` call and the `endEncoding` call, and per
+//!   dispatch the encoding thread's wall time between them and the process's CPU time;
+//!   `dispatch_resident_moving_0`, `_16`, `_256` and `_4096`: as many after none, 16, 256 or 4096
+//!   buffers made resident, the output buffer's offset moved before each dispatch;
+//!   `dispatch_resident_textures_256` and `_4096`: as many after 256 or 4096 textures made
+//!   resident; `dispatch_handles`: as many of a kernel reading a
+//!   resident texture through a handle in an argument buffer.
 //! - `fixed`: a command buffer's creation, an encoder of one command each (render, compute,
 //!   blit), and the commit call of a command buffer of 30 such encoders.
 //! - `calls`: the frames of a guest as reims-vgpu's `frame_cost` measures them, call by call: one
@@ -188,6 +198,12 @@
 //!   the frame from the command buffer's creation to the wait's return; and the commit to the
 //!   wait's return. On the runtime's side, its draws through last-vertex pipelines, its listed
 //!   draws, dispatches and pipeline barriers per frame (`rt_*`).
+//! - **threads**: the encode workload's `static` and `offset` draws on 1, 2, 4 and 8 threads at
+//!   once, each with its own command queue and target, through one shared pipeline state
+//!   (`shared`) and through one of each thread's own (`each`); each thread encodes `--timed / 4`
+//!   (at least 8) command buffers of `--draws` draws, one in flight before the next commits. Per
+//!   case, over 3 runs: the draws a second of all threads together (from their common start to
+//!   the last one's last commit), each thread's CPU time per draw, and the process's.
 //!
 //! Options: `--rounds N` (3), `--draws N` (2000), `--timed N` (30), `--latency N` (200),
 //! `--heavy-iterations N` (64), `--heavy-runs N` (15), `--many-draws N` (6000), `--frames N`
@@ -195,10 +211,13 @@
 //! shader caches; a directory under the OS's temporary directory by default, removed at the end),
 //! `--metallib PATH` (skip the compile; not with `pipeline`), `--cache DIR` (the runtime's shader
 //! cache, with `--side`), `--variants a,b,...` (the encode workload's variants alone:
-//! `draw_static`, `draw_bind`, `draw_pipeline`, `draw_passes`, `dispatch_static`,
-//! `dispatch_offsets`, `dispatch_churn`, `dispatch_resident_0`, `_1`, `_256`, `_4096`,
-//! `_same_4096`; for a profile of one; and the memory workload's parts alone: `create`,
-//! `no_copy`, `held_1m`, `held_64m`, `texture`), `--announce-each a,b,...` (the runtime's device
+//! `draw_static`, `draw_offset`, `draw_bind`, `draw_pipeline`, `draw_passes`, `draw_compositor`,
+//! `draw_host`,
+//! `dispatch_static`, `dispatch_offsets`, `dispatch_churn`, `dispatch_resident_0`, `_1`, `_256`,
+//! `_4096`, `_same_4096`, `dispatch_resident_moving_0`, `_16`, `_256`, `_4096`,
+//! `dispatch_resident_textures_256`, `_4096`, `dispatch_handles`; for a profile of one; and the
+//! memory workload's parts alone: `create`, `no_copy`, `held_1m`, `held_64m`, `texture`),
+//! `--announce-each a,b,...` (the runtime's device
 //! announces these degradation kinds, by code with or without its `metal2vulkan-degrade-` prefix,
 //! or `all` of them, at every occurrence, `DeviceOptions::announce_each`, as a consumer that hears
 //! some kinds at each call opens it), `--sink-least verbose|info|warning|error` (the runtime's
@@ -221,10 +240,10 @@ use gpu::Gpu;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use workloads::Sizes;
 
-const WORKLOADS: [&str; 20] = [
+const WORKLOADS: [&str; 21] = [
     "encode",
     "fixed",
     "calls",
@@ -245,6 +264,7 @@ const WORKLOADS: [&str; 20] = [
     "provoking",
     "icb_cpu",
     "percall",
+    "threads",
 ];
 
 struct Options {
@@ -386,7 +406,7 @@ fn child(side: &str, options: &Options) {
         #[cfg(target_os = "macos")]
         "native" => {
             let native = native::Native::open();
-            run(&native, t, metallib, options);
+            run(&native, t.elapsed(), metallib, options);
         }
         "runtime" => {
             let cache = options
@@ -395,7 +415,9 @@ fn child(side: &str, options: &Options) {
                 .unwrap_or_else(|| scratch_default().join("cache"));
             let runtime =
                 runtime::Runtime::open(&cache, &options.announce_each, options.sink_least);
-            run(&runtime, t, metallib, options);
+            let opened = t.elapsed();
+            runtime.settle_checks();
+            run(&runtime, opened, metallib, options);
             let c = runtime.device().work_counts();
             eprintln!(
                 "runtime work counts: queue_submissions {} command_buffers_submitted {} \
@@ -467,12 +489,13 @@ fn child(side: &str, options: &Options) {
     }
 }
 
-fn run<G: Gpu>(g: &G, opened: Instant, metallib: &Path, options: &Options) {
+/// Run the selected workloads on `g`, whose device took `opened` to open.
+fn run<G: Gpu>(g: &G, opened: Duration, metallib: &Path, options: &Options) {
     workloads::emit(
         "meta",
         "device_open",
         "ms",
-        &mut [opened.elapsed().as_secs_f64() * 1e3],
+        &mut [opened.as_secs_f64() * 1e3],
     );
     eprintln!("{}", g.label());
     let sizes = &options.sizes;
@@ -499,7 +522,7 @@ fn run<G: Gpu>(g: &G, opened: Instant, metallib: &Path, options: &Options) {
     );
     for workload in rest {
         match workload {
-            "encode" => workloads::encode(g, &scene, sizes, &options.variants),
+            "encode" => workloads::encode(g, &scene, &library, sizes, &options.variants),
             "fixed" => workloads::fixed(g, &scene, sizes),
             "calls" => workloads::calls(g, &scene, &library, sizes, &options.variants),
             "latency" => workloads::latency(g, &scene, sizes),
@@ -518,6 +541,7 @@ fn run<G: Gpu>(g: &G, opened: Instant, metallib: &Path, options: &Options) {
             "provoking" => workloads::provoking(g, &library, sizes),
             "icb_cpu" => workloads::icb_cpu(g, &library, sizes),
             "percall" => percall::percall(g, &scene, &library, sizes),
+            "threads" => workloads::threads(g, &library, &scene.textured[0], sizes),
             _ => unreachable!(),
         }
     }

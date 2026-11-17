@@ -23,9 +23,10 @@
 //! which Metal renders plain and its validation stops.
 
 use super::buffer_texture_blits::{Held, Kind, OFF};
+use super::degrade_notices::counts;
 use super::{
-    buffer_with, layer_reported_nothing_at_all, read_buffer, validated_device, Messages,
-    ScratchCache, WAIT,
+    buffer_with, layer_reported_nothing_at_all, read_buffer, validated_device,
+    validated_device_with, Messages, ScratchCache, WAIT,
 };
 use crate::air_library::AirLibrary;
 use crate::gpu::TEST_DEVICE;
@@ -37,13 +38,13 @@ use metal2vulkan::metal::{
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_devtools::llvm_assemble;
 use metal2vulkan_runtime::{
-    Attachment, BlitCommandEncoder, BlitOption, Buffer, ClearColor, CommandBufferStatus,
-    CommandQueue, CpuCacheMode, Device, Error, HazardTrackingMode, HeapDescriptor, HeapType,
-    Invalid, Library, LoadAction, Origin, PipelineOptions, Problem, Region, RenderCommandEncoder,
-    RenderPassDescriptor, RenderPipelineState, ResourceOptions, ScissorRect, Size, StorageMode,
-    StoreAction, Texture, TextureDescriptor, TextureProblem, ViewProblem,
+    Attachment, BlitCommandEncoder, BlitOption, Buffer, ClearColor, CommandBuffer,
+    CommandBufferStatus, CommandQueue, CpuCacheMode, Degradation, Device, Error,
+    HazardTrackingMode, HeapDescriptor, HeapType, Invalid, Library, LoadAction, Origin,
+    PipelineOptions, Problem, Region, RenderCommandEncoder, RenderPassDescriptor,
+    RenderPipelineState, ResourceOptions, ScissorRect, Size, StorageMode, StoreAction, Texture,
+    TextureDescriptor, TextureProblem, ViewProblem,
 };
-use std::path::Path;
 
 /// The probe's clear and draw colors.
 const CLEAR: [f64; 4] = [0.5, 0.25, 0.75, 1.0];
@@ -77,9 +78,7 @@ struct Lane {
 impl Lane {
     fn new(device: &Device) -> Lane {
         let library = |name: &str| {
-            let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("fixtures/public/engine")
-                .join(name);
+            let ll = metal2vulkan_devtools::engine_dir().join(name);
             device
                 .new_library_with_air(&llvm_assemble(&ll).unwrap())
                 .unwrap()
@@ -1261,11 +1260,10 @@ fn drawn_planes(drawn: &[u64], encoding: ([u8; 4], [u8; 4])) -> Vec<u8> {
         .collect()
 }
 
-/// A 3D texture's depth plane is an attachment and a resolve target, every other plane kept
-/// (an M3 Max and an M4, API validation passing each): plane 2 of a 4x4x4
-/// `RGBA8Unorm` volume filled with 0x11 (`t3d_plane2`), plane 1 of level 1 of an 8x8x8 one
-/// (`t3d_level1_plane1`), plane 1 through an sRGB view (`t3d_view_srgb_plane1`), and plane 3
-/// resolved into from a 4x multisampled attachment (`t3d_resolve_plane3`).
+/// A 3D texture's depth plane is an attachment, every other plane kept (an M3 Max and an M4, API
+/// validation passing each): plane 2 of a 4x4x4 `RGBA8Unorm` volume filled with 0x11
+/// (`t3d_plane2`), plane 1 of level 1 of an 8x8x8 one (`t3d_level1_plane1`), and plane 1 through
+/// an sRGB view (`t3d_view_srgb_plane1`). Its resolves: [`a_resolve_writes_the_volume_plane_it_names`].
 #[test]
 fn a_volume_s_plane_is_an_attachment() {
     on_device(|lane| {
@@ -1307,8 +1305,23 @@ fn a_volume_s_plane_is_an_attachment() {
             1,
             "t3d_view_srgb_plane1",
         );
+    });
+}
 
-        let texture = volume(lane, rgba, RT, [4, 4, 1], (0, 0x11));
+/// A 3D texture's depth plane is a resolve target, every other plane kept: a 4x multisampled
+/// `RGBA8Unorm` attachment cleared and its left half drawn, resolved into each plane of a 4x4x4
+/// volume filled with 0x11, one volume a plane (an M3 Max and an M4 measured plane 3,
+/// `t3d_resolve_plane3`, API validation passing; `resolveDepthPlane` names the one plane the
+/// resolve writes). Prints the planes each resolve wrote (`VOLUME-RESOLVE` lines); the layer's
+/// reports fail it before the bytes are checked.
+#[test]
+fn a_resolve_writes_the_volume_plane_it_names() {
+    let messages = Messages::default();
+    let cache = ScratchCache::new().unwrap();
+    let resolved = {
+        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let lane = Lane::new(&device);
+        let rgba = PixelFormat::RGBA8Unorm;
         let msaa = lane.texture(
             rgba,
             TextureUsage::RENDER_TARGET,
@@ -1318,16 +1331,30 @@ fn a_volume_s_plane_is_an_attachment() {
             },
         );
         let multisampled = lane.solid(rgba, 4, false);
-        let mut descriptor = pass(&msaa, (0, 0), LoadAction::Clear, Some(&texture));
-        descriptor.color_attachments[0].resolve_depth_plane = 3;
-        lane.run(&descriptor, |l, e, h| l.left(e, h, &multisampled, COLOR));
-        check(
-            &planes(&texture, 0, 4),
-            &drawn_planes(&[3], UNORM),
-            1,
-            "t3d_resolve_plane3",
-        );
-    });
+        let resolved: Vec<(u64, Vec<u8>)> = (0..4)
+            .map(|plane| {
+                let texture = volume(&lane, rgba, RT, [4, 4, 1], (0, 0x11));
+                let mut descriptor = pass(&msaa, (0, 0), LoadAction::Clear, Some(&texture));
+                descriptor.color_attachments[0].resolve_depth_plane = plane;
+                lane.run(&descriptor, |l, e, h| l.left(e, h, &multisampled, COLOR));
+                let bytes = planes(&texture, 0, 4);
+                let written: Vec<usize> = (0..4)
+                    .filter(|&at| bytes[64 * at..64 * (at + 1)].iter().any(|&b| b != 0x11))
+                    .collect();
+                eprintln!(
+                    "VOLUME-RESOLVE on {}: into plane {plane}, planes written {written:?}",
+                    device.name()
+                );
+                (plane, bytes)
+            })
+            .collect();
+        resolved
+    };
+    layer_reported_nothing_at_all(&messages);
+    for (plane, bytes) in resolved {
+        let what = format!("t3d_resolve_plane{plane}");
+        check(&bytes, &drawn_planes(&[plane], UNORM), 1, &what);
+    }
 }
 
 /// A layered pass renders a 3D attachment's planes from its depth plane, instance `i` into the
@@ -1465,4 +1492,114 @@ fn a_layered_pass_renders_a_line_s_slices() {
             );
         }
     });
+}
+
+/// An `RGBA8Unorm` texture that renders, made without `PixelFormatView` usage, renders into its
+/// `BGRA8Unorm` and `BGRA8Unorm_sRGB` views in place: its image lists their formats, so each is a
+/// view of the image (no `shadowed-texture-view`), and stores its format's bytes as Metal's does
+/// (the probe's `v_*` bytes, in the view's channel order). Apple documents the `bgra8Unorm_srgb`
+/// view as needing no `PixelFormatView` usage; plain Metal makes the `BGRA8Unorm` one too.
+#[test]
+fn a_render_target_s_reordered_views_render_in_place() {
+    const BGRA_UNORM: ([u8; 4], [u8; 4]) = ([0x99, 0x66, 0x33, 0xcc], [0xbf, 0x40, 0x80, 0xff]);
+    let messages = Messages::default();
+    let cache = ScratchCache::new().unwrap();
+    {
+        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let lane = Lane::new(&device);
+        for (pf, want) in [
+            (PixelFormat::BGRA8Unorm, BGRA_UNORM),
+            (PixelFormat::BGRA8UnormSRGB, BGRA_SRGB),
+        ] {
+            let texture = lane.texture(PixelFormat::RGBA8Unorm, RT, PLAIN);
+            let viewed = texture.new_texture_view(pf).unwrap();
+            let pipeline = lane.solid(pf, 1, false);
+            lane.run(
+                &pass(&viewed, (0, 0), LoadAction::Clear, None),
+                |l, e, h| l.left(e, h, &pipeline, COLOR),
+            );
+            let what = format!("{}: a {pf:?} view", device.name());
+            // Within 1, as this file's other checks: the device's own rounding.
+            check(&lane.bytes(&texture, 0, 0), &halves(want), 1, &what);
+        }
+        let notices = counts(&messages.take_notices());
+        assert_eq!(
+            notices.get(&Degradation::ShadowedTextureView),
+            None,
+            "{}: {notices:?}",
+            device.name()
+        );
+    }
+    layer_reported_nothing_at_all(&messages);
+}
+
+/// What a 2048x2048 `RGBA8Unorm` render target made without `PixelFormatView` usage costs the
+/// GPU, without the validation layer: a pass that clears it and stores, a blit copying it into
+/// another such texture, and a pass that clears its `BGRA8Unorm` view and stores, each its own
+/// command buffer, medians and the fastest of 40 after 8 untimed; and the notices, whose
+/// `shadowed-texture-view` says the view's pass rendered through a shadow. The first two show
+/// what the formats the texture's image lists cost the driver's compression. Ignored by default:
+/// a measurement, not a check.
+#[test]
+#[ignore = "a measurement, not a check: run by name with --run-ignored all"]
+fn reordered_view_render_costs() {
+    const BIG: u64 = 2048;
+    let messages = Messages::default();
+    let cache = ScratchCache::new().unwrap();
+    let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |options| {
+        options.layers.clear();
+    })
+    .unwrap();
+    let mut descriptor = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, BIG, BIG, false);
+    descriptor.usage = RT;
+    descriptor.resource_options = ResourceOptions::private();
+    let target = device.new_texture(&descriptor).unwrap();
+    let copy = device.new_texture(&descriptor).unwrap();
+    let view = target.new_texture_view(PixelFormat::BGRA8Unorm).unwrap();
+    let queue = device.new_command_queue().unwrap();
+    let time = |encode: &dyn Fn(&CommandBuffer)| {
+        let mut gpu = Vec::new();
+        for run in 0..48 {
+            let command_buffer = queue.command_buffer().unwrap();
+            encode(&command_buffer);
+            command_buffer.commit().unwrap();
+            command_buffer.wait_until_completed_for(WAIT).unwrap();
+            assert_eq!(command_buffer.error(), None);
+            let start = command_buffer.gpu_start_time().unwrap();
+            let end = command_buffer.gpu_end_time().unwrap();
+            if run >= 8 {
+                gpu.push((end - start) * 1e6);
+            }
+        }
+        gpu.sort_by(f64::total_cmp);
+        (gpu[gpu.len() / 2], gpu[0])
+    };
+    let cleared = |command_buffer: &CommandBuffer, texture: &Texture| {
+        let mut pass = RenderPassDescriptor::new();
+        let color = &mut pass.color_attachments[0];
+        color.texture = Some(texture.clone());
+        color.load_action = LoadAction::Clear;
+        color.store_action = StoreAction::Store;
+        let encoder = command_buffer.render_command_encoder(&pass).unwrap();
+        encoder.end_encoding().unwrap();
+    };
+    let clear = time(&|command_buffer| cleared(command_buffer, &target));
+    let blit = time(&|command_buffer| {
+        let mut blit = command_buffer.blit_command_encoder().unwrap();
+        blit.copy_texture(&target, &copy).unwrap();
+        blit.end_encoding().unwrap();
+    });
+    let viewed = time(&|command_buffer| cleared(command_buffer, &view));
+    let notices = counts(&messages.take_notices());
+    eprintln!(
+        "REORDERED-VIEW on {}: clear median {:.1} us, fastest {:.1} us; copy median {:.1} us, \
+         fastest {:.1} us; the view's clear median {:.1} us, fastest {:.1} us; notices {notices:?}",
+        device.name(),
+        clear.0,
+        clear.1,
+        blit.0,
+        blit.1,
+        viewed.0,
+        viewed.1
+    );
 }

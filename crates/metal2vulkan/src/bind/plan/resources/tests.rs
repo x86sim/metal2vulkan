@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::bind::state::BoundSampler;
+use crate::error::Needs;
 use crate::metal::format::storage_choice;
 use crate::pipeline::sym::SampledType;
 use std::collections::BTreeSet;
@@ -93,6 +94,7 @@ fn compatibility_is_type_samples_numeric_type_and_depth() {
         offset_base_axes: 0,
         ycbcr_in_place: false,
         ycbcr_planes_sampler: None,
+        texel_rows: false,
         texture_type,
         pixel_format,
         sample_count,
@@ -164,6 +166,7 @@ fn a_ulong_slot_binds_only_rg32uint_textures() {
         offset_base_axes: 0,
         ycbcr_in_place: false,
         ycbcr_planes_sampler: None,
+        texel_rows: false,
         texture_type: TextureType::Type2D,
         pixel_format,
         sample_count: 1,
@@ -258,6 +261,7 @@ fn a_numeric_slot_binds_either_integer_type() {
                 offset_base_axes: 0,
                 ycbcr_in_place: false,
                 ycbcr_planes_sampler: None,
+                texel_rows: false,
                 texture_type: TextureType::Type2D,
                 pixel_format,
                 sample_count: 1,
@@ -299,6 +303,116 @@ fn a_numeric_slot_binds_either_integer_type() {
     assert!(!plan(PixelFormat::RGBA32Float, &numeric).0);
     assert!(!plan(PixelFormat::RGBA16Sint, &[]).0);
     assert!(plan(PixelFormat::RGBA16Uint, &[]).0);
+}
+
+/// A texture of a format held for copies alone (`metal::format::copies_only`), which Metal reads as
+/// floats, bound at a `float` slot that samples, reads, writes or reads and writes it, is the
+/// format's own refusal, `NotImplemented(Format)`: its emulation is admitted for no usage, so no
+/// view serves the slot. No neutral stands in for it, as one did while the binder took it for a
+/// mismatch, so a kernel's read completed and read the neutral's zeros. At a `uint` slot it is a
+/// mismatch, whose neutral the binder writes and reports.
+#[test]
+fn a_texture_held_for_copies_alone_is_refused_at_a_float_slot() {
+    let texture = SlotRef {
+        stage: Stage::Kernel,
+        class: SlotClass::Texture,
+        index: 0,
+    };
+    let p =
+        crate::pipeline::testing::profile("moltenvk-m3", crate::device::DevicePolicy::default())
+            .expect("profile");
+    let plan = |pixel_format, access: TextureAccess, sampled_type, ty| {
+        let slot = TextureSlot {
+            access,
+            ..slot_iface(TextureType::Type2D, sampled_type)
+        };
+        let slots = BTreeMap::from([(texture, SlotInterface::Texture(slot))]);
+        let mut stage = StageShape::default();
+        stage.textures.insert(
+            texture.index,
+            TextureShape::Texture {
+                address_modes: crate::metal::sampler::AddressModeMap::IDENTITY,
+                offset_base_axes: 0,
+                ycbcr_in_place: false,
+                ycbcr_planes_sampler: None,
+                texel_rows: false,
+                texture_type: TextureType::Type2D,
+                pixel_format,
+                sample_count: 1,
+                usage: crate::metal::TextureUsage::SHADER_READ
+                    | crate::metal::TextureUsage::SHADER_WRITE,
+                mipmap_level_count: 1,
+                sparse: false,
+                swizzle: crate::metal::TextureSwizzleChannels::DEFAULT,
+            },
+        );
+        let shape = BTreeMap::from([(Stage::Kernel, stage)]);
+        let mut planner = ResourcePlanner {
+            profile: &p,
+            shape: &shape,
+            slots: &slots,
+            dependencies: &[],
+            stage_flags: |_| vk::PipelineStageFlags2::COMPUTE_SHADER,
+            variant: VariantKey::new(),
+            diagnostics: Vec::new(),
+            uses: Vec::new(),
+            template: Default::default(),
+            alpha_red_texels: Default::default(),
+        };
+        let planned = planner
+            .plain_texture(0, 0, ty, texture)
+            .map(|(write, _)| write);
+        (planned, planner.diagnostics)
+    };
+    let sampled = vk::DescriptorType::SAMPLED_IMAGE;
+    let storage = vk::DescriptorType::STORAGE_IMAGE;
+    let uses = [
+        ("sampled", TextureAccess::new(true, false, false), sampled),
+        ("read", TextureAccess::new(false, true, false), sampled),
+        ("written", TextureAccess::new(false, false, true), storage),
+        (
+            "read and written",
+            TextureAccess::new(false, true, true),
+            storage,
+        ),
+    ];
+    let held: Vec<PixelFormat> = (PixelFormat::ALL.iter().copied())
+        .filter(|&pf| copies_only(pf))
+        .collect();
+    assert_eq!(held.len(), 20, "{held:?}");
+    for pf in held {
+        for (name, access, ty) in uses {
+            match plan(pf, access, SampledType::Float, ty) {
+                (Err(BindError::Unsupported(u)), diagnostics) => {
+                    assert_eq!(
+                        (u.feature, u.needs),
+                        (Feature::Format, Needs::NotImplemented),
+                        "{pf:?} {name}"
+                    );
+                    assert!(diagnostics.is_empty(), "{pf:?} {name}: {diagnostics:?}");
+                }
+                other => panic!("{pf:?} {name}: {other:?}"),
+            }
+        }
+        let (mismatch, diagnostics) = plan(
+            pf,
+            TextureAccess::new(false, true, false),
+            SampledType::Uint,
+            sampled,
+        );
+        assert!(
+            matches!(mismatch, Ok(WriteSource::Neutral(_))),
+            "{pf:?} at a uint slot: {mismatch:?}"
+        );
+        assert!(
+            matches!(
+                diagnostics.as_slice(),
+                [PlanDiagnostic::IncompatibleBinding { .. }
+                    | PlanDiagnostic::CrossClassNeutral { .. }]
+            ),
+            "{pf:?} at a uint slot: {diagnostics:?}"
+        );
+    }
 }
 
 /// A sampled view selects the depth aspect of a depth (or combined) format, the stencil aspect of
@@ -625,6 +739,7 @@ fn an_immutable_linear_sampler_needs_a_filterable_view() {
                     offset_base_axes: 0,
                     ycbcr_in_place: false,
                     ycbcr_planes_sampler: None,
+                    texel_rows: false,
                     texture_type: TextureType::Type2D,
                     pixel_format: pf,
                     sample_count: 1,
@@ -726,6 +841,7 @@ fn a_linear_compare_sampler_needs_no_filterable_view() {
                         offset_base_axes: 0,
                         ycbcr_in_place: false,
                         ycbcr_planes_sampler: None,
+                        texel_rows: false,
                         texture_type: TextureType::Type2D,
                         pixel_format: pf,
                         sample_count: 1,
@@ -821,6 +937,7 @@ fn bicubic_texels_follow_the_bound_format() {
                     offset_base_axes: 0,
                     ycbcr_in_place: false,
                     ycbcr_planes_sampler: None,
+                    texel_rows: false,
                     texture_type: TextureType::Type2D,
                     pixel_format: pf,
                     sample_count: 1,
@@ -982,6 +1099,7 @@ fn texel_format_follows_the_bound_format() {
             offset_base_axes: 0,
             ycbcr_in_place: false,
             ycbcr_planes_sampler: None,
+            texel_rows: false,
             texture_type: TextureType::Type2D,
             pixel_format,
             sample_count: 1,
@@ -1166,6 +1284,7 @@ fn a_separate_pair_takes_the_combined_pairs_checks() {
                         offset_base_axes: 0,
                         ycbcr_in_place: false,
                         ycbcr_planes_sampler: None,
+                        texel_rows: false,
                         texture_type: TextureType::Type2D,
                         pixel_format: pf,
                         sample_count: 1,

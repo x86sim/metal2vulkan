@@ -5,11 +5,12 @@ use super::super::host_aliases::{self, Alias};
 use super::super::key_hash::KeyMap;
 use super::super::resource::ResourceKey;
 use super::super::shadow::{
-    self, Backing, CopyCause, KeptArea, Lost, ShadowBuffer, ShadowCarry, ShadowCopies, ShadowCopy,
-    ShadowSource, ShadowSync, ShadowTarget, ShadowUse, Step, Within,
+    self, Backing, CopyCause, ImageTruth, KeptArea, LaterLevels, LevelsCopy, Lost, ShadowBuffer,
+    ShadowCarry, ShadowCopies, ShadowCopy, ShadowSource, ShadowSync, ShadowTarget, ShadowUse, Step,
+    Within,
 };
 use super::super::shadow_merge::ScratchSpares;
-use super::super::tracker::{Access, Use, UseRange};
+use super::super::tracker::{Access, ImagePlace, Use, UseRange};
 use ash::vk;
 use metal2vulkan::error::Feature;
 use std::ops::Range;
@@ -91,13 +92,15 @@ fn shadow_in(
             aspects: vk::ImageAspectFlags::COLOR,
             levels: 0..1,
             layers: 0..1,
+            place: ImagePlace::WHOLE,
         },
         tracked: true,
         drops_writes: false,
+        levels: None,
         backing: Backing::MappedBuffer,
         merge_scratch: ScratchSpares::default(),
-        touched: AtomicU64::new(0),
         stood: AtomicU64::new(0),
+        standing: Default::default(),
     })
 }
 
@@ -125,6 +128,7 @@ fn through(texture: &Arc<ShadowCopies>, writes: bool) -> (ShadowUse, Use<Resourc
             area: None,
             loads: None,
             tile_stores: false,
+            cleared: None,
         },
         used,
     )
@@ -263,6 +267,7 @@ fn a_copy_back_covers_only_where_the_commands_wrote() {
         area,
         loads: None,
         tile_stores: false,
+        cleared: None,
     };
     let (_, written) = through(&t, true);
     let run = |areas: &[Option<[u32; 4]>]| {
@@ -374,6 +379,7 @@ fn a_copy_in_covers_only_where_the_command_reads_and_writes() {
         area: writes.then_some(area),
         loads: Some(area),
         tile_stores: false,
+        cleared: None,
     };
     let a = [8, 4, 40, 20];
     let mut sync = ShadowSync::<u32>::default();
@@ -397,12 +403,13 @@ fn a_copy_in_covers_only_where_the_command_reads_and_writes() {
         [('m', None), ('i', None)]
     );
     assert_eq!(back_areas(&mut sync), []);
-    // Past it, unwritten: only the copy in.
+    // Past it, unwritten: only the copy in, of every texel (a rectangle of them all is all of
+    // them, held as such).
     let mut sync = ShadowSync::<u32>::default();
     planned_areas(&mut sync, &[inside(a, false)], std::slice::from_ref(&read));
     assert_eq!(
         planned_areas(&mut sync, &[inside([0, 0, 64, 32], false)], &[read]),
-        [('i', Some([0, 0, 64, 32]))]
+        [('i', None)]
     );
     // Joined with a use that reads anywhere, a use reads anywhere.
     let mut joined = vec![inside(a, true)];
@@ -448,6 +455,8 @@ fn a_copy_in_covers_only_where_the_command_reads_and_writes() {
         area: Some(a),
         cause: Some(CopyCause::First),
         moves: None,
+        later: None,
+        clear: None,
     };
     assert_eq!((copy.texels_in(), copy.texels_back()), (32 * 16, 0));
     assert_eq!(copy.texels_copied_in(), 32 * 16);
@@ -667,9 +676,9 @@ fn writes_within_a_rectangle_copy_in_only_the_texels_they_changed() {
     let bytes_of = 256..256 + 320 * 32;
     let t = cut_shadow(buffer, bytes_of.clone());
     let attachment = bytes(buffer, bytes_of.clone(), true);
-    let within = |area: [u32; 4], texels: Option<&Arc<ShadowCopies>>| Within {
-        uses: vec![attachment.clone()],
-        texels: texels.cloned(),
+    let within = |area: [u32; 4], texels| Within {
+        uses: std::slice::from_ref(&attachment),
+        texels,
         area,
     };
     let whole = (true, None, false);
@@ -708,8 +717,8 @@ fn writes_within_a_rectangle_copy_in_only_the_texels_they_changed() {
     assert_eq!(read_anywhere(&mut sync, &t), [whole]);
     // Writes elsewhere in the buffer: nothing.
     let apart = Within {
-        uses: vec![bytes(buffer, 0..256, true)],
-        texels: Some(Arc::clone(&t)),
+        uses: &[bytes(buffer, 0..256, true)],
+        texels: Some(&t),
         area: [0, 0, 2, 2],
     };
     within_command(&mut sync, &[], &[apart], &[]);
@@ -760,8 +769,8 @@ fn a_read_inside_a_rectangle_leaves_the_other_changed_texels_to_the_next_read() 
     let mut sync = ShadowSync::<u32>::default();
     let drawn = |sync: &mut ShadowSync<u32>, area: [u32; 4]| {
         let part = Within {
-            uses: vec![attachment.clone()],
-            texels: Some(Arc::clone(&t)),
+            uses: std::slice::from_ref(&attachment),
+            texels: Some(&t),
             area,
         };
         within_command(sync, &[], &[part], &[])
@@ -775,6 +784,7 @@ fn a_read_inside_a_rectangle_leaves_the_other_changed_texels_to_the_next_read() 
             area: None,
             loads: Some(area),
             tile_stores: false,
+            cleared: None,
         };
         within_command(sync, &[reader], &[], std::slice::from_ref(&read))
     };
@@ -841,6 +851,7 @@ fn a_copy_back_of_a_part_leaves_a_twin_stale_there_alone() {
             area: Some(area),
             loads: Some([0, 0, 64, 32]),
             tile_stores: false,
+            cleared: None,
         }];
         let mut uses = vec![written.clone()];
         for texture in also {
@@ -864,12 +875,12 @@ fn a_copy_back_of_a_part_leaves_a_twin_stale_there_alone() {
             .collect::<Vec<_>>()
     };
     let mut sync = ShadowSync::<u32>::default();
-    let all = Some([0, 0, 64, 32]);
     let a = attachment.shadow_key;
     let (r, o) = (read.shadow_key, other.shadow_key);
+    // It loads every texel: copied in whole.
     assert_eq!(
         instance(&mut sync, [8, 4, 12, 6], &[]),
-        [(a, true, all, false)]
+        [(a, true, None, false)]
     );
     assert_eq!(
         instance(&mut sync, [20, 4, 24, 6], &[&read, &other]),
@@ -914,6 +925,7 @@ fn a_merge_of_a_part_leaves_a_twin_stale_there_alone() {
             area: Some(area),
             loads: Some([0, 0, 64, 32]),
             tile_stores: false,
+            cleared: None,
         }];
         let mut uses = vec![written.clone()];
         for texture in also {
@@ -929,12 +941,12 @@ fn a_merge_of_a_part_leaves_a_twin_stale_there_alone() {
             .collect::<Vec<_>>()
     };
     let mut sync = ShadowSync::<u32>::default();
-    let all = Some([0, 0, 64, 32]);
     let a = attachment.shadow_key;
     let (r, o) = (read.shadow_key, other.shadow_key);
+    // It loads every texel: copied in whole.
     assert_eq!(
         instance(&mut sync, [8, 4, 12, 6], &[]),
-        [(a, 'i', all, false), (a, 'k', None, false)]
+        [(a, 'i', None, false), (a, 'k', None, false)]
     );
     assert_eq!(
         instance(&mut sync, [20, 4, 24, 6], &[&read, &other]),
@@ -1058,6 +1070,7 @@ fn a_use_that_overwrites_every_texel_takes_no_copy_in() {
         area: None,
         loads: None,
         tile_stores: false,
+        cleared: None,
     };
     let (_, written) = through(&t, true);
     for stores in [true, false] {
@@ -1187,7 +1200,7 @@ fn textures_over_two_buffers_of_one_memory_see_each_others_writes() {
     let aliases: KeyMap<_, _> = [(second, Alias { key: first })].into_iter().collect();
     let augmented = |uses: &[Use<ResourceKey>]| {
         let mut all = Vec::new();
-        match host_aliases::augmented(Some(&aliases), None, uses, &mut all) {
+        match host_aliases::augmented((Some(&aliases), None), uses, &mut all, None) {
             true => all,
             false => uses.to_vec(),
         }
@@ -1306,6 +1319,8 @@ fn one_command_writing_a_texture_and_its_bytes_another_way_keeps_and_merges_it()
 /// merged before the next command. An image's shadow, one whose writes Metal drops, and one over a
 /// tracked `Private` buffer's bytes, which no other writer writes while a command buffer runs,
 /// merge nothing back: the last is copied in and back; an untracked `Private` buffer's merges.
+/// So does an IOSurface plane's in a tracked `Private` buffer (a consumer's device copy of the
+/// surface), where a plane the CPU may write merges.
 #[test]
 fn a_texture_over_a_buffer_s_bytes_is_merged_where_it_would_be_copied_back() {
     let buffer = ResourceKey::new();
@@ -1316,6 +1331,14 @@ fn a_texture_over_a_buffer_s_bytes_is_merged_where_it_would_be_copied_back() {
     assert!(over_private(shadow(buffer, 0..1024), false).merges_back());
     let private = over_private(shadow(buffer, 0..1024), true);
     assert!(!private.merges_back());
+    let with = |backing, tracked| {
+        let mut copies = Arc::into_inner(shadow(buffer, 0..1024)).expect("one holder");
+        (copies.backing, copies.tracked) = (backing, tracked);
+        copies
+    };
+    assert!(!with(Backing::PrivateSurface, true).merges_back());
+    assert!(with(Backing::PrivateSurface, false).merges_back());
+    assert!(with(Backing::Surface, true).merges_back());
     let mut dropped = Arc::into_inner(shadow(buffer, 0..1024)).expect("one holder");
     dropped.drops_writes = true;
     assert!(!dropped.merges_back());
@@ -1412,6 +1435,19 @@ fn a_refused_scratch_changes_nothing() {
     );
 }
 
+/// An image no copy is recorded with: these tests track uses alone.
+struct NoImage;
+
+impl ImageTruth for NoImage {
+    fn raw(&self) -> vk::Image {
+        vk::Image::null()
+    }
+
+    fn handed_out(&self) -> bool {
+        false
+    }
+}
+
 /// A shadow of `levels` and `layers` of the image `image`: a texture view of another component
 /// layout on a device whose Vulkan views reinterpret none (`texture/view_shadow.rs`).
 fn view_of(image: ResourceKey, levels: Range<u32>, layers: Range<u32>) -> Arc<ShadowCopies> {
@@ -1419,10 +1455,11 @@ fn view_of(image: ResourceKey, levels: Range<u32>, layers: Range<u32>) -> Arc<Sh
         aspects: vk::ImageAspectFlags::COLOR,
         levels,
         layers,
+        place: ImagePlace::WHOLE,
     };
     Arc::new(ShadowCopies {
         source: ShadowSource::Image {
-            image: vk::Image::null(),
+            image: Arc::new(NoImage),
             key: image,
             range: range.clone(),
             shadow: vk::Image::null(),
@@ -1433,10 +1470,11 @@ fn view_of(image: ResourceKey, levels: Range<u32>, layers: Range<u32>) -> Arc<Sh
         shadow_range: range,
         tracked: true,
         drops_writes: false,
+        levels: None,
         backing: Backing::Image,
         merge_scratch: ScratchSpares::default(),
-        touched: AtomicU64::new(0),
         stood: AtomicU64::new(0),
+        standing: Default::default(),
     })
 }
 
@@ -1451,6 +1489,7 @@ fn texels(
         aspects: vk::ImageAspectFlags::COLOR,
         levels,
         layers,
+        place: ImagePlace::WHOLE,
     };
     if writes {
         Use::writes(image, true, range, shader())
@@ -1613,11 +1652,11 @@ fn an_images_shadow_of_one_level_and_slice_is_cut_as_a_buffers_texture_is() {
     };
     let attachment = texels(image, 2..3, 0..1, true);
     let drawn = |area: [u32; 4]| Within {
-        uses: vec![attachment.clone()],
-        texels: Some(Arc::clone(&s)),
+        uses: std::slice::from_ref(&attachment),
+        texels: Some(&s),
         area,
     };
-    let command = |sync: &mut ShadowSync<u32>, shadows: &[ShadowUse], parts: &[Within]| {
+    let command = |sync: &mut ShadowSync<u32>, shadows: &[ShadowUse], parts: &[Within<'_>]| {
         let mut uses = vec![read.clone()];
         uses.extend(parts.iter().flat_map(|part| part.uses.iter().cloned()));
         let copies = sync.before(shadows, &uses, |_, _, _| Ok(0)).unwrap();
@@ -1653,8 +1692,8 @@ fn an_images_shadow_of_one_level_and_slice_is_cut_as_a_buffers_texture_is() {
     // every texel.
     let other_level = image_shadow(image, 1, 1);
     let elsewhere = Within {
-        uses: vec![texels(image, 2..3, 0..1, true)],
-        texels: Some(Arc::clone(&other_level)),
+        uses: &[texels(image, 2..3, 0..1, true)],
+        texels: Some(&other_level),
         area: a,
     };
     command(&mut sync, &[], &[elsewhere]);
@@ -2069,10 +2108,13 @@ fn a_large_surface_is_copied_in_whole_once_for_a_command_buffer_that_samples_it(
 }
 
 /// A command buffer carries a shadowed texture's image on only while nothing lets another writer
-/// of its truth in: a command of any of its encoders that writes the bytes another way, an
-/// encoder of another command buffer that ended with the texture in between, a wait for an event
-/// or a fence, work the encoder records apart, and an encoder that did not end holding the truth
-/// each leave the next encoder to copy the plane in again.
+/// of its truth in: a command of any of its encoders that writes the bytes another way, a copy
+/// back or merge of another shadowed texture over them, a wait for an event or a fence (or any
+/// other split of its batches, `State::shadows_to_carry`), work the encoder records apart, and an
+/// encoder that did not end holding the truth each leave the next encoder to copy the plane in
+/// again. An encoder of another command buffer that ended with the texture in between, or while
+/// this one's encoder was open, does not: on the GPU it runs before or after the batch
+/// (`shadow::ShadowCarry`).
 #[test]
 fn a_carried_surface_is_dropped_by_anything_that_lets_another_writer_in() {
     let plane = ResourceKey::new();
@@ -2098,18 +2140,19 @@ fn a_carried_surface_is_dropped_by_anything_that_lets_another_writer_in() {
         .sampling(&s, 1);
     assert_eq!(frame.texels, SURFACE_TEXELS, "other bytes");
     // An encoder of another command buffer ended with the texture between this command buffer's
-    // two: what this one carries is no longer what the image holds.
+    // two, or while this one's was open: it runs before or after this one's batch, so the image
+    // this one's next encoder runs after is still the one it left. Each carries its own.
     let mut frame = Frame::new();
     frame.sampling(&s, 1);
     let mut other = Frame::new();
     other.sampling(&s, 1);
     frame.sampling(&s, 1);
+    other.sampling(&s, 1);
     assert_eq!(
-        frame.texels, twice,
+        (frame.texels, other.texels),
+        (SURFACE_TEXELS, SURFACE_TEXELS),
         "another command buffer's encoder between"
     );
-    // One that ended with the texture while this command buffer's encoder was still open: its
-    // own end carries nothing either, as the image is no longer the one it left.
     let mut frame = Frame::new();
     let mut sync = frame.encoder();
     let mut made = 0;
@@ -2119,7 +2162,7 @@ fn a_carried_surface_is_dropped_by_anything_that_lets_another_writer_in() {
     frame.end(sync);
     frame.sampling(&s, 1);
     assert_eq!(
-        frame.texels, twice,
+        frame.texels, SURFACE_TEXELS,
         "another command buffer's encoder while open"
     );
     // The command buffer waits for an event or a binary semaphore; an encoder's wait for a
@@ -2173,6 +2216,17 @@ fn a_carried_surface_is_dropped_by_anything_that_lets_another_writer_in() {
     frame.end(sync);
     frame.sampling(&dropped, 1);
     assert_eq!(frame.texels, twice, "writes Metal drops");
+    // An encoder that writes through another shadowed texture over the same bytes, merged back
+    // as it ends, and never meets the carried one: the carried image no longer holds the bytes.
+    let twin = surface_shadow(plane);
+    let mut frame = Frame::new();
+    frame.sampling(&s, 1);
+    let mut sync = frame.encoder();
+    let mut made = 0;
+    frame.texels += texels_in(&planned(&mut sync, &mut made, &[(&twin, true)], &[]));
+    frame.end(sync);
+    frame.sampling(&s, 1);
+    assert_eq!(frame.texels, 3 * SURFACE_TEXELS, "a twin written through");
 }
 
 /// A render pass that renders a large surface's texture as a color attachment it loads pays only
@@ -2205,6 +2259,34 @@ fn sampling_a_large_surface_costs_every_texel_whatever_its_pass_repainted() {
     let mut present = Frame::new();
     present.sampling(&s, 1);
     assert_eq!(present.texels, SURFACE_TEXELS);
+}
+
+/// A render pass whose draws no scissor bounds renders every texel of a large surface's texture
+/// as a color attachment it loads: its rectangle is every texel, so its copy in moves them all,
+/// and the image then holds every texel. A later encoder of the command buffer that samples the
+/// plane takes the image the pass left and copies nothing in (`ShadowCarry`), as after a pass
+/// that bounds nothing; one with a scissor of a part of the plane still leaves the sample to copy
+/// every texel in.
+///
+/// The counts are this state machine's, taken by this test; they are no measurement of any
+/// program.
+#[test]
+fn a_pass_over_every_texel_leaves_the_image_holding_every_texel() {
+    let plane = ResourceKey::new();
+    let s = surface_shadow(plane);
+    let every = [0, 0, 3840, 2160];
+    let mut frame = Frame::new();
+    frame.rendering(&s, every).sampling(&s, 1);
+    assert_eq!(frame.texels, SURFACE_TEXELS);
+    // Past the plane's texels too: the rectangle is cut to them.
+    let mut frame = Frame::new();
+    frame.rendering(&s, [0, 0, 4096, 4096]).sampling(&s, 1);
+    assert_eq!(frame.texels, SURFACE_TEXELS);
+    // The control: a part of the plane leaves the sample every texel to copy in.
+    let part = [0, 0, 3840, 2159];
+    let mut frame = Frame::new();
+    frame.rendering(&s, part).sampling(&s, 1);
+    assert_eq!(frame.texels, 3840 * 2159 + SURFACE_TEXELS);
 }
 
 /// An encoder's first copy in of a large IOSurface plane falls in one of three places, which
@@ -2329,4 +2411,145 @@ fn a_pass_storing_its_loaded_area_merges_in_whole_blocks() {
     shadow::join(&mut joined, &through(&t, false).0);
     assert!(joined[0].tile_stores);
     assert_eq!(made_for(&joined, &used), [(true, Some(area))]);
+}
+
+/// A shadowed texture over `bytes` of the buffer `buffer` whose shadow is a copy taken at use (a
+/// tiled texture's of more than one level), its later levels kept.
+fn taken_at_use(buffer: ResourceKey, bytes: Range<u64>) -> Arc<ShadowCopies> {
+    let mut copies = Arc::into_inner(shadow(buffer, bytes)).expect("one holder");
+    let aspects = vk::ImageAspectFlags::COLOR;
+    copies.levels = Some(LevelsCopy::new(LaterLevels::Kept, aspects));
+    Arc::new(copies)
+}
+
+/// A copy taken at use is taken by the first use encoded after its mark, which clears it. An
+/// encoding of an encoder again (`command_buffer/reencode.rs`) takes it where its first encoding
+/// took it and not where it did not, whatever the mark, which it leaves as it finds it: a
+/// `did_modify_data` after the first encoding is the next use's to take.
+#[test]
+fn an_encoding_again_takes_a_copy_taken_at_use_where_its_first_encoding_took_it() {
+    let t = taken_at_use(ResourceKey::new(), 0..4096);
+    let k = t.shadow_key;
+    let levels = t.levels.as_ref().expect("a copy taken at use");
+    let first_use = |sync: &mut ShadowSync<u32>| moved(&planned(sync, &mut 0, &[(&t, false)], &[]));
+    // The first encoding takes it at its first use alone.
+    let mut first = ShadowSync::default();
+    assert_eq!(first_use(&mut first), [Moved::Into(k)]);
+    assert_eq!(first_use(&mut first), []);
+    let took = first.into_takes();
+    // A later encoder takes nothing.
+    let mut later = ShadowSync::default();
+    assert_eq!(first_use(&mut later), []);
+    let took_none = later.into_takes();
+    // Encoded again, the first takes it again, and the mark stays clear.
+    let mut again = ShadowSync::again(took.clone());
+    assert_eq!(first_use(&mut again), [Moved::Into(k)]);
+    assert_eq!(first_use(&mut again), []);
+    // An encoding again notes no take of its own.
+    assert_eq!(first_use(&mut ShadowSync::again(again.into_takes())), []);
+    assert_eq!(first_use(&mut ShadowSync::default()), []);
+    // After a `did_modify_data`, the later one encoded again takes nothing and the first takes it,
+    // as each did; the mark stays for the next use encoded.
+    levels.mark_stale();
+    assert_eq!(first_use(&mut ShadowSync::again(took_none)), []);
+    assert_eq!(first_use(&mut ShadowSync::again(took)), [Moved::Into(k)]);
+    assert_eq!(first_use(&mut ShadowSync::default()), [Moved::Into(k)]);
+    assert_eq!(first_use(&mut ShadowSync::default()), []);
+}
+
+/// A take whose recording never runs is given back (`Takes::give_back`, as `State::fail_part`
+/// gives back a failed encoder's): the next use takes the copy again, where that take is still the
+/// latest and the mark was not set since. A take a later one followed, or one of an encoder that
+/// took none, gives nothing back; nor does giving back twice. What an encoder leaves out
+/// (`ShadowSync::forget`) is given back so too.
+#[test]
+fn a_take_given_back_is_taken_again_at_the_next_use() {
+    let t = taken_at_use(ResourceKey::new(), 0..4096);
+    let k = t.shadow_key;
+    let levels = t.levels.as_ref().expect("a copy taken at use");
+    let first_use = |sync: &mut ShadowSync<u32>| moved(&planned(sync, &mut 0, &[(&t, false)], &[]));
+    let encode = || {
+        let mut sync = ShadowSync::default();
+        let moved = first_use(&mut sync);
+        (moved, sync.into_takes())
+    };
+    // Given back: the next use takes it, once.
+    let (moved, failed) = encode();
+    assert_eq!(moved, [Moved::Into(k)]);
+    failed.give_back();
+    let (moved, _) = encode();
+    assert_eq!(moved, [Moved::Into(k)]);
+    assert_eq!(encode().0, []);
+    // A later take holds the copy: giving the first back again changes nothing.
+    failed.give_back();
+    assert_eq!(encode().0, []);
+    // An encoder that took none gives nothing back.
+    let (moved, none) = encode();
+    assert_eq!(moved, []);
+    none.give_back();
+    assert_eq!(encode().0, []);
+    // A mark set since the take asks the next use for it once, the give-back adding nothing.
+    levels.mark_stale();
+    let (moved, taken) = encode();
+    assert_eq!(moved, [Moved::Into(k)]);
+    levels.mark_stale();
+    taken.give_back();
+    assert_eq!(encode().0, [Moved::Into(k)]);
+    assert_eq!(encode().0, []);
+    // Left out by the encoder that took it: the next use takes it.
+    levels.mark_stale();
+    let mut sync = ShadowSync::default();
+    assert_eq!(first_use(&mut sync), [Moved::Into(k)]);
+    sync.forget();
+    assert_eq!(encode().0, [Moved::Into(k)]);
+    assert_eq!(encode().0, []);
+}
+
+/// A recording in place of another that never runs (`ShadowSync::over`: a host step's of work its
+/// commit recorded) takes the copy where that one took it, whatever the mark, keeping its take,
+/// and decides a use that one did not meet by the mark. As it replaces that one, a take of that
+/// one it never met is given back (`Takes::give_back_unheld`), and one it kept is not. A use that
+/// one met and took nothing at takes nothing, the mark left for the next use.
+#[test]
+fn a_recording_in_place_of_another_keeps_its_takes() {
+    let t = taken_at_use(ResourceKey::new(), 0..4096);
+    let u = taken_at_use(ResourceKey::new(), 4096..8192);
+    let (kt, ku) = (t.shadow_key, u.shadow_key);
+    let levels = t.levels.as_ref().expect("a copy taken at use");
+    let first_use = |sync: &mut ShadowSync<u32>, of: &Arc<ShadowCopies>| {
+        moved(&planned(sync, &mut 0, &[(of, false)], &[]))
+    };
+    // The commit's recording takes t's copy.
+    let mut commit = ShadowSync::default();
+    assert_eq!(first_use(&mut commit, &t), [Moved::Into(kt)]);
+    let took = commit.into_takes();
+    // The step's takes t's where the commit's took it, the mark clear, and u's by its mark.
+    let mut step = ShadowSync::over(took.clone());
+    assert_eq!(first_use(&mut step, &t), [Moved::Into(kt)]);
+    assert_eq!(first_use(&mut step, &u), [Moved::Into(ku)]);
+    let kept = step.into_takes();
+    // The take it kept is not given back, and its own holds u's.
+    took.give_back_unheld(&kept);
+    assert_eq!(first_use(&mut ShadowSync::default(), &t), []);
+    assert_eq!(first_use(&mut ShadowSync::default(), &u), []);
+    // Its takes are the ones a failure gives back.
+    kept.give_back();
+    assert_eq!(first_use(&mut ShadowSync::default(), &t), [Moved::Into(kt)]);
+    assert_eq!(first_use(&mut ShadowSync::default(), &u), [Moved::Into(ku)]);
+    // A take of the commit's the step never meets is given back.
+    levels.mark_stale();
+    let mut commit = ShadowSync::default();
+    assert_eq!(first_use(&mut commit, &t), [Moved::Into(kt)]);
+    let took = commit.into_takes();
+    let step = ShadowSync::<u32>::over(took.clone());
+    took.give_back_unheld(&step.into_takes());
+    assert_eq!(first_use(&mut ShadowSync::default(), &t), [Moved::Into(kt)]);
+    // A use the commit's met and took nothing at takes nothing after a `did_modify_data`, which
+    // is the next use's to take.
+    let mut commit = ShadowSync::default();
+    assert_eq!(first_use(&mut commit, &t), []);
+    let took_none = commit.into_takes();
+    levels.mark_stale();
+    assert_eq!(first_use(&mut ShadowSync::over(took_none), &t), []);
+    assert_eq!(first_use(&mut ShadowSync::default(), &t), [Moved::Into(kt)]);
 }

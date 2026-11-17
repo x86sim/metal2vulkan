@@ -7,8 +7,8 @@
 //! `[[visible]]` functions. Through the public API (`Library::from_air`, `FunctionDescriptor`
 //! with `LinkedFunctions`, `Device::compile_compute_pipeline`) the caller compiles once its
 //! references resolve: a reference nothing supplies is `NeedsInput(LinkedFunction)`, a function
-//! of another signature is a descriptor error, a visible function is not a stage, and the linked
-//! functions are part of the compile key. The linked kernel validates on every committed
+//! of another signature links with the arguments by position, a visible function is not a stage,
+//! and the linked functions are part of the compile key. The linked kernel validates on every committed
 //! profile and computes Metal's values on the CPU interpreter. No GPU is used.
 //!
 //! `llvm-as` assembles the fixtures; a missing tool skips visibly.
@@ -20,7 +20,7 @@ use crate::air::ir::print::print_inst;
 use crate::air::ir::InstId;
 use crate::budget::{Budget, SPIRV_WORDS};
 use crate::device::{Device, DeviceDescription, DevicePolicy};
-use crate::error::{DescriptorError, Error, Feature, LinkProblem, LowerFamily, RuntimeInput};
+use crate::error::{DescriptorError, Error, Feature, LowerFamily, RuntimeInput};
 use crate::library::{FunctionConstantValue, FunctionConstantValues, FunctionStage, Library};
 use crate::lower::select::LowerInputs;
 use crate::metal::DataType;
@@ -255,6 +255,104 @@ fn a_linked_kernel_computes_its_linked_functions() {
     assert_eq!(words(&out.buffers[1]), expect_floats);
 }
 
+/// The words `words[i]` the caller computes over 32 threads with `linked`.
+fn caller_words(caller: &[u8], linked: &[LinkedSource<'_>]) -> Vec<u32> {
+    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let (_, m) = typed_module_linked(caller, CALLER, &p, linked).expect("module");
+    const N: u32 = 32;
+    let buffer = |index| Buffer {
+        slot: Some(ResourceSlot {
+            stage: Stage::Kernel,
+            kind: ResourceKind::Buffer,
+            index,
+        }),
+        address: None,
+        bytes: vec![0; N as usize * 4],
+    };
+    let res = Resources {
+        buffers: vec![buffer(0), buffer(1)],
+        push: vec![0; 128],
+        spec: Default::default(),
+    };
+    let cfg = Config {
+        workgroups: [N, 1, 1],
+        ..Config::default()
+    };
+    let out = run(&m, &cfg, res).unwrap_or_else(|e| panic!("{e:?}"));
+    out.buffers[0]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// `name` of `bitcode` in the linked list `list`.
+fn in_list<'a>(
+    name: &'a str,
+    bitcode: &'a [u8],
+    none: &'a FunctionConstantValues,
+    list: crate::pipeline::LinkedList<'static>,
+) -> LinkedSource<'a> {
+    let mut source = LinkedSource::new(name, bitcode, none);
+    source.key.list = list;
+    source
+}
+
+/// No visible-function reference resolves to a function only `binary_functions` lists, as Metal
+/// links them (a probe on an M3 Max under macOS 27.0.1, `binary_function_linking.m`): the caller's
+/// `linked_scale` and `linked_scale`'s own `linked_offset` held there alone need their linked
+/// function, as Metal's creation fails ("unresolved visible function reference"); beside a
+/// `linked_scale` of `functions` (`engine/linked_other_functions`' is `x + 100`), the reference
+/// calls that one, whichever module it comes from, as Metal's does.
+#[test]
+fn a_reference_resolves_to_no_binary_function() {
+    use crate::pipeline::LinkedList::{BinaryFunctions, Functions, PrivateFunctions};
+    let Some((caller, functions)) = fixtures() else {
+        return;
+    };
+    let Some(other) = fixture("linked_other_functions") else {
+        return;
+    };
+    let none = FunctionConstantValues::defaults();
+    let blend = in_list("linked_blend", &functions, &none, Functions);
+    let offset = in_list("linked_offset", &caller, &none, PrivateFunctions);
+    let scale = |bitcode, list| in_list("linked_scale", bitcode, &none, list);
+    let alone = [scale(&functions, BinaryFunctions), blend, offset];
+    assert_eq!(
+        compile_linked(&caller, &alone, "moltenvk-m3").map(|_| ()),
+        Err(needs("linked_scale"))
+    );
+    let nested = [
+        scale(&functions, Functions),
+        blend,
+        in_list("linked_offset", &caller, &none, BinaryFunctions),
+    ];
+    assert_eq!(
+        compile_linked(&caller, &nested, "moltenvk-m3").map(|_| ()),
+        Err(needs("linked_offset"))
+    );
+    let own: Vec<u32> = (0..32).map(|i| 3 * i + (i & 7)).collect();
+    let others: Vec<u32> = (0..32).map(|i| i + 100).collect();
+    for (linked, expect) in [
+        (
+            [scale(&functions, Functions), scale(&other, BinaryFunctions)],
+            &own,
+        ),
+        (
+            [scale(&other, BinaryFunctions), scale(&functions, Functions)],
+            &own,
+        ),
+        (
+            [scale(&other, Functions), scale(&functions, BinaryFunctions)],
+            &others,
+        ),
+    ] {
+        let all = [linked[0], linked[1], blend, offset];
+        assert_eq!(&caller_words(&caller, &all), expect);
+    }
+}
+
 /// Through the public API: `FunctionDescriptor.linked` resolves the references from
 /// `functions` and `private_functions` alike, a function listed twice is one function, and
 /// `groups` (function-pointer call sites) resolve no reference.
@@ -354,14 +452,18 @@ fn linked_functions_are_part_of_the_key() {
     }
 }
 
-/// A linked function whose type is not the reference's is a descriptor error, not a
-/// conversion: here `linked_scale` is renamed onto `linked_blend`'s `float(float, float)`.
+/// A linked function whose type is not the reference's links with the arguments by position, as
+/// Metal links it (the probe `linked_function_signatures.m`, the conformance crate's `probes/`):
+/// here `linked_scale`, referenced as `uint (uint)`, is `linked_blend`'s
+/// `float (float a, float b) = a * b + 1` renamed onto it. Its `a` takes the bits of the
+/// argument, its `b`, which the reference does not pass, reads zero, and its result passes back
+/// as its bits: every word is 1.0's.
 #[test]
-fn a_linked_function_of_another_signature_is_a_descriptor_error() {
-    let Some(caller) = fixture(CALLER) else {
+fn a_linked_function_of_another_signature_links_by_position() {
+    let Some((caller, functions)) = fixtures() else {
         return;
     };
-    let Some(functions) = edited(FUNCTIONS, |text| {
+    let Some(renamed) = edited(FUNCTIONS, |text| {
         text.replace("@linked_scale", "@linked_int")
             .replace("!\"linked_scale\"", "!\"linked_int\"")
             .replace("@linked_blend", "@linked_scale")
@@ -370,14 +472,11 @@ fn a_linked_function_of_another_signature_is_a_descriptor_error() {
         return;
     };
     let none = FunctionConstantValues::defaults();
-    let linked = [LinkedSource::new("linked_scale", &functions, &none)];
-    assert_eq!(
-        compile_linked(&caller, &linked, "moltenvk-m3").map(|_| ()),
-        Err(Error::InvalidDescriptor(DescriptorError::LinkedFunction {
-            name: crate::error::DiagName::new("linked_scale"),
-            problem: LinkProblem::Signature,
-        }))
-    );
+    let linked = [
+        LinkedSource::new("linked_scale", &renamed, &none),
+        LinkedSource::new("linked_blend", &functions, &none),
+    ];
+    assert_eq!(caller_words(&caller, &linked), vec![1.0f32.to_bits(); 32]);
 }
 
 /// A constexpr sampler inside a linked function links with it: the linked module's

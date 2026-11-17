@@ -11,38 +11,73 @@
 //!   its copies takes the pages again, and waits for that publication as the batch that holds
 //!   the copy is submitted, which records the copy then (`shadow::GatedCopyIn`,
 //!   [`DirtyPages::wait`]); a copied host buffer (`copied.rs`), whose copy in is the commit's
-//!   own, asks and waits at the commit, one stamp of each log for every copy. A copy then syncs
-//!   to that stamp: every write made after it is stamped later.
+//!   own, asks and waits at the commit, one stamp of each log for every copy, and again as a batch
+//!   that waits for an event value not reached before that copy in is submitted
+//!   (`command_buffer/copies_again.rs`). A copy then syncs to that stamp: every write made after
+//!   it is stamped later.
 //! - **The pages changed** ([`DirtyPages::changed_except`]) since the stamp a copy synced to, by
 //!   any writer but that copy's own, are the only bytes it may lack: they are copied in, the rest
 //!   skipped. Copied host buffers ask once per log and stamp for all of them, every writer's
 //!   ([`DirtyPages::changed`]), but one whose merges back wrote a MiB or more since, which asks
 //!   apart for every writer's but its own.
 //! - **The runtime's own writes** into the pages (a shadow's copy back or merge, a copied host
-//!   buffer's merge back, `copied.rs`) are reported ([`DirtyPages::wrote_as`]), naming the copy
-//!   as their writer, so other copies of the same
+//!   buffer's merge back, `copied.rs`) are reported ([`DirtyPages::wrote_runs_as`]), naming the
+//!   copy as their writer, so other copies of the same
 //!   pages see them as changed and the copy's own copies in, under a log that keeps writers
 //!   apart, do not. So are the GPU's writes into pages imported in place, which no log of the
-//!   host's sees, and the runtime's CPU writes into the pages ([`DirtyPages::wrote`]).
+//!   host's sees, and the runtime's CPU writes into the pages ([`DirtyPages::wrote_runs`]).
+//!   Each report is one call to each log, carrying every run of the source's offsets the write
+//!   reaches in it (an object over a guest RAM's scattered pages is many runs of the RAM's log):
+//!   gathered in a buffer of the reporting thread's, kept for its next report.
 //! - **The GPU's writes in place** are those a command buffer's commands name (their uses, of a
 //!   buffer over the pages, a heap's buffers or textures, a texture over a buffer's bytes: a
 //!   texture's use names its whole buffer or heap, and so does a command buffer that wrote more
-//!   than 64 ranges of one), reported at its commit, again before anything sees each of its
-//!   batches complete, and at its completion ([`DirtyCommit::report_host_writes`]), but for the
-//!   bytes its shadows' copies back report as their own. Metal's contract has a command reach a
-//!   resource only through a binding or a residency it named.
+//!   than 64 ranges of one), reported at its commit and once more after they ran, as the
+//!   runtime finishes its last batch, or a batch that signals an event, before it marks the
+//!   batch's events reached, tells the scheduler, its waiters and its completed handlers
+//!   ([`DirtyCommit::report_host_writes`]). A read of a shared event's value from its semaphore
+//!   (`signaledValue`, a host wait) can see the GPU's signal before that, so a copy of the pages
+//!   made on the CPU at a commit (a copied host buffer's) also compares the bytes written in place
+//!   by every command buffer not yet so reported ([`DirtyShadows::in_flight`]); a copy on the GPU
+//!   is ordered after the write by the tracker. Its shadows' copies
+//!   back and merges into the pages are the shadow's own writes on every log of the pages, never
+//!   the consumer's. Metal's contract has a command reach a resource only through a binding or a
+//!   residency it named.
+//! - **Holds.** A shadow's log holds the stamp as of which its image held every texel of the
+//!   truth, set at the commit of a command buffer whose end left it so ([`ShadowLog`]), and its
+//!   next copy in takes only the pages changed since. A write of the truth reported to the same
+//!   source over every byte it names (a command's write into the pages imported in place, a
+//!   shadow's merge back: at the commit, stamped after every stamp asked before, and ordered on
+//!   the GPU by the tracker against the copies of the command buffers committed before or after
+//!   it) is such a change: it lets go of no hold, before its copy in in the same command buffer
+//!   or in a later one, and the copy takes the pages it wrote. A write of the shadow itself, one
+//!   no log of the source keeps whole, and any write of its truth in a command buffer that copies
+//!   it back or merges it (whose own write, reported as the shadow's, would hide a write beneath
+//!   it from the shadow's copies in) let go of it: the next copy in moves every row, unless the
+//!   command buffer's end left the image holding every texel, which then holds from its stamp.
+//!   A merge back cut to a rectangle of the texels names, and reports, the rows of the rectangle
+//!   alone (`shadow_merge.rs`), so another copy of the same pages takes those rows.
+//! - **A waiting writer.** A command buffer that waits for an event or a semaphore may run after
+//!   work committed after it. Its writes into the pages are reported at its commit, before that
+//!   work's stamps, so a hold a later commit takes (its image holding the truth as of its stamp)
+//!   would not count them, though they land after the image's copy. So its writes are kept
+//!   ([`WaitingWrites`]) until it completes, and while they meet a shadow's truth or the shadow,
+//!   that shadow's log takes no hold and gives none (`WorkCounts::dirty_holds_withheld`): a log
+//!   made after the commit too, since a shadow's log is made at its first copy in. Its completion
+//!   reports the writes again, and the next commit holds again.
 //! - **Correctness first.** A wait that answers `false`, a source that cannot say, and a copy
 //!   that holds nothing it may count on all copy every byte.
 //!
 //! [`HostMemory::with_dirty_pages`]: crate::HostMemory::with_dirty_pages
 
-use super::copied::Written;
+use super::copied::CopiesReached;
 use super::device::lock;
 use super::key_hash::KeyMap;
 use super::resource::ResourceKey;
 use super::shadow::ShadowCopies;
 use super::tracker::{Use, UseRange};
 use ash::vk;
+use std::cell::RefCell;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::ops::Range;
@@ -69,32 +104,41 @@ pub struct DirtyStamp(pub u64);
 /// changed for any stamp earlier than the start of the log's continuous watch over it
 /// ([`watch`](Self::watch)), which the first watch over the page begins, whatever source asks;
 /// a page no one watches any more counts as changed for every stamp until one watches it again.
-/// A write the host makes (the consumer's own, and those [`wrote`](Self::wrote) reports) is
-/// stamped at once. The sources over the same host bytes share one order of stamps: each answers
+/// A write the host makes (the consumer's own, and those the runtime reports,
+/// [`wrote_runs`](Self::wrote_runs) and kin, every run of a call) is stamped at once. The sources over the same host bytes share one order of stamps: each answers
 /// [`changed`](Self::changed) for a stamp another of them gave as for its own. A closed source
 /// (the consumer's reset, pause or stop) answers [`wait`](Self::wait) with `false`, so the
 /// runtime takes every page as changed.
 ///
 /// **Writers** (optional: both methods default to the plain ones). The runtime reports a copy's
 /// own copy back or merge (a shadow's, or a copied host buffer's merge back of the GPU's writes,
-/// `copied.rs`) naming the copy as its writer ([`wrote_as`](Self::wrote_as)), and asks
-/// for that copy's copy in which pages changed by any writer but it
-/// ([`changed_except`](Self::changed_except)): it already holds what it wrote, so a page only it
-/// wrote since is no change to it. A writer is a [`NonZeroU64`] no other writer in the process
-/// is ever given; 0 is the consumer's own writes and every write reported through
-/// [`wrote`](Self::wrote), which no copy's question leaves out. The sources over the same host
-/// bytes share their writers as their stamps. One way to keep it: per page, its latest stamp and
-/// that write's writer, and the latest stamp of any other writer; `changed_except(since, w)`
-/// counts the page where its latest writer is not `w` and its latest stamp is later than
-/// `since`, or where it is and the other writers' latest stamp is.
+/// `copied.rs`) naming the copy as its writer ([`wrote_runs_as`](Self::wrote_runs_as), by
+/// default [`wrote_as`](Self::wrote_as) for each run), and asks for that copy's copy in which
+/// pages changed by any writer but it ([`changed_except`](Self::changed_except)): it already
+/// holds what it wrote, so a page only it wrote since is no change to it. A writer is a
+/// [`NonZeroU64`] no other writer in the process is ever given; 0 is the consumer's own writes
+/// and every write reported through [`wrote_runs`](Self::wrote_runs) (or [`wrote`](Self::wrote)),
+/// which no copy's question leaves out. The sources over the same host bytes share their writers
+/// as their stamps. One way to keep it: per page, its latest stamp and that write's writer, and
+/// the latest stamp of any other writer; `changed_except(since, w)` counts the page where its
+/// latest writer is not `w` and its latest stamp is later than `since`, or where it is and the
+/// other writers' latest stamp is.
+///
+/// **Batches.** Each write the runtime reports comes to each log of the pages as one call of
+/// [`wrote_runs`](Self::wrote_runs) or [`wrote_runs_as`](Self::wrote_runs_as) carrying every run
+/// of it in that log: an object over a guest RAM's scattered pages is many runs of the RAM's log,
+/// one call. By default they call [`wrote`](Self::wrote) or [`wrote_as`](Self::wrote_as) once a
+/// run, in order, so a source that implements only those hears every run.
 ///
 /// **Threads.** Called on the runtime's threads, never under a lock the source's own calls
 /// take: [`watch`](Self::watch) where a copy of the pages is made, [`request`](Self::request) on
 /// the thread that commits a command buffer, [`wait`](Self::wait), [`changed`](Self::changed)
 /// and [`changed_except`](Self::changed_except) on the thread that records its commands for the
-/// GPU, and for copied host buffers on the thread that commits it, [`wrote`](Self::wrote) and
-/// [`wrote_as`](Self::wrote_as) at the commit and at the completion. A [`Watch`](Self::Watch) may be dropped on a completion thread, so its drop takes
-/// no lock the consumer holds while it calls the runtime.
+/// GPU, and for copied host buffers on the thread that commits it,
+/// [`wrote_runs`](Self::wrote_runs) and [`wrote_runs_as`](Self::wrote_runs_as) at the commit and
+/// once its work ran (on the thread that finishes its batches, before its waiters and completed
+/// handlers see its last batch complete). A [`Watch`](Self::Watch) may be dropped on a
+/// completion thread, so its drop takes no lock the consumer holds while it calls the runtime.
 ///
 /// [`HostMemory::with_dirty_pages`]: crate::HostMemory::with_dirty_pages
 /// [`HostMemory::pointer`]: crate::HostMemory::pointer
@@ -125,7 +169,7 @@ pub trait DirtyPages: Send + Sync {
 
     /// The runtime wrote the memory's bytes `range` (offsets from its pointer) itself: from the
     /// GPU (a shadow's copy back, a merge, a copied host buffer's merge back, a command's write
-    /// into the pages imported in place, at the commit and again at the completion) or from the
+    /// into the pages imported in place, at the commit and again once it ran) or from the
     /// CPU (a `replaceRegion` of a texture over them or of a heap's texture held in them, an
     /// argument encoder's write, `copyParameterDataToBuffer`), so other copies of the same pages
     /// see it as changed.
@@ -136,6 +180,44 @@ pub trait DirtyPages: Send + Sync {
     fn wrote_as(&self, range: Range<u64>, writer: NonZeroU64) {
         let _ = writer;
         self.wrote(range);
+    }
+
+    /// [`wrote`](Self::wrote) of each of `runs`, in one call: how the runtime reports every write
+    /// of its own as the consumer's (writer 0). No Metal counterpart: a metal2vulkan host-memory
+    /// extension. By default, `wrote` for each run, in order.
+    ///
+    /// One call carries one write the runtime made into the bytes of one object over the memory
+    /// (a no-copy buffer's or heap's, or a guest RAM's chunk a
+    /// `BlitCommandEncoder::copy_to_host_ram` writes): a range a command buffer's commands wrote
+    /// in place (but for the bytes a shadow's copy back or merge wrote, which
+    /// [`wrote_runs_as`](Self::wrote_runs_as) reports apart), or a CPU write. `runs` is never
+    /// empty, and each run is non-empty and holds bytes of the object. The runs are in the order
+    /// of the object's bytes they hold, and no two hold the same byte of the object; they are not
+    /// sorted by offset where the object's pages are not in the memory's order (a guest RAM's
+    /// log, whose offsets are host addresses, over an object's scattered pages), two may meet one
+    /// page of the log, and two may name the same bytes where the object's pages map one page of
+    /// the memory twice.
+    fn wrote_runs(&self, runs: &[Range<u64>]) {
+        for run in runs {
+            self.wrote(run.clone());
+        }
+    }
+
+    /// [`wrote_as`](Self::wrote_as) of each of `runs`, in one call, every one of them `writer`'s:
+    /// how the runtime reports a copy's own copy back or merge (the trait's **Writers**). No Metal
+    /// counterpart: a metal2vulkan host-memory extension. By default, `wrote_as` for each run, in
+    /// order.
+    ///
+    /// One call carries one write of the copy's into the bytes of one object over the memory (a
+    /// shadow's truth, or the no-copy buffer's or heap's pages it lies in): a shadow's copy back or
+    /// merge, or a copied host buffer's merge back (the blocks of 4 KiB it wrote a byte of,
+    /// adjacent ones joined). `runs` is as [`wrote_runs`](Self::wrote_runs)' is: never empty,
+    /// each run non-empty, in the order of the object's bytes they hold, no two holding the same
+    /// byte of the object, not sorted by offset where its pages are scattered.
+    fn wrote_runs_as(&self, runs: &[Range<u64>], writer: NonZeroU64) {
+        for run in runs {
+            self.wrote_as(run.clone(), writer);
+        }
     }
 
     /// [`changed`](Self::changed), leaving out a page whose every write stamped later than
@@ -156,10 +238,10 @@ pub(crate) trait DirtyHook: Send + Sync {
     fn request(&self) -> DirtyStamp;
     /// [`DirtyPages::wait`].
     fn wait(&self, stamp: DirtyStamp) -> bool;
-    /// [`DirtyPages::wrote`].
-    fn wrote_as_consumer(&self, range: Range<u64>);
-    /// [`DirtyPages::wrote_as`].
-    fn wrote_as(&self, range: Range<u64>, writer: NonZeroU64);
+    /// [`DirtyPages::wrote_runs`].
+    fn wrote_runs(&self, runs: &[Range<u64>]);
+    /// [`DirtyPages::wrote_runs_as`].
+    fn wrote_runs_as(&self, runs: &[Range<u64>], writer: NonZeroU64);
     /// [`DirtyPages::changed`].
     fn changed(&self, since: DirtyStamp, out: &mut Vec<Range<u64>>);
     /// [`DirtyPages::changed_except`].
@@ -183,11 +265,11 @@ where
     fn wait(&self, stamp: DirtyStamp) -> bool {
         self.0.wait(stamp)
     }
-    fn wrote_as_consumer(&self, range: Range<u64>) {
-        self.0.wrote(range);
+    fn wrote_runs(&self, runs: &[Range<u64>]) {
+        self.0.wrote_runs(runs);
     }
-    fn wrote_as(&self, range: Range<u64>, writer: NonZeroU64) {
-        self.0.wrote_as(range, writer);
+    fn wrote_runs_as(&self, runs: &[Range<u64>], writer: NonZeroU64) {
+        self.0.wrote_runs_as(runs, writer);
     }
     fn changed(&self, since: DirtyStamp, out: &mut Vec<Range<u64>>) {
         self.0.changed(since, out);
@@ -283,11 +365,16 @@ impl DirtySource {
         published
     }
 
-    /// [`DirtyPages::wrote`] of the source's offsets `range` by the runtime's own CPU (a
-    /// `replaceRegion` of a texture over the pages, writer 0), where non-empty.
-    pub(crate) fn wrote(&self, range: Range<u64>) {
-        if range.start < range.end {
-            self.hook.wrote_as_consumer(range);
+    /// The runtime wrote the source's offsets `runs` (each non-empty) itself, as `writer`
+    /// ([`DirtyPages::wrote_runs_as`]), or as the consumer where `None`
+    /// ([`DirtyPages::wrote_runs`]): one call, where there are any.
+    pub(crate) fn wrote(&self, runs: &[Range<u64>], writer: Option<NonZeroU64>) {
+        if runs.is_empty() {
+            return;
+        }
+        match writer {
+            Some(writer) => self.hook.wrote_runs_as(runs, writer),
+            None => self.hook.wrote_runs(runs),
         }
     }
 
@@ -339,11 +426,19 @@ impl ShadowLog {
         range.start.wrapping_add(self.delta)..range.end.wrapping_add(self.delta)
     }
 
+    /// The host addresses a copy back or merge into the `VkBuffer` bytes `range` writes, cut to
+    /// the truth's; `None` where it writes none.
+    fn written_at(&self, range: Range<u64>) -> Option<Range<u64>> {
+        let offsets = self.written(range)?;
+        let pointer = self.source.pointer;
+        Some(offsets.start.wrapping_add(pointer)..offsets.end.wrapping_add(pointer))
+    }
+
     /// Report a copy back or merge of the shadow into the `VkBuffer` bytes `range`
-    /// ([`DirtyPages::wrote_as`], the shadow its writer).
+    /// ([`DirtyPages::wrote_runs_as`], one run, the shadow its writer).
     pub(crate) fn wrote_back(&self, range: Range<u64>) {
         if let Some(offsets) = self.written(range) {
-            self.source.hook.wrote_as(offsets, self.writer);
+            (self.source).wrote(std::slice::from_ref(&offsets), Some(self.writer));
         }
     }
 
@@ -375,6 +470,32 @@ pub(crate) struct DirtyShadows {
     /// once one is ([`DirtyShadows::collects`]).
     imports: Mutex<Imports>,
     imported: AtomicBool,
+    /// The writes of the committed command buffers not yet completed that wait for an event or a
+    /// semaphore ([`DirtyShadows::committed`]), each one's apart.
+    waiting: Mutex<Vec<Arc<WaitingWrites>>>,
+    /// The host addresses each committed command buffer wrote in place, from its commit until its
+    /// writes were reported as run ([`DirtyShadows::in_flight`]), by its number.
+    in_flight: Mutex<Vec<(u64, Box<[Range<u64>]>)>>,
+    /// The number the next such command buffer takes.
+    next_in_flight: AtomicU64,
+}
+
+/// A committed command buffer's writes, kept while it waits for an event or a semaphore and has
+/// not completed (the module docs' **A waiting writer**): it may run after work committed after
+/// it.
+struct WaitingWrites {
+    written: Vec<Use<ResourceKey>>,
+    /// Its writes were more than [`WRITES`], or went unnoted while nothing collected them: they
+    /// meet everything.
+    overflowed: bool,
+}
+
+impl WaitingWrites {
+    /// Whether a write of them meets `copies`' truth or its shadow.
+    fn meets(&self, copies: &ShadowCopies) -> bool {
+        self.overflowed
+            || (self.written.iter()).any(|used| used.key == copies.shadow_key || copies.meets(used))
+    }
 }
 
 /// The logs of host pages imported in place, by the key of each buffer whose uses name them, held
@@ -399,6 +520,20 @@ pub(crate) struct DirtyTally {
     pub(crate) waits: AtomicU64,
     pub(crate) waits_unanswered: AtomicU64,
     pub(crate) wait_nanos: AtomicU64,
+    pub(crate) holds_withheld: AtomicU64,
+}
+
+/// How long [`DirtyShadows::ran`] waits before it reports a command buffer's writes in place, in
+/// milliseconds: set by a test, so a host wait sees the batch's signal well before the report
+/// (`tests::copied_log_device`). Never set outside tests.
+#[cfg(test)]
+static REPORT_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Make [`DirtyShadows::ran`] wait `ms` milliseconds before each report of writes in place in
+/// this process ([`REPORT_DELAY_MS`]).
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) fn delay_reports(ms: u64) {
+    REPORT_DELAY_MS.store(ms, Ordering::SeqCst);
 }
 
 /// The writers no other shadow or copy in the process is ever given.
@@ -424,19 +559,84 @@ pub(crate) struct PagesLog {
     logs: Vec<LogOf>,
 }
 
+/// A shadow's copy back or merge as [`PagesLog::wrote_but`] takes it: the shadow's writer, the
+/// source its copies in ask, and the host addresses it wrote.
+pub(crate) type ShadowWrite<'a> = (NonZeroU64, &'a Arc<DirtySource>, Range<u64>);
+
 /// One log of an object's pages ([`PagesLog`]).
 struct LogOf {
     source: Arc<DirtySource>,
-    /// The object's bytes in the source's offsets: runs, each its first byte of the object and
-    /// the source's offsets of it, in the object's order, apart.
-    runs: Box<[(u64, Range<u64>)]>,
+    /// The object's bytes in the source's offsets, as runs in the object's order, apart: each
+    /// one's first byte of the object (ascending), and the source's offsets of it.
+    firsts: Box<[u64]>,
+    offsets: Box<[Range<u64>]>,
+    /// The runs' indices in the order of their first offsets in the source, and the longest
+    /// run's length: [`bytes_of`](Self::bytes_of) finds the runs a few changed pages meet from
+    /// them, with no walk over every run.
+    by_offset: Box<[u32]>,
+    longest: u64,
 }
 
 impl LogOf {
+    /// The log of `source` that holds the object's bytes in `runs`: each one's first byte of the
+    /// object and the source's offsets of it, in the object's order, apart.
+    fn new(source: &Arc<DirtySource>, runs: impl IntoIterator<Item = (u64, Range<u64>)>) -> LogOf {
+        let (firsts, offsets): (Vec<u64>, Vec<Range<u64>>) = runs.into_iter().unzip();
+        let mut by_offset: Vec<u32> = (0..offsets.len() as u32).collect();
+        by_offset.sort_unstable_by_key(|&index| offsets[index as usize].start);
+        let longest = (offsets.iter())
+            .map(|run| run.end.saturating_sub(run.start))
+            .max()
+            .unwrap_or(0);
+        LogOf {
+            source: Arc::clone(source),
+            firsts: firsts.into_boxed_slice(),
+            offsets: offsets.into_boxed_slice(),
+            by_offset: by_offset.into_boxed_slice(),
+            longest,
+        }
+    }
+
+    /// Its runs, in the object's order: each one's first byte of the object and the source's
+    /// offsets of it.
+    fn runs(&self) -> impl Iterator<Item = (u64, &Range<u64>)> {
+        self.firsts.iter().copied().zip(self.offsets.iter())
+    }
+
+    /// One past the object's last byte in run `index`.
+    fn end_of(&self, index: usize) -> u64 {
+        let offsets = &self.offsets[index];
+        self.firsts[index] + (offsets.end - offsets.start)
+    }
+
     /// Each run of the object's bytes that `changed` (the source's offsets, sorted by start and
-    /// apart) meets, to `each`, in the object's order.
+    /// apart) meets, to `each`: in the object's order where `changed` holds as many runs as the
+    /// object's bytes take or more, walking every run of them; else in `changed`'s order, each
+    /// changed run finding the runs it meets by their first offsets (`by_offset`), so a commit
+    /// that changed a few pages of a copy stitched from thousands of runs costs those pages alone.
     fn bytes_of(&self, changed: &[Range<u64>], mut each: impl FnMut(Range<u64>)) {
-        for (first, offsets) in self.runs.iter() {
+        if changed.len() < self.offsets.len() {
+            for run in changed {
+                // A run whose first offset lies below this, at most the longest run's length
+                // long, ends by the changed run's start.
+                let low = run.start.saturating_sub(self.longest);
+                let from = (self.by_offset)
+                    .partition_point(|&index| self.offsets[index as usize].start < low);
+                for &index in self.by_offset[from..]
+                    .iter()
+                    .take_while(|&&index| self.offsets[index as usize].start < run.end)
+                {
+                    let (first, offsets) =
+                        (self.firsts[index as usize], &self.offsets[index as usize]);
+                    let (start, stop) = (run.start.max(offsets.start), run.end.min(offsets.end));
+                    if start < stop {
+                        each(first + (start - offsets.start)..first + (stop - offsets.start));
+                    }
+                }
+            }
+            return;
+        }
+        for (first, offsets) in self.runs() {
             let from = changed.partition_point(|run| run.end <= offsets.start);
             for run in changed[from..]
                 .iter()
@@ -450,15 +650,68 @@ impl LogOf {
         }
     }
 
-    /// Each run of the source's offsets of the object's bytes `bytes`, to `each`.
-    fn each(&self, bytes: &Range<u64>, mut each: impl FnMut(Range<u64>)) {
-        for (first, offsets) in self.runs.iter() {
-            let end = first + (offsets.end - offsets.start);
-            let (start, stop) = (bytes.start.max(*first), bytes.end.min(end));
-            if start < stop {
-                each(offsets.start + (start - first)..offsets.start + (stop - first));
-            }
+    /// Each run of the source's offsets of the object's bytes `bytes`, appended to `out` in the
+    /// object's order: the runs `bytes` meets, found by their first bytes, copied as one slice,
+    /// the first and the last cut to it.
+    fn runs_of(&self, bytes: &Range<u64>, out: &mut Vec<Range<u64>>) {
+        if bytes.start >= bytes.end {
+            return;
         }
+        // The runs that start at or before `bytes` does, and those that start before it ends.
+        let below = self.firsts.partition_point(|first| *first <= bytes.start);
+        let to = self.firsts.partition_point(|first| *first < bytes.end);
+        // The last run that starts at or before `bytes` meets it unless it ends by its start.
+        let from = match below.checked_sub(1) {
+            Some(last) if self.end_of(last) > bytes.start => last,
+            _ => below,
+        };
+        if from >= to {
+            return;
+        }
+        let at = out.len();
+        out.extend_from_slice(&self.offsets[from..to]);
+        out[at].start += bytes.start.saturating_sub(self.firsts[from]);
+        let last = out.len() - 1;
+        out[last].end -= self.end_of(to - 1).saturating_sub(bytes.end);
+    }
+}
+
+thread_local! {
+    /// What a report of the runtime's writes to an object's logs gathers before each call
+    /// ([`DirtyPages::wrote_runs`]), kept for the thread's next report: a warm one allocates
+    /// nothing.
+    static SCRATCH: RefCell<Scratch> = const {
+        RefCell::new(Scratch {
+            runs: Vec::new(),
+            apart: Vec::new(),
+        })
+    };
+}
+
+/// A report's buffers ([`SCRATCH`]).
+struct Scratch {
+    /// The runs of one call to a source.
+    runs: Vec<Range<u64>>,
+    /// The object's bytes its shadows' copies back and merges wrote, sorted by start
+    /// ([`PagesLog::wrote_but`]).
+    apart: Vec<Range<u64>>,
+}
+
+/// `report` with the thread's [`Scratch`]; with a new one where the thread's is in use (a source's
+/// call that reported a write through the runtime again) or gone (the thread's end).
+fn with_scratch(mut report: impl FnMut(&mut Scratch)) {
+    let kept = SCRATCH.try_with(|scratch| match scratch.try_borrow_mut() {
+        Ok(mut scratch) => {
+            report(&mut scratch);
+            true
+        }
+        Err(_) => false,
+    });
+    if !matches!(kept, Ok(true)) {
+        report(&mut Scratch {
+            runs: Vec::new(),
+            apart: Vec::new(),
+        });
     }
 }
 
@@ -475,10 +728,10 @@ impl PagesLog {
         let mut logs = Vec::new();
         if let Some(source) = own {
             if let Some(start) = source.offset_of(pointer) {
-                logs.push(LogOf {
-                    source: Arc::clone(source),
-                    runs: Box::new([(0, start..start.saturating_add(length))]),
-                });
+                logs.push(LogOf::new(
+                    source,
+                    [(0, start..start.saturating_add(length))],
+                ));
             }
         }
         if let Some((source, window, offset)) = ram {
@@ -499,10 +752,7 @@ impl PagesLog {
                 at += size;
             }
             if !runs.is_empty() {
-                logs.push(LogOf {
-                    source: Arc::clone(source),
-                    runs: runs.into_boxed_slice(),
-                });
+                logs.push(LogOf::new(source, runs));
             }
         }
         (!logs.is_empty()).then(|| {
@@ -524,9 +774,7 @@ impl PagesLog {
     pub(crate) fn watch(&self) -> Vec<Box<dyn Send + Sync>> {
         (self.logs.iter())
             .flat_map(|log| {
-                log.runs
-                    .iter()
-                    .map(|(_, offsets)| log.source.hook.watch(offsets.clone()))
+                (log.offsets.iter()).map(|offsets| log.source.hook.watch(offsets.clone()))
             })
             .collect()
     }
@@ -534,8 +782,8 @@ impl PagesLog {
     /// The object's bytes no log keeps the writes to, in order: every copy in compares them.
     pub(crate) fn unlogged(&self) -> Vec<Range<u64>> {
         let mut kept: Vec<Range<u64>> = (self.logs.iter())
-            .flat_map(|log| log.runs.iter())
-            .map(|(first, offsets)| *first..first + (offsets.end - offsets.start))
+            .flat_map(|log| log.runs())
+            .map(|(first, offsets)| first..first + (offsets.end - offsets.start))
             .collect();
         kept.sort_by_key(|run| run.start);
         let mut unlogged = Vec::new();
@@ -550,6 +798,30 @@ impl PagesLog {
             unlogged.push(at..self.length);
         }
         unlogged
+    }
+
+    /// Whether its log of `source` keeps every byte of the object's `bytes` (cut to its length):
+    /// a write of them it reports ([`DirtyCommit::report_host_writes`]) reaches `source` whole.
+    fn logs_all_of(&self, source: &Arc<DirtySource>, bytes: &Range<u64>) -> bool {
+        let (start, end) = (bytes.start, bytes.end.min(self.length));
+        if start >= end {
+            return true;
+        }
+        let of_source = self
+            .logs
+            .iter()
+            .filter(|log| Arc::ptr_eq(&log.source, source));
+        of_source.into_iter().any(|log| {
+            // The runs are in the object's order, apart.
+            let mut at = start;
+            for (first, offsets) in log.runs() {
+                let stop = first + (offsets.end - offsets.start);
+                if first <= at && at < stop {
+                    at = stop;
+                }
+            }
+            at >= end
+        })
     }
 
     /// Each run of the object's bytes that `changed`, the runs log `index` (of [`sources`]'
@@ -567,34 +839,96 @@ impl PagesLog {
         }
     }
 
-    /// The runtime wrote the object's bytes `bytes` itself (writer 0, [`DirtyPages::wrote`]):
+    /// The runtime wrote the object's bytes `bytes` itself (writer 0, [`DirtyPages::wrote_runs`]):
     /// reported to every log, so every copy of the pages takes them.
     pub(crate) fn wrote(&self, bytes: Range<u64>) {
+        let bytes = std::slice::from_ref(&bytes);
+        with_scratch(|scratch| self.report(bytes, None, None, &mut scratch.runs));
+    }
+
+    /// Report the object's bytes `bytes` (in its order, apart) as `writer`'s, or the consumer's
+    /// where `None` ([`DirtySource::wrote`]), to each log but the one of source `but` where
+    /// given: one call to each, carrying the runs of the log's offsets of all of them, in order,
+    /// gathered in `runs`.
+    fn report(
+        &self,
+        bytes: &[Range<u64>],
+        writer: Option<NonZeroU64>,
+        but: Option<&Arc<DirtySource>>,
+        runs: &mut Vec<Range<u64>>,
+    ) {
         for log in &self.logs {
-            log.each(&bytes, |run| log.source.wrote(run));
+            if but.is_some_and(|source| Arc::ptr_eq(&log.source, source)) {
+                continue;
+            }
+            runs.clear();
+            for bytes in bytes {
+                log.runs_of(bytes, runs);
+            }
+            log.source.wrote(runs, writer);
         }
     }
 
-    /// [`wrote`](Self::wrote), but for the source offsets `but` names of each source: what a
-    /// shadow over the same pages reports as its own write ([`DirtyCommit::report_host_writes`]).
-    fn wrote_but(&self, bytes: Range<u64>, but: &[(&Arc<DirtySource>, Range<u64>)]) {
-        for log in &self.logs {
-            log.each(&bytes, |run| {
-                let mut left = vec![run];
-                for (_, apart) in but.iter().filter(|(s, _)| Arc::ptr_eq(s, &log.source)) {
-                    left = (left.into_iter())
-                        .flat_map(|run| {
-                            let before = run.start..run.end.min(apart.start);
-                            let after = run.start.max(apart.end)..run.end;
-                            [before, after].into_iter().filter(|r| r.start < r.end)
-                        })
-                        .collect();
+    /// The host addresses of the object's bytes `bytes`, cut to the object's.
+    fn addresses(&self, bytes: &Range<u64>) -> Range<u64> {
+        let (start, end) = (bytes.start.min(self.length), bytes.end.min(self.length));
+        self.pointer + start..self.pointer + end
+    }
+
+    /// The object's bytes at the host addresses `addresses`, cut to the object's; `None` where
+    /// none lies there.
+    pub(crate) fn bytes_at(&self, addresses: &Range<u64>) -> Option<Range<u64>> {
+        let start = (addresses.start.saturating_sub(self.pointer)).min(self.length);
+        let end = (addresses.end.saturating_sub(self.pointer)).min(self.length);
+        (start < end).then_some(start..end)
+    }
+
+    /// The object's bytes `written` a command buffer's commands wrote in place
+    /// ([`DirtyCommit::report_host_writes`]), reported to every log: as the consumer's
+    /// ([`wrote`](Self::wrote)) but for what its shadows' copies back and merges wrote (each
+    /// `shadows`' writer, the source its copies in ask and the host addresses it wrote), which is
+    /// the shadow's own write on every log ([`DirtyPages::wrote_as`]): its own source hears of it
+    /// from the shadow's log ([`ShadowLog::wrote_back`]), every other log of the pages here.
+    /// Another copy of the pages, through any of their logs, counts it as changed; the shadow's
+    /// own copies in do not, whose source answers for the writers of every source over the same
+    /// host bytes (the trait's **Writers**).
+    ///
+    /// Each log hears of each of `written` in one call ([`DirtyPages::wrote_runs`]), carrying the
+    /// runs of every byte of it no shadow wrote, in order, and of each shadow's write in one more
+    /// ([`DirtyPages::wrote_runs_as`]).
+    pub(crate) fn wrote_but(&self, written: &[Range<u64>], shadows: &[ShadowWrite<'_>]) {
+        with_scratch(|Scratch { runs, apart }| {
+            apart.clear();
+            apart.extend((shadows.iter()).filter_map(|(_, _, at)| self.bytes_at(at)));
+            apart.sort_unstable_by_key(|bytes| bytes.start);
+            for bytes in written {
+                let bytes = bytes.start.min(self.length)..bytes.end.min(self.length);
+                for log in &self.logs {
+                    runs.clear();
+                    // The bytes no shadow wrote, in order: the gaps between the shadows' writes.
+                    let mut at = bytes.start;
+                    for shadow in apart.iter() {
+                        if at >= bytes.end {
+                            break;
+                        }
+                        if at < shadow.start {
+                            log.runs_of(&(at..shadow.start.min(bytes.end)), runs);
+                        }
+                        at = at.max(shadow.end);
+                    }
+                    if at < bytes.end {
+                        log.runs_of(&(at..bytes.end), runs);
+                    }
+                    log.source.wrote(runs, None);
                 }
-                for run in left {
-                    log.source.wrote(run);
+            }
+            for (writer, source, at) in shadows {
+                if let Some(bytes) = self.bytes_at(at) {
+                    let bytes = std::slice::from_ref(&bytes);
+                    self.report(bytes, Some(*writer), Some(*source), runs);
                 }
-            });
-        }
+            }
+        });
     }
 
     /// [`wrote`](Self::wrote) of the host addresses `addresses`, cut to the object's: a CPU write
@@ -607,16 +941,10 @@ impl PagesLog {
         }
     }
 
-    /// The runtime wrote the object's bytes `bytes` as `writer`, a copy's merge back
-    /// ([`DirtyPages::wrote_as`]): reported to every log.
-    pub(crate) fn wrote_as(&self, bytes: Range<u64>, writer: NonZeroU64) {
-        for log in &self.logs {
-            log.each(&bytes, |run| {
-                if run.start < run.end {
-                    log.source.hook.wrote_as(run, writer);
-                }
-            });
-        }
+    /// The runtime wrote the object's bytes `bytes` (in its order, apart) as `writer`, a copy's
+    /// merge back ([`DirtyPages::wrote_runs_as`]): reported to every log, in one call to each.
+    pub(crate) fn wrote_as(&self, bytes: &[Range<u64>], writer: NonZeroU64) {
+        with_scratch(|scratch| self.report(bytes, Some(writer), None, &mut scratch.runs));
     }
 }
 
@@ -721,16 +1049,48 @@ impl DirtyShadows {
         Some(log)
     }
 
-    /// A command buffer whose commit was `commit` completed, `failed` or not: its shadows' copies
+    /// A batch of the command buffer whose commit was `commit` completed that ends it, or that
+    /// signals an event, and nothing saw it complete yet (`completion.rs`): its shadows' copies
     /// back and merges are reported again ([`DirtyPages::wrote_as`]), and its writes into logged
-    /// host pages imported in place ([`DirtyCommit::report_host_writes`]), now they ran, so a
-    /// stamp asked between the commit and the GPU's write still finds them; where it failed, the
-    /// holds its copies in set are let go of, its copies having perhaps not run.
-    pub(crate) fn completed(&self, commit: &DirtyCommit, failed: bool) {
+    /// host pages imported in place ([`DirtyCommit::report_host_writes`]), now they ran, so a copy
+    /// that synced to a stamp asked between the commit and the GPU's write, and read the pages
+    /// before it, finds them changed at its next copy in. Before the batch's events are marked
+    /// reached and the scheduler, its waiters and its completed handlers see it: a copy after any
+    /// of those finds them too.
+    /// Where the batch `ends` the command buffer, every write of it ran.
+    pub(crate) fn ran(&self, commit: &mut DirtyCommit, ends: bool) {
+        #[cfg(test)]
+        if !commit.host.is_empty() {
+            let delay = REPORT_DELAY_MS.load(Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
         for (log, range) in &commit.wrote {
             log.wrote_back(range.clone());
         }
         commit.report_host_writes();
+        commit.ran |= ends;
+        if ends {
+            self.reported(commit);
+        }
+    }
+
+    /// A command buffer whose commit was `commit` completed, `failed` or not: its writes are
+    /// reported again as [`ran`](Self::ran) does where no batch of it reported them so (a batch
+    /// failed, or the waiters finished none); where it failed, the holds its copies in set are let
+    /// go of, its copies having perhaps not run.
+    pub(crate) fn completed(&self, commit: &DirtyCommit, failed: bool) {
+        if !commit.ran {
+            for (log, range) in &commit.wrote {
+                log.wrote_back(range.clone());
+            }
+            commit.report_host_writes();
+        }
+        self.reported(commit);
+        // Its writes ran and were reported again, stamped after them: the logs they met may hold
+        // again from the next commit on.
+        if let Some(writes) = &commit.waiting {
+            lock(&self.waiting).retain(|kept| !Arc::ptr_eq(kept, writes));
+        }
         if !failed {
             return;
         }
@@ -757,14 +1117,38 @@ impl DirtyShadows {
     /// the holds as they stand and a stamp each (no hold where it `waits` for an event or a
     /// semaphore: work committed after it may run before it), its writes let go of the holds of
     /// the shadows they meet, and the shadows its end left holding every texel of the truth
-    /// (`held`) hold from their stamp on.
-    pub(crate) fn committed(&self, commit: &DirtyCommit, held: &[Arc<ShadowCopies>], waits: bool) {
-        let DirtyCommit {
-            written,
-            gates,
-            wrote,
-            ..
-        } = commit;
+    /// (`held`) hold from their stamp on. Where it `waits`, its writes are kept until it
+    /// completed ([`WaitingWrites`]), and no log they meet holds or is held: it may run after a
+    /// later commit's work, whose hold its write, reported before that commit's stamp, would not
+    /// undo. Where some of its commands' writes went `unnoted`, nothing collecting them then, its
+    /// writes meet every log.
+    pub(crate) fn committed(
+        &self,
+        commit: &mut DirtyCommit,
+        held: &[Arc<ShadowCopies>],
+        waits: bool,
+        unnoted: bool,
+    ) {
+        let overflowed = commit.overflowed || unnoted;
+        if waits && (overflowed || !commit.written.is_empty()) {
+            let writes = Arc::new(WaitingWrites {
+                written: commit.written.clone(),
+                overflowed,
+            });
+            lock(&self.waiting).push(Arc::clone(&writes));
+            commit.waiting = Some(writes);
+        }
+        let DirtyCommit { gates, wrote, .. } = &*commit;
+        // Whether the writes of a command buffer that waits and has not completed, this one among
+        // them, meet `log`'s truth or shadow.
+        let waited = |log: &ShadowLog| {
+            let Some(copies) = log.copies.upgrade() else {
+                return false;
+            };
+            lock(&self.waiting)
+                .iter()
+                .any(|writes| writes.meets(&copies))
+        };
         // One stamp per source and commit.
         let mut stamps: Vec<(Arc<DirtySource>, DirtyStamp)> = Vec::new();
         let mut stamp_of = |source: &Arc<DirtySource>| {
@@ -776,8 +1160,8 @@ impl DirtyShadows {
             stamp
         };
         let mut synced: Vec<(Arc<ShadowLog>, DirtyStamp)> = Vec::new();
-        for gate in gates {
-            let since = match gate.written_before || waits {
+        for gate in gates.iter() {
+            let since = match gate.written_before || waits || waited(&gate.log) {
                 true => None,
                 false => *lock(&gate.log.hold),
             };
@@ -785,18 +1169,18 @@ impl DirtyShadows {
             *lock(&gate.decision) = Some(Decision { since, stamp });
             synced.push((Arc::clone(&gate.log), stamp));
         }
-        for (log, range) in wrote {
+        for (log, range) in wrote.iter() {
             log.wrote_back(range.clone());
         }
-        commit.report_host_writes();
+        // A write the logs will report lets go of no hold: a later copy in takes the pages it
+        // wrote as changed since (the module docs' **Holds**). Writes kept not all apart meet
+        // every log.
         let logs: Vec<Arc<ShadowLog>> = lock(&self.logs).clone();
         for log in &logs {
             let Some(copies) = log.copies.upgrade() else {
                 continue;
             };
-            let meets =
-                |used: &Use<ResourceKey>| used.key == copies.shadow_key || copies.meets(used);
-            if written.iter().any(meets) {
+            if overflowed || commit.wrote_unreported(&copies, &log.source) {
                 *lock(&log.hold) = None;
             }
         }
@@ -805,9 +1189,45 @@ impl DirtyShadows {
                 .copies
                 .upgrade()
                 .is_some_and(|copies| held.iter().any(|h| Arc::ptr_eq(h, &copies)));
-            if holds {
-                *lock(&log.hold) = Some(stamp);
+            if !holds {
+                continue;
             }
+            match waited(&log) {
+                false => *lock(&log.hold) = Some(stamp),
+                true => {
+                    self.tally.holds_withheld.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        if !commit.host.is_empty() {
+            let number = self.next_in_flight.fetch_add(1, Ordering::Relaxed);
+            let addresses: Box<[Range<u64>]> = (commit.host.iter())
+                .flat_map(|(pages, ranges)| ranges.iter().map(|bytes| pages.addresses(bytes)))
+                .collect();
+            lock(&self.in_flight).push((number, addresses));
+            commit.in_flight = Some(number);
+        }
+        commit.report_host_writes();
+    }
+
+    /// The host addresses the committed command buffers wrote in place whose writes were not yet
+    /// reported as run ([`ran`](Self::ran)): a copy of the pages made on the CPU at a commit
+    /// compares them whatever the logs say (`copied.rs`). The GPU may have written them already,
+    /// and a host wait for an event (`signaledValue`, `waitUntilSignaledValue`) reads its
+    /// semaphore, so the program may know it before the report, and commit work that reads the
+    /// copy. Taken before the copy asks the logs for a stamp: a command buffer gone from here was
+    /// reported before that stamp.
+    pub(crate) fn in_flight(&self) -> Vec<Range<u64>> {
+        let in_flight = lock(&self.in_flight);
+        (in_flight.iter())
+            .flat_map(|(_, addresses)| addresses.iter().cloned())
+            .collect()
+    }
+
+    /// `commit`'s writes were reported as run: no copy needs to compare them apart any more.
+    fn reported(&self, commit: &DirtyCommit) {
+        if let Some(number) = commit.in_flight {
+            lock(&self.in_flight).retain(|(kept, _)| *kept != number);
         }
     }
 }
@@ -818,64 +1238,127 @@ impl DirtyShadows {
 #[derive(Default)]
 pub(crate) struct DirtyCommit {
     written: Vec<Use<ResourceKey>>,
+    /// For each of `written`, the logs of host pages imported in place its write is reported to
+    /// ([`DirtyCommit::report_host_writes`]): indices into `host`.
+    reported: Vec<Vec<usize>>,
     gates: Vec<Arc<CopyInGate>>,
     wrote: Vec<(Arc<ShadowLog>, Range<u64>)>,
+    /// Its writes as the device keeps them while it waits for an event or a semaphore
+    /// ([`DirtyShadows::committed`]), let go of at its completion.
+    waiting: Option<Arc<WaitingWrites>>,
     /// Its writes were more than [`WRITES`]: `written` holds the first alone.
     overflowed: bool,
+    /// The keys its commands used (read or wrote), for the copy in of copied host buffers at its
+    /// commit (`copied.rs`): at most [`WRITES`] of them, past which `used_all`.
+    used: KeyMap<ResourceKey, ()>,
+    used_all: bool,
     /// Its writes into host pages imported in place whose memory is logged: each pages' logs,
     /// and the bytes written, in order, at most [`HOST_RANGES`] of them, past which the pages
     /// are written whole.
     host: Vec<(Arc<PagesLog>, Vec<Range<u64>>)>,
+    /// The logs heard of its writes after they all ran ([`DirtyShadows::ran`]).
+    ran: bool,
+    /// Its number among the command buffers whose writes in place were not reported as run yet
+    /// ([`DirtyShadows::in_flight`]), from its commit.
+    in_flight: Option<u64>,
 }
 
 /// The most writes a command buffer keeps apart, past which they are one write of everything.
 const WRITES: usize = 4096;
+
+/// The bytes a write `used` names: its range's, or every byte for an image's levels and layers,
+/// which name no bytes.
+fn written_bytes(used: &Use<ResourceKey>) -> Range<u64> {
+    match &used.range {
+        UseRange::Bytes(bytes) => bytes.clone(),
+        UseRange::Image { .. } => 0..u64::MAX,
+    }
+}
 
 /// The most ranges of one host pages' a command buffer keeps apart, past which it wrote them
 /// whole.
 const HOST_RANGES: usize = 64;
 
 impl DirtyCommit {
-    /// Note a command's `uses`: its writes, each once; and of them, those into logged host pages
-    /// imported in place (`shadows`' [`Imports`]).
+    /// Note a command's `uses`: the keys it used, each once; its writes, each once; and of them,
+    /// those into logged host pages imported in place (`shadows`' [`Imports`]).
     pub(crate) fn note(&mut self, uses: &[Use<ResourceKey>], shadows: &DirtyShadows) {
+        for used in uses {
+            if self.used_all {
+                break;
+            }
+            match self.used.len() < WRITES || self.used.contains_key(&used.key) {
+                true => {
+                    self.used.insert(used.key, ());
+                }
+                false => {
+                    self.used_all = true;
+                    self.used.clear();
+                }
+            }
+        }
         let imports = shadows.in_place().then(|| lock(&shadows.imports));
         for used in uses.iter().filter(|used| !used.write.is_empty()) {
             let seen = (self.written.iter().rev().take(8))
                 .any(|w| w.key == used.key && w.range == used.range);
-            match (seen, self.written.len() < WRITES) {
-                (true, _) => {}
-                (false, true) => self.written.push(used.clone()),
-                (false, false) => self.overflowed = true,
-            }
+            let kept = match (seen, self.written.len() < WRITES) {
+                (true, _) => None,
+                (false, true) => {
+                    self.written.push(used.clone());
+                    self.reported.push(Vec::new());
+                    Some(self.written.len() - 1)
+                }
+                (false, false) => {
+                    self.overflowed = true;
+                    None
+                }
+            };
             let Some(logs) = imports.as_ref().and_then(|i| i.by_key.get(&used.key)) else {
                 continue;
             };
-            let bytes = match &used.range {
-                UseRange::Bytes(bytes) => bytes.clone(),
-                // An image's levels and layers, which name no bytes: all of them.
-                UseRange::Image { .. } => 0..u64::MAX,
-            };
+            let bytes = written_bytes(used);
             for log in logs.iter().filter_map(Weak::upgrade) {
-                self.wrote_host(log, bytes.clone());
+                let at = self.wrote_host(log, bytes.clone());
+                if let Some(kept) = kept {
+                    self.reported[kept].push(at);
+                }
             }
         }
+    }
+
+    /// Whether its commands so far may have written the bytes of `key`: a write of it noted, or
+    /// more writes than it keeps apart (`read_twin.rs`).
+    pub(crate) fn may_have_written(&self, key: ResourceKey) -> bool {
+        self.overflowed || self.written.iter().any(|used| used.key == key)
     }
 
     /// Its commands' writes, for the merge back of copied host buffers (`copied.rs`): the keys
     /// they wrote, or every copy where it kept them not all apart.
-    pub(crate) fn copies_written(&self, into: &mut Written) {
+    pub(crate) fn copies_written(&self, into: &mut CopiesReached) {
         if self.overflowed {
-            into.wrote_all();
+            into.reached_all();
             return;
         }
         for used in &self.written {
-            into.wrote(used.key);
+            into.reached(used.key);
         }
     }
 
-    /// Note a write of `bytes` of the host pages `log` keeps the writes to.
-    fn wrote_host(&mut self, log: Arc<PagesLog>, bytes: Range<u64>) {
+    /// Its commands' uses, for the copy in of copied host buffers at its commit (`copied.rs`): the
+    /// keys they read or wrote, or every copy where it kept them not all apart.
+    pub(crate) fn copies_used(&self, into: &mut CopiesReached) {
+        if self.used_all {
+            into.reached_all();
+            return;
+        }
+        for key in self.used.keys() {
+            into.reached(*key);
+        }
+    }
+
+    /// Note a write of `bytes` of the host pages `log` keeps the writes to: where it lies in
+    /// `host`.
+    fn wrote_host(&mut self, log: Arc<PagesLog>, bytes: Range<u64>) -> usize {
         let at = match (self.host.iter()).position(|(kept, _)| Arc::ptr_eq(kept, &log)) {
             Some(at) => at,
             None => {
@@ -886,40 +1369,69 @@ impl DirtyCommit {
         let ranges = &mut self.host[at].1;
         let whole = 0..u64::MAX;
         if ranges.first() == Some(&whole) || ranges.iter().rev().take(8).any(|r| *r == bytes) {
-            return;
+            return at;
         }
         match ranges.len() < HOST_RANGES {
             true => ranges.push(bytes),
             false => *ranges = vec![whole],
         }
+        at
+    }
+
+    /// Whether a write noted so far meets `copies`' truth or its shadow where it is not reported
+    /// to `source` whole: a write of the shadow itself, or of a truth's bytes that no log of
+    /// `source` over host pages imported in place keeps ([`DirtyCommit::report_host_writes`]),
+    /// or any write of the truth where the shadow copies back or merges into it in the command
+    /// buffer, whose own write the report names it the writer of over the bytes beneath it, a
+    /// command's write there among them, so its own copies in would leave them out. A write so
+    /// reported reaches a copy in that asks `source` what changed after it.
+    fn wrote_unreported(&self, copies: &ShadowCopies, source: &Arc<DirtySource>) -> bool {
+        let backs = (self.wrote.iter()).any(|(log, _)| std::ptr::eq(log.copies.as_ptr(), copies));
+        (self.written.iter().zip(&self.reported)).any(|(used, reported)| {
+            if used.key == copies.shadow_key {
+                return true;
+            }
+            if !copies.meets(used) {
+                return false;
+            }
+            if backs {
+                return true;
+            }
+            let bytes = written_bytes(used);
+            let reaches = |&at: &usize| self.host[at].0.logs_all_of(source, &bytes);
+            !reported.iter().any(reaches)
+        })
     }
 
     /// Report its writes into logged host pages imported in place to their logs, as the
     /// consumer's writes (writer 0, [`DirtyPages::wrote`]): but for the bytes its shadows' copies
-    /// back and merges report as their own ([`ShadowLog::wrote_back`]), which every other copy
-    /// of the pages counts as changed already, and their own copies in must not. At the commit
-    /// ([`DirtyShadows::committed`]), again at each of its batches' completion turns, before
-    /// anything sees the batch complete (its event signals among them, `completion.rs`), and at
-    /// its completion ([`DirtyShadows::completed`]): a GPU write after a copy's sync at a stamp is
-    /// reported after it too, before work ordered after the write can look.
+    /// back and merges wrote, the shadow's own on every log of the pages
+    /// ([`PagesLog::wrote_but`]), which every other copy of the pages counts as changed, and the
+    /// shadow's own copies in must not. Twice: at the commit ([`DirtyShadows::committed`]), so a
+    /// copy that a later commit's stamp syncs and the device orders after the write takes the
+    /// pages; and once the write ran, before the runtime marks it complete
+    /// ([`DirtyShadows::ran`]; [`DirtyShadows::completed`] where no batch did), so a copy that
+    /// synced between the commit and the write, reading the pages before it, takes them at its
+    /// next copy in.
     pub(crate) fn report_host_writes(&self) {
         if self.host.is_empty() {
             return;
         }
-        let shadows: Vec<(&Arc<DirtySource>, Range<u64>)> = (self.wrote.iter())
-            .filter_map(|(log, range)| Some((&log.source, log.written(range.clone())?)))
+        let shadows: Vec<ShadowWrite<'_>> = (self.wrote.iter())
+            .filter_map(|(log, range)| {
+                Some((log.writer, &log.source, log.written_at(range.clone())?))
+            })
             .collect();
-        for (log, ranges) in &self.host {
-            for bytes in ranges {
-                log.wrote_but(bytes.clone(), &shadows);
-            }
+        for (pages, ranges) in &self.host {
+            pages.wrote_but(ranges, &shadows);
         }
     }
 
-    /// Whether a write noted so far meets `copies`' truth or its shadow.
-    fn wrote_over(&self, copies: &ShadowCopies) -> bool {
-        self.written.len() >= WRITES
-            || (self.written.iter()).any(|used| used.key == copies.shadow_key || copies.meets(used))
+    /// Whether a write noted so far meets `copies`' truth or its shadow where `source`'s log is
+    /// not told of it ([`wrote_unreported`](Self::wrote_unreported)); every one where they were
+    /// more than [`WRITES`].
+    fn wrote_over(&self, copies: &ShadowCopies, source: &Arc<DirtySource>) -> bool {
+        self.overflowed || self.written.len() >= WRITES || self.wrote_unreported(copies, source)
     }
 
     /// A gate for a copy in of `log`'s shadow `copies` recorded now ([`CopyInGate`]), counted in
@@ -929,11 +1441,12 @@ impl DirtyCommit {
         (log, copies, texel): (Arc<ShadowLog>, &ShadowCopies, u64),
         shadows: &DirtyShadows,
     ) -> Arc<CopyInGate> {
+        let written_before = self.wrote_over(copies, &log.source);
         let gate = Arc::new(CopyInGate {
             log,
             texel,
             tally: Arc::clone(&shadows.tally),
-            written_before: self.wrote_over(copies),
+            written_before,
             decision: Mutex::new(None),
         });
         self.gates.push(Arc::clone(&gate));

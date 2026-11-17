@@ -49,9 +49,11 @@
 //!   in which, in the draw that takes the snapshot, each non-helper fragment copies its pixel's
 //!   texel, and that draw returns after it; in the draw that reads it, each read of the slot reads
 //!   the snapshot, and a helper reads 0. The body runs outside the critical section.
-//! - Refused: the `uint2` overloads of `map_screen_to_physical_coordinates` and its inverse
-//!   (canon compiles the `float2` ones to the rate map's decoder; no reading of the
-//!   physical-to-screen `uint2` one is established).
+//! - **Pull-model interpolation** (`interpolate`): each `interpolate_at_*` call of an
+//!   `interpolant` reads the interpolant's variable where it says (`stage_io::interpolate`); the
+//!   interpolant itself is planned by `lower::stage_io`.
+//! - `map_screen_to_physical_coordinates` and its inverse never reach lowering: canon compiles
+//!   every overload, `float2` and `uint2`, to the rate map's decoder (`air::canon::rate_map`).
 
 mod color;
 mod coverage;
@@ -60,6 +62,9 @@ mod discard;
 pub(crate) mod fetch;
 mod imageblock;
 mod input_blend;
+mod input_shadow;
+mod interpolate;
+mod logic;
 mod rog;
 mod snapshot;
 mod stencil;
@@ -109,8 +114,17 @@ pub use fetch::{
     StorageColor,
 };
 pub use imageblock::{select_output as select_imageblock_output, ImageblockPlan};
-pub(crate) use input_blend::texel as input_blend_texel;
-pub use input_blend::{select_second_output as select_input_second_output, InputBlend};
+pub(crate) use input_blend::{rotated_texel as rotated_input_texel, texel as input_blend_texel};
+pub use input_blend::{
+    select_second_output as select_input_second_output, InputBlend, RotatedInputBlend,
+};
+pub use input_shadow::InputShadow;
+pub(crate) use input_shadow::{shadows as input_shadow, store as input_shadow_store};
+pub use logic::LogicInput;
+pub(crate) use logic::{
+    channels as logic_channels, input_operated as logic_input_operated,
+    vulkan_differs as logic_vulkan_differs,
+};
 #[cfg(test)]
 pub(crate) use snapshot::{decode as snapshot_decode, encode as snapshot_encode};
 pub(crate) use snapshot::{prepare as snapshot_prepare, read as snapshot_read};
@@ -134,6 +148,8 @@ pub enum FragmentStrategy {
     /// `OpIsHelperInvocationEXT` where a discard demotes, else the `HelperInvocation` input, or a
     /// predicated discard's `discarded`; `false` in every other stage, as Metal answers there.
     IsHelperThread,
+    /// An interpolation function of an `interpolant` (`stage_io::interpolate`).
+    Interpolate(crate::lower::stage_io::InterpolantRead),
 }
 
 impl FamilyStrategy for FragmentStrategy {
@@ -145,6 +161,7 @@ impl FamilyStrategy for FragmentStrategy {
             FragmentStrategy::Discard => "fragment.discard",
             FragmentStrategy::NumSamples(_) => "fragment.num_samples",
             FragmentStrategy::IsHelperThread => "fragment.is_helper_thread",
+            FragmentStrategy::Interpolate(_) => "fragment.interpolate",
         })
     }
 
@@ -157,6 +174,9 @@ impl FamilyStrategy for FragmentStrategy {
             FragmentStrategy::Discard => 24,
             FragmentStrategy::NumSamples(_) => 16,
             FragmentStrategy::IsHelperThread => 32,
+            // An offset's move and clamp, and their constants, or a sample's mask; the read is
+            // the parameter's use (`stage_io`).
+            FragmentStrategy::Interpolate(_) => 32,
         }
     }
 }
@@ -194,10 +214,20 @@ pub struct FragmentPlan {
     /// The extended-range attachments whose blend the function computes over their input
     /// attachments, on a device that orders fetch through them (`input_blend`), by index.
     pub input_blends: BTreeMap<u32, InputBlend>,
+    /// The attachments held with their channels rotated whose blend the function computes over
+    /// their input attachments, on a device that orders fetch through them (`input_blend`), by
+    /// index.
+    pub rotated_blends: BTreeMap<u32, RotatedInputBlend>,
     /// The word attachments whose word the function merges into the texel's over their input
     /// attachments, on a device that orders fetch through them (`word_input`), by index: the bits
     /// of the fields each write keeps from the texel.
     pub word_merges: BTreeMap<u32, u32>,
+    /// The attachments whose private logic operation the function computes over their input
+    /// attachments, on a device that orders fetch through them (`logic`), by index.
+    pub logic_inputs: BTreeMap<u32, LogicInput>,
+    /// The extended-range attachments whose `half` shadow the draw's instance holds, on a device
+    /// that orders fetch through input attachments (`input_shadow`), by index.
+    pub input_shadows: BTreeMap<u32, InputShadow>,
     /// The stage interface's `FragCoord` object, which gives the pixel of the storage form and
     /// of the shader-side stencil.
     pub fetch_coord: Option<usize>,
@@ -336,17 +366,21 @@ pub fn finish(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<(), Error> {
     imageblock::finish(cx)?;
     fetch::finish(cx)?;
     stencil::finish(cx)?;
-    // An imageblock, an attachment in the storage form, and the shadow of a shader-side stencil
-    // are read and written inside the critical section whether or not the function names a
-    // raster order group.
+    // An imageblock, an attachment in the storage form, the shadow of a shader-side stencil and
+    // an extended-range attachment's shadow over its input attachment are read and written inside
+    // the critical section whether or not the function names a raster order group.
     let shadow = cx.families.fragment.stencil.is_some();
-    let storage = !cx.families.fragment.fetch.is_empty() || shadow;
-    let interlock =
-        if rog::declared(cx.entry) || cx.families.fragment.imageblock.is_some() || storage {
-            Some(rog::mode(cx)?)
-        } else {
-            None
-        };
+    let input_shadows = !cx.families.fragment.input_shadows.is_empty();
+    // A function looping over its covered samples runs no interlocked body (`wrap_entry`).
+    if input_shadows && looped {
+        return Err(Unsupported::not_implemented(Feature::FramebufferFetch).into());
+    }
+    let storage = !cx.families.fragment.fetch.is_empty() || shadow || input_shadows;
+    let interlock = if rog::declared(cx) || cx.families.fragment.imageblock.is_some() || storage {
+        Some(rog::mode(cx)?)
+    } else {
+        None
+    };
     let snapshot = snapshot::finish(cx, interlock.is_some(), looped)?;
     let sites: Vec<InstId> = cx.families.fragment.discards.keys().copied().collect();
     let discard::DiscardPlan {
@@ -403,7 +437,13 @@ pub fn finish(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<(), Error> {
         ))
         .saturating_add(stencil::words(cx, rets))
         .saturating_add(input_blend::words(cx, returns(cx)))
+        .saturating_add(input_shadow::words(
+            cx,
+            color::uses(cx, &cx.families.fragment.colors),
+            returns(cx),
+        ))
         .saturating_add(word_input::words(cx, returns(cx)))
+        .saturating_add(logic::words(cx, returns(cx)))
         .saturating_add(depth_test::words(cx, rets))
         .saturating_add(killing_rets.saturating_mul(RETURN_KILL_WORDS))
         .saturating_add((quad_exits.len() as u64).saturating_mul(QUAD_EXIT_WORDS))
@@ -446,7 +486,8 @@ pub struct Declared {
     /// The stand-in of the stencil attachment an in-shader stencil test reads and writes.
     pub stencil_stand_in: Option<GlobalId>,
     /// The `half` shadow of each extended-range attachment the storage form reads and writes
-    /// against it (`fetch::StorageColor::shadowed`), by color index.
+    /// against it (`fetch::StorageColor::shadowed`), or that a function on a device that fetches
+    /// through input attachments reads and writes beside them (`input_shadow`), by color index.
     pub extended_shadows: BTreeMap<u32, GlobalId>,
     /// The `Private u32` holding the sample of the loop's pass over the covered samples.
     pub loop_sample: Option<GlobalId>,
@@ -494,13 +535,18 @@ pub fn declare(
         mb,
         &fp.colors,
         (&fp.fetch, &fp.input_blends, &fp.word_merges),
+        (&fp.rotated_blends, &fp.logic_inputs),
         fp.fetch_sample.is_some(),
     )?;
     for (&color, sc) in &fp.fetch {
         if sc.shadowed {
             d.extended_shadows
-                .insert(color, fetch::declare_shadow(mb, color)?);
+                .insert(color, fetch::declare_shadow(mb, color, sc.view.samples)?);
         }
+    }
+    for (&color, shadow) in &fp.input_shadows {
+        d.extended_shadows
+            .insert(color, fetch::declare_shadow(mb, color, shadow.samples)?);
     }
     d.imageblock = imageblock::declare(mb, fp.imageblock.as_ref())?;
     d.shadow_stencil = stencil::declare(mb, fp.stencil.as_ref())?;
@@ -608,7 +654,9 @@ pub fn select_param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<(), Error
 pub fn plan_entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     fetch::plan(cx)?;
     input_blend::plan(cx)?;
+    input_shadow::plan(cx)?;
     word_input::plan(cx)?;
+    logic::plan(cx)?;
     coverage::plan(cx)
 }
 
@@ -686,8 +734,12 @@ pub(crate) fn shader_blend(
             .map(|form| (sc.view.blend, form, sc.view.stores_nothing()));
     }
     fp.input_blends.get(&color).map(|ib| {
-        let stores = ib.blend.is_some();
-        (stores.then_some(ib.equation), ib.form, !stores)
+        let blends = ib.blend.is_some();
+        (
+            blends.then_some(ib.equation).flatten(),
+            ib.form,
+            !blends && !ib.merges(),
+        )
     })
 }
 
@@ -708,16 +760,29 @@ pub fn writes_outside_interface(cx: &SelectCx<'_>) -> bool {
 }
 
 /// The work before the body, in the function's first block: read the imageblock input, place the
-/// fragment's tile in the pass's tile memory, and copy the textures read through snapshots
-/// (`snapshot`).
+/// fragment's tile in the pass's tile memory, copy the textures read through snapshots
+/// (`snapshot`), and read the texel of each storage-form color the function reads
+/// (`EmitCx::fetched`), which every use of the color then takes.
 pub fn emit_entry(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>) -> BResult<()> {
     imageblock::emit_entry(cx, fb)?;
     crate::lower::access::tile_memory::emit_entry(cx, fb)?;
-    snapshot::emit_entry(cx, fb)
+    snapshot::emit_entry(cx, fb)?;
+    let fp = &cx.plan.families.fragment;
+    let read: BTreeSet<u32> = fp
+        .colors
+        .iter()
+        .map(|c| c.color)
+        .filter(|color| fp.fetch.contains_key(color))
+        .collect();
+    for color in read {
+        let texel = fetch::texel(cx, fb, color)?;
+        cx.fetched.push((color, texel));
+    }
+    Ok(())
 }
 
 /// The value of parameter `b` in its lowered representation, read by an instruction or a
-/// terminator: a color input's texel, read at each use.
+/// terminator: a color input's texel (`color::value`).
 pub fn param_value(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
@@ -929,12 +994,16 @@ pub fn select(cx: &mut SelectCx<'_>, at: InstId, inst: &Inst) -> Result<Fragment
     let InstKind::Call(call) = &inst.kind else {
         return Err(cx.invariant("a non-call routed to the fragment family"));
     };
-    let Callee::Air {
-        op: AirIntrinsic::Fragment(op),
-        ..
-    } = &call.callee
-    else {
-        return Err(cx.invariant("a call routed to the fragment family is no fragment op"));
+    let op = match &call.callee {
+        Callee::Air {
+            op: AirIntrinsic::Fragment(op),
+            ..
+        } => op,
+        Callee::Air {
+            op: AirIntrinsic::Interpolate(i),
+            ..
+        } => return interpolate::select(cx, i, &call.args),
+        _ => return Err(cx.invariant("a call routed to the fragment family is no fragment op")),
     };
     match op {
         Fragment::Discard if cx.stage == Stage::Fragment => {
@@ -946,9 +1015,9 @@ pub fn select(cx: &mut SelectCx<'_>, at: InstId, inst: &Inst) -> Result<Fragment
             Ok(FragmentStrategy::Discard)
         }
         Fragment::Discard => Err(not_lowered()),
-        // Canon compiled every `float2` map; the `uint2` ones reach here.
+        // Canon compiled every map, `float2` and `uint2`, to its decoder.
         Fragment::MapCoordinates { .. } => {
-            Err(Unsupported::not_implemented(Feature::RasterizationRateMap).into())
+            Err(cx.invariant("a rasterization-rate map call canon compiles reached lowering"))
         }
         Fragment::NumSamples if cx.stage == Stage::Fragment => num_samples(cx, inst, &call.args),
         Fragment::NumSamples => Err(not_lowered()),
@@ -995,6 +1064,14 @@ pub fn emit(
     s: &FragmentStrategy,
 ) -> BResult<()> {
     match s {
+        FragmentStrategy::Interpolate(read) => {
+            let Some(result) = cx.plan.values.inst(at) else {
+                return Err(cx.fail(format!("{at:?} is out of range")));
+            };
+            let x = crate::lower::stage_io::interpolate(cx, fb, read)?;
+            cx.define(result, x);
+            Ok(())
+        }
         FragmentStrategy::IsHelperThread => {
             let Some(result) = cx.plan.values.inst(at) else {
                 return Err(cx.fail(format!("{at:?} is out of range")));

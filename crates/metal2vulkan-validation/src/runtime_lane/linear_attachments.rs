@@ -1,8 +1,9 @@
 //! Device tests of render passes over linear images on the device the cfg selects, under the
 //! validation layer. A render target over a `Shared` buffer of the runtime's memory is its own
 //! linear image where the device renders one there ([`surface`]), as on every device that renders
-//! one only by the rule below; one over a no-copy buffer's host pages is a shadow on every device
-//! (`shadowed-texture`), which the detach, rebind and shadow tests take ([`host_surface`]). On a
+//! one only by the rule below; one over a no-copy buffer's host pages is an image in place where
+//! the device's check passed for render targets over such pages, else a shadow
+//! (`shadowed-texture`), which the detach, rebind and host-page tests take ([`host_surface`]). On a
 //! device that renders a linear image only by `VK_NV_linear_color_attachment` (NVIDIA's, whose
 //! linear tiling has the extension's bit and not the color attachment feature: [`by_the_rule`]),
 //! the runtime enables the extension and renders it in place, but only where every color attachment
@@ -11,11 +12,11 @@
 //! runtime's, copied in and back, and announce `linear-attachment-copies` ([`LINEAR_COPIES`]) once
 //! a device. Elsewhere nothing is announced.
 //!
-//! - [`a_cleared_render_target_over_a_shared_buffer_renders_through_copies`]: a 256x64
+//! - [`a_cleared_render_target_over_a_shared_buffer_renders_in_place`]: a 256x64
 //!   `BGRA8Unorm` render target over a `Shared` buffer, aliased; a pass of it alone that loads it
 //!   and draws nothing changes no texel and records nothing, counted neither way; one that clears
-//!   it renders it through copies and announces `linear-attachment-clear-copies`, by the rule
-//!   (counted so); the buffer holds what each pass stored.
+//!   it renders it in place, by the rule (counted so), announcing nothing; the buffer holds what
+//!   each pass stored. A 1920x1080 one cleared, its GPU time printed.
 //! - [`a_render_target_over_host_pages_is_a_shadow`]: a 256x64 `BGRA8Unorm` render target over a
 //!   no-copy buffer is a shadow, never an image bound to the pages; a pass of it alone that loads
 //!   it and one that clears it each leave the pages holding what it stored, and neither announces
@@ -28,11 +29,8 @@
 //!   attachment cleared and resolved into the texture: the buffer holds the clear; announced
 //!   exactly where the texture is aliased by the rule.
 //!
-//! Where the rule lets a pass render the texture in place, the pass still chooses as it ends
-//! (`linear_attachment::choose`): one that loads it renders it in place; one that clears it renders
-//! it through copies, copied back, announcing `linear-attachment-clear-copies` ([`CHOSEN_COPIES`]),
-//! only where no command of it may read the texture's bytes (no barrier inside it, no draw reaching
-//! memory it does not name, no command naming the bytes), else in place. A pass rendered apart
+//! Where the rule lets a pass render the texture in place, it does, whatever it loads
+//! (`linear_attachment::choose`). A pass rendered apart
 //! (beside a private color, or a depth or stencil attachment) copies the texture in over its draws'
 //! box and merges the words it changed back into the bytes (`linear_merge.rs`), merging and copying
 //! in again before the draws after a memory barrier inside it. Each pass's pages are compared with
@@ -69,25 +67,41 @@
 //!   a panel, a render-target barrier, then a draw sampling the surface's own texture at its
 //!   pixel: the buffer holds the private texture's pass. A cleared one renders in place (a command
 //!   of it may read the bytes); one apart is split at the barrier, merged and copied in again.
-//!   Where the device renders the texture's own image as any other, the pass alone records its
-//!   instances inline (`render/inline_first.rs`, `render/inline_splits.rs`), counted.
+//!   The pass alone records its first instance inline, by the rule or not, and the instance after
+//!   the split too but where the reader's snapshots lead it (`render/inline_first.rs`,
+//!   `render/inline_splits.rs`, `render/snapshot.rs`), counted.
 //! - [`a_detach_while_a_pass_over_host_pages_is_open_fails_its_command_buffer`] and
 //!   [`a_detach_while_a_pass_in_a_no_copy_heap_is_open_fails_its_command_buffer`]: the bytes
 //!   detached after the pass's first draw: the command buffer fails `DetachedBacking`, the pages
 //!   keep their bytes, and the validation layer reports nothing, where the pass records inline
-//!   too (`render/inline_first.rs`; a heap's texture of its own image does, unless the rule binds
-//!   it).
+//!   too (`render/inline_first.rs`; a heap's texture of its own image does).
 //! - [`a_rebind_while_a_pass_over_host_pages_is_open_is_refused`]: refused `EncodedUses`, before
 //!   any draw.
 //!
+//! A command buffer of [`MANY`] passes over one such target, each loading and storing it beside a
+//! cleared and stored `Depth32Float` depth attachment and blending one rectangle over it (a WebGPU
+//! frame split at every indexed draw, `stencilMask`'s), holds its texels as the same passes leave
+//! a private texture, the bytes between its rows untouched; where the device renders it apart
+//! (`linear_merge.rs`) or it is a shadow merged back (`shadow_merge.rs`), its merges take one
+//! scratch and lend it to every later merge of the command buffer (`merge_scratch.rs`), so the
+//! device's memory grows by no scratch a pass while they are encoded:
+//! [`many_passes_over_a_private_buffer_take_one_scratch`] (rows of a multiple of 256 bytes),
+//! [`many_passes_over_packed_rows_take_one_scratch`] (a `Shared` buffer of an IOSurface's packed
+//! rows, of no multiple of 256), [`many_passes_over_host_pages_take_one_scratch`] (such rows over
+//! host pages) and [`many_passes_over_host_pages_of_whole_rows_take_one_scratch`] (host pages,
+//! rows of a multiple of 256).
+//!
 //! Each prints the texture's form (`LINEAR-ATTACHMENT`).
 
+use super::degrade_notices::on_device_with;
 use super::degrade_notices::{counts, on_device};
+use super::first_use_writes::CHECK_WAIT;
 use super::host_memory::{counting, no_copy, not_importable, Mapping, Seen, GUEST_PAGE};
+use super::in_place_rows;
 use super::no_copy_heaps::{no_copy_heap, shared, HEAP};
 use super::no_copy_textures::{blending, floats, rects_beside, staged};
 use super::rebinds::rebind;
-use super::{Messages, WAIT};
+use super::{at_plan, Messages, WAIT};
 use crate::air_library::AirLibrary;
 use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
 use metal2vulkan::metal::{
@@ -103,17 +117,12 @@ use metal2vulkan_runtime::{
     RenderPassDescriptor, RenderPipelineState, ResourceOptions, ScissorRect, Size, StoreAction,
     Texture, TextureDescriptor, WorkCounts,
 };
-use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// The kind a pass that renders a linear image apart takes.
 pub(super) const LINEAR_COPIES: [Degradation; 1] = [Degradation::LinearAttachmentCopies];
-
-/// The kind a pass that could render a linear image in place takes where it renders it through
-/// copies: it clears it, and no command of it may read the texture's bytes.
-pub(super) const CHOSEN_COPIES: [Degradation; 1] = [Degradation::LinearAttachmentClearCopies];
 
 /// The texture's size, and its texel's bytes.
 const W: u64 = 256;
@@ -204,8 +213,9 @@ fn surface_of(
 }
 
 /// A no-copy buffer over a new mapping of the texture's bytes, which hold `counting` from
-/// `start`, and a `BGRA8Unorm` render target over it, a shadow; `None`, printed, where the device
-/// imports no host memory.
+/// `start`, and a `BGRA8Unorm` render target over it, in place where the device's check passed
+/// for it ([`renders_in_place`]), else a shadow; `None`, printed, where the device imports no host
+/// memory.
 fn host_surface(device: &Device, start: usize) -> Option<(Mapping, Buffer, Texture)> {
     host_surface_of(device, start, W, H)
 }
@@ -244,6 +254,24 @@ fn host_surface_of(
     d.resource_options = buffer.resource_options();
     let texture = buffer.new_texture(&d, 0, width * TEXEL).unwrap();
     Some((mapping, buffer, texture))
+}
+
+/// Whether `device`'s check passed for render targets over pointer pages, once it answered: a
+/// texture over host pages starts it, and one made after it answered takes its verdict.
+fn renders_in_place(device: &Device) -> bool {
+    if let Some((mapping, buffer, texture)) = host_surface_of(device, 0, 16, 16) {
+        drop((texture, buffer));
+        drop(mapping);
+    }
+    let settled = device.settle_in_place_checks(CHECK_WAIT);
+    println!(
+        "LINEAR-ATTACHMENT on {}: the in-place check settled {settled}: {:?}",
+        device.name(),
+        device.in_place_check_report()
+    );
+    // The surface's rows lie one after another from the start of its pages.
+    let on_lines = in_place_rows::on_lines(device, 0, W * TEXEL, W * TEXEL, H);
+    in_place_rows::passed(device, "Pointer renders", on_lines)
 }
 
 /// Whether `texture`'s texels are its own image's: aliased, not a shadow.
@@ -297,8 +325,8 @@ fn blit_out(queue: &CommandQueue, texture: &Texture) -> Vec<u8> {
 
 /// One render pass, of no draws, over `attachments` (each its texture, load action and resolve
 /// texture), storing each (resolving where it has a resolve texture), clearing to [`CLEAR`], in a
-/// command buffer that completes.
-fn pass(queue: &CommandQueue, attachments: &[(&Texture, LoadAction, Option<&Texture>)]) {
+/// command buffer that completes: its GPU time, in seconds.
+fn pass(queue: &CommandQueue, attachments: &[(&Texture, LoadAction, Option<&Texture>)]) -> f64 {
     let mut descriptor = RenderPassDescriptor::new();
     for (index, &(texture, load, resolve)) in attachments.iter().enumerate() {
         let attachment = &mut descriptor.color_attachments[index];
@@ -320,6 +348,7 @@ fn pass(queue: &CommandQueue, attachments: &[(&Texture, LoadAction, Option<&Text
     command_buffer.commit().unwrap();
     command_buffer.wait_until_completed_for(WAIT).unwrap();
     assert_eq!(command_buffer.error(), None);
+    command_buffer.gpu_end_time().unwrap() - command_buffer.gpu_start_time().unwrap()
 }
 
 /// The texture's bytes cleared to [`CLEAR`].
@@ -332,15 +361,10 @@ fn cleared() -> Vec<u8> {
         .collect()
 }
 
-/// The [`LINEAR_COPIES`] notices among those delivered so far (removed), counted.
+/// The [`LINEAR_COPIES`] notices among those delivered so far (all removed), counted.
 fn copies_announced(messages: &Messages) -> usize {
-    announced(messages, Degradation::LinearAttachmentCopies)
-}
-
-/// The notices of `kind` among those delivered so far (all removed), counted.
-fn announced(messages: &Messages, kind: Degradation) -> usize {
     counts(&messages.take_notices())
-        .get(&kind)
+        .get(&Degradation::LinearAttachmentCopies)
         .copied()
         .unwrap_or(0)
 }
@@ -501,8 +525,10 @@ const FIRST_DIFFERING: usize = 32;
 /// time over a fresh one: its bytes hold what the same pass leaves in a private texture of the same
 /// bytes, and the bytes past `scissor` keep theirs. Where the texture is aliased by the rule both
 /// render in place, announcing nothing; elsewhere no pass counts a way.
+/// Its devices take their queue plan (`at_plan`): the work of the tests that call it
+/// changes placements under the lane's queue limits.
 fn blends_over_the_pages(start: usize, scissor: Option<ScissorRect>, corners: &[[f32; 4]]) {
-    on_device(|device, messages| {
+    on_device_with(at_plan, |device, messages| {
         messages.take_notices();
         let before = device.work_counts();
         let mut rule = false;
@@ -549,7 +575,6 @@ fn blends_over_the_pages(start: usize, scissor: Option<ScissorRect>, corners: &[
             "the passes' ways, in place and through copies"
         );
         let notices = counts(&messages.take_notices());
-        assert_eq!(notices.get(&Degradation::LinearAttachmentClearCopies), None);
         assert_eq!(notices.get(&Degradation::LinearAttachmentCopies), None);
     });
 }
@@ -669,7 +694,7 @@ fn a_blend_beside_a_stencil_attachment_renders_the_linear_texture_apart() {
 
 /// The owned fixture `zwd_shapes`' library on `device`.
 fn zwd_library(device: &Device) -> metal2vulkan_runtime::Library {
-    let ll = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/public/engine/zwd_shapes.ll");
+    let ll = metal2vulkan_devtools::engine_dir().join("zwd_shapes.ll");
     device
         .new_library_with_air(&llvm_assemble(&ll).unwrap())
         .unwrap()
@@ -884,8 +909,10 @@ fn read_out(queue: &CommandQueue, texture: &Texture, size: [u64; 2]) -> Vec<u8> 
 /// hold what the same pass leaves in a private texture of the same bytes. Where the texture is
 /// aliased by the rule, the passes render in place, or, beside the stencil, apart over a box that
 /// holds both, merged back.
+/// Its devices take their queue plan (`at_plan`): the work of the tests that call it
+/// changes placements under the lane's queue limits.
 fn colorless_clip(start: usize, stencil: bool) {
-    on_device(|device, _| {
+    on_device_with(at_plan, |device, _| {
         let before = device.work_counts();
         let states = panel_and_clip(device, stencil);
         let mut rule = false;
@@ -1142,18 +1169,19 @@ fn sampling_pass(
 /// [`sampling_pass`] over a [`WIDE`] render target over a `Shared` buffer (counting from `start`),
 /// and over a private texture of the same bytes: its bytes hold the private texture's texels, so
 /// the draw after the barrier read the panel the pass drew. Where the texture is aliased by the
-/// rule the pass renders in place, loaded or cleared (a command of it may read the texture's bytes,
-/// so no clear is copied), announcing no `linear-attachment-clear-copies`; beside a stencil
-/// attachment apart, split at the barrier: the stand-in merged back (or, cleared, copied back) and
-/// copied in again before the reading draw. Where the device renders the texture's own image as any
-/// other, the pass alone records both its instances inline, the reading draw's after the split
-/// (`WorkCounts::inline_split_instances`).
+/// rule the pass renders in place, loaded or cleared, announcing nothing; beside a stencil
+/// attachment apart, split at the barrier, announcing `linear-attachment-copies`: the stand-in
+/// merged back (or, cleared, copied back) and copied in again before the reading draw. The pass
+/// alone, by the rule or not, records its first instance inline, and the reading draw's after the
+/// split too (`WorkCounts::inline_split_instances`) but where the draw's snapshots lead it
+/// (`WorkCounts::reading_draws_snapshotted_leading`: their instance records in a secondary,
+/// `render/snapshot.rs`).
 fn sampling(start: usize, load: LoadAction, stencil: bool) {
     on_device(|device, messages| {
         messages.take_notices();
         let (contents, buffer, texture) = surface_of(device, start, WIDE[0], WIDE[1]);
         let rule = by_the_rule(device) && aliased(&texture);
-        let inline = aliased(&texture) && !by_the_rule(device) && !stencil;
+        let inline = aliased(&texture) && !stencil;
         println!(
             "LINEAR-ATTACHMENT sampled after a barrier on {}: {load:?}, stencil {stencil}, by the \
              rule {rule}, inline {inline}",
@@ -1179,11 +1207,16 @@ fn sampling(start: usize, load: LoadAction, stencil: bool) {
         let before = device.work_counts();
         sampling_pass(&queue, &states, &texture, load, stencil);
         let inlined = inlined(device, &before);
-        println!("LINEAR-ATTACHMENT sampled after a barrier: inline counts {inlined:?}");
+        let leading = device.work_counts().reading_draws_snapshotted_leading
+            - before.reading_draws_snapshotted_leading;
+        println!(
+            "LINEAR-ATTACHMENT sampled after a barrier: inline counts {inlined:?}, readers \
+             through leading snapshots {leading}"
+        );
         assert_eq!(
             inlined,
             match inline {
-                true => [1, 1, 1],
+                true => [1, 1, u64::from(leading == 0)],
                 false => [0, 0, 0],
             },
             "passes inline, of them split, and instances after a split inline"
@@ -1204,7 +1237,11 @@ fn sampling(start: usize, load: LoadAction, stencil: bool) {
             "the pass's way, in place and through copies"
         );
         let notices = counts(&messages.take_notices());
-        assert_eq!(notices.get(&Degradation::LinearAttachmentClearCopies), None);
+        assert_eq!(
+            notices.contains_key(&Degradation::LinearAttachmentCopies),
+            rule && stencil,
+            "announced linear-attachment-copies"
+        );
         drop((texture, buffer));
         drop(contents);
     });
@@ -1319,8 +1356,8 @@ fn detached_in_an_open_pass(
 /// [`detached_in_an_open_pass`] over a [`WIDE`] render target over a no-copy buffer's host pages
 /// (counting from 59): the pages keep their bytes, and the validation layer reports nothing. The
 /// pass holds the pages from its open (`render.rs`), so the images over them the detach replaces
-/// stay until the command buffer goes (`detach.rs`). Where the texture is its own image outside
-/// `VK_NV_linear_color_attachment`'s rule ([`by_the_rule`]), the pass records inline.
+/// stay until the command buffer goes (`detach.rs`). Where the texture is its own image, by
+/// `VK_NV_linear_color_attachment`'s rule ([`by_the_rule`]) or not, the pass records inline.
 #[test]
 fn a_detach_while_a_pass_over_host_pages_is_open_fails_its_command_buffer() {
     on_device(|device, messages| {
@@ -1330,7 +1367,7 @@ fn a_detach_while_a_pass_over_host_pages_is_open_fails_its_command_buffer() {
         };
         let n = (WIDE[0] * WIDE[1] * TEXEL) as usize;
         let inline = detached_in_an_open_pass(device, &texture, WIDE, || buffer.detach_backing());
-        let own = aliased(&texture) && !by_the_rule(device);
+        let own = aliased(&texture);
         println!(
             "LINEAR-ATTACHMENT detached in an open pass on {}: aliased {}, by the rule {}, inline \
              {inline}",
@@ -1351,12 +1388,11 @@ fn a_detach_while_a_pass_over_host_pages_is_open_fails_its_command_buffer() {
 }
 
 /// [`detached_in_an_open_pass`] over a render target in a no-copy heap, detached while the pass is
-/// open: where the texture is an image of its own (no `shadowed-texture` announced) that the device
-/// renders without `VK_NV_linear_color_attachment`'s rule ([`by_the_rule`]; a pass of an image the
-/// rule binds records into a secondary), the pass's first instance records inline into a command
-/// buffer it holds, naming the image's view from its first draw; the detach leaves that image and
-/// view until the command buffer goes, so the command buffer stays valid to its end, and the
-/// validation layer reports nothing.
+/// open: where the texture is an image of its own (no `shadowed-texture` announced), whether the
+/// device renders it by `VK_NV_linear_color_attachment`'s rule ([`by_the_rule`]) or not, the
+/// pass's first instance records inline into a command buffer it holds, naming the image's view
+/// from its first draw; the detach leaves that image and view until the command buffer goes, so
+/// the command buffer stays valid to its end, and the validation layer reports nothing.
 #[test]
 fn a_detach_while_a_pass_in_a_no_copy_heap_is_open_fails_its_command_buffer() {
     on_device(|device, messages| {
@@ -1380,7 +1416,7 @@ fn a_detach_while_a_pass_in_a_no_copy_heap_is_open_fails_its_command_buffer() {
              {shadowed}, by the rule {rule}, inline {inline}",
             device.name()
         );
-        if !shadowed && !rule {
+        if !shadowed {
             assert_eq!(inline, 1, "passes inline");
         }
         drop((texture, heap));
@@ -1427,10 +1463,9 @@ fn a_rebind_while_a_pass_over_host_pages_is_open_is_refused() {
 /// A render target over a `Shared` buffer is aliased, and on a device that renders it by the rule
 /// a pass of it alone that loads it and draws nothing changes no texel, so it records nothing
 /// (`render/untouched.rs`) and is counted neither way, announcing nothing; one that clears it
-/// renders it through copies, announcing `linear-attachment-clear-copies` once, counted so. The
-/// buffer holds what each stored.
+/// renders it in place, counted so, announcing nothing. The buffer holds what each stored.
 #[test]
-fn a_cleared_render_target_over_a_shared_buffer_renders_through_copies() {
+fn a_cleared_render_target_over_a_shared_buffer_renders_in_place() {
     on_device(|device, messages| {
         messages.take_notices();
         let (contents, buffer, texture) = surface(device, 3);
@@ -1453,16 +1488,11 @@ fn a_cleared_render_target_over_a_shared_buffer_renders_through_copies() {
             contents.read(0..n) == counting(n, 3),
             "a load and store changed the buffer"
         );
-        assert_eq!(
-            announced(messages, Degradation::LinearAttachmentClearCopies),
-            0,
-            "a pass that loads the texture"
-        );
         let before = device.work_counts();
         pass(&queue, &[(&texture, LoadAction::Clear, None)]);
         assert_eq!(
             ways(device, &before),
-            (0, u64::from(rule)),
+            (u64::from(rule), 0),
             "a pass that clears the texture, in place and through copies"
         );
         assert!(
@@ -1470,41 +1500,79 @@ fn a_cleared_render_target_over_a_shared_buffer_renders_through_copies() {
             "a clear did not reach the buffer"
         );
         let notices = counts(&messages.take_notices());
-        let count = |kind| notices.get(&kind).copied().unwrap_or(0);
         assert_eq!(
-            count(Degradation::LinearAttachmentCopies),
-            0,
+            notices.get(&Degradation::LinearAttachmentCopies),
+            None,
             "a pass of the texture alone"
-        );
-        assert_eq!(
-            count(Degradation::LinearAttachmentClearCopies),
-            usize::from(rule),
-            "a pass that clears the texture, once a device that renders it by the rule"
         );
         drop((texture, buffer));
         drop(contents);
+        cleared_1080p(device, &queue);
     });
 }
 
-/// A render target over host pages is a shadow on every device, never an image bound to the
-/// pages: a pass of it alone that loads it and one that clears it each leave the pages holding
-/// what it stored, and neither announces a linear attachment's copies.
+/// Passes clearing a 1920x1080 `BGRA8Unorm` render target over a `Shared` buffer, printed for the
+/// record: their ways, and the median GPU time of `TIMED` after one; the buffer holds the clear.
+fn cleared_1080p(device: &Device, queue: &CommandQueue) {
+    /// The passes timed.
+    const TIMED: usize = 7;
+    let (width, height) = (1920, 1080);
+    let n = (width * height * TEXEL) as usize;
+    let (contents, buffer, texture) = surface_of(device, 7, width, height);
+    let before = device.work_counts();
+    pass(queue, &[(&texture, LoadAction::Clear, None)]);
+    let mut times: Vec<f64> = (0..TIMED)
+        .map(|_| pass(queue, &[(&texture, LoadAction::Clear, None)]))
+        .collect();
+    times.sort_by(f64::total_cmp);
+    let (in_place, through) = ways(device, &before);
+    println!(
+        "LINEAR-ATTACHMENT clear of {width}x{height} over a Shared buffer on {}: by the rule {}, \
+         aliased {}; {in_place} passes in place, {through} through copies; GPU {:.3} ms (median \
+         of {TIMED}, {:.3} to {:.3})",
+        device.name(),
+        by_the_rule(device),
+        aliased(&texture),
+        times[TIMED / 2] * 1e3,
+        times[0] * 1e3,
+        times[TIMED - 1] * 1e3,
+    );
+    assert!(
+        contents
+            .read(0..n)
+            .as_chunks::<{ TEXEL as usize }>()
+            .0
+            .iter()
+            .all(|&texel| texel == CLEAR_BYTES),
+        "a clear did not reach the buffer"
+    );
+    drop((texture, buffer));
+    drop(contents);
+}
+
+/// A render target over host pages is an image bound to them exactly where the device's check
+/// passed for render targets over pointer pages, else a shadow: a pass of it alone that loads it
+/// and one that clears it each leave the pages holding what it stored, and neither announces a
+/// linear attachment's copies.
 #[test]
-fn a_render_target_over_host_pages_is_a_shadow() {
+fn a_render_target_over_host_pages_is_in_place_where_the_check_passed() {
     on_device(|device, messages| {
+        let in_place = renders_in_place(device);
         messages.take_notices();
         let Some((mapping, buffer, texture)) = host_surface(device, 3) else {
             return;
         };
+        let rule = by_the_rule(device);
         println!(
-            "LINEAR-ATTACHMENT on {}: by the rule {}, aliased {}",
+            "LINEAR-ATTACHMENT on {}: by the rule {rule}, aliased {}, the check passed for render \
+             targets {in_place}",
             device.name(),
-            by_the_rule(device),
             aliased(&texture)
         );
-        assert!(
-            !aliased(&texture),
-            "a render target over host pages is an image bound to them"
+        assert_eq!(
+            aliased(&texture),
+            in_place,
+            "an image bound to the pages exactly where the check passed for them"
         );
         let queue = device.new_command_queue().unwrap();
         let n = (W * H * TEXEL) as usize;
@@ -1519,14 +1587,10 @@ fn a_render_target_over_host_pages_is_a_shadow() {
             "a clear did not reach the pages"
         );
         let notices = counts(&messages.take_notices());
-        let count = |kind| notices.get(&kind).copied().unwrap_or(0);
         assert_eq!(
-            (
-                count(Degradation::LinearAttachmentCopies),
-                count(Degradation::LinearAttachmentClearCopies)
-            ),
-            (0, 0),
-            "a shadow's passes"
+            notices.get(&Degradation::LinearAttachmentCopies),
+            None,
+            "a pass of the texture alone, and one that clears it"
         );
         drop((texture, buffer));
         drop(mapping);
@@ -1623,4 +1687,355 @@ fn a_resolve_into_a_linear_texture_resolves_through_a_scratch() {
         drop((texture, buffer, samples));
         drop(contents);
     });
+}
+
+/// The passes of [`many_passes`]: a WebGPU frame that splits its pass at every indexed draw
+/// (the `stencilMask` sample's first: 706), and the height of their targets.
+const MANY: usize = 706;
+const MANY_H: u64 = 240;
+
+/// The byte between a [`many_target`]'s rows, which no pass writes.
+const BETWEEN: u8 = 0xa5;
+
+/// Where a [`many_target`]'s bytes lie.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ManyOver {
+    /// A `Private` buffer, written and read through blits.
+    Private,
+    /// A `Shared` buffer.
+    Shared,
+    /// A no-copy buffer over host pages.
+    HostPages,
+}
+
+/// The bytes a [`many_target`] of `width` texels a row, `row` bytes apart, holds first: a counting
+/// pattern in the texels, [`BETWEEN`] between the rows.
+fn many_first(width: u64, row: u64) -> Vec<u8> {
+    let pattern = counting((row * MANY_H) as usize, 29);
+    (0..(row * MANY_H) as usize)
+        .map(|i| match (i as u64 % row) < width * TEXEL {
+            true => pattern[i],
+            false => BETWEEN,
+        })
+        .collect()
+}
+
+/// The texels of `bytes`, rows `row` bytes apart, packed.
+fn many_texels(bytes: &[u8], width: u64, row: u64) -> Vec<u8> {
+    (bytes.chunks(row as usize))
+        .flat_map(|r| &r[..(width * TEXEL) as usize])
+        .copied()
+        .collect()
+}
+
+/// A blit encoder's commands, `encode` encoding them, in a command buffer that completes.
+fn blit_with(
+    queue: &CommandQueue,
+    encode: impl FnOnce(&mut metal2vulkan_runtime::BlitCommandEncoder),
+) {
+    let command_buffer = queue.command_buffer().unwrap();
+    let mut encoder = command_buffer.blit_command_encoder().unwrap();
+    encode(&mut encoder);
+    encoder.end_encoding().unwrap();
+    command_buffer.commit().unwrap();
+    command_buffer.wait_until_completed_for(WAIT).unwrap();
+    assert_eq!(command_buffer.error(), None);
+}
+
+/// A `BGRA8Unorm` render target of `width` x [`MANY_H`] texels, rows `row` bytes apart, over a
+/// buffer of `over`'s holding [`many_first`] (the buffer, its mapping where it is over host
+/// pages); `None`, printed, where the device imports no host memory.
+fn many_target(
+    queue: &CommandQueue,
+    over: ManyOver,
+    (width, row): (u64, u64),
+) -> Option<(Buffer, Option<Mapping>, Texture)> {
+    let device = queue.device();
+    let first = many_first(width, row);
+    let length = row * MANY_H;
+    let (buffer, mapping) = match over {
+        ManyOver::Private => {
+            let buffer = device
+                .new_buffer(length, ResourceOptions::private())
+                .unwrap();
+            let source = staged(device, &first);
+            blit_with(queue, |b| {
+                (b.copy_from_buffer_to_buffer(&source, 0, &buffer, 0, length)).unwrap()
+            });
+            (buffer, None)
+        }
+        ManyOver::Shared => {
+            let buffer = staged(device, &first);
+            (buffer, None)
+        }
+        ManyOver::HostPages => {
+            let len = (length as usize).next_multiple_of(GUEST_PAGE);
+            let mapping = Mapping::anonymous(len);
+            mapping.write(0, &first);
+            // SAFETY: the test drops the mapping after every buffer over it.
+            let made = unsafe {
+                no_copy(
+                    device,
+                    mapping.pointer(),
+                    len,
+                    ResourceOptions::default(),
+                    None,
+                )
+            };
+            match made {
+                Ok(buffer) => (buffer, Some(mapping)),
+                Err(error) if not_importable(&error) => {
+                    eprintln!("LINEAR-ATTACHMENT: the device imports no host memory: {error:?}");
+                    return None;
+                }
+                Err(error) => panic!("new_buffer_with_bytes_no_copy: {error:?}"),
+            }
+        }
+    };
+    let mut d = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, width, MANY_H, false);
+    d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+    d.resource_options = buffer.resource_options();
+    let texture = buffer.new_texture(&d, 0, row).unwrap();
+    Some((buffer, mapping, texture))
+}
+
+/// The first `length` bytes of `buffer`, of `over`'s, read through a blit where it is `Private`.
+fn many_bytes(queue: &CommandQueue, over: ManyOver, buffer: &Buffer, length: u64) -> Vec<u8> {
+    let device = queue.device();
+    let shared = match over {
+        ManyOver::Private => {
+            let out = device
+                .new_buffer(length, ResourceOptions::shared())
+                .unwrap();
+            blit_with(queue, |b| {
+                (b.copy_from_buffer_to_buffer(buffer, 0, &out, 0, length)).unwrap()
+            });
+            out
+        }
+        ManyOver::Shared | ManyOver::HostPages => buffer.clone(),
+    };
+    Contents(shared).read(0..length as usize)
+}
+
+/// [`MANY`] passes in one command buffer over `texture`, each loading and storing it beside a
+/// `Depth32Float` depth attachment it clears and stores, blending one half-transparent rectangle
+/// of its own color over a place of its own (overlapping its neighbours'); committed and
+/// completed. The device's work counts once they were encoded, before the commit.
+fn many_passes(
+    queue: &CommandQueue,
+    pipeline: &RenderPipelineState,
+    texture: &Texture,
+) -> WorkCounts {
+    let device = queue.device();
+    let mut d =
+        TextureDescriptor::texture_2d(PixelFormat::Depth32Float, texture.width(), MANY_H, false);
+    d.usage = TextureUsage::RENDER_TARGET;
+    d.resource_options = ResourceOptions::private();
+    let depth = device.new_texture(&d).unwrap();
+    let command_buffer = queue.command_buffer().unwrap();
+    for i in 0..MANY {
+        let mut descriptor = RenderPassDescriptor::new();
+        let color = &mut descriptor.color_attachments[0];
+        color.texture = Some(texture.clone());
+        color.load_action = LoadAction::Load;
+        color.store_action = StoreAction::Store;
+        descriptor.depth_attachment.texture = Some(depth.clone());
+        descriptor.depth_attachment.load_action = LoadAction::Clear;
+        descriptor.depth_attachment.store_action = StoreAction::Store;
+        let mut encoder = command_buffer.render_command_encoder(&descriptor).unwrap();
+        encoder.set_render_pipeline_state(pipeline).unwrap();
+        let (x, y) = ((i % 12) as f32, ((i / 12) % 6) as f32);
+        let (x0, y0) = (-1.0 + 0.125 * x, -1.0 + 0.25 * y);
+        let corners = [x0, y0, (x0 + 0.5).min(1.0), (y0 + 0.75).min(1.0)];
+        let rgba = [
+            (i % 5) as f32 / 4.0,
+            (i % 7) as f32 / 6.0,
+            (i % 3) as f32 / 2.0,
+            0.5,
+        ];
+        encoder.set_vertex_bytes(&floats(corners), 0).unwrap();
+        encoder.set_fragment_bytes(&floats(rgba), 0).unwrap();
+        encoder
+            .draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0)
+            .unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    let encoded = device.work_counts();
+    command_buffer.commit().unwrap();
+    command_buffer.wait_until_completed_for(WAIT).unwrap();
+    assert_eq!(command_buffer.error(), None);
+    encoded
+}
+
+/// The texels [`many_passes`] leave in a private texture of `width` texels a row holding
+/// [`many_first`]'s texels first, packed.
+fn many_reference(queue: &CommandQueue, pipeline: &RenderPipelineState, width: u64) -> Vec<u8> {
+    let device = queue.device();
+    let mut d = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, width, MANY_H, false);
+    d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+    d.resource_options = ResourceOptions::private();
+    let texture = device.new_texture(&d).unwrap();
+    let packed = width * TEXEL;
+    let first = many_first(width, packed);
+    let source = staged(device, &first);
+    let size = Size::new(width, MANY_H, 1);
+    blit_with(queue, |b| {
+        let origin = Origin::new(0, 0, 0);
+        let (bpr, bpi) = (packed, packed * MANY_H);
+        (b.copy_from_buffer_to_texture(
+            &source,
+            0,
+            bpr,
+            bpi,
+            size,
+            &texture,
+            0,
+            0,
+            origin,
+            BlitOption::None,
+        ))
+        .unwrap()
+    });
+    many_passes(queue, pipeline, &texture);
+    let out = device
+        .new_buffer(packed * MANY_H, ResourceOptions::shared())
+        .unwrap();
+    blit_with(queue, |b| {
+        let origin = Origin::new(0, 0, 0);
+        let (bpr, bpi) = (packed, packed * MANY_H);
+        (b.copy_from_texture_to_buffer(
+            &texture,
+            0,
+            0,
+            origin,
+            size,
+            &out,
+            0,
+            bpr,
+            bpi,
+            BlitOption::None,
+        ))
+        .unwrap()
+    });
+    Contents(out).read(0..(packed * MANY_H) as usize)
+}
+
+/// [`many_passes`] over a target over `over`'s buffer of `width` texels a row, `row` bytes apart
+/// (`merge_scratch.rs`): its texels equal those the same passes leave in a private texture, and
+/// the bytes between its rows keep theirs. Where the device renders it apart by the rule
+/// (`linear_merge.rs`), the passes form a run or two merged once each (`pass_runs.rs`), each
+/// merge taking one scratch; where it is a shadow merged back (`shadow_merge.rs`), the passes
+/// form one run after the first, which merges in place: kept before the first and the second,
+/// and merged after the first and the last (`pass_runs.rs`).
+/// Either way the device's memory grows by less than an eighth of a scratch a pass while they are
+/// encoded.
+fn many_passes_over(over: ManyOver, (width, row): (u64, u64)) {
+    on_device(|device, _| {
+        let queue = device.new_command_queue().unwrap();
+        let pipeline = rects_beside(
+            device,
+            PixelFormat::BGRA8Unorm,
+            true,
+            Some(PixelFormat::Depth32Float),
+        );
+        let expected = many_reference(&queue, &pipeline, width);
+        let Some((buffer, mapping, texture)) = many_target(&queue, over, (width, row)) else {
+            return;
+        };
+        let apart = by_the_rule(device) && aliased(&texture);
+        // A shadow merged back: one over bytes another writer may write, all but a tracked
+        // `Private` buffer's, whose shadow is copied back.
+        let shadow = !aliased(&texture) && over != ManyOver::Private;
+        let before = device.work_counts();
+        let encoded = many_passes(&queue, &pipeline, &texture);
+        let after = device.work_counts();
+        let delta = |of: fn(&WorkCounts) -> u64| of(&after) - of(&before);
+        let through = delta(|c| c.linear_passes_through_copies);
+        let made = delta(|c| c.linear_merge_scratches_made);
+        let reused = delta(|c| c.linear_merge_scratches_reused);
+        let recorded = delta(|c| c.linear_merges_recorded);
+        let taken_over = delta(|c| c.linear_merges_taken_over);
+        let shadow_reused = delta(|c| c.shadow_merge_scratches_reused);
+        let kept = delta(|c| c.shadow_texels_kept);
+        let grown = encoded.device_memory_allocated - before.device_memory_allocated;
+        // A merge of every texel's rows: its kept and changed parts.
+        let scratch = 2 * width * TEXEL * MANY_H;
+        println!(
+            "LINEAR-ATTACHMENT many passes over {over:?} {width}x{MANY_H}, rows of {row}, on {}: \
+             apart by the rule {apart}, shadow {shadow}; {through} passes through copies, linear \
+             merges {recorded} recorded and {taken_over} taken over, linear scratches {made} made \
+             and {reused} reused, shadow scratches {shadow_reused} reused, shadow texels kept \
+             {kept}; device memory grew {grown} bytes while encoding",
+            device.name()
+        );
+        // One run (`pass_runs.rs`), or two where the second pass's box reaches past the
+        // first's (then one over the whole target), merged once each.
+        if apart {
+            assert_eq!(through, MANY as u64, "every pass renders the texture apart");
+            assert!(
+                recorded <= 2,
+                "the passes merge once a run: {recorded} merges"
+            );
+            assert_eq!(
+                recorded + taken_over,
+                MANY as u64,
+                "every later pass takes its run's"
+            );
+            assert_eq!(
+                made + reused,
+                recorded,
+                "each run's merge takes one scratch"
+            );
+        }
+        // One run of passes (`pass_runs.rs`): kept twice, every texel, before the first pass,
+        // which merges in place, and before the second, which opens the run.
+        if shadow {
+            assert_eq!(
+                kept,
+                2 * width * MANY_H,
+                "the passes keep twice, as one run"
+            );
+        }
+        assert!(
+            grown < scratch * MANY as u64 / 8,
+            "encoding the passes grew the device's memory by {grown} bytes"
+        );
+        let pages = many_bytes(&queue, over, &buffer, row * MANY_H);
+        let between = (0..pages.len())
+            .filter(|&i| (i as u64 % row) >= width * TEXEL && pages[i] != BETWEEN)
+            .count();
+        assert_eq!(between, 0, "bytes between the rows changed");
+        let got = many_texels(&pages, width, row);
+        let differ = (0..got.len()).filter(|&i| got[i] != expected[i]).count();
+        assert_eq!(differ, 0, "the texels differ from the private texture's");
+        drop((texture, buffer));
+        drop(mapping);
+    });
+}
+
+/// Over a `Private` buffer, packed rows of 320 texels: 1280 bytes, a multiple of 256 (rows
+/// rounded up to 256 bytes with none between them).
+#[test]
+fn many_passes_over_a_private_buffer_take_one_scratch() {
+    many_passes_over(ManyOver::Private, (320, 1280));
+}
+
+/// Over a `Shared` buffer, packed rows of 300 texels: 1200 bytes, of no multiple of 256 (an
+/// IOSurface's).
+#[test]
+fn many_passes_over_packed_rows_take_one_scratch() {
+    many_passes_over(ManyOver::Shared, (300, 1200));
+}
+
+/// Over a no-copy buffer's host pages, packed rows of 300 texels (an IOSurface's over guest
+/// pages).
+#[test]
+fn many_passes_over_host_pages_take_one_scratch() {
+    many_passes_over(ManyOver::HostPages, (300, 1200));
+}
+
+/// Over a no-copy buffer's host pages, rows of 320 texels: 1280 bytes, a multiple of 256.
+#[test]
+fn many_passes_over_host_pages_of_whole_rows_take_one_scratch() {
+    many_passes_over(ManyOver::HostPages, (320, 1280));
 }

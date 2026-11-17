@@ -149,6 +149,17 @@ pub fn storage_buffers(a: &FunctionArtifact) -> u32 {
         .sum()
 }
 
+/// Whether artifact `a` leaves a NaN's bits to the device, which the interpreter does not model:
+/// it records `PrecisionNote::NativeNanEncoding`, or it requires `VkProperty::MetalNanMoves`, whose
+/// measured device answers Metal's bits where the interpreter's conversions answer their own.
+pub fn device_nan_bits(a: &FunctionArtifact) -> bool {
+    a.precision
+        .contains(&crate::pipeline::artifact::PrecisionNote::NativeNanEncoding)
+        || a.requirements
+            .properties
+            .contains(&crate::device::requirements::VkProperty::MetalNanMoves)
+}
+
 /// The default policy with Metal's answers wherever a choice still offers them
 /// ([`DevicePolicy::exact_answers`]).
 pub fn exact_maths() -> DevicePolicy {
@@ -263,7 +274,30 @@ pub fn compile_kept(
         &mut meter(),
         SPIRV_WORDS,
     )
-    .map(|(compiled, plan, module)| (Arc::new(compiled.artifact().clone()), plan, module))
+    .map(|(compiled, plan, module)| {
+        let a = compiled.artifact();
+        assert_walk_estimate(entry, &plan, a.module.words.len());
+        (Arc::new(a.clone()), plan, module)
+    })
+}
+
+/// The plan's size estimate bounds the `emitted` words of a module of the emulated simdgroup tier
+/// or of the predicated walk: checked on every such module the engine tests build through
+/// [`compile_kept`] and [`typed_module_with`] (the estimate refuses before emission, so one under
+/// the emitted words would let a module past the cap only `check_emitted` catches, and one far
+/// over refuses a module that fits).
+fn assert_walk_estimate(entry: &str, plan: &Plan, emitted: usize) {
+    assert!(
+        !walked(plan) || plan.estimate.words >= emitted as u64,
+        "{entry}: estimate {} < emitted {emitted}",
+        plan.estimate.words
+    );
+}
+
+/// The plan is of the emulated simdgroup tier or walks its body predicated.
+fn walked(plan: &Plan) -> bool {
+    plan.simd.1 == crate::device::subgroup::Tier::Emulated
+        || plan.families.simd.predication.is_some()
 }
 
 /// The plan and the finished typed module of entry `entry` of `bitcode` for `p`, with no function
@@ -372,12 +406,19 @@ fn typed_module_of(
         m,
     )?;
     let memory = crate::memory::static_root::analyze_memory(&spec, p, m)?;
-    let plan = crate::lower::select::select(&spec, &memory, p, inputs, m)?;
+    let widest = crate::lower::simd::WidestPin::Weighed;
+    let plan = crate::lower::select::select(&spec, &memory, p, (inputs, widest), m)?;
     let crate::lower::emit::Emitted { mut module, .. } =
         crate::lower::emit::emit_module(&spec, &plan, m)?;
     crate::spirv::roll::roll_entry(&mut module, m)?;
-    crate::spirv::helper_branches::guard_for(&mut module, p, m)?;
+    crate::spirv::hoist::hoist_uniform_loads(&mut module, p.containment(), m)?;
+    let (_, fences) = crate::spirv::helper_branches::guard_for(&mut module, p, m)?;
+    fences.apply(&mut module)?;
     crate::spirv::verify::verify(&module, p, m)?;
+    if walked(&plan) {
+        let words = crate::spirv::serialize::serialize_for(module.clone(), p)?.words;
+        assert_walk_estimate(entry, &plan, words.len());
+    }
     Ok((plan, module))
 }
 

@@ -1,24 +1,30 @@
-//! Textures in heaps over host pages laid out as Metal lays them out, on the device the cfg
-//! selects, under the validation layer:
+//! Textures in heaps over host pages, on the device the cfg selects, under the validation layer:
 //!
-//! - **Tiles.** A texture of a plain format that Metal keeps uncompressed lies in the heap's
-//!   bytes as Metal's tiles hold it: each element (a texel) in the tile of the largest 16 KiB
-//!   whose side is the level's own where shorter, the tiles in rows, the elements of a tile in
-//!   Morton order (`x0 y0 x1 y1 ...`, the longer side's extra bits on top). The bytes it is made
-//!   over, its `replaceRegion` and `getBytes`, the GPU's blits, and the CPU's and a buffer's
-//!   writes over the bytes all meet the texels at those bytes, and no byte between them changes.
-//!   The runtime counts the texture (`WorkCounts::heap_textures_tiled`), announces no layout
-//!   notice, and writes no zeros making it. Each lane-side offset
-//!   is restated here from the measured rule, apart from the runtime's
-//!   (`texture/heap_tiled.rs`).
-//! - **Two ways in one command.** A dispatch that writes the tiled texture's texel (0, 0) and
-//!   four of its bytes through a buffer over the heap keeps both writes: the next element's bytes
+//! - **In place.** A texture of a plain format that Metal keeps uncompressed lies in the device's
+//!   image over the heap's bytes where one serves it, in the driver's layout (Apple documents a
+//!   texture's layout in a heap's bytes as Metal's own): counted untiled
+//!   (`WorkCounts::heap_texture_untiled_layouts`), the first announced `heap-texture-untiled-layout`
+//!   with its ID, made with no zeros. Its `replaceRegion` and `getBytes`, the GPU's blits and a
+//!   buffer's write over its bytes meet its texels, and its writes reach no byte of the heap past
+//!   its answered size.
+//! - **Tiles.** Where none serves, it lies in the heap's bytes as Metal's tiles hold it: each
+//!   element (a texel) in the tile of the largest 16 KiB whose side is the level's own where
+//!   shorter, the tiles in rows, the elements of a tile in Morton order (`x0 y0 x1 y1 ...`, the
+//!   longer side's extra bits on top). The bytes it is made over, its `replaceRegion` and
+//!   `getBytes`, the GPU's blits, and the CPU's and a buffer's writes over the bytes all meet the
+//!   texels at those bytes, and no byte between them changes. The runtime counts the texture
+//!   (`WorkCounts::heap_textures_tiled`), announces no layout notice, and writes no zeros making
+//!   it. Each lane-side offset is restated here from the measured rule, apart from the runtime's
+//!   (`texture/heap_tiled.rs`). The tests of tiles say so and skip their tiled steps for a texture
+//!   in place.
+//! - **Two ways in one command.** A dispatch that writes the texture's texel (0, 0) and four of
+//!   the heap's bytes through a buffer over it keeps both writes: the next element's bytes
 //!   (`k.two_ways_disjoint`'s shape) or bytes between the elements (`k.two_ways_gap`'s), every
-//!   other byte the heap's, through the merge (`shadow-merge` once).
-//! - **Blocks**. A BC, ETC2, EAC or ASTC texture lies as Metal lays it out: each row's span,
-//!   every block numbered as the probes numbered it, hashes to the M3 Max's and the M4's under
-//!   macOS 27.0.1 through `replaceRegion` and blits; `getBytes` reads the CPU's writes of those
-//!   bytes.
+//!   other byte the heap's; a tiled one's through the merge (`shadow-merge` once).
+//! - **Blocks**. A BC, ETC2, EAC or ASTC texture no image over the pages serves lies as Metal
+//!   lays it out: each row's span, every block numbered as the probes numbered it, hashes to the
+//!   M3 Max's and the M4's under macOS 27.0.1 through `replaceRegion` and blits; `getBytes` reads
+//!   the CPU's writes of those bytes.
 //! - **Layouts the runtime does not follow** ([`HEAP_LAYOUTS`]). A texture Metal keeps
 //!   losslessly compressed (`heap-texture-lossless-layout`) and one
 //!   of a format whose layout is not measured
@@ -48,7 +54,6 @@ use metal2vulkan_runtime::{
     RenderPassDescriptor, ResourceOptions, RuntimeGap, Size, StoreAction, Texture,
     TextureDescriptor, WorkCounts,
 };
-use std::path::Path;
 
 /// The kinds a texture in a heap over host pages laid out otherwise than Metal's tiles takes, each
 /// counted per texture and announced once per device with the first's ID.
@@ -286,15 +291,21 @@ fn layouts_counted(before: &WorkCounts, after: &WorkCounts) -> [u64; 4] {
     ]
 }
 
-/// A plain texture in a heap over host pages lies in Metal's tiles (the module docs): its
-/// answered size holds them; the bytes it is made over, `replaceRegion`, a blit into it, the CPU's
-/// writes and a buffer's over the bytes meet its texels there, and `getBytes` and a blit out of it
-/// read them; no byte between them changes. Counted tiled, with no layout notice; made with no
-/// zeros (`WorkCounts::images_started_on_the_host`, `staging_submissions`).
+/// A plain texture in a heap over host pages (the module docs), its answered size holding Metal's
+/// tiles, made with no zeros (`WorkCounts::images_started_on_the_host`, `staging_submissions`,
+/// `staging_moves_queued`). Where the device's image over the pages serves it, it lies there:
+/// counted untiled, the first announced `heap-texture-untiled-layout` with its ID, and its texels
+/// meet each way in ([`in_place_round_trips`]). Elsewhere it lies in Metal's tiles: the bytes it is
+/// made over, `replaceRegion`, a blit into it, the CPU's writes and a buffer's over the bytes meet
+/// its texels there, and `getBytes` and a blit out of it read them; no byte between them changes,
+/// and its CPU copies are made in the heap's bytes with no submission
+/// (`WorkCounts::heap_shadow_cpu_copies`). Counted tiled, with no layout notice. Printed: how many
+/// shapes lay each way.
 #[test]
-fn a_host_heap_s_plain_texture_lies_in_metal_s_tiles() {
+fn a_host_heap_s_plain_texture_lies_in_place_or_in_metal_s_tiles() {
     on_device(|device, messages| {
         let queue = device.new_command_queue().unwrap();
+        let (mut in_place, mut tiled) = (0, 0);
         for plain in plains() {
             let what = format!("{:?} {:?}", plain.format, plain.extent);
             let mapping = Mapping::anonymous(HEAP);
@@ -320,19 +331,39 @@ fn a_host_heap_s_plain_texture_lies_in_metal_s_tiles() {
             let texture = heap.new_texture_at_offset(&descriptor, OFFSET).unwrap();
             let made = device.work_counts();
             assert_eq!(
-                layouts_counted(&before, &made),
-                [1, 0, 0, 0],
-                "{what}: counted tiled"
-            );
-            assert_eq!(
-                (made.images_started_on_the_host, made.staging_submissions),
+                (
+                    made.images_started_on_the_host,
+                    made.staging_submissions,
+                    made.staging_moves_queued
+                ),
                 (
                     before.images_started_on_the_host,
-                    before.staging_submissions
+                    before.staging_submissions,
+                    before.staging_moves_queued
                 ),
                 "{what}: made with no zeros"
             );
-            assert_eq!(layout_notices(messages), [], "{what}");
+            let counted = layouts_counted(&before, &made);
+            let notices = layout_notices(messages);
+            if counted == [0, 0, 0, 1] {
+                let kind = Degradation::HeapTextureUntiledLayout;
+                let want: &[_] = match in_place {
+                    0 => &[(kind, Some(texture.object_id()))],
+                    _ => &[],
+                };
+                assert_eq!(notices, want, "{what}: announced at the first");
+                in_place_round_trips(&queue, (&heap, &mapping), &texture, &plain, answer.size);
+                in_place += 1;
+                drop((texture, heap));
+                drop(mapping);
+                eprintln!(
+                    "HEAPLAYOUT {what}: in the device's image over the pages, size {}",
+                    answer.size
+                );
+                continue;
+            }
+            assert_eq!(counted, [1, 0, 0, 0], "{what}: counted tiled");
+            assert_eq!(notices, [], "{what}");
             assert_eq!(
                 blit_out(&queue, &texture, &plain),
                 held,
@@ -341,8 +372,9 @@ fn a_host_heap_s_plain_texture_lies_in_metal_s_tiles() {
             mapping.fill(0);
 
             // `replaceRegion` writes the texels into Metal's tiles; `getBytes` and a blit read
-            // them back.
+            // them back. Both CPU copies are made in the heap's bytes on the host.
             let first = named(len, 1);
+            let copied = device.work_counts();
             texture
                 .replace_region(plain.region(), 0, 0, &first, plain.row(), 0)
                 .unwrap();
@@ -355,6 +387,15 @@ fn a_host_heap_s_plain_texture_lies_in_metal_s_tiles() {
                 .get_bytes(&mut read, plain.row(), 0, plain.region(), 0, 0)
                 .unwrap();
             assert_eq!(read, first, "{what}: getBytes");
+            let read_back = device.work_counts();
+            assert_eq!(
+                (
+                    read_back.heap_shadow_cpu_copies - copied.heap_shadow_cpu_copies,
+                    read_back.internal_submissions - copied.internal_submissions,
+                ),
+                (2, 0),
+                "{what}: replaceRegion and getBytes in the heap's bytes, with no submission"
+            );
             assert_eq!(blit_out(&queue, &texture, &plain), first, "{what}: a blit");
 
             // A blit into the texture lands in the tiles, no other byte.
@@ -405,6 +446,7 @@ fn a_host_heap_s_plain_texture_lies_in_metal_s_tiles() {
             );
             drop((buffer, texture, heap));
             drop(mapping);
+            tiled += 1;
             eprintln!("HEAPLAYOUT {what}: in Metal's tiles, size {}", answer.size);
         }
         let counted = counts(&messages.take_notices());
@@ -412,7 +454,69 @@ fn a_host_heap_s_plain_texture_lies_in_metal_s_tiles() {
             HEAP_LAYOUTS.iter().all(|kind| !counted.contains_key(kind)),
             "{counted:?}"
         );
+        eprintln!(
+            "HEAPLAYOUT plain: {in_place} in the device's image over the pages, {tiled} in Metal's \
+             tiles"
+        );
     });
+}
+
+/// The texels of `plain`'s texture in the device's image over the heap's bytes (`mapping`'s), its
+/// answered size `span`, meet each way in: `replaceRegion` and `getBytes`, a blit in and one out,
+/// and a buffer's write of every byte of its span over it; and a blit into it writes no byte of
+/// the heap outside its span.
+fn in_place_round_trips(
+    queue: &CommandQueue,
+    (heap, mapping): (&Heap, &Mapping),
+    texture: &Texture,
+    plain: &Plain,
+    span: u64,
+) {
+    let what = format!("{:?} {:?}", plain.format, plain.extent);
+    let len = plain.texels() * plain.unit as usize;
+    let first = named(len, 1);
+    texture
+        .replace_region(plain.region(), 0, 0, &first, plain.row(), 0)
+        .unwrap();
+    let mut read = vec![0u8; len];
+    texture
+        .get_bytes(&mut read, plain.row(), 0, plain.region(), 0, 0)
+        .unwrap();
+    assert_eq!(read, first, "{what}: getBytes of replaceRegion's");
+    assert_eq!(blit_out(queue, texture, plain), first, "{what}: a blit");
+    let second = named(len, 2);
+    blit_in(queue, texture, plain, &second);
+    texture
+        .get_bytes(&mut read, plain.row(), 0, plain.region(), 0, 0)
+        .unwrap();
+    assert_eq!(read, second, "{what}: getBytes of a blit's");
+
+    // A buffer over the texture's bytes: its write reaches every texel.
+    let buffer = heap.new_buffer_at_offset(span, shared(), OFFSET).unwrap();
+    let command_buffer = queue.command_buffer().unwrap();
+    let mut blit = command_buffer.blit_command_encoder().unwrap();
+    blit.fill_buffer(&buffer, 0..span, 0x5a).unwrap();
+    blit.end_encoding().unwrap();
+    run(&command_buffer);
+    assert_eq!(
+        blit_out(queue, texture, plain),
+        vec![0x5a; len],
+        "{what}: the buffer's write"
+    );
+
+    // A blit into it writes its span alone.
+    let outside = named(HEAP, 9);
+    mapping.write(0, &outside);
+    let third = named(len, 3);
+    blit_in(queue, texture, plain, &third);
+    let after = mapping.read(0..HEAP);
+    let (start, end) = (OFFSET as usize, (OFFSET + span) as usize);
+    assert!(
+        after[..start] == outside[..start] && after[end..] == outside[end..],
+        "{what}: a blit's bytes outside its span"
+    );
+    assert_eq!(blit_out(queue, texture, plain), third, "{what}: a blit");
+    drop(buffer);
 }
 
 /// A texture made again in a heap over host pages, of a descriptor a texture of the device was
@@ -421,8 +525,8 @@ fn a_host_heap_s_plain_texture_lies_in_metal_s_tiles() {
 /// (`WorkCounts::requirement_images_made`), nor asks the device's limits for those images
 /// (`WorkCounts::requirement_limits_asked`), and neither does the size query of that descriptor;
 /// the first texture of another extent asks. Elsewhere each making asks as the first did. Each
-/// texture made again lies in Metal's tiles all the same: a blit reads the bytes it was made
-/// over, its answered size the first's.
+/// texture made again lies as the first did, its answered size the first's: one in Metal's tiles
+/// holds the bytes it was made over, which a blit reads.
 #[test]
 fn a_texture_made_again_asks_the_device_nothing_its_first_making_asked() {
     on_device(|device, _| {
@@ -453,19 +557,25 @@ fn a_texture_made_again_asks_the_device_nothing_its_first_making_asked() {
             let len = plain.texels() * plain.unit as usize;
             let mut answers = Vec::new();
             let mut counts = Vec::new();
+            let mut in_tiles = Vec::new();
             for seed in 0..3 {
                 let held = named(len, seed);
                 mapping.write(0, &plain.laid(&held, &zero));
                 let mut texture = None;
+                let before = device.work_counts();
                 counts.push(asked(&mut || {
                     texture = Some(heap.new_texture_at_offset(&descriptor, OFFSET).unwrap());
                 }));
                 let texture = texture.unwrap();
-                assert_eq!(
-                    blit_out(&queue, &texture, plain),
-                    held,
-                    "{what} {seed}: the bytes it was made over"
-                );
+                let tiled = layouts_counted(&before, &device.work_counts()) == [1, 0, 0, 0];
+                in_tiles.push(tiled);
+                if tiled {
+                    assert_eq!(
+                        blit_out(&queue, &texture, plain),
+                        held,
+                        "{what} {seed}: the bytes it was made over"
+                    );
+                }
                 counts.push(asked(&mut || {
                     answers.push(device.heap_texture_size_and_align(&descriptor).unwrap());
                 }));
@@ -486,7 +596,14 @@ fn a_texture_made_again_asks_the_device_nothing_its_first_making_asked() {
                 answers.iter().all(|answer| *answer == answers[0]),
                 "{answers:?}"
             );
-            eprintln!("HEAPLAYOUT {what}: asked {counts:?}, kept {kept}");
+            assert!(
+                in_tiles.iter().all(|&tiled| tiled == in_tiles[0]),
+                "{what}: {in_tiles:?}"
+            );
+            eprintln!(
+                "HEAPLAYOUT {what}: asked {counts:?}, kept {kept}, in Metal's tiles {}",
+                in_tiles[0]
+            );
         }
     });
 }
@@ -495,7 +612,8 @@ fn a_texture_made_again_asks_the_device_nothing_its_first_making_asked() {
 /// set 0 holds storage buffers alone, as its moves' sets do, makes no descriptor pool: the
 /// runtime's own kernels' sets take spares of a list of their own, which a command buffer's set 0
 /// never takes, so the pool the dropped texture's moves gave back is there
-/// (`WorkCounts::arena_pools_made`). It lies in Metal's tiles all the same.
+/// (`WorkCounts::arena_pools_made`). One in Metal's tiles holds the bytes it was made over all the
+/// same; one in the device's image over the pages has no moves.
 #[test]
 fn a_texture_made_again_beside_dispatches_takes_its_moves_pool_back() {
     on_device(|device, _| {
@@ -527,11 +645,14 @@ fn a_texture_made_again_beside_dispatches_takes_its_moves_pool_back() {
             encoder.end_encoding().unwrap();
             let held = named(len, round);
             mapping.write(0, &plain.laid(&held, &zero));
-            let before = device.work_counts().arena_pools_made;
+            let before = device.work_counts();
             let made_now = heap.new_texture_at_offset(&descriptor, OFFSET).unwrap();
-            made.push(device.work_counts().arena_pools_made - before);
+            let after = device.work_counts();
+            made.push(after.arena_pools_made - before.arena_pools_made);
             run(&command_buffer);
-            assert_eq!(blit_out(&queue, &made_now, &plain), held, "round {round}");
+            if layouts_counted(&before, &after) == [1, 0, 0, 0] {
+                assert_eq!(blit_out(&queue, &made_now, &plain), held, "round {round}");
+            }
             // The texture before it goes, giving its moves' pool back.
             drop(texture.replace(made_now));
         }
@@ -539,17 +660,18 @@ fn a_texture_made_again_beside_dispatches_takes_its_moves_pool_back() {
     });
 }
 
-/// A dispatch writes a tiled texture's texel (0, 0) and four bytes of a buffer over the heap,
-/// those of element (1, 0) or ones between the elements, and both writes stay: every other byte
-/// is the heap's (the module docs), merged once (`shadow-merge`). Each keep, right after its copy
-/// in, copies the heap's bytes that copy took (`WorkCounts::shadow_keeps_from_staging`): a keep
-/// of other bytes would have the merge put the copy in's back over the buffer's write.
+/// A dispatch writes a texture's texel (0, 0) and four bytes of a buffer over the heap, those of
+/// Metal's element (1, 0) or ones between Metal's elements, and both writes stay: every other byte
+/// is the heap's (the module docs). A tiled one's are merged once (`shadow-merge`), and each keep,
+/// right after its copy in, copies the heap's bytes that copy took
+/// (`WorkCounts::shadow_keeps_from_staging`): a keep of other bytes would have the merge put the
+/// copy in's back over the buffer's write. One in the device's image over the pages, whose texel
+/// (0, 0) lies at its first byte too, takes neither.
 #[test]
 fn a_command_writing_a_tiled_texture_two_ways_keeps_both_writes() {
     on_device(|device, messages| {
         let queue = device.new_command_queue().unwrap();
-        let ll =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/public/engine/tob_renders.ll");
+        let ll = metal2vulkan_devtools::engine_dir().join("tob_renders.ll");
         let library = device
             .new_library_with_air(&llvm_assemble(&ll).unwrap())
             .unwrap();
@@ -574,9 +696,11 @@ fn a_command_writing_a_tiled_texture_two_ways_keeps_both_writes() {
             let Some(heap) = heap_over(device, &mapping) else {
                 return;
             };
+            let making = device.work_counts();
             let texture = heap
                 .new_texture_at_offset(&plain.descriptor(), OFFSET)
                 .unwrap();
+            let tiled = layouts_counted(&making, &device.work_counts()) == [1, 0, 0, 0];
             let span = device
                 .heap_texture_size_and_align(&plain.descriptor())
                 .unwrap()
@@ -611,19 +735,21 @@ fn a_command_writing_a_tiled_texture_two_ways_keeps_both_writes() {
             );
             let staged =
                 device.work_counts().shadow_keeps_from_staging - counted.shadow_keeps_from_staging;
-            assert_eq!(staged, 1, "{what}: keeps from the staging buffer");
-            made = true;
+            assert_eq!(
+                staged,
+                u64::from(tiled),
+                "{what}: keeps from the staging buffer"
+            );
+            made |= tiled;
             drop((buffer, texture, heap));
             drop(mapping);
-            eprintln!("HEAPLAYOUT two ways {what}: both writes kept");
+            eprintln!("HEAPLAYOUT two ways {what}: both writes kept, in Metal's tiles {tiled}");
         }
         let counted = counts(&messages.take_notices());
-        if made {
-            assert_eq!(
-                counted.get(&Degradation::ShadowMerge),
-                Some(&1),
-                "merged, announced once: {counted:?}"
-            );
+        let merged = counted.get(&Degradation::ShadowMerge);
+        match made {
+            true => assert_eq!(merged, Some(&1), "merged, announced once: {counted:?}"),
+            false => assert_eq!(merged, None, "nothing merged: {counted:?}"),
         }
     });
 }
@@ -634,13 +760,13 @@ fn a_command_writing_a_tiled_texture_two_ways_keeps_both_writes() {
 /// Its keep and changed copy write the texture's bytes whole, so no merge zeroes its scratch:
 /// each takes one an earlier merge kept, else a new one
 /// (`WorkCounts::shadow_merge_scratches_zeroed`, `shadow_merge_scratches_reused`); and each keep
-/// copies the bytes its copy in took (`WorkCounts::shadow_keeps_from_staging`).
+/// copies the bytes its copy in took (`WorkCounts::shadow_keeps_from_staging`). Skipped, saying
+/// so, where the device's image over the pages holds the texture.
 #[test]
 fn a_tiled_texture_s_merges_take_kept_scratches_unzeroed() {
     on_device(|device, _| {
         let queue = device.new_command_queue().unwrap();
-        let ll =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/public/engine/tob_renders.ll");
+        let ll = metal2vulkan_devtools::engine_dir().join("tob_renders.ll");
         let library = device
             .new_library_with_air(&llvm_assemble(&ll).unwrap())
             .unwrap();
@@ -662,11 +788,14 @@ fn a_tiled_texture_s_merges_take_kept_scratches_unzeroed() {
             .new_texture_at_offset(&plain.descriptor(), OFFSET)
             .unwrap();
         let counts = device.work_counts();
-        assert_eq!(
-            layouts_counted(&made, &counts),
-            [1, 0, 0, 0],
-            "the texture lies in Metal's tiles"
-        );
+        match layouts_counted(&made, &counts) {
+            [1, 0, 0, 0] => {}
+            [0, 0, 0, 1] => {
+                eprintln!("HEAPLAYOUT tiled merges: skipped, the texture lies in place");
+                return;
+            }
+            other => panic!("counted {other:?}"),
+        }
         let aside = buffer_with(device, &[0u8; 16]).unwrap();
         let at = buffer_with(device, &0u32.to_le_bytes()).unwrap();
         for run_at in 0..3 {
@@ -1074,13 +1203,14 @@ fn fnv(bytes: &[u8]) -> u64 {
     })
 }
 
-/// A block-compressed texture in a heap over host pages lies as Metal lays it out (the M4's and
-/// the M3 Max's under macOS 27.0.1): its answer holds Metal's size; `replaceRegion` of every block
-/// leaves the span Metal's bytes, and a blit of each level the same bytes (their hash); `getBytes`
-/// reads each level back from the CPU's writes of those bytes. Counted tiled, with no layout
-/// notice. A device whose image of the format holds other bytes than its blocks (a format it
-/// decodes) announces `heap-texture-untiled-layout` instead (each row's notice: the device asks
-/// for each, `DeviceOptions::announce_each`). An ASTC texture on a device without ASTC, whose
+/// A block-compressed texture in a heap over host pages that no image over the pages serves lies
+/// as Metal lays it out (the M4's and the M3 Max's under macOS 27.0.1): its answer holds Metal's
+/// size; `replaceRegion` of every block leaves the span Metal's bytes, and a blit of each level
+/// the same bytes (their hash); `getBytes` reads each level back from the CPU's writes of those
+/// bytes. Counted tiled, with no layout notice. One in the device's image over the pages, and one
+/// whose image of the format holds other bytes than its blocks (a format it decodes), announces
+/// `heap-texture-untiled-layout` instead (each row's notice: the device asks for each,
+/// `DeviceOptions::announce_each`). An ASTC texture on a device without ASTC, whose
 /// carrier's decoded twin would decode what the heap's bytes held, answers Metal's size and is
 /// refused its making (`NotImplemented(DecodedHeapTexture)`), its `HEAPLAYOUT` line saying so.
 #[test]
@@ -1092,7 +1222,7 @@ fn a_host_heap_s_block_compressed_texture_lies_as_metal_lays_it_out() {
 /// `a_host_heap_s_block_compressed_texture_lies_as_metal_lays_it_out` on `device`.
 fn block_rows_lie_as_metal_lays_them_out(device: &Device, messages: &Messages) {
     let queue = device.new_command_queue().unwrap();
-    let mut tiled = 0;
+    let (mut tiled, mut untiled) = (0, 0);
     for row in block_rows() {
         let what = format!("{:?} {:?} {:?}", row.format, row.texture_type, row.extent);
         let mapping = Mapping::anonymous(HEAP);
@@ -1137,7 +1267,11 @@ fn block_rows_lie_as_metal_lays_them_out(device: &Device, messages: &Messages) {
             [0, 0, 0, 1] => {
                 let kind = Degradation::HeapTextureUntiledLayout;
                 assert_eq!(notices, [(kind, Some(texture.object_id()))], "{what}");
-                eprintln!("HEAPLAYOUT {what}: the device's image holds other bytes");
+                eprintln!(
+                    "HEAPLAYOUT {what}: untiled, in the device's image over the pages or one that \
+                     holds other bytes"
+                );
+                untiled += 1;
                 continue;
             }
             other => panic!("{what}: counted {other:?}"),
@@ -1213,7 +1347,8 @@ fn block_rows_lie_as_metal_lays_them_out(device: &Device, messages: &Messages) {
             answer.size
         );
     }
-    assert!(tiled > 0, "no block-compressed texture tiled");
+    assert!(tiled + untiled > 0, "no block-compressed texture made");
+    eprintln!("HEAPLAYOUT blocks: {tiled} as Metal lays them out, {untiled} untiled");
 }
 
 /// 4-sample 64 x 64 render targets in a heap over host pages, each a shadow of its samples in
@@ -1226,7 +1361,8 @@ fn block_rows_lie_as_metal_lays_them_out(device: &Device, messages: &Messages) {
 /// layout notice, each sample of each found in the heap's bytes where Metal's tiles place it after
 /// a blit naming it, and bytes written there read back by a blit
 /// (`heap_textures::sample_round_trip`). The size query answers at least Metal's for each on every
-/// device (66048 and 65536 bytes at 128).
+/// device (66048 and 65536 bytes at 128). Once everything over the heap went and the pages were
+/// unmapped, a command buffer of the same queue runs and reads the resolved texels.
 #[test]
 fn a_host_heap_s_multisample_textures_hold_their_samples_in_metal_s_tiles() {
     use super::heap_textures::sample_round_trip;
@@ -1327,8 +1463,24 @@ fn a_host_heap_s_multisample_textures_hold_their_samples_in_metal_s_tiles() {
             );
             assert_eq!((off, read_off), (0, 0), "{what}: samples off Metal's tiles");
         }
-        drop((texture, resolved, heap));
+        // The pass and its command buffer hold the texture, which holds the heap and its import
+        // of the pages: they all go before the pages, as the heap's contract asks.
+        drop((command_buffer, pass, texture, heap));
         drop(mapping);
+        // A command buffer committed once the pages are unmapped runs: no import of them is left
+        // (RADV lists every imported memory in every kernel submission, and the kernel refuses
+        // one that lists pages no longer mapped).
+        let plain = Plain {
+            format: PixelFormat::RGBA8Unorm,
+            unit: 4,
+            extent: [64, 64],
+        };
+        let texels = blit_out(&queue, &resolved, &plain);
+        assert!(
+            texels.chunks(4).all(|texel| texel == [51, 102, 153, 255]),
+            "resolved after the unmap: {:?}",
+            &texels[..16]
+        );
         eprintln!("HEAPLAYOUT multisample: compressed and uncompressed held in Metal's tiles");
     });
 }

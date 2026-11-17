@@ -52,6 +52,19 @@
 //! library of shaders, so nothing of its stages is converted or compiled again; and no making
 //! asks for a cache, so none is shared.
 //!
+//! **A pass's attachment formats name no record**: creations of one pair whose passes differ only
+//! in their colour format each make their libraries of shaders against their own pass, handed the
+//! first's caches, so a driver that keys a stage's compile without the format (ANV) finds it
+//! there; a format the translation reads changes the fragment module, which keeps a record of
+//! its own (`creations_over_colour_formats_take_the_first_s_records`).
+//!
+//! **A library of shaders reports what its driver found**, as a whole pipeline's making does: a
+//! later device over the directory an earlier one wrote counts one report per library of shaders
+//! it makes, and reads no data back for one found in its record
+//! (`a_library_of_shaders_reports_what_its_driver_found`). So do the runtime's own kernels, and
+//! one found in its record writes no record again
+//! (`the_runtime_s_own_kernels_found_in_their_records_write_nothing`).
+//!
 //! The device takes a shader cache directory of its own, empty, so no run reads a record an
 //! earlier run stored.
 //!
@@ -61,6 +74,7 @@
 
 use super::blit_holds::{device, Scratch};
 use super::descriptor_key_once::descriptor;
+use crate::owned_kernel::OwnedModule;
 use crate::PipelineOptions;
 use metal2vulkan::metal::{BlendFactor, BlendOperation};
 
@@ -166,4 +180,257 @@ fn every_sibling_render_creation_takes_the_first_s_driver_cache() {
         "a driver that reports a sibling found in the first's cache must report every one of \
          {RUN} found there, their stages being the same: {hits} hits and {misses} misses"
     );
+}
+
+/// Where the device links its render pipelines from libraries and its makings report, the making
+/// of each library of shaders reports what its driver found, as a whole pipeline's making does: a
+/// later device over the directory an earlier one's creation of the same state wrote counts one
+/// report for each of the state's pre-rasterization and fragment shader libraries, and each one
+/// the driver reports found in the cache its record loaded reads no data back and writes nothing
+/// (`driver_data_found`). Unreported, a library's making read its data back and compared the
+/// bytes, and RADV's data after a library found in its record is now and then not the record's
+/// byte for byte (`shader_cache/driver.rs`), so such a device wrote the record again.
+#[test]
+fn a_library_of_shaders_reports_what_its_driver_found() {
+    let scratch = Scratch::new("driver-library-reports");
+    let options = PipelineOptions::default();
+    {
+        let device = device(&scratch.0);
+        let shared = device.shared();
+        if shared.libraries.is_none() || !shared.shader_cache.driver_reports() {
+            println!(
+                "DRIVER-LIBRARY-REPORTS: not covered (links from libraries: {}, makings report: \
+                 {})",
+                shared.libraries.is_some(),
+                shared.shader_cache.driver_reports()
+            );
+            return;
+        }
+        drop(
+            device
+                .new_render_pipeline_state(&descriptor(&device), &options)
+                .unwrap(),
+        );
+    }
+    // The first device is gone, so its cache thread wrote what its makings handed it.
+    let device = device(&scratch.0);
+    let base = descriptor(&device);
+    let before = device.shader_cache_statistics();
+    let counts_before = device.work_counts();
+    let _state = device.new_render_pipeline_state(&base, &options).unwrap();
+    let after = device.shader_cache_statistics();
+    let counts = device.work_counts();
+    let made = |of: fn(&crate::WorkCounts) -> u64| of(&counts) - of(&counts_before);
+    let since = |of: fn(&crate::ShaderCacheStatistics) -> u64| of(&after) - of(&before);
+    let (hits, misses) = (
+        since(|s| s.driver_pipeline_hits),
+        since(|s| s.driver_pipeline_misses),
+    );
+    let (found, saves) = (since(|s| s.driver_data_found), since(|s| s.driver_saves));
+    println!(
+        "DRIVER-LIBRARY-REPORTS: {hits} hits and {misses} misses reported, {found} found and read \
+         nothing back, {saves} records' data written, {} loaded",
+        since(|s| s.driver_loads)
+    );
+    // The fresh device makes each of the state's four libraries once and links them.
+    assert_eq!(
+        (
+            made(|c| c.pipelines_linked),
+            made(|c| c.pipeline_libraries_made),
+            made(|c| c.fragment_shader_libraries_made)
+        ),
+        (1, 4, 1),
+        "the state links one pipeline from four libraries made for it"
+    );
+    assert_eq!(
+        hits + misses,
+        2,
+        "each of the state's two libraries of shaders reports what its driver found: {hits} hits \
+         and {misses} misses"
+    );
+    assert_eq!(
+        found, hits,
+        "each library its driver reports found in the cache its record loaded reads no data back"
+    );
+    if hits == 2 {
+        assert_eq!(saves, 0, "libraries found in their records write nothing");
+    }
+}
+
+/// The runtime's own kernels made again on a later device report what their driver found, and
+/// those it reports found in the records an earlier device over the same directory wrote write no
+/// record again (`driver_saves`), whatever bytes the driver's data holds after them: RADV's
+/// differs from the record's now and then (`shader_cache/driver.rs`), which a byte comparison
+/// took for new data and wrote the record again at the device's every making of them.
+#[test]
+fn the_runtime_s_own_kernels_found_in_their_records_write_nothing() {
+    let scratch = Scratch::new("driver-own-kernels");
+    let kernels = [OwnedModule::RowsCopy, OwnedModule::VisibilityCombine];
+    {
+        let device = device(&scratch.0);
+        let reports = device.shared().shader_cache.driver_reports();
+        if !reports {
+            println!("DRIVER-OWN-KERNELS: not covered (the device's makings report nothing)");
+            return;
+        }
+        for which in kernels {
+            device.owned_kernel(which).unwrap();
+        }
+    }
+    // The first device is gone, so its cache thread wrote what its makings handed it.
+    let device = device(&scratch.0);
+    let before = device.shader_cache_statistics();
+    let counts_before = device.work_counts();
+    for which in kernels {
+        device.owned_kernel(which).unwrap();
+    }
+    let after = device.shader_cache_statistics();
+    let made = device.work_counts().owned_kernels_made - counts_before.owned_kernels_made;
+    let since = |of: fn(&crate::ShaderCacheStatistics) -> u64| of(&after) - of(&before);
+    let (hits, misses) = (
+        since(|s| s.driver_pipeline_hits),
+        since(|s| s.driver_pipeline_misses),
+    );
+    let (found, saves) = (since(|s| s.driver_data_found), since(|s| s.driver_saves));
+    println!(
+        "DRIVER-OWN-KERNELS: {made} kernels made, {hits} hits and {misses} misses reported, \
+         {found} found and read nothing back, {saves} records' data written, {} loaded",
+        since(|s| s.driver_loads)
+    );
+    assert_eq!(
+        made,
+        kernels.len() as u64,
+        "the later device made each kernel"
+    );
+    assert_eq!(
+        hits + misses,
+        made,
+        "each of the runtime's kernels reports what its driver found: {hits} hits and {misses} \
+         misses"
+    );
+    assert_eq!(
+        found, hits,
+        "each kernel its driver reports found in the cache its record loaded reads no data back"
+    );
+    if hits == made {
+        assert_eq!(saves, 0, "kernels found in their records write nothing");
+    }
+}
+
+/// Render creations of one function pair whose passes differ only in their colour attachment's
+/// format take the first creation's records: a pass's attachment formats reach no stage's
+/// conversion, so they name no record (`GraphicsContent::record_parts`), and each making of
+/// shaders is handed the cache the first made. Where the device links from libraries, each such
+/// creation makes its own pre-rasterization and fragment shader libraries, against its own pass,
+/// and both are handed the first's caches; a whole making is handed the first's one. A format
+/// the translation reads keeps a record of its own: under `TextureWriteRoundingMode::NearestEven`
+/// the fragment function rounds a half-float channel itself (`pipeline/color_writes.rs`), so its
+/// module for an `RGBA16Float` attachment is another, and its making is handed a cache of its
+/// own. Where the device links, that creation makes its fragment shader library alone: its
+/// pre-rasterization library is the one the `RGBA16Float` creation before it made against the
+/// same pass.
+///
+/// The counts are this crate's own arrangement and hold on every device. What the driver
+/// reports it found is the driver's: ANV finds a fragment shader library of one module made
+/// against another format's pass in the shared cache (Mesa 26.2.6, Iris Xe:
+/// `APPLICATION_PIPELINE_CACHE_HIT`, where a cache of its own compiled it again, 3.3 to 3.7 s
+/// for a module of some 200,000 words), so the run prints it and asserts only that a reporting
+/// device reports one answer per making of shaders.
+#[test]
+fn creations_over_colour_formats_take_the_first_s_records() {
+    use metal2vulkan::metal::{PixelFormat, TextureWriteRoundingMode};
+    use metal2vulkan::pipeline::ColorAttachmentDescriptor;
+    let scratch = Scratch::new("driver-pipeline-formats");
+    let device = device(&scratch.0);
+    let base = descriptor(&device);
+    let options = PipelineOptions::default();
+    let links = device.shared().libraries.is_some();
+    let with = |format: PixelFormat, rounding: TextureWriteRoundingMode| {
+        let mut d = base.clone();
+        d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(format));
+        d.texture_write_rounding_mode = rounding;
+        d
+    };
+    // What a creation of `d` did: the caches it was handed that an earlier making made, the
+    // libraries it made of a fragment shader, and what its driver reported.
+    let create = |d: &metal2vulkan::pipeline::RenderPipelineDescriptor| {
+        let shared_before = device.shared().shader_cache.caches_shared();
+        let before = device.shader_cache_statistics();
+        let counts_before = device.work_counts();
+        let state = device.new_render_pipeline_state(d, &options).unwrap();
+        let after = device.shader_cache_statistics();
+        let shared = device.shared().shader_cache.caches_shared() - shared_before;
+        let fragment_shaders = device.work_counts().fragment_shader_libraries_made
+            - counts_before.fragment_shader_libraries_made;
+        let hits = after.driver_pipeline_hits - before.driver_pipeline_hits;
+        let misses = after.driver_pipeline_misses - before.driver_pipeline_misses;
+        (state, shared, fragment_shaders, hits, misses)
+    };
+    let _first = create(&with(
+        PixelFormat::RGBA8Unorm,
+        TextureWriteRoundingMode::TowardZero,
+    ));
+    // Each making of shaders a creation over another format makes: where the device links, its
+    // two libraries of shaders, each against its own pass; else its one whole pipeline.
+    let makings = if links { 2 } else { 1 };
+    let mut kept = Vec::new();
+    for format in [PixelFormat::BGRA8Unorm, PixelFormat::RGBA16Float] {
+        let (state, shared, fragment_shaders, hits, misses) =
+            create(&with(format, TextureWriteRoundingMode::TowardZero));
+        println!(
+            "DRIVER-PIPELINE-FORMATS: {format:?}: {shared} of {makings} makings took an earlier \
+             making's cache, {fragment_shaders} fragment shader libraries made, {hits} hits and \
+             {misses} misses reported"
+        );
+        assert_eq!(
+            shared, makings,
+            "a creation whose pass differs from the first's only in its colour format ({format:?}) \
+             must be handed the first's cache for each of its {makings} makings of shaders, the \
+             format naming no record: {shared} were"
+        );
+        if links {
+            assert_eq!(
+                fragment_shaders, 1,
+                "a pass of another format takes a fragment shader library of its own"
+            );
+        }
+        if hits + misses > 0 {
+            assert_eq!(
+                hits + misses,
+                makings,
+                "a device that reports what it found reports one answer per making of shaders"
+            );
+        }
+        kept.push(state);
+    }
+    // A format the translation reads: the rounding module is another, so its making names a
+    // record of its own and is handed no earlier making's cache. Where the device links, its
+    // fragment shader library is the one library it makes.
+    let (_rounded, shared, fragment_shaders, hits, misses) = create(&with(
+        PixelFormat::RGBA16Float,
+        TextureWriteRoundingMode::NearestEven,
+    ));
+    println!(
+        "DRIVER-PIPELINE-FORMATS: RGBA16Float rounded to nearest even: {shared} makings took an \
+         earlier making's cache, {fragment_shaders} fragment shader libraries made, {hits} hits \
+         and {misses} misses reported"
+    );
+    assert_eq!(
+        shared, 0,
+        "a fragment module the format changes keeps a record of its own: {shared} makings took an \
+         earlier making's cache"
+    );
+    if links {
+        assert_eq!(
+            fragment_shaders, 1,
+            "the rounding module takes a fragment shader library of its own"
+        );
+    }
+    if hits + misses > 0 {
+        assert_eq!(
+            hits + misses,
+            1,
+            "a device that reports what it found reports one answer per making of shaders"
+        );
+    }
 }

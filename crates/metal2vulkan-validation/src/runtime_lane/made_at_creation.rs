@@ -8,10 +8,11 @@
 //! `validation/fixtures/public/examples/runtime_examples.ll`, and owned functions reading their
 //! vertices through a vertex descriptor (`LAYOUT_FUNCTIONS`).
 
-use super::degrade_notices::{counts, on_device};
+use super::degrade_notices::on_device_with;
+use super::degrade_notices::{counts, on_device, shared_in_system_memory};
 use super::pixel_samplers::metal_sampler;
 use super::{
-    dynamic_input_assembly, layer_reported_nothing_at_all, pipelines_settled,
+    at_plan, dynamic_input_assembly, layer_reported_nothing_at_all, pipelines_settled,
     validated_device_with, Messages, ScratchCache, WAIT,
 };
 use crate::air_library::AirLibrary;
@@ -30,7 +31,6 @@ use metal2vulkan_runtime::{
     ResourceOptions, SamplerState, Size, StoreAction, Texture, TextureDescriptor, WorkCounts,
 };
 use std::collections::BTreeSet;
-use std::path::Path;
 
 /// The render target's side, and the color `colored_fragment` draws with its `RGBA8Unorm` bytes.
 const SIDE: u64 = 8;
@@ -41,8 +41,7 @@ const HALF_DRAWN: [u8; 8] = [0x00, 0x3c, 0x66, 0x32, 0x00, 0x00, 0x00, 0x3c];
 
 /// The owned fixture's library on `device`.
 fn library(device: &Device) -> Library {
-    let ll =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/public/examples/runtime_examples.ll");
+    let ll = metal2vulkan_devtools::fixtures_dir().join("examples/runtime_examples.ll");
     let bitcode = llvm_assemble(&ll).unwrap();
     device.new_library_with_air(&bitcode).unwrap()
 }
@@ -271,7 +270,7 @@ fn draw_into(
 /// key, made at its draw.
 #[test]
 fn a_state_s_first_draw_takes_the_pipeline_made_at_its_creation() {
-    on_device(|device, _| {
+    on_device_with(at_plan, |device, _| {
         let before = device.work_counts();
         let state = state(device, "colored_fragment");
         assert_eq!(made_since(device, &before), (1, 0), "made at creation");
@@ -303,16 +302,17 @@ fn a_state_s_first_draw_takes_the_pipeline_made_at_its_creation() {
 /// there may hold one (`PrecisionNote::DeviceNanEncoding`, a test of the bound format, which no
 /// pipeline's key carries). Each draw binds an `RGBA16Float` texture, which takes the pipeline
 /// made at creation (`a_draw_binding_a_texture_takes_the_pipeline_made_at_creation`); every kind
-/// the first draw announces is one the stage specializes ([`specialized_kinds`]). On a device that
-/// samples through Metal's own texture unit the creation makes the predicted key's general form,
-/// and hands the predicted key itself to the pool right after (`pipeline/render/residual.rs`):
-/// both counted once the pool settles, and neither announcing anything before a draw.
+/// the first draw announces is one the stage specializes ([`specialized_kinds`]), or, on a device
+/// without unified memory, `SharedInSystemMemory` for the draw's `Shared` buffer. The creation
+/// makes that one pipeline on every device, counted once the pool settles: where the device
+/// samples through Metal's own texture unit too, the predicted key's plain `half` arm is no
+/// constant of its general form (`pipeline/render/residual.rs`).
 #[test]
 fn a_pipeline_made_at_creation_announces_at_its_first_draw() {
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
     {
-        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |_| {}).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let nans = Degradation::from_precision_note(PrecisionNote::DeviceNanEncoding);
         let waits = specialized_kinds(&device, "sampled_fragment");
         assert!(
@@ -324,12 +324,10 @@ fn a_pipeline_made_at_creation_announces_at_its_first_draw() {
         let before = device.work_counts();
         let state = state(&device, "sampled_fragment");
         pipelines_settled(&device);
-        let metal = metal_sampler(&device);
         assert_eq!(
             made_since(&device, &before),
-            (1 + u64::from(metal), 0),
-            "the predicted key's pipeline, made at creation, and its general form where the \
-             device samples through Metal's texture unit ({metal})"
+            (1, 0),
+            "the predicted key's pipeline, made at creation, alone"
         );
         let at_creation = counts(&messages.take_notices());
         let created = device.work_counts();
@@ -345,9 +343,13 @@ fn a_pipeline_made_at_creation_announces_at_its_first_draw() {
             "the first draw announced the pipeline's notices: {at_draw:?} (creation: \
              {at_creation:?})"
         );
+        // The draw's `Shared` buffer is the device's first: a device without unified memory
+        // announces it as well.
+        let system_memory = shared_in_system_memory(&device);
         let unspecialized: Vec<_> = at_draw
             .keys()
             .filter(|kind| !waits.contains(kind))
+            .filter(|&&kind| !(system_memory && kind == Degradation::SharedInSystemMemory))
             .collect();
         assert!(
             unspecialized.is_empty(),
@@ -376,22 +378,20 @@ fn a_pipeline_made_at_creation_announces_at_its_first_draw() {
 /// draw binds. A draw of `sampled_fragment` binding nothing takes the pipeline made at creation,
 /// and so do draws binding an `RGBA8Unorm` or an `RGBA16Float` texture, each sampling its texels:
 /// the class of the format the slot binds reaches the function as a push field, not as the
-/// pipeline's specialization. On a device that samples through Metal's own texture unit the
-/// creation makes the predicted key's general form too (`pipeline/render/residual.rs`), and the
-/// predicted key, made on the pool right after, is the one these draws take once the pool settles:
-/// each class is plain and measured, as the unbound slot the prediction binds.
+/// pipeline's specialization. On a device that samples through Metal's own texture unit too, the
+/// creation makes the predicted key alone, its texture slot's plain `half` arm
+/// (`pipeline/render/residual.rs`), which these draws take: each class is plain and measured, as
+/// the unbound slot the prediction binds. No draw takes a general form.
 #[test]
 fn a_draw_binding_a_texture_takes_the_pipeline_made_at_creation() {
-    on_device(|device, _| {
-        let metal = metal_sampler(device);
+    on_device_with(at_plan, |device, _| {
         let before = device.work_counts();
         let state = state(device, "sampled_fragment");
         pipelines_settled(device);
         assert_eq!(
             made_since(device, &before),
-            (1 + u64::from(metal), 0),
-            "made at creation, with the general form where the device samples through Metal's \
-             texture unit ({metal})"
+            (1, 0),
+            "made at creation, the predicted key alone"
         );
         let created = device.work_counts();
         draw(device, &state, PrimitiveType::Triangle);
@@ -454,21 +454,21 @@ fn bc4_filled(device: &Device, side: u64, block: [u8; 8]) -> Texture {
 /// draws at once with the pipeline its state's creation made. On a device that samples through
 /// Metal's own texture unit the class keys apart from the prediction (`SpecKey::UnmeasuredTexels`
 /// 1, where the unbound slot the prediction binds has 0), so the draw takes its key's general form,
-/// the one the creation made (`pipeline/render/residual.rs`), and hands its own key's making to
-/// the pool, which nothing waits for; once made, a second draw takes it. Elsewhere the class is a
-/// push field alone, and both draws take the predicted key. Each draws the blocks' red, 1.
+/// which is the predicted key the creation made (`pipeline/render/residual.rs`), and hands its own
+/// key's making to the pool, which nothing waits for; once made, a second draw takes it. Elsewhere
+/// the class is a push field alone, and both draws take the predicted key. Each draws the blocks'
+/// red, 1.
 #[test]
 fn a_draw_of_an_unmeasured_class_takes_the_general_form_its_creation_made() {
-    on_device(|device, _| {
+    on_device_with(at_plan, |device, _| {
         let metal = metal_sampler(device);
         let before = device.work_counts();
         let state = state(device, "sampled_fragment");
         let created = pipelines_settled(device);
         assert_eq!(
             made_since(device, &before),
-            (1 + u64::from(metal), 0),
-            "made at creation, with the general form where the device samples through Metal's \
-             texture unit ({metal})"
+            (1, 0),
+            "made at creation, the predicted key alone"
         );
         // Both endpoints 255, every index 0: red 1, and Metal's green 0, blue 0 and alpha 1.
         let red = bc4_filled(device, SIDE, [0xff, 0xff, 0, 0, 0, 0, 0, 0]);
@@ -486,9 +486,9 @@ fn a_draw_of_an_unmeasured_class_takes_the_general_form_its_creation_made() {
                 drawn.creation_pipelines_drawn - created.creation_pipelines_drawn,
             ),
             (metal_count, metal_count, 1),
-            "the draw took the general form, made at creation, and began its own key's making \
-             where the device samples through Metal's texture unit ({metal}); elsewhere the \
-             predicted key"
+            "the draw took its general form, the predicted key made at creation, and began its \
+             own key's making where the device samples through Metal's texture unit ({metal}); \
+             elsewhere the predicted key"
         );
         assert_eq!(
             made_since(device, &created),
@@ -593,12 +593,13 @@ fn a_creation_makes_the_default_sampler_s_key() {
 /// pipeline and links it; a second state of the same functions and pass whose attachment blends
 /// with factors one and zero, which store the output as the unblended attachment does (the
 /// fragment rounds it, and link gives such an attachment no Vulkan blend), makes no library and
-/// links its pipeline from the first state's: its fragment function is not compiled again. Both
-/// draw what the fragment computes. A device that makes its pipelines whole makes no library and
-/// links none.
+/// links nothing: its four libraries and its layout are the first state's, so its linked pipeline
+/// is too (`WorkCounts::linked_pipelines_shared`), and its fragment function is not compiled
+/// again. Both draw what the fragment computes. A device that makes its pipelines whole makes no
+/// library and links none.
 #[test]
 fn states_of_one_fragment_and_pass_share_its_fragment_library() {
-    on_device(|device, _| {
+    on_device_with(at_plan, |device, _| {
         let before = device.work_counts();
         let first = state(device, "colored_fragment");
         let (libraries, linked, made, pooled) = linked_since(device, &before);
@@ -621,8 +622,13 @@ fn states_of_one_fragment_and_pass_share_its_fragment_library() {
                 );
                 assert_eq!(
                     again,
-                    (0, 1, 1, 0),
-                    "the second state's pipeline linked from the first state's libraries"
+                    (0, 0, 0, 0),
+                    "the second state's pipeline, the first state's: no library made, nothing linked"
+                );
+                assert_eq!(
+                    device.work_counts().linked_pipelines_shared - created.linked_pipelines_shared,
+                    1,
+                    "the second state took the first state's linked pipeline"
                 );
             }
         }
@@ -823,7 +829,7 @@ fn draw_layout(device: &Device, state: &RenderPipelineState, vertices: Vertices)
 /// takes it too.
 #[test]
 fn a_state_with_a_vertex_descriptor_makes_its_first_draw_s_pipeline_at_creation() {
-    on_device(|device, _| {
+    on_device_with(at_plan, |device, _| {
         let before = device.work_counts();
         let state = layout_state(device, Some(LAYOUT_STRIDE));
         assert_eq!(made_since(device, &before), (1, 0), "made at creation");

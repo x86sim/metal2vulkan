@@ -15,7 +15,8 @@
 //!   buffer keeps its bytes, Metal's answer (a Metal probe on the M3 Max and an M4, and the
 //!   DontCare-store probe, `kept_bytes.rs`). A pass that reaches no tile
 //!   (`clear_reach::PassReach::Nothing`) leaves a color attachment it loads, resolves nothing from
-//!   and stores (or stores `DontCare`) as it was, as Metal loads and stores only the tiles a draw
+//!   and stores (or stores `DontCare`) as it was (but one it loads after a clear before it past
+//!   the render area, `ColorTarget::cleared_ahead`, which is copied in and back), as Metal loads and stores only the tiles a draw
 //!   reaches: where its texture's shadow is an image of a buffer's bytes, nothing is copied in or
 //!   back. A pass whose draws do reach tiles, some or (where it clears and stores an attachment)
 //!   every one, changes a color attachment it loads (as the encoder set its load, so no clear
@@ -49,6 +50,8 @@
 //!   (`NotImplemented(IndirectRenderCommands)`): a command's draw that uses a shadowed texture its
 //!   call did not gather (none can: its tables and residency are the call's).
 
+use super::face_swap;
+use crate::binding::ResidentPrefix;
 use crate::buffer::Buffer;
 use crate::clear_reach::DrawnArea;
 use crate::encoder::EncoderCore;
@@ -59,12 +62,11 @@ use crate::render_values::{LoadAction, StoreAction};
 use crate::residency::Used;
 use crate::resource::ResourceKey;
 use crate::shadow::{self, ShadowCopies, ShadowCopy, ShadowUse, Within};
-use crate::tracker::{Access, Use, UseRange};
+use crate::tracker::{Access, ImagePlace, Use, UseRange};
 use crate::work_counts::{ColorTaken, Counters};
 use crate::Device;
 use ash::vk;
 use metal2vulkan::metal::TextureType;
-use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -74,23 +76,38 @@ use std::sync::Arc;
 /// in the gap.
 const RANGES_PER_BUFFER: usize = 16;
 
-/// What one render pass instance's draws gathered (the module docs).
+/// What one render pass instance's draws gathered (the module docs). Its lists keep their room
+/// when it is cleared ([`clear`](Self::clear)), so a render encoder's next pass that takes it
+/// gathers into them without allocating ([`DrawRoom`](super::draw_room::DrawRoom)).
 #[derive(Default)]
 pub(super) struct InstanceShadows {
     /// The shadowed textures the draws use, each once.
     shadows: Vec<ShadowUse>,
-    /// The bytes of buffers the draws use, by buffer and whether they write: ranges in order,
-    /// apart, merged where they meet (at most [`RANGES_PER_BUFFER`]).
-    bytes: BTreeMap<(ResourceKey, bool), Vec<Range<u64>>>,
-    /// The images the draws use, by image and whether they write: the aspects, levels and
-    /// layers of every such use, one range spanning them all (which can only add a copy, or
-    /// refuse an instance that writes one image apart two ways), for the shadows of images'
-    /// views of another layout (`texture/view_shadow.rs`).
-    images: BTreeMap<(ResourceKey, bool), UseRange>,
-    /// The uses the last [`add`](InstanceShadows::add) gathered, in order: a use equal to the
-    /// one at its position there is gathered already (gathering one again changes nothing, as
-    /// each range only grows), so a draw that uses what the last one did gathers nothing new.
+    /// The bytes of buffers the draws use, by buffer and whether they write, in that order: the
+    /// first [`held`](Self::held), each with its ranges in order, apart, merged where they meet
+    /// (at most [`RANGES_PER_BUFFER`]). Those past them are lists left empty with their room,
+    /// which the next buffers take.
+    bytes: Vec<((ResourceKey, bool), Vec<Range<u64>>)>,
+    held: usize,
+    /// The images the draws use, by image and whether they write, in that order: the aspects,
+    /// levels and layers of every such use, one range spanning them all (which can only add a
+    /// copy, or refuse an instance that writes one image apart two ways), for the shadows of
+    /// images' views of another layout (`texture/view_shadow.rs`).
+    images: Vec<((ResourceKey, bool), UseRange)>,
+    /// The uses the last [`add`](InstanceShadows::add) gathered, in order, or uses covering them
+    /// (`Use::covers`): a use equal to the one at its position there, or covered by it, is
+    /// gathered already (gathering one again changes nothing, as each range only grows), so a
+    /// draw that uses what the last one did, or bytes inside those, gathers nothing new.
     last: Vec<Use<ResourceKey>>,
+    /// The identity and count of the uses of what the encoder made resident the last
+    /// [`add_draw`](InstanceShadows::add_draw) began with: gathered, as what the instance
+    /// gathered stays until it is cleared, so a draw that begins with the same gathered those
+    /// already.
+    last_prefix: Option<(u64, usize)>,
+    /// The shadows whose copy in is a clear to the value given (`shadow::ShadowUse::cleared`):
+    /// the pass's first instance's, of textures its draws sample whose color it clears, after a
+    /// memory barrier before its first draw (`texture/attached_reads.rs`).
+    clears: Vec<(ResourceKey, vk::ClearColorValue)>,
 }
 
 /// `range` of the buffer `key` as a use, read or written (`write`), for `shadow.rs`, which reads
@@ -121,16 +138,22 @@ fn span(a: &UseRange, b: &UseRange) -> UseRange {
                 aspects,
                 levels,
                 layers,
+                place,
             },
             UseRange::Image {
                 aspects: b_aspects,
                 levels: b_levels,
                 layers: b_layers,
+                place: b_place,
             },
         ) => UseRange::Image {
             aspects: *aspects | *b_aspects,
             levels: levels.start.min(b_levels.start)..levels.end.max(b_levels.end),
             layers: layers.start.min(b_layers.start)..layers.end.max(b_layers.end),
+            place: match place == b_place {
+                true => *place,
+                false => ImagePlace::WHOLE,
+            },
         },
         // An image's uses are all of one kind; another kind on one key takes the later.
         (_, b) => b.clone(),
@@ -153,6 +176,30 @@ fn range_use(key: ResourceKey, write: bool, range: UseRange) -> Use<ResourceKey>
     } else {
         Use::reads(key, false, range, access)
     }
+}
+
+/// The ranges of `key`'s bytes, a buffer's read or written, among an instance's `bytes`, of which
+/// the first `held` are gathered ([`InstanceShadows`]): a new list in its place among them where
+/// there are none, the first left empty past them where one is left
+/// ([`clear`](InstanceShadows::clear)).
+fn ranges_mut<'a>(
+    bytes: &'a mut Vec<((ResourceKey, bool), Vec<Range<u64>>)>,
+    held: &mut usize,
+    key: (ResourceKey, bool),
+) -> &'a mut Vec<Range<u64>> {
+    let at = match bytes[..*held].binary_search_by_key(&key, |&(at, _)| at) {
+        Ok(at) => at,
+        Err(at) => {
+            match bytes.get_mut(*held) {
+                Some(left) => left.0 = key,
+                None => bytes.push((key, Vec::new())),
+            }
+            bytes[at..=*held].rotate_right(1);
+            *held += 1;
+            at
+        }
+    };
+    &mut bytes[at].1
 }
 
 /// Add `range` to `ranges` (in order, apart): merged with those it meets or touches, and past
@@ -182,9 +229,28 @@ fn insert(ranges: &mut Vec<Range<u64>>, mut range: Range<u64>) {
 }
 
 impl InstanceShadows {
+    /// What its draws gathered: its shadows' count, its buffers' ranges, its images' and the last
+    /// draw's uses (builds with debug assertions: `render/draw_again.rs`'s check, which digests
+    /// it).
+    #[cfg(debug_assertions)]
+    pub(super) fn gathered(&self) -> impl std::fmt::Debug + '_ {
+        (
+            self.shadows.len(),
+            &self.bytes[..self.held],
+            &self.images,
+            &self.last,
+            self.last_prefix,
+        )
+    }
+
     /// Whether the draws use no shadowed texture.
     pub(super) fn is_empty(&self) -> bool {
         self.shadows.is_empty()
+    }
+
+    /// The shadowed textures the draws use.
+    pub(super) fn copies(&self) -> impl Iterator<Item = &Arc<ShadowCopies>> {
+        self.shadows.iter().map(|shadow| &shadow.copies)
     }
 
     /// Whether each of `shadows` is among the gathered textures, writing only where the gathered
@@ -207,47 +273,207 @@ impl InstanceShadows {
 
     /// Gather a recorded draw's `shadows` and `uses`.
     pub(super) fn add(&mut self, shadows: &[ShadowUse], uses: &[Use<ResourceKey>]) {
+        self.join(shadows);
+        // Its storage is kept from one draw to the next: only the uses that differ from the last
+        // draw's at their place change in it (those past the last draw's are added, in order).
+        self.last.truncate(uses.len());
+        for (at, used) in uses.iter().enumerate() {
+            match self.last.get_mut(at) {
+                Some(kept) if *kept == *used || kept.covers(used) => continue,
+                Some(kept) => kept.clone_from(used),
+                None => self.last.push(used.clone()),
+            }
+            self.gather(used);
+        }
+    }
+
+    /// Gather a recorded draw's `shadows` alone, as [`add`](Self::add) does beside its uses: a
+    /// draw whose uses it takes by [`add_moved`](Self::add_moved) (`render/draw_again/rebound.rs`).
+    pub(super) fn join(&mut self, shadows: &[ShadowUse]) {
         for shadow in shadows {
             shadow::join(&mut self.shadows, shadow);
         }
-        let last = &self.last;
-        let gathered = |(at, used): &(usize, &Use<ResourceKey>)| last.get(*at) == Some(*used);
-        let fresh = uses.iter().enumerate().filter(|at| !gathered(at));
-        for (_, used) in fresh {
-            for (write, access) in [(false, used.read), (true, used.write)] {
-                if access.is_empty() {
-                    continue;
+    }
+
+    /// [`add`](Self::add) a recorded draw's `uses`, its shadowed textures gathered apart
+    /// ([`join`](Self::join)), where they differ from the last draw's only at the positions `at` (a draw whose calls moved buffer
+    /// offsets alone: `render/draw_again/rebound.rs`): those positions alone are looked at, as
+    /// `add` skips every use equal to the last draw's at its place. Whether it took them so: the
+    /// last draw's uses were as many; else it changed nothing, and the caller adds them whole.
+    pub(super) fn add_moved(&mut self, uses: &[Use<ResourceKey>], at: &[usize]) -> bool {
+        if self.last.len() != uses.len() {
+            return false;
+        }
+        for &at in at {
+            let (kept, used) = (&mut self.last[at], &uses[at]);
+            if *kept != *used && !kept.covers(used) {
+                kept.clone_from(used);
+                self.gather(used);
+            }
+        }
+        debug_assert!(
+            (self.last.iter().zip(uses)).all(|(kept, used)| kept == used || kept.covers(used)),
+            "an instance gathered a draw moved whose other uses differ from the last draw's"
+        );
+        true
+    }
+
+    /// Gather `used`'s reads and writes ([`add`](Self::add)).
+    fn gather(&mut self, used: &Use<ResourceKey>) {
+        for (write, access) in [(false, used.read), (true, used.write)] {
+            if access.is_empty() {
+                continue;
+            }
+            match &used.range {
+                UseRange::Bytes(range) => {
+                    let ranges = ranges_mut(&mut self.bytes, &mut self.held, (used.key, write));
+                    insert(ranges, range.clone());
                 }
-                match &used.range {
-                    UseRange::Bytes(range) => {
-                        let ranges = self.bytes.entry((used.key, write)).or_default();
-                        insert(ranges, range.clone());
-                    }
-                    image => {
-                        self.images
-                            .entry((used.key, write))
-                            .and_modify(|held| *held = span(held, image))
-                            .or_insert_with(|| image.clone());
+                image => {
+                    let key = (used.key, write);
+                    match self.images.binary_search_by_key(&key, |&(at, _)| at) {
+                        Ok(at) => {
+                            let held = &mut self.images[at].1;
+                            *held = span(held, image);
+                        }
+                        Err(at) => self.images.insert(at, (key, image.clone())),
                     }
                 }
             }
         }
-        // Its storage is kept from one draw to the next.
+    }
+
+    /// [`add`](Self::add) a draw's `shadows` and `uses`, which begin with the uses of what its
+    /// encoder made resident of the identity `prefix`: those once while the instance's last such
+    /// draw began with the same, as what an instance gathered stays until it is cleared
+    /// (`WorkCounts::resident_uses_gathered` counts those it walked). Whether it walked them.
+    pub(super) fn add_draw(
+        &mut self,
+        shadows: &[ShadowUse],
+        (uses, prefix): (&[Use<ResourceKey>], ResidentPrefix),
+    ) -> bool {
+        let now = Some((prefix.id, prefix.len));
+        let past = match self.last_prefix == now {
+            true => prefix.len,
+            false => 0,
+        };
+        self.add(shadows, &uses[past..]);
+        self.last_prefix = now;
+        #[cfg(debug_assertions)]
+        for used in uses {
+            assert!(
+                self.holds(used),
+                "an instance gathered by its uses' identity less than its uses"
+            );
+        }
+        past == 0
+    }
+
+    /// Whether what it gathered holds `used`'s reads and writes (builds with debug assertions:
+    /// [`add_draw`](Self::add_draw)'s check). Each gathered list is in key order, so a use's key
+    /// is found by a binary search: a draw of `R` uses checks them in `O(R log R)`, where a walk of
+    /// every gathered key for each use took `O(R^2)` and a debug frame of 5001 such draws ran past
+    /// a minute.
+    #[cfg(debug_assertions)]
+    fn holds(&self, used: &Use<ResourceKey>) -> bool {
+        [(false, used.read), (true, used.write)]
+            .into_iter()
+            .filter(|(_, access)| !access.is_empty())
+            .all(|(write, _)| {
+                let key = (used.key, write);
+                match &used.range {
+                    UseRange::Bytes(range) => {
+                        let held = self.held();
+                        held.binary_search_by_key(&key, |&(at, _)| at)
+                            .is_ok_and(|at| {
+                                (held[at].1.iter())
+                                    .any(|held| held.start <= range.start && range.end <= held.end)
+                            })
+                    }
+                    image => (self.images.binary_search_by_key(&key, |&(at, _)| at))
+                        .is_ok_and(|at| span(&self.images[at].1, image) == self.images[at].1),
+                }
+            })
+    }
+
+    /// The gathered buffers' byte ranges, by buffer and whether they write, in that order.
+    fn held(&self) -> &[((ResourceKey, bool), Vec<Range<u64>>)] {
+        &self.bytes[..self.held]
+    }
+
+    /// The ranges of `key`'s bytes it gathered.
+    #[cfg(test)]
+    fn ranges(&self, key: (ResourceKey, bool)) -> &Vec<Range<u64>> {
+        let at = self.held().binary_search_by_key(&key, |&(at, _)| at);
+        &self.bytes[at.expect("the buffer's bytes are gathered")].1
+    }
+
+    /// The entries it holds room for: its buffers' lists, gathered or kept, its images' and its
+    /// shadowed textures'.
+    pub(super) fn room(&self) -> usize {
+        self.bytes.len() + self.images.capacity() + self.shadows.capacity()
+    }
+
+    /// Gather nothing, keeping the lists' room for the next draws.
+    pub(super) fn clear(&mut self) {
+        for (_, ranges) in &mut self.bytes[..self.held] {
+            ranges.clear();
+        }
+        self.held = 0;
+        self.shadows.clear();
+        self.images.clear();
         self.last.clear();
-        self.last.extend_from_slice(uses);
+        self.last_prefix = None;
+        self.clears.clear();
+    }
+
+    /// Make the copy in of each shadow among `clears` a clear to its value
+    /// ([`clears`](Self::clears)).
+    pub(super) fn clear_in(&mut self, clears: &[(ResourceKey, vk::ClearColorValue)]) {
+        for &(key, value) in clears {
+            if !self.clears_in(key) {
+                self.clears.push((key, value));
+            }
+        }
+    }
+
+    /// Whether the copy in of the shadow `key` is a clear ([`clear_in`](Self::clear_in)).
+    pub(super) fn clears_in(&self, key: ResourceKey) -> bool {
+        self.clears.iter().any(|&(cleared, _)| cleared == key)
+    }
+
+    /// Whether its draws may have changed the truth of `copies` other than as a color attachment
+    /// of the pass: a draw wrote through a shadowed texture, or wrote bytes or an image that meet
+    /// the truth ([`ShadowCopies::meets`]), through the device's aliases of them too.
+    pub(super) fn writes_truth(&self, device: &Device, copies: &ShadowCopies) -> bool {
+        if self.shadows.iter().any(|shadow| shadow.writes) {
+            return true;
+        }
+        let writes: Vec<Use<ResourceKey>> = (self.uses())
+            .filter(|used| !used.write.is_empty())
+            .collect();
+        let augmented = device.shared().aliases.augment(&writes);
+        let writes = augmented.as_deref().unwrap_or(&writes);
+        writes.iter().any(|used| copies.meets(used))
+    }
+
+    /// How many uses [`uses`](Self::uses) gives.
+    fn uses_len(&self) -> usize {
+        let bytes: usize = self.held().iter().map(|(_, ranges)| ranges.len()).sum();
+        bytes + self.images.len()
     }
 
     /// The gathered bytes and images as uses.
     fn uses(&self) -> impl Iterator<Item = Use<ResourceKey>> + '_ {
-        let bytes = self.bytes.iter().flat_map(|(&(key, write), ranges)| {
+        let bytes = self.held().iter().flat_map(|((key, write), ranges)| {
             ranges
                 .iter()
-                .map(move |range| bytes_use(key, write, range.clone()))
+                .map(move |range| bytes_use(*key, *write, range.clone()))
         });
         let images = self
             .images
             .iter()
-            .map(|(&(key, write), range)| range_use(key, write, range.clone()));
+            .map(|((key, write), range)| range_use(*key, *write, range.clone()));
         bytes.chain(images)
     }
 }
@@ -293,45 +519,34 @@ pub(super) fn meets_truths(device: &Device, shadows: &[Arc<ShadowCopies>], used:
 
 /// The copies before each of `instances` of a pass of `layout` (its render pass instances and
 /// tile dispatches, in order), planned through `core`'s shadowed textures
-/// (`EncoderCore::plan_shadows`), the attachments a use of each, a pass whose draws reach tiles
+/// (`EncoderCore::plan_shadows`), the attachments a use of each (`attached`, the pass's
+/// `render_target::attachment_uses`), a pass whose draws reach tiles
 /// where `reached` (`clear_reach::PassReach`), inside `drawn` where its draws' scissors bound
 /// them (`clear_reach::DrawnArea::bounds`) and nothing but they write the color attachments it
 /// names as loaded by index (their loads as the encoder set them). Each of `instances` comes
 /// with the rectangle bounding its own draws' scissors, where `drawn` holds and it bounds them
-/// (an instance of draws alone, after the pass's first, which the steps before the pass's
-/// instances do not precede): its writes of those colors change their bytes inside it alone
-/// ([`bounded_color`], `shadow::Within`), and an attachment's shadow is copied back there.
+/// (an instance of draws alone; the pass's first among them, as the steps before the pass's
+/// instances write no color the encoder set to load but through a stand-in, which
+/// [`bounded_color`] leaves out, and a clear before the pass clears none of them): its writes of
+/// those colors change their bytes inside it alone ([`bounded_color`], `shadow::Within`), so
+/// another shadow of the texture (a draw's read of the attachment through a copy,
+/// `texture/attached_reads.rs`) is stale there alone, and an attachment's shadow is copied back
+/// there.
 /// `area` is the draws' scissor rectangles `drawn` bounds, which the first instance's colors
 /// are counted against (`WorkCounts::shadow_attachment_tiles_covered`).
 pub(super) fn plan<'a>(
     core: &mut EncoderCore,
     instances: impl Iterator<Item = (&'a InstanceShadows, Option<[u32; 4]>)>,
-    layout: &PassLayout,
+    (layout, attached): (&PassLayout, &[Use<ResourceKey>]),
     (reached, drawn): (bool, Option<([u32; 4], &[bool])>),
     area: Option<&DrawnArea>,
 ) -> Result<Vec<Vec<ShadowCopy>>, Error> {
-    let attached = render_target::attachment_uses(layout)?;
-    // The colors whose writes an instance bounds, and the uses of the other attachments.
-    let bounded: Vec<usize> = (layout.colors.iter().enumerate())
-        .filter(|&(index, color)| {
-            let loaded = drawn.is_some_and(|(_, loaded)| loaded.get(index) == Some(&true));
-            color
-                .as_ref()
-                .is_some_and(|color| loaded && bounded_color(color, layout))
-        })
-        .map(|(index, _)| index)
-        .collect();
-    let others = render_target::attachment_uses_but(layout, |index| bounded.contains(&index))?;
-    let mut writes = Vec::with_capacity(bounded.len());
-    for color in bounded
-        .iter()
-        .filter_map(|&index| layout.colors[index].as_ref())
-    {
-        let texture = &color.target.texture;
-        let uses = render_target::target_uses(&color.target, false)?;
-        writes.push((uses, texture.usage_shadow_copies()));
-    }
+    // The writes an instance bounds, made at the first that bounds its own.
+    let mut bounded: Option<BoundedWrites> = None;
     let mut copies = Vec::new();
+    // Each instance's uses, then the pass's attachments' (or those an instance does not bound),
+    // in one list whose room goes from one instance to the next.
+    let mut uses: Vec<Use<ResourceKey>> = Vec::new();
     for (index, (instance, bound)) in instances.enumerate() {
         let bound = bound.filter(|_| drawn.is_some());
         let attachments = attachment_shadows(layout, reached, drawn, bound);
@@ -345,16 +560,42 @@ pub(super) fn plan<'a>(
         for shadow in attachments.iter().chain(&instance.shadows) {
             shadow::join(&mut shadows, shadow);
         }
-        let uses: Vec<Use<ResourceKey>> = instance.uses().chain(attached.iter().cloned()).collect();
-        copies.push(core.plan_shadows(&shadows, &uses)?);
-        match bound.filter(|_| !writes.is_empty()) {
-            Some(area) => {
-                let uses: Vec<Use<ResourceKey>> =
-                    instance.uses().chain(others.iter().cloned()).collect();
-                let within: Vec<Within> = (writes.iter())
+        for shadow in &mut shadows {
+            let key = shadow.copies.shadow_key;
+            if let Some(&(_, value)) = instance.clears.iter().find(|&&(cleared, _)| cleared == key)
+            {
+                shadow.cleared = Some(value);
+            }
+        }
+        // The shadows a turn of their textures' faces left holding the texels from before the
+        // pass, which the pass's first instance reads with no copy in (`render/face_swap.rs`):
+        // held at the pass's first plan, the first instance's.
+        core.hold_turned(&shadows, |key| instance.clears_in(key));
+        // Reserved once: the chained iterators tell no exact length, which would grow the list
+        // as it fills.
+        uses.clear();
+        uses.reserve(instance.uses_len() + attached.len());
+        uses.extend(instance.uses());
+        let own = uses.len();
+        uses.extend(attached.iter().cloned());
+        let planned = core.plan_shadows(&shadows, &uses)?;
+        face_swap::counted(core, layout, &planned);
+        copies.push(planned);
+        if bound.is_some() && bounded.is_none() {
+            bounded = Some(BoundedWrites::of(layout, drawn)?);
+        }
+        let writes = bounded
+            .as_ref()
+            .filter(|bounded| !bounded.writes.is_empty());
+        match bound.zip(writes) {
+            Some((area, bounded)) => {
+                // The instance's own uses kept, the attachments' but the bounded colors' after.
+                uses.truncate(own);
+                uses.extend(bounded.others.iter().cloned());
+                let within: Vec<Within<'_>> = (bounded.writes.iter())
                     .map(|(uses, texels)| Within {
-                        uses: uses.clone(),
-                        texels: texels.clone(),
+                        uses,
+                        texels: texels.as_ref(),
                         area,
                     })
                     .collect();
@@ -364,6 +605,42 @@ pub(super) fn plan<'a>(
         }
     }
     Ok(copies)
+}
+
+/// The writes of the colors whose writes an instance of a pass bounds by its draws' scissors
+/// ([`plan`]), and the uses of the pass's other attachments.
+struct BoundedWrites {
+    /// The uses of the attachments but those colors (their resolves' kept).
+    others: Vec<Use<ResourceKey>>,
+    /// Each such color's attachment uses and its texture's usage shadow, where it has one.
+    writes: Vec<(Vec<Use<ResourceKey>>, Option<Arc<ShadowCopies>>)>,
+}
+
+impl BoundedWrites {
+    /// Those of a pass of `layout` that loads the colors `drawn` names by index, inside its
+    /// rectangle: each loaded color whose writes the pass bounds ([`bounded_color`]).
+    fn of(layout: &PassLayout, drawn: Option<([u32; 4], &[bool])>) -> Result<Self, Error> {
+        let bounded: Vec<usize> = (layout.colors.iter().enumerate())
+            .filter(|&(index, color)| {
+                let loaded = drawn.is_some_and(|(_, loaded)| loaded.get(index) == Some(&true));
+                color
+                    .as_ref()
+                    .is_some_and(|color| loaded && bounded_color(color, layout))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let others = render_target::attachment_uses_but(layout, |index| bounded.contains(&index))?;
+        let mut writes = Vec::with_capacity(bounded.len());
+        for color in bounded
+            .iter()
+            .filter_map(|&index| layout.colors[index].as_ref())
+        {
+            let texture = &color.target.texture;
+            let uses = render_target::target_uses(&color.target, false)?;
+            writes.push((uses, texture.usage_shadow_copies()));
+        }
+        Ok(BoundedWrites { others, writes })
+    }
 }
 
 /// Whether a pass of `layout` has a shadowed attachment or resolve target.
@@ -381,8 +658,16 @@ pub(super) fn attachments_shadowed(layout: &PassLayout) -> bool {
 /// fragment's samples outside the scissor rectangle "will have their coverage set to 0" (the
 /// Fragment Operations chapter's Scissor Test).
 fn bounded_color(color: &ColorTarget, layout: &PassLayout) -> bool {
+    color.load == LoadAction::Load && drawn_alone(color, layout)
+}
+
+/// Whether a render pass instance of a pass of `layout` that loads `color` (as the encoder set it
+/// in the pass's first instance; every later instance loads it, `render_target`'s `load_at`)
+/// changes a texel of it only inside its draws' scissors, at the texel of the pixel: as
+/// [`bounded_color`], a single-sampled color it resolves nowhere and renders itself, the whole of
+/// a one-level, one-slice 2D texture.
+pub(super) fn drawn_alone(color: &ColorTarget, layout: &PassLayout) -> bool {
     layout.samples == 1
-        && color.load == LoadAction::Load
         && color.resolve.is_none()
         && color.copied_resolve.is_none()
         && color.stand_in.is_none()
@@ -483,7 +768,7 @@ fn attachment_shadows(
             None => vec![&ds.target],
         };
         for target in targets.into_iter().chain(own) {
-            if let Some(copies) = target.texture.shadow() {
+            if let Some(copies) = held_shadow(target) {
                 let used = ShadowUse {
                     copies: Arc::clone(copies),
                     writes,
@@ -492,6 +777,7 @@ fn attachment_shadows(
                     area: None,
                     loads: None,
                     tile_stores: false,
+                    cleared: None,
                 };
                 shadow::join(&mut shadows, &used);
             }
@@ -502,7 +788,7 @@ fn attachment_shadows(
             .flat_map(|r| r.written())
             .flat_map(|(resolve, _)| std::iter::once(&resolve.attachment).chain(&resolve.copy_to));
         for target in resolves {
-            if let Some(copies) = target.texture.shadow() {
+            if let Some(copies) = held_shadow(target) {
                 let used = ShadowUse {
                     copies: Arc::clone(copies),
                     writes: true,
@@ -511,6 +797,7 @@ fn attachment_shadows(
                     area: None,
                     loads: None,
                     tile_stores: false,
+                    cleared: None,
                 };
                 shadow::join(&mut shadows, &used);
             }
@@ -529,7 +816,7 @@ fn attachment_shadows(
         } = color_take(layout, index, color, reached, drawn);
         let own = color.stand_in.as_ref().map(|s| &s.own);
         for target in std::iter::once(&color.target).chain(own) {
-            if let Some(copies) = target.texture.shadow() {
+            if let Some(copies) = held_shadow(target) {
                 if untouched && copies.left_untouched() {
                     continue;
                 }
@@ -537,12 +824,13 @@ fn attachment_shadows(
                     copies: Arc::clone(copies),
                     writes: stores,
                     overwrites,
-                    kept: !reached,
+                    kept: !reached && !color.cleared_ahead,
                     area: area.map(|area| instance.unwrap_or(area)),
                     loads: area,
                     // A color it loads and stores inside its draws' scissors: Metal's store
                     // writes back each tile its draws reach whole (`shadow.rs`).
                     tile_stores: stores && area.is_some(),
+                    cleared: None,
                 };
                 shadow::join(&mut shadows, &used);
             }
@@ -553,7 +841,7 @@ fn attachment_shadows(
             .flat_map(|r| std::iter::once(&r.attachment).chain(&r.copy_to))
             .chain(&color.copied_resolve);
         for target in resolves {
-            if let Some(copies) = target.texture.shadow() {
+            if let Some(copies) = held_shadow(target) {
                 let used = ShadowUse {
                     copies: Arc::clone(copies),
                     writes: true,
@@ -562,12 +850,31 @@ fn attachment_shadows(
                     area: None,
                     loads: None,
                     tile_stores: false,
+                    cleared: None,
                 };
                 shadow::join(&mut shadows, &used);
             }
         }
     }
     shadows
+}
+
+/// The shadow of `target`'s texture, where the attachment renders a level and layers of its
+/// image that the shadow holds a copy of its truth in ([`ShadowCopies::holds`]: every level of a
+/// tiled texture's, `Buffer::new_tiled_texture`); `None` for a texture with no shadow.
+fn held_shadow(target: &Target) -> Option<&Arc<ShadowCopies>> {
+    let copies = target.texture.shadow()?;
+    let (levels, layers) = (
+        target.level..target.level + 1,
+        target.layer..target.layer + target.layers,
+    );
+    match target
+        .texture
+        .image_use(levels, layers, Access::NONE, false)
+    {
+        Ok(used) if !copies.holds(&used) => None,
+        _ => Some(copies),
+    }
 }
 
 /// How a pass takes a color attachment ([`color_take`]).
@@ -601,8 +908,11 @@ fn color_take(
     // Vulkan's load and store write back what they read. Nothing resolves from it, so the
     // pass needs none of the texels: a texture over a buffer's bytes in its own image takes
     // no copy in, and nothing is copied back.
+    // One a clear before the pass cleared past the render area is changed, though it loads
+    // (`ColorTarget::cleared_ahead`).
     let untouched = !reached
         && color.load == LoadAction::Load
+        && !color.cleared_ahead
         && matches!(color.store, StoreAction::Store | StoreAction::DontCare)
         && color.resolve.is_none()
         && color.copied_resolve.is_none()
@@ -638,6 +948,8 @@ fn color_take(
 
 /// Count how a pass of `layout` takes each of its color attachments whose texture is shadowed
 /// (`WorkCounts::shadow_attachment_loads_within` and kin), as [`attachment_shadows`] plans them.
+/// The tiles `area` covers are counted only for a shadowed color loaded within its draws'
+/// scissors, the one count that reads them: a pass with none counts no tile.
 fn count_colors(
     counts: &Counters,
     layout: &PassLayout,
@@ -645,10 +957,10 @@ fn count_colors(
     drawn: Option<([u32; 4], &[bool])>,
     area: Option<&DrawnArea>,
 ) {
-    let tiles = area.and_then(DrawnArea::covered_tiles);
+    let mut tiles = None;
     let colors = layout.colors.iter().enumerate();
     for (index, color) in colors.filter_map(|(index, color)| Some((index, color.as_ref()?))) {
-        let Some(copies) = color.target.texture.shadow() else {
+        let Some(copies) = held_shadow(&color.target) else {
             continue;
         };
         let take = color_take(layout, index, color, reached, drawn);
@@ -660,25 +972,39 @@ fn count_colors(
             _ => ColorTaken::Loaded,
         };
         counts.shadow_color_taken(taken);
-        if let (ColorTaken::LoadedWithin, Some((covered, bounded))) = (taken, tiles) {
+        if taken != ColorTaken::LoadedWithin {
+            continue;
+        }
+        let tiles = *tiles.get_or_insert_with(|| area.and_then(DrawnArea::covered_tiles));
+        if let Some((covered, bounded)) = tiles {
             counts.shadow_attachment_tiles(covered, bounded);
         }
     }
 }
 
-/// Whether `target` is the whole of its texture, a 2D texture of one level, and the pass's
-/// render area covers it: a clear of it replaces every texel.
+/// Whether `target` is the whole of its texture, a 2D texture of one level and one slice (a
+/// multisample one too), and the pass's render area covers it: a clear of it replaces every texel,
+/// every sample of each.
 fn whole(target: &Target, layout: &PassLayout) -> bool {
-    one_image(target)
+    let planar = matches!(
+        target.texture.texture_type(),
+        TextureType::Type2D | TextureType::Type2DMultisample
+    );
+    planar
+        && one_slice(target)
         && [target.texture.width(), target.texture.height()] == layout.extent.map(u64::from)
 }
 
 /// Whether `target` is the whole of its texture, a 2D texture of one level and one slice, whose
 /// pixels are its texels.
 fn one_image(target: &Target) -> bool {
+    target.texture.texture_type() == TextureType::Type2D && one_slice(target)
+}
+
+/// Whether `target` is its texture's one level and one slice.
+fn one_slice(target: &Target) -> bool {
     let texture = &target.texture;
-    texture.texture_type() == TextureType::Type2D
-        && texture.mipmap_level_count() == 1
+    texture.mipmap_level_count() == 1
         && texture.array_length() == 1
         && target.level == 0
         && target.layer == 0
@@ -689,7 +1015,7 @@ fn one_image(target: &Target) -> bool {
 mod tests {
     use super::{InstanceShadows, RANGES_PER_BUFFER};
     use crate::resource::ResourceKey;
-    use crate::tracker::{Access, Use, UseRange};
+    use crate::tracker::{Access, ImagePlace, Use, UseRange};
     use ash::vk;
     use std::ops::Range;
 
@@ -729,16 +1055,17 @@ mod tests {
                 aspects: vk::ImageAspectFlags::COLOR,
                 levels: 0..1,
                 layers: 0..1,
+                place: ImagePlace::WHOLE,
             },
             ..bytes(c, 0..0, true)
         };
         gathered.add(&[], &[image]);
-        let keys: Vec<_> = gathered.bytes.keys().copied().collect();
+        let keys: Vec<_> = gathered.held().iter().map(|&(key, _)| key).collect();
         assert_eq!(keys, [(a, false), (a, true), (b, false)]);
-        assert_eq!(gathered.bytes[&(a, false)], [0..64, 100..130]);
+        assert_eq!(*gathered.ranges((a, false)), [0..64, 100..130]);
         let one = |start, end| [Range { start, end }];
-        assert_eq!(gathered.bytes[&(a, true)], one(8, 24));
-        assert_eq!(gathered.bytes[&(b, false)], one(0, 4));
+        assert_eq!(*gathered.ranges((a, true)), one(8, 24));
+        assert_eq!(*gathered.ranges((b, false)), one(0, 4));
         assert!(gathered.is_empty());
         // Seventeen ranges of one buffer 90 bytes apart: the first two merge; then one 20 bytes
         // past the third: it merges with that one.
@@ -746,15 +1073,170 @@ mod tests {
         for i in 0..17 {
             bounded.add(&[], &[bytes(a, 100 * i..100 * i + 10, true)]);
         }
-        let ranges = &bounded.bytes[&(a, true)];
+        let ranges = bounded.ranges((a, true));
         assert_eq!(ranges.len(), RANGES_PER_BUFFER);
         assert_eq!(ranges[0], 0..110);
         bounded.add(&[], &[bytes(a, 330..340, true)]);
-        let ranges = &bounded.bytes[&(a, true)];
+        let ranges = bounded.ranges((a, true));
         assert_eq!(ranges.len(), RANGES_PER_BUFFER);
         assert!(ranges.contains(&(300..340)), "{ranges:?}");
         // Its list took room for every range it keeps and the merge's one at its first, and
         // never grew.
         assert_eq!(ranges.capacity(), RANGES_PER_BUFFER + 1);
+    }
+
+    /// `holds` (the debug check of `add_draw`) answers by key among many gathered buffers and
+    /// images: a gathered use's bytes, read or written, inside a gathered range, and a gathered
+    /// image's levels; not a buffer gathered only for the other access, a range past the gathered
+    /// one, a key never gathered, or an image's levels past its span.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn an_instance_holds_what_it_gathered_among_many() {
+        let keys: Vec<ResourceKey> = (0..2000).map(|_| ResourceKey::new()).collect();
+        let image = |key, levels: Range<u32>| Use {
+            range: UseRange::Image {
+                aspects: vk::ImageAspectFlags::COLOR,
+                levels,
+                layers: 0..1,
+                place: ImagePlace::WHOLE,
+            },
+            ..bytes(key, 0..0, false)
+        };
+        let mut uses = Vec::new();
+        for (at, &key) in keys.iter().enumerate() {
+            match at % 3 {
+                0 => uses.push(bytes(key, 64..128, at % 2 == 0)),
+                1 => uses.push(image(key, 1..3)),
+                _ => {
+                    uses.push(bytes(key, 0..16, false));
+                    uses.push(bytes(key, 32..48, true));
+                }
+            }
+        }
+        let mut gathered = InstanceShadows::default();
+        gathered.add(&[], &uses);
+        for used in &uses {
+            assert!(gathered.holds(used), "{used:?}");
+        }
+        for (at, &key) in keys.iter().enumerate() {
+            let unheld = match at % 3 {
+                0 => vec![
+                    bytes(key, 64..128, at % 2 != 0),
+                    bytes(key, 120..136, at % 2 == 0),
+                ],
+                1 => vec![image(key, 0..3), image(key, 2..4)],
+                _ => vec![bytes(key, 16..32, false), bytes(key, 0..16, true)],
+            };
+            for used in &unheld {
+                assert!(!gathered.holds(used), "{used:?}");
+            }
+        }
+        assert!(!gathered.holds(&bytes(ResourceKey::new(), 0..4, false)));
+        assert!(!gathered.holds(&image(ResourceKey::new(), 1..2)));
+    }
+
+    /// A draw's use equal to the last draw's at its place is gathered already, and only the
+    /// uses that differ change the last draw's kept: draws that change some uses, take more or
+    /// fewer, gather what one gathering of all their uses gathers, each kept whole as the last.
+    #[test]
+    fn an_instance_gathers_the_uses_each_draw_changed() {
+        let (a, b, c) = (ResourceKey::new(), ResourceKey::new(), ResourceKey::new());
+        let image = |levels: Range<u32>| Use {
+            range: UseRange::Image {
+                aspects: vk::ImageAspectFlags::COLOR,
+                levels,
+                layers: 0..1,
+                place: ImagePlace::WHOLE,
+            },
+            ..bytes(c, 0..0, false)
+        };
+        let draws = [
+            vec![bytes(a, 0..16, false), bytes(b, 0..4, true)],
+            vec![bytes(a, 16..32, false), bytes(b, 0..4, true)],
+            vec![bytes(a, 16..32, false), bytes(b, 8..12, true), image(0..1)],
+            vec![bytes(b, 8..12, true), bytes(a, 64..80, false), image(2..3)],
+            vec![bytes(a, 200..300, true)],
+            vec![],
+            vec![
+                bytes(a, 0..8, false),
+                image(0..1),
+                bytes(b, 100..104, false),
+            ],
+        ];
+        let mut each = InstanceShadows::default();
+        for draw in &draws {
+            each.add(&[], draw);
+            assert_eq!(each.last, *draw);
+        }
+        let mut all = InstanceShadows::default();
+        all.add(&[], &draws.concat());
+        let uses = |gathered: &InstanceShadows| gathered.uses().collect::<Vec<_>>();
+        assert_eq!(uses(&each), uses(&all));
+        assert_eq!(each.images, all.images);
+    }
+
+    /// A draw's use that the last draw's at its place covers (`Use::covers`) is gathered already:
+    /// draws whose buffer offset moves along a buffer, each reading from a later offset to its
+    /// end, keep the first one's use as the last, and gather what one gathering of all their uses
+    /// gathers, added whole or moved (`InstanceShadows::add_moved`).
+    #[test]
+    fn an_instance_takes_a_covered_use_as_gathered() {
+        let (a, b) = (ResourceKey::new(), ResourceKey::new());
+        let draws: Vec<_> = (0..4u64)
+            .map(|at| vec![bytes(b, 0..4, true), bytes(a, 16 * at..64, false)])
+            .collect();
+        let uses = |gathered: &InstanceShadows| gathered.uses().collect::<Vec<_>>();
+        let mut all = InstanceShadows::default();
+        all.add(&[], &draws.concat());
+        let mut each = InstanceShadows::default();
+        for draw in &draws {
+            each.add(&[], draw);
+            assert_eq!(each.last, draws[0]);
+        }
+        assert_eq!(uses(&each), uses(&all));
+        let mut moved = InstanceShadows::default();
+        moved.add(&[], &draws[0]);
+        for draw in &draws[1..] {
+            assert!(moved.add_moved(draw, &[1]));
+            assert_eq!(moved.last, draws[0]);
+        }
+        assert_eq!(uses(&moved), uses(&all));
+        // A range past the kept one's is gathered, and kept.
+        let past = vec![bytes(b, 0..4, true), bytes(a, 48..128, false)];
+        assert!(moved.add_moved(&past, &[1]));
+        assert_eq!(moved.last, past);
+        all.add(&[], &past);
+        assert_eq!(uses(&moved), uses(&all));
+    }
+
+    /// Cleared, an instance's gathering gathers nothing, keeps its lists' room, and gathers the
+    /// next draws' uses as a new one does, in the same order, into the lists it kept.
+    #[test]
+    fn a_cleared_instance_gathers_into_the_room_it_kept() {
+        let (a, b) = (ResourceKey::new(), ResourceKey::new());
+        let draws = [
+            bytes(b, 0..4, false),
+            bytes(a, 8..24, true),
+            bytes(a, 100..120, false),
+        ];
+        let mut kept = InstanceShadows::default();
+        kept.add(&[], &draws);
+        let room: Vec<*const Range<u64>> = (kept.bytes.iter()).map(|(_, r)| r.as_ptr()).collect();
+        kept.clear();
+        assert_eq!(kept.uses().count(), 0);
+        assert!(kept.held().is_empty() && kept.images.is_empty() && kept.is_empty());
+        // Gathered again, in another order of buffers: the lists are those it kept.
+        let again = [draws[2].clone(), draws[1].clone(), draws[0].clone()];
+        kept.add(&[], &again);
+        let mut fresh = InstanceShadows::default();
+        fresh.add(&[], &again);
+        let uses = |gathered: &InstanceShadows| gathered.uses().collect::<Vec<_>>();
+        assert_eq!(uses(&kept), uses(&fresh));
+        let mut taken: Vec<*const Range<u64>> =
+            (kept.held().iter()).map(|(_, r)| r.as_ptr()).collect();
+        let mut room = room;
+        taken.sort();
+        room.sort();
+        assert_eq!(taken, room);
     }
 }

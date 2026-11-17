@@ -14,14 +14,21 @@
 //!   archives hold the archive key of each of its stages (`metal_key`), as Metal's creation is,
 //!   naming the first stage's function they miss. Without archives, or without the option,
 //!   archives only make creation faster.
-//! - **Adding.** `add_compute_pipeline_functions`, `add_render_pipeline_functions` and
-//!   `add_tile_render_pipeline_functions` make the state their descriptor describes, as the
-//!   creation would, and answer that creation's error; then they keep what the creation used and
-//!   the archive keys of its stages. Adding twice keeps one copy.
+//! - **Adding.** `add_compute_pipeline_functions`, `add_render_pipeline_functions`,
+//!   `add_tile_render_pipeline_functions` and `add_mesh_render_pipeline_functions` make the state
+//!   their descriptor describes, as the creation would, and answer that creation's error; then
+//!   they keep what the creation used and the archive keys of its stages. Adding twice keeps one
+//!   copy. A mesh creation compiles its pipeline whole, looking in no archive, so a mesh add keeps
+//!   its key alone, which `FAIL_ON_BINARY_ARCHIVE_MISS` finds.
 //! - **Files.** An archive is read whole from its descriptor's file (`container.rs`) and written
-//!   through a temporary file and a rename. An archive of another profile or build loads, and
-//!   its entries miss, as Metal's archive of another device or OS does. Labels are not written,
-//!   as Metal's are not.
+//!   through a temporary file and a rename. A metallib, which Metal takes as an archive, loads as
+//!   an empty one, whose lookups miss as Metal's do. An archive of another profile or build
+//!   loads, and its entries miss, as Metal's archive of another device or OS does. Labels are not
+//!   written, as Metal's are not.
+//! - **Across a recovery.** An archive holds no Vulkan object, so it goes on past its device's
+//!   recovery, as Metal's does, the recovery carrying its handle of the device alone
+//!   (`device/carry.rs`'s `LineDevice`): a creation of any generation lists it, and an add makes
+//!   its state on the generation that serves.
 //! - **Differences from Metal**, accepted (docs/API.md §10): the file is read whole at load, so an
 //!   archive serializes after its file was deleted, where Metal's fails; and a file is a path,
 //!   so a URL that is not a file cannot be named, where Metal answers it as an invalid URL.
@@ -29,10 +36,9 @@
 pub(super) mod container;
 pub(super) mod metal_key;
 
+use super::device::carry::LineDevice;
 use super::device::lock;
-use super::error::{
-    invalid, ArchivedPipeline, BinaryArchiveError, BinaryArchiveMiss, Error, Problem,
-};
+use super::error::{ArchivedPipeline, BinaryArchiveError, BinaryArchiveMiss, Error};
 use super::pipeline::{
     ComputePipelineState, GraphicsState, PipelineOption, PipelineOptions, TileState,
 };
@@ -42,8 +48,8 @@ use container::{Contents, Place};
 use metal2vulkan::cache::{Hash256, PipelineArtifact, PipelineKey};
 use metal2vulkan::library::{CompiledFunction, FunctionCompileKey};
 use metal2vulkan::pipeline::{
-    ComputePipeline, ComputePipelineDescriptor, RenderPipeline, RenderPipelineDescriptor,
-    StageSource, TileRenderPipelineDescriptor,
+    ComputePipeline, ComputePipelineDescriptor, MeshPipelineDescriptor, RenderPipeline,
+    RenderPipelineDescriptor, StageSource, TileRenderPipelineDescriptor,
 };
 use metal_key::VertexKind;
 use std::cell::RefCell;
@@ -70,7 +76,9 @@ impl BinaryArchiveDescriptor {
 pub struct BinaryArchive(Arc<Shared>);
 
 struct Shared {
-    device: Device,
+    /// The device: its root handle, which a creation's check matches by its line and an add's
+    /// creation goes through, and the generation handle `device` answers.
+    device: LineDevice,
     label: Mutex<Option<String>>,
     contents: Mutex<Contents>,
 }
@@ -97,10 +105,23 @@ pub(crate) type Used = RefCell<Vec<Artifact>>;
 
 impl Device {
     /// `newBinaryArchiveWithDescriptor:error:`: an empty archive, or the archive in the
-    /// descriptor's file. A file that is missing or not an archive is
+    /// descriptor's file. A file that is missing or neither an archive nor a metallib is
     /// `BinaryArchive(InvalidFile)`, as Metal answers for a missing, empty, garbage or text file
-    /// and for a directory (measured on an M3 Max and an M4).
+    /// and for a directory (measured on an M3 Max and an M4). A metallib, which Metal takes as an
+    /// archive (measured on an M3 Max), holds nothing of ours: it loads as an empty archive,
+    /// whose lookups miss and which serializes as one nothing was added to. Metal's archive of a
+    /// metallib misses too: a compute pipeline of a kernel the metallib holds, listing it with
+    /// `FAIL_ON_BINARY_ARCHIVE_MISS`, is refused, and without the bit it is created (measured on
+    /// an M3 Max under macOS 27.0.1, `binary-archive-sources`).
     pub fn new_binary_archive(
+        &self,
+        descriptor: &BinaryArchiveDescriptor,
+    ) -> Result<BinaryArchive, Error> {
+        self.at_serving(|device| device.new_binary_archive_now(descriptor))
+    }
+
+    /// [`Device::new_binary_archive`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn new_binary_archive_now(
         &self,
         descriptor: &BinaryArchiveDescriptor,
     ) -> Result<BinaryArchive, Error> {
@@ -109,7 +130,7 @@ impl Device {
             Some(path) => container::read(path)?,
         };
         Ok(BinaryArchive(Arc::new(Shared {
-            device: self.clone(),
+            device: LineDevice::new(self),
             label: Mutex::new(None),
             contents: Mutex::new(contents),
         })))
@@ -117,9 +138,26 @@ impl Device {
 }
 
 impl BinaryArchive {
-    /// `device`.
-    pub fn device(&self) -> &Device {
-        &self.0.device
+    /// `device`: a generation handle of the device, owned, as Metal's `device` answers a retained
+    /// device: of the generation the archive was made on, then of each one the device's recoveries
+    /// carried the archive to. The handle is the caller's: it keeps meaning that generation while
+    /// held, past a recovery that carries the archive on, its raw handles that generation's
+    /// `VkDevice`'s, kept alive while held.
+    pub fn device(&self) -> Device {
+        self.generation().clone()
+    }
+
+    /// The generation handle [`device`](Self::device) answers a clone of, borrowed for the
+    /// runtime's own reads: a caller's handle is `device`'s, as a recovery lets go of the
+    /// object's handle of a lost generation at that generation's rest (`device/carry.rs`).
+    pub(crate) fn generation(&self) -> &Device {
+        self.0.device.generation()
+    }
+
+    /// A root handle of the archive's device, which a creation of any of its generations
+    /// matches.
+    fn root_device(&self) -> &Device {
+        self.0.device.root()
     }
 
     /// `setLabel:`.
@@ -139,13 +177,12 @@ impl BinaryArchive {
         &self,
         descriptor: &ComputePipelineDescriptor,
     ) -> Result<(), Error> {
-        let used = Used::default();
-        ComputePipelineState::create(
-            self.device(),
-            descriptor,
-            &PipelineOptions::default(),
-            Some(&used),
-        )?;
+        let used = self.root_device().at_serving(|device| {
+            let used = Used::default();
+            let options = PipelineOptions::default();
+            ComputePipelineState::create(device, descriptor, &options, Some(&used))?;
+            Ok(used)
+        })?;
         let profile = self.profile();
         self.keep(
             used.into_inner(),
@@ -162,13 +199,12 @@ impl BinaryArchive {
         &self,
         descriptor: &RenderPipelineDescriptor,
     ) -> Result<(), Error> {
-        let used = Used::default();
-        let state = GraphicsState::create(
-            self.device(),
-            descriptor,
-            &PipelineOptions::default(),
-            Some(&used),
-        )?;
+        let (state, used) = self.root_device().at_serving(|device| {
+            let used = Used::default();
+            let options = PipelineOptions::default();
+            let state = GraphicsState::create(device, descriptor, &options, Some(&used))?;
+            Ok((state, used))
+        })?;
         let profile = self.profile();
         let keys = metal_key::render(&profile, descriptor);
         let kind = if crate::tessellation::patches(&state.base().graphics).is_some() {
@@ -195,18 +231,42 @@ impl BinaryArchive {
         &self,
         descriptor: &TileRenderPipelineDescriptor,
     ) -> Result<(), Error> {
-        let used = Used::default();
-        TileState::create(
-            self.device(),
-            descriptor,
-            &PipelineOptions::default(),
-            Some(&used),
-        )?;
+        let used = self.root_device().at_serving(|device| {
+            let used = Used::default();
+            let options = PipelineOptions::default();
+            TileState::create(device, descriptor, &options, Some(&used))?;
+            Ok(used)
+        })?;
         let profile = self.profile();
         self.keep(
             used.into_inner(),
             &profile,
             [metal_key::tile(&profile, descriptor)],
+        );
+        Ok(())
+    }
+
+    /// `addMeshRenderPipelineFunctionsWithDescriptor:error:`: make the state `descriptor`
+    /// describes, as `new_mesh_render_pipeline_state` makes it with the default options,
+    /// answering its error; then keep the descriptor's archive key. A mesh creation compiles its
+    /// pipeline whole and looks in no archive, so the add keeps no compiled artifact and makes no
+    /// later creation faster. Which of the descriptor's fields Metal keys a mesh pipeline by is
+    /// not measured: the key holds every field (`metal_key`), so under
+    /// `FAIL_ON_BINARY_ARCHIVE_MISS` a mesh creation hits only an add of an equal descriptor, and
+    /// one that differs from every add in a field Metal does not key is `BinaryArchiveMiss` where
+    /// Metal's creation may hit.
+    pub fn add_mesh_render_pipeline_functions(
+        &self,
+        descriptor: &MeshPipelineDescriptor,
+    ) -> Result<(), Error> {
+        self.root_device().at_serving(|device| {
+            GraphicsState::create_mesh(device, descriptor, &PipelineOptions::default())
+        })?;
+        let profile = self.profile();
+        self.keep(
+            Vec::new(),
+            &profile,
+            [metal_key::mesh(&profile, descriptor)],
         );
         Ok(())
     }
@@ -281,7 +341,7 @@ impl BinaryArchive {
 
     /// The fingerprint of the device's profile.
     fn profile(&self) -> Hash256 {
-        self.device().compile_device().profile_fingerprint()
+        self.generation().compile_device().profile_fingerprint()
     }
 
     /// Keep `used`, compiled for the profile of fingerprint `profile`, and the archive keys
@@ -327,11 +387,11 @@ pub(crate) fn check<'a>(
     missing: impl FnOnce(&Hash256, &dyn Fn(&Hash256) -> bool) -> Option<&'a StageSource>,
 ) -> Result<(), Error> {
     let archives = &options.binary_archives;
-    if archives
+    if let Some(archive) = archives
         .iter()
-        .any(|archive| !archive.device().same(device))
+        .find(|archive| !archive.root_device().same(device))
     {
-        return Err(invalid(call, Problem::ForeignObject));
+        return Err(archive.root_device().foreign(call, device));
     }
     if archives.is_empty()
         || !options
@@ -360,6 +420,13 @@ pub(crate) fn compute_missing<'a>(
     move |profile, held| {
         (!held(&metal_key::compute(profile, descriptor))).then_some(&descriptor.kernel)
     }
+}
+
+/// The mesh function of a mesh creation of `descriptor`, when no listed archive holds its key.
+pub(crate) fn mesh_missing<'a>(
+    descriptor: &'a MeshPipelineDescriptor,
+) -> impl FnOnce(&Hash256, &dyn Fn(&Hash256) -> bool) -> Option<&'a StageSource> + 'a {
+    move |profile, held| (!held(&metal_key::mesh(profile, descriptor))).then_some(&descriptor.mesh)
 }
 
 /// The tile function of a tile creation of `descriptor`, when no listed archive holds its key.

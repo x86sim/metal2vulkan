@@ -5,14 +5,22 @@
 //!
 //! - `Threadgroups` within `maxComputeWorkGroupCount`, and every `ThreadgroupsIndirect`, is one
 //!   region with `MultiRegion = 0`: the grid comes from `NumWorkgroups`, so GPU-written counts
-//!   need no CPU read (an indirect region's group counts are never an input of the plan).
+//!   need no CPU read (an indirect region's group counts are never an input of the plan). On the
+//!   plan of a partial-threadgroups variant a `Threadgroups` region has `MultiRegion = 1`, as that
+//!   plan's `Threads` regions do, so one `VkPipeline` of a threadgroup size runs both.
 //! - `Threads` with a grid that is not a multiple of the threadgroup size becomes up to eight
 //!   regions per group-count chunk: the interior, and per axis an edge of one threadgroup of the
 //!   remaining threads, all with `MultiRegion = 1`, so the grid and the region base come from the
 //!   `DispatchRegion` push field. On the plan of a flat variant ([`VariantKey::flat_grid`]) it is
 //!   one region instead, of the dispatch's own threadgroup size: its invocations count the grid's
 //!   threads in order and each takes the one it counts to, those past the last returning before
-//!   the body, so no edge and no group-count chunk is planned ([`regions`]).
+//!   the body, so no edge and no group-count chunk is planned ([`regions`]). On the plan of a
+//!   partial-threadgroups variant ([`VariantKey::partial_threadgroups`]) it is the threadgroups
+//!   its threads fill, rounded up, at the dispatch's threadgroup size, per group-count chunk, all
+//!   with `MultiRegion = 1` and their `DispatchRegion` flagged `lower::dispatch::NONUNIFORM`: the
+//!   kernel's last threadgroup along an axis answers Metal's partial threadgroup, so no edge is
+//!   planned and one `VkPipeline` of the dispatch's size runs every such grid. A grid of whole
+//!   threadgroups takes the same regions there, unflagged: every thread is live.
 //! - A count above `maxComputeWorkGroupCount` on an axis is split into chunks, each a region
 //!   with `MultiRegion = 1` and its base in the push field. At most [`MAX_REGIONS`] regions are
 //!   planned; more is `Unsupported{GroupCount}`.
@@ -39,7 +47,28 @@
 //! emulated simdgroups, and instantiating it on the plan of another variant is
 //! `BindError::NeedsVariant`, before anything is written. Only the variant's scratch is left to the
 //! variant's own plan, since only its compile knows it. A dispatch of whole subgroups keeps the
-//! flattened pipeline.
+//! flattened pipeline, and so does a region of one row of a kernel whose only simdgroup semantics
+//! are lockstep barriers that order pairs meeting across rows (`RuntimeFact::RowLockstep`): its
+//! simdgroups lie within the row, where no pair meets, so it runs whatever its width, without
+//! `REQUIRE_FULL_SUBGROUPS`.
+//!
+//! **One row**. A dispatch of such a kernel whose every region is one row (`y` and `z` 1) asks
+//! for the kernel's one-row variant (`VariantKey::one_row`): its simdgroups lie within their rows,
+//! so the variant leaves the lockstep simdgroup barriers out and keeps the threadgroup ones, and,
+//! with no simdgroup semantics left, its tier pins no subgroup size and flattens no local size.
+//! The planned pipeline still runs such a dispatch. The variant's plan runs every dispatch of
+//! one-row regions, and a dispatch with a region of more rows on it is `BindError::NeedsVariant`
+//! for the variant without it.
+//!
+//! **Unit axes**. A kernel walked predicated whose threads' positions alone steer some of its
+//! synchronizations, along some axes, states which masks of axes relieve it
+//! (`LocalRules::unit_relief`, `RuntimeFact::UnitAxes`). A dispatch whose threadgroups have one thread along such
+//! a mask's axes, Metal's `threads_per_threadgroup` 1 there and every region's local size too, is
+//! offered the kernel's unit-axes variant ([`BindingPlan::unit_axes_variant`],
+//! `VariantKey::unit_axes`), where the plan's own variant runs it: the plan's still does, and
+//! gives the same answers. The variant's plan runs every dispatch of threadgroups of one thread
+//! along its axes, and a dispatch of more is `BindError::NeedsVariant` for the variant without
+//! them.
 //!
 //! **Push bytes.** Each region's push write covers the stage's whole push range, so every
 //! statically used push byte is written (VUID-vkCmdDispatch-maintenance4-08602): the
@@ -49,16 +78,19 @@
 //!
 //! **Stage-in region**. A kernel that reads the region (a `[[stage_in]]` step by thread position,
 //! `[[grid_origin]]`, or `[[grid_size]]`) is dispatched only with one the encoder set: without it,
-//! `BindError::MissingStageInRegion`, since what Metal reads then is not established. A kernel
-//! whose step reads the thread position alone (a step rate above 1, or an indexed step) depends on
-//! the region's origin being 0 on that axis; a dispatch with another origin there is
-//! `Unsupported{KernelStageIn, NotImplemented}`: whether Metal adds the origin before or after the
-//! division or the index lookup is not established.
+//! `BindError::MissingStageInRegion`, since what Metal reads then is not established. A step at a
+//! rate above 1 adds the region's origin to the quotient, and an indexed step adds it to the index
+//! it looks up at the thread position, as an M4 and an M3 Max read (`lower::stage_io::stage_in`):
+//! the binder writes the region whatever its origin. Each region's `SpecKey::StageInReach` says
+//! whether an element of a thread-position step may lie past the first `2^32` bytes from its bind
+//! offset ([`stage_in_reach`]). It is false where none can, which drops the fetch's reach check,
+//! so only a dispatch that can reach takes the `VkPipeline` that keeps it.
 //!
 //! **Indirect.** When any axis of `maxComputeWorkGroupCount` is below `2^32 - 1`, an indirect
 //! dispatch carries an [`IndirectClamp`] prepass and its region reads the clamp's scratch
 //! ([`IndirectArgs::ClampScratch`]).
 
+use crate::bind::heap::HeapSource;
 use crate::bind::indirect_clamp::IndirectClamp;
 use crate::bind::instantiate::{
     bind_buffers, put, slot_field, texel_ranges, BufferExtent, DescriptorBytes, DescriptorRange,
@@ -69,14 +101,17 @@ use crate::bind::plan::{
     AccessClass, BindingPlan, ByteRange, ComputeTemplate, LocalRules, ResourceUse, UseTarget,
 };
 use crate::bind::replay::ReplayRefusal;
-use crate::bind::resident::{resident_entries, stage_root_table};
+use crate::bind::resident::{stage_root_table, table_entries};
 use crate::bind::state::{BindState, BoundBuffer, StageInRegion};
 use crate::cache::{SpecializationKey, VariantKey};
 use crate::device::requirements::VkLimit;
 use crate::error::{BindError, Capability, Feature, LowerFamily, Unsupported};
 use crate::indirect_commands::BINDING_COUNT;
-use crate::lower::dispatch::{pack_nominal, region_bytes};
+use crate::lower::dispatch::{nonuniform_region_bytes, pack_nominal, region_bytes};
+use crate::metal::vertex::vertex_bytes;
+use crate::metal::{StepFunction, VertexFormat};
 use crate::pipeline::interface::{AccessSet, BufferForm, PushLoc};
+use crate::pipeline::stage_io::StageInFetch;
 use crate::pipeline::sym::{Axis, PushField, SlotClass, SpecKey, Stage};
 use crate::vk;
 
@@ -235,13 +270,32 @@ pub(crate) enum Fit {
 /// A flattened tier's region of local size `r` that is not whole subgroups of its size: every
 /// multiple of a flattened plan is its tier's subgroup size, since the flattened tiers refuse
 /// derivatives (`ComputeDerivativesWithSimd`).
-fn partial(rules: &LocalRules, r: [u32; 3]) -> bool {
+fn unwhole(rules: &LocalRules, r: [u32; 3]) -> bool {
     let n: u64 = r.iter().map(|&x| u64::from(x)).product();
     rules.flat
         && rules
             .multiples
             .iter()
             .any(|&m| m > 0 && !n.is_multiple_of(u64::from(m)))
+}
+
+/// A region that is not whole subgroups ([`unwhole`]) and needs emulated simdgroups: any but a
+/// region of one row of a kernel whose simdgroup semantics need no simdgroup spanning two rows
+/// (`LocalRules::rows`), whose simdgroups then lie within its row, where no pair meets.
+fn partial(rules: &LocalRules, r: [u32; 3]) -> bool {
+    unwhole(rules, r) && !(rules.rows && r[1] == 1 && r[2] == 1)
+}
+
+/// The stage flags of a region of local size `r` on the planned pipeline: the pipeline's, but
+/// `REQUIRE_FULL_SUBGROUPS` for a region that is not whole subgroups, a row [`partial`] admits.
+fn region_flags(rules: &LocalRules, r: [u32; 3]) -> vk::PipelineShaderStageCreateFlags {
+    if unwhole(rules, r) {
+        rules
+            .stage_flags
+            .difference(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
+    } else {
+        rules.stage_flags
+    }
 }
 
 /// The local-size rules of the kernel's emulated-simdgroups variant as the plan of its flattened
@@ -255,6 +309,7 @@ fn emulated_rules(rules: &LocalRules) -> LocalRules {
         required_subgroup_size: None,
         stage_flags: vk::PipelineShaderStageCreateFlags::empty(),
         scratch: None,
+        rows: false,
         ..rules.clone()
     }
 }
@@ -409,6 +464,29 @@ fn product(pieces: [Vec<Piece>; 3], force_multi: bool) -> Result<Vec<Region>, Bi
     Ok(out)
 }
 
+/// Whether a region of `planned` has more than one row (`y` or `z` above 1), where a simdgroup
+/// may span two rows.
+/// The axes along which every threadgroup of `planned` has one thread (bit 0 `x`, bit 1 `y`, bit
+/// 2 `z`): Metal's `threads_per_threadgroup` there is 1, and so is every region's local size.
+fn unit_axes(planned: &Planned) -> u8 {
+    (0..3)
+        .filter(|&a| planned.nominal[a] == 1 && planned.regions.iter().all(|r| r.local[a] <= 1))
+        .fold(0, |axes, a| axes | 1 << a)
+}
+
+/// Whether the unit-axes variant of `axes` (`VariantKey::unit_axes`) runs `planned`: every one of
+/// its threadgroups has one thread along each of those axes.
+fn unit_axes_run(axes: u8, planned: &Planned) -> bool {
+    unit_axes(planned) & axes == axes
+}
+
+fn multi_row(planned: &Planned) -> bool {
+    planned
+        .regions
+        .iter()
+        .any(|r| r.local[1] > 1 || r.local[2] > 1)
+}
+
 /// The regions of a dispatch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Planned {
@@ -420,6 +498,37 @@ pub(crate) struct Planned {
     pub nominal: [u32; 3],
     /// Some region runs only on the kernel's emulated-simdgroups variant.
     pub emulated: bool,
+    /// The regions run a partial-threadgroups variant's ragged grid: their `DispatchRegion` is
+    /// flagged `lower::dispatch::NONUNIFORM` ([`Ragged::Partial`]).
+    pub nonuniform: bool,
+}
+
+/// How a plan runs a `Threads` dispatch whose grid is not a whole number of threadgroups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ragged {
+    /// Its interior and, per axis, an edge region of the remainder, each of an exact local size.
+    Split,
+    /// One region of the dispatch's threadgroup size, on a flat variant
+    /// ([`VariantKey::flat_grid`]).
+    Flat,
+    /// The threadgroups its threads fill at the dispatch's threadgroup size, per group-count
+    /// chunk, flagged `lower::dispatch::NONUNIFORM`, on a partial-threadgroups variant
+    /// ([`VariantKey::partial_threadgroups`]). A whole grid takes the same regions unflagged, and
+    /// a `Threadgroups` dispatch's regions read the region too (`MultiRegion` 1).
+    Partial,
+}
+
+impl Ragged {
+    /// The form the plan of a pipeline compiled under `variant` runs a ragged grid in.
+    pub(crate) fn of(variant: &VariantKey) -> Ragged {
+        if variant.flat_grid {
+            Ragged::Flat
+        } else if variant.partial_threadgroups {
+            Ragged::Partial
+        } else {
+            Ragged::Split
+        }
+    }
 }
 
 /// The widest tile threadgroup, and the tallest: Metal's largest tile, 32x32.
@@ -493,13 +602,17 @@ fn spread(need: u64, max_count: [u32; 3]) -> Result<[u32; 3], BindError> {
     Ok(out)
 }
 
-/// The regions of `dispatch` under `rules`, on the plan of a flat variant where `flat`
-/// ([`VariantKey::flat_grid`]): there a `Threads` grid that is not a whole number of threadgroups
-/// is one region of the dispatch's own threadgroup size, not an interior and its edges.
+/// The regions of `dispatch` under `rules`, a `Threads` grid that is not a whole number of
+/// threadgroups in the form `ragged` names: an interior and its edges, one region of the
+/// dispatch's own threadgroup size on a flat variant ([`VariantKey::flat_grid`]), or the
+/// threadgroups its threads fill on a partial-threadgroups variant
+/// ([`VariantKey::partial_threadgroups`]). On the last, a whole `Threads` grid and a
+/// `Threadgroups` dispatch take regions that read the region too (`MultiRegion` 1), so the
+/// variant's one `VkPipeline` of a threadgroup size runs them as well.
 pub(crate) fn regions(
     rules: &LocalRules,
     dispatch: &Dispatch,
-    flat: bool,
+    ragged: Ragged,
 ) -> Result<Planned, BindError> {
     if rules.tile {
         check_tile_dispatch(dispatch)?;
@@ -524,6 +637,7 @@ pub(crate) fn regions(
         regions,
         grid,
         nominal,
+        nonuniform: false,
     };
     match *dispatch {
         Dispatch::Threadgroups { groups, .. } => {
@@ -537,8 +651,11 @@ pub(crate) fn regions(
                 chunks(&mut p, 0, groups[i], l[i], rules.max_count[i]);
                 p
             });
+            // A partial-threadgroups variant's regions read their region, as its `Threads`
+            // regions do, so both run on its one `VkPipeline` of the dispatch's size.
+            let multi = tile_sized || ragged == Ragged::Partial;
             Ok(planned(
-                product(pieces, tile_sized)?,
+                product(pieces, multi)?,
                 grid,
                 fit == Fit::EmulatedSimdgroups,
             ))
@@ -586,7 +703,7 @@ pub(crate) fn regions(
             // the single dispatch's group counts, so splitting them into regions would restart it
             // in each and run the same threads again: the region is never chunked, and its counts
             // only have to cover the grid ([`spread`]).
-            if flat {
+            if ragged == Ragged::Flat {
                 let fit = fit(rules, &[l])?;
                 let n: u64 = l.iter().map(|&x| u64::from(x)).product();
                 let total: u128 = threads.iter().map(|&x| u128::from(x)).product();
@@ -609,6 +726,33 @@ pub(crate) fn regions(
                     threads,
                     fit == Fit::EmulatedSimdgroups,
                 ));
+            }
+            // A partial-threadgroups variant runs the threadgroups the grid's threads fill, rounded
+            // up, at the dispatch's threadgroup size, per chunk of group counts, each region
+            // reading its base and the grid: the last threadgroup along an axis answers the
+            // threads left where the region is flagged. A whole grid's regions are unflagged, so
+            // every thread is live, on the same `VkPipeline` of the dispatch's size.
+            let nonuniform = (0..3).any(|i| !threads[i].is_multiple_of(l[i]));
+            if ragged == Ragged::Partial {
+                let pieces: [Vec<Piece>; 3] = std::array::from_fn(|i| {
+                    let mut p = Vec::new();
+                    chunks(
+                        &mut p,
+                        0,
+                        threads[i].div_ceil(l[i]),
+                        l[i],
+                        rules.max_count[i],
+                    );
+                    p
+                });
+                let fit = fit(rules, &[l])?;
+                let mut out = planned(
+                    product(pieces, true)?,
+                    threads,
+                    fit == Fit::EmulatedSimdgroups,
+                );
+                out.nonuniform = nonuniform;
+                return Ok(out);
             }
             let mut edges = false;
             let pieces: [Vec<Piece>; 3] = std::array::from_fn(|i| {
@@ -681,6 +825,15 @@ impl BindingPlan {
     /// the call's threadgroup size, read by `vkCmdDispatchIndirect` with no clamp prepass, and the
     /// region reads its group counts and its grid builtins from the region record at its
     /// `PushHole::ReplayRegionAddress` (`MultiRegion` 1).
+    ///
+    /// The plan of a partial-threadgroups variant ([`VariantKey::partial_threadgroups`]) runs a
+    /// `Threads` dispatch whose grid is not a whole number of threadgroups as the threadgroups its
+    /// threads fill, rounded up, at the dispatch's threadgroup size, one region per chunk of group
+    /// counts, each `MultiRegion` 1 with its `DispatchRegion` flagged
+    /// `lower::dispatch::NONUNIFORM`; a `Threads` dispatch of a whole number of threadgroups as the
+    /// same regions unflagged, every thread live, and a `Threadgroups` dispatch as its regions,
+    /// each `MultiRegion` 1, so one `VkPipeline` of a threadgroup size runs all three; any other
+    /// dispatch as the plan of the pipeline without it.
     pub fn instantiate_dispatch(
         &self,
         state: &BindState,
@@ -688,6 +841,7 @@ impl BindingPlan {
     ) -> Result<DispatchCommands, BindError> {
         let t = self.compute_template("instantiate_dispatch")?;
         let flat = self.variant.flat_grid;
+        let ragged = Ragged::of(&self.variant);
         let records = match (flat || self.variant.folded_groups, dispatch) {
             (false, _) => Records::Binder,
             (true, Dispatch::ThreadgroupsIndirect { .. }) => Records::Flat,
@@ -696,10 +850,22 @@ impl BindingPlan {
             (true, Dispatch::Threads { .. }) if flat => Records::Flat,
             (true, _) => return Err(not_implemented(Feature::GpuEncodedIndirectCommands)),
         };
-        let mut planned = regions(&t.local, dispatch, flat)?;
+        let mut planned = regions(&t.local, dispatch, ragged)?;
         if planned.emulated {
             return Err(BindError::NeedsVariant {
                 variant: Box::new(self.emulated_variant()),
+            });
+        }
+        // The one-row variant runs one-row threadgroups only.
+        if self.variant.one_row && multi_row(&planned) {
+            return Err(BindError::NeedsVariant {
+                variant: Box::new(self.one_row_variant(false)),
+            });
+        }
+        // The unit-axes variant runs threadgroups of one thread along its axes only.
+        if !unit_axes_run(self.variant.unit_axes, &planned) {
+            return Err(BindError::NeedsVariant {
+                variant: Box::new(self.unit_axes_key(0)),
             });
         }
         // A folded variant's region reads its record.
@@ -709,6 +875,45 @@ impl BindingPlan {
             }
         }
         instantiate(t, planned, state, dispatch, records)
+    }
+
+    /// Whether [`instantiate_dispatch`](Self::instantiate_dispatch)'s commands may read a value the
+    /// state binds at a slot of `class` past the slot's shape. The plan is made for one shape, so
+    /// two states of it that differ only in the values bound at slots of a class this answers
+    /// `false` for give the same commands for a dispatch: a consumer that keeps a dispatch's
+    /// commands keeps them across such a change.
+    ///
+    /// - **Buffer slots**: `true`. Their offsets, lengths and addresses place the descriptor
+    ///   ranges, the push bytes and the root table.
+    /// - **Texture slots**: `true` where the plan binds a texture buffer's range as a texel-buffer
+    ///   view, a push field carries a texture's in-place planes (`PushField::YCbCrInPlace`) or
+    ///   rows (`PushField::TexelRows`), or a handle table names the texture bound at a slot by its
+    ///   resource ID; `false` otherwise, as
+    ///   the commands read a texture slot nowhere else (the consumer binds its view itself).
+    /// - **Sampler slots**: `false`. The commands read no sampler slot.
+    ///
+    /// Every other value of the state may be read (its used resources, its argument samplers, its
+    /// stage-in region, ...). `true` for every class of a plan that is not a compute plan.
+    pub fn dispatch_reads(&self, class: SlotClass) -> bool {
+        let Some(t) = &self.compute else {
+            return true;
+        };
+        match class {
+            SlotClass::Buffer => true,
+            SlotClass::Texture => {
+                let resources = &t.resources;
+                !resources.texel_buffers.is_empty()
+                    || (t.fields.iter()).any(|f| {
+                        matches!(
+                            f.field,
+                            PushField::YCbCrInPlace(_) | PushField::TexelRows(_)
+                        )
+                    })
+                    || (resources.heap_members.iter())
+                        .any(|m| matches!(m.source, HeapSource::Bound(_)))
+            }
+            SlotClass::Sampler => false,
+        }
     }
 
     /// The commands of one registered variant of a device replay
@@ -737,7 +942,7 @@ impl BindingPlan {
             indirect: IndirectRef::new(0, 0),
             threads_per_group,
         };
-        let mut planned = regions(&t.local, &dispatch, self.variant.flat_grid)?;
+        let mut planned = regions(&t.local, &dispatch, Ragged::of(&self.variant))?;
         if planned.emulated {
             return Err(BindError::NeedsVariant {
                 variant: Box::new(self.emulated_variant()),
@@ -754,7 +959,10 @@ impl BindingPlan {
     /// [`variant`](BindingPlan::variant), with `emulated_simdgroups` when a threadgroup of the
     /// dispatch has a partial simdgroup the kernel's flattened simd tier cannot run (its
     /// `threads_per_threadgroup`, or a `dispatchThreads` edge region, is not a multiple of the
-    /// tier's subgroup size). A pure function of the plan and the dispatch, so a consumer can
+    /// tier's subgroup size); else with `one_row` when every region of the dispatch is one row of
+    /// a kernel whose lockstep simdgroup barriers order only pairs meeting across rows
+    /// (`RuntimeFact::RowLockstep`), and without it on the one-row variant's plan when a region
+    /// has more rows. A pure function of the plan and the dispatch, so a consumer can
     /// compile the variant before it binds. It reports the dispatch's local-size refusals as
     /// [`BindingPlan::instantiate_dispatch`] does, each region checked against the limits of the
     /// pipeline the result names: a result names a variant whose plan, for the same shape, states
@@ -763,19 +971,71 @@ impl BindingPlan {
     /// only the variant's compile knows.
     pub fn dispatch_variant(&self, dispatch: &Dispatch) -> Result<VariantKey, BindError> {
         let t = self.compute_template("dispatch_variant")?;
-        Ok(
-            if regions(&t.local, dispatch, self.variant.flat_grid)?.emulated {
-                self.emulated_variant()
-            } else {
-                self.variant.clone()
-            },
-        )
+        let planned = regions(&t.local, dispatch, Ragged::of(&self.variant))?;
+        // A unit-axes variant's plan sends threadgroups of more threads along one of its axes to
+        // the variant without them.
+        if !unit_axes_run(self.variant.unit_axes, &planned) {
+            let mut base = self.clone();
+            base.variant.unit_axes = 0;
+            return base.dispatch_variant(dispatch);
+        }
+        Ok(if planned.emulated {
+            self.emulated_variant()
+        } else if t.local.rows && !planned.regions.is_empty() && !multi_row(&planned) {
+            // Each simdgroup lies within its row, where no pair the lockstep simdgroup barriers
+            // order meets: the variant without them.
+            self.one_row_variant(true)
+        } else if self.variant.one_row && multi_row(&planned) {
+            self.one_row_variant(false)
+        } else {
+            self.variant.clone()
+        })
+    }
+
+    /// The unit-axes variant (`VariantKey::unit_axes`) a compute dispatch may run on in place of
+    /// the plan's own: its variant with `unit_axes` the axes along which every threadgroup of the
+    /// dispatch has one thread, where the plan's pipeline is walked predicated and a variant of
+    /// exactly those axes relieves the walk (`RuntimeFact::UnitAxes`'s `relief`) and the plan's
+    /// own variant runs the dispatch ([`dispatch_variant`](Self::dispatch_variant)). `None` where
+    /// it does not, where the dispatch has no such axis, or where the plan is a unit-axes
+    /// variant's. A pure function of the plan and the dispatch, so a consumer can make the variant
+    /// before any dispatch runs on it, and run the dispatch on the plan's own pipeline until it
+    /// is made: the two give the same answers, Metal's, since every thread's position along such
+    /// an axis is 0 in its threadgroup and its threadgroup's in the grid.
+    pub fn unit_axes_variant(&self, dispatch: &Dispatch) -> Result<Option<VariantKey>, BindError> {
+        let t = self.compute_template("unit_axes_variant")?;
+        if t.local.unit_relief == 0 || self.variant.unit_axes != 0 {
+            return Ok(None);
+        }
+        let planned = regions(&t.local, dispatch, Ragged::of(&self.variant))?;
+        let axes = unit_axes(&planned);
+        if axes == 0 || t.local.unit_relief >> (axes - 1) & 1 == 0 {
+            return Ok(None);
+        }
+        if self.dispatch_variant(dispatch)? != self.variant {
+            return Ok(None);
+        }
+        Ok(Some(self.unit_axes_key(axes)))
+    }
+
+    /// The plan's variant with `unit_axes` `axes`.
+    fn unit_axes_key(&self, axes: u8) -> VariantKey {
+        let mut v = self.variant.clone();
+        v.unit_axes = axes;
+        v
     }
 
     /// The plan's variant with emulated simdgroups.
     fn emulated_variant(&self) -> VariantKey {
         let mut v = self.variant.clone();
         v.emulated_simdgroups = true;
+        v
+    }
+
+    /// The plan's variant with or without `one_row`.
+    fn one_row_variant(&self, one_row: bool) -> VariantKey {
+        let mut v = self.variant.clone();
+        v.one_row = one_row;
         v
     }
 
@@ -793,19 +1053,118 @@ impl BindingPlan {
         threads_per_group: [u32; 3],
     ) -> Result<SpecializationKey, BindError> {
         let t = self.compute_template("replay_specialization")?;
-        Ok(region_specialization(t, threads_per_group, true))
+        // A replay variant reads no stage-in region (`check_replay`), so no key bounds a fetch.
+        Ok(region_specialization(t, threads_per_group, true, true))
     }
 }
 
 /// The specialization of a region of `local` threads of `t`: the template's fixed constants, the
-/// local size, and whether the region reads its record (`MultiRegion`).
-fn region_specialization(t: &ComputeTemplate, local: [u32; 3], multi: bool) -> SpecializationKey {
+/// local size, whether the region reads its record (`MultiRegion`), and whether a stage-in element
+/// it fetches may lie past the first `2^32` bytes from its bind offset (`StageInReach`,
+/// [`stage_in_reach`]).
+fn region_specialization(
+    t: &ComputeTemplate,
+    local: [u32; 3],
+    multi: bool,
+    reach: bool,
+) -> SpecializationKey {
     let n: u64 = local.iter().map(|&x| u64::from(x)).product();
     spec_key(&t.spec, |k| match k {
         SpecKey::LocalSize(a) => Some(u64::from(local[a as usize])),
         SpecKey::FlatLocalSize => Some(n),
         SpecKey::MultiRegion => Some(u64::from(multi)),
+        SpecKey::StageInReach => Some(u64::from(reach)),
         other => t.fixed.iter().find(|(key, _)| *key == other).map(|f| f.1),
+    })
+}
+
+/// The stride the compute encoder binds kernel buffer `index` with in `state`
+/// (`setBuffer:offset:attributeStride:atIndex:` and its forms, `MTLAttributeStrideStatic`'s low
+/// 32 bits), 0 where it binds none: what a stage-in layout of `MTLBufferLayoutStrideDynamic`
+/// fetches at.
+fn stage_in_stride(state: &BindState, index: u32) -> u32 {
+    match state
+        .stages
+        .get(&Stage::Kernel)
+        .and_then(|k| k.buffers.get(&index))
+    {
+        Some(
+            &BoundBuffer::Buffer {
+                attribute_stride: Some(s),
+                ..
+            }
+            | &BoundBuffer::Bytes {
+                attribute_stride: Some(s),
+                ..
+            },
+        ) => s,
+        _ => 0,
+    }
+}
+
+/// The axis (0 for x, 1 for y) of fetch `f`'s thread-position step; `None` for any other step.
+/// These are the steps whose element the region clamps, and which `SpecKey::StageInReach` bounds
+/// (`lower::stage_io::stage_in`).
+pub(super) fn grid_axis(f: &StageInFetch) -> Option<usize> {
+    match f.step_function {
+        StepFunction::ThreadPositionInGridX => Some(0),
+        StepFunction::ThreadPositionInGridY => Some(1),
+        _ => None,
+    }
+}
+
+/// The end of fetch `f`'s attribute bytes in an element: its offset plus its format's store
+/// size ([`vertex_bytes`]; `MTLAttributeFormat` lists `MTLVertexFormat`'s formats at the same
+/// values). An element `e` at stride `s` lies in the first `2^32` bytes from the bind offset
+/// exactly where `e · s` plus this end is at most `2^32` (`lower::stage_io::fetch`'s
+/// `within_reach`). `None` for a format no fetch decodes.
+fn element_end(f: &StageInFetch) -> Option<u64> {
+    let format = VertexFormat::try_from(f.format.as_raw()).ok()?;
+    let bytes = vertex_bytes(format)?;
+    Some(u64::from(f.offset) + u64::from(bytes))
+}
+
+/// The `SpecKey::StageInReach` of a dispatch of `t` over Metal's `grid` (0 on each axis for an
+/// indirect dispatch, whose grid only the GPU knows) in stage-in region `region`, under `state`'s
+/// strides. It says whether an element that a thread-position fetch reads may lie past the first
+/// `2^32` bytes from its bind offset, where the fetch's reach check reads it as zero
+/// (`lower::stage_io::fetch`). Each element is `origin + min(position / rate, size - 1)` on the
+/// step's axis, so it is at most the origin plus the smaller of the region's last element and the
+/// grid's last position over the rate. In a region of size 0 on the axis, whose size less 1 clamps
+/// nothing, it is bounded by the grid alone. Where that bound is unknown (an indirect grid over
+/// such a region) or the sum leaves 32 bits (the shader's add wraps), any element may be read.
+fn stage_in_reach(
+    t: &ComputeTemplate,
+    region: Option<StageInRegion>,
+    grid: [u32; 3],
+    state: &BindState,
+) -> bool {
+    let Some(region) = region else {
+        return !t.stage_in_grid.is_empty();
+    };
+    t.stage_in_grid.iter().any(|f| {
+        let (Some(axis), Some(end)) = (grid_axis(f), element_end(f)) else {
+            return true;
+        };
+        let stride = f
+            .stride
+            .unwrap_or_else(|| stage_in_stride(state, f.buffer_index));
+        // At stride 0 every element is the attribute's own bytes at the bind offset.
+        if stride == 0 {
+            return end > 1 << 32;
+        }
+        let rate = f.step_rate.max(1);
+        let positions = grid[axis].checked_sub(1).map(|p| p / rate);
+        let last = match (region.size[axis].checked_sub(1), positions) {
+            (None, None) => return true,
+            (None, Some(p)) => p,
+            (Some(z), None) => z,
+            (Some(z), Some(p)) => z.min(p),
+        };
+        let Some(element) = region.origin[axis].checked_add(last) else {
+            return true;
+        };
+        u64::from(element) * u64::from(stride) + end > 1 << 32
     })
 }
 
@@ -900,7 +1259,7 @@ fn instantiate(
                 .iter()
                 .map(|(slot, e)| (slot.index, *e))
                 .collect();
-            Some(stage_root_table(&statics, first, &resident_entries(state)))
+            Some(stage_root_table(&statics, first, &table_entries(state)))
         }
         None => None,
     };
@@ -938,36 +1297,12 @@ fn instantiate(
             PushField::StageInRegion => stage_in_region_bytes(region.ok_or_else(|| {
                 internal("a stage-in region push field without the region's fact")
             })?),
-            // The stride the encoder bound the stage-in buffer with, 0 without one, as Metal
-            // reads a dynamic layout; inline bytes' alike, but at `MTLAttributeStrideStatic`, whose
-            // answer is not measured.
+            // The stride the encoder bound the stage-in buffer or inline bytes with, 0 without
+            // one, as Metal reads a dynamic layout: `MTLAttributeStrideStatic`'s is its low 32
+            // bits, whose elements past the first the fetch reads past the bind offset's 2^32
+            // bytes (`lower::stage_io::fetch`).
             PushField::StageInStride(index) => {
-                let stride = match state
-                    .stages
-                    .get(&Stage::Kernel)
-                    .and_then(|k| k.buffers.get(&index))
-                {
-                    Some(&BoundBuffer::Bytes {
-                        attribute_stride: Some(u32::MAX),
-                        ..
-                    }) => {
-                        return Err(BindError::Unsupported(Unsupported::not_implemented(
-                            Feature::KernelStageIn,
-                        )))
-                    }
-                    Some(
-                        &BoundBuffer::Buffer {
-                            attribute_stride: Some(s),
-                            ..
-                        }
-                        | &BoundBuffer::Bytes {
-                            attribute_stride: Some(s),
-                            ..
-                        },
-                    ) => s,
-                    _ => 0,
-                };
-                FieldBytes::of(&stride.to_le_bytes())
+                FieldBytes::of(&stage_in_stride(state, index).to_le_bytes())
             }
             field => slot_field(field, &bound.residuals, &t.resources, state)
                 .ok_or_else(|| internal(format!("a compute push field {field:?}")))?,
@@ -985,17 +1320,22 @@ fn instantiate(
         regions: planned,
         grid,
         nominal,
+        nonuniform,
         ..
     } = planned;
+    let reach = stage_in_reach(t, region, grid, state);
     let mut regions = Vec::with_capacity(planned.len());
     for r in planned {
         let mut bytes = push.clone();
         if let Some(loc) = region_field {
-            let b = region_bytes(r.base, grid, nominal)
-                .ok_or_else(|| internal("an unpackable nominal threadgroup size"))?;
+            let b = match nonuniform {
+                true => nonuniform_region_bytes(r.base, grid, nominal),
+                false => region_bytes(r.base, grid, nominal),
+            }
+            .ok_or_else(|| internal("an unpackable nominal threadgroup size"))?;
             put(&mut bytes, push_start, &mut [], loc, &b)?;
         }
-        let specialization = region_specialization(t, r.local, r.multi);
+        let specialization = region_specialization(t, r.local, r.multi, reach);
         let indirect = match *dispatch {
             Dispatch::ThreadgroupsIndirect { .. } if replay => Some(IndirectArgs::Replay),
             Dispatch::ThreadgroupsIndirect { indirect, .. } => {
@@ -1020,7 +1360,7 @@ fn instantiate(
                 }]
             },
             indirect,
-            stage_flags: t.local.stage_flags,
+            stage_flags: region_flags(&t.local, r.local),
             required_subgroup_size: t.local.required_subgroup_size,
         });
     }

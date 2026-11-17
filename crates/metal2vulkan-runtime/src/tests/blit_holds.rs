@@ -23,6 +23,7 @@ use crate::{
     Device, DeviceKind, DeviceOptions, Error, HostMemory, Origin, PurgeableState, ResourceOptions,
     ShaderCacheOptions, Size, Texture, TextureDescriptor,
 };
+use metal2vulkan::device::{HostPageTexturePolicy, PipelineWaitPolicy};
 use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
 use std::alloc::Layout;
 use std::path::{Path, PathBuf};
@@ -62,6 +63,20 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+        // What the debug builds' checks of draws again and rebound covered in the test
+        // (`render/draw_again.rs`), where they checked any.
+        #[cfg(debug_assertions)]
+        {
+            let [checked, took] = (crate::render::IDENTITIES_CHECKED.each_ref())
+                .map(|count| count.load(Ordering::Relaxed));
+            if checked > 0 {
+                eprintln!(
+                    "KEPT-IDENTITY-CHECKS {}: {checked} draws again or rebound checked, {took} \
+                     of them taking a reader's identity",
+                    self.0.display()
+                );
+            }
+        }
     }
 }
 
@@ -133,7 +148,41 @@ impl Drop for Host {
 /// The device the cfg selects: a CPU device under `m2v_cpu_icd`, else a GPU, its shader cache
 /// in `cache`.
 pub(super) fn device(cache: &Path) -> Device {
-    let options = DeviceOptions {
+    Device::system_default_with(&options(cache)).unwrap()
+}
+
+/// As [`device`], every call waiting for a pipeline still being made until it is made
+/// (`PipelineWaitPolicy::Exact`): for a test that holds a making in the device's pool and watches
+/// the command buffer that awaits it not complete. A command buffer waits for its makings under
+/// the default `Bounded` wait too; under `Exact` a state's creation also makes its predicted
+/// pipeline before it returns, and a `commit` waits for the pipelines it records with no bound.
+pub(super) fn exact_waits_device(cache: &Path) -> Device {
+    let mut options = options(cache);
+    options.policy.pipeline_waits = PipelineWaitPolicy::Exact;
+    Device::system_default_with(&options).unwrap()
+}
+
+/// As [`device`], every texture over host pages a shadow (`HostPageTexturePolicy::Shadow`): for a
+/// test whose subject is such a shadow (its copies, merges and runs), which under the default
+/// policy a render target over host pages is only where the device's check did not pass for it.
+pub(super) fn shadow_device(cache: &Path) -> Device {
+    let mut options = options(cache);
+    options.policy.host_page_textures = HostPageTexturePolicy::Shadow;
+    Device::system_default_with(&options).unwrap()
+}
+
+/// As [`device`], with the queue plan (`queue_limits: None`) in place of the runtime tests'
+/// default queue limits (`device/create.rs`): for a test that keeps more than two of its
+/// command queues live at once.
+pub(super) fn plan_device(cache: &Path) -> Device {
+    let mut options = options(cache);
+    options.queue_limits = None;
+    Device::system_default_with(&options).unwrap()
+}
+
+/// The options of [`device`].
+pub(super) fn options(cache: &Path) -> DeviceOptions {
+    DeviceOptions {
         kinds: match cfg!(m2v_cpu_icd) {
             true => vec![DeviceKind::Cpu],
             false => vec![
@@ -147,8 +196,7 @@ pub(super) fn device(cache: &Path) -> Device {
             ..ShaderCacheOptions::default()
         },
         ..DeviceOptions::default()
-    };
-    Device::system_default_with(&options).unwrap()
+    }
 }
 
 /// A no-copy buffer over `host`, whose deallocator counts its runs in `runs`; `None`, printed,

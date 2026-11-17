@@ -11,6 +11,9 @@
 //!   [`AbiError`] (`UnknownKey`, `BadValue`, `MissingKey`). An argument-buffer member's
 //!   `air.indirect_argument` belongs to an `air.indirect_buffer`'s layout, so an `air.buffer`
 //!   (a parameter or a member) whose layout holds one at any depth is `UnknownKey`.
+//! - An `UnknownKey` names what it read: the key the ABI defines but the place does not accept,
+//!   as its location's key, or, where it read a string the ABI does not define or an operand left
+//!   over, that string or the operand's shape ([`InputError`]'s Display: `saw "air.no_such_key"`).
 //! - Names (`air.arg_name`, `air.arg_type_name`, struct member and type names, constant names)
 //!   are kept as [`DiagName`]s for diagnostics and never decide anything. The varying user key
 //!   (`generated(..)`, `user(..)`) is the Metal interface-matching ABI and is compared for
@@ -18,15 +21,18 @@
 //!
 //! Decoding also cross-checks the metadata against the IR: every entry parameter has exactly one
 //! binding, each role agrees with its parameter's type and address space (a buffer, texture, or
-//! sampler table passed as an `array_ref` is a thread-space pointer), and the outputs agree with
+//! sampler table passed as an `array_ref` is a thread-space pointer, and a read-only `device`
+//! buffer may be a constant-space pointer), and the outputs agree with
 //! the return type; likewise each `!air.visible` function binds every parameter once and has an
 //! output exactly when it returns a value, and each `!air.ci` Core Image kernel also binds every
 //! parameter once, with a role that agrees with the parameter's type, and has a scalar or vector
-//! output exactly when it returns a value. For typed-pointer bitcode, a buffer's (or Core Image
-//! pointer's) `air.arg_type_size` equals the allocation size of its pointee under the DataLayout, a
-//! buffer's `air.buffer_size` is a multiple of it (a reference to an array), and every
-//! `air.struct_type_info` member starts inside its container, with arrays and nested structs wholly
-//! inside. `air.arg_type_align_size` is Metal's alignment, which the LLVM type does not carry
+//! output exactly when it returns a value. For typed-pointer bitcode, the `air.arg_type_size` of an
+//! argument buffer, a threadgroup argument, a buffer with a struct layout or a Core Image pointer
+//! equals the allocation size of its pointee under the DataLayout; a plain buffer's states its
+//! declared type, which may differ from the pointee (Apple's OpenGL front end declares byte buffers
+//! behind typed pointers). A buffer's `air.buffer_size` is a multiple of its declared type's size
+//! (a reference to an array), and every `air.struct_type_info` member starts inside its container,
+//! with arrays and nested structs wholly inside. `air.arg_type_align_size` is Metal's alignment, which the LLVM type does not carry
 //! (clang lowers many structs packed), so it is only required to be a power of two. A metallib
 //! function's container metadata is cross-checked by [`AirAbi::check_container`].
 //!
@@ -39,6 +45,7 @@
 //! [`ImageShape`]: crate::intrinsics::ImageShape
 //! [`AbiError`]: crate::error::AbiError
 //! [`AbiError::UnknownKey`]: crate::error::AbiError::UnknownKey
+//! [`InputError`]: crate::error::InputError
 
 mod args;
 mod check;
@@ -119,7 +126,8 @@ pub struct AirAbi {
     pub visible_functions: Vec<VisibleFunction>,
     /// `!air.ci`: the Core Image kernels this module exports, in list order.
     pub core_image_kernels: Vec<CoreImageKernel>,
-    /// `!air.signature`: stitching or linked-constant signatures (decoded; lowering refuses them).
+    /// `!air.signature`: stitching or linked-constant signatures (how the module was produced;
+    /// see [`LinkageSignature`]).
     pub linkage_signature: Option<LinkageSignature>,
     /// Every `air.struct_type_info` layout, shared by the [`StructRef`]s that name it.
     pub structs: Vec<StructInfo>,
@@ -370,6 +378,10 @@ pub enum Stage {
     Kernel {
         /// `air.max_work_group_size` (`[[max_total_threads_per_threadgroup]]`).
         max_total_threads: Option<u32>,
+        /// `air.work_group_size`: the threadgroup size an OpenCL C kernel requires
+        /// (`reqd_work_group_size(x, y, z)`). Metal caps the pipeline's threadgroup at its
+        /// `x * y * z` threads.
+        work_group_size: Option<[u32; 3]>,
     },
     /// A vertex function (`!air.vertex`).
     Vertex {
@@ -397,10 +409,22 @@ pub enum Stage {
 }
 
 impl Stage {
+    /// `air.work_group_size`, a kernel's.
+    pub fn work_group_size(&self) -> Option<[u32; 3]> {
+        match *self {
+            Stage::Kernel {
+                work_group_size, ..
+            } => work_group_size,
+            _ => None,
+        }
+    }
+
     /// `air.max_work_group_size`, the stages that state it: kernels, object and mesh functions.
     pub fn max_total_threads(&self) -> Option<u32> {
         match *self {
-            Stage::Kernel { max_total_threads }
+            Stage::Kernel {
+                max_total_threads, ..
+            }
             | Stage::Object {
                 max_total_threads, ..
             }
@@ -531,6 +555,7 @@ pub enum AccelerationStructureKind {
 }
 
 /// Interpolation of a fragment input (`air.center|centroid|sample` with
+/// `air.perspective|no_perspective`, `air.interpolation_function` with
 /// `air.perspective|no_perspective`, or `air.flat`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Interpolation {
@@ -554,6 +579,23 @@ pub enum Sampling {
     Centroid,
     /// `air.sample`: at each sample's location (per-sample shading).
     Sample,
+    /// `air.interpolation_function`: an `interpolant` (Metal's pull-model interpolation), a
+    /// handle (`ptr addrspace(1)`) read only through the `air.interpolate_*` calls, each at the
+    /// location it names.
+    Interpolant,
+}
+
+impl Interpolation {
+    /// Whether the input is an `interpolant` ([`Sampling::Interpolant`]).
+    pub fn is_interpolant(self) -> bool {
+        matches!(
+            self,
+            Interpolation::Smooth {
+                sampling: Sampling::Interpolant,
+                ..
+            }
+        )
+    }
 }
 
 /// A varying's AIR user key (`generated(..)` / `user(..)`): the Metal interface-matching ABI,
@@ -827,6 +869,8 @@ pub enum AbiHandle {
     MeshGridProperties,
     /// A mesh function's output (`air.mesh`).
     Mesh,
+    /// A fragment input that is an `interpolant` (`air.interpolation_function`).
+    Interpolant,
 }
 
 impl ParamRole {
@@ -846,6 +890,9 @@ impl ParamRole {
             ParamRole::DepthStencilState(_) => Some(AbiHandle::DepthStencilState),
             ParamRole::MeshGridProperties => Some(AbiHandle::MeshGridProperties),
             ParamRole::Mesh(_) => Some(AbiHandle::Mesh),
+            ParamRole::FragmentInput(v) if v.interpolation.is_interpolant() => {
+                Some(AbiHandle::Interpolant)
+            }
             ParamRole::Payload { .. }
             | ParamRole::Buffer(_)
             | ParamRole::ArgumentBuffer(_)
@@ -1319,10 +1366,11 @@ pub enum LinkageSignatureKind {
 
 /// `!air.signature`. Only its kind and operand count are decoded. It describes how a closed
 /// module was produced (the constants a linked-constants module was specialized with, the graph
-/// a stitched module was built from); the module's own code is what runs. A linked-constants module
-/// that still declares function constants is refused (`Feature::Linking`), as is a linked function
-/// module with a signature. An `air.rename_qualified_function_signature` (a function renamed to its
-/// qualified name after it was produced) is read as the signature it wraps.
+/// a stitched module was built from); the module's own code is what runs, whether the module is
+/// the entry's or a linked function's. A linked-constants module that still declares function
+/// constants is refused (`Feature::Linking`). An `air.rename_qualified_function_signature` (a
+/// function renamed to its qualified name after it was produced) is read as the signature it
+/// wraps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LinkageSignature {
     /// Which signature the node's leading string names.

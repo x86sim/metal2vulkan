@@ -27,14 +27,15 @@ use crate::cache::VariantKey;
 use crate::device::requirements::{Requirements, VkExtension, VkFeature, VkLimit, VkProperty};
 use crate::device::{mechanism, Device, DeviceProfile};
 use crate::error::{
-    DescriptorError, Error, Feature, InternalError, InternalKind, RuntimeInput, Unsupported,
+    ComputePipelineProblem, DescriptorError, Error, Feature, InternalError, InternalKind,
+    MeshPipelineProblem, MetalAnswer, RuntimeInput, Unsupported,
 };
 use crate::library::{CompiledFunction, FunctionArtifact, FunctionCompileKey};
 use crate::lower::select::LowerInputs;
 use crate::lower::simd::workgroup::arena_bytes;
 use crate::pipeline::artifact::{
-    ComputePipeline, ComputePipelineMetalInfo, PrecisionNote, RenderPipeline, RuntimeDependency,
-    StageModule,
+    ComputePipeline, ComputePipelineMetalInfo, MeshPipelineMetalInfo, PrecisionNote,
+    RenderPipeline, RuntimeDependency, StageModule,
 };
 use crate::pipeline::compile::key::{
     function_key, mesh_descriptor_key, pipeline_key, render_descriptor_key,
@@ -210,8 +211,10 @@ impl Device {
     /// one a linked-use question or a key of the same creation made
     /// ([`RenderPipelineDescriptor::fragment_writes_depth_unattached`],
     /// [`Device::render_variant_key`]), else one made there now, so a creation decodes and
-    /// specializes each stage once. It compiles what `compile_function` compiles; the
-    /// specialization a creation already did is not charged to `b` again.
+    /// specializes each stage once. It compiles and charges what `compile_function` compiles and
+    /// charges: an entry the creation already made is charged to `b` what making it charged,
+    /// though it is not made again, so a refusal at one of the budget's caps is
+    /// `compile_function`'s too.
     pub fn compile_function_from_entries(
         &self,
         f: &FunctionDescriptor,
@@ -244,9 +247,10 @@ impl Device {
     /// [`ComputePipelineDescriptor::reflection`] still lists a buffer for every set attribute.
     ///
     /// It decodes and specializes the kernel's AIR under `b`, reading the stage's specialized
-    /// entry from `entries` (the one a key or check of the same creation made, else one made
-    /// there now), so a sweep of states over one kernel decodes once. Inputs without a
-    /// stage-input descriptor are their own answer, decoding nothing.
+    /// entry from `entries` (the one a key or check of the same creation made, charged to `b`
+    /// what making it charged, else one made there now), so a sweep of states over one kernel
+    /// decodes once. Inputs without a stage-input descriptor are their own answer, decoding
+    /// nothing.
     ///
     /// Refused by the decode's and the specialization's own errors.
     pub fn kernel_inputs_read(
@@ -313,7 +317,7 @@ impl Device {
     /// render area, binding each attachment it reaches (`WriteSource::TileAttachment`). A
     /// `Compiled` tile function must have been compiled under the same formats: one compiled
     /// without tile inputs is `InvalidDescriptor(StageMismatch)`, and one that stages an attachment
-    /// the descriptor gives another format (`RuntimeFact::TileAttachmentFormat`) is
+    /// the descriptor gives another format, or none (`RuntimeFact::TileAttachmentFormat`), is
     /// `InvalidDescriptor(ColorAttachment)`. A multisampled pass (`raster_sample_count` above 1) is
     /// `Unsupported{TileShading, NotImplemented}`: what its imageblock's samples are is not read.
     /// The tile function's recursion is sized for `d`'s `maxCallStackDepth` as a compute kernel's
@@ -356,7 +360,8 @@ impl Device {
             crate::pipeline::private_state::check_render(d)?;
             let p = self.profile();
             // The attachments as the private logic operation draws them (`render_pipeline`).
-            let (operated, _) = crate::pipeline::private_state::logic_operation(d, p)?;
+            let (operated, logic) = crate::pipeline::private_state::logic_operation(d, p)?;
+            let logic = crate::pipeline::private_state::LogicDraw::shader(logic);
             let d = operated.as_ref();
             // A color group's variant is the pipeline of its group's attachments
             // (`render_pipeline`).
@@ -414,6 +419,7 @@ impl Device {
                     // module, so a pipeline whose masks drop a sample lowers it once.
                     let mut pass: FragmentPass<'_> = d.into();
                     pass.color_group = group.as_ref();
+                    pass.logic_operation = logic;
                     if crate::pipeline::private_state::applied_masks(d).is_some() {
                         let inputs = InputsFrom::Fragment(
                             pass,
@@ -545,22 +551,44 @@ impl Device {
                 "a mesh variant zeroing, dropping, interlocking or shadowing colors",
             ));
         }
+        check_mesh_fields(d)?;
         let p = self.profile();
+        // `payloadMemoryLength`: bytes past the object function's payload type widen its arena
+        // (`LoweringInputs::object_payload`).
+        let payload_length = d.payload_memory_length.filter(|&bytes| bytes > 0);
         let object = match &d.object {
             Some(o) => {
                 // An object function on a device that folds its grids runs any object grid in
                 // pieces within the task stage's limits (`bind::mesh_arguments`).
                 let mut inputs = v.lowering_inputs(Stage::Object);
                 inputs.folded_groups = crate::lower::mesh::folds_object_grids(p);
+                inputs.object_payload = payload_length;
                 Some(self.stage(o, InputsFrom::Given(&inputs), m)?)
             }
             None => None,
         };
         // The mesh function reads its payload within the object function's
-        // (`LoweringInputs::object_payload`).
+        // (`LoweringInputs::object_payload`), or the descriptor's length without one.
         let mut mesh_inputs = v.lowering_inputs(Stage::Mesh);
-        mesh_inputs.object_payload = object.as_ref().and_then(|o| o.artifact().interface.payload);
+        mesh_inputs.object_payload = match &object {
+            Some(o) => o.artifact().interface.payload,
+            None => payload_length,
+        };
         let mesh = self.stage(&d.mesh, InputsFrom::Given(&mesh_inputs), m)?;
+        check_function_maxima(d, object.as_ref(), &mesh)?;
+        // A stage compiled on its own holds the descriptor's length only where it was compiled
+        // under it.
+        if let Some(bytes) = payload_length {
+            let first = object.as_ref().unwrap_or(&mesh).artifact();
+            let arena = crate::memory::arena::payload_bytes(u64::from(bytes));
+            if first
+                .interface
+                .payload
+                .is_some_and(|held| u64::from(held) < arena)
+            {
+                return Err(Error::NeedsInput(RuntimeInput::ObjectPayload));
+            }
+        }
         let written = raw_indices_written(mesh.artifact());
         let primitive = primitive_varyings_written(mesh.artifact());
         let varyings = varyings_written(mesh.artifact());
@@ -629,6 +657,7 @@ impl Device {
         dependencies.extend(mesh_facts);
         let (graphics, requirements) = graphics_requirements(requirements, &linked, &artifacts, p)?;
         let profile = self.profile_fingerprint();
+        let mesh_info = self.mesh_info(d, object.as_ref(), &mesh);
         Ok(RenderPipeline {
             key: pipeline_key(
                 b"mesh",
@@ -645,7 +674,75 @@ impl Device {
             interface: linked.interface,
             requirements,
             variant_bits: artifacts.iter().fold(0, |bits, a| bits | a.variant_bits),
+            mesh_info: Some(mesh_info),
         })
+    }
+
+    /// Answers to Metal's queries of the mesh render pipeline of descriptor `d`, of object function
+    /// `object` (where it has one) and mesh function `mesh` ([`MeshPipelineMetalInfo`]).
+    fn mesh_info(
+        &self,
+        d: &MeshPipelineDescriptor,
+        object: Option<&CompiledFunction>,
+        mesh: &CompiledFunction,
+    ) -> MeshPipelineMetalInfo {
+        let p = self.profile();
+        let limits = &p.fields().limits;
+        // Each stage's threadgroups run in the task and mesh stages, or as compute work.
+        let (object_limit, mesh_limit) = if crate::lower::mesh::emulates(p) {
+            let compute = limits.max_compute_work_group_invocations;
+            (compute, compute)
+        } else {
+            (
+                limits.mesh.max_task_work_group_invocations,
+                limits.mesh.max_mesh_work_group_invocations,
+            )
+        };
+        // Metal's on a first compile: the least of 1024, the function's own maximum, the
+        // descriptor's (Metal's 0 is none) and the threads of the stage's required size (Metal's
+        // all-zero size is none), within the device's.
+        let threads =
+            |f: &CompiledFunction, given: Option<u32>, required: Option<[u32; 3]>, device: u32| {
+                let required = required_size(required).map(|axes| {
+                    let threads: u64 = axes.iter().map(|&axis| u64::from(axis)).product();
+                    u32::try_from(threads).unwrap_or(u32::MAX)
+                });
+                [f.artifact().kernel.max_total_threads, given, required]
+                    .into_iter()
+                    .flatten()
+                    .filter(|&n| n > 0)
+                    .fold(METAL_MAX_THREADS.min(device), u32::min)
+            };
+        let width = self.metal_properties().thread_execution_width;
+        // The descriptor's, else Metal's: an object function's
+        // `[[max_total_threadgroups_per_mesh_grid(n)]]` changes nothing Metal answers.
+        let grid = d
+            .max_total_threadgroups_per_mesh_grid
+            .filter(|&n| n > 0)
+            .unwrap_or(METAL_MESH_GRID_THREADGROUPS);
+        let grid = match crate::lower::mesh::emulates(p) {
+            true => grid,
+            false => grid.min(limits.mesh.max_mesh_work_group_total_count),
+        };
+        MeshPipelineMetalInfo {
+            max_total_threads_per_object_threadgroup: object.map_or(0, |o| {
+                threads(
+                    o,
+                    d.max_total_threads_per_object_threadgroup,
+                    d.required_threads_per_object_threadgroup,
+                    object_limit,
+                )
+            }),
+            max_total_threads_per_mesh_threadgroup: threads(
+                mesh,
+                d.max_total_threads_per_mesh_threadgroup,
+                d.required_threads_per_mesh_threadgroup,
+                mesh_limit,
+            ),
+            object_thread_execution_width: object.map_or(0, |_| width),
+            mesh_thread_execution_width: width,
+            max_total_threadgroups_per_mesh_grid: grid,
+        }
     }
 
     /// A stage from its source: compiled now under `inputs`, or taken as compiled (link and
@@ -709,8 +806,10 @@ impl Device {
         }
         let kernel = self.stage(&d.kernel, InputsFrom::Given(inputs), m)?;
         let a = kernel.artifact();
+        check_compute_maxima(d, a)?;
         check_stage_in(a, d)?;
         check_call_stack(a, d.max_call_stack_depth)?;
+        check_open_cl_mode(a, d.open_cl_mode_enabled)?;
         let linked = link(&[a], &LinkInputs::compute(), p)?;
         let stage = stage_module(&kernel, &linked, 0)?;
         let profile = self.profile_fingerprint();
@@ -794,9 +893,9 @@ impl Device {
         crate::pipeline::private_state::check_render(d)?;
         let p = self.profile();
         // The attachments as the private logic operation draws them: its normalized and integer
-        // attachments unblended (unwritten under a no-op), and Vulkan's operation where one is
-        // needed.
-        let (operated, logic_op) = crate::pipeline::private_state::logic_operation(d, p)?;
+        // attachments unblended (unwritten under a no-op), and Vulkan's operation, or the fragment
+        // function's, where one is needed.
+        let (operated, logic) = crate::pipeline::private_state::logic_operation(d, p)?;
         let d = operated.as_ref();
         let group = color_group::group(d, v, p)?;
         let grouped = group.as_ref().map(|g| color_group::descriptor(d, g));
@@ -805,6 +904,7 @@ impl Device {
         let pass = || {
             let mut pass = FragmentPass::from(d);
             pass.color_group = group.as_ref();
+            pass.logic_operation = crate::pipeline::private_state::LogicDraw::shader(logic);
             pass
         };
         // On a device without a fragment `PrimitiveId` or without `tessellationShader`, whether
@@ -911,8 +1011,9 @@ impl Device {
             stages = all;
         }
         // A fragment function that reads `[[barycentric_coord]]` as varyings, or a vertex function
-        // that selects its slice or viewport through them: the geometry stages of the point, line
-        // and triangle classes, before the fragment stage, or last without one.
+        // that selects its slice or viewport through them, or a fan-out variant: the geometry
+        // stages of the point, line and triangle classes, before the fragment stage, or last
+        // without one.
         if let Some(g) = &linked.geometry {
             let at = stages
                 .iter()
@@ -925,8 +1026,24 @@ impl Device {
             }
             stages.splice(at..at, added);
         }
+        // A variant that draws its lines as bands: the band's control and evaluation stages,
+        // right after the vertex stage.
+        if let Some(band) = &linked.band {
+            let at = stages
+                .iter()
+                .position(|s| s.stage == vk::ShaderStage::VERTEX)
+                .map_or(0, |i| i + 1);
+            let mut added = Vec::with_capacity(2);
+            for (module, r) in band.stages(&linked, p, m)? {
+                requirements = p.union_requirements(&requirements, &r);
+                added.push(module);
+            }
+            stages.splice(at..at, added);
+        }
         let mut dependencies = dependencies(&artifacts, self);
-        if let Some(g) = &linked.geometry {
+        // A fan-out variant's stages are the consumer's choice of how to draw its rate-mapped
+        // pass, which its graphics state states (`GraphicsState::region_fan_out`).
+        if let Some(g) = linked.geometry.as_ref().filter(|g| g.fan_out.is_none()) {
             let fact = RuntimeFact::SynthesizedGeometry {
                 weights: !g.forms.is_empty(),
                 layer: g.layer,
@@ -950,11 +1067,13 @@ impl Device {
             fragment.as_ref().map(|f| f.artifact()),
         )?;
         crate::pipeline::private_state::logic_operated(
-            logic_op,
+            logic,
             fragment.as_ref().map(|f| f.artifact()),
             &graphics,
         )?;
+        let logic_op = crate::pipeline::private_state::LogicDraw::vulkan(logic);
         graphics.logic_op = logic_op;
+        crate::pipeline::private_state::note_vulkan_codes(d, &graphics, &mut stages);
         let mut requirements = requirements;
         if logic_op.is_some() {
             requirements.features.insert(VkFeature::LogicOp);
@@ -976,6 +1095,7 @@ impl Device {
             interface: linked.interface,
             requirements,
             variant_bits: artifacts.iter().fold(0, |bits, a| bits | a.variant_bits),
+            mesh_info: None,
         })
     }
 
@@ -1012,9 +1132,15 @@ impl Device {
             let groups = free / per_simdgroup;
             max = max.min(u32::try_from(groups.saturating_mul(32)).unwrap_or(u32::MAX));
         }
-        // Metal's own answer: Apple's 1024 under the same caps, without the device's limits.
+        // Metal's own answer: Apple's 1024 under the same caps, without the device's limits. A
+        // required work-group size caps both at its threads (64 for `reqd_work_group_size(64, 1,
+        // 1)` on the M3 Max, macOS 27.0.1).
+        let required = c
+            .kernel
+            .work_group_size
+            .map(|[x, y, z]| x.saturating_mul(y).saturating_mul(z));
         let mut metal = METAL_MAX_THREADS;
-        for cap in [c.kernel.max_total_threads, max_threads]
+        for cap in [c.kernel.max_total_threads, required, max_threads]
             .into_iter()
             .flatten()
             // Metal's 0 is "the device maximum".
@@ -1023,21 +1149,14 @@ impl Device {
             max = max.min(cap);
             metal = metal.min(cap);
         }
-        // The emulated scratch of the most threads counts as static threadgroup memory, so any
-        // `[[threadgroup(n)]]` lengths that fit beside the reported length fit every threadgroup
-        // up to the maximum (the arena grows by exactly their rounded lengths).
-        // A predicated walk's vote word is static threadgroup memory beside the arena.
-        let vote = if c.facts.contains(&RuntimeFact::PredicationVote) {
-            u64::from(crate::lower::simd::divergent::VOTE_BYTES)
-        } else {
-            0
-        };
-        let static_bytes = match emulation {
-            Some((per_simdgroup, fixed)) => {
-                fixed.saturating_add(u64::from(max).div_ceil(32).saturating_mul(per_simdgroup))
-            }
-            None => c.kernel.static_threadgroup_bytes.saturating_add(vote),
-        };
+        // The static part of Metal's own layout, as Metal reports it: neither the emulated
+        // simdgroups' scratch nor a predicated walk's vote word, which are ours and which the
+        // planner counts in each dispatch's total (`bind::plan::compute`), refusing a threadgroup
+        // whose lengths fit beside this length and not beside them (`ThreadgroupMemorySize`).
+        // Metal reports it rounded up to 16 bytes, its threadgroup memory's granularity
+        // (`threadgroup uint a[256]; threadgroup uint b;` answers 1040, not 1028, on the M3 Max,
+        // macOS 27.0.1).
+        let static_bytes = c.kernel.static_threadgroup_bytes.saturating_add(15) & !15;
         ComputePipelineMetalInfo {
             max_total_threads_per_threadgroup: max,
             thread_execution_width: self.metal_properties().thread_execution_width,
@@ -1186,10 +1305,13 @@ fn graphics_requirements(
     // A multiview pipeline needs `multiview` and its view count whether or not a stage reads the
     // view index; the binder draws more amplifications than the device has views one at a time, so
     // the views it needs are at most those.
+    // A mesh pipeline draws no amplification as a view: its draws of more than one amplification
+    // are refused at the draw (`bind::graphics`), and one draws without multiview.
+    let mesh = artifacts.iter().any(|a| a.interface.stage == Stage::Mesh);
     let views = graphics
         .max_vertex_amplification_count
         .min(p.fields().limits.max_multiview_view_count.max(1));
-    if views > 1 {
+    if views > 1 && !mesh {
         requirements.features.insert(VkFeature::Multiview);
         if linked.control.is_some() {
             requirements
@@ -1248,11 +1370,13 @@ fn invariant(detail: &str) -> Error {
 }
 
 /// The lowering inputs a `Function` kernel of compute pipeline `d` compiles under: its
-/// stage-input descriptor and its `maxCallStackDepth` when not Metal's default, 1.
+/// stage-input descriptor, its `maxCallStackDepth` when not Metal's default, 1, and its OpenCL
+/// mode.
 fn kernel_inputs(d: &ComputePipelineDescriptor) -> LoweringInputs {
     LoweringInputs {
         stage_input: d.stage_input.clone(),
         max_call_stack_depth: (d.max_call_stack_depth > 1).then_some(d.max_call_stack_depth),
+        open_cl_mode: d.open_cl_mode_enabled,
         ..LowerInputs::new()
     }
 }
@@ -1298,7 +1422,10 @@ fn check_tile_threadgroup(
 
 /// Each attachment the tile function of artifact `a` stages has the format it was compiled for in
 /// `d`: a `Compiled` tile function compiled under other formats is
-/// `InvalidDescriptor(ColorAttachment)` (a `Function` one is compiled under `d`'s).
+/// `InvalidDescriptor(ColorAttachment)` (a `Function` one is compiled under `d`'s). It answers
+/// Metal's nil and `NSError` where `d` gives the attachment no format, as Metal answers a tile
+/// function reaching one; under another format it answers `EndsProcess`, the answer of a case
+/// with no Metal counterpart.
 fn check_tile_formats(a: &FunctionArtifact, d: &TileRenderPipelineDescriptor) -> Result<(), Error> {
     for fact in &a.facts {
         let RuntimeFact::TileAttachmentFormat { color, format } = *fact else {
@@ -1307,11 +1434,17 @@ fn check_tile_formats(a: &FunctionArtifact, d: &TileRenderPipelineDescriptor) ->
         let given = usize::try_from(color)
             .ok()
             .and_then(|i| d.color_attachment_formats.get(i).copied().flatten());
-        if given != Some(format) {
-            return Err(Error::InvalidDescriptor(DescriptorError::ColorAttachment {
-                index: color,
-            }));
-        }
+        // Without a format, Metal's answer; under another, compiled for another pipeline, which
+        // has no Metal counterpart.
+        let metal = match given {
+            Some(given) if given == format => continue,
+            Some(_) => MetalAnswer::EndsProcess,
+            None => MetalAnswer::NilWithError,
+        };
+        return Err(Error::InvalidDescriptor(DescriptorError::ColorAttachment {
+            index: color,
+            metal,
+        }));
     }
     Ok(())
 }
@@ -1324,6 +1457,171 @@ fn check_tile_formats(a: &FunctionArtifact, d: &TileRenderPipelineDescriptor) ->
 const TILE_MAX_THREADS: u32 = TILE_MAX_SIDE * TILE_MAX_SIDE;
 /// Apple's GPUs' threads a threadgroup (a threadgroup of 2048 ran nothing on an M4).
 const METAL_MAX_THREADS: u32 = 1024;
+
+/// `maxTotalThreadgroupsPerMeshGrid` of a mesh render pipeline whose descriptor sets none, as an
+/// M3 Max under macOS 27.0.1 answers it, whatever its object function's
+/// `[[max_total_threadgroups_per_mesh_grid(n)]]`.
+const METAL_MESH_GRID_THREADGROUPS: u32 = 1 << 20;
+
+/// The most bytes of a mesh render pipeline's `payloadMemoryLength` Metal makes a pipeline of (an
+/// M3 Max under macOS 27.0.1).
+const METAL_MAX_PAYLOAD: u32 = 16384;
+
+/// Metal's refusal of a mesh descriptor field.
+fn mesh_refusal(problem: MeshPipelineProblem) -> Error {
+    Error::InvalidDescriptor(DescriptorError::MeshPipeline { problem })
+}
+
+/// Metal's error over compute descriptor `d`'s `maxTotalThreadsPerThreadgroup` beside kernel `a`
+/// ([`ComputePipelineProblem`]): one other than the kernel's own maximum, else one above 1024.
+/// Metal's 0 is no maximum.
+fn check_compute_maxima(d: &ComputePipelineDescriptor, a: &FunctionArtifact) -> Result<(), Error> {
+    let Some(max) = d.max_total_threads_per_threadgroup.filter(|&max| max > 0) else {
+        return Ok(());
+    };
+    let refusal = |problem| {
+        Err(Error::InvalidDescriptor(DescriptorError::ComputePipeline {
+            problem,
+        }))
+    };
+    match a.kernel.max_total_threads.filter(|&n| n > 0) {
+        Some(specified) if specified != max => {
+            refusal(ComputePipelineProblem::MaxThreadsDiffer { specified, max })
+        }
+        None if max > METAL_MAX_THREADS => refusal(ComputePipelineProblem::MaxThreadsOverLimit {
+            max,
+            limit: METAL_MAX_THREADS,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// `required`, with Metal's all-zero size as none.
+fn required_size(required: Option<[u32; 3]>) -> Option<[u32; 3]> {
+    required.filter(|axes| *axes != [0; 3])
+}
+
+/// Metal's refusals of mesh descriptor `d` before any compile ([`MeshPipelineProblem`]), in
+/// Metal's order: those its descriptor validation ends the process at (the required sizes, an
+/// amplification count of 0), then the creation's errors over the thread maxima, each stage's
+/// required size beside its maximum and the payload length.
+fn check_mesh_fields(d: &MeshPipelineDescriptor) -> Result<(), Error> {
+    let stages = [
+        (
+            Stage::Object,
+            d.required_threads_per_object_threadgroup,
+            d.max_total_threads_per_object_threadgroup,
+        ),
+        (
+            Stage::Mesh,
+            d.required_threads_per_mesh_threadgroup,
+            d.max_total_threads_per_mesh_threadgroup,
+        ),
+    ];
+    for (stage, required, max) in stages {
+        let Some(required) = required_size(required) else {
+            continue;
+        };
+        if stage == Stage::Object && d.object.is_none() {
+            return Err(mesh_refusal(
+                MeshPipelineProblem::RequiredWithoutObjectFunction { required },
+            ));
+        }
+        if required.contains(&0) {
+            return Err(mesh_refusal(MeshPipelineProblem::RequiredEmptyAxis {
+                stage,
+                required,
+            }));
+        }
+        let threads: u64 = required.iter().map(|&axis| u64::from(axis)).product();
+        if threads > u64::from(METAL_MAX_THREADS) {
+            return Err(mesh_refusal(MeshPipelineProblem::RequiredOverLimit {
+                stage,
+                threads,
+                limit: METAL_MAX_THREADS,
+            }));
+        }
+        if let Some(max) = max.filter(|&max| max > 0 && threads > u64::from(max)) {
+            return Err(mesh_refusal(MeshPipelineProblem::RequiredOverMax {
+                stage,
+                threads,
+                max,
+            }));
+        }
+    }
+    if d.max_vertex_amplification_count == 0 {
+        return Err(Error::InvalidDescriptor(
+            DescriptorError::VertexAmplificationCount { count: 0 },
+        ));
+    }
+    let maxima = [
+        (Stage::Object, d.max_total_threads_per_object_threadgroup),
+        (Stage::Mesh, d.max_total_threads_per_mesh_threadgroup),
+    ];
+    for (stage, max) in maxima {
+        if let Some(max) = max.filter(|&max| max > METAL_MAX_THREADS) {
+            return Err(mesh_refusal(MeshPipelineProblem::MaxThreadsOverLimit {
+                stage,
+                max,
+                limit: METAL_MAX_THREADS,
+            }));
+        }
+    }
+    // A stage's required size gives its threads, as its function's maximum does, in either
+    // stage: Metal's first compile refuses a maximum of other threads.
+    for (stage, required, max) in stages {
+        let (Some(required), Some(max)) = (required_size(required), max.filter(|&max| max > 0))
+        else {
+            continue;
+        };
+        // Within the limit, so within `u32`.
+        let specified = required.iter().product::<u32>();
+        if specified != max {
+            return Err(mesh_refusal(MeshPipelineProblem::MaxThreadsDiffer {
+                stage,
+                specified,
+                max,
+            }));
+        }
+    }
+    if let Some(length) = d
+        .payload_memory_length
+        .filter(|&length| length > METAL_MAX_PAYLOAD)
+    {
+        return Err(mesh_refusal(MeshPipelineProblem::PayloadOverLimit {
+            length,
+            limit: METAL_MAX_PAYLOAD,
+        }));
+    }
+    Ok(())
+}
+
+/// Metal's error over mesh descriptor `d` of object function `object` (where it has one) and
+/// mesh function `mesh`: a stage whose function's `[[max_total_threads_per_threadgroup(n)]]`
+/// differs from the descriptor's maximum for it (`MeshPipelineProblem::MaxThreadsDiffer`).
+fn check_function_maxima(
+    d: &MeshPipelineDescriptor,
+    object: Option<&CompiledFunction>,
+    mesh: &CompiledFunction,
+) -> Result<(), Error> {
+    let stages = object
+        .map(|o| (Stage::Object, o, d.max_total_threads_per_object_threadgroup))
+        .into_iter()
+        .chain([(Stage::Mesh, mesh, d.max_total_threads_per_mesh_threadgroup)]);
+    for (stage, f, max) in stages {
+        let specified = f.artifact().kernel.max_total_threads.filter(|&n| n > 0);
+        if let (Some(specified), Some(max)) = (specified, max.filter(|&max| max > 0)) {
+            if specified != max {
+                return Err(mesh_refusal(MeshPipelineProblem::MaxThreadsDiffer {
+                    stage,
+                    specified,
+                    max,
+                }));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// The widest and tallest tile threadgroup (`bind::dispatch::TILE_THREADGROUP_SIDE`).
 const TILE_MAX_SIDE: u32 = crate::bind::dispatch::TILE_THREADGROUP_SIDE;
@@ -1383,6 +1681,19 @@ fn check_stage_in(a: &FunctionArtifact, d: &ComputePipelineDescriptor) -> Result
     Ok(())
 }
 
+/// The kernel of artifact `a` was compiled in its compute pipeline's OpenCL mode, `given`
+/// (`RuntimeFact::OpenClMode`): a `Compiled` kernel of the other mode is
+/// `InvalidDescriptor(OpenClMode)` (a `Function` kernel is compiled under `given`).
+fn check_open_cl_mode(a: &FunctionArtifact, given: bool) -> Result<(), Error> {
+    let compiled = a.facts.contains(&RuntimeFact::OpenClMode);
+    if compiled != given {
+        return Err(Error::InvalidDescriptor(DescriptorError::OpenClMode {
+            compiled,
+        }));
+    }
+    Ok(())
+}
+
 /// The stage of artifact `a` has the call stack its pipeline's `maxCallStackDepth` for it,
 /// `given`, sizes: a `Compiled` stage whose stack was sized for another depth is
 /// `InvalidDescriptor(MaxCallStackDepth)` (a `Function` stage is compiled under `given`).
@@ -1422,8 +1733,8 @@ fn compute_fields(d: &ComputePipelineDescriptor) -> String {
 
 /// The pipeline key's fields of variant `v` past its stages' keys: its color group past the first
 /// (`VariantKey::color_group`), whose variant of a pipeline without a fragment function has no
-/// stage of its own, and its emulated mesh function's synthesized vertex stage. Empty for every
-/// other variant, so a pipeline keeps its key.
+/// stage of its own, its emulated mesh function's synthesized vertex stage, and a band variant's
+/// synthesized tessellation stages. Empty for every other variant, so a pipeline keeps its key.
 fn variant_fields(v: &VariantKey) -> String {
     let mut fields = String::new();
     // The group a pipeline without a fragment function keeps in no stage's key.
@@ -1433,6 +1744,22 @@ fn variant_fields(v: &VariantKey) -> String {
     // The synthesized vertex stage of an emulated mesh function's pipeline, in no stage's key.
     if v.mesh_last_first {
         fields.push_str(" mesh_last_first");
+    }
+    // The band's synthesized stages, in no stage's key.
+    match v.line_band {
+        None => {}
+        Some(crate::pipeline::BandPrimitive::Lines) => fields.push_str(" line_band"),
+        Some(crate::pipeline::BandPrimitive::Triangles) => fields.push_str(" line_band triangles"),
+    }
+    // The fan-out's synthesized geometry stages, in no stage's key.
+    match v.region_fan_out {
+        None => {}
+        Some(crate::pipeline::RegionFanOut::Draw) => fields.push_str(" region_fan_out"),
+        Some(crate::pipeline::RegionFanOut::Probe) => fields.push_str(" region_fan_out probe"),
+        Some(crate::pipeline::RegionFanOut::DrawFew) => fields.push_str(" region_fan_out few"),
+        Some(crate::pipeline::RegionFanOut::RegionCopies) => {
+            fields.push_str(" region_fan_out copies")
+        }
     }
     fields
 }
@@ -1446,7 +1773,9 @@ fn render_fields(d: &RenderPipelineDescriptor) -> String {
             RenderLinkInputs::from(d),
             d.support_indirect_command_buffers
         )
-    );
+    )
+    // A descriptor's inputs never fan out (`variant_fields` keys a variant that does).
+    .replace(", region_fan_out: None", "");
     // Appended only past Metal's defaults, so a default descriptor keeps its key.
     let fields = match (
         d.max_vertex_call_stack_depth,
@@ -1515,6 +1844,8 @@ fn stage_module(c: &CompiledFunction, linked: &Linked, i: usize) -> Result<Stage
         specialized_notes: a.specialized.clone(),
         own_pixel_textures: a.interface.own_pixel_textures.clone(),
         snapshot_textures: a.interface.snapshot_textures.clone(),
+        snapshot_refusals: a.interface.snapshot_refusals.clone(),
+        level_reads: a.interface.level_reads.clone(),
         private_bytes: a.interface.private_bytes,
         // Link resolves the module's symbols and adds no instruction, so the function's own
         // counts are the stage's.
@@ -1587,16 +1918,23 @@ fn primitive_varyings_written(a: &FunctionArtifact) -> std::collections::BTreeSe
 }
 
 /// The mesh descriptor fields the artifact depends on: its fixed-function state, as a render
-/// pipeline's ([`render_fields`]).
+/// pipeline's ([`render_fields`]), and the limits its `mesh_info` answers within.
 fn mesh_fields(d: &MeshPipelineDescriptor) -> String {
-    format!("{:?}", RenderLinkInputs::from(d))
+    format!(
+        "{:?} {:?} {:?} {:?}",
+        RenderLinkInputs::from(d),
+        d.max_total_threads_per_object_threadgroup,
+        d.max_total_threads_per_mesh_threadgroup,
+        d.max_total_threadgroups_per_mesh_grid
+    )
 }
 
 /// A fragment function of a pipeline that rasterizes more than one sample, which reads a value
 /// Vulkan evaluates at an implementation-defined position within the fragment, or at the
 /// invocation's sample under sample shading, and Metal at the pixel center, notes
 /// `PrecisionNote::MultisamplePosition`: `[[position]]`'s z or w, a center varying not read at the
-/// pixel (`StageIo::varyings_at_pixel`), a centroid varying, `[[point_coord]]`, or
+/// pixel (`StageIo::varyings_at_pixel`), a centroid varying, an interpolant read at the center or
+/// the centroid as those are (`Sampling::Interpolant`), `[[point_coord]]`, or
 /// `[[barycentric_coord]]`, at pixel rate or per sample. Link refused a per-sample function's
 /// center varying where the device has no pixel form, so a center varying reaches here without it
 /// only at pixel rate.
@@ -1614,20 +1952,20 @@ fn note_sample_position(
             continue;
         }
         let io = &a.interface.io;
-        let interpolated = |at: Sampling| {
+        let interpolated = |reads: fn(Sampling) -> bool| {
             io.inputs.iter().any(|v| {
                 matches!(
                     v.role,
                     IoRole::Varying {
                         interpolation: Some(Interpolation::Smooth { sampling, .. }),
                         ..
-                    } if sampling == at
+                    } if reads(sampling)
                 )
             })
         };
         let reads = (io.builtins.contains(&StageBuiltin::FragCoord) && io.position_depth)
-            || (interpolated(Sampling::Center) && !io.varyings_at_pixel)
-            || interpolated(Sampling::Centroid)
+            || (interpolated(Sampling::reads_center) && !io.varyings_at_pixel)
+            || interpolated(Sampling::reads_centroid)
             || io
                 .builtins
                 .iter()

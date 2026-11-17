@@ -10,7 +10,10 @@
 //!   ([`pooled_backing`]).
 //! - **A fetched texture's scratch.** One rule for both forms of framebuffer fetch: a color
 //!   texture whose image lacks the usage its fetch form needs renders, in a pass that fetches
-//!   it, into a scratch image that has it, as its attachment in every instance too. In the
+//!   it, into a scratch image that has it, as its attachment in every instance too, but those
+//!   that render the texture itself before it arrives (recorded inline, or pinned by a draw that
+//!   reads it through a snapshot: `render/inline_first.rs`, `render/snapshot.rs`), after which it
+//!   is copied in. In the
 //!   pixel interlock that usage is `STORAGE`, which a texture the runtime makes holds only where
 //!   it costs the image nothing (`framebuffer_fetch::Answers`); through input attachments it is
 //!   input attachment usage, which every color render target the runtime makes holds and a
@@ -85,7 +88,7 @@
 
 use super::blit::TRANSFER;
 use super::color_resolve;
-use super::command_buffer::CommandBuffer;
+use super::command_buffer::{CommandBuffer, Finished};
 use super::device::lock;
 use super::encoder::EncoderCore;
 use super::error::{internal, Error, RuntimeGap};
@@ -155,6 +158,12 @@ pub(super) enum Cause {
     /// copied into where the pass loads it and never back, so the texture keeps the samples it
     /// held before the pass, as Metal's does.
     KeptSamples,
+    /// The image a pass renders a texture's own image through where it stores it `DontCare`
+    /// under `DontCareColorPolicy::Kept` and the device's own `DONT_CARE` would not leave the
+    /// texture's earlier texels, which Metal leaves (`kept_bytes.rs`): one its queue keeps for its passes of the attachment's shape
+    /// ([`pooled_backing`]), copied into where the pass loads it and never back. No notice names
+    /// it: the texture keeps its texels, Metal's answer.
+    KeptTexels,
 }
 
 impl StandIn {
@@ -245,7 +254,7 @@ pub(super) fn kept_backing(
     Ok(made)
 }
 
-/// The most memoryless color backings a queue keeps ([`pooled_backing`]), and the most bytes of
+/// The most color backings a queue keeps ([`pooled_backing`]), and the most bytes of
 /// device memory their images take together: past either, the backing passes took least recently
 /// goes (but the one just made, which alone may take more). The count is above the shapes a
 /// frame cycles through: a compositor's frames on the consumer's macOS guest render 11 to 14
@@ -255,24 +264,29 @@ pub(super) fn kept_backing(
 const MOST_POOLED_BACKINGS: usize = 32;
 const MOST_POOLED_BYTES: u64 = 256 << 20;
 
-/// A memoryless color attachment's backing its queue keeps ([`pooled_backing`]): the shape it
-/// backs (the attachment's pixel format, the format its pass renders it in, its samples, layers
-/// and extent), the bytes its image takes, and the pool's count of takes at its last take.
+/// A color attachment's backing its queue keeps ([`pooled_backing`]): the shape it backs (the
+/// attachment's pixel format, the format its pass renders it in, its samples, layers and extent),
+/// whether it was made for copies from its attachment (`stand_in`'s `copies`), the bytes its image
+/// takes, and the pool's count of takes at its last take.
 struct PooledBacking {
     pixel_format: PixelFormat,
     format: metal2vulkan::vk::Format,
     samples: u32,
     layers: u32,
     extent: [u32; 2],
+    copies: bool,
     bytes: u64,
     taken: u64,
+    /// Whether the command buffer that took it last completed.
+    taker: Finished,
     backing: Target,
 }
 
 impl PooledBacking {
-    /// Whether it backs an attachment of `own`'s shape.
-    fn backs(&self, own: &Target) -> bool {
-        self.pixel_format == own.texture.pixel_format()
+    /// Whether it backs an attachment of `own`'s shape, copied from it where `copies`.
+    fn backs(&self, own: &Target, copies: bool) -> bool {
+        (self.copies || !copies)
+            && self.pixel_format == own.texture.pixel_format()
             && self.format == own.format
             && self.samples == own.samples
             && self.layers == own.layers
@@ -280,7 +294,7 @@ impl PooledBacking {
     }
 }
 
-/// The memoryless color backings one command queue keeps for its passes ([`pooled_backing`]): at
+/// The color backings one command queue keeps for its passes ([`pooled_backing`]): at
 /// most [`MOST_POOLED_BACKINGS`], over at most [`MOST_POOLED_BYTES`] but for the one just made.
 /// They go with the queue; each command buffer that rendered into one holds it until it
 /// completes.
@@ -314,23 +328,29 @@ impl BackingPool {
 
 /// The backing of `own`, a memoryless color attachment of a pass of `maker`'s queue that renders
 /// into an image of its own (a framebuffer fetch through the pixel interlock reads it, or the pass
-/// splits): one the queue keeps of `own`'s pixel format, format, samples, layers and extent that
-/// is none of `taken` (the images the pass renders its other attachments into), else one made now
-/// and kept ([`BackingPool`]). Metal neither loads nor stores a memoryless texture
-/// (`render_pass::check_memoryless`), and a pass gives a memoryless color's every texel a draw can
-/// read a value before its draws: its `Clear` load, or the zero its `DontCare` load clears to in a
-/// pass that draws (`clear_reach::dont_care_loads`), before the pass where the pass leaves it out
-/// of its subpass (`render.rs`). A fresh image's texels were undefined there as well. So no pass
-/// reads what another left in the backing, and the passes of one queue that take it are ordered by
-/// their uses of it, as by any texture's: one image serves every pass of the shape, across
-/// command buffers and frames (`WorkCounts::pooled_backings_made`).
+/// splits), or a color a pass stores `DontCare` that renders through one so that its texture
+/// keeps its texels (`kept_bytes.rs`), made for the copy into it where `copies` (the pass loads
+/// it): one the queue keeps of `own`'s pixel format, format, samples, layers and extent (made for
+/// copies where `copies`) that is none of `taken` (the images the pass renders its other
+/// attachments into), else one made now and kept ([`BackingPool`]). Metal neither loads nor stores
+/// a memoryless texture (`render_pass::check_memoryless`), and a pass gives a memoryless color's
+/// every texel a draw can read a value before its draws: its `Clear` load, or the zero its
+/// `DontCare` load clears to in a pass that draws (`clear_reach::dont_care_loads`), before the pass
+/// where the pass leaves it out of its subpass (`render.rs`); a `DontCare` store's backing is
+/// given the same before its pass, or the texture's texels over the render area where the pass
+/// loads it, and nothing reads what its pass leaves in it. A fresh image's texels were undefined
+/// there as well. So no pass reads what another left in the backing, and the passes of one queue
+/// that take it are ordered by their uses of it, as by any texture's: one image serves every pass
+/// of the shape, across command buffers and frames (`WorkCounts::pooled_backings_made`,
+/// `pooled_backings_taken`, `pooled_backings_taken_in_flight`).
 pub(super) fn pooled_backing(
     maker: &CommandBuffer,
     own: &Target,
     taken: &[Texture],
+    copies: bool,
 ) -> Result<Target, Error> {
-    let queue = maker.command_queue();
-    let free = |k: &PooledBacking| k.backs(own) && !taken.contains(&k.backing.texture);
+    let queue = maker.queue_place();
+    let free = |k: &PooledBacking| k.backs(own, copies) && !taken.contains(&k.backing.texture);
     {
         let mut pool = lock(queue.memoryless_backings());
         pool.takes += 1;
@@ -338,7 +358,16 @@ pub(super) fn pooled_backing(
         if let Some(found) = pool.kept.iter_mut().find(|k| free(k)) {
             found.taken = takes;
             let backing = found.backing.clone();
+            // Taken while another command buffer that took it has not completed: the hazard
+            // tracker orders their uses of it (counted).
+            let in_flight = !found.taker.of(maker) && !found.taker.completed();
+            found.taker = maker.finished();
             drop(pool);
+            maker
+                .device()
+                .shared()
+                .counts
+                .pooled_backing_taken(in_flight);
             // Held as one `maker` made: its first batch moves it to `GENERAL` where the command
             // buffer that made it has not yet submitted a batch.
             maker.hold_own_texture(backing.texture.clone());
@@ -346,7 +375,7 @@ pub(super) fn pooled_backing(
         }
     }
     // Made with no lock held; the pool may keep one another thread made meanwhile beside it.
-    let made = stand_in(maker, own, false)?;
+    let made = stand_in(maker, own, copies)?;
     maker.device().shared().counts.pooled_backing_made();
     let mut pool = lock(queue.memoryless_backings());
     pool.takes += 1;
@@ -357,8 +386,10 @@ pub(super) fn pooled_backing(
         samples: own.samples,
         layers: own.layers,
         extent: own.extent,
+        copies,
         bytes: made.texture.placed_bytes().unwrap_or(0),
         taken: takes,
+        taker: maker.finished(),
         backing: made.clone(),
     });
     pool.bound();
@@ -429,7 +460,7 @@ pub(super) fn stand_in_as(
     // input attachment (`color_resolve.rs`), as does the resolve into the attachment's format's
     // sRGB twin, whose encoding no device's average writes (`color_resolve::twin_resolved`).
     let resolved = multisampled
-        && (color_resolve::shader_rules(pixel_format, target.samples).is_some()
+        && (color_resolve::shader_rules(pixel_format, target.format, target.samples).is_some()
             || color_resolve::twin_resolved(pixel_format, target.samples));
     if color && (framebuffer_fetch::through_inputs(profile) || resolved) {
         usage |= ImageUsageFlags::INPUT_ATTACHMENT;
@@ -780,7 +811,7 @@ impl StandInCopies {
             if aspect_mask == vk::ImageAspectFlags::COLOR {
                 let direction = if into_stand_in { "into" } else { "back from" };
                 nan_clear::degrade_converting_copy(
-                    to.texture.device(),
+                    to.texture.generation(),
                     to.format,
                     to.samples,
                     || {

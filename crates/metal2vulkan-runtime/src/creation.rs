@@ -5,7 +5,8 @@
 //!
 //! Each is made where it is first needed: on the program's thread, in a section of the device's
 //! lowering thread, which lowers render encoders' calls (`render/lowering_worker.rs`), or in a host
-//! step (`exit_guard::host_step`) on the scheduler's thread, an object no earlier settle made (a
+//! step (`exit_guard::host_step`) on the steps' thread (`scheduler/steps.rs`), an object no earlier
+//! settle made (a
 //! state made after its command buffer's commit, whose run needs an attachment's stand-in, a
 //! shadow, or a pass and framebuffer of its own shape). So the four, and an image's memory
 //! requirements and binding, are in the guard's table (`exit_guard::Call`) and among the calls a
@@ -20,6 +21,7 @@
 //! `vkAllocateMemory`. A count is deterministic, so a test can hold a call to it where a time
 //! cannot.
 
+use crate::allocations;
 use crate::churn_counts::{vk_made, VkMaking};
 use crate::error::{vulkan, Error};
 use ash::prelude::VkResult;
@@ -97,7 +99,9 @@ pub(crate) unsafe fn image_view(
 
 /// `VkDeviceMemory` of `info`, allocated by `device`: one call of `vkAllocateMemory`, counted
 /// whether or not the driver gave it, because a caller that tries memory types in turn pays for
-/// each try.
+/// each try. Refused (`ERROR_TOO_MANY_OBJECTS`) with no call where the device has
+/// `maxMemoryAllocationCount` allocations live (`allocations.rs`). The call is the device's work
+/// in progress for its checks to step aside for (`step_aside.rs`).
 ///
 /// # Safety
 ///
@@ -108,9 +112,16 @@ pub(crate) unsafe fn allocate_memory(
     device: &ash::Device,
     info: &vk::MemoryAllocateInfo<'_>,
 ) -> VkResult<vk::DeviceMemory> {
+    let Some(admitted) = allocations::before_allocation(device.handle()) else {
+        return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
+    };
     vk_made(VkMaking::Memory, Location::caller());
+    let busy = allocations::Busy::of(admitted.as_deref());
     // SAFETY: the caller's.
-    unsafe { device.allocate_memory(info, None) }
+    let memory = unsafe { device.allocate_memory(info, None) };
+    drop(busy);
+    allocations::allocated(admitted, memory.is_ok());
+    memory
 }
 
 /// `image` bound to `memory` at `offset`.

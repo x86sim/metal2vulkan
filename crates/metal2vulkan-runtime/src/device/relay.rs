@@ -36,7 +36,14 @@
 //! (`CommandBuffer::error_description`); a failure of the program's own submission is the program's
 //! to read (its own messenger hears it); and one of the runtime's own, or one no submission in
 //! flight explains (a Metal command buffer MoltenVK made for itself), loses the device: every
-//! command buffer in flight then finishes `DeviceLost`, and no later one is submitted.
+//! batch in flight then takes the loss's code (`DeviceRemoved`, 11), and no later one is
+//! submitted. So does every batch where no fence can be read, the device lost before the report
+//! (MoltenVK under the program's own `MVK_CONFIG_RESUME_LOST_DEVICE` off). Where the device's
+//! line recovers (`device/line.rs`), its command buffers answer as the recovery does: where the
+//! loss failed a wait for their fences, the command buffer of the oldest incomplete batch as the
+//! hang (`GpuHang`) and the rest as its victims (`command_buffer/completion.rs`), the loss's code
+//! leaving that answer as it is; where their fences signaled, each as a victim
+//! (`GpuRecoveryVictim`).
 //!
 //! **The loader word.** MoltenVK writes `ICD_LOADER_MAGIC` over the first word of an object it
 //! names in a message (`loader_word.rs`), the queue's here, where a layer between the loader and
@@ -49,8 +56,8 @@
 //! the device is lost), and a device whose instance lacks `VK_EXT_debug_utils` (the same).
 
 use super::functions::Functions;
-use super::lock;
 use super::submit_stalls::{Caller, Uses};
+use super::{lock, SlotHold};
 use crate::exit_guard::{self, Call};
 use crate::loader_word::LoaderWord;
 use ash::vk::{self, Handle};
@@ -58,6 +65,10 @@ use std::collections::VecDeque;
 use std::ffi::{c_void, CStr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// The longest wait for a kept mark's fence inside one section of the exit guard.
+const WAIT_SLICE: Duration = Duration::from_millis(100);
 
 /// MoltenVK's setting that keeps a device after a command buffer fails (`MVKConfigMembers.def`:
 /// `resumeLostDevice`, a `VkBool32`).
@@ -75,7 +86,7 @@ pub(super) fn setting() -> super::create::LayerSetting {
 
 /// `MTLCommandBufferErrorDeviceRemoved`: the code a device lost by the relay gives its command
 /// buffers in flight.
-const DEVICE_REMOVED: u64 = 11;
+pub(crate) const DEVICE_REMOVED: u64 = 11;
 
 /// The relay's messenger on an instance the runtime created, and the relay it reports to.
 pub(super) struct Messenger {
@@ -163,13 +174,13 @@ impl Relay {
         match flights.first_pending() {
             Some(By::Batch(failed)) => failed.fail(code, Some(description)),
             Some(By::Program) => {}
-            Some(By::Runtime) | None => {
+            Some(By::Runtime | By::Checks) | None => {
                 flights.lost.store(true, Ordering::Release);
                 for each in queues
                     .iter()
                     .filter(|f| Arc::ptr_eq(&f.lost, &flights.lost))
                 {
-                    each.fail_all(DEVICE_REMOVED);
+                    each.lose_all();
                 }
             }
         }
@@ -201,6 +212,12 @@ impl Relayed {
         }
     }
 
+    /// The device was lost: its loss's code (`DeviceRemoved`), unless a failure was kept already
+    /// (the module docs).
+    pub(crate) fn lost(&self) {
+        self.fail(DEVICE_REMOVED, None);
+    }
+
     /// The code and the description kept, if a failure was relayed.
     pub(crate) fn failure(&self) -> Option<(u64, Option<String>)> {
         lock(&self.0).clone()
@@ -216,12 +233,23 @@ pub(crate) enum By {
     Program,
     /// The runtime's own use outside a batch.
     Runtime,
+    /// The device's submission checks' use (`submit_check.rs`): the runtime's own, its mark
+    /// counted with the checks' calls (`WorkCounts::submit_check_calls`), not the device's.
+    Checks,
 }
 
-/// A submission in flight: the fence it signals, and whose it is.
+/// A submission in flight: the fence it signals, whose it is, whether its call returned, and
+/// whether its use's caller keeps it.
 struct Flight {
     fence: vk::Fence,
     by: By,
+    /// Whether the `vkQueueSubmit` that signals the fence returned: until it did, the fence is the
+    /// submitting thread's (a submission's fence is externally synchronized, and a driver may
+    /// signal it before the call returns), so no other thread reads, resets or gives it back.
+    made: bool,
+    /// Whether the mark is kept for the caller of its use, which may wait for its fence
+    /// ([`Mark`]): until it lets go, no other thread resets or gives the fence back.
+    kept: bool,
 }
 
 /// One `VkQueue`'s submissions in flight, in submission order (the module docs).
@@ -258,9 +286,42 @@ impl Flights {
         }
     }
 
-    /// A submission of `fence`, `by`'s, is made next.
-    pub(super) fn push(&self, fence: vk::Fence, by: By) {
-        lock(&self.log).push_back(Flight { fence, by });
+    /// A submission of `fence`, `by`'s, is made next, under the queue's lock: until it is
+    /// [`made`](Self::made), the log holds it pending and reads nothing of its fence.
+    pub(crate) fn push(&self, fence: vk::Fence, by: By) {
+        lock(&self.log).push_back(Flight {
+            fence,
+            by,
+            made: false,
+            kept: false,
+        });
+    }
+
+    /// The mark of `fence` pushed last was [`made`](Self::made), and is kept for its use's
+    /// caller ([`Mark`]) from the same moment, so no other use takes it in between.
+    fn made_kept(&self, fence: vk::Fence) {
+        let mut log = lock(&self.log);
+        if let Some(flight) = log.iter_mut().rev().find(|flight| flight.fence == fence) {
+            flight.made = true;
+            flight.kept = true;
+        }
+    }
+
+    /// The caller of the kept mark of `fence` lets go of it: the next use takes it once done.
+    fn let_go_of_kept(&self, fence: vk::Fence) {
+        let mut log = lock(&self.log);
+        if let Some(flight) = log.iter_mut().find(|flight| flight.fence == fence) {
+            flight.kept = false;
+        }
+    }
+
+    /// The submission of `fence` pushed last was made: its call returned, and its fence may be
+    /// read.
+    pub(crate) fn made(&self, fence: vk::Fence) {
+        let mut log = lock(&self.log);
+        if let Some(flight) = log.iter_mut().rev().find(|flight| flight.fence == fence) {
+            flight.made = true;
+        }
     }
 
     /// The submission of `fence` pushed last was not made.
@@ -272,9 +333,10 @@ impl Flights {
     }
 
     /// The submissions through the one of the last of `fences` completed (their fences are
-    /// signaled, and every earlier submission's): they leave the log. The fences of the ones not
-    /// of a batch go onto `marks`, for the caller to reset and give back (a batch's goes back with
-    /// it).
+    /// signaled, and every earlier submission's): they leave the log, but for the marks kept for
+    /// their uses' callers ([`Mark`]), which stay at its front, signaled, until let go. The fences
+    /// of the others not of a batch go onto `marks`, for the caller to reset and give back (a
+    /// batch's goes back with it).
     pub(crate) fn settled(&self, fences: &[vk::Fence], marks: &mut Vec<vk::Fence>) {
         let mut log = lock(&self.log);
         let Some(through) = log
@@ -283,11 +345,17 @@ impl Flights {
         else {
             return;
         };
-        marks.extend(
-            log.drain(..=through)
-                .filter(|flight| !matches!(flight.by, By::Batch(_)))
-                .map(|flight| flight.fence),
-        );
+        let mut kept = Vec::new();
+        for flight in log.drain(..=through) {
+            match (&flight.by, flight.kept) {
+                (_, true) => kept.push(flight),
+                (By::Batch(_), false) => {}
+                (_, false) => marks.push(flight.fence),
+            }
+        }
+        for flight in kept.into_iter().rev() {
+            log.push_front(flight);
+        }
     }
 
     /// How many of the queue's submissions are in the log: made, and not yet seen complete.
@@ -301,14 +369,18 @@ impl Flights {
         lock(&self.log).retain(|flight| flight.fence != fence);
     }
 
-    /// The first submissions not of a batch whose fences are signaled, each before any other in
-    /// the log: they leave it, and their fences are for the caller to reset and give back.
-    /// Inside a section of the exit guard.
-    pub(super) fn done_marks(&self) -> Vec<vk::Fence> {
+    /// The first submissions not of a batch whose calls returned, which no use's caller keeps and
+    /// whose fences are signaled, each before any other in the log: they leave it, and their
+    /// fences are for the caller to reset and give back. Inside a section of the exit guard.
+    pub(crate) fn done_marks(&self) -> Vec<vk::Fence> {
         let mut log = lock(&self.log);
         let mut done = Vec::new();
         while let Some(front) = log.front() {
-            if matches!(front.by, By::Batch(_)) || !self.signaled(front.fence) {
+            if matches!(front.by, By::Batch(_))
+                || !front.made
+                || front.kept
+                || !self.signaled(front.fence)
+            {
                 break;
             }
             done.extend(log.pop_front().map(|flight| flight.fence));
@@ -324,11 +396,15 @@ impl Flights {
             .collect()
     }
 
-    /// Whose the first submission is whose fence is unsignaled; `None` when every fence is
-    /// signaled or one cannot be read. Inside a section of the exit guard.
+    /// Whose the first submission is whose fence is unsignaled, or whose call has not returned
+    /// (its fence unread: pending); `None` when every fence is signaled or one cannot be read.
+    /// Inside a section of the exit guard.
     fn first_pending(&self) -> Option<By> {
         let log = lock(&self.log);
         for flight in log.iter() {
+            if !flight.made {
+                return Some(flight.by.clone());
+            }
             // SAFETY: the fence is the device's and in the log, so not yet released.
             let status = unsafe {
                 self.functions
@@ -353,11 +429,12 @@ impl Flights {
         status.is_ok()
     }
 
-    /// Every batch in flight fails with `code`, unless it failed already.
-    fn fail_all(&self, code: u64) {
+    /// Every batch in flight takes the device's loss ([`Relayed::lost`]), unless it failed
+    /// already.
+    fn lose_all(&self) {
         for flight in lock(&self.log).iter() {
             if let By::Batch(failed) = &flight.by {
-                failed.fail(code, None);
+                failed.lost();
             }
         }
     }
@@ -379,7 +456,8 @@ impl super::DeviceShared {
 
     /// Submit a batch of a command buffer's to `VkQueue` `queue` with `f`, under the queue's
     /// lock: where its failures are relayed, the submission of `fence` is logged first, its
-    /// failure for `failed` ([`By::Batch`]), and dropped from the log again when `f` fails. A
+    /// failure for `failed` ([`By::Batch`]), made once `f` returns ([`Flights::made`]), and
+    /// dropped from the log again when `f` fails. A
     /// batch that signals the queue's timeline to `value` notes it once submitted (the exit
     /// hook's value, and where freed memory waits for the batches in flight, theirs, under the
     /// gate's read lock: `freed_memory.rs`). The time `f` takes, the driver's, is counted
@@ -400,23 +478,44 @@ impl super::DeviceShared {
             if let Some((fence, flights)) = logged {
                 flights.push(fence, By::Batch(Arc::clone(failed)));
             }
+            #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+            crate::command_buffer::completion::trace::submitting("submit called");
+            let cpu = period.cpu_now();
             let entered = crate::gpu_time::host_nanos();
+            // A device test's failure of the call, which is never made
+            // (`Device::fail_next_submissions`).
+            #[cfg(test)]
+            let f = |vk_queue| {
+                let failing = &self.failing_submissions;
+                match failing.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                {
+                    Ok(_) => Err(match self.failing_result.load(Ordering::Relaxed) {
+                        0 => vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+                        raw => vk::Result::from_raw(raw),
+                    }),
+                    Err(_) => f(vk_queue),
+                }
+            };
             let submitted = f(vk_queue);
             let end = crate::gpu_time::host_nanos();
+            #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+            crate::command_buffer::completion::trace::submitting("submit returned");
             let nanos = end.saturating_sub(entered);
             (self.counts).batch_submitted_in(nanos);
-            if submitted.is_ok() && period.called(Caller::Work, nanos, end) {
+            let took = period.took(nanos, cpu);
+            if submitted.is_ok() && period.called(Caller::Work, took, end) {
                 self.counts.submit_stall_on_work();
             }
-            match (&submitted, logged, value) {
-                (Err(_), Some((fence, flights)), _) => flights.unpush(fence),
-                (Ok(()), _, Some(value)) => {
-                    slot.submitted(value);
-                    if let Some(parking) = parking {
-                        parking.submitted(queue, value);
-                    }
-                }
+            match (&submitted, logged) {
+                (Err(_), Some((fence, flights))) => flights.unpush(fence),
+                (Ok(()), Some((fence, flights))) => flights.made(fence),
                 _ => {}
+            }
+            if let (Ok(()), Some(value)) = (&submitted, value) {
+                slot.submitted(value);
+                if let Some(parking) = parking {
+                    parking.submitted(queue, value);
+                }
             }
             submitted
         });
@@ -429,7 +528,10 @@ impl super::DeviceShared {
     /// `f` with `VkQueue` `queue` under its lock: a use outside a batch, `by`'s. Where the
     /// queue's failures are relayed, a submission of no work after `f`'s, under the same lock,
     /// signals a fence logged as `by`'s, which ends where `f`'s submissions end (the module
-    /// docs); the marks before it whose fences are signaled go back first. Where freed memory
+    /// docs), made once its call returns ([`Flights::made`]); the marks before it whose fences
+    /// are signaled go back first. The mark is counted among the device's submissions
+    /// (`WorkCounts::queue_submissions`), or the submission checks' for theirs
+    /// ([`By::Checks`]). Where freed memory
     /// waits for the work in flight, the program's use takes a value of the queue's timeline of
     /// such marks before `f` runs, which that submission signals too (`freed_memory.rs`); should
     /// the submission fail, the value counts as reached once the queue is idle. Each reach of the
@@ -444,32 +546,97 @@ impl super::DeviceShared {
         uses: Uses,
         f: impl FnOnce(vk::Queue) -> R,
     ) -> R {
-        let slot = &self.queues[queue];
-        let flights = slot.flights.get();
-        let parking = (self.parking.get()).filter(|_| matches!(by, By::Program));
-        if flights.is_none() && parking.is_none() {
-            return match uses {
-                Uses::Unknown => slot.with(f),
-                Uses::OneSignalling => {
-                    let (used, behind) = slot.with_counted(Caller::Work, |vk_queue, period| {
-                        let entered = crate::gpu_time::host_nanos();
-                        let used = f(vk_queue);
-                        let end = crate::gpu_time::host_nanos();
-                        if period.called(Caller::Work, end.saturating_sub(entered), end) {
-                            self.counts.submit_stall_on_work();
-                        }
-                        used
-                    });
-                    if let Some(waited) = behind {
-                        self.counts.submit_behind_idle_stall(waited);
-                    }
-                    used
-                }
-            };
+        self.queue_uses().use_queue(queue, by, uses, f)
+    }
+
+    /// What its uses of a queue outside a batch reach ([`QueueUses`]), borrowed from it.
+    pub(crate) fn queue_uses(&self) -> QueueUses<'_> {
+        QueueUses {
+            queues: &self.queues,
+            parking: self.parking.get().map(|parking| &**parking),
+            counts: &self.counts,
+            fences: &self.fences,
+            functions: &self.functions,
         }
-        let fence = flights.and_then(|flights| {
+    }
+}
+
+/// What a use of a device's `VkQueue` outside a batch reaches ([`QueueUses::use_queue`]): its
+/// queues, its parking, its counts, its fences and its functions. Borrowed from the device
+/// ([`DeviceShared::queue_uses`](super::DeviceShared::queue_uses)), or from the shares of them
+/// the queue-switch check holds, which hold no device (`queue_switch_check.rs`).
+pub(crate) struct QueueUses<'a> {
+    pub(crate) queues: &'a [super::QueueSlot],
+    pub(crate) parking: Option<&'a crate::freed_memory::Parking>,
+    pub(crate) counts: &'a crate::work_counts::Counters,
+    pub(crate) fences: &'a crate::command_buffer::fences::Fences,
+    pub(crate) functions: &'a Functions,
+}
+
+impl<'a> QueueUses<'a> {
+    /// [`DeviceShared::use_queue`](super::DeviceShared::use_queue), over what it reaches.
+    pub(crate) fn use_queue<R>(
+        &self,
+        queue: usize,
+        by: By,
+        uses: Uses,
+        f: impl FnOnce(vk::Queue) -> R,
+    ) -> R {
+        self.use_queue_kept(queue, by, uses, false, f).0
+    }
+
+    /// [`use_queue`](Self::use_queue), its mark, where `keep` asks and one was made, kept for
+    /// the caller until the [`Mark`] drops: a caller that holds the device's loader word through
+    /// its use's completion waits for the mark too (`loader_word.rs`), the use's last submission
+    /// on the queue, whose Metal command buffer MoltenVK names the device for as it completes.
+    pub(crate) fn use_queue_kept<R>(
+        &self,
+        queue: usize,
+        by: By,
+        uses: Uses,
+        keep: bool,
+        f: impl FnOnce(vk::Queue) -> R,
+    ) -> (R, Option<Mark<'a>>) {
+        let fence = self.mark_fence(queue);
+        let mut hold = self.queues[queue].hold();
+        self.use_held(&mut hold, (queue, by), (uses, keep), fence, f)
+    }
+
+    /// [`use_queue_kept`](Self::use_queue_kept) for each use `f` makes through the [`Together`]
+    /// it is given, each `by`'s, with each of `queues` (each once, in index order) under its lock
+    /// from before `f` begins until after it returns: no other use of those queues comes between
+    /// two of `f`'s, nor between its last and what it does after it. The queue-switch check
+    /// submits each round so, its batches waiting for a gate it then signals from the host
+    /// (`queue_switch_check.rs`).
+    pub(crate) fn use_queues_kept<T>(
+        &self,
+        queues: &[usize],
+        by: By,
+        f: impl FnOnce(&mut Together<'_, 'a>) -> T,
+    ) -> T {
+        debug_assert!(
+            queues.windows(2).all(|pair| pair[0] < pair[1]),
+            "the queues are held each once, in index order"
+        );
+        let queue_slots: &'a [super::QueueSlot] = self.queues;
+        let holds = (queues.iter())
+            .map(|&queue| (queue, queue_slots[queue].hold()))
+            .collect();
+        f(&mut Together {
+            uses: self,
+            by,
+            holds,
+        })
+    }
+
+    /// The fence of the relay's mark after a use of `queue`, where its failures are relayed
+    /// (none elsewhere, or once the process is exiting), taken before the use takes the queue's
+    /// lock: the marks before it whose fences are signaled go back first.
+    fn mark_fence(&self, queue: usize) -> Option<vk::Fence> {
+        let flights = self.queues[queue].flights.get();
+        flights.and_then(|flights| {
             exit_guard::enter().and_then(|_busy| {
-                let raw = self.vk();
+                let raw = self.functions.get();
                 let mut done = flights.done_marks();
                 if !done.is_empty() {
                     // SAFETY: each is signaled, its submission completed, and out of the log.
@@ -487,18 +654,58 @@ impl super::DeviceShared {
                 // SAFETY: the device's fences, inside a section.
                 unsafe { self.fences.take(raw) }.ok()
             })
-        });
-        slot.with(|vk_queue| {
+        })
+    }
+
+    /// [`use_queue_kept`](Self::use_queue_kept) of `queue`, `by`'s, under `hold`, the queue's
+    /// lock, `fence` the relay's mark's ([`mark_fence`](Self::mark_fence)).
+    fn use_held<R>(
+        &self,
+        hold: &mut SlotHold<'_>,
+        (queue, by): (usize, By),
+        (uses, keep): (Uses, bool),
+        fence: Option<vk::Fence>,
+        f: impl FnOnce(vk::Queue) -> R,
+    ) -> (R, Option<Mark<'a>>) {
+        let queues: &'a [super::QueueSlot] = self.queues;
+        let slot = &queues[queue];
+        let flights = slot.flights.get();
+        let parking = self.parking.filter(|_| matches!(by, By::Program));
+        let checks = matches!(by, By::Checks);
+        if flights.is_none() && parking.is_none() {
+            let used = match uses {
+                Uses::Unknown => hold.with(f),
+                Uses::OneSignalling => {
+                    let (used, behind) = hold.with_counted(Caller::Work, |vk_queue, period| {
+                        let cpu = period.cpu_now();
+                        let entered = crate::gpu_time::host_nanos();
+                        let used = f(vk_queue);
+                        let end = crate::gpu_time::host_nanos();
+                        let took = period.took(end.saturating_sub(entered), cpu);
+                        if period.called(Caller::Work, took, end) {
+                            self.counts.submit_stall_on_work();
+                        }
+                        used
+                    });
+                    if let Some(waited) = behind {
+                        self.counts.submit_behind_idle_stall(waited);
+                    }
+                    used
+                }
+            };
+            return (used, None);
+        }
+        hold.with(|vk_queue| {
             // Taken before `f` submits: a block that goes meanwhile waits for the mark.
             let mark = parking.and_then(|parking| {
                 let _busy = exit_guard::enter()?;
-                parking.program_use(queue, self.vk())
+                parking.program_use(queue, self.functions.get())
             });
             let used = f(vk_queue);
             let Some(_busy) = exit_guard::enter() else {
-                return used;
+                return (used, None);
             };
-            let raw = self.vk();
+            let raw = self.functions.get();
             let logged = fence.zip(flights);
             if let Some((fence, flights)) = logged {
                 flights.push(fence, by);
@@ -516,7 +723,10 @@ impl super::DeviceShared {
                     true => std::slice::from_ref(&submit),
                     false => &[],
                 };
-                self.counts.queue_submitted(submits.len(), 0);
+                match checks {
+                    true => self.counts.submit_check_called(1),
+                    false => self.counts.queue_submitted(submits.len(), 0),
+                }
                 // SAFETY: a submission of no work, with an unsignaled fence in no pending
                 // submission where it has one, signalling the timeline of marks above every
                 // value signalled there before where it has one; the queue is used under its
@@ -524,6 +734,13 @@ impl super::DeviceShared {
                 let submitted =
                     unsafe { raw.queue_submit(vk_queue, submits, fence.unwrap_or_default()) };
                 exit_guard::called(Call::QueueSubmit);
+                if let (Ok(()), Some((fence, flights))) = (&submitted, logged) {
+                    if keep {
+                        flights.made_kept(fence);
+                        return (used, Some(Mark { flights, fence }));
+                    }
+                    flights.made(fence);
+                }
                 if submitted.is_err() {
                     if let Some((fence, flights)) = logged {
                         flights.unpush(fence);
@@ -541,8 +758,80 @@ impl super::DeviceShared {
                     }
                 }
             }
-            used
+            (used, None)
         })
+    }
+}
+
+/// The queues a use of several holds, each under its lock ([`QueueUses::use_queues_kept`]).
+pub(crate) struct Together<'u, 'a> {
+    uses: &'u QueueUses<'a>,
+    by: By,
+    holds: Vec<(usize, SlotHold<'a>)>,
+}
+
+impl<'a> Together<'_, 'a> {
+    /// [`QueueUses::use_queue_kept`] of `queue`, one of the queues held, under its hold.
+    pub(crate) fn use_queue_kept<R>(
+        &mut self,
+        queue: usize,
+        uses: Uses,
+        keep: bool,
+        f: impl FnOnce(vk::Queue) -> R,
+    ) -> (R, Option<Mark<'a>>) {
+        let fence = self.uses.mark_fence(queue);
+        let (_, hold) = (self.holds.iter_mut())
+            .find(|(held, _)| *held == queue)
+            .expect("a use of a queue the use of several holds");
+        (self.uses).use_held(hold, (queue, self.by.clone()), (uses, keep), fence, f)
+    }
+}
+
+/// The relay's mark after a use of a queue, kept for the use's caller
+/// ([`QueueUses::use_queue_kept`]): while it lives, no other use takes it from the log or resets
+/// its fence, so the caller may wait for it. Let go as it drops, for the next use to take.
+pub(crate) struct Mark<'a> {
+    flights: &'a Flights,
+    fence: vk::Fence,
+}
+
+impl Mark<'_> {
+    /// The mark's fence, for the tests.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn fence(&self) -> vk::Fence {
+        self.fence
+    }
+
+    /// Wait for the mark's submission to complete, a slice of [`WAIT_SLICE`] at a time, each
+    /// inside a section of the exit guard: whether it did (`false` once the process is exiting,
+    /// or where the wait failed).
+    pub(crate) fn wait(&self) -> bool {
+        loop {
+            let Some(_busy) = exit_guard::enter() else {
+                return false;
+            };
+            // SAFETY: the fence is the device's, in the log, its call made and the mark kept, so
+            // no thread resets or releases it.
+            let waited = unsafe {
+                (self.flights.functions.get()).wait_for_fences(
+                    &[self.fence],
+                    true,
+                    WAIT_SLICE.as_nanos() as u64,
+                )
+            };
+            exit_guard::called(Call::WaitForFences);
+            match waited {
+                Ok(()) => return true,
+                Err(vk::Result::TIMEOUT) => continue,
+                Err(_) => return false,
+            }
+        }
+    }
+}
+
+impl Drop for Mark<'_> {
+    fn drop(&mut self) {
+        self.flights.let_go_of_kept(self.fence);
     }
 }
 

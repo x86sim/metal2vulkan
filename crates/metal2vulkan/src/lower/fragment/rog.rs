@@ -1,5 +1,5 @@
-//! Raster order groups: a fragment function that names a raster order group on any parameter,
-//! output it reads, or argument-buffer member runs its whole body inside a fragment-interlock
+//! Raster order groups: a fragment function that names a raster order group on any parameter it
+//! uses, output it reads, or argument-buffer member runs its whole body inside a fragment-interlock
 //! critical section.
 //!
 //! Metal orders a raster order group's accesses between fragments that cover the same pixel (the
@@ -27,6 +27,21 @@
 //! output alone does not interlock the function, so a function whose groups hold nothing else
 //! compiles on every device, the ones without an interlock included.
 //!
+//! **Color inputs without an ordered fetch form**. On a device with neither rasterization-order
+//! color attachment access nor the pixel interlock (`fetch::fetch_unordered`), a color input reads
+//! its input attachment ordered between draws alone, by the consumer's barriers. A group on such
+//! an input, or on a color output of an attachment the function reads, asks for the order of that
+//! read, which is the read's own there: it does not interlock the function, and the read's
+//! fragments of one draw stay unordered (`PrecisionNote::UnorderedFetchWithinDraw`, which the read
+//! records). A group on anything else still needs the interlock.
+//!
+//! **Unused inputs**. A group on a parameter the body never uses, such as an input whose reads the
+//! function's constants fold away, orders no access, and neither does a member of a layout only
+//! such a parameter reaches, nor a color output whose attachment only such a color input reads. None
+//! of them interlocks the function: plain Metal makes and draws such a function where the read is
+//! dead as where it is live (`metal2vulkan-conformance/probes/dead_ordered_and_unattached_reads.m`,
+//! an M3 Max under macOS 27.0.1).
+//!
 //! **Mode** ([`mode`]). `PixelInterlockOrderedEXT` where the profile has
 //! `fragmentShaderPixelInterlock`: it orders every invocation covering the pixel, which covers
 //! Metal's pixel- and sample-rate ordering. `SampleInterlockOrderedEXT` orders only invocations
@@ -39,7 +54,6 @@
 use std::collections::BTreeSet;
 
 use crate::air::abi::{MemberKind, OutputRole, ParamRole, StructRef};
-use crate::air::Entry;
 use crate::device::requirements::VkFeature;
 use crate::error::{Capability, Error, Feature, Unsupported};
 use crate::lower::select::SelectCx;
@@ -73,39 +87,48 @@ fn role_layouts(role: &ParamRole) -> [Option<StructRef>; 2] {
     }
 }
 
-/// Whether entry `e` names a raster order group that needs the interlock: on a parameter, a
-/// color output whose attachment the function reads (a color input of the same attachment), or
-/// an argument-buffer or imageblock member of a layout its parameters and outputs reach.
-/// `e.structs` holds every layout of the module, so a layout only another function names does not
-/// count. A group's color output the function does not read needs none ([module docs](self)).
-pub(super) fn declared(e: &Entry) -> bool {
-    let params = e.ep.params.iter().any(|b| role_group(&b.role).is_some());
+/// Whether the function names a raster order group that needs the interlock: on a parameter its
+/// body uses, a color output whose attachment the function reads (a used color input of the same
+/// attachment), or an argument-buffer or imageblock member of a layout its used parameters and its
+/// outputs reach. `e.structs` holds every layout of the module, so a layout only another function
+/// names does not count. A group's color output the function does not read needs none, and neither
+/// does a group on a parameter the body never uses, nor, on a device with neither ordered fetch
+/// form, a group on a color input or on a color output of an attachment the function reads
+/// ([module docs](self)).
+pub(super) fn declared(cx: &SelectCx<'_>) -> bool {
+    let e = cx.entry;
+    let used = &crate::lower::users::params_used(cx.body);
+    let params = || e.ep.params.iter().filter(move |b| used.contains(&b.param));
     let read = |attachment| {
-        e.ep.params
-            .iter()
+        params()
             .any(|b| matches!(b.role, ParamRole::ColorInput { index, .. } if index == attachment))
     };
-    let outputs = e.ep.outputs.iter().any(|o| match o.role {
-        OutputRole::RenderTarget {
-            attachment,
-            raster_order_group: Some(_),
-            ..
-        } => read(attachment),
-        _ => false,
+    // Whether a group on a color read interlocks: not where the read is ordered between draws
+    // alone.
+    let colors = !super::fetch::fetch_unordered(cx.profile);
+    let named = params().any(|b| {
+        role_group(&b.role).is_some() && (colors || !matches!(b.role, ParamRole::ColorInput { .. }))
     });
-    if params || outputs {
+    let outputs = colors
+        && e.ep.outputs.iter().any(|o| match o.role {
+            OutputRole::RenderTarget {
+                attachment,
+                raster_order_group: Some(_),
+                ..
+            } => read(attachment),
+            _ => false,
+        });
+    if named || outputs {
         return true;
     }
-    let mut stack: Vec<StructRef> =
-        e.ep.params
-            .iter()
-            .flat_map(|b| role_layouts(&b.role))
-            .chain(e.ep.outputs.iter().flat_map(|o| match o.role {
-                OutputRole::ImageblockData(ib) => [ib.layout, ib.master],
-                _ => [None, None],
-            }))
-            .flatten()
-            .collect();
+    let mut stack: Vec<StructRef> = params()
+        .flat_map(|b| role_layouts(&b.role))
+        .chain(e.ep.outputs.iter().flat_map(|o| match o.role {
+            OutputRole::ImageblockData(ib) => [ib.layout, ib.master],
+            _ => [None, None],
+        }))
+        .flatten()
+        .collect();
     let mut seen = BTreeSet::new();
     while let Some(r) = stack.pop() {
         if !seen.insert(r) {

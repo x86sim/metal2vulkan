@@ -27,10 +27,12 @@
 //!   stores a `float` NaN as `0x7e00` and a `half` NaN's own bits. A `float` output's NaN is
 //!   Metal's where the profile takes `DriverDeviation::MetalColorWrites`, and a lane's the function
 //!   rounds to nearest even (its NaN `0x7fc00000`) where it takes `MetalFloatColorNans`; a `half`
-//!   output's (held widened, its payload in the significand's top bits) where it takes
-//!   `MetalHalfColorNans`; elsewhere the module records the note (`runtime_lane::color_writes`:
-//!   ANV and RADV store `0xfe00`, lavapipe quiets or canonicalizes a `half` NaN, MoltenVK
-//!   canonicalizes it).
+//!   output's on no device: it reaches the attachment held widened by the device's conversion,
+//!   whose NaN is the device's (`runtime_lane::color_writes`: NVIDIA's stores `0x7fff`, ANV and
+//!   RADV store `0xfe00`, lavapipe quiets or canonicalizes a `half` NaN, MoltenVK canonicalizes
+//!   it); elsewhere the module records the note. An output every return of which holds a constant
+//!   none of whose lanes is a NaN (`stage_io::returns_no_nan`) stores none, and records no note for
+//!   one.
 //!
 //! On a profile that stores Metal's codes itself (`VkProperty::MetalColorWrites`) the map holds
 //! only half-float channels (`pipeline::color_writes`): only the NaN note is recorded, and the
@@ -71,8 +73,9 @@ use std::collections::BTreeSet;
 
 /// Plan the write of a fragment function's output of form `f` to color attachment `color`
 /// (dual-source index 0), through an output variable or in the storage form (see the module
-/// docs).
-pub(crate) fn plan(cx: &mut SelectCx<'_>, color: u32, f: Form) {
+/// docs). `nan_free`: every value the function returns there is a constant none of whose lanes is
+/// a NaN, which stores no NaN.
+pub(crate) fn plan(cx: &mut SelectCx<'_>, color: u32, f: Form, nan_free: bool) {
     if cx.stage != Stage::Fragment {
         return;
     }
@@ -106,7 +109,10 @@ pub(crate) fn plan(cx: &mut SelectCx<'_>, color: u32, f: Form) {
     let mut relied = BTreeSet::new();
     for (slot, rule) in lanes.iter_mut().zip(rules).take(usize::from(f.lanes)) {
         let Some(rule) = rule else { continue };
-        nans |= !shader_blended && color_writes::half_float(rule) && !nan_kept(cx, rule, f);
+        nans |= !shader_blended
+            && !nan_free
+            && color_writes::half_float(rule)
+            && !nan_kept(cx, rule, f);
         if sixteen_blended && f.float_fmt() == Some(FloatFmt::F32) {
             match cx
                 .profile
@@ -142,7 +148,7 @@ pub(crate) fn plan(cx: &mut SelectCx<'_>, color: u32, f: Form) {
             (ChannelWrite::Device, _) => device |= !shader_blended,
             (rule, Some(fmt)) => match conversion(cx, rule, fmt, storage, &mut relied) {
                 Conversion::Metal => {}
-                Conversion::MetalButNan => nans |= !shader_blended,
+                Conversion::MetalButNan => nans |= !shader_blended && !nan_free,
                 Conversion::Device => device |= !shader_blended,
             },
         }
@@ -224,7 +230,8 @@ fn conversion(
 /// `DriverDeviation::MetalColorWrites`, or where the function rounds the lane
 /// (`color_writes::HALF_NEAREST`), whose NaN `0x7fc00000` it then stores as Metal's `0x7e00`
 /// under `MetalFloatColorNans` (the output's own NaN, unrounded, it is not measured to); a `half`
-/// output's where it takes `MetalHalfColorNans`. Another output stores no NaN of its own there.
+/// output's on no device, whose widening's NaN is the device's. Another output stores no NaN of
+/// its own there.
 fn nan_kept(cx: &SelectCx<'_>, rule: ChannelWrite, f: Form) -> bool {
     let takes = |d| cx.profile.takes_driver_deviation(d);
     match f.float_fmt() {
@@ -233,7 +240,7 @@ fn nan_kept(cx: &SelectCx<'_>, rule: ChannelWrite, f: Form) -> bool {
                 || (rule == color_writes::HALF_NEAREST
                     && takes(DriverDeviation::MetalFloatColorNans))
         }
-        Some(FloatFmt::Half) => takes(DriverDeviation::MetalHalfColorNans),
+        Some(FloatFmt::Half) => false,
         _ => true,
     }
 }

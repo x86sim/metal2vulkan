@@ -1,6 +1,7 @@
 //! Buffers over the caller's host memory without a copy (`newBufferWithBytesNoCopy:`), through
-//! `VK_EXT_external_memory_host`, or, where the device refuses the pointer, dma-buf memory of the
-//! pages the caller imports (`VK_EXT_external_memory_dma_buf`, [`DmaBufSource`], `dma_buf.rs`).
+//! `VK_EXT_external_memory_host`, or, where the device refuses the pointer or imports none,
+//! dma-buf memory of the pages the caller imports (`VK_EXT_external_memory_dma_buf`,
+//! [`DmaBufSource`], `dma_buf.rs`).
 //!
 //! - **What Metal takes** (measured on an Apple M3 Max and an M4, plain and under API validation):
 //!   any pointer and any length but 0; the buffer covers the whole host pages its range touches
@@ -16,16 +17,17 @@
 //!   the buffer reads them past its length, the caller's bytes, as plain Metal reads them
 //!   (`Buffer::copy_reach`). The import is never a dedicated allocation in Vulkan's sense
 //!   (`VkMemoryDedicatedAllocateInfo`), which host memory cannot be.
-//! - **What it refuses**, typed: a device without the extension (`Unsupported` naming it), and
-//!   what this device cannot import exactly (`Unsupported`, `not_representable`): an import
+//! - **What it refuses**, typed: every memory on a device that imports neither pointers nor
+//!   dma-bufs (`Unsupported` naming the extension), and what this device cannot import exactly
+//!   (`Unsupported`, `not_representable`): an import
 //!   alignment above the host page whose rounding would take pages the range does not touch, an
 //!   offset in the pages that misses the buffer's memory alignment, no memory type both allow, or
 //!   a driver that refuses the pointer.
-//! - **Pages the process cannot write** are refused typed on Linux, before the buffer's own import,
-//!   unless the caller gave a dma-buf source the device can use: then they are imported from it
-//!   alone, never by their pointer, and the device announces `read-only-pages-written`, as the
-//!   GPU's writes reach them where Metal's leave the CPU's view of them as it was
-//!   ([`refuse_unwritable`] asks the kernel for the process's own mappings over the window, with
+//! - **Pages the process cannot write** are never imported on Linux: the buffer is a copy of them
+//!   whose GPU writes are dropped (`copied.rs`, announced as `copied-host-pages`,
+//!   `WorkCounts::copied_unwritable_pages`), on every device, its dma-buf source never called, as
+//!   a dma-buf of them would take the GPU's writes where Metal's leave the CPU's view of them as it
+//!   was ([`refuse_unwritable`] asks the kernel for the process's own mappings over the window, with
 //!   `PROCMAP_QUERY` on `/proc/self/maps`, a file kept open for them (`kept_maps`), or reads
 //!   that file's lines where the kernel predates the query, Linux 6.11;
 //!   `WorkCounts::host_mappings_queried`). A buffer that lies in a live
@@ -34,29 +36,35 @@
 //!   writable. Nor does one over pages whose write permission the caller vouched for
 //!   ([`HostMemory::assume_writable`]). Linux drivers pin user pages for writing: NVIDIA failed
 //!   a read-only page as out of device memory, RADV refused it, and ANV imported it and lost the
-//!   device at the GPU's first read. lavapipe read one, so there the rule refuses a little more
-//!   than the driver would. On macOS, MoltenVK hands the range to Metal, which reads read-only
-//!   pages, so there is no check.
+//!   device at the GPU's first read. lavapipe read one, so there the rule copies a little more
+//!   than the driver would need. On macOS, MoltenVK hands the range to Metal, which reads
+//!   read-only pages, so there is no check.
 //! - **What drivers answered**. Private anonymous memory was imported on every venue measured. RADV
 //!   refused shared memory typed: anonymous shared memory, and any mapping of a file, a shared
 //!   memory object or a `memfd` among them (QEMU's `memory-backend-memfd,share=on` guest RAM). It
 //!   imports a host pointer through amdgpu's userptr, which the kernel takes only over anonymous
 //!   pages. Mesa 26.2.4 answers `VK_ERROR_INVALID_EXTERNAL_HANDLE`, 26.0.8 `VK_ERROR_UNKNOWN`, and
 //!   both are refusals ([`import_refused`]). NVIDIA and lavapipe imported the same shared memory.
-//! - **Dma-bufs of the pages** ([`HostMemory::with_dma_buf`]), the last resort before that
-//!   refusal: where the device refuses the pointer ([`refused`]: the import window, the buffer's
+//! - **Dma-bufs of the pages** ([`HostMemory::with_dma_buf`]), the last import before a copy
+//!   or a refusal: where the device refuses the pointer ([`refused`]: the import window, the buffer's
 //!   binding in it, the memory types, the driver, or the runtime for a driver that breaks on
 //!   pages the kernel cannot pin, [`unpinnable`]) and imports dma-bufs, the buffer is bound in
 //!   imports of the source's dma-bufs of the pages instead (`dma_buf.rs`). Every import the device
-//!   takes by its pointer is made exactly as before, with no call more.
+//!   takes by its pointer is made exactly as before, with no call more. A device that enables no
+//!   `VK_EXT_external_memory_host` (a driver that lists none, or a device made withholding it,
+//!   `DeviceOptions::withheld_extensions`) but imports dma-bufs takes this route alone: no pointer
+//!   is asked of it ([`Importer::pointers`]), and the pages are rounded out to the host page. A
+//!   no-copy buffer or heap over memory that comes with no source it can use, or whose source
+//!   fails, is a copy of the pages (`copied.rs`, announced as `copied-host-pages`, counted as
+//!   the device's refusal, `WorkCounts::copied_host_buffers_device_refused`), as where a device
+//!   refuses the pointer; a rebind to such memory is refused, as is a guest RAM with no source
+//!   (`Device::use_host_ram`), naming the extension ([`Importer::pointer_import`]).
 //! - **When**. The pages are imported when the buffer is made, on every platform, as Metal wires
-//!   them then: the GPU uses the pages mapped at the pointer when the buffer was made, whatever is
-//!   mapped there later, but on a driver whose pointer imports follow their address
-//!   (`DriverFact::PointerImportsFollowTheirAddress`: ANV on i915, RADV, lavapipe), the import of
-//!   the pointer reads the pages mapped there at each submission (a remap under a live buffer,
-//!   which [`HostMemory::new`] forbids, reaches it there; `docs/FAST-PATHS.md`, known gaps). Memory
-//!   the device cannot import is refused by the call that makes the buffer, as Metal answers nil
-//!   there. The import costs work per page there: on macOS MoltenVK's
+//!   them then: the GPU uses the pages mapped at the pointer when the buffer was made, which
+//!   [`HostMemory::new`]'s contract keeps there while the buffer lives. What a buffer reads after
+//!   a remap under it, which that contract forbids, is unspecified (`docs/FAST-PATHS.md`, known
+//!   gaps). Memory the device cannot import is refused by the call that makes the buffer, as
+//!   Metal answers nil there. The import costs work per page there: on macOS MoltenVK's
 //!   `newBufferWithBytesNoCopy:` and its residency set's commit, about 11 to 20 ms per GiB (an M4,
 //!   an M3 Max); Metal makes the buffer at once and pays at the first command using it (24 to 88 ms
 //!   per GiB). The runtime once deferred the macOS import to the buffer's first GPU use, which
@@ -77,7 +85,12 @@
 //!   runs on one of the device's handler threads, in the command buffer's queue's context, after
 //!   the GPU's last use, as Metal's runs on one of its threads: what its commands retained and its
 //!   encoders' logs (`replay.rs`) go in its release, and no thread that submits command buffers
-//!   or sees them complete holds a handle past it (`exit_guard::program_release`). One released
+//!   or sees them complete holds a handle past it (`exit_guard::program_release`). Where that
+//!   release lets go of the import last and the deallocator waits for its free (no keep-alive),
+//!   the free goes to the device's free thread and the deallocator runs there after it
+//!   (`free_thread.rs`, **What is posted**), possibly after the command buffer's waiters
+//!   returned: Metal ties the deallocator to the buffer's deallocation, not to a wait for the
+//!   command buffer. One released
 //!   while only command buffers not yet submitted reach it unnamed goes at once, as Metal's does
 //!   (it runs in the release, on the releasing thread, while such a command buffer waits
 //!   committed: probe `dealloc-probe3`, the M3 Max under macOS 27.0.1): on the releasing thread,
@@ -87,7 +100,11 @@
 //! - **A keep-alive** ([`KeepAlive`]). The import can outlive the buffer: a texture over the buffer
 //!   that a command buffer submitted before its release may still read through its resource ID
 //!   keeps its image, and the image the import, until that command buffer completes
-//!   (`heap_sets.rs`). Vulkan requires imported pages to stay mapped while the import lives, so
+//!   (`heap_sets.rs`); and a buffer made over part of its bytes, or over the same bytes as memory
+//!   of another class, while it lived is bound inside its import, holding it, until that buffer
+//!   goes (`host_aliases.rs`, "One page, one import": one live import of a page, as
+//!   `VK_EXT_external_memory_host` leaves a page imported twice undefined;
+//!   `WorkCounts::host_releases_held_inside`). Vulkan requires imported pages to stay mapped while the import lives, so
 //!   with no keep-alive the deallocator waits for the import's free, announced
 //!   (`host-deallocator-delayed`). With a keep-alive, which the caller's mapping lives in, the
 //!   deallocator runs at the release, as Metal's does, and the keep-alive is dropped once the
@@ -107,7 +124,7 @@ use super::dirty_pages::{hook, DirtyHook, DirtyPages, DirtySource};
 use super::dma_buf::DmaBufSource;
 use super::error::{vulkan, Error};
 use super::exit_guard;
-use super::loader_word::LoaderWord;
+use super::loader_word::DeviceWord;
 use super::program_objects::ProgramObject;
 use super::work_counts::Counters;
 use ash::vk;
@@ -135,6 +152,9 @@ pub struct HostMemory {
     gate: Option<ImportGate>,
     /// The caller's resolver of the pages' runs in its guest RAM ([`HostMemory::with_runs`]).
     runs: Option<RunResolver>,
+    /// The pages are imported as dma-bufs of the source's, never by their pointer
+    /// ([`HostMemory::dma_buf_only`]): the device's check's pages of that class.
+    dma_buf_only: bool,
 }
 
 /// A consumer's resolver of a no-copy object's pages to the runs of guest RAM they are views of
@@ -147,7 +167,10 @@ pub struct HostMemory {
 /// other paths. Asked at most once per object, as a no-copy buffer or heap is made over the
 /// pages, and once at each rebind of either to new pages (but for bytes moved in their page under
 /// a texture, which take a copy without asking), on the calling thread, holding no lock of the
-/// runtime's, before the import gate ([`ImportGate`]);
+/// runtime's, before the import gate ([`ImportGate`]); and once again for a buffer at each
+/// recovery of its device, which makes it again over the same pages on the new `VkDevice`
+/// (`Degradation::DeviceRecovered`), on the thread that recovers, before the new device serves,
+/// so it makes no call on the device;
 /// only on a device that uses a RAM
 /// ([`Device::use_host_ram`](crate::Device::use_host_ram)), and only where the object would import
 /// the pages itself (not one that lies in a live import of the same bytes, nor one whose GPU
@@ -168,14 +191,17 @@ pub type RunResolver = Arc<dyn Fn(u64, u64) -> Option<Vec<Range<u64>>> + Send + 
 /// runtime asks the kernel whether the process may write the pages (Linux): pages it refuses are a
 /// copy whatever their permission, and a copy of pages the process maps read-only drops the GPU's
 /// writes, as Metal drops them. Called on the
-/// thread that makes the buffer, heap or rebind, holding no lock of the runtime's. Not asked for a
-/// buffer or rebind that lies in a live import (one made over the same bytes), nor where the device
-/// refused the import before it (no host-pointer import, an import alignment the range cannot
-/// meet), nor for memory whose GPU writes Metal's private option bit 24 drops, nor for a buffer's
-/// rebind to bytes at another offset in their page under a texture planned at the old one, which
-/// is a copy without asking. A heap's rebind asks it as a heap's making does. An import it lets go
-/// on that then fails (out of memory, another Vulkan error), of the pointer or of the dma-bufs of
-/// the caller's source, makes the copy all the same. Every copy is announced
+/// thread that makes the buffer, heap or rebind, holding no lock of the runtime's; asked again for
+/// a buffer at each recovery of its device, which makes it again over the same pages on the new
+/// `VkDevice` (`Degradation::DeviceRecovered`), on the thread that recovers, before the new device
+/// serves, so it makes no call on the device. Not asked for a
+/// buffer or rebind that lies in a live import or copy (one made over the same bytes), nor where
+/// the device refused the import before it (no host-pointer import, an import alignment the range
+/// cannot meet), nor for memory whose GPU writes Metal's private option bit 24 drops, nor for a
+/// buffer's rebind to bytes at another offset in their page under a texture planned at the old
+/// one, which is a copy without asking. A heap's rebind asks it as a heap's making does. An
+/// import it lets go on that then fails (out of memory, another Vulkan error), of the pointer or
+/// of the dma-bufs of the caller's source, makes the copy all the same. Every copy is announced
 /// (`copied-host-pages`). No Metal counterpart.
 pub type ImportGate = Arc<dyn Fn(ImportRequest) -> bool + Send + Sync + 'static>;
 
@@ -222,6 +248,7 @@ impl std::fmt::Debug for HostMemory {
             .field("dirty_pages", &self.dirty.is_some())
             .field("import_gate", &self.gate.is_some())
             .field("runs", &self.runs.is_some())
+            .field("dma_buf_only", &self.dma_buf_only)
             .finish()
     }
 }
@@ -237,26 +264,40 @@ impl HostMemory {
     /// - stay mapped, at this address and with the same backing: with a keep-alive
     ///   ([`KeepAlive`]), until it is dropped; else until the buffer's deallocator runs; with
     ///   neither, until the buffer's last reference is dropped (a command buffer that uses the
-    ///   buffer holds a reference until it completed) and every command buffer submitted before
-    ///   a texture over the buffer was released completed;
+    ///   buffer holds a reference until its completed handlers ran, after its status reads
+    ///   `Completed` and before its `wait_until_completed` returns) and every command buffer
+    ///   submitted before a texture over the buffer was released completed;
     /// - are not freed, unmapped or remapped by anyone meanwhile.
+    ///
+    /// This is `VK_EXT_external_memory_host`'s rule: "the application must ensure that the
+    /// imported memory range remains valid and accessible for the lifetime of the imported memory
+    /// object" (`VkImportMemoryHostPointerInfoEXT`). Each of those moments comes only once every
+    /// `vkFreeMemory` of the buffer's import of the pages has returned, whichever thread made it:
+    /// the releasing thread, a queue's thread once the last command buffer holding the buffer
+    /// completed, or the device's thread that releases idle imports. The one exception is a buffer
+    /// that lies in the import of another live buffer made over the same bytes: its moment comes
+    /// at its release, and the other buffer's contract keeps the pages mapped. So the buffers go
+    /// first and the pages after; unmapping them first and releasing the buffer after, even at
+    /// once on another thread, unmaps them under a live import (docs/HOWTO.md, "Unmapping host
+    /// memory").
     ///
     /// Reading or writing them through the pointer while the GPU writes them is a data race, as
     /// Metal's `contents` is.
     ///
-    /// On Linux a buffer over a page this process maps without write permission is refused
-    /// (`Unsupported`, `HostMemory`), though Metal reads such pages: Linux drivers pin imported
-    /// pages for writing, and one (ANV) imported a read-only page and then lost the device at the
-    /// GPU's first read. So on Linux the pages also stay writable while they are imported: RADV
-    /// failed every command buffer submitted after a page of an import was made read-only
-    /// (`mprotect`). With a dma-buf source ([`HostMemory::with_dma_buf`]) pages the process maps
-    /// read-only are instead imported from the source alone, announced
-    /// (`read-only-pages-written`). Under a gate that refuses their import
-    /// ([`HostMemory::with_import_gate`]), or where the source's import fails, they are a copy
-    /// whose GPU writes are dropped, as Metal drops them (`copied-host-pages`). Some drivers also
+    /// On Linux a buffer over a page this process maps without write permission is a copy of the
+    /// pages whose GPU writes are dropped, as Metal drops them (`copied-host-pages`), with or
+    /// without a dma-buf source ([`HostMemory::with_dma_buf`]), which is never called for them:
+    /// Linux drivers pin imported pages for writing (one, ANV, imported a read-only page and then
+    /// lost the device at the GPU's first read), and a dma-buf of them would take the GPU's
+    /// writes. So on Linux the pages also stay writable while they are imported: RADV failed every
+    /// command buffer submitted after a page of an import was made read-only (`mprotect`). The
+    /// caller's gate ([`HostMemory::with_import_gate`]) is asked first where the pointer would be
+    /// imported. Some drivers also
     /// refuse shared memory (RADV refused anonymous shared memory and mappings of shared memory
     /// objects, `memfd` mappings among them); private memory imports everywhere measured.
-    /// [`HostMemory::with_dma_buf`] imports such memory where the device imports dma-bufs.
+    /// [`HostMemory::with_dma_buf`] imports such memory where the device imports dma-bufs; a
+    /// no-copy buffer or heap over it made without one is a copy of the pages, announced
+    /// (`copied-host-pages`), and a rebind to it is refused.
     pub unsafe fn new(pointer: NonNull<u8>) -> HostMemory {
         HostMemory {
             pointer,
@@ -265,6 +306,7 @@ impl HostMemory {
             dirty: None,
             gate: None,
             runs: None,
+            dma_buf_only: false,
         }
     }
 
@@ -276,23 +318,50 @@ impl HostMemory {
     /// A texture over such pages (over the buffer, placed in the heap, or a view of one) is an
     /// image over a dma-buf of its own pages where the device lists
     /// `VK_EXT_image_drm_format_modifier` and `VK_EXT_queue_family_foreign`, else a shadow of the
-    /// bytes (announced `shadowed-texture`). Refused as [`HostMemory::new`]'s memory is
-    /// (`Unsupported`, `HostMemory`) where the device imports no chunk or the source fails; chunks
-    /// that break the source's contract are misuse (`Invalid`, `Problem::DmaBuf`). Measured: RADV
+    /// bytes (announced `shadowed-texture`). Where the device imports no chunk or the source
+    /// fails, the pointer's refusal stands: a no-copy buffer or heap is a copy of the pages, as
+    /// [`HostMemory::new`]'s memory is where the device refuses its pointer (`copied-host-pages`,
+    /// `WorkCounts::copied_host_buffers_device_refused`), and a rebind is refused (`Unsupported`,
+    /// `HostMemory`); chunks that break the source's contract are misuse (`Invalid`,
+    /// `Problem::DmaBuf`). Measured: RADV
     /// refuses the pointer of `memfd` and other shared mappings and imports `udmabuf`s of their
-    /// pages; NVIDIA and lavapipe import the pointer and never call the source.
+    /// pages; NVIDIA and lavapipe import the pointer and never call the source. ANV (Mesa 26.2.6 on
+    /// i915) imports the pointer of a `memfd`'s mapping and refuses that of a dma-buf's mapping
+    /// (`VK_ERROR_INVALID_EXTERNAL_HANDLE`), and imports a dma-buf for a plain buffer but reports
+    /// none for a sparse one, so it takes the pages only as one chunk: the source is asked for one
+    /// (a `granule` of the request's `length`), and pages that one dma-buf cannot hold (more runs
+    /// than one `udmabuf` takes) are refused.
+    ///
+    /// The chunks may be pieces of files the source shares among the buffers and heaps it answers
+    /// (`DmaBufChunk`: the same `Arc`, an offset in the file that is a multiple of the request's
+    /// `alignment`): the device imports each such file once, whole, and binds each buffer at its
+    /// piece's offset there, so RADV, which lists every import in every kernel submission, lists
+    /// one per file (`WorkCounts::dma_buf_pieces_joined`, `dma_buf_shared_imports_live`). The
+    /// file's import lives while any buffer or heap bound in it does (and the command buffers that
+    /// hold them), and goes with the last; a buffer's deallocator and keep-alive wait for its own
+    /// binding's end, not for the file's import, which no command reaches the buffer's bytes
+    /// through once it went. A shared file's import is never dedicated to a buffer: where the
+    /// driver takes the file only dedicated (NVIDIA's 615.71.09 refuses small dma-bufs otherwise),
+    /// the buffer is a copy of the pages as for a refused chunk, and the source is not asked
+    /// again; answer such a device's requests with dma-bufs of their own. A request whose
+    /// `shared_files` is `false` (a texture's image) takes one dma-buf of its own at offset 0.
     ///
     /// A no-copy buffer's own import of the chunks (not a heap's or a rebind's) may be released
-    /// while idle, because RADV lists every import in every submission. The release frees its
+    /// while idle, or past the 64 the device keeps resident, because RADV lists every import in
+    /// every submission. The release frees its
     /// `VkBuffer` and memory and keeps the chunks open: the runtime keeps a duplicate descriptor of
-    /// each, within a quarter of the process's `RLIMIT_NOFILE` soft limit. The next blit imports
-    /// them again, on the thread that encodes it, which costs time then. A buffer whose
+    /// each dma-buf of its own, within a quarter of the process's `RLIMIT_NOFILE` soft limit, and
+    /// the `Arc` of each shared file, which opens none (the file's import goes once every buffer
+    /// bound in it went or was released). The next blit imports them again (or joins the file's
+    /// live import), on the thread that encodes it, which costs time then. A buffer whose
     /// descriptors pass that quarter (read once, at the process's first such import) stays
     /// imported, in every kernel submission's list (`WorkCounts::host_imports_kept_for_fds` counts
     /// them). The runtime never changes the limit: a program that makes many no-copy buffers at
     /// once raises its soft limit toward the hard one at startup (`setrlimit`), as QEMU does. Only
     /// a buffer that blits alone have read is released. One whose `gpu_address` or `VkBuffer` was
-    /// handed out, or with a texture over its bytes, stays imported. Nothing of Metal's observes
+    /// handed out, or with a texture over its bytes that reads its memory (a shadow), stays
+    /// imported; a texture in place over its bytes, an image over a dma-buf of its own pages from
+    /// `source`, leaves it releasable. Nothing of Metal's observes
     /// the release: the bytes, the address and the pages stay, the CPU's writes made meanwhile are
     /// read, and the source is not called again. A blit that finds the device unable to import the
     /// chunks again (out of memory) is refused.
@@ -313,6 +382,7 @@ impl HostMemory {
             dirty: None,
             gate: None,
             runs: None,
+            dma_buf_only: false,
         }
     }
 
@@ -354,17 +424,19 @@ impl HostMemory {
     /// latest stamp asked of the log so far, so one wait serves every command buffer committed
     /// before it; none where the copy has no earlier copy to count on). A command buffer that
     /// waits for an event or a semaphore, or wrote the bytes before the copy, copies every row.
-    /// The runtime reports its own writes into the pages back to the log: a shadow's copy back
-    /// or merge ([`DirtyPages::wrote_as`], the shadow its writer, at the commit and again at the
-    /// completion), which that shadow's own copies in leave out
+    /// The runtime reports its own writes into the pages back to the log, each write in one call
+    /// to each log carrying all its runs there: a shadow's copy back or merge
+    /// ([`DirtyPages::wrote_runs_as`], the shadow its writer, to every log of the pages, at the
+    /// commit and again once it ran), which that shadow's own copies in leave out
     /// ([`DirtyPages::changed_except`]), a copied host buffer's merge back of the GPU's writes
-    /// (`copied.rs`; [`DirtyPages::wrote_as`], the copy its writer, before the batch is seen
-    /// complete), the GPU's writes into them where they are imported in place
-    /// ([`DirtyPages::wrote`]: the bytes a command buffer's commands wrote through the buffers,
-    /// heaps and textures over them, at the commit, again before the batch is seen complete, and
-    /// at the completion), and its CPU writes into them ([`DirtyPages::wrote`]): a
-    /// `replaceRegion` of a texture over them or of a heap's texture held in them, an argument
-    /// encoder's writes, and `copyParameterDataToBuffer`. A wait the log answers `false` makes
+    /// (`copied.rs`; [`DirtyPages::wrote_runs_as`], the copy its writer, before the batch is
+    /// seen complete), the GPU's writes into them where they are imported in place
+    /// ([`DirtyPages::wrote_runs`]: the bytes a command buffer's commands wrote through the
+    /// buffers, heaps and textures over them, at the commit and again once they ran, before the
+    /// command buffer's last batch, or a batch that signals an event, is seen complete), and its
+    /// CPU writes into them ([`DirtyPages::wrote_runs`]): a `replaceRegion` of a texture over
+    /// them or of a heap's texture held in them, an argument encoder's writes, and
+    /// `copyParameterDataToBuffer`. A wait the log answers `false` makes
     /// the copy take every row, and is not made again for a stamp at or below it. Such a shadow's
     /// copy in is never cut to the rectangle a pass's scissors bound, so its image holds every
     /// texel for the next command buffer. A copied host buffer or heap over the pages
@@ -416,13 +488,35 @@ impl HostMemory {
     /// `VkBuffer` bound in that chunk's import, at the run, sized and bound against the object's
     /// own pages as an import of them would be, so no access through the buffer reaches the rest
     /// of the chunk: no import of its own, no kernel mapping of the pages, and the import gate
-    /// ([`HostMemory::with_import_gate`]) is not asked. Pages of more than one run, or of a run
-    /// crossing a chunk's end, take the runtime's other paths (the gate, then an import or a
-    /// copy), the runs kept with the object. Counted: `WorkCounts::chunk_bound_buffers_made`. No
-    /// Metal counterpart.
+    /// ([`HostMemory::with_import_gate`]) is not asked. Where the chunk is not imported yet, the
+    /// object imports it, or waits for its import under way; but where each import the device
+    /// holds costs every submission and the RAM's chunks are its dma-bufs (RADV), it takes the
+    /// runtime's other paths, as over memory no RAM holds, and the chunk is imported only for
+    /// the copies over it ([`Device::use_host_ram`](crate::Device::use_host_ram)). Pages of more
+    /// than one run, or of a run crossing a chunk's end, take the runtime's other paths (the gate,
+    /// then an import or a copy), the runs kept with the object. A `Managed` no-copy buffer over
+    /// such pages on a device without unified memory, whose host copy is its pages alone (an import
+    /// of their own would map pages a chunk's import holds), copies them in by the GPU from the
+    /// chunks' imports where those hold them all, the CPU staging nothing. Counted:
+    /// `WorkCounts::chunk_bound_buffers_made`, `WorkCounts::managed_pages_in_ram_chunks`. No Metal
+    /// counterpart.
     pub fn with_runs(self, resolver: RunResolver) -> HostMemory {
         HostMemory {
             runs: Some(resolver),
+            ..self
+        }
+    }
+
+    /// This memory, imported only as the source's dma-bufs (`HostMemory::with_dma_buf`), never
+    /// by its pointer, even where the device would import the pointer: for the device's check of
+    /// images over pages imported as dma-bufs (`in_place_check.rs`), whose verdict is about such
+    /// imports and whose pages a driver may also take by their pointer (an allocation of the
+    /// device's own, exported and mapped). Without a source the device can use, the import is
+    /// refused as the pointer's would be (`Unsupported`, `HostMemory`).
+    #[cfg(unix)]
+    pub(crate) fn dma_buf_only(self) -> HostMemory {
+        HostMemory {
+            dma_buf_only: true,
             ..self
         }
     }
@@ -435,8 +529,9 @@ impl HostMemory {
     /// The pointer, the dma-buf source where the caller gave one, whether the caller vouched
     /// for the pages' write permission ([`HostMemory::assume_writable`]), and its log of the pages
     /// written ([`HostMemory::with_dirty_pages`]), kept with the pointer its offsets count from,
-    /// its gate over their import ([`HostMemory::with_import_gate`]), and its resolver of their
-    /// runs in guest RAM ([`HostMemory::with_runs`]).
+    /// its gate over their import ([`HostMemory::with_import_gate`]), its resolver of their
+    /// runs in guest RAM ([`HostMemory::with_runs`]), and whether they are imported only as
+    /// dma-bufs ([`HostMemory::dma_buf_only`]).
     pub(super) fn into_parts(self) -> HostParts {
         let dirty = (self.dirty).map(|hook| DirtySource::new(hook, self.pointer.as_ptr() as u64));
         HostParts {
@@ -446,11 +541,14 @@ impl HostMemory {
             dirty,
             gate: self.gate,
             runs: self.runs,
+            dma_buf_only: self.dma_buf_only,
         }
     }
 }
 
-/// A [`HostMemory`]'s parts ([`HostMemory::into_parts`]).
+/// A [`HostMemory`]'s parts ([`HostMemory::into_parts`]): cloned, what a no-copy buffer's pages
+/// were made of, which its device's recovery makes it again of (`HostPages::made_of`).
+#[derive(Clone)]
 pub(super) struct HostParts {
     pub(super) pointer: NonNull<u8>,
     pub(super) source: Option<Source>,
@@ -458,26 +556,46 @@ pub(super) struct HostParts {
     pub(super) dirty: Option<Arc<DirtySource>>,
     pub(super) gate: Option<ImportGate>,
     pub(super) runs: Option<RunResolver>,
+    pub(super) dma_buf_only: bool,
 }
+
+// SAFETY: as `HostMemory`'s: an address and the caller's guarantee for it, and parts that are
+// `Send` and `Sync`.
+unsafe impl Send for HostParts {}
+// SAFETY: as above.
+unsafe impl Sync for HostParts {}
 
 /// A no-copy buffer's deallocator (Metal's block): called once, with the pointer and the length,
 /// when the buffer is released. It may run on a runtime thread, as Metal's runs on any thread: a
 /// command buffer's queue's handler thread, where that command buffer's release lets go of the
-/// buffer, or, where the release frees the import, the releasing thread before the release
-/// returns, as Metal's; never a thread that submits command buffers or sees them complete. A panic
-/// inside it is caught.
+/// buffer; the device's free thread, after the import's free, where that release lets go of the
+/// pages' import last (the free paced there, possibly after the command buffer's waiters
+/// returned); or, where the program's release frees the import, the releasing thread before the
+/// release returns, as Metal's; never a thread that submits command buffers or sees them complete.
+/// A panic
+/// inside it is caught. Given with no keep-alive, it runs once the buffer's import of the pages
+/// was freed (but for a buffer lying in another live buffer's import, [`HostMemory::new`]), so the
+/// pages may be unmapped from inside it on; given with one, it runs at the release, possibly while
+/// the import lives, and the pages wait for the keep-alive's drop.
 pub type Deallocator = Box<dyn FnOnce(NonNull<u8>, u64) + Send + 'static>;
 
 /// What keeps the caller's host memory mapped (a runtime extension: Metal has none): given with a
 /// no-copy buffer's or heap's memory, it is dropped once the device's import of the pages is
-/// freed, which may be after the deallocator ran, or at the buffer's release, after its
+/// freed (for a buffer its device's recovery made again over them, every `VkDevice`'s import of
+/// them), which may be after the deallocator ran, or at the buffer's release, after its
 /// deallocator, where the import's pages stay mapped without it: another buffer made over the
 /// same bytes lies in the import, or the import keeps such a buffer's keep-alive already (the
 /// module docs). With one, the deallocator runs when the buffer
 /// is released, as Metal's does, though a command buffer submitted before a texture over the
-/// pages was released may still hold the import; with none, the deallocator waits for the import
-/// (the module docs). Dropped on a runtime thread, possibly; a panic inside its drop is caught.
+/// pages was released may still hold the import, or a buffer made over part of the bytes, or over
+/// the same bytes as memory of another class, while it lived, bound inside the import, holds it
+/// until that buffer goes (`WorkCounts::host_releases_held_inside`); with none, the deallocator
+/// waits for the import (the module docs). Dropped on a runtime thread, possibly; a panic inside its drop is caught.
+/// The program's last drop of the device waits for such a drop on a runtime thread, so it must not
+/// wait for the thread that drops the device.
 /// Never dropped while the process exits: the pages stay imported to its end (`exit_guard`).
+/// Its drop is the moment the pages may be unmapped (docs/HOWTO.md, "Unmapping host memory"): a
+/// keep-alive that owns the mapping and unmaps it as it drops keeps the order Vulkan requires.
 pub type KeepAlive = Box<dyn Send + 'static>;
 
 /// What the caller gives back with its host memory: the deallocator, and the keep-alive, each
@@ -508,6 +626,7 @@ impl HostRelease {
             deallocator: Mutex::new(deallocator),
             keep_alive: Mutex::new(keep_alive),
             held_back: Mutex::new(None),
+            due_to: Mutex::new(None),
         })
     }
 }
@@ -923,6 +1042,64 @@ const PROCMAP_QUERY_VMA_READABLE: u64 = 0x01;
 #[cfg(target_os = "linux")]
 const PROCMAP_QUERY_VMA_WRITABLE: u64 = 0x02;
 
+/// `PROCMAP_QUERY_VMA_SHARED`: the mapping's `VM_SHARED`, the `s` of its line in the maps.
+#[cfg(target_os = "linux")]
+const PROCMAP_QUERY_VMA_SHARED: u64 = 0x08;
+
+/// The mapping covering `address`, as the kernel answers `PROCMAP_QUERY` on `maps` (this
+/// process's `/proc/self/maps`); else the call's error number (`ENOENT` where no mapping covers
+/// it, `ENOTTY` before Linux 6.11), or `None` for an answer that does not cover `address`.
+#[cfg(target_os = "linux")]
+fn mapping_at(maps: &std::fs::File, address: u64) -> Result<ProcmapQuery, Option<i32>> {
+    use std::os::fd::AsRawFd;
+    let mut query = ProcmapQuery {
+        size: std::mem::size_of::<ProcmapQuery>() as u64,
+        query_addr: address,
+        ..ProcmapQuery::default()
+    };
+    // SAFETY: `query` is a `struct procmap_query` of its stated size, which the kernel reads and
+    // writes during the call; it asks for no name or build ID (sizes 0).
+    let result = unsafe {
+        libc::ioctl(
+            maps.as_raw_fd(),
+            PROCMAP_QUERY as _,
+            std::ptr::from_mut(&mut query),
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error());
+    }
+    // The mapping covers `address`; an answer that does not is not taken.
+    if query.vma_start > address || query.vma_end <= address {
+        return Err(None);
+    }
+    Ok(query)
+}
+
+/// Whether every mapping over `[start, end)` is shared and of the host's base pages, as the kernel
+/// answers `PROCMAP_QUERY` now (`vma_flags`, `vma_page_size`): shared memory such as a `memfd`, a
+/// VMM's RAM, whose read fault maps a page writable, and no hugetlbfs mapping, whose fault past
+/// its pool of pages ends the process (`SIGBUS`) where `MADV_POPULATE_WRITE` answers an error
+/// (`host_ram.rs`'s `fault_in`). `false` where a page of the window is not mapped and where the
+/// kernel does not answer the query (before Linux 6.11).
+#[cfg(target_os = "linux")]
+pub(super) fn shared_base_pages(start: u64, end: u64) -> bool {
+    let (Some(maps), Some(page)) = (kept_maps(), host_page()) else {
+        return false;
+    };
+    let mut covered = start;
+    while covered < end {
+        let Ok(mapping) = mapping_at(&maps, covered) else {
+            return false;
+        };
+        if mapping.vma_flags & PROCMAP_QUERY_VMA_SHARED == 0 || mapping.vma_page_size != page {
+            return false;
+        }
+        covered = mapping.vma_end;
+    }
+    true
+}
+
 /// Whether the process maps `[start, end)` without a gap, each mapping with `access`, as the
 /// kernel answers `PROCMAP_QUERY` on `maps` (this process's `/proc/self/maps`): one query per
 /// mapping the window touches, each for the mapping covering the first address not yet covered,
@@ -937,32 +1114,13 @@ pub(super) fn queried_permitted(
     access: Access,
     asked: &mut u64,
 ) -> Option<bool> {
-    use std::os::fd::AsRawFd;
     let mut covered = start;
     while covered < end {
         *asked += 1;
-        let mut query = ProcmapQuery {
-            size: std::mem::size_of::<ProcmapQuery>() as u64,
-            query_addr: covered,
-            ..ProcmapQuery::default()
+        let query = match mapping_at(maps, covered) {
+            Ok(query) => query,
+            Err(error) => return (error == Some(libc::ENOENT)).then_some(false),
         };
-        // SAFETY: `query` is a `struct procmap_query` of its stated size, which the kernel reads
-        // and writes during the call; it asks for no name or build ID (sizes 0).
-        let result = unsafe {
-            libc::ioctl(
-                maps.as_raw_fd(),
-                PROCMAP_QUERY as _,
-                std::ptr::from_mut(&mut query),
-            )
-        };
-        if result != 0 {
-            let error = std::io::Error::last_os_error().raw_os_error();
-            return (error == Some(libc::ENOENT)).then_some(false);
-        }
-        // The mapping covers `covered`; an answer that does not is not taken.
-        if query.vma_start > covered || query.vma_end <= covered {
-            return None;
-        }
         if query.vma_flags & access.queried() == 0 || !access.pinned(covered) {
             return Some(false);
         }
@@ -1024,13 +1182,17 @@ fn mapping(line: &str, access: Access) -> Option<(u64, u64, bool)> {
     ))
 }
 
-/// What a device knows to import host memory.
+/// What a device knows to import host memory: the pages' pointer ([`PointerImport`]), where it
+/// enables `VK_EXT_external_memory_host`, and dma-bufs of the pages a caller's source makes
+/// (`dma_buf.rs`), where it enables the dma-bufs' route. A device with neither has none
+/// ([`Importer::new`]).
+#[derive(Clone)]
 pub(super) struct Importer {
-    functions: ash::ext::external_memory_host::DeviceFn,
+    /// The import of a pages' pointer, or why the device has none, where it imports only dma-bufs
+    /// of them: every pointer refused unasked, so ([`Importer::pointer_import`]).
+    pointers: Result<PointerImport, Unsupported>,
     /// The host's page size.
     pub(super) page: u64,
-    /// `minImportedHostPointerAlignment`.
-    pub(super) alignment: u64,
     /// `vkGetMemoryFdPropertiesKHR`, where the device enables the dma-buf route (`dma_buf.rs`).
     dma_buf: Option<ash::khr::external_memory_fd::DeviceFn>,
     /// Whether the device also enables the route's image extensions (`create.rs`'s
@@ -1041,12 +1203,31 @@ pub(super) struct Importer {
     /// the first time a pointer is refused and a source called; `None` where the device makes no
     /// such buffer.
     pub(super) sparse_granule: std::sync::OnceLock<Option<u64>>,
+    /// The memory alignment of a plain buffer made for dma-bufs, which Vulkan keeps the same for
+    /// every buffer of the same usage and flags: what a chunk's offset in its file is a multiple
+    /// of (`dma_buf.rs`'s `DmaBufRequest::alignment`). Asked once, as the granule is; `None`
+    /// where the driver makes no such buffer.
+    pub(super) dma_buf_alignment: std::sync::OnceLock<Option<u64>>,
+}
+
+/// A device's import of host memory by its pointer (`VK_EXT_external_memory_host`). A clone is the
+/// submission checks' own (`submit_check.rs`), which hold nothing of the device.
+#[derive(Clone)]
+pub(super) struct PointerImport {
+    functions: ash::ext::external_memory_host::DeviceFn,
+    /// The host's page size.
+    page: u64,
+    /// `minImportedHostPointerAlignment`.
+    pub(super) alignment: u64,
 }
 
 impl Importer {
-    /// The importer of a device, or the refusal every no-copy buffer on it gets: the device did
-    /// not enable `VK_EXT_external_memory_host`, the runtime does not know the host's page size,
-    /// or the device cannot bind a buffer of `usage` to imported host memory.
+    /// The importer of a device, or the refusal every no-copy buffer on it gets: where it imports
+    /// neither the pages' pointer ([`PointerImport::new`]'s refusal) nor dma-bufs of them
+    /// (`dma_buf`), the pointer's refusal; where the runtime does not know the host's page size,
+    /// not implemented. A device that imports dma-bufs alone imports them only: each no-copy
+    /// buffer's pages come from its caller's source ([`DmaBufSource`]), and memory with none is
+    /// refused as the pointer is ([`Importer::pointer_import`]).
     ///
     /// # Safety
     ///
@@ -1059,60 +1240,60 @@ impl Importer {
         device: &ash::Device,
         enabled: &EnableSet,
         usage: vk::BufferUsageFlags,
-        loader_word: &LoaderWord,
+        loader_word: &DeviceWord,
         dma_buf: bool,
         dma_buf_images: bool,
     ) -> Result<Importer, Unsupported> {
-        if !enabled
-            .extensions
-            .contains(&VkExtension::ExtExternalMemoryHost)
-        {
-            return Err(Unsupported::needs(
-                Feature::HostMemory,
-                metal2vulkan::error::Capability::Extension(VkExtension::ExtExternalMemoryHost),
-            ));
-        }
-        let page = host_page().ok_or_else(|| Unsupported::not_implemented(Feature::HostMemory))?;
-        let mut host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
-        let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
-        // SAFETY: the caller's contract; the structure belongs to an enabled extension.
-        unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
-        let alignment = host.min_imported_host_pointer_alignment;
-        let info = vk::PhysicalDeviceExternalBufferInfo::default()
-            .usage(usage)
-            .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
-        let mut external = vk::ExternalBufferProperties::default();
-        // SAFETY: the caller's contract; the query is core in Vulkan 1.1.
-        unsafe {
-            instance.get_physical_device_external_buffer_properties(physical, &info, &mut external)
-        };
-        let features = external.external_memory_properties.external_memory_features;
-        if !features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
-            || features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY)
-        {
-            return Err(Unsupported::not_representable(Feature::HostMemory));
-        }
         let handle = device.handle();
         let load = |name: &std::ffi::CStr| {
             // SAFETY: the device is live, and the loader serves `vkGetDeviceProcAddr` after its
-            // word is put back; the extension is enabled.
+            // word is put back; each caller loads the functions of an enabled extension.
             let function = unsafe {
-                loader_word.restore();
-                instance.get_device_proc_addr(handle, name.as_ptr())
+                loader_word.restored(|| instance.get_device_proc_addr(handle, name.as_ptr()))
             };
             function.map_or(std::ptr::null(), |function| function as *const c_void)
         };
-        let functions = ash::ext::external_memory_host::DeviceFn::load(load);
+        // SAFETY: the caller's contract.
+        let pointers = unsafe { PointerImport::new(instance, physical, enabled, usage, load) };
         let dma_buf = dma_buf.then(|| ash::khr::external_memory_fd::DeviceFn::load(load));
+        let page = match (&pointers, &dma_buf) {
+            (Ok(pointers), _) => pointers.page,
+            // Dma-bufs of the pages alone, every pointer refused unasked.
+            (Err(_), Some(_)) => {
+                host_page().ok_or_else(|| Unsupported::not_implemented(Feature::HostMemory))?
+            }
+            (Err(refusal), None) => return Err(refusal.clone()),
+        };
         let dma_buf_images = dma_buf.is_some() && dma_buf_images;
         Ok(Importer {
-            functions,
+            pointers,
             page,
-            alignment,
             dma_buf,
             dma_buf_images,
             sparse_granule: std::sync::OnceLock::new(),
+            dma_buf_alignment: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The device's import of host memory by its pointer (`VK_EXT_external_memory_host`); `None`
+    /// where it imports dma-bufs of the pages alone.
+    pub(super) fn pointers(&self) -> Option<&PointerImport> {
+        self.pointers.as_ref().ok()
+    }
+
+    /// The device's import of host memory by its pointer, or, where it imports dma-bufs of the
+    /// pages alone, its refusal of every pointer, memory that comes with no source of them among
+    /// it: why it imports none, which names `VK_EXT_external_memory_host` where the device does
+    /// not enable it (`PointerImport::new`).
+    pub(super) fn pointer_import(&self) -> Result<&PointerImport, Error> {
+        (self.pointers.as_ref()).map_err(|refusal| Error::Unsupported(refusal.clone()))
+    }
+
+    /// The unit an import's pages round out to: the larger of the host page and the device's
+    /// `minImportedHostPointerAlignment` where it imports the pointer, else the host page, which a
+    /// dma-buf of the pages is made in.
+    pub(super) fn unit(&self) -> u64 {
+        self.pointers().map_or(self.page, PointerImport::unit)
     }
 
     /// Whether the device imports dma-bufs (`VK_EXT_external_memory_dma_buf`), which a no-copy
@@ -1188,12 +1369,69 @@ impl Importer {
         // SAFETY: a new descriptor Vulkan handed over, which the caller owns from here on.
         Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
     }
+}
+
+impl PointerImport {
+    /// The import of a device that enables `VK_EXT_external_memory_host` (in `enabled`), its
+    /// functions loaded through `load`; else the refusal of its pointers: the extension not
+    /// enabled (`Unsupported`, naming it), the host's page size unknown to the runtime (not
+    /// implemented), or no buffer of `usage` bound to imported host memory (`not_representable`).
+    ///
+    /// # Safety
+    ///
+    /// `physical` is a physical device of `instance` whose device was made with `enabled`
+    /// enabled, and `load` answers that device's functions by name.
+    unsafe fn new(
+        instance: &ash::Instance,
+        physical: vk::PhysicalDevice,
+        enabled: &EnableSet,
+        usage: vk::BufferUsageFlags,
+        load: impl FnMut(&std::ffi::CStr) -> *const c_void,
+    ) -> Result<PointerImport, Unsupported> {
+        if !enabled
+            .extensions
+            .contains(&VkExtension::ExtExternalMemoryHost)
+        {
+            return Err(no_pointer_refusal());
+        }
+        let page = host_page().ok_or_else(|| Unsupported::not_implemented(Feature::HostMemory))?;
+        let mut host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+        let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
+        // SAFETY: the caller's contract; the structure belongs to an enabled extension.
+        unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
+        let alignment = host.min_imported_host_pointer_alignment;
+        let info = vk::PhysicalDeviceExternalBufferInfo::default()
+            .usage(usage)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+        let mut external = vk::ExternalBufferProperties::default();
+        // SAFETY: the caller's contract; the query is core in Vulkan 1.1.
+        unsafe {
+            instance.get_physical_device_external_buffer_properties(physical, &info, &mut external)
+        };
+        let features = external.external_memory_properties.external_memory_features;
+        if !features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+            || features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY)
+        {
+            return Err(Unsupported::not_representable(Feature::HostMemory));
+        }
+        Ok(PointerImport {
+            functions: ash::ext::external_memory_host::DeviceFn::load(load),
+            page,
+            alignment,
+        })
+    }
+
+    /// The unit an import of a pointer's pages rounds out to: the larger of the host page and
+    /// `minImportedHostPointerAlignment`.
+    pub(super) fn unit(&self) -> u64 {
+        self.page.max(self.alignment)
+    }
 
     /// The memory types `pointer` can be imported into (`vkGetMemoryHostPointerPropertiesEXT`).
     ///
     /// # Safety
     ///
-    /// `device` is the importer's device; `pointer` is host memory aligned to its import
+    /// `device` is the import's device; `pointer` is host memory aligned to its import
     /// alignment.
     pub(super) unsafe fn memory_types(
         &self,
@@ -1214,6 +1452,14 @@ impl Importer {
     }
 }
 
+/// The refusal of the pointers of a device that enables no `VK_EXT_external_memory_host`.
+fn no_pointer_refusal() -> Unsupported {
+    Unsupported::needs(
+        Feature::HostMemory,
+        metal2vulkan::error::Capability::Extension(VkExtension::ExtExternalMemoryHost),
+    )
+}
+
 /// What a no-copy buffer gives back when its last reference goes: the caller's range, to its
 /// deallocator, and its keep-alive.
 pub(super) struct Release {
@@ -1221,9 +1467,14 @@ pub(super) struct Release {
     length: u64,
     deallocator: Mutex<Option<ProgramObject<Deallocator>>>,
     keep_alive: Mutex<Option<ProgramObject<KeepAlive>>>,
-    /// Where a detach held both back ([`Release::hold_back`]): told as the release would have run
-    /// the deallocator.
+    /// Where a detach held both back ([`Release::hold_back`]), or a recovery carried the buffer to
+    /// its device's next generation ([`Release::carry_on`]): told, as the release would have run
+    /// the deallocator, that these pages may be unmapped.
     held_back: Mutex<Option<Arc<HeldBack>>>,
+    /// Where these pages are those a recovery made the buffer again over on its device's next
+    /// generation ([`Release::carried`]): where the deallocator and the keep-alive wait, told as
+    /// the release would have run the deallocator that it came and these pages may be unmapped.
+    due_to: Mutex<Option<Arc<HeldBack>>>,
 }
 
 // SAFETY: the pointer is only handed to the deallocator, which is `Send`; the deallocator and
@@ -1265,19 +1516,27 @@ impl Release {
         self.length
     }
 
-    /// Run the deallocator, once; a panic inside it is caught. Where a detach held it back, the
-    /// [`HeldBack`] is told instead: the pages may be unmapped from now on.
+    /// Run the deallocator, once; a panic inside it is caught. Where a detach held it back, or a
+    /// recovery carried the buffer on, the [`HeldBack`] is told instead: the pages may be
+    /// unmapped from now on; where these are the pages a recovery made the buffer again over, it
+    /// is told the release came too.
     pub(super) fn run(&self) {
         if let Some(held) = lock(&self.held_back).take() {
             held.unmappable();
             return;
         }
+        if let Some(held) = lock(&self.due_to).take() {
+            held.released();
+            return;
+        }
         let deallocator = lock(&self.deallocator).take();
         if let Some(deallocator) = deallocator {
-            let (pointer, length) = (self.pointer, self.length);
-            exit_guard::program_release(move || {
-                deallocator.run(|deallocator| deallocator(pointer, length));
-            });
+            let deallocation = Deallocation {
+                deallocator,
+                pointer: self.pointer,
+                length: self.length,
+            };
+            exit_guard::program_release(move || deallocation.run());
         }
     }
 
@@ -1289,13 +1548,19 @@ impl Release {
     /// the deallocator ran and the pages may be unmapped, so the deallocator may read the bytes, as
     /// with a release. `None` where it has no deallocator left to run.
     pub(super) fn hold_back(&self) -> Option<Arc<HeldBack>> {
+        // Pages a recovery made the buffer again over: what waits for its release is held back
+        // already, which the release of these pages now tells only that they may be unmapped.
+        if let Some(held) = lock(&self.due_to).take() {
+            *lock(&self.held_back) = Some(Arc::clone(&held));
+            return Some(held);
+        }
         let deallocator = lock(&self.deallocator).take()?;
         let keep_alive = lock(&self.keep_alive).take();
         let held = Arc::new(HeldBack {
             state: Mutex::new(Back {
                 deallocator: Some(deallocator),
                 keep_alive,
-                unmappable: false,
+                mapped: 1,
                 due: false,
             }),
             pointer: self.pointer,
@@ -1303,6 +1568,53 @@ impl Release {
         });
         *lock(&self.held_back) = Some(Arc::clone(&held));
         Some(held)
+    }
+
+    /// Hold back its deallocator and its keep-alive for a recovery that carries the buffer to its
+    /// device's next generation, which makes it again over the same pages (`Buffer::carry`): both
+    /// wait for the buffer's release, or its next rebind, there ([`Release::carried`]), and for
+    /// every import of the pages, on each generation the buffer lay on, to be freed, as Metal
+    /// keeps a buffer's pages wired until it releases them. Where these pages are those an
+    /// earlier recovery made the buffer again over, what waits already waits for one more import.
+    /// `None` where it holds neither.
+    pub(super) fn carry_on(&self) -> Option<Arc<HeldBack>> {
+        if let Some(held) = lock(&self.due_to).take() {
+            lock(&held.state).mapped += 1;
+            *lock(&self.held_back) = Some(Arc::clone(&held));
+            return Some(held);
+        }
+        let deallocator = lock(&self.deallocator).take();
+        let keep_alive = lock(&self.keep_alive).take();
+        if deallocator.is_none() && keep_alive.is_none() {
+            return None;
+        }
+        let held = Arc::new(HeldBack {
+            state: Mutex::new(Back {
+                deallocator,
+                keep_alive,
+                // These pages' import, and the next generation's.
+                mapped: 2,
+                due: false,
+            }),
+            pointer: self.pointer,
+            length: self.length,
+        });
+        *lock(&self.held_back) = Some(Arc::clone(&held));
+        Some(held)
+    }
+
+    /// The release of the pages a recovery made a buffer again over (`Buffer::carry`), of the
+    /// `length` bytes at `pointer`: what `held` holds back of the pages' first release
+    /// ([`Release::carry_on`]) waits for it.
+    pub(super) fn carried(pointer: NonNull<u8>, length: u64, held: Arc<HeldBack>) -> Release {
+        Release {
+            pointer,
+            length,
+            deallocator: Mutex::new(None),
+            keep_alive: Mutex::new(None),
+            held_back: Mutex::new(None),
+            due_to: Mutex::new(Some(held)),
+        }
     }
 }
 
@@ -1322,7 +1634,10 @@ pub(super) struct HeldBack {
 struct Back {
     deallocator: Option<ProgramObject<Deallocator>>,
     keep_alive: Option<ProgramObject<KeepAlive>>,
-    unmappable: bool,
+    /// The imports of the pages whose release has not reached it yet ([`HeldBack::unmappable`]):
+    /// the one a detach let go of, or one on each generation a recovery carried the buffer
+    /// across ([`Release::carry_on`]). The pages may be unmapped once none is left.
+    mapped: usize,
     due: bool,
 }
 
@@ -1331,6 +1646,30 @@ struct Back {
 unsafe impl Send for HeldBack {}
 // SAFETY: as above.
 unsafe impl Sync for HeldBack {}
+
+/// A deallocator and the caller's range it is handed ([`Release::run`], [`HeldBack`]), to run
+/// where a release of the program's runs (`exit_guard::program_release`), which may be another
+/// thread.
+struct Deallocation {
+    deallocator: ProgramObject<Deallocator>,
+    pointer: NonNull<u8>,
+    length: u64,
+}
+
+// SAFETY: the pointer is only handed to the deallocator, which is `Send`.
+unsafe impl Send for Deallocation {}
+
+impl Deallocation {
+    /// Run the deallocator with the caller's range; a panic inside it is caught where it runs.
+    fn run(self) {
+        let Deallocation {
+            deallocator,
+            pointer,
+            length,
+        } = self;
+        deallocator.run(|deallocator| deallocator(pointer, length));
+    }
+}
 
 /// What a [`HeldBack`] runs and drops now, taken under its lock.
 type Ready = (
@@ -1342,11 +1681,12 @@ impl HeldBack {
     /// What runs and goes now: the deallocator once due and the pages are mapped (a keep-alive)
     /// or may be unmapped; the keep-alive once the deallocator ran and they may be unmapped.
     fn ready(back: &mut Back) -> Ready {
-        let deallocator = match back.due && (back.unmappable || back.keep_alive.is_some()) {
+        let unmappable = back.mapped == 0;
+        let deallocator = match back.due && (unmappable || back.keep_alive.is_some()) {
             true => back.deallocator.take(),
             false => None,
         };
-        let keep_alive = match back.unmappable && back.deallocator.is_none() {
+        let keep_alive = match unmappable && back.deallocator.is_none() {
             true => back.keep_alive.take(),
             false => None,
         };
@@ -1362,10 +1702,14 @@ impl HeldBack {
             return;
         };
         drop(busy);
-        let (pointer, length) = (self.pointer, self.length);
+        let deallocation = deallocator.map(|deallocator| Deallocation {
+            deallocator,
+            pointer: self.pointer,
+            length: self.length,
+        });
         exit_guard::program_release(move || {
-            if let Some(deallocator) = deallocator {
-                deallocator.run(|deallocator| deallocator(pointer, length));
+            if let Some(deallocation) = deallocation {
+                deallocation.run();
             }
             drop(keep_alive);
         });
@@ -1376,7 +1720,7 @@ impl HeldBack {
     fn unmappable(&self) {
         let ready = {
             let mut back = lock(&self.state);
-            back.unmappable = true;
+            back.mapped = back.mapped.saturating_sub(1);
             HeldBack::ready(&mut back)
         };
         self.run(ready);
@@ -1393,6 +1737,18 @@ impl HeldBack {
         };
         self.run(ready);
         waits
+    }
+
+    /// The pages a recovery made the buffer again over went ([`Release::carried`]): the buffer's
+    /// release or next rebind came, and their import's release reached it.
+    fn released(&self) {
+        let ready = {
+            let mut back = lock(&self.state);
+            back.due = true;
+            back.mapped = back.mapped.saturating_sub(1);
+            HeldBack::ready(&mut back)
+        };
+        self.run(ready);
     }
 }
 

@@ -93,6 +93,14 @@ impl Gpu for Native {
         format!("native Metal on {}", self.device.name())
     }
 
+    fn with_own_queue(&self) -> Native {
+        let queue = self.device.newCommandQueue().expect("newCommandQueue");
+        Native {
+            device: self.device.clone(),
+            queue,
+        }
+    }
+
     fn library(&self, metallib: &Path) -> Self::Library {
         let path = NSString::from_str(metallib.to_str().expect("a UTF-8 path"));
         self.device
@@ -243,6 +251,10 @@ impl Gpu for Native {
 
     fn pipeline_id(&self, state: &Self::ComputePipeline) -> u64 {
         state.gpuResourceID().to_raw()
+    }
+
+    fn texture_id(&self, texture: &Self::Texture) -> u64 {
+        texture.gpuResourceID().to_raw()
     }
 
     fn cpu_indirect_commands(&self, count: usize) -> Self::IndirectCommands {
@@ -736,6 +748,16 @@ impl Gpu for Native {
         unsafe { encoder.setVertexBuffer_offset_atIndex(Some(buffer), offset, index) };
     }
 
+    fn set_vertex_buffer_offset(
+        &self,
+        encoder: &mut Self::RenderEncoder,
+        offset: usize,
+        index: usize,
+    ) {
+        // SAFETY: the offset lies in the buffer bound at the index, which is in Metal's range.
+        unsafe { encoder.setVertexBufferOffset_atIndex(offset, index) };
+    }
+
     fn set_vertex_buffers(
         &self,
         encoder: &mut Self::RenderEncoder,
@@ -1054,6 +1076,18 @@ impl Gpu for Native {
             return;
         };
         // SAFETY: `first` points at `resources.len()` live resources, held by `buffers`.
+        unsafe { encoder.useResources_count_usage(first, resources.len(), MTLResourceUsage::Read) };
+    }
+
+    fn use_textures(&self, encoder: &mut Self::ComputeEncoder, textures: &[&Self::Texture]) {
+        let resources: Vec<NonNull<ProtocolObject<dyn MTLResource>>> = textures
+            .iter()
+            .map(|texture| NonNull::from(ProtocolObject::from_ref(&***texture)))
+            .collect();
+        let Some(first) = NonNull::new(resources.as_ptr().cast_mut()) else {
+            return;
+        };
+        // SAFETY: `first` points at `resources.len()` live resources, held by `textures`.
         unsafe { encoder.useResources_count_usage(first, resources.len(), MTLResourceUsage::Read) };
     }
 

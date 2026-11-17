@@ -19,6 +19,10 @@
 //!   count, or numeric type, a texture buffer for an image, a color texture under a depth
 //!   comparison): the neutral of exactly the declared type; an incompatible binding is also a
 //!   `PlanDiagnostic::IncompatibleBinding` (guest undefined behavior).
+//! - **Bound, its storage not held:** a storage slot a function only writes over a texture whose
+//!   writes Metal drops (`metal::format::writes_dropped`), and any storage slot over an ASTC
+//!   texture, whose blocks no storage view stores into (`PlanDiagnostic::AstcStorageNeutral`):
+//!   the neutral of the declared type, which the writes leave as Metal leaves the texture.
 //! - **Variant**: a read or written storage slot's choice joins the plan's `VariantKey` unless the
 //!   declaration a pipeline compiled without one has serves it (an `Identity` choice without an
 //!   alias, where the profile accesses the slot's uses without a format), so the common path stays
@@ -52,15 +56,16 @@ use super::{
 };
 use crate::bind::neutral::NeutralResource;
 use crate::bind::state::{SamplerShape, StageShape, TextureShape};
+use crate::bind::AstcDecode;
 use crate::cache::VariantKey;
 use crate::device::requirements::{FormatUsage, VkLimit};
 use crate::device::DeviceProfile;
 use crate::error::{BindError, Capability, Error, Feature, LowerFamily, Unsupported};
 use crate::metal::bicubic::{texels as bicubic_texels, BicubicTexels};
 use crate::metal::format::{
-    accessed_without_format, aspects, direct_format, is_depth_stencil, sampled_type, srgb_raw_twin,
-    storage_choice, texel_buffer_alpha_in_red, vk_format, writes_dropped, ycbcr_writes_stored,
-    ExtendedRange, FormatMapping, StorageUse,
+    accessed_without_format, aspects, copies_only, direct_format, is_depth_stencil, sampled_type,
+    srgb_raw_twin, storage_choice, texel_buffer_alpha_in_red, vk_format, writes_dropped,
+    ycbcr_writes_stored, ExtendedRange, FormatMapping, StorageUse,
 };
 use crate::metal::sampler::{
     check_border_view, check_sampler, opaque_black_reads_transparent, vk_filtering,
@@ -429,16 +434,19 @@ fn texel_type_binds(pf: PixelFormat, ty: SampledType) -> bool {
 /// Metal's numeric type of a texture of `pf` bound at a slot: the format table's
 /// (`sampled_type`), and `Float` for a color format the table holds no representation of (the
 /// 4:2:2 formats, whose texels the runtime holds raw for copies, and ASTC's 4x2 and 8x4
-/// footprints).
+/// footprints) or holds for copies alone (`copies_only`: the one-plane YCbCr formats, the padded
+/// 10- and 12-bit display formats, the transfer-function twins of the 10-bit formats and
+/// `ARGB8Unorm_sRGB`, whose emulation the table admits for no usage).
 /// Metal reads each as floats, so a slot of that type holds such a texture, and its binding is
-/// the format's own refusal (it has no sampled view), not a mismatch a neutral stands in for.
+/// the format's own refusal (it has no sampled or storage view: `NotImplemented(Format)`), not a
+/// mismatch a neutral stands in for.
 /// A slot has an interface only where the function uses it, so a texture bound at an index the
 /// function never reads is refused nothing. A heap's classes keep the table's type
 /// (`heap::fit`): a resident texture the heap cannot view is the neutral at its element.
 fn bound_sampled_type(pf: PixelFormat) -> Option<SampledType> {
     sampled_type(pf).or_else(|| {
         let placeholder = matches!(pf, PixelFormat::Invalid | PixelFormat::Unspecialized);
-        (!placeholder && aspects(pf).is_none()).then_some(SampledType::Float)
+        (!placeholder && (aspects(pf).is_none() || copies_only(pf))).then_some(SampledType::Float)
     })
 }
 
@@ -677,6 +685,97 @@ impl ResourcePlanner<'_> {
         }
     }
 
+    /// The texel buffer format of the rows (`bind::texel_rows`) of the texture the shape binds at
+    /// `slot`, a storage slot where `storage`, where its function reads, writes and asks the size
+    /// of them through it (`RuntimeFact::TexelRows`): a single-sample 2D texture whose rows the
+    /// runtime states (`TextureShape::Texture::texel_rows`), of a color format of the slot's
+    /// numeric type that is no sRGB format, its texels unswizzled and unconverted (its image the
+    /// direct format, which holds Metal's bytes), whose direct format the device views as the
+    /// slot's texel buffer: a uniform one, or a storage one read and written as the function
+    /// does without a declared format. The device converts such a view's texels "in the same way
+    /// as they are for an image" (Uniform Texel Buffer, Storage Texel Buffer), so the function
+    /// reads and writes the texels the image route does. `None` for any other slot.
+    fn rows_format(&self, slot: SlotRef, storage: bool) -> Option<vk::Format> {
+        if !self.has_fact(RuntimeFact::TexelRows { slot }) {
+            return None;
+        }
+        let Some(&TextureShape::Texture {
+            texture_type: TextureType::Type2D,
+            pixel_format: pf,
+            sample_count: 1,
+            swizzle,
+            texel_rows: true,
+            ..
+        }) = self.texture_shape(slot)
+        else {
+            return None;
+        };
+        let t = self.texture_slot(slot).ok()?;
+        let plain = swizzle.is_default()
+            && !t.access.sample
+            && t.sampled_type != SampledType::Uint64
+            && texel_type_binds(pf, t.sampled_type)
+            && !is_depth_stencil(pf)
+            && srgb_raw_twin(pf).is_none()
+            && ExtendedRange::of(pf).is_none();
+        let format = crate::metal::format::byte_format(pf).filter(|_| plain)?;
+        if format.block().is_none_or(|b| b.texels != 1) {
+            return None;
+        }
+        let usage = match storage {
+            true => FormatUsage::StorageTexelBuffer,
+            false => FormatUsage::UniformTexelBuffer,
+        };
+        let mapping = vk_format(pf, &[usage].into(), self.profile).ok()?;
+        let direct = mapping.format == format
+            && mapping.emulation == crate::metal::format::FormatEmulation::Direct;
+        let accessed = match storage {
+            true => accessed_without_format(
+                format,
+                StorageUse::texel_buffer(t.access.read, t.access.write),
+                self.profile,
+            ),
+            false => true,
+        };
+        (direct && accessed).then_some(format)
+    }
+
+    /// The write of `slot`'s binding under its rows variant (`VariantKey::texel_rows`), declared
+    /// `ty`, a texel buffer: the texel buffer of the rows of the texture the shape binds there
+    /// ([`rows_format`](Self::rows_format)), a use of their bytes; the neutral of the declared
+    /// texel buffer where the shape binds no such rows, which the plan's key then leaves.
+    fn rows_write(
+        &mut self,
+        ty: vk::DescriptorType,
+        slot: SlotRef,
+    ) -> Result<(WriteSource, NeutralResource), BindError> {
+        let t = *self.texture_slot(slot)?;
+        let storage = ty == vk::DescriptorType::STORAGE_TEXEL_BUFFER;
+        let buffer = TextureSlot {
+            texture_type: TextureType::TextureBuffer,
+            ..t
+        };
+        let n = neutral(&declared(
+            &buffer,
+            ty,
+            false,
+            false,
+            StorageFormatClass::Unknown,
+        )?)?;
+        let Some(format) = self.rows_format(slot, storage) else {
+            return Ok((WriteSource::Neutral(n), n));
+        };
+        self.variant.texel_rows.insert(slot);
+        self.uses.push(ResourceUse {
+            resource: UseTarget::Slot(slot),
+            access: texture_access(t.access),
+            class: AccessClass::TexelRows,
+            stages: (self.stage_flags)(slot.stage),
+            range: None,
+        });
+        Ok((WriteSource::TexelRows { slot, format }, n))
+    }
+
     /// The write of `slot`'s binding under its planes-image variant (`BindingSource::YCbCrPlanes`,
     /// `VariantKey::ycbcr_planes_sampled`): the image of the planes of the two-plane YCbCr texture
     /// the shape binds there, viewed with the device's conversion of `TextureShape::Texture::
@@ -820,16 +919,40 @@ impl ResourcePlanner<'_> {
         ty: vk::DescriptorType,
         slot: SlotRef,
     ) -> Result<(WriteSource, NeutralResource), BindError> {
-        // A texture slot that is no texture buffer is declared a uniform texel buffer only under
-        // its in-place variant (`VariantKey::ycbcr_in_place`).
-        if ty == vk::DescriptorType::UNIFORM_TEXEL_BUFFER
-            && self.texture_slot(slot)?.texture_type != TextureType::TextureBuffer
-        {
-            return Ok(self.in_place_write(slot));
+        // A texture slot that is no texture buffer is declared a texel buffer only under its
+        // in-place variant (`VariantKey::ycbcr_in_place`), a uniform one, or its rows variant
+        // (`VariantKey::texel_rows`): the rows' where the shape binds a texture whose rows are
+        // read in place there, else the planes'.
+        let texel_buffer = matches!(
+            ty,
+            vk::DescriptorType::UNIFORM_TEXEL_BUFFER | vk::DescriptorType::STORAGE_TEXEL_BUFFER
+        );
+        if texel_buffer && self.texture_slot(slot)?.texture_type != TextureType::TextureBuffer {
+            let rows = matches!(
+                self.texture_shape(slot),
+                Some(TextureShape::Texture {
+                    texel_rows: true,
+                    ..
+                })
+            );
+            return match rows || ty == vk::DescriptorType::STORAGE_TEXEL_BUFFER {
+                true => self.rows_write(ty, slot),
+                false => Ok(self.in_place_write(slot)),
+            };
         }
         let levels_read = self.has_fact(RuntimeFact::StorageTextureLevels { slot });
         let write = self.plain_texture(set, binding, ty, slot)?;
         self.write_rounding(slot, &write.0)?;
+        // A slot whose texture's rows are read in place takes its rows variant where its image is
+        // declared as the rows' texel buffer is, without a storage format
+        // ([`rows_format`](Self::rows_format)).
+        let storage = ty == vk::DescriptorType::STORAGE_IMAGE;
+        if matches!(write.0, WriteSource::Texture { .. })
+            && !self.variant.storage_images.contains_key(&slot)
+            && self.rows_format(slot, storage).is_some()
+        {
+            self.variant.texel_rows.insert(slot);
+        }
         if levels_read {
             let levels = match write.0 {
                 WriteSource::Texture { .. } => self.bound_levels(slot),
@@ -924,10 +1047,20 @@ impl ResourcePlanner<'_> {
         // stops the binding), so the slot takes its neutral, which the writes leave as Metal leaves
         // the texture. A slot that reads it keeps the format's refusal (`metal::format`).
         let only_written = storage && t.access.write && !t.access.read && !t.access.sample;
+        // An ASTC texture at a storage slot: no storage view stores into its blocks (no Vulkan
+        // format of a block is a storage image's). Plain Metal completes a function's writes,
+        // storing bytes no format defines into the blocks, and reads the blocks' decode through
+        // a slot that also reads them (our probe `astc_passes_writes_footprints`): the slot takes
+        // its neutral, so the writes leave the texture's blocks as they were, and the plan says
+        // so (`PlanDiagnostic::AstcStorageNeutral`), which the runtime announces.
+        let astc_storage = storage
+            && matches!(compat, Some(TextureShape::Texture { pixel_format, .. })
+                if AstcDecode::of(pixel_format).is_some());
         let compat = compat.filter(|s| {
-            !(only_written
-                && matches!(s, TextureShape::Texture { .. })
-                && writes_dropped(s.pixel_format()))
+            !astc_storage
+                && !(only_written
+                    && matches!(s, TextureShape::Texture { .. })
+                    && writes_dropped(s.pixel_format()))
         });
         // A 4:4:4 two-plane YCbCr texture whose writes Metal stores into its planes
         // (`metal::format::ycbcr_writes_stored`) at a storage slot its function only writes: the
@@ -1052,8 +1185,18 @@ impl ResourcePlanner<'_> {
             self.variant.extended_range.insert(slot, form);
         }
         let Some(shape) = compat else {
-            let write = WriteSource::Neutral(self.substitute(slot, n, shape.as_ref(), (&t, &base)));
-            return Ok((write, n));
+            let n = match astc_storage {
+                true => {
+                    let d = PlanDiagnostic::AstcStorageNeutral {
+                        slot,
+                        substituted: n,
+                    };
+                    self.diagnostics.push(d);
+                    n
+                }
+                false => self.substitute(slot, n, shape.as_ref(), (&t, &base)),
+            };
+            return Ok((WriteSource::Neutral(n), n));
         };
         self.texture_use(slot, &t, storage);
         match shape {
@@ -1192,6 +1335,12 @@ impl ResourcePlanner<'_> {
                 if shader_swizzle {
                     self.variant.swizzled_storage.insert(slot);
                 }
+                // A storage slot its function only queries reads and writes no texel, and what a
+                // query answers (the view's size, levels and layers, an OpenCL image's format
+                // words, which the third hidden buffer holds) no swizzle reaches: plain Metal's and
+                // OpenCL mode's queries of a swizzled view answer so (our probe
+                // `opencl_swizzled_images`, on an M3 Max). Its view takes none, under no variant.
+                let queried = storage && !t.access.read && !t.access.write && !swizzle.is_default();
                 let view = if storage {
                     let format = match choice {
                         _ if ulong_atomic => vk::Format::R64_UINT,
@@ -1216,7 +1365,7 @@ impl ResourcePlanner<'_> {
                         layout: vk::ImageLayout::GENERAL,
                         components: vk::ComponentMapping::IDENTITY,
                         level: None,
-                        shader_swizzle,
+                        shader_swizzle: shader_swizzle || queried,
                     }
                 } else {
                     match self.texel_view(pixel_format, &class)? {
@@ -1482,7 +1631,8 @@ impl ResourcePlanner<'_> {
     /// modes and color) must read it exactly through its view
     /// (`metal::sampler::check_border_view`). The immutable sampler's filters must be ones the
     /// bound view's format supports ([`check_filter_features`]), as a runtime sampler's are when it
-    /// is instantiated.
+    /// is instantiated. A use that reads texel coordinates (`CombinedSampler::unnormalized`) views
+    /// the texture's first level alone.
     pub fn combined(
         &mut self,
         texture: SlotRef,
@@ -1665,10 +1815,18 @@ impl ResourcePlanner<'_> {
                     if shader_swizzle {
                         self.variant.swizzled_storage.insert(texture);
                     }
+                    // A pixel sampler's texel coordinates read through the device's unnormalized
+                    // sampler, which reads a view of one level (and one layer: the slot's texture
+                    // is no array).
+                    let level = match sampler.unnormalized {
+                        true => Some(0),
+                        false => view.level,
+                    };
                     let image = ImageSource::Texture {
                         slot: texture,
                         view: ImageViewDesc {
                             shader_swizzle,
+                            level,
                             ..view
                         },
                     };
@@ -1790,6 +1948,19 @@ impl ResourcePlanner<'_> {
         self.stage_shape(slot.stage)
             .and_then(|s| s.samplers.get(&slot.index))
             .map_or(0, |s| u64::from(s.degree))
+    }
+
+    /// The `NearestPixelSampler(slot)` specialization: 1 where the sampler bound to `slot` is a
+    /// nearest pixel sampler of one isotropic level (its word masked by
+    /// `SamplerWord::nearest_pixel(false)` is `SamplerWord::PIXEL_COORDINATES`), else 0; 0 for a
+    /// slot bound to no sampler.
+    pub fn nearest_pixel_sampler(&self, slot: SlotRef) -> u64 {
+        use crate::metal::sampler::SamplerWord;
+        let word = self
+            .stage_shape(slot.stage)
+            .and_then(|s| s.samplers.get(&slot.index))
+            .map_or(0, |s| s.word.0);
+        u64::from(word & SamplerWord::nearest_pixel(false) == SamplerWord::PIXEL_COORDINATES)
     }
 
     /// The `BicubicTexels(slot)` specialization: how Metal's bicubic filter treats the texels of

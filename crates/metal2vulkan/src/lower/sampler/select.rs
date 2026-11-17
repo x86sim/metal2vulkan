@@ -23,7 +23,7 @@ use crate::pipeline::sym::{ImageAccess, SamplerRef, SlotClass, SlotRef, Stage};
 
 use super::{
     BiasReach, BindingKey, CubeFootprint, HeapKey, HeapSamplerKey, Lod, MinLevel, Offset, Pixel,
-    SampleOp, Sampling, Source, Unmapped,
+    PixelPosition, SampleOp, Sampling, Source, Unmapped,
 };
 
 fn refuse() -> Error {
@@ -336,37 +336,7 @@ pub fn select_sampling(
     let (tex_handle, textures) = split(texture);
     let (smp_handle, samplers) = split(sampler);
     let combinations = textures.len().saturating_mul(samplers.len());
-    // A tangled use: the fragment's implicit-LOD sample, or an LOD query.
-    let fragment = cx.stage == Stage::Fragment;
-    let mut queries = false;
-    let hoist = match t.op {
-        // Every candidate's query, at the call's own position with the call's coordinate,
-        // before the switch, which selects one: bounded, as every fragment runs each.
-        TexOp::CalculateLod { .. } if fragment => {
-            if combinations > super::LOD_QUERY_CANDIDATES {
-                return Err(Unsupported::not_implemented(Feature::DivergentImplicitLod).into());
-            }
-            queries = true;
-            None
-        }
-        TexOp::Sample {
-            lod: LodMode::Bias, ..
-        } if fragment => {
-            let coord = ops
-                .get(TexRole::Coord)
-                .ok_or_else(|| cx.invariant("a sampling call without a coordinate"))?;
-            let bias = match ops.get(TexRole::LodValue) {
-                Some(v) if !is_zero_float(cx, v) => Some(id(cx, v)?),
-                _ => None,
-            };
-            Some(super::Hoist {
-                coord: id(cx, coord)?,
-                lanes: plane(t.image.dim),
-                bias,
-            })
-        }
-        _ => None,
-    };
+    let (hoist, queries) = tangled(cx, &ops, combinations)?;
     let mut arms = Vec::with_capacity(combinations);
     for tc in &textures {
         let index = match *tc {
@@ -394,6 +364,65 @@ pub fn select_sampling(
             arms.push((lits, one));
         }
     }
+    let prelude = prelude(cx, (hoist, queries), &arms, &ops, &samplers)?;
+    Ok(TextureStrategy::Switch(Box::new(Switch {
+        handles: tex_handle.into_iter().chain(smp_handle).collect(),
+        arms,
+        null: NullArm::Zero(cx.lowered_repr(Value::Inst(at), inst.ty)?),
+        prelude,
+    })))
+}
+
+/// How sampling call `ops` sits in a switch-at-use of `combinations` arms: the gradients a
+/// fragment's implicit-LOD sample hoists before the switch, and whether a fragment's LOD query
+/// runs every arm's query before it (up to [`super::LOD_QUERY_CANDIDATES`] combinations, past
+/// them `DivergentImplicitLod`, not implemented).
+fn tangled(
+    cx: &SelectCx<'_>,
+    ops: &Operands<'_>,
+    combinations: usize,
+) -> Result<(Option<super::Hoist>, bool), Error> {
+    let t = ops.t;
+    let fragment = cx.stage == Stage::Fragment;
+    match t.op {
+        // Every candidate's query, at the call's own position with the call's coordinate,
+        // before the switch, which selects one: bounded, as every fragment runs each.
+        TexOp::CalculateLod { .. } if fragment => {
+            if combinations > super::LOD_QUERY_CANDIDATES {
+                return Err(Unsupported::not_implemented(Feature::DivergentImplicitLod).into());
+            }
+            Ok((None, true))
+        }
+        TexOp::Sample {
+            lod: LodMode::Bias, ..
+        } if fragment => {
+            let coord = ops
+                .get(TexRole::Coord)
+                .ok_or_else(|| cx.invariant("a sampling call without a coordinate"))?;
+            let bias = match ops.get(TexRole::LodValue) {
+                Some(v) if !is_zero_float(cx, v) => Some(id(cx, v)?),
+                _ => None,
+            };
+            let hoist = super::Hoist {
+                coord: id(cx, coord)?,
+                lanes: plane(t.image.dim),
+                bias,
+            };
+            Ok((Some(hoist), false))
+        }
+        _ => Ok((None, false)),
+    }
+}
+
+/// The prelude of a switch-at-use of `arms` over the sampler candidates `samplers`, the use
+/// planned as [`tangled`] answered.
+fn prelude(
+    cx: &mut SelectCx<'_>,
+    (hoist, queries): (Option<super::Hoist>, bool),
+    arms: &[(Vec<u32>, TextureStrategy)],
+    ops: &Operands<'_>,
+    samplers: &[Candidate],
+) -> Result<Prelude, Error> {
     // The gradients are hoisted only for arms that sample with them: an arm through a nearest
     // pixel sampler fetches and needs none.
     let hoist = hoist.filter(|_| {
@@ -410,23 +439,17 @@ pub fn select_sampling(
     // The hoisted derivatives are the whole bias's, but Metal's own sample where the device samples
     // through Metal's sampler and the sample takes no bias, which the module then requires.
     if let Some(h) = &hoist {
-        if hoist_is_metals(cx, h, &ops, &samplers)? {
+        if hoist_is_metals(cx, h, ops, samplers)? {
             cx.families.sampler.metal_sampler = true;
         } else {
             cx.precision.insert(PrecisionNote::GradFromBias);
         }
     }
-    let prelude = match hoist {
+    Ok(match hoist {
         Some(h) => Prelude::Gradients(h),
         None if queries => Prelude::Arms,
         None => Prelude::Nothing,
-    };
-    Ok(TextureStrategy::Switch(Box::new(Switch {
-        handles: tex_handle.into_iter().chain(smp_handle).collect(),
-        arms,
-        null: NullArm::Zero(cx.lowered_repr(Value::Inst(at), inst.ty)?),
-        prelude,
-    })))
+    })
 }
 
 /// Select sampling call `inst` (sample, gather, or LOD query) decoded as `t` on element `handle`
@@ -434,8 +457,8 @@ pub fn select_sampling(
 /// separate heap sampler. The sampler is one constexpr sampler, or one runtime `[[sampler(n)]]`,
 /// whose heap sampler binding the binder writes with the sampler bound at the slot, or a sampler
 /// loaded from an argument buffer, whose element of the sampler array of the use the binder writes
-/// with it; several sampler candidates beside a heap image are not implemented
-/// (`ArgumentBufferTextures`), and the null sampler has no defined result.
+/// with it; a sampler of several static candidates beside a heap image is a switch-at-use over
+/// them ([`select_heap_switch`]), and the null sampler has no defined result.
 pub fn select_heap_sampling(
     cx: &mut SelectCx<'_>,
     at: InstId,
@@ -460,15 +483,217 @@ pub fn select_heap_sampling(
             }
             HandleTarget::One(c) => sampler_of(cx, c)?,
             HandleTarget::Null => return Err(refuse()),
-            HandleTarget::Switch { .. } => {
-                return Err(Unsupported::not_implemented(Feature::ArgumentBufferTextures).into())
-            }
+            HandleTarget::Switch {
+                handle: smp_handle,
+                cands,
+            } => return select_heap_switch(cx, call, (group, handle), smp_handle, &cands, m),
         },
     };
+    select_heap_arm(cx, call, (group, handle), s, None, m)
+}
+
+/// The sampling `call` of element `handle` of heap group `group` through `sampler`: the heap
+/// element through a separate heap sampler, with its raw-texel emulation ([`select_heap_raw`]);
+/// `arm` as [`select_one`] takes it.
+fn select_heap_arm(
+    cx: &mut SelectCx<'_>,
+    call: Call<'_>,
+    (group, handle): (u32, ValueId),
+    sampler: SamplerArg,
+    arm: Option<bool>,
+    m: &mut Meter,
+) -> Result<TextureStrategy, Error> {
     let image = ImageRef::Heap { group, handle };
-    let mut x = select_one(cx, call, image, s, None, m)?;
-    x.heap_raw = select_heap_raw(cx, call, (group, handle), s)?;
+    let mut x = select_one(cx, call, image, sampler, arm, m)?;
+    x.heap_raw = select_heap_raw(cx, call, (group, handle), sampler, m)?;
     Ok(TextureStrategy::Sampling(Box::new(x)))
+}
+
+/// A heap image sampled through a sampler of several static candidates `cands`, chosen by handle
+/// `smp_handle` (a table of constexpr samplers read at an index the run knows): a switch-at-use
+/// with one arm per candidate, each the heap element's sampling through that sampler
+/// ([`select_heap_arm`]), the absent sampler's the absent read, and every other handle value the
+/// null arm, zero. A tangled use is planned as a static texture's switch plans it ([`tangled`]).
+fn select_heap_switch(
+    cx: &mut SelectCx<'_>,
+    call: Call<'_>,
+    heap: (u32, ValueId),
+    smp_handle: ValueId,
+    cands: &[Candidate],
+    m: &mut Meter,
+) -> Result<TextureStrategy, Error> {
+    if let Some(array) = select_heap_array(cx, call, heap, smp_handle, cands, m)? {
+        return Ok(array);
+    }
+    let ops = Operands {
+        t: call.t,
+        args: call.args,
+    };
+    let (hoist, queries) = tangled(cx, &ops, cands.len())?;
+    let mut arms = Vec::with_capacity(cands.len());
+    for &c in cands {
+        let one = match c {
+            Candidate::Absent => AbsentArgument::select(cx, call.at, call.inst, call.t)?,
+            c => {
+                let s = sampler_of(cx, c)?;
+                select_heap_arm(cx, call, heap, s, Some(hoist.is_some()), m)?
+            }
+        };
+        arms.push((vec![c.handle()], one));
+    }
+    let prelude = prelude(cx, (hoist, queries), &arms, &ops, cands)?;
+    Ok(TextureStrategy::Switch(Box::new(Switch {
+        handles: vec![smp_handle],
+        arms,
+        null: NullArm::Zero(cx.lowered_repr(Value::Inst(call.at), call.inst.ty)?),
+        prelude,
+    })))
+}
+
+/// A heap image sampled through one of the constexpr samplers `cands`, chosen by handle
+/// `smp_handle`, as one sampling through an array of the candidates' samplers
+/// (`Source::HeapArray`): its element `smp_handle - first` is exactly the sampler of the candidate
+/// of that handle, and the raw emulation reads that element's state word
+/// (`heap_raw::State::Table`), as it states whether the sampling reads one texel where the
+/// candidates differ in that (`OneTexel::Table`). Where every candidate is a constexpr sampler,
+/// their handles consecutive (`first..first + n`); the device indexes an array of samplers by a
+/// value that may differ between invocations (`shaderSampledImageArrayNonUniformIndexing`, which
+/// the heap's own image array already needs); the use is not tangled; and each candidate's
+/// sampling is the same but for its sampler, the state its raw emulation follows, and whether it
+/// reads one texel. `None` otherwise, and the switch over the candidates stays.
+fn select_heap_array(
+    cx: &mut SelectCx<'_>,
+    call: Call<'_>,
+    heap: (u32, ValueId),
+    smp_handle: ValueId,
+    cands: &[Candidate],
+    m: &mut Meter,
+) -> Result<Option<TextureStrategy>, Error> {
+    use super::heap_raw::State;
+    if cands.len() < 2 || !cx.profile.fields().descriptors.non_uniform_sampled_image {
+        return Ok(None);
+    }
+    if !cands
+        .iter()
+        .all(|c| matches!(c, Candidate::Constexpr { .. }))
+    {
+        return Ok(None);
+    }
+    let ops = Operands {
+        t: call.t,
+        args: call.args,
+    };
+    if !matches!(tangled(cx, &ops, 1)?, (None, false)) {
+        return Ok(None);
+    }
+    let mut order = cands.to_vec();
+    order.sort_by_key(|c| c.handle());
+    let Some(first) = order.first().map(|c| c.handle()) else {
+        return Ok(None);
+    };
+    if order.iter().zip(first..).any(|(c, h)| c.handle() != h) {
+        return Ok(None);
+    }
+    // Each candidate's sampling, as the switch's arm would take it; the heap sampler uses they
+    // add are dropped where the array replaces them.
+    let before = cx.families.sampler.heap.clone();
+    let mut arms = Vec::with_capacity(order.len());
+    for &c in &order {
+        let sampler = sampler_of(cx, c)?;
+        match select_heap_arm(cx, call, heap, sampler, Some(false), m)? {
+            TextureStrategy::Sampling(x) => arms.push(*x),
+            _ => return Ok(None),
+        }
+    }
+    use crate::lower::texture::OneTexel;
+    let elements = u32::try_from(arms.len())
+        .map_err(|_| cx.invariant("constexpr sampler candidates past u32"))?;
+    // A candidate's sampling but for its sampler, its raw emulation's constant state, and whether
+    // it reads one texel, which the element's word then states (`OneTexel::Table`).
+    let shape = |x: &Sampling| -> Option<Sampling> {
+        let mut y = x.clone();
+        let Source::Heap { handle, key } = y.source else {
+            return None;
+        };
+        y.source = Source::Heap {
+            handle,
+            key: HeapKey {
+                sampler: SamplerRef::Slot(0),
+                ..key
+            },
+        };
+        if let Some(raw) = &mut y.heap_raw {
+            if !matches!(raw.state, State::Constant { .. }) {
+                return None;
+            }
+            raw.state = State::Table { elements };
+        }
+        if matches!(y.one_texel, OneTexel::Always | OneTexel::Never) {
+            y.one_texel = OneTexel::Table(elements);
+        }
+        Some(y)
+    };
+    let Some(one) = arms.first().and_then(shape) else {
+        return Ok(None);
+    };
+    if arms.iter().any(|x| shape(x).as_ref() != Some(&one)) {
+        return Ok(None);
+    }
+    let mut samplers = Vec::with_capacity(arms.len());
+    for x in &arms {
+        match x.source {
+            Source::Heap {
+                key:
+                    HeapKey {
+                        sampler: SamplerRef::Constexpr(words),
+                        ..
+                    },
+                ..
+            } => samplers.push(words),
+            _ => return Ok(None),
+        }
+    }
+    let mut words = Vec::with_capacity(samplers.len());
+    for w in &samplers {
+        words.push(super::constexpr::sampler_word(*w)?.0);
+    }
+    let one_texel = match arms.first().map(|x| x.one_texel) {
+        Some(o) if arms.iter().all(|x| x.one_texel == o) => o,
+        _ => OneTexel::Table(elements),
+    };
+    let array = super::ConstexprArray {
+        first,
+        samplers,
+        words,
+    };
+    let arrays = &mut cx.families.sampler.arrays;
+    let index = match arrays.iter().position(|a| *a == array) {
+        Some(i) => i,
+        None => {
+            arrays.push(array);
+            arrays.len() - 1
+        }
+    };
+    let index =
+        u32::try_from(index).map_err(|_| cx.invariant("constexpr sampler arrays past u32"))?;
+    let mut x = one;
+    let Source::Heap { handle, key } = x.source else {
+        return Err(cx.invariant("a heap sampling without its heap source"));
+    };
+    let key = super::HeapArrayKey {
+        group: key.group,
+        compare: key.compare,
+        array: index,
+    };
+    x.source = Source::HeapArray {
+        handle,
+        sampler: smp_handle,
+        key,
+    };
+    x.one_texel = one_texel;
+    cx.families.sampler.heap = before;
+    cx.families.sampler.heap_arrays.insert(key);
+    Ok(Some(TextureStrategy::Sampling(Box::new(x))))
 }
 
 /// The emulation of heap sampling call `call` of element `handle` of heap group `group` through
@@ -485,6 +710,7 @@ fn select_heap_raw(
     call: Call<'_>,
     (group, handle): (u32, ValueId),
     sampler: SamplerArg,
+    m: &mut Meter,
 ) -> Result<Option<super::heap_raw::HeapRaw>, Error> {
     let shape = call.t.image;
     let float = match call.t.texel {
@@ -500,12 +726,12 @@ fn select_heap_raw(
     if shape.ms || shape.depth || shape.dim == ImageDim::Buffer || !float {
         return Ok(None);
     }
-    let raw = heap_raw_sample(cx, call, (group, handle), sampler)?;
+    let raw = heap_raw_sample(cx, call, (group, handle), sampler, m)?;
     // The neutral wherever such a texture is reached, or where the runtime sampler slot's bound
     // sampler states what the emulation does not answer.
     let reads_neutral = match &raw {
         Some(r) if r.whole() => match r.state {
-            super::heap_raw::State::Constant { .. } => None,
+            super::heap_raw::State::Constant { .. } | super::heap_raw::State::Table { .. } => None,
             super::heap_raw::State::Slot { sampler } => Some(Some(sampler)),
         },
         _ => Some(None),
@@ -529,12 +755,14 @@ fn select_heap_raw(
 /// word the emulation tests. `None` for every other call, an argument buffer's sampler's
 /// among them (whose listed states the plan does not check against its textures). It
 /// plans the group's unsigned integer class (`HeapPlan::reads_raw`), the heap's decode routines,
-/// the handle's class index, and the exact routine where it may filter.
+/// the handle's class index and the decode's note (`texture::heap_raw::plan`), and the exact
+/// routine where it may filter.
 fn heap_raw_sample(
     cx: &mut SelectCx<'_>,
     call: Call<'_>,
     (group, handle): (u32, ValueId),
     sampler: SamplerArg,
+    m: &mut Meter,
 ) -> Result<Option<super::heap_raw::HeapRaw>, Error> {
     use super::bicubic::TapAddress;
     use super::heap_raw::{HeapRaw, State};
@@ -633,23 +861,34 @@ fn heap_raw_sample(
         State::Constant { address, .. } => address
             .get(a)
             .is_some_and(|m| matches!(m, TapAddress::Repeat | TapAddress::Mirror)),
-        State::Slot { .. } => true,
+        State::Slot { .. } | State::Table { .. } => true,
     };
     let moved = offset.as_deref().unwrap_or_default();
     if moved.iter().enumerate().any(|(a, k)| *k != 0 && wraps(a)) {
         cx.precision.insert(PrecisionNote::ViewBaseTexelOffset);
     }
-    if let Some(h) = cx.families.texture.heap.get_mut(&group) {
-        h.reads_raw = true;
-    }
-    cx.families.texture.heap_raw.insert(false);
-    if half {
-        cx.families.texture.heap_raw.insert(true);
-    }
-    cx.families.access.heap_class_index = true;
-    // A linear filter's sum of the decoded taps is the device's arithmetic (`extended::filtered`).
-    if gather.is_none() && !matches!(state, State::Constant { linear: false, .. }) {
-        cx.precision.insert(PrecisionNote::BicubicFilterArithmetic);
+    // Every sample takes the `float` routine, a `half` one the `half` routine too.
+    crate::lower::texture::heap_raw::plan(cx, group, &[false, half], m)?;
+    // A linear filter's sum of the decoded taps is the device's arithmetic (`extended::filtered`):
+    // a constexpr sampler's that filters, and a runtime sampler slot's where the word bound there
+    // filters (`linear::filtering_word`), as a word that reads one texel takes that texel alone;
+    // each where a texture the stage's handles can name is held by its raw texels in a form the
+    // function filters (`SpecKey::HeapRawTextures`' `FILTERED` bit), as a bfloat form's sample
+    // reads the nearest texel and any other member's is the device's own sample.
+    if gather.is_none() {
+        use crate::bind::heap::FILTERED;
+        let note = PrecisionNote::BicubicFilterArithmetic;
+        let raw = NoteTest::equal(NoteOn::HeapRaw(cx.stage), FILTERED, FILTERED);
+        let when: Vec<crate::lower::select::NoteClause> = match state {
+            // A sampler array's table is made of candidates whose states each noted their own.
+            State::Constant { linear: false, .. } | State::Table { .. } => Vec::new(),
+            State::Constant { .. } => vec![[raw].into()],
+            State::Slot { sampler: n } => super::linear::filtering_word(n)
+                .into_iter()
+                .map(|word| [raw, word].into())
+                .collect(),
+        };
+        cx.note_when(note, when, m)?;
     }
     Ok(Some(HeapRaw {
         state,
@@ -1002,6 +1241,28 @@ fn nearest_fetch(r: SamplerRef, dim: ImageDim, integer: bool) -> Result<bool, Er
         && edge)
 }
 
+/// Whether a sample or gather without comparison through constexpr sampler `words` of a texture of
+/// `shape` hands `x` itself to the device's unnormalized sampler (`PixelPosition::Unnormalized`):
+/// pixel coordinates, which that sampler reads as it is (`metal::sampler::unnormalized_reads`:
+/// one filter, no mip filter, no anisotropy, clamping addressing; Metal's own rule for a
+/// `coord::pixel` sampler), of a 1D or 2D texture that is no array (Vulkan's views for such a
+/// sampler, `VUID-vkCmdDraw-None-08609` and `-09635`).
+fn unnormalized(words: [u64; 2], shape: ImageShape) -> Result<bool, Error> {
+    let s = super::state_of(words)?;
+    Ok(s.coordinates == Coordinates::Pixel
+        && matches!(shape.dim, ImageDim::D1 | ImageDim::D2)
+        && !shape.array
+        && super::constexpr::unnormalized_reads(&s)?)
+}
+
+/// Whether constexpr sampler `words` reads a texture whose texels are `integer` or not nearest:
+/// its filters are, or the texture is integer, which no filter blends
+/// (`metal::sampler::vk_sampler`).
+fn constexpr_nearest(words: [u64; 2], integer: bool) -> Result<bool, Error> {
+    let s = super::state_of(words)?;
+    Ok(integer || (s.min_filter == Filter::Nearest && s.mag_filter == Filter::Nearest))
+}
+
 /// Select sampling call `call` of texture slot `index` through static sampler `sampler`: an
 /// extended-range sample where the slot's variant binds such a format ([`select_extended`]), else
 /// [`select_one`]'s sampling. `arm` is set for an arm of a switch-at-use, whether it reads the
@@ -1029,7 +1290,7 @@ fn select_slot(
         }
         _ => sampler,
     };
-    if let Some(sample) = select_in_place(cx, call, index, &sampler, arm)? {
+    if let Some(sample) = select_in_place(cx, call, index, &sampler, arm, m)? {
         return Ok(TextureStrategy::InPlaceSample(Box::new(sample)));
     }
     match crate::lower::texture::extended_range(cx, ImageRef::Slot(index))? {
@@ -1050,6 +1311,7 @@ fn select_in_place(
     index: u32,
     sampler: &SamplerArg,
     arm: Option<bool>,
+    m: &mut Meter,
 ) -> Result<Option<super::in_place::Sample>, Error> {
     let variant = crate::lower::texture::ycbcr_in_place(cx, index)?;
     let Some((sample, samplers)) = in_place_sample(cx, call, index, sampler, arm)? else {
@@ -1068,6 +1330,11 @@ fn select_in_place(
     s.observe(call.t.image, Some(TexelClass::Float))?;
     s.uses.read = true;
     s.offset_base |= sample.offset_base;
+    // The device's own conversion samples a planes image's slot (`in_place`'s **The device's
+    // sampler**), whose answers the runtime announces where it binds one: the model is the
+    // texel buffer's.
+    let mut sample = sample;
+    sample.model &= !cx.inputs.ycbcr_planes_sampled.contains_key(&s.slot);
     // A runtime sampler's word states the filter, the coordinates, the address modes and the
     // border color.
     if let super::extended::State::Slot { sampler: n } = sample.state {
@@ -1076,16 +1343,57 @@ fn select_in_place(
         };
         r.linear = true;
     }
-    if !matches!(
-        sample.state,
-        super::extended::State::Constant { linear: false, .. }
-    ) {
+    // A linear filter's exact sum (a gather sums nothing, and the model's linear sample blends the
+    // codes; a runtime sampler's word may still take Metal's).
+    let sums = match sample.state {
+        super::extended::State::Constant { linear, .. } => linear && !sample.model,
+        super::extended::State::Slot { .. } => true,
+    };
+    if sample.gather.is_none() && sums {
         cx.families
             .sampler
             .bicubic_routines
             .insert(super::bicubic::routines::Routine::Quad);
     }
+    if sample.model {
+        model_note(cx, &sample, m)?;
+    }
     Ok(Some(sample))
+}
+
+/// The note of the model's sample `s` (`super::in_place`'s **The model**): the codes' blend, not
+/// Metal's exact filter of the format, `PrecisionNote::HalfSampleFilter` for a `half` result and
+/// `FloatSampleFilter` for a `float` one, under the clause that the slot binds a converted 4:2:0
+/// format (`SpecKey::BoundTexelFormat`, which the runtime reads at each draw or dispatch and
+/// announces as `ycbcr-filter-not-exact`), and through a runtime sampler slot that the word bound
+/// there filters linearly and addresses no border on either plane axis
+/// (`SpecKey::BoundSamplerWord`), where the sample takes the model.
+fn model_note(
+    cx: &mut SelectCx<'_>,
+    s: &super::in_place::Sample,
+    m: &mut Meter,
+) -> Result<(), Error> {
+    use crate::metal::texel_format::{PackedTexels, TexelFormat};
+    let note = match s.half {
+        true => PrecisionNote::HalfSampleFilter,
+        false => PrecisionNote::FloatSampleFilter,
+    };
+    let format = NoteTest::equal(
+        NoteOn::Bound(s.texture),
+        TexelFormat::PACKED_MASK,
+        PackedTexels::YCbCr2048.class().0,
+    );
+    let mut clause = crate::lower::select::NoteClause::from([format]);
+    if let super::extended::State::Slot { sampler: n } = s.state {
+        let on = NoteOn::BoundSampler(n);
+        let filter = SamplerWord::MIN_LINEAR | SamplerWord::MAG_LINEAR;
+        clause.insert(NoteTest::equal(on, filter, SamplerWord::LINEAR));
+        // A mode from 4 on (clamp-to-zero, clamp-to-border) addresses a border.
+        for shift in SamplerWord::ADDRESS_SHIFT.into_iter().take(2) {
+            clause.insert(NoteTest::equal(on, 4 << shift, 0));
+        }
+    }
+    cx.note_when(note, vec![clause], m)
 }
 
 /// Whether the device's own sampler Y′CbCr conversion of a planes image takes in-place sample `s`
@@ -1093,7 +1401,8 @@ fn select_in_place(
 /// constexpr sampler that addresses no border on either plane axis (a 4:2:0 texture samples every
 /// other mode as clamp-to-edge, as that sampler does), or a runtime sampler, whose bound word the
 /// binder holds to the same (`bind::plan::slots::planes_word`); and no texel offset Metal places
-/// by a parent's size.
+/// by a parent's size; and no gather, which the conversion does not take
+/// (`VUID-RuntimeSpirv-OpTypeSampledImage-12206`).
 fn device_takes(s: &super::in_place::Sample) -> bool {
     use super::bicubic::TapAddress;
     let border = match &s.state {
@@ -1102,13 +1411,14 @@ fn device_takes(s: &super::in_place::Sample) -> bool {
         }
         super::extended::State::Slot { .. } => false,
     };
-    !border && !s.offset_base
+    !border && !s.offset_base && s.gather.is_none()
 }
 
 /// Sampling call `call` of texture slot `index` through `sampler` as the in-place form reads it
 /// (`in_place`), with the runtime sampler slots it reads (bit `n` `[[sampler(n)]]`); `None` where
-/// the form does not: anything but a 2D texture's sample or gradient sample without comparison,
-/// with a `float` or `half` result, a constant texel offset or none, no `min_lod_clamp`, and no
+/// the form does not: anything but a 2D texture's sample or gradient sample without comparison, or
+/// gather of a component without comparison (which follows no filter), with a `float` or `half`
+/// result, a constant texel offset or none, no `min_lod_clamp`, and no
 /// status word observed, through a constexpr sampler of one filter for minification and
 /// magnification (nearest or linear), no anisotropy and the weighted-average reduction, or a
 /// runtime sampler slot, whose bound word the binder holds to the same
@@ -1130,7 +1440,7 @@ fn in_place_sample(
     if arm.is_some() || shape.dim != ImageDim::D2 || shape.array || shape.ms || shape.depth {
         return Ok(None);
     }
-    let has_offset = match t.op {
+    let (has_offset, gather) = match t.op {
         TexOp::Sample {
             compare: false,
             offset,
@@ -1139,7 +1449,21 @@ fn in_place_sample(
         | TexOp::SampleGrad {
             compare: false,
             offset,
-        } => offset,
+        } => (offset, None),
+        TexOp::Gather {
+            component,
+            compare: false,
+            offset,
+        } => {
+            use crate::air::intrinsics::Component as C;
+            let component = match component {
+                None | Some(C::X) => 0,
+                Some(C::Y) => 1,
+                Some(C::Z) => 2,
+                Some(C::W) => 3,
+            };
+            (offset, Some(component))
+        }
         _ => return Ok(None),
     };
     if clamp_value(cx, &ops)?.is_some() || crate::lower::texture::observes_status(cx, at) {
@@ -1169,6 +1493,8 @@ fn in_place_sample(
             if s.max_anisotropy > 1 || s.reduction != crate::air::abi::Reduction::WeightedAverage {
                 return Ok(None);
             }
+            // A gather follows no filter.
+            let linear = linear && gather.is_none();
             let address = [s.address_s, s.address_t]
                 .into_iter()
                 .map(|m| match m {
@@ -1207,6 +1533,18 @@ fn in_place_sample(
     let coord = ops
         .get(TexRole::Coord)
         .ok_or_else(|| cx.invariant("a sampling call without a coordinate"))?;
+    // The model takes a linear sample that addresses no border and whose offset no parent's size
+    // places: a constexpr sampler's state decides now, a runtime sampler's word as it runs.
+    let model = cx.profile.fields().ycbcr_in_place_reads
+        == crate::device::YCbCrInPlacePolicy::Model
+        && gather.is_none()
+        && !offset_base
+        && match &state {
+            State::Constant {
+                linear, address, ..
+            } => *linear && !address.iter().any(|m| matches!(m, TapAddress::Border)),
+            State::Slot { .. } => true,
+        };
     let sample = super::in_place::Sample {
         texture: index,
         state,
@@ -1214,6 +1552,8 @@ fn in_place_sample(
         offset_base,
         coord: id(cx, coord)?,
         half,
+        gather,
+        model,
         result: cx.lowered_repr(Value::Inst(at), inst.ty)?,
     };
     Ok(Some((sample, samplers)))
@@ -1514,9 +1854,21 @@ fn select_extended(
     cx.families.arith.converts(form);
     let filters = !form.bfloat() && gather.is_none();
     // A linear filter's sum of the decoded taps is the device's arithmetic, as a bicubic
-    // sample's is (its 2D routine), not Metal's datapath.
-    if filters && !matches!(state, State::Constant { linear: false, .. }) {
-        cx.precision.insert(PrecisionNote::BicubicFilterArithmetic);
+    // sample's is (its 2D routine), not Metal's datapath: a constexpr sampler's that filters, and
+    // a runtime sampler slot's where the word bound there filters (`linear::filtering_word`), as a
+    // word that reads one texel of one level takes that texel alone.
+    if filters {
+        let note = PrecisionNote::BicubicFilterArithmetic;
+        match state {
+            State::Constant { linear: false, .. } => {}
+            State::Constant { .. } => {
+                cx.precision.insert(note);
+            }
+            State::Slot { sampler: n } => {
+                let when = any_of(super::linear::filtering_word(n));
+                cx.note_when(note, when, m)?;
+            }
+        }
     }
     if cubic.is_some() {
         cx.families
@@ -1525,14 +1877,22 @@ fn select_extended(
             .insert(super::bicubic::routines::Routine::Plane);
         cx.precision.insert(PrecisionNote::BicubicFilterArithmetic);
     }
-    // A linear mip filter's blend of two levels (not a 3D texture's).
-    let blends = match level {
-        Level::Base => false,
-        Level::Stated { stated, .. } => stated.linear,
-        Level::Word { .. } => form.blends_levels() && !volume,
-    };
-    if blends {
-        cx.precision.insert(PrecisionNote::BicubicFilterArithmetic);
+    // A linear mip filter's blend of two levels (not a 3D texture's): a runtime sampler slot's
+    // where the word bound there states one.
+    match level {
+        Level::Base => {}
+        Level::Stated { stated, .. } => {
+            if stated.linear {
+                cx.precision.insert(PrecisionNote::BicubicFilterArithmetic);
+            }
+        }
+        Level::Word { sampler, .. } => {
+            if form.blends_levels() && !volume {
+                let [_, linear_mip] = super::linear::filtering_word(sampler);
+                let when = any_of([linear_mip]);
+                cx.note_when(PrecisionNote::BicubicFilterArithmetic, when, m)?;
+            }
+        }
     }
     let coord = ops
         .get(TexRole::Coord)
@@ -1661,6 +2021,15 @@ fn select_one(
         Some((r, _)) => nearest_fetch(r, shape.dim, integer)?,
         None => false,
     };
+    // A sample the exact fetch takes (its arm comes first) is no unnormalized one; its sampler's
+    // gather is.
+    let native = bicubic.is_none()
+        && matches!(image, ImageRef::Slot(_))
+        && !crate::lower::texture::status_observed(cx, at)
+        && match stat {
+            Some((SamplerRef::Constexpr(words), _)) => unnormalized(words, shape)?,
+            _ => false,
+        };
     let (op, form, class, tangled) = match t.op {
         // A bicubic sample is fetches of the base level: its level, bias, gradients, and fragment
         // derivatives select nothing, so it is not tangled. A `min_lod_clamp` has no Metal
@@ -1712,6 +2081,29 @@ fn select_one(
                 Some(class),
                 false,
             )
+        }
+        // A sample the device's unnormalized sampler reads at `x` itself: level 0 (Metal's pixel
+        // sampler has no mip filter, and one filter for both), its offset added to `x` on any
+        // profile (`PixelPosition::Unnormalized`), its bias, gradients and minimum-LOD clamp
+        // selecting nothing, so it is not tangled.
+        TexOp::Sample {
+            compare: false,
+            offset: has_offset,
+            ..
+        }
+        | TexOp::SampleGrad {
+            compare: false,
+            offset: has_offset,
+        } if native => {
+            let offset = fetch_offset(cx, &ops, has_offset, lanes)?;
+            let (form, class) = texel_in(t, cross, if shape.depth { 1 } else { 4 })?;
+            let op = SampleOp::Sample {
+                lod: Lod::Level(None),
+                dref: None,
+                min_lod: None,
+                offset,
+            };
+            (op, Some(form), Some(class), false)
         }
         TexOp::Sample {
             compare,
@@ -1860,7 +2252,12 @@ fn select_one(
                 Some(C::W) => 3,
             };
             let dref = compare_ref(cx, &ops, compare)?;
-            let off = offset(cx, &ops, has_offset, lanes, true)?;
+            // The device's unnormalized sampler takes no offset: it is added to `x`, on any
+            // profile (`PixelPosition::Unnormalized`).
+            let off = match native && !compare {
+                true => fetch_offset(cx, &ops, has_offset, lanes)?,
+                false => offset(cx, &ops, has_offset, lanes, true)?,
+            };
             let (form, class) = texel_in(t, cross, 4)?;
             (
                 SampleOp::Gather {
@@ -1926,6 +2323,32 @@ fn select_one(
         SamplerArg::Static(SamplerRef::Constexpr(_), Coordinates::Pixel) if !cube => Pixel::Always,
         _ => Pixel::None,
     };
+    let position = match (native, &op, stat) {
+        (
+            true,
+            SampleOp::Sample {
+                dref: None,
+                offset: Some(_),
+                ..
+            },
+            Some((SamplerRef::Constexpr(words), _)),
+        ) if constexpr_nearest(words, integer)? => PixelPosition::UnnormalizedTexel,
+        (true, SampleOp::Sample { dref: None, .. } | SampleOp::Gather { dref: None, .. }, _) => {
+            PixelPosition::Unnormalized
+        }
+        _ => pixel_position(&op, pixel, stat.map(|(r, _)| r), integer)?,
+    };
+    // A texel's centre is `floor(x) + 0.5`, whose `floor` reads a subnormal `x` as the device
+    // does, where Metal's sampler reads its texel from `x` itself: the zero of either sign is
+    // texel 0, and a negative subnormal texel -1. So does a pixel fetch's texel `floor(x) + k`,
+    // where an offset moves that texel off the edge the clamp sends both to. The note holds where
+    // the centre can be the sample's coordinate under a mode that reads texel -1 apart from texel
+    // 0 (`centre_denormals`).
+    let when = centre_denormals(pixel, position, stat.map(|(r, _)| r))?;
+    cx.note_when(PrecisionNote::DeviceDenormals, when, m)?;
+    if matches!(op, SampleOp::PixelFetch { offset: Some(_) }) {
+        cx.precision.insert(PrecisionNote::DeviceDenormals);
+    }
     // A `half` texel's NaN is the device's decode, a bicubic sample's taps included: where the
     // bound format may hold one.
     let half = form.is_some_and(|f| f.conv == TexelConv::F16);
@@ -1963,6 +2386,7 @@ fn select_one(
         };
         s.compare |= compare;
         s.coordinates |= pixel != Pixel::None;
+        s.nearest |= position == PixelPosition::TexelBySpec;
         // A cube's gradients whose footprint the word chooses read its anisotropy.
         s.anisotropy |= matches!(
             op,
@@ -2076,18 +2500,28 @@ fn select_one(
         _ => false,
     };
     // A filtered sample's note, where Metal's own sampler filters the slot and a two-plane YCbCr
-    // format bound there takes another filter than Metal's: the clauses test the bound format
-    // alone, which the runtime reads at each draw, whatever a runtime sampler's word states (no key
-    // carries it there).
+    // format bound there takes another filter than Metal's: the clauses test the bound format,
+    // which the runtime reads at each draw, and through a runtime sampler slot the bound word's
+    // filter (`SpecKey::BoundSamplerWord`, which the plan gives: no key carries either); a heap
+    // texture's test what its handles and an argument buffer's sampler can name. A handle names a
+    // two-plane YCbCr texture (2D, one layer) only through a 2D color class.
     let by = stat.map(|(r, _)| r);
-    if let Some((note, when)) = super::linear::filter_note(cx, &op, form, (by, image))? {
-        cx.note_when(note, when, m)?;
+    let two_plane_reach = match image {
+        ImageRef::Slot(_) => true,
+        ImageRef::Heap { .. } => {
+            shape.dim == ImageDim::D2 && !shape.array && !shape.depth && !shape.ms
+        }
+    };
+    if two_plane_reach {
+        if let Some((note, when)) = super::linear::filter_note(cx, &op, form, (by, image))? {
+            cx.note_when(note, when, m)?;
+        }
     }
     // A pixel sampler's coordinate reaches the device's sampler over the level-0 size, whose
     // texels at a texel edge or a filter step's edge are the device's arithmetic's on that
     // coordinate (`pixel_note`). An argument buffer's sampler records a note of its own, which the
     // runtime announces only while a bound state can need it.
-    let when = pixel_note(pixel);
+    let when = pixel_note(pixel, position);
     let note = match pixel {
         Pixel::Heap(_) => PrecisionNote::ArgumentPixelSamplerScaling,
         _ => PrecisionNote::PixelSamplerScaling,
@@ -2103,7 +2537,8 @@ fn select_one(
     // On a device that samples through Metal's own texture unit, the `half` routine reads an
     // access's lanes only for a YCbCr field's one texel (`texture::half`): no sampler word decides
     // them. A slot's texture of a YCbCr format on the grid `8192` (`TexelFormat::YCBCR_8192`) then
-    // rounds a sample of its one texel to nearest even, where Metal rounds it with ties away,
+    // takes the device's rounding of a sample of its one texel (toward zero on MoltenVK over the
+    // M3 Max, measured; unmeasured on other Apple GPUs), where Metal rounds it with ties away,
     // noted where it is bound.
     let one_texel = match one_texel {
         crate::lower::texture::OneTexel::Word(_)
@@ -2170,6 +2605,7 @@ fn select_one(
                 texture,
                 sampler,
                 compare,
+                unnormalized: position.unnormalized(),
             };
             cx.families.sampler.combined.insert(key);
             Source::Combined(key)
@@ -2288,6 +2724,7 @@ fn select_one(
         depth: shape.depth,
         result,
         pixel,
+        position,
         residency,
         footprint,
         cube,
@@ -2349,25 +2786,152 @@ fn clamps_reference(
 
 /// Where a sampling through a sampler of pixel coordinates `pixel` hands the device a coordinate
 /// scaled by the texture's level-0 size, whose texels the device's sampler decides
-/// (`PrecisionNote::PixelSamplerScaling`): the clauses of the arms that do (empty: none).
+/// (`PrecisionNote::PixelSamplerScaling`): the clauses of the arms that do (empty: none). Neither
+/// `x` itself to the device's unnormalized sampler nor a texel's centre (`position`) is such a
+/// coordinate: the device reads exactly Metal's texel from a centre, and its own footprint from `x`.
 ///
 /// - A constexpr pixel sampler: always (its exact fetch, `SampleOp::PixelFetch`, reaches here with
 ///   [`Pixel::None`]).
-/// - A runtime sampler slot: where its word states pixel coordinates.
+/// - A runtime sampler slot: where its word states pixel coordinates, and, for a sample at its
+///   texel's centre by its `NearestPixelSampler` specialization ([`PixelPosition::TexelBySpec`]),
+///   where that does not hold.
 /// - An argument buffer's sampler ([`PrecisionNote::ArgumentPixelSamplerScaling`]): always, since
-///   its word, which the specialized module cannot read, may state pixel coordinates; the runtime
-///   announces it only while a state of pixel coordinates lives.
-fn pixel_note(pixel: Pixel) -> Vec<crate::lower::select::NoteClause> {
+///   its word, which the specialized module cannot read, may state pixel coordinates (through a
+///   linear filter, where its sample's position is [`PixelPosition::TexelByWord`], whose nearest
+///   centre's `floor` the note records too: `centre_denormals`); the runtime announces it only
+///   while such a state lives.
+fn pixel_note(pixel: Pixel, position: PixelPosition) -> Vec<crate::lower::select::NoteClause> {
     use crate::lower::select::NoteClause;
-    match pixel {
-        Pixel::None => Vec::new(),
-        Pixel::Always | Pixel::Heap(_) => vec![NoteClause::new()],
-        Pixel::Spec(n) => {
-            let coordinates =
-                NoteTest::differ(NoteOn::Sampler(n), SamplerWord::PIXEL_COORDINATES, 0);
-            vec![[coordinates].into()]
+    match (pixel, position) {
+        (Pixel::None, _) | (_, PixelPosition::Texel) => Vec::new(),
+        (_, p) if p.unnormalized() => Vec::new(),
+        (Pixel::Always | Pixel::Heap(_), _) => vec![NoteClause::new()],
+        (Pixel::Spec(n), position) => {
+            let mut clause = NoteClause::from([NoteTest::differ(
+                NoteOn::Sampler(n),
+                SamplerWord::PIXEL_COORDINATES,
+                0,
+            )]);
+            if position == PixelPosition::TexelBySpec {
+                clause.insert(NoteTest::equal(NoteOn::NearestPixel(n), 1, 0));
+            }
+            vec![clause]
         }
     }
+}
+
+/// Where a sampling through a sampler of pixel coordinates `pixel` (the static sampler `stat`) at
+/// `position` hands the device its texel's centre, `floor(x) + 0.5`, whose `floor` reads a
+/// subnormal `x` by the device's float controls (`PrecisionNote::DeviceDenormals`): the clauses of
+/// the arms that do (empty: none). Metal's sampler reads a negative subnormal as texel -1, and a
+/// `floor` that reads it as a zero makes it texel 0: an address mode that reads texel -1 as texel 0
+/// ([`centre_parts`] false: clamp to edge, mirror clamp to edge, mirrored repeat) answers alike, so
+/// a clause holds only where the `s` or `t` axis takes another mode. Code behind a constant that
+/// no other state takes cannot change that state's answer, so:
+///
+/// - a constexpr sampler's centre ([`PixelPosition::Texel`], [`PixelPosition::UnnormalizedTexel`]):
+///   where its `s` or `t` mode parts the two texels;
+/// - a runtime sampler slot's: where its word states pixel coordinates (an integer texture's
+///   centre, [`PixelPosition::Texel`]), or where its `NearestPixelSampler` specialization holds
+///   ([`PixelPosition::TexelBySpec`]), never under a normalized state, and where the bound
+///   sampler's `s` or `t` mode parts them (`NoteOn::BoundSampler`, the word the plan gives at each
+///   draw or dispatch, which no pipeline's key carries);
+/// - an argument buffer's sampler's ([`PixelPosition::TexelByWord`]): never here, its table entry's
+///   word deciding it where no specialization can; `PrecisionNote::ArgumentPixelSamplerScaling`,
+///   which the runtime announces only while a state of pixel coordinates lives, records it
+///   (`pixel_note`).
+fn centre_denormals(
+    pixel: Pixel,
+    position: PixelPosition,
+    stat: Option<SamplerRef>,
+) -> Result<Vec<crate::lower::select::NoteClause>, Error> {
+    use crate::lower::select::NoteClause;
+    use crate::metal::SamplerAddressMode as M;
+    // The clauses of `held` on a runtime slot `n`, one per axis whose bound mode parts the texels:
+    // that axis's mode is none of the three that do not.
+    let parted = |n: u32, held: NoteTest| -> Vec<NoteClause> {
+        // The s and t axes' fields of the word.
+        (SamplerWord::ADDRESS_SHIFT.iter())
+            .zip(SamplerWord::ADDRESS)
+            .take(2)
+            .map(|(&shift, mask)| {
+                let mut clause = NoteClause::from([held]);
+                for mode in [M::ClampToEdge, M::MirrorClampToEdge, M::MirrorRepeat] {
+                    let bits = mode.as_raw() << shift;
+                    clause.insert(NoteTest::differ(NoteOn::BoundSampler(n), mask, bits));
+                }
+                clause
+            })
+            .collect()
+    };
+    Ok(match (pixel, position) {
+        (Pixel::Spec(n), PixelPosition::Texel) => parted(
+            n,
+            NoteTest::differ(NoteOn::Sampler(n), SamplerWord::PIXEL_COORDINATES, 0),
+        ),
+        (Pixel::Spec(n), PixelPosition::TexelBySpec) => {
+            parted(n, NoteTest::equal(NoteOn::NearestPixel(n), 1, 1))
+        }
+        (Pixel::Heap(_), _) => Vec::new(),
+        (_, PixelPosition::Texel | PixelPosition::UnnormalizedTexel) => match stat {
+            Some(SamplerRef::Constexpr(words)) => {
+                let s = super::state_of(words)?;
+                match centre_parts(s.address_s) || centre_parts(s.address_t) {
+                    true => vec![NoteClause::new()],
+                    false => Vec::new(),
+                }
+            }
+            _ => vec![NoteClause::new()],
+        },
+        _ => Vec::new(),
+    })
+}
+
+/// Whether address mode `mode` reads texel -1 apart from texel 0 (repeat, clamp to zero, clamp to
+/// the border), where a negative subnormal coordinate's centre that a `floor` reads as a zero
+/// samples another texel than Metal's sampler; clamp to edge and mirrored repeat read texel -1 as
+/// texel 0.
+fn centre_parts(mode: AddressMode) -> bool {
+    match mode {
+        AddressMode::ClampToEdge | AddressMode::MirroredRepeat => false,
+        AddressMode::ClampToZero | AddressMode::Repeat | AddressMode::ClampToBorder => true,
+    }
+}
+
+/// What the device's normalized sampler is handed of the pixel coordinate of `op` through a sampler
+/// of pixel coordinates `pixel` (the static sampler `stat`, of a texture whose texels are `integer`
+/// or not), where the device's unnormalized sampler does not take `x` itself:
+///
+/// - a sample through a constexpr pixel sampler that filters nearest, without a mip filter or
+///   anisotropy, or of an integer texture (which every filter reads nearest): its texel's centre;
+/// - a sample through a runtime sampler slot: its texel's centre where the slot's
+///   `NearestPixelSampler` specialization states such a sampler, or always of an integer texture;
+/// - a sample through an argument buffer's sampler: its texel's centre where the table entry's
+///   word states such a sampler (`SamplerWord::nearest_pixel`);
+/// - else the quotient: a linear filter's sample, a gather (whose block the device's sampler
+///   reads from its own reading of the coordinate, as Metal's does), and a level query.
+fn pixel_position(
+    op: &SampleOp,
+    pixel: Pixel,
+    stat: Option<SamplerRef>,
+    integer: bool,
+) -> Result<PixelPosition, Error> {
+    Ok(match (op, pixel, stat) {
+        (_, Pixel::None, _) => PixelPosition::Scaled,
+        (SampleOp::Sample { .. }, Pixel::Always, Some(SamplerRef::Constexpr(words))) => {
+            let s = super::state_of(words)?;
+            let nearest =
+                integer || (s.min_filter == Filter::Nearest && s.mag_filter == Filter::Nearest);
+            match nearest && s.mip_filter == MipFilter::None && s.max_anisotropy <= 1 {
+                true => PixelPosition::Texel,
+                false => PixelPosition::Scaled,
+            }
+        }
+        (SampleOp::Sample { .. }, Pixel::Spec(_), _) if integer => PixelPosition::Texel,
+        (SampleOp::Sample { .. }, Pixel::Spec(_), _) => PixelPosition::TexelBySpec,
+        (SampleOp::Sample { .. }, Pixel::Heap(_), _) => PixelPosition::TexelByWord,
+        _ => PixelPosition::Scaled,
+    })
 }
 
 /// Whether sampling `op` through `sampler` reads one texel of one level: a 2D gather and a pixel

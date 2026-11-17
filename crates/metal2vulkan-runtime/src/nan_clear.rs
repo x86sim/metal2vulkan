@@ -43,6 +43,10 @@
 //! hands such a store to its driver (`render_target::DontCare::Discarded`, MoltenVK among them),
 //! where Metal keeps the texture's earlier texels, which the word would replace; and a
 //! multisampled depth on a device without either form of the write.
+//! A `DontCare` load's NaN clear depth, which Metal's tiles hold alike where its draws touch
+//! them, is not written: where the pass clears that load (`clear_reach::dont_care_loads`), a
+//! `Depth16Unorm` clears to 0, Metal's answer, and a 32-bit float depth to 1.0, announced
+//! (`signed-depth-test`).
 
 use super::blit::TRANSFER;
 use super::buffer::Buffer;
@@ -110,13 +114,17 @@ pub(super) fn degrade_nan_clears(device: &Device, layout: &PassLayout, drew: boo
 }
 
 /// Whether Metal's NaN clear of `target`, in a pass with a draw call where `called`, keeps a
-/// `half` NaN's sign (the module docs): its texture (a view's first texture) is one Metal keeps
-/// losslessly compressed (`heap_tiled::metal_compresses`: not over a buffer, of no usage Metal
-/// keeps uncompressed, optimized contents allowed), the attachment's level is 16 texels or more
-/// a side, counted in pixels at any sample count, and the pass has no draw call. A resolve
-/// texture's level of the same keeps the clear's texel through the pass's resolve.
+/// `half` NaN's sign (the module docs), which is also whether its clear takes the straight route
+/// (`render.rs`): on a device that presents an Apple silicon Mac's compression
+/// (`Device::metal_compresses_textures`; on one that presents a Mac keeping none, as a Mac with
+/// an Intel or AMD GPU does, never: expected rather than measured), its texture (a view's first
+/// texture) is one Metal keeps losslessly compressed (`heap_tiled::metal_compresses`: not over a
+/// buffer, of no usage Metal keeps uncompressed, optimized contents allowed), the attachment's
+/// level is 16 texels or more a side, counted in pixels at any sample count, and the pass has no
+/// draw call. A resolve texture's level of the same keeps the clear's texel through the pass's
+/// resolve.
 pub(super) fn keeps_nan_sign(target: &Target, called: bool) -> bool {
-    if called {
+    if called || !target.texture.generation().metal_compresses_textures() {
         return false;
     }
     let mut root = &target.texture;

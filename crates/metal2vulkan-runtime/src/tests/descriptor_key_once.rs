@@ -22,12 +22,10 @@ use super::blit_holds::{device, Scratch};
 use crate::{Device, PipelineOption, PipelineOptions, RenderPipelineState};
 use metal2vulkan::metal::PixelFormat;
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
-use std::path::Path;
 
 /// The fixture's render descriptor, one `RGBA8Unorm` target.
 pub(super) fn descriptor(device: &Device) -> RenderPipelineDescriptor {
-    let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/fixtures/public/engine/ubo_bind_offsets.ll");
+    let ll = metal2vulkan_devtools::engine_dir().join("ubo_bind_offsets.ll");
     let bitcode = metal2vulkan_devtools::llvm_assemble(&ll).unwrap();
     let library = device.new_library_with_compile_library(
         metal2vulkan::library::Library::from_air(&bitcode).unwrap(),
@@ -108,6 +106,30 @@ fn a_render_creation_builds_one_descriptor_key() {
         &reflected[1..],
         &made[1..],
         "the second creation's other work: nothing made again for one descriptor"
+    );
+}
+
+/// A plain render creation -- rasterizing, a vertex and a fragment function, no indirect command
+/// buffers -- on a fresh device asks two linked-use questions (the fragment's depth write and the
+/// unwritten fragment inputs) and specializes its two stages once each. Whether its vertex
+/// function returns a value is no question of its own: the compile reads it from the vertex entry
+/// it specializes anyway, and its link refuses a `void` one (`pipeline/unrasterized.rs`). A
+/// question for it would cost every such creation a third question and a third stage entry, over
+/// the conformance cost records.
+#[test]
+fn a_plain_render_creation_asks_two_questions_and_specializes_two_stages() {
+    let scratch = Scratch::new("plain-render-counts");
+    let device = device(&scratch.0);
+    let descriptor = descriptor(&device);
+    let before = built(&device);
+    device
+        .new_render_pipeline_state(&descriptor, &PipelineOptions::default())
+        .unwrap();
+    let made = built(&device);
+    assert_eq!(
+        [made[4] - before[4], made[5] - before[5]],
+        [2, 2],
+        "stage entries specialized and linked-use questions asked"
     );
 }
 

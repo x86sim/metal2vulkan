@@ -81,6 +81,7 @@ GPUINFO_DISPLAY = "https://vulkan.gpuinfo.org/displayreport.php?id={}"
 # and keeps the device's value whatever a profile states.
 UNREQUIRED_PROPERTIES_BLOCK = "m2v_unrequired_properties"
 UNREQUIRED_PROPERTIES = {
+    "VkPhysicalDeviceProperties": {"limits": {"strictLines": False}},
     "VkPhysicalDeviceVulkan11Properties": {"subgroupQuadOperationsInAllStages": False},
 }
 
@@ -181,6 +182,12 @@ CORE_PROPERTIES = {
         # Without `largePoints` a device's points are 1.0 (`pointSizeRange` (1.0, 1.0)), the
         # bound the reader takes for an absent range.
         "pointSizeRange": [1.0, 1.0],
+        # Without `wideLines` a device's lines are 1.0 (`lineWidthRange` (1.0, 1.0),
+        # `lineWidthGranularity` 0.0); subPixelPrecisionBits' guarantee is 4; strictLines none.
+        "subPixelPrecisionBits": 4,
+        "lineWidthRange": [1.0, 1.0],
+        "lineWidthGranularity": 0.0,
+        "strictLines": False,
     }}),
     "VkPhysicalDeviceVulkan11Properties": (1, {
         "subgroupSize": 1,
@@ -232,6 +239,7 @@ EXTENSION_PROPERTIES = {
         "requiredSubgroupSizeStages": [],
     },
     "VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT": {"maxVertexAttribDivisor": 0},
+    "VkPhysicalDeviceMaintenance5Properties": {"nonStrictWideLinesUseParallelogram": False},
     "VkPhysicalDeviceSampleLocationsPropertiesEXT": {
         "sampleLocationSampleCounts": [],
         "variableSampleLocations": False,
@@ -417,14 +425,14 @@ SOURCES = [
     {
         "name": "amd-780m-radv",
         "kind": "vulkaninfo",
-        "sha256": "7a95a457cbb9811a7a65bad8a4fa1ccd63bebe64cdaa8296e662baa4ba5fcd79",
-        "profile": "VP_VULKANINFO_AMD_Radeon_780M_Graphics_(RADV_PHOENIX)_26_2_4",
+        "sha256": "f109b309ae26d97339bb5b26f4ed5d6aa60c16dd8affeec6c5719bcda4d90601",
+        "profile": "VP_VULKANINFO_AMD_Radeon_780M_Graphics_(RADV_PHOENIX)_26_2_6",
         "command": "vulkaninfo --json",
-        "host": ("AMD Radeon 780M (Phoenix), CachyOS: mesa and vulkan-radeon 26.2.4, "
+        "host": ("AMD Radeon 780M (Phoenix), CachyOS: mesa and vulkan-radeon 26.2.6, "
                  "vulkan-icd-loader and vulkan-tools 1.4.363.0"),
         "formats": {
             "command": "corpus-vulkan --capture-formats OUT --device-type gpu",
-            "sha256": "d06d4b4c3ebbdd56252670ddffae10dac01d2090a71e3ffae5c0fbdba26b78d2",
+            "sha256": "987f79dcaea1d8ac4e1f7565377e81d656e15af810dee851a4b14d8515969387",
         },
     },
     {
@@ -433,33 +441,33 @@ SOURCES = [
         # the same RADV build, differs from `amd-780m-radv`'s only in the deviceID.
         "name": "amd-780m-hawkpoint-radv",
         "kind": "vulkaninfo",
-        "sha256": "2a79388cb4ef4f6dbe99fd31217b6eb6b200c1d92c3e12304e99efb15c46cd3c",
-        "profile": "VP_VULKANINFO_AMD_Radeon_780M_Graphics_(RADV_PHOENIX)_26_2_4",
+        "sha256": "bafbfbfad3ee3d4cdac62485d73e45291cd7dcf4e0a145534ebe6d0bacc4deb5",
+        "profile": "VP_VULKANINFO_AMD_Radeon_780M_Graphics_(RADV_PHOENIX)_26_2_6",
         "command": "vulkaninfo --json",
         "host": ("AMD Radeon 780M (Hawk Point, Ryzen 7 8845HS), CachyOS: mesa and vulkan-radeon "
-                 "26.2.4, vulkan-icd-loader and vulkan-tools 1.4.363.0"),
+                 "26.2.6, vulkan-icd-loader and vulkan-tools 1.4.363.0"),
         "formats": {
             "command": "corpus-vulkan --capture-formats OUT --device-type gpu",
-            "sha256": "d999da3206596ae9b15e9c523b098bdda379b4c2a8a214076e7fc8804e095321",
+            "sha256": "8bc7553ce483f8d294d1e4dcf336086f56f338791958f99f3b68c240a4daa5e6",
         },
     },
     {
         "name": "intel-irisxe-rplp-anv",
         "kind": "vulkaninfo",
-        "sha256": "6d34a34db319ee2f6b45f0fadac382cb5d3b3e7a5f5816513a71cd4080d34c8d",
-        "profile": "VP_VULKANINFO_Intel(R)_Iris(R)_Xe_Graphics_(RPL-P)_26_2_4",
+        "sha256": "270ab1aa612b3430b1bf041fe6c41ec140921cc3c4b8b16f29f51d192163ad38",
+        "profile": "VP_VULKANINFO_Intel(R)_Iris(R)_Xe_Graphics_(RPL-P)_26_2_6",
         "command": "vulkaninfo --json",
         "host": ("Intel Iris Xe Graphics (Raptor Lake-P), CachyOS: mesa and vulkan-intel "
-                 "26.2.4, vulkan-icd-loader and vulkan-tools 1.4.357.0"),
+                 "26.2.6, vulkan-icd-loader and vulkan-tools 1.4.363.0"),
         "formats": {
             "command": "corpus-vulkan --capture-formats OUT --device-type gpu",
-            "sha256": "6e532de1596b32bb703505c7ca6670358f9200386dd2a2d72f4ad0229164e8ff",
+            "sha256": "81e40f063157bc2bb874574b38aeeeb7084505a08963d9158e34a1403020c1ec",
         },
     },
     {
         # The second device the intel-irisxe-rplp-anv venue allows: an i9-13900's UHD Graphics 770
-        # (Raptor Lake-S), under the same ANV build and loader as the venue's Iris Xe (RPL-P); its
-        # capture derives the venue's translation key.
+        # (Raptor Lake-S), captured under ANV 26.2.4 (the venue's Iris Xe (RPL-P) is captured
+        # under 26.2.6); its capture derives the venue's translation key.
         "name": "intel-uhd770-rpls-anv",
         "kind": "vulkaninfo",
         "sha256": "c4088e885bf46fc414e55a56fdb0f5b946ae6a34af61e2667891cab6089f8ca2",
@@ -1302,10 +1310,15 @@ def derive(registry, data, source, formats):
         "dropped_features": sorted(dropped),
         "spec_corrections": sorted(corrected),
     }
+    def flattened(struct, members):
+        nested = members.get("limits") if struct == "VkPhysicalDeviceProperties" else None
+        return nested if nested is not None else members
+
     stated = {(struct, member) for block in capabilities.values()
-              for struct, members in block.get("properties", {}).items() for member in members}
+              for struct, members in block.get("properties", {}).items()
+              for member in flattened(struct, members)}
     restated = sorted(f"{struct}.{member}" for struct, members in UNREQUIRED_PROPERTIES.items()
-                      for member in members if (struct, member) in stated)
+                      for member in flattened(struct, members) if (struct, member) in stated)
     if restated:
         raise SystemExit(f"{source['name']}: the base profile now states {restated}")
     capabilities[UNREQUIRED_PROPERTIES_BLOCK] = {

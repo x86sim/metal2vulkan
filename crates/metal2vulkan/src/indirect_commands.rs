@@ -93,6 +93,22 @@ pub const COMMAND_BYTES: usize =
     ((THREADGROUP_WORD + THREADGROUP_COUNT + 2) * 4).next_multiple_of(8);
 /// Host-initialized command count, atomic encoding-fault flag, descriptor flags, and packed binding counts.
 pub const COMMAND_BUFFER_HEADER_BYTES: usize = 16;
+/// Bytes of one command's written flag (a `u32`), past every record ([`written_flag_offset`]).
+pub const WRITTEN_FLAG_BYTES: usize = 4;
+
+/// The byte offset of command `index`'s written flag in the storage of a buffer of `capacity`
+/// commands: the flags follow the records, one `u32` a command. Each encoder operation that
+/// writes a command's record (one the header's policy takes, `lower::access::encode`) stores 1
+/// at its flag, contained as the record's fields are: storage that ends at its records takes no
+/// flag, and its records are written as before. A consumer whose storage holds the flags, and
+/// whose own writes of the records set them as well, knows a record whose flag is clear to hold
+/// what it last reset it to, and may reset only the flagged ones, clearing each flag with its
+/// record (`bind::IcbResetModule`).
+pub const fn written_flag_offset(capacity: u32, index: u32) -> u64 {
+    COMMAND_BUFFER_HEADER_BYTES as u64
+        + capacity as u64 * COMMAND_BYTES as u64
+        + index as u64 * WRITTEN_FLAG_BYTES as u64
+}
 
 /// The guest address of the records of the indirect command buffer of resource ID 0, the null
 /// one, which no records lie at ([`records_address`]).
@@ -191,10 +207,18 @@ pub(crate) mod layout {
     /// A record's pipeline state word (`u32`, after the imageblock size, 8-byte aligned and alone
     /// in its `u64`): [`RETAINED`] where the pipeline word holds the pipeline a compute command's
     /// reset left it executing with, which its read-back reports cleared, as Metal's getter does;
-    /// 0 otherwise.
+    /// [`KERNEL_PIPELINE`] where a kernel's encoder wrote the pipeline word; 0 where the pipeline
+    /// word holds no pipeline. Each bit lies only beside a pipeline.
     pub(crate) const STATE: u64 = IMAGEBLOCK + 4;
     /// The state word's bit of a retained pipeline.
     pub(crate) const RETAINED: u32 = 1;
+    /// The state word's bit of a pipeline a kernel's encoder wrote: its pipeline setter, or its
+    /// copy from a command whose pipeline one wrote ([`CommandRecord::kernel_pipeline`]).
+    ///
+    /// [`CommandRecord::kernel_pipeline`]: super::CommandRecord::kernel_pipeline
+    pub(crate) const KERNEL_PIPELINE: u32 = 2;
+    /// Both bits of the state word.
+    pub(crate) const STATE_BITS: u32 = RETAINED | KERNEL_PIPELINE;
 }
 
 /// The descriptor policy an encoder operation's write requires of the record header: its
@@ -564,6 +588,13 @@ pub enum Action {
 }
 
 impl Action {
+    /// What a record holding the action, and no barrier, holds of what a command may write
+    /// ([`CommandRecord::writes`] of such a record): its operation, and a draw's primitive type
+    /// (every type for a private one, past Metal's five).
+    pub fn writes(&self) -> crate::pipeline::CommandWrites {
+        writes_of(self, false)
+    }
+
     /// Whether the action's arguments take the stage-in region's words
     /// (`layout::DRAW_ARGUMENT_WORDS`): an indexed draw's, a patch draw's, an indexed patch
     /// draw's or a mesh draw's. A render command sets no stage-in region.
@@ -640,6 +671,13 @@ pub struct CommandRecord {
     /// it (measured on the M3 Max and the M4). A pipeline setter, or a copy from a command that
     /// reports one, replaces it. Never beside `bindings.pipeline`.
     pub retained_pipeline: Option<NonZeroU64>,
+    /// Whether a kernel's encoder wrote the pipeline the command executes with (its pipeline
+    /// setter, or its copy from a command whose pipeline one wrote), rather than a CPU setter:
+    /// Metal's kernel resolves the ID it writes to the state holding it as it writes, where the
+    /// CPU's setter names the state it is handed, so a replay that tells the two apart needs it.
+    /// A CPU pipeline setter clears it; a compute command's reset keeps it with the pipeline it
+    /// retains. Never without a pipeline.
+    pub kernel_pipeline: bool,
 }
 
 /// Why a record was refused: its length, an unknown action, a barrier flag other than 0 or 1,
@@ -663,7 +701,7 @@ pub enum RecordError {
     /// (`layout::DRAW_ARGUMENT_WORDS`): a render command sets none.
     StageInRegion,
     /// A retained pipeline beside a set one, or a pipeline state word with a bit other than
-    /// `layout::RETAINED`, or that bit without a pipeline.
+    /// `layout::RETAINED` and `layout::KERNEL_PIPELINE`, or either bit without a pipeline.
     PipelineState,
     /// A threadgroup length set beside an indexed patch draw, whose control-point index buffer
     /// takes the first two lengths' words (`layout::CONTROL_POINT_INDICES`): a render command
@@ -753,17 +791,26 @@ impl CommandRecord {
         if self.bindings.pipeline.is_some() && self.retained_pipeline.is_some() {
             return Err(RecordError::PipelineState);
         }
+        let pipeline = self.bindings.pipeline.or(self.retained_pipeline);
+        if self.kernel_pipeline && pipeline.is_none() {
+            return Err(RecordError::PipelineState);
+        }
         bytes.fill(0);
         let (tag, arguments) = action_words(&self.action);
         put_word(bytes, 0, tag);
         put_word(bytes, 1, u32::from(self.barrier));
         // The pipeline word holds the pipeline the command executes with; the state word says
-        // whether the read-back reports it.
-        let pipeline = self.bindings.pipeline.or(self.retained_pipeline);
+        // whether the read-back reports it, and whether a kernel wrote it.
         put_u64(bytes, 2, pipeline.map_or(0, NonZeroU64::get));
-        if self.retained_pipeline.is_some() {
-            put_word(bytes, layout::STATE as usize / 4, layout::RETAINED);
-        }
+        let retained = match self.retained_pipeline {
+            Some(_) => layout::RETAINED,
+            None => 0,
+        };
+        let kernel = match self.kernel_pipeline {
+            true => layout::KERNEL_PIPELINE,
+            false => 0,
+        };
+        put_word(bytes, layout::STATE as usize / 4, retained | kernel);
         let first = layout::ARGUMENTS as usize / 4;
         for (index, value) in arguments.into_iter().enumerate() {
             put_word(bytes, first + index, value);
@@ -799,7 +846,8 @@ impl CommandRecord {
     }
 }
 
-/// What a record of `action` and `barrier` holds ([`CommandRecord::writes`]).
+/// What a record of `action` and `barrier` holds ([`CommandRecord::writes`]): its action's
+/// command kind too, a dispatch's compute and a draw's render; a record of no action names none.
 pub(crate) fn writes_of(action: &Action, barrier: bool) -> crate::pipeline::CommandWrites {
     use crate::pipeline::CommandWrites;
     let draw = |operations: u32, primitive_type: u32| CommandWrites {
@@ -809,25 +857,27 @@ pub(crate) fn writes_of(action: &Action, barrier: bool) -> crate::pipeline::Comm
         } else {
             CommandWrites::ALL_PRIMITIVE_TYPES
         },
+        kinds: CommandWrites::RENDER_COMMANDS,
     };
-    let only = |operations: u32| CommandWrites {
+    let only = |operations: u32, kinds: u8| CommandWrites {
         operations,
         primitive_types: 0,
+        kinds,
     };
     let mut writes = match *action {
         Action::Empty => CommandWrites::NONE,
         Action::DispatchThreadgroups { .. } | Action::DispatchThreads { .. } => {
-            only(CommandWrites::DISPATCH)
+            only(CommandWrites::DISPATCH, CommandWrites::COMPUTE_COMMANDS)
         }
         Action::DrawPrimitives { primitive_type, .. } => draw(CommandWrites::DRAW, primitive_type),
         Action::DrawIndexedPrimitives { primitive_type, .. } => {
             draw(CommandWrites::DRAW_INDEXED, primitive_type)
         }
         Action::DrawPatches { .. } | Action::DrawIndexedPatches { .. } => {
-            only(CommandWrites::DRAW_PATCHES)
+            only(CommandWrites::DRAW_PATCHES, CommandWrites::RENDER_COMMANDS)
         }
         Action::DrawMeshThreadgroups { .. } | Action::DrawMeshThreads { .. } => {
-            only(CommandWrites::DRAW_MESH)
+            only(CommandWrites::DRAW_MESH, CommandWrites::RENDER_COMMANDS)
         }
     };
     if barrier {
@@ -873,11 +923,14 @@ impl CommandRecord {
     /// have changed.
     pub fn write_field(bytes: &mut [u8], field: RecordField) -> Result<Range<usize>, RecordError> {
         let view = RecordView::new(bytes)?;
-        let (action, retained) = (view.action(), view.retained_pipeline().is_some());
-        let (stage_in, lengths) = (
-            view.stage_in_region(),
-            [0, 1].map(|index| view.threadgroup_memory_length(index).unwrap_or(0)),
-        );
+        // The stage-in region and the first two lengths are read only for an action, which checks
+        // them: a setter of another field reads no more of the record than `RecordView::new` does.
+        let action = view.action();
+        let flagged = view.retained_pipeline().is_some() || view.kernel_pipeline();
+        let stage_in = |view: &RecordView<'_>| view.stage_in_region();
+        let lengths = |view: &RecordView<'_>| {
+            [0, 1].map(|index| view.threadgroup_memory_length(index).unwrap_or(0))
+        };
         let word_bytes = |word: usize, words: usize| word * 4..(word + words) * 4;
         match field {
             RecordField::Barrier(barrier) => {
@@ -886,7 +939,8 @@ impl CommandRecord {
             }
             RecordField::Pipeline(pipeline) => {
                 put_u64(bytes, 2, pipeline.get());
-                if !retained {
+                // A pipeline the CPU sets is reported, and not a kernel's.
+                if !flagged {
                     return Ok(word_bytes(2, 2));
                 }
                 let state = layout::STATE as usize;
@@ -959,6 +1013,7 @@ impl CommandRecord {
                 Ok(at..at + 4)
             }
             RecordField::Action(new) => {
+                let (stage_in, lengths) = (stage_in(&view), lengths(&view));
                 let wide = new.takes_stage_in_words();
                 if wide && stage_in != [0; 6] {
                     return Err(RecordError::StageInRegion);

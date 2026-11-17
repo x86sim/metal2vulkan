@@ -90,6 +90,7 @@ fn every_fact() -> Vec<RuntimeFact> {
         RuntimeFact::StorageTextureNumericType { slot },
         RuntimeFact::OutOfBoundsAlpha { slot },
         RuntimeFact::BicubicTexels { slot },
+        RuntimeFact::BorderTexels { slot },
         RuntimeFact::StorageTextureLevels { slot },
         RuntimeFact::StorageTextureLevelViews { slot },
         RuntimeFact::SparseTexture {
@@ -128,7 +129,12 @@ fn every_fact() -> Vec<RuntimeFact> {
         RuntimeFact::ViewportCount,
         RuntimeFact::AliasedImageblock { data_size: 24 },
         RuntimeFact::CallStackDepth { depth: 8 },
+        RuntimeFact::OpenClMode,
+        RuntimeFact::RowLockstep,
+        RuntimeFact::OneRow,
+        RuntimeFact::UnitAxes { axes: 0, relief: 2 },
         RuntimeFact::FlatGrid,
+        RuntimeFact::CallThreadgroups,
         RuntimeFact::SparseTextureWrites {
             slot,
             atomic: false,
@@ -153,14 +159,18 @@ fn every_fact() -> Vec<RuntimeFact> {
         RuntimeFact::FoldedGroups,
         RuntimeFact::ReplayBindings,
         RuntimeFact::MergedDraws,
+        RuntimeFact::PartialObjectThreadgroups,
         RuntimeFact::QuadPrimitiveIds,
         RuntimeFact::RotatedWeights,
         RuntimeFact::PrivateList,
+        RuntimeFact::RegionViewports,
+        RuntimeFact::PartialThreadgroups,
         RuntimeFact::YCbCrInPlace {
             slot,
             samplers: 1,
             device: true,
         },
+        RuntimeFact::TexelRows { slot },
         RuntimeFact::MeshLastFirst,
         RuntimeFact::AbsentArgumentRead {
             stage: Stage::Fragment,
@@ -208,6 +218,18 @@ fn every_fact() -> Vec<RuntimeFact> {
             },
             kept: crate::vk::ColorComponentFlags::empty(),
         },
+        RuntimeFact::RotatedInputBlend {
+            color: 0,
+            blend: {
+                let mut c = crate::pipeline::ColorAttachmentDescriptor::new(
+                    crate::metal::PixelFormat::ARGB8Unorm,
+                );
+                c.blending_enabled = true;
+                c.destination_rgb_blend_factor = crate::metal::BlendFactor::DestinationAlpha;
+                crate::pipeline::lower_inputs::BlendEquation::of(&c).expect("a blend")
+            },
+            kept: crate::vk::ColorComponentFlags::empty(),
+        },
         RuntimeFact::WordInputMerge {
             color: 1,
             kept: crate::vk::ColorComponentFlags::G,
@@ -230,6 +252,21 @@ fn every_fact() -> Vec<RuntimeFact> {
                 format: crate::pipeline::sym::StorageFormatClass::NotStorage,
             },
             every_member: true,
+        },
+        RuntimeFact::HeapResidency {
+            stage: Stage::Fragment,
+        },
+        RuntimeFact::HeapStorageReads {
+            stage: Stage::Kernel,
+            class: crate::pipeline::sym::ImageHandleClass {
+                dim: crate::pipeline::sym::ImageDim::D2,
+                arrayed: false,
+                multisampled: false,
+                sampled_type: crate::pipeline::sym::SampledType::Float,
+                depth_compare: false,
+                access: crate::pipeline::sym::ImageAccess::Storage,
+                format: crate::pipeline::sym::StorageFormatClass::Unknown,
+            },
         },
         RuntimeFact::AnisotropicSampler {
             slot: SlotRef {
@@ -355,6 +392,19 @@ fn variant(f: &RuntimeFact) -> usize {
         RuntimeFact::PrivateList => 86,
         RuntimeFact::MeshLastFirst => 71,
         RuntimeFact::YCbCrInPlace { .. } => 65,
+        RuntimeFact::PartialObjectThreadgroups => 89,
+        RuntimeFact::RotatedInputBlend { .. } => 90,
+        RuntimeFact::OpenClMode => 91,
+        RuntimeFact::RowLockstep => 92,
+        RuntimeFact::BorderTexels { .. } => 93,
+        RuntimeFact::HeapResidency { .. } => 94,
+        RuntimeFact::OneRow => 95,
+        RuntimeFact::RegionViewports => 96,
+        RuntimeFact::CallThreadgroups => 97,
+        RuntimeFact::PartialThreadgroups => 98,
+        RuntimeFact::TexelRows { .. } => 99,
+        RuntimeFact::HeapStorageReads { .. } => 100,
+        RuntimeFact::UnitAxes { .. } => 101,
     }
 }
 
@@ -362,7 +412,7 @@ fn variant(f: &RuntimeFact) -> usize {
 fn mechanism_is_total_over_every_fact_and_profile() {
     let facts = every_fact();
     let covered: std::collections::BTreeSet<usize> = facts.iter().map(variant).collect();
-    assert_eq!(covered, (0..89).collect(), "every_fact misses a variant");
+    assert_eq!(covered, (0..102).collect(), "every_fact misses a variant");
     for (stem, _) in super::committed_profiles() {
         let dev = device(&stem);
         let p = dev.profile();
@@ -382,6 +432,7 @@ fn mechanism_is_total_over_every_fact_and_profile() {
                 | RuntimeFact::TileFunction
                 | RuntimeFact::OutOfBoundsAlpha { .. }
                 | RuntimeFact::BicubicTexels { .. }
+                | RuntimeFact::BorderTexels { .. }
                 | RuntimeFact::SparseTexture {
                     sparse_arm: true, ..
                 }
@@ -409,10 +460,13 @@ fn mechanism_is_total_over_every_fact_and_profile() {
                 | RuntimeFact::StorageTextureWriteRounding { .. }
                 | RuntimeFact::HeapWriteRounding { .. }
                 | RuntimeFact::HeapCrossClassNeutral { .. }
-                | RuntimeFact::ObjectThreadgroupArena { .. } => Mechanism::PlanTimeCheck,
-                RuntimeFact::DispatchGrid | RuntimeFact::TileThreadgroup { .. } => {
-                    Mechanism::RegionSelected
-                }
+                | RuntimeFact::HeapResidency { .. }
+                | RuntimeFact::HeapStorageReads { .. }
+                | RuntimeFact::ObjectThreadgroupArena { .. }
+                | RuntimeFact::RowLockstep => Mechanism::PlanTimeCheck,
+                RuntimeFact::DispatchGrid
+                | RuntimeFact::TileThreadgroup { .. }
+                | RuntimeFact::PartialObjectThreadgroups => Mechanism::RegionSelected,
                 RuntimeFact::IndirectGroupCount => {
                     if f.limits.max_compute_work_group_count == [u32::MAX; 3] {
                         Mechanism::None
@@ -428,6 +482,10 @@ fn mechanism_is_total_over_every_fact_and_profile() {
                 | RuntimeFact::SrgbTexture { .. }
                 | RuntimeFact::CrossClassReads { .. }
                 | RuntimeFact::FlatGrid
+                | RuntimeFact::CallThreadgroups
+                | RuntimeFact::PartialThreadgroups
+                | RuntimeFact::OneRow
+                | RuntimeFact::UnitAxes { .. }
                 | RuntimeFact::AmplificationDraws { .. }
                 | RuntimeFact::ViewportCompensation { .. }
                 | RuntimeFact::FoldedGroups
@@ -435,7 +493,9 @@ fn mechanism_is_total_over_every_fact_and_profile() {
                 | RuntimeFact::MergedDraws
                 | RuntimeFact::QuadPrimitiveIds
                 | RuntimeFact::PrivateList
+                | RuntimeFact::RegionViewports
                 | RuntimeFact::YCbCrInPlace { .. }
+                | RuntimeFact::TexelRows { .. }
                 | RuntimeFact::ZeroedColor { .. }
                 | RuntimeFact::DroppedColor { .. }
                 | RuntimeFact::DepthClampRange
@@ -480,6 +540,7 @@ fn mechanism_is_total_over_every_fact_and_profile() {
                 | RuntimeFact::ShaderStencilTest { .. }
                 | RuntimeFact::TileImageblock { .. }
                 | RuntimeFact::ExtendedRangeInputBlend { .. }
+                | RuntimeFact::RotatedInputBlend { .. }
                 | RuntimeFact::WordInputMerge { .. } => Mechanism::RenderPassContract,
                 RuntimeFact::ExecutionStatus => match f.buffer_access {
                     crate::device::profile::BufferAccess::Addressed => Mechanism::PushConstant,
@@ -496,6 +557,7 @@ fn mechanism_is_total_over_every_fact_and_profile() {
                 | RuntimeFact::TexelFormat { .. } => Mechanism::PushConstant,
                 RuntimeFact::AliasedImageblock { .. } => Mechanism::None,
                 RuntimeFact::CallStackDepth { .. }
+                | RuntimeFact::OpenClMode
                 | RuntimeFact::AbsentArgumentRead { .. }
                 | RuntimeFact::SynthesizedGeometry { .. } => Mechanism::None,
             };

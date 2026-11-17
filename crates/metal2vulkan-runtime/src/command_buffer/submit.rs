@@ -51,9 +51,19 @@
 //! and the RTX 3090, about 2 ms of CPU in one `vkQueueSubmit` in about every thousand waits and
 //! signals) takes no such wait: each batch with work starts instead with a command buffer of
 //! barriers whose first is [`Barrier::after_completed`], which makes what completed batches
-//! wrote visible to every later command, and the staging queue's copies signal no timeline.
-//! Where every batch waited, about twice as many of its submissions took that long as where
-//! batches only signal.
+//! wrote visible to every later command. Where every batch waited, about twice as many of its
+//! submissions took that long as where batches only signal.
+//!
+//! **The staging queue's copies.** On every driver, a batch waits on the GPU for the staging
+//! queue's last submission while the host has not seen it complete (`Device::staging_wait`),
+//! unless a batch of its `VkQueue` already waited for that submission: the wait's second
+//! synchronization scope holds every command later in submission order there, so one wait per
+//! `VkQueue` makes the copies visible to every later batch of it, as one wait per value does for
+//! completed work above. A submission that carries the copies a burst of host calls queued is
+//! made just before the batch and waited for on the GPU, not the host
+//! (`texture/staging_copy.rs`). The batches after the one that waits may then join a group
+//! (**Grouped**, above), which a batch with a wait for work the host has not seen complete only
+//! leads. Counted: `WorkCounts::staging_gpu_waits`.
 //!
 //! Each barrier goes in a command buffer of barriers alone, which the scheduler records once per
 //! list of barriers and submits again once the batch that last carried it completed
@@ -87,7 +97,8 @@
 //! orders only its own `VkSubmitInfo`'s commands, and a signal follows commands, not waits
 //! (`vkQueueSubmit`'s synchronization scopes), so a signal after a wait needs both in one, with
 //! the end's barrier, a command, between. Where it has no wait, no image to move back and no
-//! timestamp to write either (an empty command buffer's batch, one of signals alone), its end
+//! timestamp to write either (an empty command buffer's batch that carries the device's first
+//! work, one of signals alone), its end
 //! records nothing and the `VkSubmitInfo` holds no `VkCommandBuffer`: none of its commands wrote
 //! anything, every batch before it made its own writes visible to the host before its signals,
 //! and its signals follow every command submitted before them. ANV on i915 lists every
@@ -108,6 +119,15 @@
 //! moves are planned with the encoders as the caller's images' are, each a write of the whole
 //! image outside the encoder joined to its summary, and recorded the same way, after the barrier
 //! the tracker planned for the encoder. The layouts the batch leaves count from its submission on.
+//!
+//! **Writes through the residency** (`State::resident_writes`). Residency is the command
+//! buffer's (`residency.rs`), so a function of any of its encoders may write a resource any of
+//! them made resident for writing, in an encoder whose commands name it nowhere. Each batch with a
+//! part plans those writes with its first part, as writes of each whole resource in every stage
+//! that widen none of the stages the part's fences cover: the tracker then holds the batch as their
+//! last writer, so what reads them later on any queue, and a later host step's gate
+//! (`scheduler/mod.rs`'s `gate_heads`), orders after it. A resource made resident for reading
+//! alone is planned as the commands that name it use it.
 //!
 //! **New resources' first work** (`texture/first_move.rs`). Every batch first does the first GPU
 //! work of the resources made since the device's last submission: each new image's move to
@@ -173,35 +193,88 @@
 //! The submission of a command buffer's last batch, or its hold in a group (`group.rs`), leaves its
 //! submission handlers to the submitting thread, once the scheduler's lock is free; its transition
 //! to `Scheduled` waits for them.
+//!
+//! **No GPU work, no submission** ([`State::needs_no_gpu`]). A command buffer whose encoders
+//! recorded nothing and whose one batch waits for and signals no event and no binary semaphore (so
+//! presents no drawable) is taken, once it leads its logical queue's line, no group is held and
+//! no first work of the device's waits (`texture/first_move.rs`), with no `vkQueueSubmit`: its batch is watched at its `VkQueue`'s last submitted value, so it
+//! completes in its queue's order, once the queue's work before it completed, or at once where the
+//! queue has none in flight (`Completion::watch_unsubmitted`). Everything else its last batch's
+//! taking does is done as for a submitted one: its kernel times, its scheduling (by a hang's
+//! thread where one makes it), its submission handlers, its holds. Metal completes such a command
+//! buffer without its GPU too: on the M3 Max (macOS 27.0.1) one committed and waited for on an
+//! idle queue returned in 15 us at the median of 1000, its `GPUStartTime` equal to its
+//! `GPUEndTime` (within 0.3 us) 1 to 2 us after its `kernelEndTime`; one committed behind a fill
+//! completed after the fill, its GPU times 65 to 135 us after the fill's `GPUEndTime`. Counted:
+//! `WorkCounts::command_buffers_unsubmitted`.
 
-use super::completion::Submitted;
+use super::completion::{Submitted, Waited};
+use super::follow::{Follow, Release};
 use super::gate::Hold;
-use super::group::{self, After, GroupEnd, InfoParts};
+use super::group::{After, GroupEnd, InfoParts};
 use super::hang;
 use super::kept_barriers::{KeptBarriers, SlotStamps};
 use super::{lock, recording_error, submission_error, CommandBufferShared, State};
 use crate::deferred::Deferred;
-use crate::encoder::RecordedSegment;
+use crate::encoder::{count_shadow_copies, OverwriteBy, Recorded, RecordedSegment};
+use crate::encoder_fold::GroupPlaces;
 use crate::error::CommandBufferError;
 use crate::error::{internal, Error};
+use crate::event::EventShared;
 use crate::event_timeline::Signal;
 use crate::exit_guard::{self, Call};
 use crate::gpu_time;
+use crate::managed_copy::AtCompletion;
+use crate::managed_sync::SyncCopy;
 use crate::release;
-use crate::resource::ResourceKey;
-use crate::retained::Retained;
+use crate::resource::{ObjectId, ResourceKey};
 use crate::scheduler;
+use crate::shadow::ShadowCopies;
+use crate::shadow_standing::{LetGo, Missed, Unskipped};
+use crate::slow_submissions::{self, Phase, Watch};
 use crate::sparse::bind::{bind_batch, BindFailure, Bound};
 use crate::sparse::encoder::SparseUpdate;
+use crate::submit_failure::{Carried, TypeFlags};
 use crate::texture::decoded_twin::{SecondDecode, TwinWrite};
+use crate::texture::faces::FaceFix;
+use crate::texture::first_move::{last_of_each, FillTake};
 use crate::texture::wrapped::Transition;
 use crate::texture::Texture;
-use crate::tracker::{Barrier, EncoderUses, Point, Summary};
+use crate::tracker::{Barrier, Point, Summary};
+use crate::used_resources::{EncoderKind, EncoderRecord};
 use crate::work_counts::Begun;
 use ash::vk;
-use metal2vulkan::bind::ReplayFaults;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+use {crate::tracker::Footprint, std::sync::Mutex};
+
+/// The command buffers a device test watches (`tests::kept_heap_uses`), by the address of their
+/// shared state, and the footprints of the batches the scheduler planned of each, in order.
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+static PLANNED: Mutex<Vec<(usize, Vec<Footprint<ResourceKey>>)>> = Mutex::new(Vec::new());
+
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+impl super::CommandBuffer {
+    /// Note the footprint of each batch of it the scheduler plans from now on: a device test's
+    /// (`tests::kept_heap_uses`), before its commit.
+    pub(crate) fn watch_planned(&self) {
+        lock(&PLANNED).push((Arc::as_ptr(&self.0) as usize, Vec::new()));
+    }
+
+    /// The footprints of its batches the scheduler planned since [`watch_planned`]: their tracked
+    /// uses, as the tracker planned them. Watched no more.
+    ///
+    /// [`watch_planned`]: Self::watch_planned
+    pub(crate) fn planned(&self) -> Vec<Footprint<ResourceKey>> {
+        let mut planned = lock(&PLANNED);
+        let at = Arc::as_ptr(&self.0) as usize;
+        match planned.iter().position(|(of, _)| *of == at) {
+            Some(index) => planned.swap_remove(index).1,
+            None => Vec::new(),
+        }
+    }
+}
 
 /// The lists a batch's submission fills and empties, kept in the scheduler's state from batch to
 /// batch with their room, so that a submission allocates none of them once they have room for
@@ -246,6 +319,9 @@ pub(crate) struct Submission {
     /// Its command buffer became `Scheduled` as it was held in a group
     /// ([`schedule_held`](Submission::schedule_held)).
     scheduled: bool,
+    /// It was taken with no `vkQueueSubmit`: its command buffer needs no GPU work
+    /// ([`State::needs_no_gpu`]).
+    unsubmitted: bool,
 }
 
 /// What [`CommandBufferShared::submit_batch`] did with a batch.
@@ -326,6 +402,24 @@ impl Submission {
     }
 }
 
+impl State {
+    /// Whether the command buffer needs no GPU work (the module docs): none of its encoders
+    /// recorded anything (none ended, and no storage form's switch rides on it with a part of its
+    /// own), and its one batch waits for and signals no event and no binary semaphore. Read from
+    /// what it recorded, never from a name.
+    pub(super) fn needs_no_gpu(&self) -> bool {
+        let [batch] = self.batches.all() else {
+            return false;
+        };
+        self.recorded.is_empty()
+            && self.storage_form.is_none()
+            && batch.waits.is_empty()
+            && batch.signals.is_empty()
+            && batch.binary_waits.is_empty()
+            && batch.binary_signals.is_empty()
+    }
+}
+
 impl CommandBufferShared {
     /// Submit batch `index` of the command buffer (`last` when it ends it) after the Vulkan waits
     /// `event_waits` for its events, against the scheduler's tracker and timeline values. The
@@ -336,31 +430,60 @@ impl CommandBufferShared {
     /// encoders of it a rebind encodes again (`reencode.rs`, [`Submitting::Later`]), or while the
     /// group held must go first ([`Submitting::AfterGroup`]): the caller holds the batch back at its
     /// place. Where the group went in this batch's submission, its outcome is the group's
-    /// (`Group::take_outcome`).
+    /// (`Group::take_outcome`). With `alone`, it never waits in the group: a thread other than
+    /// the scheduler's submits it (`scheduler::submit_plain_ready`).
     pub(crate) fn submit_batch(
         self: &Arc<Self>,
         index: usize,
         last: bool,
         event_waits: &[(vk::Semaphore, u64)],
+        alone: bool,
         scheduler: &mut scheduler::State,
     ) -> Result<Submitting, CommandBufferError> {
+        let _for = self.notices_for();
         let device = &self.device;
         if device.is_lost() {
             return Err(CommandBufferError::DeviceLost);
         }
+        // Where the device notes queue times, the submission timed phase by phase on this thread
+        // (`slow_submissions.rs`).
+        let mut watch = Watch::start(device.shared().timing.queue_times());
+        // A batch that waits for an event value its commit's copy in came before copies the
+        // copied host buffers in again, its wait met (`copies_again.rs`).
+        self.copy_in_again(index)?;
         let shared = device.shared();
+        // Where the spares' frees left their pools holding command buffers untrimmed past their
+        // bound, a trim round, before any batch takes a kept barrier command buffer
+        // (`scheduler::State::trim_round`). Not while the group holds batches, whose kept ones
+        // are taken and not yet submitted.
+        if shared.spares.trim_due() && !scheduler.group.holds() {
+            scheduler.trim_round(shared);
+        }
         let raw = shared.vk();
         let queue = self.queue.vk_queue();
         let mut state = lock(&self.state);
+        // What its encoders were, as the encoder trail names them (`encoder_trail.rs`).
+        let trail = match shared.encoder_trail {
+            true => batch_trail(&state.recorded[state.batch_range(index)]),
+            false => None,
+        };
         // Whether the batch may wait in the scheduler's group for one kernel submission with the
         // batches after it (`group.rs`), as far as is known before anything changes; first work
         // it takes still sends it now. One that may not, or of another `VkQueue`, waits,
         // nothing changed, for the group to go first. Its event signals ride to the group's end;
         // a wait for an event a batch held signals, which only that end meets, goes after it.
         let met = (event_waits.iter()).any(|&wait| scheduler.group.meets(wait));
+        // A batch whose work a segment cut into pieces goes in a submission of its own, whose
+        // pieces are `VkSubmitInfo`s of their own (below).
+        let pieced = (state.recorded[state.batch_range(index)].iter())
+            .flat_map(|recorded| &recorded.segments)
+            .filter_map(|segment| segment.recorded.as_ref())
+            .any(|done| !done.piece_ends.is_empty());
         let joins = {
             let sync = &state.batches.all()[index];
-            group::groups(device, queue)
+            !alone
+                && !pieced
+                && self.groups()
                 && !(last && super::fences::ends_at_fence(device, queue))
                 && !met
                 && sync.binary_waits.is_empty()
@@ -399,6 +522,22 @@ impl CommandBufferShared {
         // its own batch is submitted, after the batch's checks: one a check failed keeps the
         // check's code.
         let rebound = state.failing_at(device, index);
+        // One that needs no GPU work goes with no submission, in its queue's order (the module
+        // docs); behind a group held, it goes with the group as any batch that joins does, and
+        // where the device's first work waits, it carries it as any batch does: on a device with
+        // a fill queue, first work but the fills of the program's memory, which a batch whose
+        // commands name nothing leaves waiting (`texture/first_move.rs`, `FillTake::Reached`).
+        let fills_named_only = |key: ResourceKey| {
+            device.has_fill_queue() && crate::used_resources::owner_of(shared, key).is_some()
+        };
+        if !rebound
+            && !scheduler.group.holds()
+            && state.needs_no_gpu()
+            && (shared.textures.first_moves).none_waiting_but(fills_named_only)
+        {
+            let taken = self.take_unsubmitted(&mut state, index, last, scheduler);
+            return Ok(Submitting::Submitted(taken));
+        }
         let range = state.batch_range(index);
         // A batch that begins with resource state encoders binds their updates first, after its
         // waits, which its work then waits for through the bind.
@@ -453,7 +592,8 @@ impl CommandBufferShared {
                 scheduler.values[queue]
             })
         };
-        // The scrubs of emulated textures' writes, as mapped now, then every segment in its place.
+        // The scrubs of emulated textures' writes, as mapped now; then every segment in its
+        // place.
         self.record_scrubs(&mut state, range.clone())?;
         state
             .place(range.clone())
@@ -463,13 +603,19 @@ impl CommandBufferShared {
         state
             .runs_nothing_unrunnable(range.clone())
             .map_err(|error| recording_error(device, error))?;
-        // The decodes into ASTC carriers' second decoded twins: those queued, before its work;
-        // its blits' writes', after each part.
-        self.record_second_decodes(&mut state, range.clone())?;
+        // The copies out of buffers with a host copy its parts hold, settled by the writes noted
+        // so far; then its own writes noted.
         let at = Point {
             queue,
             value: scheduler.values[queue] + 1,
         };
+        self.settle_syncs_out(&mut state, range.clone(), at)?;
+        // The decodes into ASTC carriers' second decoded twins: those queued, before its work;
+        // its blits' writes', after each part.
+        self.record_second_decodes(&mut state, range.clone())?;
+        // The copies between textures' faces around its work, for turns whose passes have not
+        // run (`texture/faces.rs`).
+        self.record_face_fixes(&mut state, range.clone())?;
         // What each timeline whose writes the tracker forgets completed through as the host saw
         // it, each `VkQueue`'s, then the device's own (the module docs): read once, for the
         // tracker and for the work's waits alike.
@@ -485,10 +631,11 @@ impl CommandBufferShared {
             reached.push((value > 0).then_some((vk_queue.timeline, value)));
         }
         reached.extend(device.own_completed());
-        // The batches before it on its queue that the host has not seen complete: each took the
-        // next value (`WorkCounts::batches_with_none_pending` and kin).
-        let completed = shared.queues[queue].completed_value();
-        (shared.counts).batch_submitted_behind(scheduler.values[queue].saturating_sub(completed));
+        // The batches before it on its queue that the host has not seen complete, as of the value
+        // the tracker just took, which its plan orders by: each took the next value
+        // (`WorkCounts::batches_with_none_pending` and kin). A second read of the queue's value
+        // could see a completion the plan did not.
+        (shared.counts).batch_submitted_behind(scheduler.tracker.pending_before(at));
         // One a hang's thread made `Scheduled` early began then (`hang.rs`).
         if index == 0 && self.kernel.start() == 0 {
             self.kernel.begin();
@@ -506,6 +653,12 @@ impl CommandBufferShared {
         let (start, end) = (range.start, range.end);
         let binary_waits = batches[index].binary_waits.clone();
         let binary_signals = batches[index].binary_signals.clone();
+        // Whether its `VkQueue` waits on the GPU for work of another `VkQueue`'s the host had not
+        // seen complete: an event's signal pending there (below, the tracker's and the first
+        // work's waits too), which holds the `VkQueue` until that work ends (`queue_share.rs`).
+        let mut across = !event_waits.is_empty()
+            && (batches[index].waits.iter())
+                .any(|(event, value)| event.waits_across(*value, queue));
         let mut kept = Vec::new();
         let mut order_waits = Vec::new();
         for (event, value) in &batches[index].signals {
@@ -551,38 +704,122 @@ impl CommandBufferShared {
         // unnamed, so it takes every move, those of images bound to host pages among them, whose
         // pages it then holds. Its commands bind the heap sets, so it holds the texture slots'
         // writes until its submission was made (`heap_sets::hold`).
+        slow_submissions::enter(&mut watch, Phase::FirstWork);
+        // A test holds the thread here to stand in for a slow first work's take.
+        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+        super::completion::trace::at(super::completion::trace::Point::FirstWork);
         let firsts = &shared.textures.first_moves;
-        let first_work = firsts.take_holding(|_| true, || crate::heap_sets::hold(device));
+        // On a device with a fill queue it takes the fills of memory its commands may reach
+        // alone, and of memory no use of the program's names (`FillTake::Reached`): the rest wait
+        // for a batch that may reach them, so this one neither makes them nor waits for them.
+        // Either way it learns what owns the memory of the work it takes.
+        let owner_of = |key: ResourceKey| crate::used_resources::owner_of(shared, key);
+        let reaches = |owner: ObjectId| state.parts_reach(shared, start..end, &[owner]);
+        // An upload of bytes a later commit took waits for that commit's batches.
+        let commit = state.commit;
+        let fill_take = match device.has_fill_queue() {
+            true => FillTake::Reached {
+                owner_of: &owner_of,
+                reaches: &reaches,
+                commit,
+            },
+            false => FillTake::Owned {
+                owner_of: &owner_of,
+                reaches: &reaches,
+                commit,
+            },
+        };
+        let hold = || crate::heap_sets::hold(device);
+        // The new textures its commands' first use writes whole before any reads them: their
+        // moves' zeros go unrecorded (`texture/first_move.rs`).
+        let overwritten = first_overwrites(encoders, &state.ended);
+        let overwrites = |key: ResourceKey| overwritten.contains(&key);
+        let mut first_work = firsts.take_holding(|_| true, fill_take, hold, overwrites);
+        let every_fill = first_work.every_fill();
+        // What owns the memory of the first work it took, its fills for the fill queue among it.
+        let taken_owners = first_work.owners();
+        // Whether it took a move that keeps a buffer's bytes by copies around its transition.
+        let keeps = first_work.keeps();
+        // Its buffers' fills go to the device's fill queue where it has one with a command buffer
+        // free, in a submission of their own that the batch waits for (below,
+        // `device/staging.rs`), where they write at least `FILL_QUEUE_LEAST` bytes in all: not
+        // where a group holds batches of this `VkQueue`, whose values that submission would wait
+        // for before their signals were submitted, nor where the batch waits for a binary
+        // semaphore, which its one wait consumes.
+        let fills = (!scheduler.group.holds()
+            && binary_waits.is_empty()
+            && first_work.has_first()
+            && device.fill_queue_has_room())
+        .then(|| first_work.take_fills(crate::device::FILL_QUEUE_LEAST))
+        .flatten();
+        // The copies queued for the staging queue, submitted there first, which the batch waits
+        // for on the GPU (below), holding what they copied until it completed
+        // (`texture/staging_copy.rs`).
+        slow_submissions::enter(&mut watch, Phase::Staging);
+        let staged = device
+            .flush_staging()
+            .map_err(|error| recording_error(device, error))?;
+        slow_submissions::enter(&mut watch, Phase::Planning);
         let entry = (!entries.is_empty()).then(|| Summary::outside_encoders(entry_uses));
         let exit = (!exits.is_empty()).then(|| Summary::outside_encoders(exit_uses));
         // The held depths' moves before each encoder that names one, into the layout it needs
         // (`texture/held_depth.rs`): writes the tracker plans with the encoder's uses, before
-        // them, so each waits for what came before it and orders what follows.
+        // them, so each waits for what came before it and orders what follows. Those of an
+        // encoder whose commands a group's shared `VkCommandBuffer` holds go before the group
+        // (`encoder_fold::GroupPlaces`).
         let unnamed = BTreeSet::new();
-        let held_moves = shared.textures.held.moves(encoders.iter().map(|recorded| {
-            match state.ended.get(recorded.encoder) {
-                Some(record) => (&record.keys, record.held.as_slice()),
-                None => (&unnamed, &[][..]),
-            }
-        }));
-        // Each encoder's summary with its moves' uses joined, where it has moves.
-        let moved: Vec<Option<Summary<ResourceKey>>> = match held_moves.is_empty() {
-            true => Vec::new(),
-            false => (encoders.iter().enumerate())
-                .map(|(at, recorded)| {
-                    let uses = held_moves.uses(at);
-                    (!uses.is_empty()).then(|| {
-                        let mut summary = recorded.summary.clone();
-                        summary.join(Summary::outside_encoders(uses.to_vec()));
-                        summary
+        let mut places = GroupPlaces::default();
+        let held_moves =
+            (shared.textures.held).moves(encoders.iter().enumerate().map(|(at, recorded)| {
+                match state.ended.get(recorded.encoder) {
+                    Some(record) => (
+                        places.place(at, recorded.encoder, record.group.as_ref()),
+                        &record.keys,
+                        record.held.as_slice(),
+                    ),
+                    None => (at, &unnamed, &[][..]),
+                }
+            }));
+        // Each encoder's summary with its moves' uses joined, where it has moves; the first's
+        // with what the command buffer's work may write through its residency, which any of its
+        // encoders may write (`State::resident_writes`).
+        let resident_writes = state.resident_writes.as_ref();
+        let moved: Vec<Option<Summary<ResourceKey>>> =
+            match held_moves.is_empty() && resident_writes.is_none() {
+                true => Vec::new(),
+                false => (encoders.iter().enumerate())
+                    .map(|(at, recorded)| {
+                        let uses = held_moves.uses(at);
+                        let writes = resident_writes.filter(|_| at == 0);
+                        (!uses.is_empty() || writes.is_some()).then(|| {
+                            let mut summary = recorded.summary.clone();
+                            if !uses.is_empty() {
+                                summary.join(Summary::outside_encoders(uses.to_vec()));
+                            }
+                            if let Some(writes) = writes {
+                                summary.join(writes.clone());
+                            }
+                            summary
+                        })
                     })
-                })
-                .collect(),
-        };
+                    .collect(),
+            };
         let summaries = (encoders.iter().enumerate()).map(|(at, recorded)| {
             let moved = moved.get(at).and_then(Option::as_ref);
             moved.unwrap_or(&recorded.summary)
         });
+        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+        {
+            let summaries = (encoders.iter().enumerate()).map(|(at, recorded)| {
+                let moved = moved.get(at).and_then(Option::as_ref);
+                moved.unwrap_or(&recorded.summary)
+            });
+            let address = Arc::as_ptr(self) as usize;
+            let mut planned = lock(&PLANNED);
+            if let Some((_, batches)) = planned.iter_mut().find(|(of, _)| *of == address) {
+                batches.push(Footprint::of(entry.iter().chain(summaries).chain(&exit)));
+            }
+        }
         let plan = scheduler
             .tracker
             .plan(entry.iter().chain(summaries).chain(&exit), at);
@@ -652,12 +889,23 @@ impl CommandBufferShared {
             work.push(self.record_barriers(&mut state, &globals, &entries, stamps)?);
         }
         for (offset, barrier) in barriers.iter().enumerate() {
+            let moves = held_moves.transitions(offset);
+            // An encoder whose own command buffer leads it, begun with a barrier from everything
+            // before (`encoder.rs`, past `PLANNED_BARRIERS`), holds the barrier planned before
+            // it: no command buffer of barriers goes there, but one that also carries the
+            // completed work's barrier, the start or a held depth's move.
+            let part = &state.recorded[start + offset];
+            let barriered = (part.barriered).is_some_and(|raw| part.raws.first() == Some(&raw));
+            if barriered && completed_barrier.is_none() && start_stamp.is_none() && moves.is_empty()
+            {
+                work.extend(&part.raws);
+                continue;
+            }
             let globals: Vec<Barrier> = completed_barrier
                 .take()
                 .into_iter()
                 .chain(*barrier)
                 .collect();
-            let moves = held_moves.transitions(offset);
             if !globals.is_empty() || start_stamp.is_some() || !moves.is_empty() {
                 started |= offset == 0;
                 let stamps = Stamps {
@@ -749,17 +997,51 @@ impl CommandBufferShared {
             }
         }
         for wait in plan.waits() {
+            across |= wait.at.queue != queue;
             wait_semaphores.push(shared.queues[wait.at.queue].timeline);
             wait_values.push(wait.at.value);
             wait_stages.push(wait.legacy_stages());
         }
-        // Every batch on another `VkQueue` that did new resources' first work, until it
-        // completed: any command may reach those resources unnamed.
+        // Every batch on another `VkQueue` that did new resources' first work whose memory its
+        // commands, or the first work it took, may reach, until it completed: memory a resource
+        // its encoders' uses name or make resident owns, every memory where a command may reach
+        // memory no use names or where that work's owner is unknown, and the memory of the first
+        // work it took, which comes after that work's. Counted (`WorkCounts::first_work_waits`).
         let completed = |point: Point| shared.queues[point.queue].completed_value() >= point.value;
-        for point in firsts.waits(queue, completed) {
+        let first_reaches = |owners: Option<&[ObjectId]>| match (owners, taken_owners.as_deref()) {
+            (Some(owners), Some(taken)) => {
+                owners.iter().any(|owner| taken.contains(owner))
+                    || state.parts_reach(shared, start..end, owners)
+            }
+            _ => true,
+        };
+        let first_waits: Vec<Point> = (firsts.waits(queue, completed).into_iter())
+            .filter(|(_, owners)| first_reaches(owners.as_deref()))
+            .map(|(point, _)| point)
+            .collect();
+        if !first_waits.is_empty() {
+            shared.counts.first_work_waited(true);
+        }
+        for point in last_of_each(first_waits) {
+            across |= point.queue != queue;
             wait_semaphores.push(shared.queues[point.queue].timeline);
             wait_values.push(point.value);
             wait_stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
+        }
+        // And, where it took a move that keeps a buffer's bytes by copies around its transition
+        // (`texture/first_move.rs`'s `GpuKeep`), every earlier submission on the device's other
+        // `VkQueue`s not seen complete, whose commands may access those bytes while the
+        // transition rewrites them.
+        if keeps {
+            for (other, slot) in shared.queues.iter().enumerate() {
+                let value = slot.submitted_value();
+                if other != queue && value > slot.completed_value() {
+                    across = true;
+                    wait_semaphores.push(slot.timeline);
+                    wait_values.push(value);
+                    wait_stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
+                }
+            }
         }
         // And the internal submission on the first `VkQueue` that did some, until it completed.
         if let Some((timeline, value)) = firsts.internal_wait().filter(|_| queue != 0) {
@@ -773,6 +1055,72 @@ impl CommandBufferShared {
             wait_semaphores.push(timeline);
             wait_values.push(value);
             wait_stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
+        }
+        // And the staging queue's last submission, until the host saw it complete: what it
+        // copied may be among what the work reads (`device/staging.rs`). Where a batch of this
+        // `VkQueue` already waited for it, every later command there follows that wait in
+        // submission order, this batch's too (the module docs): one wait serves them all. The
+        // staging queue's place among the timelines follows the `VkQueue`s' and the internal
+        // submissions' (`Device::own_completed`).
+        let staging_place = shared.queues.len() + 1;
+        let staging_wait = (device.staging_wait())
+            .filter(|&(_, value)| value > scheduler.waited[queue][staging_place]);
+        if let Some((timeline, value)) = staging_wait {
+            wait_semaphores.push(timeline);
+            wait_values.push(value);
+            wait_stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
+            shared.counts.staging_gpu_wait();
+        }
+        // And the last of the fill queue's submissions that the host may not have seen complete
+        // and whose fills its commands may reach, as the staging queue's, its place after the
+        // staging queue's (`device/staging.rs`): what it filled may be among what the work
+        // reads. Each of them where a command may reach memory no use names, or where it took
+        // every fill waiting; else those of memory its encoders' uses name.
+        let fill_place = shared.queues.len() + 2;
+        let fill_reaches = |owners: Option<&[ObjectId]>| {
+            every_fill || owners.is_none_or(|owners| state.parts_reach(shared, start..end, owners))
+        };
+        let fill_wait =
+            device.fill_queue_wait_for(scheduler.waited[queue][fill_place], fill_reaches);
+        if let Some((timeline, value)) = fill_wait {
+            wait_semaphores.push(timeline);
+            wait_values.push(value);
+            wait_stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
+        }
+        // Its own fills, there: after the batches before it on its `VkQueue` (through the value
+        // before its own), what it waits for and what completed, as at the start of its work
+        // (`device/staging.rs`); its work waits for them.
+        let filled = match fills {
+            None => None,
+            Some(fills) => {
+                let before = (shared.queues[queue].timeline, at.value - 1);
+                let after: Vec<(vk::Semaphore, u64)> = (wait_semaphores.iter().copied())
+                    .zip(wait_values.iter().copied())
+                    .chain(reached.iter().flatten().copied())
+                    .chain([before])
+                    .collect();
+                (device.submit_fills(fills, &after))
+                    .map_err(|error| recording_error(device, error))?
+            }
+        };
+        if let Some(filled) = &filled {
+            wait_semaphores.push(filled.timeline);
+            wait_values.push(filled.value);
+            wait_stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
+        }
+        // Whether its commands may reach what the fill-queue submissions it waits for filled,
+        // counted (`WorkCounts::fill_queue_waits`): its own, and those of the others' it waits
+        // for that the host may not have seen complete.
+        if fill_wait.is_some() || filled.is_some() {
+            let own =
+                (filled.as_ref()).is_some_and(|filled| fill_reaches(filled.owners.as_deref()));
+            let after = scheduler.waited[queue][fill_place];
+            let others = fill_wait.is_some_and(|(_, value)| {
+                device
+                    .fill_queue_reached((after, value), fill_reaches)
+                    .is_some()
+            });
+            shared.counts.fill_queue_waited(own || others);
         }
         let mut order_semaphores: Vec<vk::Semaphore> =
             order_waits.iter().map(|&(s, _)| s).collect();
@@ -879,15 +1227,63 @@ impl CommandBufferShared {
                 false => work.insert(0, lead),
             }
         }
-        let mut work_timeline = vk::TimelineSemaphoreSubmitInfo::default()
-            .wait_semaphore_values(wait_values)
-            .signal_semaphore_values(work_signal_values);
-        let first = vk::SubmitInfo::default()
-            .wait_semaphores(wait_semaphores)
-            .wait_dst_stage_mask(wait_stages)
-            .command_buffers(&work)
-            .signal_semaphores(work_signals)
-            .push_next(&mut work_timeline);
+        // The pieces the batch's segments cut its work into (`RecordedSegment::piece_ends`,
+        // `rate_mapped_pass.rs`'s **Pieces**): each but the last a `VkSubmitInfo` of its own that
+        // signals its `VkQueue`'s timeline of pieces (`QueueSlot::pieces`), so no driver merges it
+        // into the next, as Mesa's common queue merges a submission that signals nothing into the
+        // next one's kernel submission (`group.rs`). The first takes the work's waits, the last
+        // its signals. Each piece runs after the one before it in submission order, and begins
+        // with a barrier from everything before (`EncoderCore::cut_piece`).
+        let cuts: Vec<usize> = (1..work.len())
+            .filter(|&at| state.piece_ends.contains(&work[at - 1]))
+            .collect();
+        state.piece_ends.retain(|raw| !work.contains(raw));
+        let pieces = cuts.len();
+        if pieces > 0 {
+            shared.counts.rate_map_pieces(pieces as u64);
+        }
+        let piece_from = match pieces {
+            0 => 0,
+            count => shared.queues[queue].piece_values(count as u64),
+        };
+        let piece_values: Vec<u64> = (0..pieces as u64).map(|k| piece_from + k).collect();
+        let piece_semaphore = [shared.queues[queue].pieces];
+        let starts: Vec<usize> = [0].into_iter().chain(cuts.iter().copied()).collect();
+        let ends: Vec<usize> = cuts.iter().copied().chain([work.len()]).collect();
+        let mut work_timelines: Vec<vk::TimelineSemaphoreSubmitInfo> = (0..=pieces)
+            .map(|k| {
+                let waits: &[u64] = match k {
+                    0 => &wait_values[..],
+                    _ => &[],
+                };
+                let signals: &[u64] = match piece_values.get(k) {
+                    Some(value) => std::slice::from_ref(value),
+                    None => work_signal_values,
+                };
+                vk::TimelineSemaphoreSubmitInfo::default()
+                    .wait_semaphore_values(waits)
+                    .signal_semaphore_values(signals)
+            })
+            .collect();
+        let mut infos: Vec<vk::SubmitInfo> = Vec::with_capacity(pieces + 2);
+        for (k, timeline) in work_timelines.iter_mut().enumerate() {
+            let (waits, stages): (&[vk::Semaphore], &[vk::PipelineStageFlags]) = match k {
+                0 => (&wait_semaphores[..], &wait_stages[..]),
+                _ => (&[], &[]),
+            };
+            let signals: &[vk::Semaphore] = match k < pieces {
+                true => &piece_semaphore,
+                false => work_signals,
+            };
+            infos.push(
+                vk::SubmitInfo::default()
+                    .wait_semaphores(waits)
+                    .wait_dst_stage_mask(stages)
+                    .command_buffers(&work[starts[k]..ends[k]])
+                    .signal_semaphores(signals)
+                    .push_next(timeline),
+            );
+        }
         // The fence the last batch signals where the driver reads a command buffer's objects
         // after its value, and every batch where the queue's failures are relayed
         // (`device/relay.rs`): taken before the submission, given back if it fails. Elsewhere
@@ -912,13 +1308,12 @@ impl CommandBufferShared {
             .command_buffers(&finale)
             .signal_semaphores(&signal_semaphores)
             .push_next(&mut end_timeline);
-        let infos = [first, second];
-        let infos = match (single, folded) {
-            (true, _) => &infos[1..],
-            (false, true) => &infos[..1],
-            (false, false) => &infos[..],
-        };
-        let submits = infos;
+        match (single, folded) {
+            (true, _) => infos = vec![second],
+            (false, true) => {}
+            (false, false) => infos.push(second),
+        }
+        let submits = &infos[..];
         let buffers = (submits.iter())
             .map(|info| info.command_buffer_count as usize)
             .sum();
@@ -927,6 +1322,9 @@ impl CommandBufferShared {
         // (`heap_sets.rs`). One committed and not yet submitted holds no gone texture.
         if let Some(ticket) = state.heaps.submit(device) {
             state.retained.push(Box::new(ticket));
+        }
+        if let Some(staged) = staged {
+            state.retained.push(Box::new(staged));
         }
         // The batch waits in the group, its submission's changes made below, where it may and
         // took no first work, the device wrapped no image of the caller's it names since it was
@@ -940,9 +1338,24 @@ impl CommandBufferShared {
             && leads
             && !first_work.has_first()
             && !first_work.has_staged()
+            && filled.is_none()
             && images.is_empty();
+        // What the batch's submission carries, to its value, from here: the device's pending
+        // audit's (`pending_audit.rs`), where it is on.
+        let carried = (shared.queues[queue].timeline, at.value);
+        if let Some(audit) = raw.pending_audit() {
+            audit.submitted(raw, carried, &[work.as_slice(), finale.as_slice()]);
+        }
+        // The host time its submission was called, where it went now (`Group::submit`).
+        let mut called = None;
         if grouped {
             scheduler.group.open(queue, &scheduler.waited[queue]);
+            // A watched submission held its thread long before the group took it in the call's
+            // place: its line (`slow_submissions.rs`).
+            if let Some(watch) = watch.take() {
+                let batches = state.batches.all().len();
+                watch.held(device, (index, batches), queue, gpu_time::host_nanos());
+            }
         } else {
             // SAFETY: every command buffer is executable and submitted once; every wait is for a
             // signal already submitted (the scheduler's order, and for a binary semaphore the
@@ -960,6 +1373,36 @@ impl CommandBufferShared {
                 };
                 shared.counts.group_ended(end);
             }
+            // What the batch carried, for the line its failed submission logs
+            // (`submit_failure.rs`): read only once the call failed.
+            let kept_signals = kept.len();
+            let kept_barriers = &scheduler.kept;
+            let carry = |carried: &mut Carried, types: &TypeFlags| {
+                carried
+                    .binary
+                    .extend(binary_waits.iter().chain(&binary_signals));
+                carried
+                    .events
+                    .extend(event_waits.iter().map(|&(semaphore, _)| semaphore));
+                carried
+                    .events
+                    .extend(signal_semaphores[..kept_signals].iter());
+                carried.events.extend(order_semaphores.iter());
+                self.carry(&state, (Some(index), Some(start..end)), carried, types);
+                let roles = &mut carried.roles;
+                roles.extend(recorded.map(|raw| (raw, "first work".to_owned())));
+                roles.extend(finale.iter().map(|&raw| (raw, "end".to_owned())));
+                for &raw in &work {
+                    if roles.iter().any(|(known, _)| *known == raw) {
+                        continue;
+                    }
+                    let role = match kept_barriers.kept(queue, raw) {
+                        Some(taken) => format!("kept barriers, taken for {taken}"),
+                        None => "barriers".to_owned(),
+                    };
+                    roles.push((raw, role));
+                }
+            };
             let after = After {
                 queue,
                 infos: submits,
@@ -967,12 +1410,35 @@ impl CommandBufferShared {
                 value: at.value,
                 fence,
                 relayed: &self.relayed,
+                carry: &carry,
             };
             let submitted =
                 scheduler
                     .group
                     .submit(device, &mut scheduler.waited[queue], Some(after));
+            // A watched submission held its thread long before the call: its line
+            // (`slow_submissions.rs`).
+            if let (Some(watch), Ok(at)) = (watch.take(), &submitted) {
+                let batches = state.batches.all().len();
+                watch.called(
+                    device,
+                    (index, batches),
+                    queue,
+                    (*at, gpu_time::host_nanos()),
+                );
+            }
+            // Where the device notes queue times, the call's return, for the command buffer this
+            // batch ends (`CommandBuffer::submit_returned_time`).
+            if last && submitted.is_ok() && shared.timing.queue_times() {
+                self.kernel.returned_at(gpu_time::host_nanos());
+            }
+            // A test's stand-in for a scheduler thread preempted once the call returned.
+            #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+            super::completion::trace::submit_returned();
             if let Err(error) = submitted {
+                if let Some(audit) = raw.pending_audit() {
+                    audit.withdrawn(carried, &[work.as_slice(), finale.as_slice()]);
+                }
                 if let Some(fence) = fence {
                     // SAFETY: the failed submission is not pending; inside the section.
                     // Released, not kept: Vulkan leaves a fence's state after a failed
@@ -990,19 +1456,34 @@ impl CommandBufferShared {
                 }
                 return Err(error);
             }
+            called = submitted.ok();
+            // A sync file's signal among its signals is now submitted (`sync_file.rs`).
+            #[cfg(unix)]
+            self.sync_file_submitted(&mut state, &binary_signals);
+            // The first call that carried a batch of it: the earliest its GPU work began at,
+            // where GPU times are answered from the host (`place_gpu_times`).
+            if let Some(at) = called {
+                self.kernel.submitted_at(at);
+            }
+        }
+        // From the first batch whose `VkQueue` waits on the GPU for another's work, its `VkQueue`
+        // holds it: its long mark counts from that batch's submission (`place_gpu_times`).
+        if across && state.times.waited_across.is_none() {
+            state.times.waited_across = Some(called.unwrap_or_else(gpu_time::host_nanos));
         }
         // It makes its command buffer `Scheduled` where it ends it, unless a hang's thread makes
         // it (`hang.rs`): the command buffer's own hang's, once this batch, the one before the
         // hang's wait, is taken (the thread waits for it on `changed`), or, for one committed
-        // during a hang, early, where it did not wait past the hang. A held batch's kernel end is
-        // its group's (`Group::submit`).
+        // during a hang, early, where it did not wait past the hang. Its kernel end is the host
+        // time its submission was called, which no GPU end of its work can precede
+        // (`Group::submit`); a held batch's is its group's.
         let (schedules, took) = hang::schedules(&mut state.hang_scheduling, index, last);
         if took {
             let parked = state.parked > 0;
             self.wake_parked(parked);
         }
-        if schedules && !grouped {
-            self.kernel.end_at(gpu_time::host_nanos());
+        if let (true, Some(at)) = (schedules, called) {
+            self.kernel.end_at(at);
         }
         if !single {
             match folded {
@@ -1013,6 +1494,20 @@ impl CommandBufferShared {
         for &(source, value) in waited.iter() {
             scheduler.waited[queue][source] = value;
         }
+        // Its staging wait, made or held: a held group goes to its `VkQueue` before any later
+        // batch there, and one whose submission fails puts the values back.
+        if let Some((_, value)) = staging_wait {
+            scheduler.waited[queue][staging_place] = value;
+        }
+        let fill_waited = fill_wait.map(|(_, value)| value);
+        let fill_waited = fill_waited.max(filled.as_ref().map(|filled| filled.value));
+        if let Some(value) = fill_waited {
+            scheduler.waited[queue][fill_place] = value;
+        }
+        // What its fills hold, until it completed.
+        if let Some(filled) = filled {
+            state.retained.push(Box::new(filled));
+        }
         shared.counts.completed_waited(waited.len());
         if !single && !started {
             shared.counts.bare_start();
@@ -1022,11 +1517,34 @@ impl CommandBufferShared {
         }
         // Its submission handlers run on this thread once the scheduler's lock is free, and a
         // switch of storage forms riding on it ends there first (`scheduler/mod.rs`); its
-        // transition to `Scheduled`, posted as it is published or held, waits for them.
+        // transition to `Scheduled`, posted as it is published or held, waits for them. One made
+        // `Scheduled` behind a host step ran them, or runs them, in that pass's turn: its flag
+        // stays as that pass left it.
         let forms = last && state.storage_form.is_some();
         let handlers = (schedules && !state.submission.is_empty()) || forms;
-        state.submitting = handlers;
+        if !hang::scheduled_early(&state.hang_scheduling) {
+            state.submitting = handlers;
+        }
         scheduler.tracker.apply(plan);
+        // The standings across command buffers, in the order the tracker took the batch
+        // (`shadow_standing.rs`): its writes let go of those they meet; then, where it ends the
+        // command buffer with its last encoder and nothing failed it or reached memory unnamed,
+        // the shadows its end left holding every texel of their truth stand.
+        let unnamed = state.reaches_unnamed;
+        let clean = state.failure.is_none()
+            && state.fails_from.is_none()
+            && state.faulted.is_empty()
+            && state.hang.is_none()
+            && !rebound;
+        let ends = last && start < end && end == state.recorded.len() && clean && !unnamed;
+        // Each shadow the end carries that it leaves no standing notes why
+        // (`shadow_standing::Missed`).
+        let held = match (last, &state.shadow_carry) {
+            (true, Some(carry)) => carry.standing_at_end(ends),
+            _ => Vec::new(),
+        };
+        let summaries = (state.recorded[start..end].iter()).map(|recorded| &recorded.summary);
+        shared.standings.submitted(summaries, unnamed, &held);
         held_moves.submitted();
         shared.counts.held_depths_released(held_moves.released);
         let several = shared.queues.len() > 1;
@@ -1035,6 +1553,19 @@ impl CommandBufferShared {
             state.retained.push(Box::new(held));
         }
         scheduler.values[queue] = at.value;
+        // Its command buffer's wait behind another command queue's batch there, from its first
+        // batch's submission or hold (`queue_wait.rs`).
+        let on = &shared.queues[queue];
+        let first = (index == 0).then(|| crate::queue_wait::First {
+            since: called.unwrap_or_else(gpu_time::host_nanos),
+            unshared: self.queue.unshared(),
+        });
+        let completed = || on.completed_value();
+        // Its place in the `VkQueue`'s flight, where an unshared queue holds it
+        // (`unshared_hold.rs`).
+        let flies = device.flies(queue, self.queue.unshared(), self.queue.expected());
+        let taken = (at.value, self.queue.id(), flies);
+        (on.waits).taken(taken, first, completed, &shared.counts);
         for image in &images {
             image.submitted();
             // One that rests in `GENERAL` from now on (an encode-time image after its first
@@ -1049,8 +1580,24 @@ impl CommandBufferShared {
         if behind_merge {
             shared.counts.event_signals_behind_merge(kept.len());
         }
+        // A last batch's signals name its command buffer, which another queue's command buffer
+        // that waits for one completes after; its transition to `Completed` lets them go
+        // (`follow.rs`).
+        let follow = (last && !kept.is_empty())
+            .then(|| Arc::new(Follow::new(self.queue.id(), Arc::as_ptr(self) as usize)));
         for (event, signal, value) in &kept {
-            event.keep(*signal, *value, queue, behind_merge);
+            event.keep(
+                *signal,
+                *value,
+                (queue, at.value),
+                follow.clone(),
+                behind_merge,
+            );
+        }
+        if let Some(follow) = follow {
+            let signals = (kept.iter()).map(|(event, signal, _)| (Arc::clone(event), *signal));
+            let signals = signals.collect();
+            state.release = Some(Release { follow, signals });
         }
         // Its commands may reach every texture through its resource ID where one bound a heap
         // set: the stale-reach degrade's trigger decides (`detach.rs`).
@@ -1058,6 +1605,15 @@ impl CommandBufferShared {
         let rebound_use = state.rebound_use.clone();
         // The holds its completion lets go (`State::holds_until`).
         let holds = state.holds_until(index);
+        // What it completes after: the batches of other `VkQueue`s whose GPU signals its event
+        // waits were met by, not finished yet, and the command buffers of other queues they end
+        // (`completion.rs`, "After what it waited for").
+        let after = {
+            let State {
+                batches, waited, ..
+            } = &mut *state;
+            finishes_after(&batches.all()[index].waits, (queue, self), waited)
+        };
         drop(state);
         if rebound {
             device.degrade_encoded_use_rebound(rebound_use);
@@ -1075,11 +1631,15 @@ impl CommandBufferShared {
                     .map(|(event, signal, _)| (event, signal))
                     .collect(),
                 holds,
+                after,
+                held: false,
+                trail,
             },
             handlers,
             forms,
             schedules,
             scheduled: false,
+            unsubmitted: false,
         };
         if !grouped {
             return Ok(Submitting::Submitted(submission));
@@ -1104,6 +1664,67 @@ impl CommandBufferShared {
         Ok(Submitting::Grouped)
     }
 
+    /// Take batch `index` (`last` where it ends the command buffer) of a command buffer that needs
+    /// no GPU work ([`State::needs_no_gpu`]) with no submission, as its submission would take it
+    /// but for the `vkQueueSubmit` (the module docs): its batch is watched at its `VkQueue`'s last
+    /// submitted value in `scheduler`, with no fence and no signal.
+    fn take_unsubmitted(
+        self: &Arc<Self>,
+        state: &mut State,
+        index: usize,
+        last: bool,
+        scheduler: &scheduler::State,
+    ) -> Submission {
+        let device = &self.device;
+        let queue = self.queue.vk_queue();
+        if index == 0 && self.kernel.start() == 0 {
+            self.kernel.begin();
+        }
+        // What it holds until it completes, as a submitted batch takes it.
+        let own: Vec<Texture> = lock(&self.own_textures).drain(..).collect();
+        if !own.is_empty() {
+            state.retained.push(Box::new(own));
+        }
+        if let Some(ticket) = state.heaps.submit(device) {
+            state.retained.push(Box::new(ticket));
+        }
+        // Scheduled by its last batch's taking, unless a hang's thread makes it (`hang.rs`).
+        let (schedules, took) = hang::schedules(&mut state.hang_scheduling, index, last);
+        if took {
+            let parked = state.parked > 0;
+            self.wake_parked(parked);
+        }
+        if schedules {
+            self.kernel.end_at(gpu_time::host_nanos());
+        }
+        let forms = last && state.storage_form.is_some();
+        let handlers = (schedules && !state.submission.is_empty()) || forms;
+        if !hang::scheduled_early(&state.hang_scheduling) {
+            state.submitting = handlers;
+        }
+        let holds = state.holds_until(index);
+        device.shared().counts.command_buffer_unsubmitted();
+        Submission {
+            queue,
+            batch: Submitted {
+                value: scheduler.values[queue],
+                buffer: self.hold(),
+                last,
+                fence: None,
+                signals: Vec::new(),
+                holds,
+                after: Vec::new(),
+                held: false,
+                trail: None,
+            },
+            handlers,
+            forms,
+            schedules,
+            scheduled: false,
+            unsubmitted: true,
+        }
+    }
+
     /// Publish a batch [`submit_batch`](Self::submit_batch) submitted, after the section that
     /// submitted it ended: when it ends the command buffer, its transition to `Scheduled`
     /// (`CommandBufferShared::schedule`) unless it made it as it was held in a group
@@ -1117,6 +1738,7 @@ impl CommandBufferShared {
             batch,
             schedules,
             scheduled,
+            unsubmitted,
             ..
         } = submission;
         if schedules && !scheduled {
@@ -1124,7 +1746,13 @@ impl CommandBufferShared {
             // transition to `Scheduled` first.
             self.schedule();
         }
-        self.device.shared().completion.watch(queue, batch);
+        let completion = &self.device.shared().completion;
+        match unsubmitted {
+            // The caller makes the turn that finishes it where its queue reached its value and no
+            // turn is under way, once it holds no lock (`Completion::turn_owed`).
+            true => completion.watch_unsubmitted(queue, batch),
+            false => completion.watch(queue, batch),
+        }
     }
 
     /// A command buffer of this command buffer's pool holding what `record` records into it,
@@ -1158,10 +1786,81 @@ impl CommandBufferShared {
         Ok(buffer)
     }
 
+    /// Record the copies between textures' faces that the batch of parts `range` takes around
+    /// its work for turns whose passes have not run (`texture/faces.rs`, `FaceSwaps::fixes`):
+    /// each from the face that holds the truth into the face the batch names, in a command buffer
+    /// before its first part's own, and back after its last part's where the batch may write the
+    /// face it names, each joined to its part's summary, so the tracker orders them with the
+    /// batch's work and the standings across command buffers count their writes. The faces are
+    /// held until the command buffer completes. A part that runs nothing (its encoder failed, or
+    /// its use was rebound) leaves a turn of its pass to the next batch that names its face.
+    fn record_face_fixes(
+        &self,
+        state: &mut State,
+        range: std::ops::Range<usize>,
+    ) -> Result<(), CommandBufferError> {
+        let device = &self.device;
+        let swaps = &device.shared().face_swaps;
+        if !swaps.any() || range.is_empty() {
+            return Ok(());
+        }
+        let unnamed = state.reaches_unnamed || state.heaps.bound();
+        let parts = &state.recorded[range.clone()];
+        let summaries = parts.iter().map(|part| &part.summary);
+        let ran = |part: usize| {
+            let at = part.checked_sub(range.start);
+            (at.and_then(|at| parts.get(at))).is_some_and(|part| !part.raws.is_empty())
+        };
+        let fixes = swaps.fixes(self.address(), (range.clone(), &ran), summaries, unnamed);
+        if fixes.is_empty() {
+            return Ok(());
+        }
+        let raw = device.shared().vk();
+        let (front, back): (Vec<_>, Vec<_>) = fixes.iter().map(FaceFix::uses).unzip();
+        let record = |state: &mut State, forward: bool| {
+            self.record_raw(state, |_, buffer| {
+                for fix in fixes.iter().filter(|fix| forward || fix.back) {
+                    // SAFETY: the command buffer is recording, outside a render pass; both faces
+                    // are live (held below until the command buffer completes) and rest in
+                    // `GENERAL`.
+                    unsafe { fix.record(raw, buffer, forward) };
+                }
+                Ok(())
+            })
+        };
+        let before = record(state, true)?;
+        let first = &mut state.recorded[range.start];
+        first.raws.insert(0, before);
+        for summary in front {
+            first.summary.join(summary);
+        }
+        let back: Vec<Summary<ResourceKey>> = back.into_iter().flatten().collect();
+        if !back.is_empty() {
+            let after = record(state, false)?;
+            let last = &mut state.recorded[range.end - 1];
+            last.raws.push(after);
+            for summary in back {
+                last.summary.join(summary);
+            }
+        }
+        let counts = &device.shared().counts;
+        for fix in &fixes {
+            let texels = fix.texels();
+            counts.attached_read_swap_fix(texels);
+            if fix.back {
+                counts.attached_read_swap_fix(texels);
+            }
+        }
+        state.retained.push(Box::new(fixes));
+        Ok(())
+    }
+
     /// Record the segments of encoders `range` that their batch's submission records: the
     /// scrubs (`Deferred::SparseScrub`), with the mappings it applied, and the gated copies in
     /// (`Deferred::GatedCopyIn`), with the regions their logs say changed since the commit's
-    /// stamp, published by now.
+    /// stamp, published by now; and the merges of runs of passes over a linear attachment or a
+    /// shadowed texture (`Deferred::RunMerge`), each the run's last pass's (or the last before a
+    /// pass encoded again), the ones taken over recording nothing.
     fn record_scrubs(
         &self,
         state: &mut State,
@@ -1172,7 +1871,7 @@ impl CommandBufferShared {
             for (at, segment) in recorded.segments.iter().enumerate() {
                 let at_submission = matches!(
                     segment.work,
-                    Deferred::SparseScrub(_) | Deferred::GatedCopyIn(_)
+                    Deferred::SparseScrub(_) | Deferred::GatedCopyIn(_) | Deferred::RunMerge(_)
                 );
                 if at_submission && segment.recorded.is_none() {
                     scrubs.push((range.start + encoder, at, segment.work.clone()));
@@ -1181,6 +1880,23 @@ impl CommandBufferShared {
         }
         let device = &self.device;
         for (encoder, at, work) in scrubs {
+            // A run's merge a later pass took over records nothing (`pass_runs.rs`).
+            if let Deferred::RunMerge(merge) = &work {
+                if merge.taken() {
+                    state.recorded[encoder].segments[at].recorded =
+                        Some(RecordedSegment::submitted(Vec::new()));
+                    continue;
+                }
+            }
+            // A copy in its shadow's standing decides moves nothing where the image stands now,
+            // or the texels inside the rectangle it stands stale in alone
+            // (`shadow_standing.rs`).
+            let standing = match &work {
+                Deferred::GatedCopyIn(copy) => copy.standing(),
+                _ => None,
+            };
+            let decided = standing.map(|copies| self.stands(state, encoder, copies));
+            let stands = decided.and_then(Result::ok);
             let raw = self.record_raw(state, |state, buffer| {
                 match &work {
                     // SAFETY: the command buffer is recording; the texture is live (its encoder's
@@ -1195,24 +1911,130 @@ impl CommandBufferShared {
                     // shadowed texture is live (its encoder's command buffer holds it), its
                     // image in `GENERAL`.
                     Deferred::GatedCopyIn(copy) => unsafe {
-                        copy.record(device.shared().vk(), buffer)
+                        copy.record(device.shared().vk(), buffer, stands)
                     },
+                    // SAFETY: the command buffer is recording, outside a render pass; the merge,
+                    // its images and its scratch are held until it completes (its pass's encoder
+                    // retains them, and the segment its copies), and the images rest in
+                    // `GENERAL`.
+                    Deferred::RunMerge(merge) => {
+                        unsafe { merge.record(device.shared().vk(), buffer) };
+                        let counts = &device.shared().counts;
+                        match merge.shadow() {
+                            Some(copy) => count_shadow_copies(counts, std::slice::from_ref(copy)),
+                            None => counts.linear_merge_recorded(),
+                        }
+                    }
                     _ => {}
                 }
                 Ok(())
             })?;
-            state.recorded[encoder].segments[at].recorded = Some(RecordedSegment {
-                raws: vec![raw],
-                summary: EncoderUses::new(true).finish(),
-                retained: Retained::default(),
-                executions: Vec::new(),
-                keys: Default::default(),
-                taken: Default::default(),
-                resident_misses: 0,
-                faults: ReplayFaults::default(),
-            });
+            state.recorded[encoder].segments[at].recorded =
+                Some(RecordedSegment::submitted(vec![raw]));
+            if let (Some(decided), Deferred::GatedCopyIn(copy)) = (decided, &work) {
+                let counts = &device.shared().counts;
+                let (texels, moved) = (copy.texels(), copy.texels_moved(stands));
+                counts.shadow_copy_in_against_standing(stands.is_some(), texels - moved);
+                match decided {
+                    Err((at, let_go, missed)) => {
+                        counts.shadow_copy_in_unskipped(at, let_go, missed, texels);
+                    }
+                    Ok(Some(_)) if moved > 0 => {
+                        let missed =
+                            standing.map_or(Missed::Unmet, |copies| copies.standing.last_missed());
+                        counts.shadow_copy_in_unskipped(
+                            Unskipped::StaleWithin,
+                            None,
+                            missed,
+                            moved,
+                        );
+                    }
+                    Ok(_) => {}
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Settle the copies out of buffers with a host copy that the blits of parts `range` decided
+    /// and recorded as they were encoded (`managed_sync.rs`, **What the encoding cannot see**):
+    /// the writes of other command buffers noted since each one's encoding go into a
+    /// `VkCommandBuffer` just before its part, where any were. Then note the parts' writes, the
+    /// command buffer's writes through its residency, and where it may write memory no use names,
+    /// the batch at `at`.
+    fn settle_syncs_out(
+        &self,
+        state: &mut State,
+        range: std::ops::Range<usize>,
+        at: Point,
+    ) -> Result<(), CommandBufferError> {
+        let shared = self.device.shared();
+        let writes = &shared.gpu_writes;
+        let completed = |point: Point| {
+            (shared.queues.get(point.queue)).is_some_and(|on| on.completed_value() >= point.value)
+        };
+        let by = self.id.get();
+        let copies: Vec<Arc<SyncCopy>> = (lock(&self.at_completion).iter())
+            .filter_map(|work| match work {
+                AtCompletion::Synced(copy) => Some(Arc::clone(copy)),
+                AtCompletion::Undo(_) => None,
+            })
+            .collect();
+        for part in range.clone() {
+            for copy in &copies {
+                if !copy.unsettled_in(&state.recorded[part].raws) {
+                    continue;
+                }
+                let top_up = copy.settle(writes, by, &completed);
+                if top_up.is_empty() {
+                    continue;
+                }
+                let raw = self.record_raw(state, |_, buffer| {
+                    // SAFETY: the command buffer is recording, outside a render pass; it goes to
+                    // the queue just before the part that holds the copy's command, whose encoder
+                    // holds the buffer and the copy's target until it completes.
+                    unsafe { copy.record_top_up(shared.vk(), buffer, &top_up) };
+                    Ok(())
+                })?;
+                state.recorded[part].raws.insert(0, raw);
+            }
+        }
+        if writes.keeps_any() {
+            let parts = state.recorded[range].iter().map(|part| &part.summary);
+            writes.note(parts.chain(&state.resident_writes), by);
+        }
+        if state.writes_unnamed {
+            writes.note_unnamed(at, &completed);
+        }
+        Ok(())
+    }
+
+    /// Whether `copies`' image stands across command buffers (`shadow_standing.rs`) for a copy
+    /// in of encoder `encoder`, submitted now: it stands, no earlier encoder of the command
+    /// buffer wrote the truth or the image, and none of its commands may reach memory no use
+    /// names; and the rectangle it stands stale inside alone, where it does
+    /// (`Standings::standing`). Where not, where that was decided, what its standing held
+    /// (`shadow_standing::Unskipped`, `LetGo`; none where it stood) and what last kept a command
+    /// buffer's end from leaving it standing (`Missed`).
+    fn stands(
+        &self,
+        state: &State,
+        encoder: usize,
+        copies: &ShadowCopies,
+    ) -> Result<Option<[u32; 4]>, (Unskipped, Option<LetGo>, Missed)> {
+        let missed = copies.standing.last_missed();
+        if !copies.stands_across() {
+            return Err((Unskipped::Unstanding, None, missed));
+        }
+        let keys = copies.standing_keys();
+        let wrote =
+            (state.recorded[..encoder].iter()).any(|recorded| recorded.summary.writes_any(&keys));
+        let standing = self.device.shared().standings.standing(copies);
+        match (state.reaches_unnamed || wrote, standing) {
+            (false, Ok(stale)) => Ok(stale),
+            (true, standing) => Err((Unskipped::CommandBuffer, standing.err(), missed)),
+            (false, Err(let_go)) => Err((Unskipped::LetGo, Some(let_go), missed)),
+        }
     }
 
     /// Record the decodes into ASTC carriers' second decoded twins (`texture/decoded_twin.rs`) of
@@ -1429,4 +2251,88 @@ impl Stamps {
             end: self.end.is_some(),
         })
     }
+}
+
+/// The batches of `VkQueue`s other than `queue` that a batch of `buffer` waiting for `waits`
+/// finishes after: for each wait, the batch whose kept GPU signal reaches its value, where that
+/// batch's completion turn has not run; and, added to `waited`, the command buffers of other queues
+/// those batches end, whose transitions to `Completed` have not run up to their completed handlers
+/// (`EventShared::signallers`, `follow.rs`). None, and nothing allocated, for a batch that waits
+/// for no event.
+fn finishes_after(
+    waits: &[(Arc<EventShared>, u64)],
+    (queue, buffer): (usize, &CommandBufferShared),
+    waited: &mut Vec<Arc<Follow>>,
+) -> Vec<Waited> {
+    let mut after: Vec<Waited> = Vec::new();
+    for (event, value) in waits {
+        let (batch, signaller) = event.signallers(*value);
+        if let Some((other, value)) = batch.filter(|(other, _)| *other != queue) {
+            let signaller = Waited {
+                queue: other,
+                value,
+            };
+            if !after.contains(&signaller) {
+                after.push(signaller);
+            }
+        }
+        // Of another queue: one of its own queue's is before it in its context.
+        let other_queue = |signaller: &Arc<Follow>| signaller.queue() != buffer.queue.id();
+        if let Some(signaller) = signaller.filter(other_queue) {
+            if !waited.iter().any(|known| Arc::ptr_eq(known, &signaller)) {
+                waited.push(signaller);
+            }
+        }
+    }
+    after
+}
+
+/// What a batch's encoders (or parts of them) `recorded` were, as the encoder trail names them
+/// (`encoder_trail.rs`): each noted one, in order; `None` where none was noted.
+fn batch_trail(recorded: &[Recorded]) -> Option<crate::encoder_trail::Named> {
+    crate::encoder_trail::Named::joined(recorded.iter().filter_map(|part| part.trail.as_ref()))
+}
+
+/// The images whose first use among `parts` (a batch's, in order) writes every texel before any
+/// command reads one, by its encoder's own description (`Recorded::overwrites`), whose first
+/// moves' zeros the batch's take leaves out (`FirstMoves::take_holding`): an overwrite by a part
+/// with no segment (work recorded later, which may go before its commands), that only blit
+/// parts with no segment naming nothing of the image come before (any other encoder's commands
+/// may reach a texture through its resource ID, unnamed), and whose own uses read nothing of the
+/// image but its attachment's own reads after its load (a pass's; a copy into or out of an image
+/// standing in for it, or a shadow's copy, reads it otherwise) or nothing at all (a blit's). Empty, and
+/// nothing allocated, where no part has an overwrite.
+fn first_overwrites(parts: &[Recorded], ended: &[EncoderRecord]) -> Vec<ResourceKey> {
+    if parts.iter().all(|part| part.overwrites.is_empty()) {
+        return Vec::new();
+    }
+    // An attachment's own reads in its pass, after its load: blending, the depth and stencil
+    // tests, a fetch through an input attachment.
+    let attachment_reads = vk::AccessFlags2::COLOR_ATTACHMENT_READ
+        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+        | vk::AccessFlags2::INPUT_ATTACHMENT_READ;
+    let mut named = BTreeSet::new();
+    let mut overwritten = Vec::new();
+    for part in parts {
+        for overwrite in &part.overwrites {
+            let reads = (part.summary.uses().iter())
+                .filter(|used| used.key == overwrite.key)
+                .fold(vk::AccessFlags2::NONE, |reads, used| {
+                    reads | used.read.access
+                });
+            let unread = match overwrite.by {
+                OverwriteBy::Pass => (reads & !attachment_reads).is_empty(),
+                OverwriteBy::Blit => reads.is_empty(),
+            };
+            if unread && part.segments.is_empty() && !named.contains(&overwrite.key) {
+                overwritten.push(overwrite.key);
+            }
+        }
+        let blit = (ended.get(part.encoder)).is_some_and(|record| record.kind == EncoderKind::Blit);
+        if !blit || !part.segments.is_empty() {
+            break;
+        }
+        named.extend(part.summary.keys());
+    }
+    overwritten
 }

@@ -15,10 +15,11 @@
 //! outside a buffer changes.
 
 use super::degrade_notices::{assert_made_once, forced, shared_in_system_memory, HOST_BYTES};
+use super::host_memory::on_device_with;
 use super::host_memory::{no_copy, on_device, run, Mapping, GUEST_PAGE};
 use super::render_state::{quiet, rows, validated, Probe, EMPTY, FULL, PASS, WHITE};
 use super::{
-    buffer_with, encode_case, pipeline_state, public_case, read_buffer, run_case,
+    at_plan, buffer_with, encode_case, pipeline_state, public_case, read_buffer, run_case,
     texture_descriptor, CaseResources, PublicCase,
 };
 use crate::candidate::engine::ComputeOutput;
@@ -269,7 +270,7 @@ pub(super) fn dispatch(
 /// over textures of its own.
 #[test]
 fn textures_over_bytes_that_start_past_their_vkbuffer_copy_through_staging() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let queue = device.new_command_queue().unwrap();
         let case = public_case(SAMPLER).unwrap();
         let expected = run_case(device, &case).unwrap().output;
@@ -300,7 +301,7 @@ fn textures_over_bytes_that_start_past_their_vkbuffer_copy_through_staging() {
 /// texture's bytes its run over buffers of its own.
 #[test]
 fn texture_buffers_over_bytes_that_start_past_their_vkbuffer() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let queue = device.new_command_queue().unwrap();
         for at in [2, 4] {
             let case = public_case(TEXEL_WRITER).unwrap();
@@ -356,7 +357,7 @@ fn texture_buffers_over_bytes_that_start_past_their_vkbuffer() {
 /// from.
 #[test]
 fn staged_texture_buffers_over_the_same_bytes_see_each_others_writes() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let queue = device.new_command_queue().unwrap();
         let writer = public_case(TEXEL_WRITER).unwrap();
         let written = run_case(device, &writer).unwrap().output;
@@ -496,8 +497,8 @@ fn draws_read_indices_and_arguments_where_their_bytes_lie() {
 
 /// Visibility results in buffers 4 bytes past a page (Vulkan copies results only to multiples of
 /// 8, so they land in an upload region and are copied on) and 8 past it (in place): probe 1's
-/// `Boolean` words, 1 for a covering draw, 0 for one covering nothing, and an offset never set
-/// keeps its bytes.
+/// `Boolean` words, 1 for a covering draw (the device's nonzero value, read by its contract), 0 for
+/// one covering nothing, and an offset never set keeps its bytes.
 #[test]
 fn visibility_results_land_where_their_bytes_lie() {
     use VisibilityResultMode::Boolean;
@@ -526,7 +527,75 @@ fn visibility_results_land_where_their_bytes_lie() {
             .map(|c| u64::from_le_bytes(*c))
             .collect();
         let u = 0xaaaa_aaaa_aaaa_aaaa;
+        let words = super::visibility::by_contract(words, &[1, 3], u);
         assert_eq!(words, [u, 1, u, 0], "results {at} bytes past a page");
+        vis.check_around("the visibility buffer");
+    }
+    quiet(probe, &messages);
+}
+
+/// `Accumulate` results in buffers 4 bytes past a page (landed in an upload region, into which each
+/// word is copied before the combine takes the results into it) and 8 past it (in place): a
+/// `Boolean` 0 under a covering draw becomes nonzero, a 2 under a draw covering nothing stays 2, a
+/// `Counting` 100 under a covering draw reads 116 where the device counts, and the words around
+/// them keep their bytes.
+#[test]
+fn accumulated_visibility_results_land_where_their_bytes_lie() {
+    use super::visibility::{complete, encode_pass, precise};
+    use metal2vulkan_runtime::VisibilityResultType::Accumulate;
+    use VisibilityResultMode::{Boolean, Counting};
+    let (messages, _cache, probe) = validated();
+    let counting = precise(&probe);
+    let color = super::render_state::texture(&probe.device, PixelFormat::RGBA8Unorm, 4);
+    let u = 0xaaaa_aaaa_aaaa_aaaa;
+    for at in [4, 8] {
+        let start: Vec<u8> = [u, 0, 2, 100]
+            .iter()
+            .flat_map(|w: &u64| w.to_le_bytes())
+            .collect();
+        let vis = HostBytes::new(&probe.device, &start, at);
+        let command_buffer = probe.queue.command_buffer().unwrap();
+        let mut held = Vec::new();
+        encode_pass(
+            &probe,
+            &command_buffer,
+            &color,
+            &vis.buffer,
+            Accumulate,
+            &mut held,
+            |p, e, h| {
+                let depth = p.depth(0.5, 0.0);
+                e.set_render_pipeline_state(&p.pipeline(WHITE)).unwrap();
+                e.set_vertex_buffer(Some(&depth), 0, 0).unwrap();
+                e.set_visibility_result_mode(Boolean, 8).unwrap();
+                e.draw_primitives(PrimitiveType::Triangle, 0, 3, 1, 0)
+                    .unwrap();
+                e.set_visibility_result_mode(Boolean, 16).unwrap();
+                e.draw_primitives(PrimitiveType::Triangle, 3, 3, 1, 0)
+                    .unwrap();
+                if counting {
+                    e.set_visibility_result_mode(Counting, 24).unwrap();
+                    e.draw_primitives(PrimitiveType::Triangle, 0, 3, 1, 0)
+                        .unwrap();
+                }
+                h.push(depth);
+            },
+        );
+        complete(command_buffer, held);
+        let words: Vec<u64> = vis
+            .bytes()
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
+            .collect();
+        let counted = if counting { 116 } else { 100 };
+        assert!(words[1] != 0, "results {at} bytes past a page: {words:?}");
+        assert_eq!(
+            [words[0], words[2], words[3]],
+            [u, 2, counted],
+            "results {at} bytes past a page"
+        );
         vis.check_around("the visibility buffer");
     }
     quiet(probe, &messages);
@@ -537,8 +606,9 @@ fn visibility_results_land_where_their_bytes_lie() {
 /// texture buffers 2 past one (staged on every venue), two indexed draws over indices 2 past one
 /// (copied before the pass), and two passes' visibility results 4 past one (landed in an upload
 /// region). The notices fail nothing; `degrade_notices` checks each one's form. Beside them the
-/// device announces what the steps force: the white pipeline's making's kinds and the cases'
-/// `Shared` buffers' system memory.
+/// device announces what the steps force: the white pipeline's making's kinds, the cases'
+/// `Shared` buffers' system memory, and the passes' `Boolean` results
+/// (`visibility::BOOLEANS`).
 #[test]
 fn host_byte_degradations_are_announced_once_per_device_and_kind() {
     use VisibilityResultMode::Boolean;
@@ -586,6 +656,7 @@ fn host_byte_degradations_are_announced_once_per_device_and_kind() {
         shared_in_system_memory(device),
     )]);
     first.extend(probe.made(WHITE));
+    first.extend(super::visibility::BOOLEANS);
     assert_made_once(&messages, &HOST_BYTES, &first);
     quiet(probe, &messages);
 }

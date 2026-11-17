@@ -47,7 +47,7 @@ impl VertexAmplificationViewMapping {
 
 /// The encoder's vertex amplification: Metal's default, a count of 1 without mappings, until
 /// set.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct Amplification {
     count: u64,
     /// The first `count` mappings; empty for `nil`.
@@ -100,6 +100,11 @@ impl Amplification {
     /// Whether a draw draws nothing: a count of 0 (the module docs).
     pub(super) fn draws_nothing(&self) -> bool {
         self.count == 0
+    }
+
+    /// Whether a draw draws more than one amplification.
+    pub(super) fn amplifies(&self) -> bool {
+        self.count > 1
     }
 
     /// Whether a mapping moves an amplification to another viewport.

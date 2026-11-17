@@ -7,8 +7,8 @@
 //! Metal makes a tile state's pipeline at `newRenderPipelineStateWithTileDescriptor`, so no Metal
 //! call of the program's blocks on a shader compile afterwards: a tile dispatch waits for none
 //! (`tile_pending.rs`), and neither does a replace of a buffer's bytes. The runtime makes a
-//! region's `VkPipeline` on demand instead, in the device's pool, and keeps at most 32 of a
-//! variant's (`pipeline::PIPELINES`): a rebind's encoding again of a dispatch whose region key
+//! region's `VkPipeline` on demand instead, in the device's pool, and keeps at most 32 of a tile
+//! function's variant's (`pipeline::PIPELINES`): a rebind's encoding again of a dispatch whose region key
 //! the memo let go of must answer as the first encoding did -- hand the making to the pool and
 //! leave the pass to record later -- and never make the pipeline on the program's thread, nor
 //! wait for a making another encoder began.
@@ -38,11 +38,14 @@
 //! pages the dispatch was encoded over stay untouched.
 //!
 //! A device test: compiled only under the validation crate's GPU safety cfgs (`m2v_gpu`,
-//! `m2v_cpu_icd`), on the kind of device the cfg selects. The tile function is the owned fixture
-//! `validation/fixtures/public/engine/k10ts_tile_grid.ll`, as `tile_pending.rs` runs it, over one
-//! 16x16 tile so that its records fit in one page ([`Page`]).
+//! `m2v_cpu_icd`), on the kind of device the cfg selects, whose recordings wait for a making until
+//! it is made (`PipelineWaitPolicy::Exact`, `blit_holds::exact_waits_device`): under the default
+//! bound, a pass whose making is still held 4.5 s after its commit runs nothing and its command
+//! buffer completes, which a loaded host reaches while a leg holds the making. The tile function is
+//! the owned fixture `validation/fixtures/public/engine/k10ts_tile_grid.ll`, as `tile_pending.rs`
+//! runs it, over one 16x16 tile so that its records fit in one page ([`Page`]).
 
-use super::blit_holds::{device, over_host, Host, Scratch, WAIT};
+use super::blit_holds::{exact_waits_device, over_host, Host, Scratch, WAIT};
 use super::layer_claim::Watched;
 use super::pending_rebind::device as watched_device;
 use super::rebind_behind_a_wait::{Page, BYTES};
@@ -66,7 +69,7 @@ const WATCHED_COMPLETION: Duration = Duration::from_millis(500);
 
 /// The safety net: the pool's hold goes after this whatever the leg is doing, so a regression that
 /// makes the rebind block again ends the leg on its assertions instead of wedging it while it holds
-/// the Mac's GPU lock. The leg's own release comes long before.
+/// the GPU. The leg's own release comes long before.
 const NET: Duration = Duration::from_secs(20);
 
 /// The pass's tile and render area: one whole 16x16 tile, so the fixture's slot
@@ -227,7 +230,7 @@ fn leg(memo: Memo) {
         Memo::LetGo => "tile-rebind-memo-let-go",
         Memo::InFlight => "tile-rebind-memo-in-flight",
     });
-    let device: Device = device(&scratch.0);
+    let device: Device = exact_waits_device(&scratch.0);
     let state = tile_state(&device);
     let colors = attachments(&device);
     let crowd_colors = attachments(&device);
@@ -321,7 +324,7 @@ fn leg(memo: Memo) {
 
     // From now on the pool starts no piece: a making handed to it stays in flight. The one hold is
     // a thread's, which drops it when the leg says so or after `NET`, whichever comes first: a leg
-    // that blocks in the rebind cannot keep it and wedge the Mac's GPU lock.
+    // that blocks in the rebind cannot keep it and hold the GPU wedged.
     let hold = held::hold();
     let (release, released_at) = std::sync::mpsc::channel::<()>();
     let watchdog = std::thread::spawn(move || {
@@ -496,9 +499,8 @@ fn a_rebind_does_not_wait_for_a_tile_making_another_encoder_began() {
 /// write into pages the program handed back, with no fault and nothing said. That is the class of
 /// bug this guard exists for, so it is watched by the layer and not by a page's contents alone.
 ///
-/// The encoding again is made impossible as `pending_rebind.rs` makes it: the render encoder is
-/// opened while the device has no buffer over host pages, so it logs no call (`Unlogged::NoCalls`)
-/// and no rebind can replay it. The device's pool is held, so only a host step records the pass,
+/// The encoding again is made impossible: the render encoder is opened while the device has no
+/// buffer over host pages, so it logs no call (`Unlogged::NoCalls`) and no rebind can replay it. The device's pool is held, so only a host step records the pass,
 /// and only once the hold is gone -- after the rebind, in every run.
 ///
 /// Without `DeferredPass::record_forms`' `encoder_rebound` guard the host step records the pass and

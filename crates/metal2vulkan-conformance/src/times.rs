@@ -528,7 +528,7 @@ impl TimeVerdict {
     pub fn ratio(&self) -> Option<f64> {
         match self {
             TimeVerdict::Within { ours, metal } | TimeVerdict::Over { ours, metal } => {
-                (*metal > 0).then(|| *ours as f64 / *metal as f64)
+                (*metal > 0).then_some(*ours as f64 / *metal as f64)
             }
             TimeVerdict::Unmeasured { .. } => None,
         }
@@ -596,7 +596,7 @@ impl Comparison {
         match self {
             Comparison::Judged { verdict } => verdict.ratio(),
             Comparison::Noticed { ours, metal, .. } => {
-                (*metal > 0).then(|| *ours as f64 / *metal as f64)
+                (*metal > 0).then_some(*ours as f64 / *metal as f64)
             }
             Comparison::Apart { .. } => None,
         }
@@ -824,7 +824,7 @@ pub struct Paired {
 impl Paired {
     /// How many times our leg's total is Metal's, where Metal's is not zero.
     pub fn ratio(&self) -> Option<f64> {
-        (self.metal.wall > 0).then(|| self.ours.wall as f64 / self.metal.wall as f64)
+        (self.metal.wall > 0).then_some(self.ours.wall as f64 / self.metal.wall as f64)
     }
 }
 
@@ -1165,7 +1165,8 @@ pub fn render(metal: Option<&Measurement>, ours: &Measurement, show: bool) -> St
         "  A RATIO FAR IN OUR FAVOUR IS A SETUP DIFFERENCE UNTIL SOMEBODY SHOWS OTHERWISE. The \
          suite's recordings make 733\n  shader references over 152 distinct (shader, entry) \
          pairs, so 90% are to a shader another case already used,\n  and our leg has a shader \
-         cache while Metal's newLibraryWithData recompiles every call. Our counters sum to 518\n           shader modules and 1,040 pipelines for 122 ms of measured compile -- about 78 us each, \
+         cache while Metal's newLibraryWithData recompiles every call. Our counters sum to 518\n  \
+         shader modules and 1,040 pipelines for 122 ms of measured compile -- about 78 us each, \
          which is not a price at\n  which any compile to machine code happens, so something below \
          us is handing back work already done. Use\n  --cold-shaders for the only setting under \
          which the compile rows compare like with like.\n",

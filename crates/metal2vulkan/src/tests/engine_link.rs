@@ -16,7 +16,9 @@ use std::sync::Arc;
 use crate::budget::SPIRV_WORDS;
 use crate::device::requirements::{FormatUsage, VkFeature};
 use crate::device::{Device, DeviceDescription, DevicePolicy, DeviceProfile};
-use crate::error::{DescriptorError, Error, Feature, LowerFamily, Needs, RuntimeInput};
+use crate::error::{
+    DescriptorError, Error, Feature, LowerFamily, MetalAnswer, Needs, RuntimeInput,
+};
 use crate::library::{FunctionArtifact, FunctionConstantValues};
 use crate::metal::{BlendFactor, PixelFormat, VertexFormat};
 use crate::pipeline::compile::{compile_bitcode, EntryRef};
@@ -261,14 +263,20 @@ fn pipeline_mismatches_are_typed_refusals() {
     r.color_attachments[2] = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm));
     assert_eq!(
         link(&[&v, &f], &render(&r), &p).unwrap_err(),
-        Error::InvalidDescriptor(DescriptorError::ColorAttachment { index: 2 })
+        Error::InvalidDescriptor(DescriptorError::ColorAttachment {
+            index: 2,
+            metal: MetalAnswer::NilWithError,
+        })
     );
     // A signed-integer attachment: the fragment compiled for an unsigned one declares the output
     // `uint`, so it is a stage of another pipeline.
     r.color_attachments[2] = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA32Sint));
     assert_eq!(
         link(&[&v, &f], &render(&r), &p).unwrap_err(),
-        Error::InvalidDescriptor(DescriptorError::ColorAttachment { index: 2 })
+        Error::InvalidDescriptor(DescriptorError::ColorAttachment {
+            index: 2,
+            metal: MetalAnswer::NilWithError,
+        })
     );
     // An absent attachment discards the output.
     r.color_attachments[2] = None;
@@ -509,7 +517,10 @@ fn a_signed_integer_attachment_takes_an_int_output() {
         assert_eq!(color_class(&plain, 1), Some(IoNumeric::Uint), "{stem}");
         assert_eq!(
             link(&[&v, &plain], &render(&signed_targets()), &p).unwrap_err(),
-            Error::InvalidDescriptor(DescriptorError::ColorAttachment { index: 1 }),
+            Error::InvalidDescriptor(DescriptorError::ColorAttachment {
+                index: 1,
+                metal: MetalAnswer::NilWithError,
+            }),
             "{stem}"
         );
         let mut unsigned = signed_targets();
@@ -517,7 +528,10 @@ fn a_signed_integer_attachment_takes_an_int_output() {
             Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA32Uint));
         assert_eq!(
             link(&[&v, &f], &render(&unsigned), &p).unwrap_err(),
-            Error::InvalidDescriptor(DescriptorError::ColorAttachment { index: 1 }),
+            Error::InvalidDescriptor(DescriptorError::ColorAttachment {
+                index: 1,
+                metal: MetalAnswer::NilWithError,
+            }),
             "{stem}"
         );
     }
@@ -548,7 +562,10 @@ fn dual_source_blending_needs_the_second_output() {
     );
     assert_eq!(
         link(&[&v, &single], &render(&r), &p).unwrap_err(),
-        Error::InvalidDescriptor(DescriptorError::ColorAttachment { index: 0 })
+        Error::InvalidDescriptor(DescriptorError::ColorAttachment {
+            index: 0,
+            metal: MetalAnswer::NilWithError,
+        })
     );
 }
 
@@ -602,8 +619,8 @@ fn the_projection_of_the_fixture_is_fixed_function() {
 /// (`PrecisionNote::DeviceNanEncoding`) only where the profile's driver is not measured to store
 /// Metal's NaN: a `float` output's everywhere but MoltenVK, whose conversion is Metal's (the
 /// output's own NaN reaches the device's conversion, which no other driver is measured with), a
-/// `half` output's everywhere but NVIDIA's measured GPUs. A write to an `RGBA8Unorm` attachment
-/// records none.
+/// `half` output's everywhere, its widening's NaN the device's (NVIDIA's on the RTX 5080 Laptop
+/// GPU stores `0x7fff`). A write to an `RGBA8Unorm` attachment records none.
 #[test]
 fn half_float_writes_note_the_nan_encoding_where_the_device_rewrites_it() {
     use crate::pipeline::artifact::PrecisionNote;
@@ -617,7 +634,7 @@ fn half_float_writes_note_the_nan_encoding_where_the_device_rewrites_it() {
         ("amd-rdna3-radv", true, true),
         ("intel-irisxe-rplp-anv", true, true),
         ("nvidia-rtx50-linux", true, true),
-        ("nvidia-rtx5080-laptop", true, false),
+        ("nvidia-rtx5080-laptop", true, true),
         ("moltenvk-m3", false, true),
     ] {
         let p = prof(stem);
@@ -644,6 +661,48 @@ fn half_float_writes_note_the_nan_encoding_where_the_device_rewrites_it() {
                 );
                 assert_eq!(notes.contains(&note), want, "{what}: {notes:?}");
             }
+        }
+    }
+}
+
+/// A fragment function's output every return of which holds a constant none of whose lanes is a
+/// NaN (`stage_io::returns_no_nan`) stores no NaN, so its write to a half-float channel records no
+/// `PrecisionNote::DeviceNanEncoding` where a computed one does: a constant `half4` and `float4`,
+/// and a struct's constant color 0, record none; a constant whose red is a NaN, a computed
+/// `half4` and the struct's computed color 1 record it, on lavapipe and MoltenVK (whose `half`
+/// outputs' NaNs the device canonicalizes).
+#[test]
+fn constant_colors_without_a_nan_record_no_nan_encoding() {
+    use crate::pipeline::artifact::PrecisionNote;
+    let Some(bc) = assemble("ncw_constant_colors.ll") else {
+        return;
+    };
+    let note = PrecisionNote::DeviceNanEncoding;
+    for stem in ["lavapipe", "moltenvk-m3"] {
+        let p = prof(stem);
+        let v = compile(&bc, "ncw_vertex", &p).expect("vertex");
+        for (entry, color, noted) in [
+            ("ncw_constant_half", 0, false),
+            ("ncw_constant_float", 0, false),
+            ("ncw_constant_nan", 0, true),
+            ("ncw_computed_half", 0, true),
+            ("ncw_constant_pair", 0, false),
+            ("ncw_constant_pair", 1, true),
+        ] {
+            let what = format!("{stem} {entry} color {color}");
+            let mut r = RenderLinkInputs::new();
+            r.color_attachments[color] =
+                Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA16Float));
+            let f = compile_with(&bc, entry, &p, &fragment_inputs(&r, &p))
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(
+                f.precision.contains(&note),
+                noted,
+                "{what}: {:?}",
+                f.precision
+            );
+            let l = link(&[&v, &f], &render(&r), &p).unwrap_or_else(|e| panic!("{what}: {e}"));
+            validate_all(&l, &[&v, &f], &p);
         }
     }
 }
@@ -1013,6 +1072,10 @@ fn the_graphics_state_states_what_the_vertex_function_writes() {
             if positioned {
                 shapes.push(vec![&*v, &*white]);
             }
+            // Metal makes a pipeline of a vertex function that writes no position only with
+            // rasterization disabled (`DescriptorError::RasterizedVoidVertex`).
+            let mut r = r.clone();
+            r.rasterization_enabled = positioned;
             for stages in shapes {
                 let graphics = link(&stages, &render(&r), &p)
                     .unwrap_or_else(|e| panic!("{what}: link: {e}"))

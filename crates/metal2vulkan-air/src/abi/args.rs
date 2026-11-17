@@ -5,7 +5,7 @@
 //! set of attributes and requires some of them.
 
 use super::keys::{Key, BUFFER_ACCESS, TEXTURE_ACCESS};
-use super::md::{kept_bytes, Ops, Site, Tok};
+use super::md::{kept_bytes, saw_str, Ops, Site, Tok};
 use super::structs::Structs;
 use super::{
     AbiInt, AccelerationStructureKind, Access, ArgTypeInfo, BufferArg, Builtin, ControlPointField,
@@ -160,6 +160,8 @@ struct Attrs {
     sampling: Option<Sampling>,
     perspective: Option<bool>,
     flat: bool,
+    /// `air.interpolation_function`: an `interpolant`.
+    interpolant: bool,
     data_size: Option<u32>,
     /// The `air.imageblock_master` layout node, resolved by [`Node::layouts`].
     master: Option<MdId>,
@@ -212,10 +214,14 @@ impl Attrs {
 
     /// The interpolation keys, if any were given.
     fn interpolation(&self, site: &Site) -> Result<Option<Interpolation>, Error> {
-        let sampling = match (self.sampling, self.access) {
-            (Some(s), None) => Some(s),
-            (None, Some(Access::Sample)) => Some(Sampling::Sample),
-            (None, None) => None,
+        let sampling = match (self.sampling, self.access, self.interpolant) {
+            (Some(s), None, false) => Some(s),
+            (None, Some(Access::Sample), false) => Some(Sampling::Sample),
+            (None, None, true) => Some(Sampling::Interpolant),
+            (None, None, false) => None,
+            (_, _, true) => {
+                return Err(site.err(AbiError::BadValue, Some(Key::InterpolationFunction.name())))
+            }
             _ => return Err(site.err(AbiError::BadValue, Some(Key::Sample.name()))),
         };
         match (self.flat, sampling, self.perspective) {
@@ -321,7 +327,10 @@ impl<'m> Cx<'m, '_> {
             pointer,
             MemberSpace::Unstated,
         )?;
-        if !input_in_stage(&role, stage) {
+        // Only a kernel takes an argument by value.
+        let by_value_outside_kernel =
+            node.role == Key::Constant && !matches!(stage, Stage::Kernel { .. });
+        if by_value_outside_kernel || !input_in_stage(&role, stage) {
             return Err(node.site.err(AbiError::UnknownKey, Some(node.role.name())));
         }
         Ok(ParamBinding {
@@ -496,8 +505,11 @@ impl<'m> Cx<'m, '_> {
             }
             _ => {}
         }
-        let vertex_input = (role, cx) == (Key::VertexInput, Context::Input);
-        self.attrs(&mut ops, &mut node.attrs, vertex_input)?;
+        let attribute = matches!(
+            (role, cx),
+            (Key::VertexInput | Key::StageIn, Context::Input)
+        );
+        self.attrs(&mut ops, &mut node.attrs, attribute)?;
         ops.finish()?;
         node.site = ops.site;
         Ok(node)
@@ -516,11 +528,13 @@ impl<'m> Cx<'m, '_> {
         Ok(Predicate { global, name })
     }
 
-    /// Read attributes until the node ends. A `vertex_input` node's location may be followed by
-    /// its attribute's user key, which AIR 2.2 (macOS 13's compiler) writes there as
-    /// `generated(..)`: a vertex input binds by its location alone, so the key is read and not
-    /// kept. Any other node's non-key string is `UnknownKey`.
-    fn attrs(&mut self, ops: &mut Ops<'m>, a: &mut Attrs, vertex_input: bool) -> Result<(), Error> {
+    /// Read attributes until the node ends. A `vertex_input` or `stage_in` node's location may be
+    /// followed by its attribute's user key, which AIR 2.2 (macOS 13's compiler) writes there as
+    /// `generated(..)` for a vertex input, and Apple's OpenGL front end as the attribute's name
+    /// (`attrib_0`) for a vertex input and a kernel's stage-in attribute alike: an attribute binds
+    /// by its location alone, so the key is read and not kept. Any other node's non-key string is
+    /// `UnknownKey`.
+    fn attrs(&mut self, ops: &mut Ops<'m>, a: &mut Attrs, attribute: bool) -> Result<(), Error> {
         while !ops.is_done() {
             self.meter.tick(1)?;
             let k = key(ops)?;
@@ -534,7 +548,7 @@ impl<'m> Cx<'m, '_> {
                         index: ops.abi_int(name)?,
                         count: ops.abi_int(name)?,
                     });
-                    if vertex_input
+                    if attribute
                         && matches!(ops.peek(), Some(Tok::Str(s)) if Key::parse(s).is_none())
                     {
                         ops.string(name)?;
@@ -560,6 +574,7 @@ impl<'m> Cx<'m, '_> {
                 Key::Perspective => set(&mut a.perspective, true, ops, k)?,
                 Key::NoPerspective => set(&mut a.perspective, false, ops, k)?,
                 Key::Flat => a.flat = true,
+                Key::InterpolationFunction => a.interpolant = true,
                 Key::ImageblockDataSize => a.data_size = Some(ops.u32(name)?),
                 Key::ImageblockMaster => {
                     a.master = Some(ops.child(name)?);
@@ -694,6 +709,33 @@ impl<'m> Cx<'m, '_> {
                     _ => ParamRole::Buffer(arg),
                 }
             }
+            // An argument passed by value (Apple's OpenCL compiler writes one for each scalar,
+            // vector or struct parameter of a kernel): the entry reads it from a constant-space
+            // pointer, so it is a read-only constant buffer holding exactly its own bytes, as a
+            // `constant T&` reference is. Its node states no access and no address space.
+            Key::Constant if !indirect => {
+                a.allow(
+                    self.meter,
+                    site,
+                    &[&[
+                        Key::LocationIndex,
+                        Key::StructTypeInfo,
+                        Key::ArgTypeSize,
+                        Key::ArgTypeAlignSize,
+                    ]],
+                )?;
+                let size = a
+                    .size
+                    .ok_or_else(|| site.err(AbiError::MissingKey, Some(Key::ArgTypeSize.name())))?;
+                ParamRole::Buffer(BufferArg {
+                    location: a.location(site)?,
+                    access: Access::Read,
+                    space: AddrSpace::Constant,
+                    buffer_size: Some(size),
+                    layout: l.layout,
+                    raster_order_group: None,
+                })
+            }
             Key::Texture => {
                 a.allow(
                     self.meter,
@@ -772,7 +814,11 @@ impl<'m> Cx<'m, '_> {
                 }
             }
             Key::FragmentInput if !indirect => {
-                a.allow(self.meter, site, &[INTERPOLATION])?;
+                a.allow(
+                    self.meter,
+                    site,
+                    &[INTERPOLATION, &[Key::InterpolationFunction]],
+                )?;
                 let key = kept_bytes(n.word.as_deref().unwrap_or_default(), self.meter)?;
                 ParamRole::FragmentInput(Varying {
                     key: UserKey(key),
@@ -1265,7 +1311,8 @@ fn key(ops: &mut Ops<'_>) -> Result<Key, Error> {
     key_of(ops)
 }
 
+/// The next operand as a known key; a string the ABI does not define is `UnknownKey`, naming it.
 pub(super) fn key_of(ops: &mut Ops<'_>) -> Result<Key, Error> {
     let s = ops.string(None)?;
-    Key::parse(s).ok_or_else(|| ops.site.err(AbiError::UnknownKey, None))
+    Key::parse(s).ok_or_else(|| ops.site.unknown(None, saw_str(s)))
 }

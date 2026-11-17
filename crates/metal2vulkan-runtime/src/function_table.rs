@@ -4,11 +4,14 @@
 //! - **A table is a buffer of words.** The translation reads a `visible_function_table` as a
 //!   read-only buffer of `pipeline::table`'s words at its Metal buffer index: 1 for a bound table,
 //!   its size, then one word per entry, 0 for a null entry and else a handle's. A table is one
-//!   runtime buffer of those words, `Shared`, written through its mapping, so a dispatch reads
-//!   the entries as they are when it runs: as on Metal (measured on an M3 Max and an M4), an
-//!   entry set after the dispatch was encoded and before the commit is the one it calls. The
-//!   encoder binds the table's buffer at the table's index (`set_visible_function_table`); an
-//!   unbound index reads the zero-filled neutral, a null table of size 0, Metal's plain answer.
+//!   runtime buffer of those words, `Shared`, outside the Metal address space (`address.rs`):
+//!   Metal shows no address of a table, which a function reaches through its binding, its
+//!   resource ID or its words' device address, so no program buffer's address depends on it. It
+//!   is written through its mapping, so a dispatch reads the entries as they are when it runs: as
+//!   on Metal (measured on an M3 Max and an M4), an entry set after the dispatch was encoded and
+//!   before the commit is the one it calls. The encoder binds the table's buffer at the table's
+//!   index (`set_visible_function_table`); an unbound index reads the zero-filled neutral, a null
+//!   table of size 0, Metal's plain answer.
 //! - **Handles are the pipeline's.** `function_handle` is the word `pipeline::table` numbers the
 //!   function by among the kernel's linked functions (`functions`, then `binary_functions`):
 //!   one per function, none for a private function, an unlinked one or the kernel, as Metal
@@ -51,7 +54,7 @@
 
 use super::address::AddressPlacement;
 use super::buffer::{Buffer, Modes};
-use super::device::lock;
+use super::device::{lock, shared_draw_lock};
 use super::error::{internal, invalid, nil, Error, Problem, RuntimeGap};
 use super::library::Function;
 use super::memory::MemoryClass;
@@ -66,6 +69,8 @@ use metal2vulkan::error::{Feature, Unsupported};
 use metal2vulkan::metal::RenderStages;
 use metal2vulkan::pipeline::{LinkedFunction, LinkedFunctions, Stage};
 use std::sync::{Arc, Mutex};
+
+pub(crate) mod carry;
 
 /// A table's options: `Shared`, the default CPU cache mode, tracked (Metal's 512).
 fn table_options() -> ResourceOptions {
@@ -126,8 +131,8 @@ pub enum FunctionTableProblem {
     /// A render pipeline state's `function_handle` or `new_visible_function_table` for `stage`,
     /// which is not one stage: empty, or more than one. Metal's validation stops each ("stage
     /// invalid"); plain Metal answers the handle nil, and the table of more than one stage (an
-    /// [`Error::Nil`](crate::Error::Nil)), and faults on a table of no stage (an
-    /// [`Error::Invalid`](crate::Error::Invalid); an M4 under macOS 27.0.1). One
+    /// [`Error::Nil`]), and faults on a table of no stage (an
+    /// [`Error::Invalid`]; an M4 under macOS 27.0.1). One
     /// stage the state has no function of answers no handle and makes a table, as plain Metal's.
     ///
     /// Basis: metal-measured (an M4, macOS 27.0.1: plain Metal answers the handle nil and the table
@@ -150,12 +155,12 @@ pub struct FunctionHandle {
 /// The pipeline state that gives a handle or makes a table, and which of its functions' linked
 /// functions number the handles: a compute state's kernel's (a tile state's, its tile
 /// function's), or a drawing state's function of one stage; or a render state's stage it has no
-/// function of, which numbers none, on its device.
+/// function of, which numbers none, on the state's device.
 #[derive(Clone)]
 enum Maker {
     Compute(ComputePipelineState),
     Render(GraphicsState, Stage),
-    Unlinked(Device),
+    Unlinked(RenderPipelineState),
 }
 
 impl Maker {
@@ -169,12 +174,26 @@ impl Maker {
         }
     }
 
-    /// The state's device.
-    fn device(&self) -> &Device {
+    /// The device of the state's program this reach takes (`pipeline/carry.rs`): a borrow for a
+    /// command buffer's work.
+    fn generation(&self) -> &Device {
+        match self {
+            Maker::Compute(state) => state.generation(),
+            Maker::Render(state, _) => state.device(),
+            Maker::Unlinked(state) => state.generation(),
+        }
+    }
+
+    /// The state's device, owned: the generation handle of its program the state's hold reached
+    /// (`pipeline/carry.rs`).
+    fn device(&self) -> Device {
         match self {
             Maker::Compute(state) => state.device(),
-            Maker::Render(state, _) => state.device(),
-            Maker::Unlinked(device) => device,
+            Maker::Render(state, _) => {
+                let _held = state.hold();
+                state.device().clone()
+            }
+            Maker::Unlinked(state) => state.device(),
         }
     }
 
@@ -192,8 +211,9 @@ impl Maker {
     /// link in `functions` or `binary_functions`. A function of another device is refused
     /// (`Invalid(ForeignObject)`).
     fn function_handle(self, function: &Function) -> Result<Option<FunctionHandle>, Error> {
-        if !function.device().same(self.device()) {
-            return Err(invalid("function_handle", Problem::ForeignObject));
+        let device = self.device();
+        if !function.root_device().same(&device) {
+            return Err(function.root_device().foreign("function_handle", &device));
         }
         let handle = self
             .linked_functions()
@@ -296,7 +316,7 @@ impl Maker {
         descriptor: &VisibleFunctionTableDescriptor,
     ) -> Result<VisibleFunctionTable, Error> {
         const CALL: &str = "new_visible_function_table";
-        let device = self.device().clone();
+        let device = self.device();
         let count = descriptor.function_count;
         let max_buffer_length = device.properties().max_buffer_length;
         let Ok(size) = u32::try_from(count) else {
@@ -316,13 +336,13 @@ impl Maker {
             modes,
             MemoryClass::WriteCombined,
             false,
-            AddressPlacement::Any,
+            AddressPlacement::Outside,
         )?;
         let table = VisibleFunctionTable(Arc::new(TableShared {
             state: self,
             words,
             count: size,
-            writes: Mutex::new(()),
+            writes: Mutex::new(vec![0; (length / 4) as usize]),
             id: IdHold::take(
                 &device.shared().resource_ids,
                 IdSpace::FunctionTable,
@@ -338,6 +358,13 @@ impl Maker {
         // The ID was free, so a table the registry still names under it is gone.
         lock(&device.shared().function_tables)
             .insert(table.gpu_resource_id().0, Arc::downgrade(&table.0));
+        // Kept for a recovery to carry (`function_table/carry.rs`).
+        if device.shared().carry.function_table(&table) {
+            device.carry_late(|serving| table.carry(serving));
+        }
+        if let Maker::Render(state, _) = &table.0.state {
+            state.made_a_table();
+        }
         Ok(table)
     }
 }
@@ -346,7 +373,7 @@ impl Maker {
 /// argument buffer can name for a command of the state (`BindState::function_tables`). Gone ones
 /// leave the device's registry.
 fn live_tables(device: &Device, made: impl Fn(&Maker) -> bool) -> Vec<VisibleFunctionTable> {
-    let mut live = lock(&device.shared().function_tables);
+    let mut live = shared_draw_lock(&device.shared().function_tables);
     live.retain(|_, table| table.strong_count() > 0);
     live.values()
         .filter_map(|table| table.upgrade().map(VisibleFunctionTable))
@@ -417,8 +444,11 @@ impl FunctionHandle {
         &self.name
     }
 
-    /// `device`.
-    pub fn device(&self) -> &Device {
+    /// `device`: a generation handle of the device, owned, as Metal's `device` answers a retained
+    /// device: that of the program of the state that gave the handle as the state answers it
+    /// ([`ComputePipelineState::device`], [`RenderPipelineState::device`]), or of a render
+    /// state's stage that has no function, the state's then.
+    pub fn device(&self) -> Device {
         self.state.device()
     }
 }
@@ -429,6 +459,7 @@ impl ComputePipelineState {
     /// `functions` or `binary_functions` (a private function, the kernel itself, another
     /// function). A function of another device is refused (`Invalid(ForeignObject)`).
     pub fn function_handle(&self, function: &Function) -> Result<Option<FunctionHandle>, Error> {
+        let _held = self.hold();
         Maker::Compute(self.clone()).function_handle(function)
     }
 
@@ -440,13 +471,14 @@ impl ComputePipelineState {
         &self,
         descriptor: &VisibleFunctionTableDescriptor,
     ) -> Result<VisibleFunctionTable, Error> {
+        let _held = self.hold();
         Maker::Compute(self.clone()).new_visible_function_table(descriptor)
     }
 
     /// The live tables this state made, in resource-ID order: what an argument buffer can name
     /// for a dispatch of the state (`BindState::function_tables`).
     pub(super) fn function_tables(&self) -> Vec<VisibleFunctionTable> {
-        live_tables(self.device(), |made| match made {
+        live_tables(self.generation(), |made| match made {
             Maker::Compute(state) => state == self,
             Maker::Render(..) | Maker::Unlinked(_) => false,
         })
@@ -466,6 +498,7 @@ impl RenderPipelineState {
         function: &Function,
         stage: RenderStages,
     ) -> Result<Option<FunctionHandle>, Error> {
+        let _held = self.hold();
         self.maker(stage)
             .ok_or_else(|| not_one_stage("function_handle", stage, false))?
             .function_handle(function)
@@ -483,6 +516,7 @@ impl RenderPipelineState {
         descriptor: &VisibleFunctionTableDescriptor,
         stage: RenderStages,
     ) -> Result<VisibleFunctionTable, Error> {
+        let _held = self.hold();
         self.maker(stage)
             .ok_or_else(|| not_one_stage("new_visible_function_table", stage, true))?
             .new_visible_function_table(descriptor)
@@ -521,7 +555,7 @@ impl RenderPipelineState {
         ];
         stages
             .contains(&stage)
-            .then(|| Maker::Unlinked(self.device().clone()))
+            .then(|| Maker::Unlinked(self.clone()))
     }
 }
 
@@ -539,7 +573,11 @@ fn not_one_stage(call: &'static str, stage: RenderStages, table: bool) -> Error 
 impl GraphicsState {
     /// The live tables this state made, for any stage, in resource-ID order: what an argument
     /// buffer can name for a draw of the state (`BindState::function_tables`).
+    /// A state that never made one takes none, and no lock of the device's registry.
     pub(crate) fn function_tables(&self) -> Vec<VisibleFunctionTable> {
+        if !self.made_tables() {
+            return Vec::new();
+        }
         live_tables(self.device(), |made| match made {
             Maker::Render(state, _) => state.is(self),
             Maker::Compute(_) | Maker::Unlinked(_) => false,
@@ -643,11 +681,13 @@ pub(super) struct TableShared {
     /// The state (and a drawing state's stage) that made the table: the only one whose handles
     /// it takes.
     state: Maker,
-    /// The table's words: bound, its size, its entries.
+    /// The table's words: bound, its size, its entries. A buffer of the runtime's own, carried
+    /// with the table (`function_table/carry.rs`).
     words: Buffer,
     count: u32,
-    /// Held while the CPU writes a word.
-    writes: Mutex<()>,
+    /// The words as the CPU wrote them, held while it writes one: what a recovery's carry to new
+    /// memory writes there (`function_table/carry.rs`).
+    writes: Mutex<Vec<u32>>,
     id: IdHold,
 }
 
@@ -670,9 +710,12 @@ impl Eq for VisibleFunctionTable {}
 impl VisibleFunctionTable {
     /// Write the word `value` at byte `offset` of the table's buffer.
     fn write(&self, offset: u64, value: u32) {
-        let contents = self.0.words.contents();
-        let _writing = lock(&self.0.writes);
-        if let Some(contents) = contents {
+        let mut written = lock(&self.0.writes);
+        if let Some(word) = written.get_mut((offset / 4) as usize) {
+            *word = value;
+        }
+        // Under `writes`, which a recovery's carry holds: the mapping of the parts it writes.
+        if let Some(contents) = self.0.words.mapped_contents() {
             // SAFETY: the table's buffer is `Shared` and mapped for its life, and holds
             // `FunctionTableWords::byte_len(count)` bytes; every caller writes a word of its
             // header or of an entry below `count`, at a multiple of 4 of the mapping, whose start
@@ -712,7 +755,7 @@ impl VisibleFunctionTable {
         let len = self.words_len() as usize;
         let mut bytes = vec![0; len];
         let _writing = lock(&self.0.writes);
-        if let Some(contents) = self.0.words.contents() {
+        if let Some(contents) = self.0.words.mapped_contents() {
             // SAFETY: the table's buffer is `Shared` and mapped for its life, and holds `len`
             // bytes; the CPU writes no word meanwhile (`writes`), and no command writes them.
             unsafe {
@@ -773,9 +816,18 @@ impl VisibleFunctionTable {
         Ok(())
     }
 
-    /// `device`.
-    pub fn device(&self) -> &Device {
+    /// `device`: a generation handle of the device, owned, as Metal's `device` answers a retained
+    /// device: that of the program of the state that made the table as the state answers it
+    /// ([`ComputePipelineState::device`], [`RenderPipelineState::device`]), or of a render
+    /// state's stage that has no function, the state's then.
+    pub fn device(&self) -> Device {
         self.0.state.device()
+    }
+
+    /// The device of the program of the state that made the table, as this reach takes it
+    /// (`pipeline/carry.rs`): a borrow for a command buffer's work.
+    pub(crate) fn generation(&self) -> &Device {
+        self.0.state.generation()
     }
 
     /// The table's size, the `functionCount` of the descriptor it was made from. Not public:

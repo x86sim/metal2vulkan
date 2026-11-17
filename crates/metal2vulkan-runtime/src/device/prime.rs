@@ -6,6 +6,14 @@
 //! destructor then, before the hook, which therefore runs first. So neither a section in progress
 //! as the process exits, nor the program's own calls before it, is the first to make such a static.
 //!
+//! **Only a device that registers the hook is primed** (`exit_guard::before_priming`): the
+//! process's first device, the first after a load of a shared object, and one of an identity new
+//! since. A device made again on what stays loaded, after a device of its identity registered,
+//! registers nothing, and its calls are not the first: the earlier device's priming made each.
+//! Priming costs a device's making the driver's time for its objects: on NVIDIA's 620.70.06 on
+//! the RTX 3090, 120 to 160 ms, nearly all in `vkCreateIndirectCommandsLayoutEXT` (112 to 144 ms)
+//! where the device generates commands, so a device made again there takes that much less.
+//!
 //! Measured: without it, at 175dd511 on lavapipe x86_64, an exit right after committing 256
 //! command buffers ended by `SIGSEGV` in one of 10 rounds. The core's stack: the scheduler's
 //! `vkCmdPipelineBarrier` (its first submission's barriers) faulting inside the validation
@@ -27,7 +35,8 @@
 //! addresses, [`DEVICE_ADDRESS_CALLS`], its address read), and an image with their memory and
 //! views, a depth image, a render pass of each form (`vkCreateRenderPass`, `vkCreateRenderPass2`)
 //! and a framebuffer, a descriptor set layout, a pipeline
-//! layout with a push constant range and a descriptor pool with a set written, and a compute
+//! layout with a push constant range and a descriptor pool with a set written (and reset before its
+//! release), and a compute
 //! pipeline made with a pipeline cache from a shader module, its stage specialized as the runtime's
 //! makings are ([`SPECIALIZED`]), whose data is read; a command buffer, recorded and never
 //! submitted, with what a host step records: the pipeline and the set bound (and, where the device
@@ -65,21 +74,22 @@
 //! registration, in each of 10.
 //!
 //! Priming makes each entry point once, in the runtime's shapes; it cannot promise that a layer
-//! makes no new static on a code path a later call takes with other parameters. A section's
-//! first call of each entry point, and every section whose count reaches a power of two,
-//! register the hook again for those (`exit_guard`).
+//! makes no new static on a code path a later call takes with other parameters. The calls it made
+//! count as the first since the load (`exit_guard::primed`), and a section's first call of an
+//! entry point it did not make registers the hook again; a static a later call makes is the
+//! hook's hole (`exit_guard`, "Registered again").
 
 use crate::draw_source::SizedIndexBind;
 use crate::dynamic_state::{ColorWriteMasks, ExtendedDynamicState};
 use crate::error::{vulkan, Error};
-use crate::exit_guard::Call;
+use crate::exit_guard::{Call, Calls};
 use crate::generated_commands::{
     Commands, ExecutionSetCreateInfo, ExecutionSetPipelineInfo, ExecutionSetToken,
     LayoutCreateInfo, LayoutToken, EXECUTION_SET_PIPELINES, INDIRECT_BINDABLE, TOKEN_DISPATCH,
     TOKEN_EXECUTION_SET,
 };
 use crate::gpu_time::Calibration;
-use crate::loader_word::LoaderWord;
+use crate::loader_word::DeviceWord;
 use crate::memory;
 use crate::release::{self, Generated, Released};
 use crate::sharing::Sharing;
@@ -185,6 +195,14 @@ pub(crate) const YCBCR_CONVERSION_CALLS: [Call; 1] = [Call::DestroySamplerYcbcrC
 /// messages ([`NAMING_CALLS`]).
 const PRIMING_PIPELINE: &std::ffi::CStr =
     c"metal2vulkan: a priming pipeline that rasterizes nothing";
+
+/// The debug name of a compute pipeline that priming makes, as [`PRIMING_PIPELINE`].
+const PRIMING_KERNEL: &std::ffi::CStr = c"metal2vulkan: a priming kernel";
+
+/// The debug name of the indirect-bindable compute pipeline that priming makes for
+/// device-generated commands, as [`PRIMING_PIPELINE`].
+const PRIMING_GENERATED_KERNEL: &std::ffi::CStr =
+    c"metal2vulkan: a priming kernel of device-generated commands";
 
 /// The longest the priming submission is waited for: it holds two barriers.
 const LIMIT: Duration = Duration::from_secs(10);
@@ -420,7 +438,7 @@ pub(super) unsafe fn prime(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
     device: &Vk,
-    loader_word: &LoaderWord,
+    loader_word: &DeviceWord,
     queue_family: u32,
     queues: &[QueueSlot],
     sharing: Sharing<'_>,
@@ -440,7 +458,7 @@ pub(super) unsafe fn prime(
         drawn,
         // SAFETY: the caller's.
         memory: unsafe { instance.get_physical_device_memory_properties(physical) },
-        calls: 0,
+        calls: Calls::NONE,
         held: Vec::new(),
     };
     // SAFETY: the caller's.
@@ -465,6 +483,9 @@ pub(super) unsafe fn prime(
             primer.made(call);
         }
     }
+    // The first calls since the last load, made before the device registers the exit hook: a
+    // section's later call of one registers nothing again.
+    crate::exit_guard::primed(primer.calls);
     if primed.is_ok() && cfg!(debug_assertions) {
         let missing = missing(primer.calls, has);
         assert!(
@@ -486,12 +507,12 @@ pub(super) unsafe fn prime(
 /// [`COLOR_WRITE_MASK_CALLS`] and [`SIZED_INDEX_BIND_CALLS`] where it has
 /// not their commands, and those of [`YCBCR_CONVERSION_CALLS`] where it converts no YCbCr format,
 /// that `calls` (one bit each) does not hold.
-pub(crate) fn missing(calls: u128, has: Has) -> Vec<Call> {
+pub(crate) fn missing(calls: Calls, has: Has) -> Vec<Call> {
     Call::ALL
         .iter()
         .copied()
         .filter(|&call| {
-            calls & call.bit() == 0
+            !calls.holds(call)
                 && !UNPRIMED.contains(&call)
                 && (has.timestamps || !TIMESTAMP_CALLS.contains(&call))
                 && ((has.timestamps && has.host_query_reset)
@@ -533,7 +554,7 @@ type Release = Box<dyn FnOnce(&ash::Device) -> Call>;
 struct Primer<'a> {
     device: &'a Vk,
     /// The device's loader word, put back before each call the loader serves.
-    loader_word: &'a LoaderWord,
+    loader_word: &'a DeviceWord,
     /// How the device's buffers and images are shared among its queue families.
     sharing: Sharing<'a>,
     /// The push command, where the device has it (`binding::push_descriptor_command`).
@@ -544,7 +565,7 @@ struct Primer<'a> {
     drawn: PrimedDraws,
     memory: vk::PhysicalDeviceMemoryProperties,
     /// The table's entry points called, one bit each.
-    calls: u128,
+    calls: Calls,
     /// What was made, released last first.
     held: Vec<Release>,
 }
@@ -552,7 +573,30 @@ struct Primer<'a> {
 impl Primer<'_> {
     /// `call` was made.
     fn made(&mut self, call: Call) {
-        self.calls |= call.bit();
+        self.calls = self.calls.with(call);
+    }
+
+    /// Name `pipeline` `name`, where the instance reports messages ([`NAMING_CALLS`]), as a
+    /// making names its pipeline (`DeviceShared::name_pipeline`): the loader serves the call.
+    ///
+    /// # Safety
+    ///
+    /// `pipeline` is the device's, made by this priming, which no other thread holds.
+    unsafe fn name(&mut self, pipeline: vk::Pipeline, name: &std::ffi::CStr) {
+        let device = self.device;
+        let Some(object_name) = device.object_name() else {
+            return;
+        };
+        let info = vk::DebugUtilsObjectNameInfoEXT::default()
+            .object_handle(pipeline)
+            .object_name(name);
+        // SAFETY: the caller's; the instance enables `VK_EXT_debug_utils` (it reports messages),
+        // and the function is the device's.
+        let _ = unsafe {
+            self.loader_word
+                .restored(|| object_name(device.handle(), &info))
+        };
+        self.made(Call::SetDebugUtilsObjectName);
     }
 
     /// The command buffer `vkAllocateCommandBuffers` allocates of `info`, the device's loader
@@ -570,8 +614,8 @@ impl Primer<'_> {
     ) -> Result<vk::CommandBuffer, Error> {
         // SAFETY: the caller's; the device is live while it is primed.
         let buffers = unsafe {
-            self.loader_word.restore();
-            self.device.allocate_command_buffers(info)
+            self.loader_word
+                .restored(|| self.device.allocate_command_buffers(info))
         };
         Ok(buffers.map_err(vulkan)?[0])
     }
@@ -583,6 +627,20 @@ impl Primer<'_> {
             // releases what it holds.
             unsafe { release::object(device, object) };
             T::CALL
+        }));
+    }
+
+    /// Reset `pool` before it is released, as a predicated loop's run again resets its arena's
+    /// pools: held right after the pool, so released before it, and after the command pool
+    /// whose never-submitted command buffer binds the pool's set, which is held later.
+    fn hold_reset(&mut self, pool: vk::DescriptorPool) {
+        self.held.push(Box::new(move |device: &ash::Device| {
+            // SAFETY: the pool is the device's, the device is idle when the priming releases what
+            // it holds, and the command buffer that bound the pool's set is freed before this.
+            let _ = unsafe {
+                device.reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
+            };
+            Call::ResetDescriptorPool
         }));
     }
 
@@ -774,6 +832,23 @@ impl Primer<'_> {
             .with(|queue| unsafe { device.queue_wait_idle(queue) })
             .map_err(vulkan)?;
         self.made(Call::QueueWaitIdle);
+        // A spare pool's command buffers freed and the pool trimmed as a command buffer gives it
+        // back (`spares.rs`). Trimmed on every device: no command buffer submitted again ever
+        // came before the priming's (`RuntimeDriverDefect::TrimmedCommandBufferFailsResubmission`).
+        // SAFETY: the command buffer is the priming's pool's, its one submission completed, and
+        // the pool is the priming's alone.
+        unsafe {
+            release::object(
+                device,
+                release::PoolBuffers {
+                    pool,
+                    buffers: &buffers,
+                    trim: true,
+                },
+            )
+        };
+        self.made(Call::FreeCommandBuffers);
+        self.made(Call::TrimCommandPool);
         if let Some(queries) = queries {
             let mut results = [[0u64; 2]; 2];
             // SAFETY: the pool's two queries were written by the submission, which completed;
@@ -850,6 +925,7 @@ impl Primer<'_> {
                 .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
                 .map_err(|(_, error)| vulkan(error))?[0];
             self.hold(pipeline);
+            self.name(pipeline, PRIMING_GENERATED_KERNEL);
             let pipelines = ExecutionSetPipelineInfo::new(pipeline, 1);
             let set = commands
                 .create_execution_set(&ExecutionSetCreateInfo::new(&pipelines))
@@ -941,6 +1017,10 @@ impl Primer<'_> {
             self.made(Call::CreateBuffer);
             let requirements = device.get_buffer_memory_requirements(buffer);
             self.made(Call::GetBufferMemoryRequirements);
+            let mut requirements2 = vk::MemoryRequirements2::default();
+            let query = vk::BufferMemoryRequirementsInfo2::default().buffer(buffer);
+            device.get_buffer_memory_requirements2(&query, &mut requirements2);
+            self.made(Call::GetBufferMemoryRequirements2);
             let host =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
             let memory = match self.allocate(requirements, host, device_addresses) {
@@ -1156,6 +1236,7 @@ impl Primer<'_> {
             let pool = device.create_descriptor_pool(&info, None).map_err(vulkan)?;
             self.made(Call::CreateDescriptorPool);
             self.hold(pool);
+            self.hold_reset(pool);
             // A set of it, written: the runtime releases its pools with their sets.
             let info = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(pool)
@@ -1197,6 +1278,7 @@ impl Primer<'_> {
                 .map_err(|(_, error)| vulkan(error))?[0];
             self.made(Call::CreateComputePipelines);
             self.hold(pipeline);
+            self.name(pipeline, PRIMING_KERNEL);
             device.get_pipeline_cache_data(cache).map_err(vulkan)?;
             self.made(Call::GetPipelineCacheData);
 
@@ -1442,16 +1524,7 @@ impl Primer<'_> {
                 .map_err(|(_, error)| vulkan(error))?[0];
             self.made(Call::CreateGraphicsPipelines);
             self.hold(pipeline);
-            // Its debug name, where the instance reports messages, as a making names its pipeline
-            // (`pipeline/graphics.rs`): the loader serves the call.
-            if let Some(name) = device.object_name() {
-                self.loader_word.restore();
-                let info = vk::DebugUtilsObjectNameInfoEXT::default()
-                    .object_handle(pipeline)
-                    .object_name(PRIMING_PIPELINE);
-                let _ = name(device.handle(), &info);
-                self.made(Call::SetDebugUtilsObjectName);
-            }
+            self.name(pipeline, PRIMING_PIPELINE);
 
             let allocate = vk::CommandBufferAllocateInfo::default()
                 .command_pool(commands)

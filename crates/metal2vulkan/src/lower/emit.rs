@@ -7,8 +7,10 @@
 //! each block by routing every instruction's [`Strategy`] to its family's emit function. It then
 //! lets `fragment::wrap_entry` choose the entry function (the walked body itself, or a raster order
 //! group's interlocked wrapper that calls it), declares the entry point, finalizes, runs P9
-//! (`promote_single_store`), and removes what no instruction reads, taking the lowering's offers
-//! that make the module smaller (`spirv::dead::remove_dead_keeping`).
+//! (`promote_single_store`), removes what no instruction reads, taking the lowering's offers
+//! that make the module smaller (`spirv::dead::remove_dead_keeping`), and, under the 16-bit float
+//! controls, holds the `half` values of a module that computes `half` in 16 bits there
+//! (`spirv::half_hold`).
 //!
 //! The emitter owns its value environment: the SPIR-V value of each AIR value in the block being
 //! emitted, reset at the top of every block, and the values the entry hook (`stage_io::emit_entry`;
@@ -106,6 +108,7 @@ fn declare(mb: &mut ModuleBuilder, plan: &Plan) -> BResult<Declared> {
     mb.set_quantize_form(plan.families.arith.quantize);
     mb.set_native_half(plan.families.arith.native_half);
     mb.set_native_half_nans(plan.families.arith.native_half_nans);
+    mb.set_half_controls(plan.families.arith.controls);
     let mut d = Declared::default();
     let modes = &mut d.modes;
     d.families.access = access::declare(mb, plan, modes)?;
@@ -188,6 +191,10 @@ pub struct EmitCx<'a> {
     /// where `live` holds. In a workgroup-uniform block every invocation is live or none is, so
     /// every lane takes part as active (a result nobody is live for is never stored).
     pub active: Option<SValue>,
+    /// The flag a predicated walk starts `live` from, computed in the function's entry: whether
+    /// the invocation is one of its partial object threadgroup's threads (`dispatch::emit_entry`).
+    /// `None`: every invocation runs the body.
+    pub(crate) entry_live: Option<SValue>,
     /// The memory-plan slots a buffer store emitted so far merges a partial word into, through
     /// the sub-word store's two atomics, which read the word they modify. Whether a store merges
     /// depends on the leaf the lowering chose and on the units the slot's views hold on the
@@ -203,9 +210,19 @@ pub struct EmitCx<'a> {
     /// (`sampler::routine`).
     pub(crate) sampling: crate::lower::sampler::routine::Routines,
     /// A merged draw's vertex function's command, vertex, instance and slot table, which
-    /// `stage_io::emit_entry` finds before the body (`stage_io::MergedRead`): defined in the
-    /// function's straight-line entry, so every later block of the function may read them.
+    /// `stage_io::emit_draw_entry` finds before the body and before any other hook reads its slot
+    /// table (`stage_io::MergedRead`): defined at entry, where they dominate every later block of
+    /// the function, which may read them.
     pub(crate) merged_draw: Option<crate::bind::MergedVertex>,
+    /// A merged draw's fragment function's command's fragment slot table, which
+    /// `stage_io::emit_draw_entry` finds before the body and before any other hook reads it
+    /// (`stage_io::StageIoPlan::merged_fragment`), defined in the function's straight-line entry.
+    pub(crate) merged_fragment_table: Option<SValue>,
+    /// The texel of each storage-form color attachment a fragment function reads, by Metal
+    /// color index, at the invocation's pixel (and sample), which `fragment::emit_entry` reads
+    /// before the body: defined in the function's straight-line entry, inside the interlock, so
+    /// every use of the color in a later block takes the one texel (`fragment::fetch::value`).
+    pub(crate) fetched: Vec<(u32, SValue)>,
 }
 
 /// A value that is the same wherever an invocation computes it, so a block computes it once, and
@@ -224,10 +241,10 @@ enum Invariant {
     /// dominates it ran that test on the same sampler, so it needs none of its own.
     CubicTested(ValueId),
     /// An indexed capture form's raw index (`stage_io::read_captured_index`), read at entry
-    /// (`stage_io::emit_entry`): the index buffer is read-only to the draw.
+    /// (`stage_io::emit_draw_entry`): the index buffer is read-only to the draw.
     CapturedIndex,
     /// The private list form's base vertex (`stage_io::read_listed_base`), read at entry
-    /// (`stage_io::emit_entry`): the list is read-only to the draw.
+    /// (`stage_io::emit_draw_entry`): the list is read-only to the draw.
     ListedBase,
     /// The root table's sink address (`access::dynamic::read_sink_host`), read at entry
     /// (`access::dynamic::emit_entry`): the root table is read-only to the dispatch.
@@ -251,11 +268,14 @@ impl<'a> EmitCx<'a> {
             entry_block: None,
             live: None,
             active: None,
+            entry_live: None,
             merged: BTreeSet::new(),
             localized: None,
             fault: None,
             sampling: Default::default(),
             merged_draw: None,
+            merged_fragment_table: None,
+            fetched: Vec::new(),
         }
     }
 
@@ -354,8 +374,8 @@ impl<'a> EmitCx<'a> {
         Ok(v)
     }
 
-    /// An indexed capture form's raw index, read once where it dominates: `stage_io::emit_entry`
-    /// reads it in the function's first block, which dominates every block of the function, the
+    /// An indexed capture form's raw index, read once where it dominates:
+    /// `stage_io::emit_draw_entry` reads it in the function's first block, which dominates every block of the function, the
     /// merge of the restart test it then closes included.
     pub(crate) fn captured_index(&mut self, fb: &mut FunctionBuilder<'_>) -> BResult<SValue> {
         let first = fb.entry_block();
@@ -439,6 +459,14 @@ impl<'a> EmitCx<'a> {
                     None => Err(self.fail("a merged draw's slot table read before its entry")),
                 };
             }
+            // A merged draw's fragment function reads its command's fragment slot table.
+            PushField::RootTableAddress
+                if self.plan.families.stage_io.merged_fragment.is_some() =>
+            {
+                return self.merged_fragment_table.ok_or_else(|| {
+                    self.fail("a merged draw's fragment slot table read before its entry")
+                });
+            }
             PushField::SlotGuestBase(slot) if self.plan.families.access.replay => {
                 return access::replay_guest_base(self, fb, slot)
             }
@@ -505,8 +533,9 @@ impl<'a> EmitCx<'a> {
     }
 
     /// Bind AIR value `v` to `x` for the whole function: `x` was emitted by the entry hook
-    /// (`stage_io::emit_entry`) in the function's first block, before the walk, so its definition
-    /// dominates every block and opening a block does not forget it.
+    /// (`stage_io::emit_entry`, `access::dynamic::emit_entry`) before the walk, in a block that
+    /// dominates every block of the body (the function's first, or a merged vertex's search's
+    /// merge, `stage_io::emit_draw_entry`), so opening a block does not forget it.
     pub fn hold(&mut self, v: ValueId, x: SValue) {
         if let Some(slot) = self.env.get_mut(v.index()) {
             *slot = Some(x);
@@ -669,11 +698,14 @@ impl<'a> Emitter<'a> {
                 entry_block: None,
                 live: None,
                 active: None,
+                entry_live: None,
                 merged: BTreeSet::new(),
                 localized: None,
                 fault: None,
                 sampling: Default::default(),
                 merged_draw: None,
+                merged_fragment_table: None,
+                fetched: Vec::new(),
             },
             vars: None,
             phis,
@@ -1108,6 +1140,10 @@ impl CodeEmitter for Emitter<'_> {
         self.cx.plan.families.simd.predication.is_some()
     }
 
+    fn entry_live(&self) -> Option<SValue> {
+        self.cx.entry_live
+    }
+
     fn syncs(&self, b: crate::air::ir::BlockId) -> bool {
         self.cx
             .plan
@@ -1325,6 +1361,9 @@ pub fn emit_module(e: &Entry, plan: &Plan, m: &mut Meter) -> Result<Emitted, Err
                 // The bound values the function reads as data, right after their fields.
                 .and_then(|()| crate::lower::specialized::emit_entry(&mut em.cx, &mut fb))
                 .and_then(|()| dispatch::emit_entry(&mut em.cx, &mut fb))
+                // What the invocation draws (a merged draw's command and its slot tables) before
+                // any hook reads a slot table.
+                .and_then(|()| stage_io::emit_draw_entry(&mut em.cx, &mut fb))
                 .and_then(|()| access::dynamic::emit_entry(&mut em.cx, &mut fb))
                 .and_then(|()| stage_io::emit_entry(&mut em.cx, &mut fb))
                 .and_then(|()| tessellation::emit_entry(&mut em.cx, &mut fb))
@@ -1429,6 +1468,11 @@ pub fn emit_module(e: &Entry, plan: &Plan, m: &mut Meter) -> Result<Emitted, Err
     let r = remove_dead_keeping(&mut module, &offers, m);
     m.release(std::mem::size_of_val(offers.as_slice()));
     r?;
+    // Under the 16-bit float controls, a module that computes `half` in 16 bits holds its `half`
+    // values there (`spirv::half_hold`).
+    if plan.families.arith.controls {
+        crate::spirv::half_hold::hold(&mut module, m)?;
+    }
     Ok(Emitted { module, merged })
 }
 

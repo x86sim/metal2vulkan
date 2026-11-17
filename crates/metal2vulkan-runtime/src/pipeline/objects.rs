@@ -13,9 +13,12 @@
 //! a variant's are shares.
 
 use super::content_keyed::{program_call, ContentKeyed, Owned};
+use super::creation_log;
 use super::graphics::Notices;
+use super::interlocked_writes;
 use super::kept::{Compiled, Instance, KeptObjects, KeptPipeline, Place};
 use super::libraries::Linked;
+use super::memo::Lru;
 use super::shared_layouts::{settle_layouts, shared_layout, SharedLayout};
 use super::RegionKey;
 use crate::binding::{Info, SetWrite};
@@ -23,11 +26,11 @@ use crate::degradation::{
     tested_slots_of, BoundFormats, BoundNotice, CompiledPipeline, Kinds, Occurrence, TestedFormats,
 };
 use crate::descriptor_arena::{DescriptorArena, SetNeeds};
-use crate::device::{lock, DeviceShared};
+use crate::device::{lock, shared_draw_lock, DeviceShared};
 use crate::error::{internal, vulkan, Error};
 use crate::exit_guard;
 use crate::generated_commands::INDIRECT_BINDABLE;
-use crate::heap_sets::{self, HeapSet};
+use crate::heap_sets::{self, HeapSet, HeapTables, TableBinder};
 use crate::release;
 use crate::shader_cache::driver::Making;
 use crate::ycbcr_device::YCbCrSampler;
@@ -37,7 +40,7 @@ use metal2vulkan::bind::{DispatchRegion, DynamicViewsModule};
 use metal2vulkan::cache::{Hash256, SpecializationKey};
 use metal2vulkan::error::{Feature, RuntimeDriverDefect, Unsupported};
 use metal2vulkan::pipeline::{
-    DescriptorSetLayout, PipelineLayout, RenderPipeline, SlotRef, StageModule,
+    DescriptorSetLayout, PipelineLayout, RenderPipeline, RuntimeDependency, SlotRef, StageModule,
 };
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,6 +75,13 @@ pub(crate) struct StageObject {
 /// device's teardown (`content_keyed.rs`).
 pub(crate) struct SamplerSet {
     samplers: Vec<vk::Sampler>,
+}
+
+impl SamplerSet {
+    /// Whether it holds any sampler: a layout that bakes none takes an empty set.
+    pub(crate) fn holds_samplers(&self) -> bool {
+        !self.samplers.is_empty()
+    }
 }
 
 impl Owned<DeviceShared> for SamplerSet {
@@ -130,7 +140,6 @@ pub(crate) fn sampler_set(
     if crate::warm::warming() {
         return Err(crate::warm::translation_only());
     }
-    let shared = device.shared();
     // The device's Y′CbCr conversion of each sampler of a planes image (`texture/ycbcr_planes.rs`),
     // the one its view is made with, so the two are identically defined: made before the sets'
     // lock, as it takes the owned kernels' own.
@@ -148,14 +157,32 @@ pub(crate) fn sampler_set(
         })
         .collect::<Result<Vec<_>, Error>>()?;
     let program = program_call();
+    loop {
+        match make_sampler_set(device, &descs, &conversions, program) {
+            // The device's samplers at its limit: a released variant's kept instance that holds
+            // samplers goes first (`kept.rs`), and the set is made again.
+            Err(Error::SamplerLimit(_)) if evict_kept_for_samplers(device) => {}
+            made => return made,
+        }
+    }
+}
+
+/// [`sampler_set`]'s making of the set of `descs`, each with its conversion, once.
+fn make_sampler_set(
+    device: &Device,
+    descs: &[metal2vulkan::vk::SamplerDesc],
+    conversions: &[Option<vk::SamplerYcbcrConversion>],
+    program: bool,
+) -> Result<(Arc<SamplerSet>, bool), Error> {
+    let shared = device.shared();
     // The lock is held across the creation, so two of the program's calls never make two sets of
     // the same samplers.
     let mut sets = lock(&shared.sampler_sets);
-    let made = sets.get_or_make(descs.clone(), program, || {
+    let made = sets.get_or_make(descs.to_vec(), program, || {
         let mut set = SamplerSet {
             samplers: Vec::with_capacity(descs.len()),
         };
-        for (desc, conversion) in descs.iter().zip(&conversions) {
+        for (desc, conversion) in descs.iter().zip(conversions) {
             let mut chained = vk::SamplerYcbcrConversionInfo::default();
             let mut reduction = vk::SamplerReductionModeCreateInfo::default();
             let mut border = vk::SamplerBorderColorComponentMappingCreateInfoEXT::default();
@@ -190,6 +217,34 @@ pub(crate) fn sampler_set(
     Ok((set, made))
 }
 
+/// Make room for a sampler the device refused at its limit (`Error::SamplerLimit`): the least
+/// recently released kept instance that holds immutable samplers goes (`Kept::evict_for_samplers`),
+/// and the device's maps let go of what nothing holds then, its samplers among it where no live
+/// variant shares them. Whether an instance went: a caller tries its sampler again while one does.
+/// In a program's call only, where the kept variants apply their queue; elsewhere none goes.
+pub(crate) fn evict_kept_for_samplers(device: &Device) -> bool {
+    if !program_call() {
+        return false;
+    }
+    let shared = device.shared();
+    if !lock(&shared.kept).evict_for_samplers(shared) {
+        return false;
+    }
+    settle_device_maps(device);
+    true
+}
+
+/// Let go of the device's graphics pipeline libraries, modules, pipeline layouts and sampler sets
+/// nothing holds now, in the program's order: after the kept variants applied their queue. In
+/// that order, so one settle lets go of all an evicted instance held: a linked pipeline holds its
+/// layout (`libraries.rs`), and a layout the samplers it bakes (`shared_layouts.rs`).
+fn settle_device_maps(device: &Device) {
+    settle_libraries(device);
+    settle_modules(device);
+    settle_layouts(device);
+    settle_sampler_sets(device);
+}
+
 /// Let go of the device's sampler sets no variant holds any more (`content_keyed.rs`): in a
 /// program's call only, where the kept variants applied their queue.
 fn settle_sampler_sets(device: &Device) {
@@ -212,6 +267,11 @@ impl StageObject {
     pub(super) fn module(&self) -> vk::ShaderModule {
         self.module.raw
     }
+
+    /// Its module's SPIR-V words (`compile_memory.rs`).
+    pub(super) fn words(&self) -> usize {
+        self.module.words
+    }
 }
 
 /// One `VkShaderModule`: the device's module of its SPIR-V, shared by every variant whose stage
@@ -224,6 +284,8 @@ impl StageObject {
 /// MSL once.
 pub(crate) struct ShaderModule {
     raw: vk::ShaderModule,
+    /// Its SPIR-V's words: what its makings weigh (`compile_memory.rs`).
+    words: usize,
 }
 
 impl Owned<DeviceShared> for ShaderModule {
@@ -240,8 +302,21 @@ impl Owned<DeviceShared> for ShaderModule {
 /// `DeviceShared::shader_modules`).
 pub(crate) type ShaderModules = ContentKeyed<Hash256, ShaderModule>;
 
+/// The most compiled pipelines whose stages' digests a device keeps ([`WordsDigests`]).
+pub(crate) const WORDS_DIGESTS: usize = 16384;
+
+/// The digests of each compiled pipeline's stage words ([`words_digest`]), in stage order, by the
+/// compiled pipeline (the memo's key), kept past its variants and past the memo, which let it go
+/// (`DeviceShared::words_digests`). A variant whose objects are made again, where no kept
+/// instance gives them back (`kept.rs`), names its modules by these and hashes no word: a
+/// program's state after the warm pass made the same pipeline, or after the memo let it go. A key
+/// names one compiled pipeline in a process, as the memo trusts, so it names those words.
+/// Holds no Vulkan object; at most [`WORDS_DIGESTS`], the least recently used going first.
+pub(crate) type WordsDigests = Lru<Compiled, Arc<[Hash256]>>;
+
 /// The SHA-256 of SPIR-V `words` (their length, then their bytes): what names a stage's module in
-/// the device's map and its words in its makings' records, taken once per stage of a variant.
+/// the device's map and its words in its makings' records, taken once per stage of a variant of a
+/// pipeline the device kept no digests of ([`WordsDigests`]).
 ///
 /// The only derivation of such a digest there is. A creation that holds the compiled function a
 /// stage's words came from asks the function for the digest it already took with this very
@@ -349,7 +424,10 @@ pub(crate) fn shader_module(
         let info = vk::ShaderModuleCreateInfo::default().code(spirv);
         // SAFETY: the code is live SPIR-V words for the call.
         let raw = unsafe { shared.vk().create_shader_module(&info, None) }.map_err(vulkan)?;
-        Ok::<_, Error>(ShaderModule { raw })
+        Ok::<_, Error>(ShaderModule {
+            raw,
+            words: spirv.len(),
+        })
     });
     let gone = modules.sweep();
     drop(modules);
@@ -428,11 +506,21 @@ pub(crate) struct VariantObjects {
     /// The formats at its tested slots under which its notes of the bound formats last named
     /// nothing (`degrade_bound_formats`).
     quiet_formats: Mutex<Option<TestedFormats>>,
+    /// Whether its notes of the bound formats named nothing at a bind, where it tests no slot
+    /// (`tested` empty): they name nothing again under any formats (`degrade_bound_formats`),
+    /// which a bind then tells with no lock.
+    quiet_untested: AtomicBool,
     /// The layout's set 1, the heap, where it has one.
     heap_layout: Option<DescriptorSetLayout>,
     /// The device's heap set of that layout, from the variant's first command that binds it
     /// (`heap_sets.rs`).
     heap: Mutex<Option<Arc<HeapSet>>>,
+    /// What its layout binds of the device's texture and sampler tables, from its first command
+    /// ([`heap_tables`](Self::heap_tables)).
+    heap_tables: OnceLock<HeapTables>,
+    /// Its share in the device's sampler tables of the kind its layout binds, from its first
+    /// command ([`bind_sampler_tables`](Self::bind_sampler_tables)).
+    sampler_binder: OnceLock<Option<TableBinder>>,
     /// The variant instance its objects are, where its last release keeps them for a variant of
     /// the same compiled pipeline made again (`kept.rs`); `None` destroys them.
     keep: Option<Instance>,
@@ -445,6 +533,13 @@ pub(crate) struct VariantObjects {
     /// The digests its graphics pipeline libraries are named by (`graphics.rs`), from its first
     /// making linked from libraries.
     parts_content: OnceLock<PartsContent>,
+    /// A compute variant's kernel, kept for the pipeline creation log's lines while the log is on
+    /// ([`VariantObjects::log_kernel`]).
+    logged: Option<Box<creation_log::LoggedKernel>>,
+    /// Its Metal functions' names, which the `VkPipeline`s it makes are named by for the layers'
+    /// messages, where the device's instance reports messages
+    /// ([`VariantObjects::name_pipelines`]).
+    named: Option<String>,
 }
 
 /// The digests of a variant's layout and of each of its stages (its stage, entry point,
@@ -520,11 +615,15 @@ pub(crate) struct RawPipeline {
     /// The variant instance whose layout made it and its place there, where its last release
     /// keeps it for that instance (`kept.rs`); `None` destroys it.
     pub(super) keep: Option<(Instance, Place)>,
+    /// Let go of by its memo past a bound ([`doom`](Self::doom)): its last release destroys it
+    /// where it would keep it.
+    pub(super) doomed: AtomicBool,
     /// Made at its state's creation, its specialized notices not announced yet: the first draw
     /// that takes it announces them, with what it binds (`RenderVariant::first_use`).
     pub(super) unannounced: AtomicBool,
-    /// The libraries it was linked from, held while it lives (`libraries.rs`); `None` for a
-    /// pipeline made whole.
+    /// The device's linked pipeline it is, with the libraries it was linked from, held while it
+    /// lives (`libraries.rs`): `raw` is that pipeline's, which only the device's map destroys.
+    /// `None` for a pipeline made whole, which is this variant's own.
     pub(super) linked: Option<Linked>,
 }
 
@@ -534,7 +633,8 @@ impl Drop for RawPipeline {
         let Some(_busy) = exit_guard::enter() else {
             return;
         };
-        if let Some((instance, place)) = self.keep.clone() {
+        let doomed = self.doomed.load(Ordering::Acquire);
+        if let Some((instance, place)) = self.keep.clone().filter(|_| !doomed) {
             let shared = self.device.shared();
             let kept = KeptPipeline {
                 place,
@@ -545,8 +645,12 @@ impl Drop for RawPipeline {
             lock(&shared.kept).pipeline_released(instance, kept);
             return;
         }
-        // SAFETY: as for `VariantObjects`.
-        unsafe { release::object(self.device.shared().vk(), self.raw) };
+        // A linked pipeline is the device's, which other variants may share: its map destroys
+        // it once nothing holds it (`libraries.rs`), and this lets go of its share.
+        if self.linked.is_none() {
+            // SAFETY: as for `VariantObjects`.
+            unsafe { release::object(self.device.shared().vk(), self.raw) };
+        }
     }
 }
 
@@ -562,9 +666,16 @@ impl RawPipeline {
             raw: kept.raw,
             created_in: std::time::Duration::ZERO,
             keep: Some((instance, kept.place)),
+            doomed: AtomicBool::new(false),
             unannounced: AtomicBool::new(kept.unannounced),
             linked: kept.linked,
         }
+    }
+
+    /// Its memo let go of it past a bound (`region_ledger.rs`): its last release destroys it,
+    /// where it would keep it for its instance, so a kept instance holds only what its memo held.
+    pub(crate) fn doom(&self) {
+        self.doomed.store(true, Ordering::Release);
     }
 
     /// Whether its specialized notices wait for this, its first draw: once true, then false.
@@ -581,6 +692,12 @@ impl RawPipeline {
 }
 
 impl VariantObjects {
+    /// The variant instance its objects are, where one keeps them (`kept.rs`): `None` in a warm
+    /// pass.
+    pub(super) fn instance(&self) -> Option<Instance> {
+        self.keep
+    }
+
     /// The shader modules of `stages` and the layouts of `layout`, a compiled pipeline's. Sets
     /// are numbered by position (the layout's set `n` is at index `n`), which the compile layer
     /// guarantees. Once they are made, the device announces what the stages record: their
@@ -598,13 +715,16 @@ impl VariantObjects {
         let push_set_zero = pushes_set_zero(device, layout, stages, pipeline);
         let dynamic = dynamic_bindings(device, layout, push_set_zero);
         let set_needs = needs_of(device, layout, push_set_zero, &dynamic)?;
-        // One sampler per binding that bakes one, in the layout's order: the live set of the same
-        // samplers where it holds one, else one made now (`sampler_set`).
+        // One sampler per binding that bakes one, and one per element of a sampler array, in the
+        // layout's order: the live set of the same samplers where it holds one, else one made now
+        // (`sampler_set`).
         let descs: Vec<metal2vulkan::vk::SamplerDesc> = layout
             .sets
             .iter()
             .flat_map(|set| &set.bindings)
-            .filter_map(|binding| binding.immutable_sampler)
+            .flat_map(|binding| {
+                (binding.immutable_sampler.into_iter()).chain(binding.immutable_samplers.clone())
+            })
             .collect();
         let (samplers, made) = sampler_set(device, descs)?;
         if made && exit_guard::in_host_step() {
@@ -645,14 +765,26 @@ impl VariantObjects {
                 .collect(),
             heap_layout: layout.sets.get(1).cloned(),
             heap: Mutex::new(None),
-            kinds: Kinds::of(stages, pipeline, understates_support(device)),
+            heap_tables: OnceLock::new(),
+            sampler_binder: OnceLock::new(),
+            kinds: Kinds::of(
+                stages,
+                pipeline,
+                (
+                    understates_support(device),
+                    unordered_bind(device, layout, stages, pipeline).is_some(),
+                ),
+            ),
             tested: tested_slots_of(stages),
             bound: Mutex::new(None),
             quiet_formats: Mutex::new(None),
+            quiet_untested: AtomicBool::new(false),
             keep: None,
             content: variant_content(layout, stages, &words),
             words: Arc::clone(&words),
             parts_content: OnceLock::new(),
+            logged: None,
+            named: None,
         };
         for (stage, words) in stages.iter().zip(words.iter()) {
             let entry = CString::new(stage.entry_point.as_str())
@@ -694,17 +826,19 @@ impl VariantObjects {
             true => None,
             false => lock(&shared.kept).take(shared, compiled),
         };
-        // The kept variants' queue applied (an evicted instance's modules let go): the device's
-        // modules nothing holds now go, in the program's order.
-        settle_modules(device);
-        // And the device's pipeline layouts nothing holds now, then the sampler sets nothing
-        // holds now, the evicted instances' layouts gone.
-        settle_layouts(device);
-        settle_sampler_sets(device);
-        // And the device's graphics pipeline libraries nothing holds now.
-        settle_libraries(device);
+        // The kept variants' queue applied (an evicted instance's objects let go): the device's
+        // modules, layouts, sampler sets and libraries nothing holds now go, in the program's
+        // order.
+        settle_device_maps(device);
         let Some(back) = back else {
+            // The digests an earlier variant of the pipeline took, where the caller has none.
+            let known = match digests {
+                Some(_) => None,
+                None => lock(&shared.words_digests).get(&compiled).cloned(),
+            };
+            let digests = digests.or(known.as_deref());
             let mut objects = VariantObjects::create(device, layout, stages, pipeline, digests)?;
+            lock(&shared.words_digests).insert(compiled, Arc::clone(&objects.words), 1);
             objects.keep = (!warming).then(|| Instance::new(compiled));
             return Ok((objects, Vec::new()));
         };
@@ -731,14 +865,26 @@ impl VariantObjects {
                 .collect(),
             heap_layout: layout.sets.get(1).cloned(),
             heap: Mutex::new(None),
-            kinds: Kinds::of(stages, pipeline, understates_support(device)),
+            heap_tables: OnceLock::new(),
+            sampler_binder: OnceLock::new(),
+            kinds: Kinds::of(
+                stages,
+                pipeline,
+                (
+                    understates_support(device),
+                    unordered_bind(device, layout, stages, pipeline).is_some(),
+                ),
+            ),
             tested: tested_slots_of(stages),
             bound: Mutex::new(None),
             quiet_formats: Mutex::new(None),
+            quiet_untested: AtomicBool::new(false),
             keep: Some(instance),
             content: back.objects.content,
             words: back.objects.words,
             parts_content: OnceLock::new(),
+            logged: None,
+            named: None,
         };
         let pipelines = back
             .pipelines
@@ -750,6 +896,40 @@ impl VariantObjects {
             .collect();
         device.degrade_stages(stages, Occurrence::Made);
         Ok((objects, pipelines))
+    }
+
+    /// Keep the kernel `stage` of the function `function` describes, of a variant of emulated
+    /// simdgroups where `emulated_variant` says so, for the pipeline creation log's line of each
+    /// compute `VkPipeline` these objects make, while the log is on
+    /// (`creation_log::compute_kernel`).
+    pub(crate) fn log_kernel(
+        &mut self,
+        function: &metal2vulkan::pipeline::FunctionDescriptor,
+        stage: &StageModule,
+        emulated_variant: bool,
+    ) {
+        self.logged = creation_log::compute_kernel(function, stage, emulated_variant);
+    }
+
+    /// Name the `VkPipeline`s it makes for the layers' messages by `names`, its Metal functions'
+    /// names, asked only where the device's instance reports messages
+    /// (`DeviceShared::name_pipeline`). Objects that two pipeline states' variants share carry
+    /// the names of the first: the names serve messages alone.
+    pub(crate) fn name_pipelines(&mut self, names: impl FnOnce() -> String) {
+        if self.device.shared().vk().object_name().is_some() {
+            self.named = Some(names());
+        }
+    }
+
+    /// What the layers' messages name a `VkPipeline` it makes by: its Metal functions' names,
+    /// then `note` (what else the pipeline is: a library's part) in parentheses where there is
+    /// one.
+    pub(crate) fn pipeline_name(&self, note: Option<&str>) -> String {
+        match (self.named.as_deref(), note) {
+            (Some(named), Some(note)) => format!("{named} ({note})"),
+            (Some(named), None) => named.to_owned(),
+            (None, note) => note.unwrap_or_default().to_owned(),
+        }
     }
 
     /// The kinds its making may announce (`Kinds::of`), which a bind tests.
@@ -770,8 +950,9 @@ impl VariantObjects {
     /// that binds `formats` (`Device::degrade_bound_formats`), but where the formats at its tested
     /// slots are those under which they last named nothing (`quiet_formats`): what they name is a
     /// function of those formats, of its stages, and of the kinds the device has yet to announce,
-    /// which only shrink, so they name nothing again. A command whose formats are unknown (an
-    /// indirect command's) announces as before.
+    /// which only shrink, so they name nothing again. A variant that tests no slot keeps that
+    /// answer with no lock (`quiet_untested`). A command whose formats are unknown (an indirect
+    /// command's) announces as before.
     pub(crate) fn degrade_bound_formats(
         &self,
         stages: &[StageModule],
@@ -781,7 +962,16 @@ impl VariantObjects {
             self.device.degrade_bound_formats(stages, None);
             return;
         };
-        let quiet = lock(&self.quiet_formats)
+        if self.tested.is_empty() {
+            if self.quiet_untested.load(Ordering::Acquire) {
+                return;
+            }
+            if !self.device.degrade_bound_formats(stages, Some(formats)) {
+                self.quiet_untested.store(true, Ordering::Release);
+            }
+            return;
+        }
+        let quiet = shared_draw_lock(&self.quiet_formats)
             .as_ref()
             .is_some_and(|quiet| quiet.iter().all(|&(slot, format)| formats(slot) == format));
         if quiet {
@@ -842,6 +1032,12 @@ impl VariantObjects {
         self.layout.layout()
     }
 
+    /// Its share of the device's layout, which a linked pipeline made with it holds
+    /// (`libraries.rs`).
+    pub(crate) fn shared_layout(&self) -> &Arc<SharedLayout> {
+        &self.layout
+    }
+
     /// How many sets the layout has.
     pub(crate) fn set_count(&self) -> usize {
         self.layout.set_layouts().len()
@@ -894,6 +1090,29 @@ impl VariantObjects {
             }
             _ => Ok(None),
         }
+    }
+
+    /// What its layout, `layout`, of a pipeline stating `dependencies` (the caller's: those of
+    /// the compiled pipeline it is the objects of), binds of the device's tables, worked out at
+    /// its first command (`heap_sets::HeapTables`).
+    pub(crate) fn heap_tables(
+        &self,
+        layout: &PipelineLayout,
+        dependencies: &[RuntimeDependency],
+    ) -> &HeapTables {
+        (self.heap_tables).get_or_init(|| HeapTables::of(&self.device, layout, dependencies))
+    }
+
+    /// As its command binds its layout, `layout`, of a pipeline stating `dependencies`: its share
+    /// in the device's sampler tables of the kind the layout binds, taken at its first command
+    /// and held while its objects live (`heap_sets::TableBinder`), so a sampler state the kind
+    /// leaves out is announced while its commands may read it, and not after.
+    pub(crate) fn bind_sampler_tables(
+        &self,
+        layout: &PipelineLayout,
+        dependencies: &[RuntimeDependency],
+    ) {
+        (self.sampler_binder).get_or_init(|| TableBinder::of(&self.device, layout, dependencies));
     }
 
     /// The device's heap set of the layout's set 1 (`heap_sets.rs`), which the variant holds
@@ -1009,13 +1228,7 @@ impl VariantObjects {
         if bindable {
             info = info.push_next(&mut flags);
         }
-        // Whether the making's cache held it and its one stage, where the making reports them
-        // (`shader_cache::found_in_cache`; one stage's feedback, as
-        // VUID-VkComputePipelineCreateInfo-pipelineStageCreationFeedbackCount-06566 allows).
-        let mut whole = vk::PipelineCreationFeedback::default();
-        let mut stage = [vk::PipelineCreationFeedback::default()];
         let shared = self.device.shared();
-        let driver_reports = shared.shader_cache.driver_reports();
         // Its record is named by the variant's content and what this making adds to it.
         let making = self.making("compute").text(&(
             c.object.stage.as_raw(),
@@ -1038,43 +1251,34 @@ impl VariantObjects {
         if followed {
             shared.counts.flight_followed();
         }
+        // A large kernel's words of the process's limit, waited for without the turn
+        // (`compile_memory.rs`).
+        let words = shared.compile_memory(c.object.words());
+        // The line and the module before the driver's call, so a making that never returns is
+        // named.
+        if let Some(kernel) = &self.logged {
+            let required = c.required_subgroup_size;
+            creation_log::compute_started(&self.device, kernel, c.specialization, required);
+        }
         let started = std::time::Instant::now();
         // With what the driver reports of the making: a pipeline found in its record's cache
         // reads no data back (`shader_cache/driver.rs`).
-        let created = shared
-            .make_pipelines_reported(making, |cache| {
-                let mut feedback = vk::PipelineCreationFeedbackCreateInfo::default()
-                    .pipeline_creation_feedback(&mut whole)
-                    .pipeline_stage_creation_feedbacks(&mut stage);
-                let mut info = info;
-                if driver_reports {
-                    info = info.push_next(&mut feedback);
-                }
-                // SAFETY: every pointer in `info` outlives the call; the pipeline cache is the
-                // making's own, destroyed once the call returned.
-                let made = unsafe { shared.vk().create_compute_pipelines(cache, &[info], None) };
-                let found = driver_reports
-                    .then(|| crate::shader_cache::found_in_cache(&whole, &stage))
-                    .flatten();
-                (made, found)
-            })
-            .map_err(|(_, error)| vulkan(error))?;
+        let raw = shared.make_compute_pipeline(making, || self.pipeline_name(None), info)?;
         let created_in = started.elapsed();
+        drop(words);
+        if let Some(kernel) = &self.logged {
+            let made = (c.specialization, c.required_subgroup_size);
+            creation_log::compute(&self.device, kernel, made, created_in);
+        }
         drop(leader);
         drop(turn);
-        if driver_reports {
-            shared.shader_cache.driver_reported(&whole, &stage);
-        }
-        let raw = created
-            .first()
-            .copied()
-            .ok_or_else(|| internal("the driver made no pipeline"))?;
         self.device.shared().counts.variant_pipeline_made();
         let pipeline = RawPipeline {
             device: self.device.clone(),
             raw,
             created_in,
             keep: None,
+            doomed: AtomicBool::new(false),
             // Its notices wait for its first dispatch where its state's creation made it.
             unannounced: AtomicBool::new(matches!(c.notices, Notices::FirstDraw)),
             linked: None,
@@ -1283,6 +1487,7 @@ fn set_zero_shape(layout: &PipelineLayout, push_set_zero: bool, dynamic: &[u32])
             binding.count.hash(&mut hasher);
             binding.stages.hash(&mut hasher);
             binding.immutable_sampler.hash(&mut hasher);
+            binding.immutable_samplers.hash(&mut hasher);
             binding.flags.hash(&mut hasher);
         }
     }
@@ -1533,7 +1738,26 @@ const PUSHED_TYPES: [vk::DescriptorType; 9] = [
 
 /// Whether a variant of `layout` and `stages` pushes its set 0 (`vkCmdPushDescriptorSet`) at
 /// each draw or dispatch, rather than allocating a set from its command buffer's pools, writing it
-/// and binding it: the same descriptors, at the same bindings. Where the device has the push
+/// and binding it: the same descriptors, at the same bindings. Where it can ([`takes_push`]), on
+/// a device whose pushed sets hold their buffers' sizes ([`pushed_sets_hold_lengths`]); on one
+/// whose pushed sets do not (`RuntimeDriverDefect::PushedBufferSizesUnset`), only a render variant
+/// whose fragment stage writes a storage buffer of set 0 inside its interlock, on a driver that
+/// orders those only in a pushed set (`RuntimeDriverDefect::InterlockedBoundBuffersUnordered`),
+/// and whose stages read no buffer's length ([`reads_lengths`]).
+fn pushes_set_zero(
+    device: &Device,
+    layout: &PipelineLayout,
+    stages: &[StageModule],
+    pipeline: CompiledPipeline<'_>,
+) -> bool {
+    takes_push(device, layout, stages, pipeline)
+        && (pushed_sets_hold_lengths(device)
+            || (orders_interlocked_buffers_pushed_alone(device)
+                && writes_interlocked_buffers(pipeline, stages)
+                && !reads_lengths(layout, stages)))
+}
+
+/// Whether a variant of `layout` and `stages` can push its set 0: where the device has the push
 /// command (Vulkan 1.4, or `VK_KHR_push_descriptor`, `binding::push_descriptor_command`), the
 /// compiled layout's set 0 fits `maxPushDescriptors` (`push_descriptor_eligible`), takes no set or
 /// binding flag and only descriptor types a push descriptor set layout takes (`PUSHED_TYPES`),
@@ -1542,7 +1766,7 @@ const PUSHED_TYPES: [vk::DescriptorType; 9] = [
 /// tessellation stage dispatches with set 0 too; a kernel's variant, of compute stages alone
 /// (a `CompiledPipeline::Kernel`), at the compute bind point, its dispatches' and tile
 /// dispatches' (`pending_dispatch::Recording`, `render::tile_dispatch`).
-fn pushes_set_zero(
+fn takes_push(
     device: &Device,
     layout: &PipelineLayout,
     stages: &[StageModule],
@@ -1570,6 +1794,105 @@ fn pushes_set_zero(
         })
 }
 
+/// Whether `device`'s pushed sets hold the sizes of their buffers that a stage reads back
+/// (`OpArrayLength`): not where its driver has `RuntimeDriverDefect::PushedBufferSizesUnset`.
+pub(crate) fn pushed_sets_hold_lengths(device: &Device) -> bool {
+    !(device.properties().driver_defects).contains(&RuntimeDriverDefect::PushedBufferSizesUnset)
+}
+
+/// Whether `device`'s driver orders the storage buffers a fragment shader writes inside its
+/// interlock only in a pushed set 0 (`RuntimeDriverDefect::InterlockedBoundBuffersUnordered`).
+fn orders_interlocked_buffers_pushed_alone(device: &Device) -> bool {
+    (device.properties().driver_defects)
+        .contains(&RuntimeDriverDefect::InterlockedBoundBuffersUnordered)
+}
+
+/// Whether a render variant of `stages` writes a storage buffer of set 0 inside its fragment
+/// stage's interlock: that stage's module interlocks and declares such a buffer it may write
+/// (`interlocked_writes`).
+fn writes_interlocked_buffers(pipeline: CompiledPipeline<'_>, stages: &[StageModule]) -> bool {
+    matches!(pipeline, CompiledPipeline::Render(_))
+        && stages.iter().any(|stage| {
+            let flags: vk::ShaderStageFlags = stage.stage.into();
+            let facts = interlocked_writes::facts(&stage.spirv);
+            flags == vk::ShaderStageFlags::FRAGMENT
+                && facts.interlocks
+                && facts.writable_set_zero_buffer
+        })
+}
+
+/// Whether a variant of `layout` and `stages` may read the length of a buffer of its set 0: a
+/// stage's module reads one (`interlocked_writes`), or a binding of set 0 lists a stage the
+/// pipeline adds at its creation, whose module is not among `stages` (a tessellation control or
+/// synthesized geometry stage, as [`dynamic_numbers`] leaves out).
+fn reads_lengths(layout: &PipelineLayout, stages: &[StageModule]) -> bool {
+    let seen = stages
+        .iter()
+        .fold(vk::ShaderStageFlags::empty(), |seen, stage| {
+            let flags: vk::ShaderStageFlags = stage.stage.into();
+            seen | flags
+        });
+    let unseen = layout.sets.first().is_some_and(|set| {
+        set.bindings.iter().any(|binding| {
+            let stages: vk::ShaderStageFlags = binding.stages.into();
+            !seen.contains(stages)
+        })
+    });
+    unseen
+        || stages
+            .iter()
+            .any(|stage| interlocked_writes::facts(&stage.spirv).reads_lengths)
+}
+
+/// Why a render variant of `layout` and `stages` binds the set 0 whose storage buffers its
+/// fragment stage writes inside its interlock on a driver that orders those only in a pushed set
+/// (`RuntimeDriverDefect::InterlockedBoundBuffersUnordered`), announced as
+/// `Degradation::InterlockedBufferOrder`; none where the variant pushes set 0, writes no such
+/// buffer, or its driver orders them bound.
+pub(crate) fn unordered_bind(
+    device: &Device,
+    layout: &PipelineLayout,
+    stages: &[StageModule],
+    pipeline: CompiledPipeline<'_>,
+) -> Option<UnorderedBind> {
+    if !orders_interlocked_buffers_pushed_alone(device)
+        || !writes_interlocked_buffers(pipeline, stages)
+    {
+        return None;
+    }
+    if device.shared().push_descriptor.is_none() {
+        return Some(UnorderedBind::NoPushCommand);
+    }
+    if !takes_push(device, layout, stages, pipeline) {
+        return Some(UnorderedBind::SetZero);
+    }
+    (!pushed_sets_hold_lengths(device) && reads_lengths(layout, stages))
+        .then_some(UnorderedBind::Lengths)
+}
+
+/// Why a variant binds a set 0 whose interlocked buffers its driver orders only pushed
+/// ([`unordered_bind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnorderedBind {
+    /// The device has no push command.
+    NoPushCommand,
+    /// Its set 0 is no push descriptor set's ([`takes_push`]).
+    SetZero,
+    /// A stage may read a buffer's length, which the driver's pushed sets do not hold
+    /// (`RuntimeDriverDefect::PushedBufferSizesUnset`, [`reads_lengths`]).
+    Lengths,
+}
+
+/// Whether a render pipeline state of `pipeline` made on `device` binds a set 0 whose storage
+/// buffers its fragment stage writes inside its interlock where its driver orders those only in
+/// a pushed set: its making announces `interlocked-buffer-order` (`unordered_bind`). The lanes
+/// predict their notices by it.
+#[doc(hidden)]
+pub fn binds_unordered_interlocked_buffers(device: &Device, pipeline: &RenderPipeline) -> bool {
+    let compiled = CompiledPipeline::Render(pipeline);
+    unordered_bind(device, &pipeline.layout, &pipeline.stages, compiled).is_some()
+}
+
 /// A write of each element of each sampler binding of `layout`'s set 0 that bakes its sampler, of
 /// the sampler `samplers` holds for it (one per binding that bakes one, in the layout's order of
 /// sets and bindings, as `VariantObjects::create` takes them). A pushed set takes them, which a
@@ -1585,22 +1908,34 @@ fn immutable_pushes(
     let mut baked = samplers.iter().copied();
     let mut pushes = Vec::new();
     for (index, set) in layout.sets.iter().enumerate() {
-        for binding in set
-            .bindings
-            .iter()
-            .filter(|b| b.immutable_sampler.is_some())
-        {
-            let sampler = baked
-                .next()
-                .ok_or_else(|| internal("a sampler set shorter than its layout"))?;
+        for binding in &set.bindings {
+            // The sampler of each element: a binding's one for all, a sampler array's its own.
+            let each: Vec<vk::Sampler> = match binding.immutable_sampler {
+                Some(_) => {
+                    let sampler = baked
+                        .next()
+                        .ok_or_else(|| internal("a sampler set shorter than its layout"))?;
+                    vec![sampler; binding.count as usize]
+                }
+                None => (&mut baked)
+                    .take(binding.immutable_samplers.len())
+                    .collect(),
+            };
+            if each.len() < binding.immutable_samplers.len() {
+                return Err(internal("a sampler set shorter than its layout"));
+            }
             let ty: vk::DescriptorType = binding.ty.into();
             if index == 0 && ty == vk::DescriptorType::SAMPLER {
-                pushes.extend((0..binding.count).map(|element| SetWrite {
-                    binding: binding.binding,
-                    element,
-                    ty,
-                    info: Info::Image(vk::DescriptorImageInfo::default().sampler(sampler)),
-                }));
+                pushes.extend(
+                    (0..binding.count)
+                        .zip(each)
+                        .map(|(element, sampler)| SetWrite {
+                            binding: binding.binding,
+                            element,
+                            ty,
+                            info: Info::Image(vk::DescriptorImageInfo::default().sampler(sampler)),
+                        }),
+                );
             }
         }
     }

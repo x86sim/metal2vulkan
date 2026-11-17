@@ -1,6 +1,30 @@
-//! The render pipeline creation log: a default-off diagnostic, `METAL2VULKAN_LOG_PIPELINES`
+//! The pipeline creation log: a default-off diagnostic, `METAL2VULKAN_LOG_PIPELINES`
 //! (`metal2vulkan::env_vars`), that tells which part of a draw's key made it pay for a `VkPipeline`
 //! of its own, and where that creation's time went.
+//!
+//! - **Compute pipelines.** One line per compute `VkPipeline` a device makes ([`compute`]): the
+//!   kernel's function name, its SPIR-V (a hash and its length), each specialization constant (its
+//!   id, its meaning and its value), the precision notes the stage holds under that
+//!   specialization (`notes`, as a render line names a stage's), the creation's wall time, and
+//!   what the kernel was made from (`descriptor:`, as a render state's first line names each
+//!   function: its name, its bitcode's SHA-256 and the constant values it was made with). Before
+//!   the driver's call, a line of the making's start ([`compute_started`]) names the kernel, its
+//!   SPIR-V and its specialization, and the dump directory takes its module then: a making that
+//!   never returns is that line without its made line, its module on disk. Both lines name the
+//!   subgroup size the pipeline is created to require (`subgroup size required 32`, or `subgroup
+//!   size any` where it requires none) and why its kernel emulates its simdgroups, where the
+//!   runtime can tell: `simdgroups emulated (widest pin)`, the translator's emulation in place of
+//!   the pin to the device's widest mode (its census entry), or `simdgroups emulated (variant)`,
+//!   the dispatch's emulated-simdgroups variant (`VariantKey::emulated_simdgroups`); else
+//!   `simdgroups not emulated for the widest pin or a variant`, which does not tell the translator's
+//!   tier, chosen for other causes too. A
+//!   compute state's pipelines differ by their specialization alone (the threadgroup size, an
+//!   edge region), so each line prints it whole: no numbering, no diff and no split. A kernel
+//!   whose compile is refused, at its state's creation or at a dispatch's variant, takes a line of
+//!   its own ([`compute_refused`]): its function name, the refusal, and its `descriptor:`. A
+//!   variant a dispatch asks for in passing, whose refusal leaves the dispatch on another form (a
+//!   flat, folded or partial-threadgroups variant), says `declined` there in place of `refused`:
+//!   the state made, and the dispatch runs. The rest of this log is the render pipelines'.
 //!
 //! - **What it prints.** One line per render `VkPipeline` a device makes for a draw (or a host
 //!   step's draw), through the device's message sink at `Info` severity (id name
@@ -17,10 +41,22 @@
 //!   the stage's discards wait until after its stores against its driver's store-dropping defect
 //!   (its census's `fragment.discard.deferred`), `helper-guard <stage>` with the number of the
 //!   stage's selections whose helper invocations take another arm against the same defect (its
-//!   census's `fragment.helper-guard`), and the graphics key's other parts (topology, pass,
-//!   strides, fixed state, sample positions). A state's first pipeline prints every field; a later
-//!   one prints the fields that differ from the state's closest earlier pipeline (the one with the
-//!   fewest differing fields), each as `old -> new` with the parts both share elided.
+//!   census's `fragment.helper-guard`), `helper-fence <stage>` with the number of the stage's
+//!   calls an identity shuffle follows against it (its census's `fragment.helper-fence`), and the
+//!   graphics key's other parts (topology, pass, strides, fixed state, sample positions). A
+//!   state's first pipeline prints every field; a later one prints the fields that differ from the
+//!   state's closest earlier pipeline (the one with the fewest differing fields), each as
+//!   `old -> new` with the parts both share elided.
+//! - **The descriptor.** A state's first line also names what the state was made from
+//!   (`descriptor:`, `StateDescriptor::logged`): each function's name, the SHA-256 of its bitcode
+//!   (`FunctionInfo::air_hash`; a precompiled function's key) and the constant values it was made
+//!   with, each color attachment's format, blend and write mask, the depth and stencil formats,
+//!   and the raster samples: enough to make the same state again from the same library.
+//! - **The SPIR-V.** With `METAL2VULKAN_DUMP_PIPELINES` naming a directory, each pipeline's
+//!   modules, render and compute, are written there ([`dump`], [`dump_modules`]), one file per
+//!   module named by the hash the line prints
+//!   it by (`<hash>.spv`), each once; a write that fails is named in the line. Setting it turns
+//!   the log on too, so the lines that name the files are there.
 //! - **MoltenVK's split.** Where the device's driver is MoltenVK and its performance tracking is
 //!   on (`MVK_CONFIG_PERFORMANCE_TRACKING=1`), the line adds what MoltenVK's own statistics
 //!   (`vkGetPerformanceStatisticsMVK`) gained during the creation, per activity: SPIR-V to MSL,
@@ -33,11 +69,13 @@
 //!   the digests of the pipeline's parts that name its record and its libraries; for a pipeline
 //!   linked from libraries, each part's library, `made` by this making (a part with shaders
 //!   through its record: `record loaded` where its driver cache started from the record, `record
-//!   missed` where not) or `another caller's` (found made, or waited for while another caller
-//!   made it), then the `link`; else the whole `pipeline`'s driver making, its record loaded or
-//!   missed. The translation of the state's functions is not in it: a variant is translated
+//!   missed` where not, `record's cache shared` where an earlier making of the same record made
+//!   the cache it was handed; then `found in cache` or `compiled` where the driver reports which,
+//!   [`record_text`]) or `another caller's` (found made, or waited for while another caller made
+//!   it), then the `link`; else the whole `pipeline`'s driver making, its record named the same
+//!   way. The translation of the state's functions is not in it: a variant is translated
 //!   before any of its pipelines is made, on the program's thread.
-//! - **Bounded, and off by default.** Nothing is kept or measured while the variable is unset.
+//! - **Bounded, and off by default.** Nothing is kept or measured while the variables are unset.
 //!   With it set, each state keeps the fields of its last [`HISTORY`] pipelines, and nothing
 //!   else changes: the same pipelines are made, from the same keys, at the same points.
 //! - **Numbered where the making begins** (the owner's HITCH rule 1). A pipeline's number and the
@@ -49,12 +87,15 @@
 use super::graphics::GraphicsKey;
 use crate::device::lock;
 use crate::Device;
+use metal2vulkan::cache::SpecializationKey;
 use metal2vulkan::cache::VariantKey;
-use metal2vulkan::pipeline::{RenderPipeline, SpecKey};
+use metal2vulkan::pipeline::{FunctionDescriptor, RenderPipeline, SpecKey, StageModule};
 use metal2vulkan::vk::{DriverId, ShaderStage};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -69,59 +110,150 @@ const DEFERRED_DISCARD_STRATEGY: &str = "fragment.discard.deferred";
 /// arm.
 const HELPER_GUARD_STRATEGY: &str = "fragment.helper-guard";
 
-/// Whether the log is on: read once, at the first state made.
+/// The census name of a fragment function's calls an identity shuffle follows.
+const HELPER_FENCE_STRATEGY: &str = "fragment.helper-fence";
+
+/// Whether the log is on: read once, at the first state made. The SPIR-V dump turns it on too.
 pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(metal2vulkan::env_vars::log_pipelines)
+    *ON.get_or_init(|| metal2vulkan::env_vars::log_pipelines() || dump_dir().is_some())
+}
+
+/// The directory the pipelines' SPIR-V is written into (`METAL2VULKAN_DUMP_PIPELINES`), read
+/// once.
+fn dump_dir() -> Option<&'static Path> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| metal2vulkan::env_vars::dump_pipelines().map(PathBuf::from))
+        .as_deref()
+}
+
+/// Write each of `pipeline`'s modules into the dump directory, where one is set, as
+/// `<hash>.spv` (`spirv` holding each stage's [`spirv_hash`], in its stages' order), each once:
+/// a module already there is left as it is. Where a write fails, the line's note of it.
+fn dump(pipeline: &RenderPipeline, spirv: &[u64]) -> Option<String> {
+    dump_modules(pipeline.stages.iter().enumerate().map(|(i, module)| {
+        let hash = spirv
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| spirv_hash(&module.spirv));
+        (hash, &module.spirv[..])
+    }))
+}
+
+/// Write each module of `modules` (its [`spirv_hash`] and its words) into the dump directory, as
+/// [`dump`] does.
+fn dump_modules<'a>(modules: impl Iterator<Item = (u64, &'a [u32])>) -> Option<String> {
+    let dir = dump_dir()?;
+    let written = std::fs::create_dir_all(dir).and_then(|()| {
+        for (hash, words) in modules {
+            let path = dir.join(format!("{hash:016x}.spv"));
+            let opened = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path);
+            let mut file = match opened {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            };
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            file.write_all(&bytes)?;
+        }
+        Ok(())
+    });
+    written
+        .err()
+        .map(|error| format!("; SPIR-V dump into {} failed: {error}", dir.display()))
 }
 
 thread_local! {
     /// The split of the making whose line this thread times now ([`Line::made`]), if any: each
     /// part noted, with how long it took.
     static SPLIT: RefCell<Option<Vec<(String, Duration)>>> = const { RefCell::new(None) };
-    /// Whether the cache the driver making this thread ran last was handed holds its record
-    /// ([`record_loaded`]), while a split is noted.
-    static RECORD: Cell<Option<bool>> = const { Cell::new(None) };
+    /// What the driver making this thread ran last noted of its record ([`record_handed`],
+    /// [`driver_found`]), while a split is noted.
+    static RECORD: Cell<Option<RecordNote>> = const { Cell::new(None) };
 }
 
 /// Whether this thread notes the split of a making's time now: its line is timed
 /// ([`Line::made`]). Each part's timing is taken only then.
 pub(crate) fn splitting() -> bool {
-    SPLIT.with(|split| split.borrow().is_some())
+    SPLIT
+        .try_with(|split| split.borrow().is_some())
+        .unwrap_or(false)
 }
 
 /// Note a part of the making this thread's line times, which took `took`; nothing where none is
 /// timed.
 pub(crate) fn note(part: impl FnOnce() -> String, took: Duration) {
-    SPLIT.with(|split| {
+    let _ = SPLIT.try_with(|split| {
         if let Some(parts) = split.borrow_mut().as_mut() {
             parts.push((part(), took));
         }
     });
 }
 
-/// The cache the driver making this thread runs was handed was made from its record, or not
-/// (`shader_cache/driver.rs`): a making of a record whose cache the device already holds live says
-/// what the making that made it said. While a split is noted.
-pub(crate) fn record_loaded(loaded: bool) {
+/// What a driver making noted of its record (`shader_cache/driver.rs`): how the cache it was
+/// handed came to be, and what the driver reported it found there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecordNote {
+    /// The cache was made from its record. A making handed a cache an earlier one made says what
+    /// that making said.
+    pub(crate) loaded: bool,
+    /// The device held the cache before this making: an earlier making of the record made it, so
+    /// what that making's driver compiled is there to find.
+    pub(crate) earlier: bool,
+    /// What the driver reported of the making (`shader_cache::found_in_cache`): found in the
+    /// cache, compiled, or `None`, unreported.
+    pub(crate) found: Option<bool>,
+}
+
+/// The driver making this thread runs was handed its record's cache: made from the record, or
+/// not (`loaded`), and held by the device before it, or not (`earlier`). While a split is noted.
+pub(crate) fn record_handed(loaded: bool, earlier: bool) {
     if splitting() {
-        RECORD.with(|record| record.set(Some(loaded)));
+        RECORD.with(|record| {
+            record.set(Some(RecordNote {
+                loaded,
+                earlier,
+                found: None,
+            }))
+        });
     }
 }
 
-/// What [`record_loaded`] last noted on this thread, read and reset: `None` where the making
-/// kept no record.
-pub(crate) fn take_record() -> Option<bool> {
+/// What the driver reported of the making [`record_handed`] noted last on this thread: found in
+/// the cache it was handed, compiled, or `None`, unreported. While a split is noted.
+pub(crate) fn driver_found(found: Option<bool>) {
+    if splitting() {
+        RECORD.with(|record| {
+            if let Some(note) = record.get() {
+                record.set(Some(RecordNote { found, ..note }));
+            }
+        });
+    }
+}
+
+/// What [`record_handed`] and [`driver_found`] last noted on this thread, read and reset: `None`
+/// where the making kept no record.
+pub(crate) fn take_record() -> Option<RecordNote> {
     RECORD.take()
 }
 
 /// Run `make`, noting the split of its time on this thread ([`note`]): what it made and the
 /// parts noted, the split of a making that encloses it (a line timed around this one) put back
-/// after it.
+/// after it. Past the thread's thread-locals' end (a program's exit handler, `this_thread.rs`),
+/// none is noted.
 fn split_of<T>(make: impl FnOnce() -> T) -> (T, Vec<(String, Duration)>) {
-    let enclosing = SPLIT.replace(Some(Vec::new()));
+    let Ok(enclosing) = SPLIT.try_with(|split| split.replace(Some(Vec::new()))) else {
+        return (make(), Vec::new());
+    };
     let made = make();
-    let parts = SPLIT.replace(enclosing).unwrap_or_default();
+    let parts = SPLIT
+        .try_with(|split| split.replace(enclosing))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     (made, parts)
 }
 
@@ -138,13 +270,24 @@ fn split_text(parts: &[(String, Duration)]) -> String {
     format!("; parts: {}", parts.join(", "))
 }
 
-/// How a part made through its record names it in the split.
-pub(crate) fn record_text(record: Option<bool>) -> &'static str {
-    match record {
-        Some(true) => ", record loaded",
-        Some(false) => ", record missed",
+/// How a part made through its record names it in the split: how its cache came to be (loaded
+/// from the record, made empty, or an earlier making's, shared), and what its driver reported
+/// (found in that cache, or compiled) where it reports.
+pub(crate) fn record_text(record: Option<RecordNote>) -> String {
+    let Some(note) = record else {
+        return String::new();
+    };
+    let cache = match (note.earlier, note.loaded) {
+        (true, _) => ", record's cache shared",
+        (false, true) => ", record loaded",
+        (false, false) => ", record missed",
+    };
+    let found = match note.found {
+        Some(true) => ", found in cache",
+        Some(false) => ", compiled",
         None => "",
-    }
+    };
+    format!("{cache}{found}")
 }
 
 /// The hash a line names a stage's SPIR-V `words` by: `DefaultHasher`'s (SipHash-1-3, its zero
@@ -178,6 +321,8 @@ static BEGUN: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct StateLog {
     /// How the line names the state.
     name: String,
+    /// What the state was made from, as its first line names it (`StateDescriptor::logged`).
+    descriptor: String,
     /// The fields of its pipelines made so far, the latest last, at most [`HISTORY`].
     made: Mutex<VecDeque<Fields>>,
     /// Its pipelines made so far.
@@ -188,9 +333,13 @@ pub(crate) struct StateLog {
 type Fields = BTreeMap<String, String>;
 
 impl StateLog {
-    /// The log of a state labelled `label` whose functions are `functions`, numbered now; `None`
-    /// while the log is off.
-    pub(crate) fn new(label: Option<&str>, functions: &[String]) -> Option<StateLog> {
+    /// The log of a state labelled `label` whose functions are `functions`, made from what
+    /// `descriptor` names, numbered now; `None` while the log is off.
+    pub(crate) fn new(
+        label: Option<&str>,
+        functions: &[String],
+        descriptor: impl FnOnce() -> String,
+    ) -> Option<StateLog> {
         if !enabled() {
             return None;
         }
@@ -198,6 +347,7 @@ impl StateLog {
         let label = label.map_or_else(String::new, |label| format!(" {label:?}"));
         Some(StateLog {
             name: format!("state {number}{label} ({})", functions.join(", ")),
+            descriptor: descriptor(),
             made: Mutex::new(VecDeque::new()),
             count: AtomicU64::new(0),
         })
@@ -225,8 +375,16 @@ impl StateLog {
     ) -> Line {
         let number = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         let fields = fields(variant, pipeline, key, spirv);
+        let dumped = dump(pipeline, spirv).unwrap_or_default();
         let mut made = lock(&self.made);
-        let described = describe(&fields, &made, number);
+        let described = match number {
+            1 => format!(
+                "; descriptor: {}{}{dumped}",
+                self.descriptor,
+                describe(&fields, &made, number)
+            ),
+            _ => format!("{}{dumped}", describe(&fields, &made, number)),
+        };
         if made.len() == HISTORY {
             made.pop_front();
         }
@@ -389,6 +547,14 @@ fn fields(
                 guard.uses.to_string(),
             );
         }
+        // The stage's calls an identity shuffle follows, against the same defect where no arm
+        // keeps the helpers out exactly.
+        if let Some(fence) = module.strategies.entries.get(HELPER_FENCE_STRATEGY) {
+            fields.insert(
+                format!("helper-fence {:?}", module.stage),
+                fence.uses.to_string(),
+            );
+        }
     }
     let specialization = &key.specialization;
     for entry in &specialization.entries {
@@ -523,6 +689,183 @@ fn elided(old: &str, new: &str) -> (String, String) {
         )
     };
     (cut(old), cut(new))
+}
+
+/// A compute variant's kernel, kept for its pipelines' lines ([`compute`]) while the log is on.
+pub(crate) struct LoggedKernel {
+    /// The kernel's library function's name.
+    name: String,
+    /// What the variant was made from: the function, its bitcode's SHA-256 and its constant
+    /// values (`render::logged_function`).
+    function: String,
+    stage: StageModule,
+    /// Why the kernel emulates its simdgroups, where the runtime can tell (the module's
+    /// documentation, "Compute pipelines").
+    simdgroups: &'static str,
+}
+
+/// The kernel `stage` of a compute variant of the function `function` describes, the variant
+/// one of emulated simdgroups where `emulated_variant` says so, kept for its pipelines' lines
+/// while the log is on; `None` while it is off.
+pub(crate) fn compute_kernel(
+    function: &FunctionDescriptor,
+    stage: &StageModule,
+    emulated_variant: bool,
+) -> Option<Box<LoggedKernel>> {
+    enabled().then(|| {
+        let widest_pin = stage
+            .strategies
+            .entries
+            .contains_key(super::sources::WIDEST_PIN_STRATEGY);
+        Box::new(LoggedKernel {
+            name: function.function.info().name.to_owned(),
+            function: super::render::logged_function(function),
+            stage: stage.clone(),
+            simdgroups: match (widest_pin, emulated_variant) {
+                (true, _) => "simdgroups emulated (widest pin)",
+                (false, true) => "simdgroups emulated (variant)",
+                (false, false) => "simdgroups not emulated for the widest pin or a variant",
+            },
+        })
+    })
+}
+
+/// The subgroup size a compute pipeline is created to require, `required`, as its lines name it.
+fn subgroup_size(required: Option<u32>) -> String {
+    match required {
+        Some(size) => format!("subgroup size required {size}"),
+        None => "subgroup size any".to_owned(),
+    }
+}
+
+/// Deliver the line of a compute `VkPipeline` `device` starts making of `kernel` under
+/// `specialization`, requiring the subgroup size `required`, before the driver's call, and write
+/// its module into the dump directory where one is set: a making that never returns is this line
+/// without its made line ([`compute`]), and its module is on disk (the module's documentation,
+/// "Compute pipelines").
+pub(crate) fn compute_started(
+    device: &Device,
+    kernel: &LoggedKernel,
+    specialization: &SpecializationKey,
+    required: Option<u32>,
+) {
+    let stage = &kernel.stage;
+    let hash = spirv_hash(&stage.spirv);
+    let dumped = dump_modules(std::iter::once((hash, &stage.spirv[..]))).unwrap_or_default();
+    deliver(
+        device,
+        format!(
+            "metal2vulkan: pipeline creation: compute pipeline `{}`: making, spirv {hash:016x} \
+             ({} words), specialization [{}], {}, {}{dumped}",
+            kernel.name,
+            stage.spirv.len(),
+            constants(stage, specialization).join(", "),
+            subgroup_size(required),
+            kernel.simdgroups,
+        ),
+    );
+}
+
+/// Each of `specialization`'s constants of `stage`: its id, its meaning and its value.
+fn constants(stage: &StageModule, specialization: &SpecializationKey) -> Vec<String> {
+    let meanings: BTreeMap<u32, SpecKey> = stage
+        .specialization
+        .constants
+        .iter()
+        .map(|c| (c.id, c.key))
+        .collect();
+    specialization
+        .entries
+        .iter()
+        .map(|e| {
+            let at = e.offset as usize;
+            let mut word = [0u8; 8];
+            if let Some(bytes) = specialization.data.get(at..at + (e.size as usize).min(8)) {
+                word[..bytes.len()].copy_from_slice(bytes);
+            }
+            let meaning = meanings
+                .get(&e.constant_id)
+                .map_or_else(String::new, |k| format!(" {k:?}"));
+            format!("{}{meaning} = {}", e.constant_id, u64::from_le_bytes(word))
+        })
+        .collect()
+}
+
+/// Deliver the line of a compute `VkPipeline` `device` made of `kernel` under `specialization`,
+/// requiring the subgroup size `required`, its creation `took` long (the module's documentation,
+/// "Compute pipelines"). Its module was dumped as the making started ([`compute_started`]).
+pub(crate) fn compute(
+    device: &Device,
+    kernel: &LoggedKernel,
+    (specialization, required): (&SpecializationKey, Option<u32>),
+    took: Duration,
+) {
+    let stage = &kernel.stage;
+    let notes = stage.precision_notes_under(specialization);
+    let hash = spirv_hash(&stage.spirv);
+    deliver(
+        device,
+        format!(
+            "metal2vulkan: pipeline creation: compute pipeline `{}`: {:.3} ms, spirv {hash:016x} \
+             ({} words), specialization [{}], {}, {}, notes {notes:?}; descriptor: {}",
+            kernel.name,
+            took.as_secs_f64() * 1000.0,
+            stage.spirv.len(),
+            constants(stage, specialization).join(", "),
+            subgroup_size(required),
+            kernel.simdgroups,
+            kernel.function,
+        ),
+    );
+}
+
+/// Deliver the line of a compute pipeline of `function` whose compile `device` refused with
+/// `error`, at its creation (`variant` `None`) or at a dispatch's variant (the module's
+/// documentation, "Compute pipelines"): the kernel's function name, the refusal, and what the
+/// kernel was made from, where the log is on. The refusal of a variant a dispatch asks for in
+/// passing ([`probed`]) is the probe's answer, `declined`.
+pub(crate) fn compute_refused(
+    device: &Device,
+    function: &FunctionDescriptor,
+    variant: Option<&VariantKey>,
+    error: &metal2vulkan::error::Error,
+) {
+    if !enabled() {
+        return;
+    }
+    let outcome = refusal_outcome(variant, error);
+    deliver(
+        device,
+        format!(
+            "metal2vulkan: pipeline creation: compute pipeline `{}`: {outcome}: {error:?}; \
+             descriptor: {}",
+            function.function.info().name,
+            super::render::logged_function(function),
+        ),
+    );
+}
+
+/// What a refused compile of a compute pipeline's `variant` (`None` at its state's creation) with
+/// `error` is to the log: the probe's answer where a dispatch asks for the variant in passing
+/// ([`probed`]) and the compile layer refuses it, `refused` otherwise.
+fn refusal_outcome(
+    variant: Option<&VariantKey>,
+    error: &metal2vulkan::error::Error,
+) -> &'static str {
+    let declined =
+        variant.is_some_and(probed) && matches!(error, metal2vulkan::error::Error::Unsupported(_));
+    match declined {
+        true => "a variant asked for in passing declined, the dispatch keeps another form",
+        false => "refused",
+    }
+}
+
+/// Whether a dispatch asks for the variant of `key` in passing, a refusal of it leaving the
+/// dispatch on another form: a flat variant (`ComputePipelineState::settle_flat` and
+/// `replay_variant`), a folded one (`settle_folded`) or a partial-threadgroups one
+/// (`settle_partial`).
+fn probed(key: &VariantKey) -> bool {
+    key.flat_grid || key.folded_groups || key.partial_threadgroups
 }
 
 /// Hand `line` to the device's message sink, else to stderr.
@@ -719,15 +1062,46 @@ fn find_statistics_function() -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        describe, elided, note, record_loaded, record_text, split_of, split_text, splitting,
-        take_record, Fields,
+        describe, driver_found, elided, note, record_handed, record_text, refusal_outcome,
+        split_of, split_text, splitting, take_record, Fields, RecordNote,
     };
+    use metal2vulkan::cache::VariantKey;
+    use metal2vulkan::error::{Error, Feature, Unsupported};
+
+    /// The flat variant's probe of a kernel that observes its partition, refused
+    /// `Unsupported{GpuEncodedIndirectCommands, NotRepresentable}`, is the probe's answer, and so
+    /// is a folded or partial-threadgroups variant's refusal; a creation's refusal, and a refused
+    /// variant no dispatch probes, stay refusals.
+    #[test]
+    fn a_probed_variant_s_refusal_is_declined_and_a_creation_s_refused() {
+        let refusal = || -> Error {
+            Unsupported::not_representable(Feature::GpuEncodedIndirectCommands).into()
+        };
+        let probes: [fn(&mut VariantKey); 3] = [
+            |k| k.flat_grid = true,
+            |k| k.folded_groups = true,
+            |k| k.partial_threadgroups = true,
+        ];
+        for probe in probes {
+            let mut key = VariantKey::new();
+            probe(&mut key);
+            assert!(
+                refusal_outcome(Some(&key), &refusal()).contains("declined"),
+                "{key:?}"
+            );
+        }
+        assert_eq!(refusal_outcome(None, &refusal()), "refused");
+        let mut emulated = VariantKey::new();
+        emulated.emulated_simdgroups = true;
+        assert_eq!(refusal_outcome(Some(&emulated), &refusal()), "refused");
+    }
     use std::collections::VecDeque;
     use std::time::Duration;
 
     /// A making's split holds the parts noted while its line is timed, in order, and nothing
     /// outside one; a line timed inside another keeps its own parts, and the enclosing line's
-    /// go on after it. A record's load is noted only while a split is.
+    /// go on after it. A record's load, and what the driver found, are noted only while a split
+    /// is.
     #[test]
     fn a_making_s_split_holds_its_own_parts_in_order() {
         assert!(!splitting());
@@ -735,13 +1109,15 @@ mod tests {
             || panic!("a part is named where no line is timed"),
             Duration::ZERO,
         );
-        record_loaded(true);
+        record_handed(true, false);
+        driver_found(Some(true));
         assert_eq!(take_record(), None, "no record noted outside a split");
         let ((inner, record), outer) = split_of(|| {
             assert!(splitting());
             note(|| "content".to_owned(), Duration::from_micros(300));
             let inner = split_of(|| note(|| "link".to_owned(), Duration::from_millis(2)));
-            record_loaded(false);
+            record_handed(false, false);
+            driver_found(Some(false));
             let record = take_record();
             note(
                 || format!("fragment shader library (made{})", record_text(record)),
@@ -750,13 +1126,46 @@ mod tests {
             (inner, record)
         });
         assert!(!splitting());
-        assert_eq!(record, Some(false));
+        assert_eq!(
+            record,
+            Some(RecordNote {
+                loaded: false,
+                earlier: false,
+                found: Some(false)
+            })
+        );
         assert_eq!(inner.1, [("link".to_owned(), Duration::from_millis(2))]);
         assert_eq!(
             split_text(&outer),
-            "; parts: content 0.3 ms, fragment shader library (made, record missed) 6812.0 ms"
+            "; parts: content 0.3 ms, fragment shader library (made, record missed, compiled) \
+             6812.0 ms"
         );
         assert_eq!(split_text(&[]), "");
+    }
+
+    /// A part made through its record names how its cache came to be and what the driver found
+    /// there: a library made against a pass that differs from an earlier making's only in a
+    /// format is handed that making's cache and found in it.
+    #[test]
+    fn a_record_s_text_names_its_cache_and_what_the_driver_found() {
+        let text = |loaded, earlier, found| {
+            record_text(Some(RecordNote {
+                loaded,
+                earlier,
+                found,
+            }))
+        };
+        assert_eq!(text(false, false, Some(false)), ", record missed, compiled");
+        assert_eq!(
+            text(true, false, Some(true)),
+            ", record loaded, found in cache"
+        );
+        assert_eq!(
+            text(false, true, Some(true)),
+            ", record's cache shared, found in cache"
+        );
+        assert_eq!(text(true, true, None), ", record's cache shared");
+        assert_eq!(record_text(None), "");
     }
 
     fn fields(pairs: &[(&str, &str)]) -> Fields {

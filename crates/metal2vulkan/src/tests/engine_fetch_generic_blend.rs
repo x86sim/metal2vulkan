@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use crate::budget::Budget;
 use crate::device::{Device, DeviceDescription, DevicePolicy, DeviceProfile};
-use crate::error::{DescriptorError, Error, Needs};
+use crate::error::{DescriptorError, Error, MetalAnswer, Needs};
 use crate::library::{FunctionArtifact, Library};
 use crate::metal::{BlendFactor, BlendOperation, ColorWriteMask, PixelFormat};
 use crate::pipeline::artifact::PrecisionNote;
@@ -134,8 +134,8 @@ fn attachments(
     let mut unwritten = ColorAttachmentDescriptor::new(PixelFormat::RGBA16Float);
     unwritten.write_mask = ColorWriteMask::NONE;
     let mut r = RenderLinkInputs::new();
-    for c in 0..=color + 1 {
-        r.color_attachments[c] = Some(unwritten);
+    for slot in r.color_attachments.iter_mut().take(color + 2) {
+        *slot = Some(unwritten);
     }
     r.color_attachments[color] = Some(blended);
     r
@@ -482,7 +482,10 @@ fn a_second_source_blend_without_its_output_is_refused_as_metal_refuses_it() {
             let inputs = state(0, &r, &p);
             let what = format!("{stem} {pf:?} {eq:?}");
             match compile_with(&fast, "fbl8_over_loaded", &p, &inputs) {
-                Err(Error::InvalidDescriptor(DescriptorError::ColorAttachment { index: 0 })) => {
+                Err(Error::InvalidDescriptor(DescriptorError::ColorAttachment {
+                    index: 0,
+                    metal: MetalAnswer::NilWithError,
+                })) => {
                     checked += 1;
                 }
                 Err(Error::Unsupported(u)) => eprintln!("{what}: {u}"),

@@ -12,8 +12,8 @@
 
 use super::driver_deviations::{half_nan, stage_notes};
 use super::{
-    buffer_with, layer_reported_nothing_at_all, read_buffer, validated_device, Messages,
-    ScratchCache, WAIT,
+    at_plan, buffer_with, layer_reported_nothing_at_all, read_buffer, validated_device_with,
+    Messages, ScratchCache, WAIT,
 };
 use crate::air_library::AirLibrary;
 use crate::gpu::TEST_DEVICE;
@@ -22,7 +22,6 @@ use metal2vulkan_devtools::llvm_assemble;
 use metal2vulkan_runtime::{
     CommandBufferStatus, ComputePipelineState, Device, PipelineOptions, Size,
 };
-use std::path::Path;
 
 /// The `float` inputs: zeros, normals, denormals, the extremes, infinities, quiet and signaling
 /// NaNs with payloads.
@@ -131,8 +130,7 @@ fn pipeline(device: &Device, name: &str) -> ComputePipelineState {
 
 /// The owned fixture's bitcode.
 fn fixture() -> Vec<u8> {
-    let ll =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/public/engine/kernel_frexp_ilogb.ll");
+    let ll = metal2vulkan_devtools::engine_dir().join("kernel_frexp_ilogb.ll");
     llvm_assemble(&ll).unwrap()
 }
 
@@ -191,7 +189,7 @@ fn frexp_and_ilogb_answer_as_metals_routines() {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let name = device.name().to_owned();
         for (kernel, inputs, answer, quarter) in [
             (

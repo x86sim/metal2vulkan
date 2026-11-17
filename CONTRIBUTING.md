@@ -5,7 +5,8 @@ they bind people too.
 
 ## Prerequisites
 
-- Rust stable, at least the `rust-version` in the crates' manifests (1.98).
+- rustup. `rust-toolchain.toml` pins the nightly this tree builds with (rustup installs it on first
+  use); the published crates promise the stable `rust-version` in their manifests (1.98).
 - [cargo-nextest](https://nexte.st): `cargo install cargo-nextest --locked`.
 - The external tools the tests and validation use (the libraries run none):
   - `llvm-as` (LLVM 21 or newer) for the `.ll` fixtures, and `llvm-dis` for validation's harvest
@@ -57,7 +58,8 @@ cargo test --workspace --all-features --doc
 ```
 
 None of these opens a device. Device tests compile only under `--cfg m2v_gpu` or
-`--cfg m2v_cpu_icd` ([docs/VALIDATION.md](docs/VALIDATION.md)).
+`--cfg m2v_cpu_icd`, and on a GPU the tests that fault it, hold it for long or allocate toward its
+limits only with `--cfg m2v_gpu_hazards` too ([docs/VALIDATION.md](docs/VALIDATION.md)).
 
 To build the command:
 
@@ -83,7 +85,16 @@ Parallel worktrees and one-shot builds write a lot to disk. Three scripts keep t
 - `scripts/xctrace-run TRACE ARGS...` records with Instruments and removes the raw
   `instruments*.ktrace` files a recording leaves in the temp dir, an aborted one included.
 
-Set `CARGO_INCREMENTAL=0` for a build that won't be edited and rebuilt.
+Builds are incremental. Every compile goes through `scripts/rustc-wrapper`, which hands it to
+[kache](https://github.com/kunobi-ninja/kache) when kache is on `PATH` (outside CI) and to rustc
+otherwise; kache restores matching compiles from its local store and imports incremental state
+between worktrees. `RUSTC_WRAPPER=` (empty) builds without it.
+
+Keep each worktree's target directories inside it: Cargo's default `target/`, and
+`target/gpucfg` for `RUSTFLAGS='--cfg m2v_gpu'` (a target of its own, since `RUSTFLAGS` is in the
+build fingerprint). kache imports incremental state only between targets inside their worktrees;
+a `CARGO_TARGET_DIR` outside the worktree neither gives nor takes it. `seed-target new` takes such
+a path too (`scripts/seed-target new WORKTREE/target SEED WORKTREE`).
 
 ## Where tests go
 

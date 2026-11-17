@@ -11,7 +11,7 @@ use super::{device_error, Device, InstanceShared, Parts};
 use crate::error::Error;
 use crate::gpu_time;
 use crate::image_barrier::MemoryReads;
-use crate::loader_word::LoaderWord;
+use crate::loader_word::DeviceWord;
 use crate::shader_cache::{CacheSetup, ShaderCacheOptions};
 use crate::sparse::device::SparseFeatures;
 use ash::vk;
@@ -51,7 +51,9 @@ pub struct RawDevice {
     /// a texture over a buffer's memory render into its linear image in place;
     /// `VK_KHR_external_memory_fd` with `VK_EXT_external_memory_dma_buf` serve
     /// `HostMemory::with_dma_buf`, and with them `VK_EXT_image_drm_format_modifier` with
-    /// `VK_EXT_queue_family_foreign` make textures over its pages images rather than shadows.
+    /// `VK_EXT_queue_family_foreign` make textures over its pages images rather than shadows;
+    /// those two with `VK_EXT_queue_family_foreign` make buffers whose memory is exported as a
+    /// dma-buf (`MemoryExport::DmaBuf`).
     pub device_extensions: Vec<CString>,
     /// Where the device keeps translated shaders: by default, the platform's per-user cache
     /// directory.
@@ -88,6 +90,10 @@ pub struct RawDevice {
     /// queue's, which answers from the host's clock whatever this says. Metal has no such
     /// setting.
     pub gpu_times_from_host: bool,
+    /// The class of Mac the device presents, as
+    /// [`DeviceOptions::mac_class`](crate::DeviceOptions::mac_class) says: `None` by default,
+    /// the class of the device's GPU. No Metal counterpart.
+    pub mac_class: Option<crate::MacClass>,
     /// The degradation kinds the device announces at every occurrence, not once, as
     /// [`DeviceOptions::announce_each`](crate::DeviceOptions::announce_each) says: none by
     /// default.
@@ -101,6 +107,10 @@ pub struct RawDevice {
     /// [`DeviceOptions::pipeline_records`](crate::DeviceOptions::pipeline_records) says: `None`
     /// by default, no record made. Metal has no such setting.
     pub pipeline_records: Option<Arc<dyn Fn(crate::PipelineRecord) + Send + Sync>>,
+    /// Load no dynamic library from a file, as
+    /// [`DeviceOptions::load_no_dynamic_library_file`](crate::DeviceOptions::load_no_dynamic_library_file)
+    /// says: false by default, Metal's behaviour. No Metal counterpart.
+    pub load_no_dynamic_library_file: bool,
 }
 
 impl std::fmt::Debug for RawDevice {
@@ -121,9 +131,11 @@ impl std::fmt::Debug for RawDevice {
             view_format_reinterpretation,
             host_image_copy,
             gpu_times_from_host,
+            mac_class,
             announce_each,
             lowering_refuses,
             pipeline_records,
+            load_no_dynamic_library_file,
         } = self;
         f.debug_struct("RawDevice")
             .field("get_instance_proc_addr", get_instance_proc_addr)
@@ -140,12 +152,14 @@ impl std::fmt::Debug for RawDevice {
             .field("view_format_reinterpretation", view_format_reinterpretation)
             .field("host_image_copy", host_image_copy)
             .field("gpu_times_from_host", gpu_times_from_host)
+            .field("mac_class", mac_class)
             .field("announce_each", announce_each)
             .field("lowering_refuses", lowering_refuses)
             .field(
                 "pipeline_records",
                 &pipeline_records.as_ref().map(|_| "hook"),
             )
+            .field("load_no_dynamic_library_file", load_no_dynamic_library_file)
             .finish()
     }
 }
@@ -176,9 +190,11 @@ impl RawDevice {
             view_format_reinterpretation: false,
             host_image_copy: false,
             gpu_times_from_host: false,
+            mac_class: None,
             announce_each: BTreeSet::new(),
             lowering_refuses: BTreeSet::new(),
             pipeline_records: None,
+            load_no_dynamic_library_file: false,
         }
     }
 }
@@ -241,13 +257,11 @@ impl Device {
         let compile =
             metal2vulkan::device::Device::new(enabled.clone(), policy).map_err(device_error)?;
         // SAFETY: the caller's contract: the word is still the loader's.
-        let loader_word = unsafe { LoaderWord::of_device(raw.device) };
+        let loader_word = unsafe { DeviceWord::of_device(raw.device) };
         // SAFETY: the device is live; the loader's `vkGetDeviceProcAddr` reads the word, which
         // is the loader's.
-        let device = unsafe {
-            loader_word.restore();
-            ash::Device::load(instance.fp_v1_0(), raw.device)
-        };
+        let device =
+            unsafe { loader_word.restored(|| ash::Device::load(instance.fp_v1_0(), raw.device)) };
         // The vocabulary does not say whether a portability subset's
         // `imageViewFormatReinterpretation` was enabled: the consumer says so beside it, and a
         // device with the subset whose consumer does not reinterprets nothing.
@@ -273,6 +287,14 @@ impl Device {
         // Nor whether the dma-buf route's were (`dma_buf.rs`): the consumer lists them.
         let dma_buf = super::create::dma_buf_names(&listed).is_some();
         let dma_buf_images = super::create::dma_buf_image_names(&listed).is_some();
+        // Nor whether `VK_KHR_external_memory_fd` was (`exported_memory.rs`): the consumer lists
+        // it.
+        let memory_fd = super::create::memory_fd_name(&listed).is_some();
+        // Nor whether `VK_EXT_queue_family_foreign` was beside the dma-buf route's
+        // (`exported_memory.rs`): the consumer lists them.
+        let foreign_family = super::create::foreign_family_name(&listed).is_some();
+        // Nor whether `VK_KHR_external_semaphore_fd` was (`exported_semaphore.rs`).
+        let semaphore_fd = super::create::semaphore_fd_name(&listed).is_some();
         let graphics_pipeline_library = super::create::graphics_pipeline_library(&listed, || {
             // SAFETY: the consumer's physical device of its instance, which lists the
             // extension (the consumer enabled it), at Vulkan 1.2 or later.
@@ -314,7 +336,12 @@ impl Device {
             queue_family: raw.queue_family,
             queues: vec![(raw.queue_family, raw.queue_index)],
             present_queues: 0,
+            planned: None,
+            least_plan: false,
             staging: None,
+            fill: None,
+            reserved_queues: Vec::new(),
+            extra_queues: Vec::new(),
             compile,
             description: enabled,
             enabled: raw.enabled,
@@ -325,17 +352,30 @@ impl Device {
                 .any(|name| name.as_c_str() == ash::ext::pipeline_creation_feedback::NAME),
             dma_buf,
             dma_buf_images,
+            memory_fd,
+            foreign_family,
+            semaphore_fd,
             calibration: gpu_time::Extension::among(&raw.device_extensions.into_iter().collect()),
             gpu_times_from_host: raw.gpu_times_from_host,
+            mac_class: raw.mac_class,
             // An adopted device keeps no execution record: validation makes its own devices.
             record_executions: false,
+            load_no_dynamic_library_file: raw.load_no_dynamic_library_file,
             pipeline_records: raw.pipeline_records,
             fail_in_place_check: false,
+            assume_submissions_merge: false,
+            // On where `METAL2VULKAN_PENDING_AUDIT` is set (`assemble`).
+            pending_audit: false,
+            // On where `METAL2VULKAN_ENCODER_TRAIL` is set (`assemble`).
+            encoder_trail: false,
             announce_each: raw.announce_each,
             lowering_refuses: raw.lowering_refuses,
             view_reinterpretation,
             generated_commands: false,
             host_image_copy,
+            // Nor whether `zeroInitializeDeviceMemory` was: none of its images start in memory the
+            // driver zeroed.
+            zero_initialize_device_memory: false,
             linear_color_attachment,
             graphics_pipeline_library,
             // Nor whether `samplerYcbcrConversion` was: its YCbCr textures convert through
@@ -346,8 +386,17 @@ impl Device {
             memory_reads,
             owned: false,
             cache,
+            // The consumer made the `VkDevice`: the runtime cannot make it again once it is
+            // lost (`line.rs`).
+            line: None,
+            recipe: None,
         };
         // SAFETY: the caller's contract.
-        unsafe { Device::assemble(parts) }
+        let device = unsafe { Device::assemble(parts) }?;
+        // The consumer made the instance, so a layer's exit handler registered at its
+        // `vkCreateInstance` may follow the hook's last registration: the hook registers again,
+        // after it (`exit_guard::instance_made`).
+        crate::exit_guard::instance_made();
+        Ok(device.root())
     }
 }

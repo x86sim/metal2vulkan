@@ -1,6 +1,8 @@
 //! External-tool helpers for metal2vulkan's own tests and its validation tools: the fixture
 //! assemblers (`llvm-as`, `xcrun metal-as`, `spirv-as`), the committed fixture directories, a
-//! synthetic metallib writer ([`metallib`]), a tool's identity, the MoltenVK toolchain the MSL
+//! synthetic metallib writer ([`metallib`]), a writer of the modules Metal's stitcher makes
+//! ([`stitched`]), the cases of the linked-signature fixtures and Metal's answers to them
+//! ([`linked_signatures`]), a tool's identity, the MoltenVK toolchain the MSL
 //! checks reproduce, and the generated-program fuzzers ([`fuzz`]) the product's CPU-interpreter
 //! tests and validation's device tests both run, the extended-range bicubic table both check
 //! ([`xr_bicubic`]), and the store-buffering litmus kernel both compile
@@ -24,20 +26,56 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 pub mod fuzz;
+pub mod linked_signatures;
 pub mod litmus;
 pub mod metallib;
 pub mod scratch;
 pub mod spirv;
+pub mod stitched;
 pub mod tools;
 pub mod xr_bicubic;
 
-/// The validation crate's `fixtures/public` beside this crate
-/// (`crates/metal2vulkan-validation/fixtures/public`, read-only).
+#[cfg(test)]
+mod tests;
+
+/// The workspace's root (read-only), as the test runner names it as a test runs: two levels above
+/// the manifest directory it names (`cargo test` and `cargo nextest` name the test's crate,
+/// `crates/<name>`; a run of a nextest archive on another machine names it in that machine's
+/// checkout, `--workspace-remap`) where that root holds the validation crate's fixtures, else above
+/// this crate as it was built. Tests read the checkout through it and the helpers on it
+/// ([`validation_dir`], [`fixtures_dir`], [`engine_dir`]), never through a path the build baked in
+/// (`env!("CARGO_MANIFEST_DIR")`), which names the build machine's checkout.
+pub fn workspace_dir() -> PathBuf {
+    let root = |manifest: &Path| {
+        manifest
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+    };
+    let running = std::env::var_os("CARGO_MANIFEST_DIR")
+        .and_then(|manifest| root(Path::new(&manifest)))
+        .filter(|root| root.join(VALIDATION).join(FIXTURES).is_dir());
+    running.unwrap_or_else(|| {
+        root(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("the dev-tools crate lies in the workspace's crates/")
+    })
+}
+
+/// The validation crate, relative to the workspace.
+const VALIDATION: &str = "crates/metal2vulkan-validation";
+
+/// The public fixtures, relative to the validation crate.
+const FIXTURES: &str = "fixtures/public";
+
+/// The validation crate's directory under [`workspace_dir`] (read-only): its committed cases and
+/// observations (`corpus/`), device profiles (`profiles/`) and sources.
+pub fn validation_dir() -> PathBuf {
+    workspace_dir().join(VALIDATION)
+}
+
+/// The validation crate's `fixtures/public` under [`validation_dir`] (read-only).
 pub fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("the dev-tools crate lies in the workspace's crates/")
-        .join("metal2vulkan-validation/fixtures/public")
+    validation_dir().join(FIXTURES)
 }
 
 /// [`fixtures_dir`]'s `engine` (read-only; the engine's own fixtures).

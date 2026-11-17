@@ -24,8 +24,10 @@
 //! table at tile buffer 1 as the kernel does, `i` its thread's index over the pass's tiles, writing
 //! word `i` of tile buffer 0.
 
+use super::at_plan;
 use super::executions::on_device_with;
 use super::host_memory::{on_device, run};
+use super::pool_slots::holding_the_space;
 use super::read_buffer;
 use crate::air_library::AirLibrary;
 use metal2vulkan::device::VkFeature;
@@ -37,9 +39,9 @@ use metal2vulkan::pipeline::{
 use metal2vulkan_devtools::{engine_dir, llvm_assemble};
 use metal2vulkan_runtime::{
     Buffer, ComputeCommandEncoder, ComputePipelineState, CpuCacheMode, Device, Error,
-    FunctionTableProblem, HazardTrackingMode, Invalid, Library, LoadAction, PipelineOptions,
-    Problem, PurgeableState, RenderPassDescriptor, RenderPipelineState, ResourceId,
-    ResourceOptions, RuntimeGap, Size, StorageMode, StoreAction, TextureDescriptor,
+    FunctionTableProblem, HazardTrackingMode, Invalid, Library, LoadAction, MetalError,
+    PipelineOptions, Problem, PurgeableState, RenderPassDescriptor, RenderPipelineState,
+    ResourceId, ResourceOptions, RuntimeGap, Size, StorageMode, StoreAction, TextureDescriptor,
     VisibleFunctionTable, VisibleFunctionTableDescriptor,
 };
 
@@ -283,7 +285,7 @@ fn tables_and_handles_answer_as_metal_s_do() {
 /// calls, as Metal's tables are read when the dispatch runs.
 #[test]
 fn a_kernel_calls_the_functions_its_table_holds() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let (caller, functions) = libraries(device);
         let function = |name: &str| functions.new_function_with_name(name).unwrap();
         let state = dispatch_state(&caller, &functions);
@@ -325,6 +327,31 @@ fn a_kernel_calls_the_functions_its_table_holds() {
     });
 }
 
+/// A table's words take no range of the Metal address space (the runtime's `address.rs`): Metal
+/// shows no address of a table. With the whole space held, a table is made, and once the space is
+/// free again for the dispatch's own buffer, a kernel calls the functions it holds, bound at its
+/// index. A table whose words took a range of the space would find none (`OutOfMemory`).
+#[test]
+fn a_table_s_words_lie_outside_the_metal_address_space() {
+    on_device(|device| {
+        let (caller, functions) = libraries(device);
+        let function = |name: &str| functions.new_function_with_name(name).unwrap();
+        let state = dispatch_state(&caller, &functions);
+        let handle = |name: &str| state.function_handle(&function(name)).unwrap().unwrap();
+        let space = holding_the_space(device);
+        let two = state
+            .new_visible_function_table(&VisibleFunctionTableDescriptor::new(2))
+            .unwrap_or_else(|error| panic!("a table made while the space is held: {error}"));
+        drop(space);
+        two.set_functions(&[Some(&handle("table_add")), Some(&handle("table_mul"))], 0)
+            .unwrap();
+        let expect: Vec<u32> = (0..N)
+            .map(|tid| if tid % 2 == 0 { tid + 3 } else { tid * 3 })
+            .collect();
+        assert_eq!(words_of(device, &state, Some(&two), || {}), expect);
+    });
+}
+
 /// A handle of another kernel's state set in a table calls the table's kernel's function at the
 /// position the handle has in its own state, as plain Metal's does where its validation stops
 /// the call (an M3 Max and an M4), Metal numbering a state's private functions first: `table_add`
@@ -335,7 +362,7 @@ fn a_kernel_calls_the_functions_its_table_holds() {
 /// refused as Metal's validation stops it.
 #[test]
 fn a_handle_of_another_kernel_calls_this_kernel_s_function_at_its_position() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let (caller, functions) = libraries(device);
         let function = |name: &str| functions.new_function_with_name(name).unwrap();
         let linked = |names: &[&str], private: &[&str]| {
@@ -520,7 +547,7 @@ fn a_buffer_at_a_vertex_table_index_reads_as_a_null_table() {
 /// as Metal's tables are read when the draw runs.
 #[test]
 fn a_vertex_function_calls_the_functions_its_stage_s_table_holds() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let (_, functions) = libraries(device);
         let function = |name: &str| functions.new_function_with_name(name).unwrap();
         let state = vertex_state(device, &functions);
@@ -751,7 +778,7 @@ fn words_with_arguments(
 /// the state is readable.
 #[test]
 fn a_kernel_calls_through_the_tables_its_argument_buffer_holds() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         argument_table_calls(device);
         an_entry_set_before_the_commit_is_called(device);
     });
@@ -898,6 +925,7 @@ fn without_the_array_s_features_a_kernel_reads_its_tables_from_a_snapshot() {
             options
                 .withheld_features
                 .insert(VkFeature::ShaderStorageBufferArrayNonUniformIndexing);
+            at_plan(options)
         },
         |device| {
             let compile = device.compile_device();
@@ -984,7 +1012,7 @@ fn a_table_past_the_storage_range_is_called_through_its_address() {
 /// nothing.
 #[test]
 fn beside_a_table_past_the_storage_range_null_and_unknown_ids_read_the_null_table() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let (state, functions) = argument_dispatch_state(device);
         let _wide = wide_table(&state, &functions);
         let empty = table(&state, 0);
@@ -1044,7 +1072,10 @@ fn without_the_array_s_features_a_table_past_the_storage_range_is_called_through
 
 /// What Metal answers for binary functions and required threadgroup sizes (the M3 Max and the M4
 /// alike):
-/// - A stage's `binary_functions` and a made state's additions must be compiled to a binary.
+/// - A stage's `binary_functions` and a made state's additions must be compiled to a binary: plain
+///   Metal's creation fails with code 2 ("Internal error during compute pipeline creation"), and
+///   its addition with code 1 ("Failed to allocate a new pipeline"), on an M3 Max under macOS
+///   27.0.1 (`binary_function_linking.m`).
 /// - Without the state's support flag, an added function's handle calls the kernel's last other
 ///   callable function.
 /// - The added state has a handle for each of the base state's functions and each added one, and
@@ -1056,7 +1087,7 @@ fn without_the_array_s_features_a_table_past_the_storage_range_is_called_through
 fn binary_functions_and_required_threads_answer_as_metal_s_do() {
     use metal2vulkan::metal::FunctionOptions;
     use metal2vulkan_runtime::{BinaryFunctionProblem, FunctionDescriptor, RequiredThreadsProblem};
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let (caller, functions) = libraries(device);
         let with_options = |name: &str, options: FunctionOptions| {
             let mut descriptor = FunctionDescriptor::new(name);
@@ -1078,13 +1109,19 @@ fn binary_functions_and_required_threads_answer_as_metal_s_do() {
         };
         const CREATE: &str = "new_compute_pipeline_state";
         const ADD: &str = "new_compute_pipeline_state_with_additional_binary_functions";
-        let binary_problem = |call, problem| invalid(call, Problem::BinaryFunctions(problem));
-        let not_precompiled = |call, name: &str| {
-            binary_problem(
+        let not_precompiled = |call, name: &str, (code, description)| {
+            Error::MetalError(MetalError::new(
                 call,
-                BinaryFunctionProblem::NotPrecompiled { name: name.into() },
-            )
+                Problem::BinaryFunctions(BinaryFunctionProblem::NotPrecompiled {
+                    name: name.into(),
+                }),
+                "AGXMetalG15X_M1",
+                code,
+                description,
+            ))
         };
+        const MADE: (i64, &str) = (2, "Internal error during compute pipeline creation");
+        const ADDED: (i64, &str) = (1, "Failed to allocate a new pipeline");
 
         // The options a function descriptor takes: every combination of the four bits, each
         // answered back verbatim, as plain Metal answers it over a descriptor that lists no
@@ -1111,7 +1148,7 @@ fn binary_functions_and_required_threads_answer_as_metal_s_do() {
         linked.binary_functions = vec![plain("table_add").linked_function()];
         assert_eq!(
             create(&descriptor(linked)).err(),
-            Some(not_precompiled(CREATE, "table_add"))
+            Some(not_precompiled(CREATE, "table_add", MADE))
         );
 
         // Functions added to a made state. Without the support flag, which Metal's validation
@@ -1165,7 +1202,7 @@ fn binary_functions_and_required_threads_answer_as_metal_s_do() {
                     plain("table_sub"),
                 ])
                 .err(),
-            Some(not_precompiled(ADD, "table_sub"))
+            Some(not_precompiled(ADD, "table_sub", ADDED))
         );
         assert_eq!(state.function_handle(&compiled("table_add")).unwrap(), None);
         let added = state
@@ -1350,7 +1387,7 @@ fn a_handle_of_another_vertex_function_calls_this_state_s_function_at_its_positi
 fn functions_added_to_a_vertex_stage_without_its_flag_call_its_last_function() {
     use metal2vulkan::metal::FunctionOptions;
     use metal2vulkan_runtime::{FunctionDescriptor, RenderPipelineFunctionsDescriptor};
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let (_, functions) = libraries(device);
         let plain = |name: &str| functions.new_function_with_name(name).unwrap();
         let compiled = |name: &str| {
@@ -1401,7 +1438,9 @@ fn functions_added_to_a_vertex_stage_without_its_flag_call_its_last_function() {
 /// Functions added to a stage a drawing state lacks (the fragment stage of a state without a
 /// fragment function, and the tile stage) are left out, with no handle, as plain Metal makes the
 /// state where its validation stops it; the state's vertex function keeps its handle. A function
-/// not compiled to a binary stays refused there, as it is for a stage the state has.
+/// not compiled to a binary is left out there too, as plain Metal leaves it (an M3 Max under
+/// macOS 27.0.1, `binary_function_linking.m`), where one added to a stage the state has fails
+/// the call.
 #[test]
 fn functions_added_to_a_stage_a_drawing_state_lacks_are_left_out() {
     use metal2vulkan::metal::FunctionOptions;
@@ -1443,17 +1482,208 @@ fn functions_added_to_a_stage_a_drawing_state_lacks_are_left_out() {
             .unwrap()
             .is_some());
         added.tile_additional_binary_functions = vec![plain("table_sub")];
+        added.fragment_additional_binary_functions = vec![plain("table_mul")];
+        let made = state
+            .new_render_pipeline_state_with_additional_binary_functions(&added)
+            .unwrap();
+        assert_eq!(
+            made.function_handle(&plain("table_sub"), RenderStages::TILE)
+                .unwrap(),
+            None
+        );
+        let mut to_vertex = RenderPipelineFunctionsDescriptor::new();
+        to_vertex.vertex_additional_binary_functions = vec![plain("table_sub")];
         assert_eq!(
             state
-                .new_render_pipeline_state_with_additional_binary_functions(&added)
+                .new_render_pipeline_state_with_additional_binary_functions(&to_vertex)
                 .unwrap_err(),
-            invalid(
+            Error::MetalError(MetalError::new(
                 "new_render_pipeline_state_with_additional_binary_functions",
                 Problem::BinaryFunctions(BinaryFunctionProblem::NotPrecompiled {
                     name: "table_sub".into()
-                })
+                }),
+                "AGXMetalG15X_M1",
+                1,
+                "Failed to allocate a new pipeline",
+            ))
+        );
+    });
+}
+
+/// Binary functions a stage links as plain Metal links them (an M3 Max under macOS 27.0.1,
+/// `binary_function_linking.m`, where Metal's API validation stops the two-list shapes):
+/// - a function `binary_functions` alone holds is called through the stage's table, a kernel's
+///   and a vertex function's;
+/// - beside a function of its name in `functions` (the owned `linked_other_functions`'
+///   `table_add`, `a + b + 100`), each has a handle of its own and the table calls each;
+/// - one not compiled to a binary fails the creation once the stage links, with plain Metal's
+///   error: code 2, "Internal error during compute pipeline creation" for a kernel, an empty
+///   description for a vertex function;
+/// - a mesh pipeline's mesh or object stage linking any is refused, as plain Metal ends its
+///   process there; its fragment stage takes them.
+#[test]
+fn binary_functions_link_as_plain_metal_links_them() {
+    use metal2vulkan::metal::FunctionOptions;
+    use metal2vulkan::pipeline::{MeshPipelineDescriptor, Stage};
+    use metal2vulkan_runtime::{BinaryFunctionProblem, FunctionDescriptor};
+    on_device_with(at_plan, |device| {
+        let (caller, functions) = libraries(device);
+        let other = llvm_assemble(&engine_dir().join("linked_other_functions.ll")).unwrap();
+        let other = device.new_library_with_air(&other).unwrap();
+        let compiled = |library: &Library, name: &str| {
+            let mut descriptor = FunctionDescriptor::new(name);
+            descriptor.options = FunctionOptions::COMPILE_TO_BINARY;
+            library.new_function_with_descriptor(&descriptor).unwrap()
+        };
+        let plain = |library: &Library, name: &str| library.new_function_with_name(name).unwrap();
+        let binary = |listed: Option<&metal2vulkan_runtime::Function>, held| {
+            let mut linked = LinkedFunctions::new();
+            if let Some(listed) = listed {
+                linked = linked.with_function(listed.linked_function());
+            }
+            linked
+                .binary_functions
+                .push(metal2vulkan_runtime::Function::linked_function(held));
+            linked
+        };
+        let add = |tid: u32| tid + 3;
+        let other_add = |tid: u32| tid + 103;
+        // A kernel's table: the binary function alone, then beside another of its name.
+        let alone = compiled(&functions, "table_add");
+        let state = state_of(&caller, "visible_table_dispatch", binary(None, &alone));
+        let one = table(&state, 1);
+        one.set_function(state.function_handle(&alone).unwrap().as_ref(), 0)
+            .unwrap();
+        let expect: Vec<u32> = (0..N).map(add).collect();
+        assert_eq!(words_of(device, &state, Some(&one), || {}), expect);
+        let (own, others) = (
+            plain(&functions, "table_add"),
+            compiled(&other, "table_add"),
+        );
+        let state = state_of(
+            &caller,
+            "visible_table_dispatch",
+            binary(Some(&own), &others),
+        );
+        let handles = [&own, &others].map(|f| state.function_handle(f).unwrap().unwrap());
+        assert_ne!(handles[0], handles[1]);
+        let two = table(&state, 2);
+        two.set_functions(&[Some(&handles[0]), Some(&handles[1])], 0)
+            .unwrap();
+        let alternate: Vec<u32> = (0..N)
+            .map(|tid| {
+                if tid % 2 == 0 {
+                    add(tid)
+                } else {
+                    other_add(tid)
+                }
+            })
+            .collect();
+        assert_eq!(words_of(device, &state, Some(&two), || {}), alternate);
+        // A vertex function's table, beside another of its name.
+        let state = vertex_state_linking(device, binary(Some(&own), &others));
+        let handles = [&own, &others].map(|f| {
+            state
+                .function_handle(f, RenderStages::VERTEX)
+                .unwrap()
+                .unwrap()
+        });
+        let two = state
+            .new_visible_function_table(
+                &VisibleFunctionTableDescriptor::new(2),
+                RenderStages::VERTEX,
+            )
+            .unwrap();
+        two.set_functions(&[Some(&handles[0]), Some(&handles[1])], 0)
+            .unwrap();
+        assert_eq!(
+            vertex_words_of(device, &state, Some(&two), || {}),
+            alternate
+        );
+        // Not compiled to a binary: plain Metal's error, a kernel's and a vertex function's.
+        let not_precompiled = |call, description| {
+            Err(Error::MetalError(MetalError::new(
+                call,
+                Problem::BinaryFunctions(BinaryFunctionProblem::NotPrecompiled {
+                    name: "table_add".into(),
+                }),
+                "AGXMetalG15X_M1",
+                2,
+                description,
+            )))
+        };
+        let kernel = caller
+            .new_function_with_name("visible_table_dispatch")
+            .unwrap();
+        assert_eq!(
+            device
+                .new_compute_pipeline_state(
+                    &ComputePipelineDescriptor::new(StageSource::Function(
+                        kernel.function_descriptor().with_linked(binary(None, &own)),
+                    )),
+                    &PipelineOptions::default(),
+                )
+                .map(drop),
+            not_precompiled(
+                "new_compute_pipeline_state",
+                "Internal error during compute pipeline creation"
             )
         );
+        let bitcode = llvm_assemble(&engine_dir().join("vft_vertex_caller.ll")).unwrap();
+        let vertex_caller = device.new_library_with_air(&bitcode).unwrap();
+        let vertex = vertex_caller
+            .new_function_with_name("vft_vertex_dispatch")
+            .unwrap();
+        let mut descriptor = RenderPipelineDescriptor::new(StageSource::Function(
+            vertex.function_descriptor().with_linked(binary(None, &own)),
+        ));
+        descriptor.rasterization_enabled = false;
+        descriptor.color_attachments[0] =
+            Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm));
+        assert_eq!(
+            device
+                .new_render_pipeline_state(&descriptor, &PipelineOptions::default())
+                .map(drop),
+            not_precompiled("new_render_pipeline_state", "")
+        );
+        // A mesh pipeline's mesh and object stages.
+        let ll = metal2vulkan_devtools::fixtures_dir().join("examples/icb_direct_arguments.ll");
+        let mesh_library = device
+            .new_library_with_air(&llvm_assemble(&ll).unwrap())
+            .unwrap();
+        let stage = |name: &str, linked: LinkedFunctions| {
+            StageSource::Function(
+                mesh_library
+                    .new_function_with_name(name)
+                    .unwrap()
+                    .function_descriptor()
+                    .with_linked(linked),
+            )
+        };
+        for linked_stage in [Stage::Mesh, Stage::Object] {
+            let linked = |of: Stage| match of == linked_stage {
+                true => binary(None, &alone),
+                false => LinkedFunctions::new(),
+            };
+            let mut descriptor =
+                MeshPipelineDescriptor::new(stage("plain_mesh", linked(Stage::Mesh)));
+            descriptor.object = Some(stage("plain_object", linked(Stage::Object)));
+            descriptor.fragment = Some(stage("plain_fragment", LinkedFunctions::new()));
+            descriptor.color_attachments[0] =
+                Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm));
+            assert_eq!(
+                device
+                    .new_mesh_render_pipeline_state(&descriptor, &PipelineOptions::default())
+                    .map(drop),
+                Err(invalid(
+                    "new_mesh_render_pipeline_state",
+                    Problem::BinaryFunctions(BinaryFunctionProblem::ObjectOrMeshStage {
+                        stage: linked_stage
+                    })
+                )),
+                "{linked_stage:?}"
+            );
+        }
     });
 }
 
@@ -1533,7 +1763,7 @@ fn tile_words_with(
 /// others.
 #[test]
 fn a_tile_function_calls_the_functions_its_stage_s_table_holds() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let (_, functions) = libraries(device);
         let function = |name: &str| functions.new_function_with_name(name).unwrap();
         let state = tile_state_adding(device, linked_four(&functions), false);
@@ -1613,7 +1843,7 @@ fn a_tile_function_calls_the_functions_its_stage_s_table_holds() {
 fn functions_added_to_a_tile_stage_without_its_flag_call_its_last_function() {
     use metal2vulkan::metal::FunctionOptions;
     use metal2vulkan_runtime::{FunctionDescriptor, RenderPipelineFunctionsDescriptor};
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let (_, functions) = libraries(device);
         let plain = |name: &str| functions.new_function_with_name(name).unwrap();
         let compiled = |name: &str| {

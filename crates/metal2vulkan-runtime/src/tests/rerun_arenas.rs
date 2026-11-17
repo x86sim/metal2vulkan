@@ -18,11 +18,13 @@ use crate::{
 use ash::vk;
 use metal2vulkan::metal::{IndirectCommandType, ResourceUsage};
 use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// The longest the test waits for the loop's runs again, and for its command buffer.
+/// The longest the test waits for the loop's next run again, and for its command buffer: the
+/// runs again take as long as the GPU's other work lets them (the forty took 4 s on an RTX 5080
+/// Laptop GPU alone and up to 59 s in a suite sharing it), so the wait bounds a stall, not the
+/// forty.
 const WAIT: Duration = Duration::from_secs(60);
 
 /// The threads each dispatch runs.
@@ -47,8 +49,7 @@ fn device() -> Device {
 /// A state of the fixture's `scale_and_offset` that an indirect command buffer's commands may
 /// set.
 fn state(device: &Device) -> ComputePipelineState {
-    let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll");
+    let ll = metal2vulkan_devtools::fixtures_dir().join("examples/runtime_examples.ll");
     let bitcode = metal2vulkan_devtools::llvm_assemble(&ll).unwrap();
     let library = metal2vulkan::library::Library::from_air(&bitcode).unwrap();
     let library = device.new_library_with_compile_library(library);
@@ -120,18 +121,35 @@ fn a_loop_run_again_holds_no_more_uploads_each_run() {
     assert_eq!(end, Ok(true));
     encoder.end_encoding().unwrap();
     let before = device.work_counts().predicated_loop_runs_again;
+    let started = Instant::now();
     command_buffer.commit().unwrap();
-    let ran_again = |runs: u64| {
-        let deadline = Instant::now() + WAIT;
-        while device.work_counts().predicated_loop_runs_again < before + runs {
-            assert!(Instant::now() < deadline, "fewer than {runs} runs again");
+    // The longest wait for one run again.
+    let mut longest = Duration::ZERO;
+    let mut ran_again = |runs: u64| {
+        let mut seen = device.work_counts().predicated_loop_runs_again;
+        let mut since = Instant::now();
+        while seen < before + runs {
             std::thread::sleep(Duration::from_millis(1));
+            let now = device.work_counts().predicated_loop_runs_again;
+            if now > seen {
+                longest = longest.max(since.elapsed());
+                (seen, since) = (now, Instant::now());
+            }
+            assert!(
+                since.elapsed() < WAIT,
+                "no run again in {WAIT:?} after {} of {runs}",
+                seen - before
+            );
         }
     };
     ran_again(3);
     let early = command_buffer.upload_bytes();
     ran_again(40);
     let late = command_buffer.upload_bytes();
+    eprintln!(
+        "RERUN-ARENAS: 40 runs again in {:?}, the longest wait for one {longest:?}",
+        started.elapsed()
+    );
     let contents = word.contents().unwrap();
     // SAFETY: the word's first 4 bytes; the GPU only reads them.
     unsafe { contents.as_ptr().cast::<u32>().write_volatile(1) };
@@ -151,8 +169,9 @@ fn a_loop_run_again_holds_no_more_uploads_each_run() {
 
 /// A descriptor arena lent another (`DescriptorArena::lend`, as a run again's work apart records)
 /// allocates every set from the lent one and opens no pool of its own; the lent one's pools,
-/// reset after each of twenty runs of forty sets (`DescriptorArena::reset`, as each run again
-/// completed), take every later run's sets: the pools the first run opened are all it ever opens.
+/// reset inside a section of the exit guard after each of twenty runs of forty sets
+/// (`DescriptorArena::reset`, as each run again completed), take every later run's sets: the pools
+/// the first run opened are all it ever opens.
 #[test]
 fn a_lent_descriptor_arena_takes_every_set_and_its_reset_opens_no_pool() {
     let device = device();
@@ -184,7 +203,11 @@ fn a_lent_descriptor_arena_takes_every_set_and_its_reset_opens_no_pool() {
         );
         let made = device.work_counts().arena_pools_made;
         assert_eq!(*opened.get_or_insert(made), made, "run {run} opened a pool");
+        // Inside a section, as the run again's settle resets it: there the device's functions
+        // are the exit guard's table alone (`device/functions.rs`).
+        let section = crate::exit_guard::enter().expect("a section");
         lock(&lent).reset().unwrap();
+        drop(section);
     }
     own.lend(None);
     assert!(lock(&lent).pools() > 0);

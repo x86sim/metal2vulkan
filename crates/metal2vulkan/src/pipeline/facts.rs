@@ -106,7 +106,7 @@ pub enum RuntimeFact {
     /// `layout` at the stride the encoder binds it with (`setBuffer:offset:attributeStride:
     /// atIndex:` and its forms), its stage-input layout being `MTLBufferLayoutStrideDynamic`: the
     /// binder writes the bound stride into `PushField::StageInStride`, or 0 for a buffer bound
-    /// without one, as Metal reads it. A layout of a fixed stride reads its own, compiled in,
+    /// without one, as Metal reads it (`MTLAttributeStrideStatic` is its low 32 bits). A layout of a fixed stride reads its own, compiled in,
     /// whatever the bind's, and records nothing.
     StageInStride { layout: u32 },
     /// A read-only slot that Profile F's per-stage storage-buffer fallback may read through a
@@ -329,11 +329,46 @@ pub enum RuntimeFact {
     /// (`InvalidDescriptor(MaxCallStackDepth)` otherwise); a `Function` stage is compiled under
     /// its pipeline's. Nothing on the device reads it.
     CallStackDepth { depth: u32 },
+    /// The kernel was compiled as the kernel of a compute pipeline of OpenCL mode
+    /// (`LoweringInputs::open_cl_mode`): it takes the three hidden buffers at indices 0 to 2 and
+    /// its own buffer-indexed arguments 3 past their indices. A `StageSource::Compiled` kernel
+    /// serves only a pipeline of the mode it was compiled in (`InvalidDescriptor(OpenClMode)`
+    /// otherwise); a `Function` kernel is compiled under its pipeline's. Nothing on the device
+    /// reads it.
+    OpenClMode,
+    /// The kernel's only simdgroup semantics are the barriers its lockstep order took
+    /// (`lower::simd::lockstep`), on a flattened tier, and they order only pairs whose threads meet
+    /// where a simdgroup spans two rows of its threadgroup (`Lockstep::rows`). A dispatch region
+    /// of one row runs on the planned pipeline whatever its width, without whole subgroups, where
+    /// no pair meets; any other region keeps the tier's whole subgroups or emulated simdgroups.
+    /// A dispatch whose every region is one row asks for the kernel's one-row variant
+    /// (`VariantKey::one_row`), which has none of those barriers.
+    RowLockstep,
+    /// The kernel was compiled under `VariantKey::one_row` (`LoweringInputs::one_row`): it runs
+    /// threadgroups whose simdgroups each lie within one row, without the lockstep simdgroup
+    /// barriers its `RowLockstep` plan had (its threadgroup ones kept). Its plans state the
+    /// variant, and a dispatch with a region of more than one row asks for the variant without it.
+    OneRow,
+    /// Unit axes (`lower::simd::uniform`, "Unit axes"; bit 0 `x`, bit 1 `y`, bit 2 `z`). Where
+    /// `axes` is 0, the kernel's walk is predicated and `relief` holds, at bit `m − 1`, each mask
+    /// `m` of axes under which fewer of its synchronizations' blocks are divergent once its
+    /// threads' positions along them are taken as uniform: a dispatch whose threadgroups have one
+    /// thread along exactly the axes `m` may run the kernel's unit-axes variant
+    /// (`VariantKey::unit_axes`, `BindingPlan::unit_axes_variant`). Where `axes` is not 0, the
+    /// kernel was compiled under that variant (`LoweringInputs::unit_axes`), `relief` is 0, its
+    /// plans state the variant, and a dispatch with more than one thread along one of `axes` asks
+    /// for the variant without it.
+    UnitAxes { axes: u8, relief: u8 },
     /// The kernel was compiled under `VariantKey::flat_grid` (`LoweringInputs::flat_grid`): it
     /// runs any grid in threadgroups of its own size, reading the grid from the 32-byte region
     /// record at its `PushField::ReplayRegionAddress`, which a preprocess writes beside the
     /// dispatch's group counts. Its plans state the variant.
     FlatGrid,
+    /// The kernel was compiled under `VariantKey::call_threadgroups`
+    /// (`LoweringInputs::call_threadgroups`), with `FlatGrid`: it runs a one-row grid in the
+    /// call's threadgroups of one row, its invocations counting their threads in its simdgroups'
+    /// lane order. Its plans state the variant.
+    CallThreadgroups,
     /// The function writes texture slot `slot` (a `write` or an imageblock slice's copy), or,
     /// with `atomic`, updates it by a texture atomic. Metal drops every write a function makes to
     /// a sparse texture, its mapped tiles' included: the texture keeps its contents for the
@@ -614,12 +649,31 @@ pub enum RuntimeFact {
         kept: crate::vk::ColorComponentFlags,
     },
     /// On a device that orders framebuffer fetch through rasterization-order input attachments,
+    /// the function computes Metal's blend `blend` into color attachment `color`, held with its
+    /// channels rotated (`ARGB8Unorm` in `R8G8B8A8_UNORM`), where no Vulkan state on that image
+    /// gives it (`color_writes::shader_rotated_blend`): it reads the texel through the
+    /// attachment's input attachment (`RuntimeFact::FramebufferFetch`), blends its output over it
+    /// in Metal's channel order by Metal's 8-bit unorm blend, and writes the result through its
+    /// first output, rotated as every output there is. `kept` is the format's channels the
+    /// descriptor's write mask leaves out, which the attachment's write mask keeps. Link gives the
+    /// attachment no Vulkan blend, and a pipeline of another blend or write mask there is
+    /// `NeedsInput(FramebufferFetch)`.
+    RotatedInputBlend {
+        color: u32,
+        blend: crate::pipeline::lower_inputs::BlendEquation,
+        kept: crate::vk::ColorComponentFlags,
+    },
+    /// On a device that orders framebuffer fetch through rasterization-order input attachments,
     /// the function writes color attachment `color`, which renders through a view of its word
     /// (`metal::format::WordAttachment`, an 8-bit sRGB one), under a write mask of some of the
     /// word's channels: it reads the texel's word through the attachment's input attachment
     /// (`RuntimeFact::FramebufferFetch`) and writes Metal's word of its output with the fields of
     /// the channels `kept` (those of the word the descriptor's write mask leaves out) taken from
-    /// the word read. Link writes the whole word, and a pipeline of another write mask there is
+    /// the word read. Likewise an extended-range attachment whose one raw component holds three
+    /// codes (`BGR10_XR`, the two-plane forms' color word, their `_sRGB` twins) written unblended
+    /// under a mask of some of them: the function writes the kernel write's encode of its output
+    /// with the codes of the channels `kept` taken from the texel read. Link writes the whole word
+    /// (every raw component), and a pipeline of another write mask there is
     /// `NeedsInput(FramebufferFetch)`.
     WordInputMerge {
         color: u32,
@@ -664,6 +718,28 @@ pub enum RuntimeFact {
         stage: Stage,
         class: ImageHandleClass,
         every_member: bool,
+    },
+    /// The `stage` function observes the residency of a read, sample, or gather of a texture it
+    /// reaches through an argument buffer (a heap element): bit 0 of the `{T, i8}` status word,
+    /// MSL's `sparse_color::resident()`. A texture that is not sparse is resident everywhere, and
+    /// the module compiles in the word Metal returns for it (0), exact on every device. It has no
+    /// form for a sparse texture, whose residency would need the member's tile map or sparse image
+    /// per handle-table entry: the planner refuses a sparse texture (`MTLTexture.isSparse`,
+    /// `bind::TextureFacts::sparse`) that the stage's handle tables reach (a member the plan
+    /// names, or one resident for the command), `Unsupported { feature: ArgumentBufferTextures,
+    /// needs: NotImplemented }`.
+    HeapResidency { stage: Stage },
+    /// The `stage` function reads members of the heap's storage array of `class` (a `read_write`
+    /// argument-buffer texture's read). Such an array holds a texture whose writes Metal drops
+    /// (`metal::format::writes_dropped`) as its neutral, and a 4:4:4 two-plane YCbCr texture whose
+    /// writes Metal stores into its planes (`metal::format::ycbcr_writes_stored`) as its write
+    /// shadow, which its writes mark and nothing reads; Metal's read of either through such a
+    /// texture is not measured, as for a slot that reads one. The planner refuses such a texture
+    /// the stage reaches in that class (a member the plan names, or one resident for the
+    /// command), `Unsupported { feature: Format, needs: NotImplemented }`.
+    HeapStorageReads {
+        stage: Stage,
+        class: ImageHandleClass,
     },
     /// The function samples a texture through the runtime sampler bound to the slot where Metal's
     /// anisotropic filter, emulated (`lower::sampler::anisotropic`), reaches the sample: bound to a
@@ -717,8 +793,8 @@ pub enum RuntimeFact {
     /// the shape asks for (`BindShape::private_list`).
     PrivateList,
     /// The function reads the texture bound to the slot only as the in-place form of a two-plane
-    /// YCbCr texture reads it (`bind::YCbCrInPlace`): sampled through a constexpr sampler or
-    /// through the runtime sampler slots whose bits `samplers` holds (bit `n` for
+    /// YCbCr texture reads it (`bind::YCbCrInPlace`): sampled or gathered through a constexpr sampler
+    /// or through the runtime sampler slots whose bits `samplers` holds (bit `n` for
     /// `[[sampler(n)]]` of the slot's stage), read, or its size queried, as a 2D `float` texture.
     /// Recorded on a profile that reads planes in place (`ProfileFields::ycbcr_in_place`). Where
     /// the binder binds a texture whose planes are read so (`TextureShape::Texture::ycbcr_in_place`)
@@ -730,7 +806,7 @@ pub enum RuntimeFact {
     /// push field (`PushField::YCbCrInPlace`). Elsewhere the slot binds the texture's image as
     /// before. `device`: every sample of the slot is one the device's own sampler Y′CbCr
     /// conversion takes (none addresses a border through a constexpr sampler or places a texel
-    /// offset by a parent's size): where the bound texture's planes are also held as an image it
+    /// offset by a parent's size, and none is a gather): where the bound texture's planes are also held as an image it
     /// samples (`TextureShape::Texture::ycbcr_planes_sampler`) and each runtime sampler addresses
     /// no border on either axis, the slot samples that image instead
     /// (`VariantKey::ycbcr_planes_sampled`, `bind::YCbCrPlanesSampler`).
@@ -739,6 +815,45 @@ pub enum RuntimeFact {
         samplers: u32,
         device: bool,
     },
+    /// The function only reads, writes or asks the size of the 2D texture bound to the slot
+    /// (`bind::TexelRows`): `read` at level 0 or a computed level, `write`, its width, height or
+    /// level count, `is_null` and a texture fence; no sample, gather, LOD query, atomic, read
+    /// through a sampler, imageblock slice or access of a level past the first through a storage
+    /// slot, and no arm of a handle that switches between slots. Where the binder binds a texture
+    /// whose rows are read and written in place (`TextureShape::Texture::texel_rows`), the slot
+    /// joins the plan's variant (`VariantKey::texel_rows`, `LoweringInputs::texel_rows`), under
+    /// which its one binding is a texel buffer over the rows' bytes (`WriteSource::TexelRows`),
+    /// texel `(x, y)` the view's `first + y · row + x`, those words in the slot's push field
+    /// (`PushField::TexelRows`). Elsewhere the slot binds the texture's image as before.
+    TexelRows { slot: SlotRef },
+    /// The object function runs a partial threadgroup of a `drawMeshThreads` as Metal does
+    /// (`lower::dispatch`'s partial object threadgroups): where its `DispatchRegion` (or a folded
+    /// variant's region record) carries `lower::dispatch::NONUNIFORM`, it answers its
+    /// threadgroup's threads, `min(L, threads_per_grid − position · L)` per axis, and its
+    /// invocations past them run none of the body: they return before it, or, in a body that
+    /// holds a workgroup barrier, walk it predicated, never live, to each barrier. Recorded for
+    /// every object function but one whose barriers are uniform and whose predicated walk's vote
+    /// word does not fit its workgroup memory; the binder refuses a draw that leaves a partial
+    /// object threadgroup of that one (`NotImplemented(MeshShading)`).
+    PartialObjectThreadgroups,
+    /// The function reads the texture bound to the slot through a sampler whose addressing may
+    /// read the border texel (Metal 4.1 `read(sampler s, ...)`): that texel is the border color in
+    /// the bound pixel format's channels, through the texture's swizzle, which the shader takes from
+    /// `SpecKey::BorderTexels`, which the binder sets from the bound texture.
+    BorderTexels { slot: SlotRef },
+    /// The render pipeline was compiled under `VariantKey::region_viewports`, and its vertex
+    /// function stores `ViewportIndex` as `DrawIndex` (`LoweringInputs::region_viewports`): each
+    /// draw of a multi-draw renders through the viewport and scissor at its index, the runtime's
+    /// draw of a rasterization-rate-mapped pass's regions several at a time. Its plans state the
+    /// variant the shape asks for (`BindShape::region_viewports`).
+    RegionViewports,
+    /// The kernel was compiled under `VariantKey::partial_threadgroups`
+    /// (`LoweringInputs::partial_threadgroups`): where its `DispatchRegion` carries
+    /// `lower::dispatch::NONUNIFORM`, its last threadgroup along an axis runs only Metal's
+    /// partial threadgroup's threads, so a `dispatchThreads` grid that is not a whole number of
+    /// threadgroups runs at the call's threadgroup size alone. Its plans state the variant, and
+    /// plan such a dispatch so.
+    PartialThreadgroups,
 }
 
 /// What one compile made of a slot of a `RuntimeFact::UniformViewRange`.

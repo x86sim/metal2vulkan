@@ -26,6 +26,7 @@ use metal2vulkan_runtime::{
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// A degrade notice no case's scope was open for: the harness could not attribute it, so it is
 /// reported rather than given to a case that did not provoke it.
@@ -265,8 +266,11 @@ fn loader() -> Option<PathBuf> {
 pub enum Policy {
     /// `DevicePolicy::exact_answers()`: the accurate form of each of the runtime's
     /// speed-for-accuracy switches, which are all it selects — `heap_compression`
-    /// `Uncompressed`, `completion` `Exact`, `batch_order` `Exact`, `render_lowering` `AtCall`,
-    /// `host_page_textures` `Shadow`, `half_chains` `EachOperation` and `pipeline_waits` `Exact`.
+    /// `Uncompressed`, `heap_answers` `Metal`, `completion` `Exact`, `batch_order` `Exact`, `render_lowering` `AtCall`,
+    /// `host_page_textures` `Shadow`, `half_chains` `EachOperation`, `pipeline_waits` `Exact`,
+    /// `wide_lines` `Exact`, `extended_range_blits` `Canonical`, `queue_sharing` `PerQueue`,
+    /// `dont_care_colors` `Kept`, `unstored_dont_care_loads` `Cleared`, `vertex_reach` `Exact`,
+    /// `managed_copy_in` `AtCommit` and `indirect_records` `Carried`.
     Exact,
     /// The runtime's own defaults: the fast form of every choice, which is what a consumer runs.
     Default,
@@ -310,6 +314,43 @@ pub fn open_under(
     options.kinds = venues.kinds();
     Device::system_default_with(&options)
         .map_err(|error| format!("the runtime made no {venues:?} device: {error}"))
+}
+
+/// The longest [`open_counted`] waits for a device whose commands the runtime counts.
+pub const SLOT_WAIT: Duration = Duration::from_secs(60);
+
+/// [`open_under`]'s device, made again until it is one whose commands the runtime counts
+/// (`WorkCounts::commands_uncounted` 0), for at most `wait`.
+///
+/// The runtime counts the commands of a few devices of the process at once, each until its
+/// teardown's `vkDestroyDevice` (its recorder's slots); a device made while every slot is held
+/// records its commands uncounted, and its `commands_recorded` reads 0 whatever it recorded. A
+/// cost read from it would record those zeros as the case's. So such a device is let go at once
+/// and made again, the devices before it given the time their teardown takes; past `wait`, `Err`
+/// names why, and nothing is measured.
+pub fn open_counted(
+    venues: Venues,
+    policy: Policy,
+    notices: &Notices,
+    cache: &ScratchCache,
+    wait: Duration,
+) -> Result<Device, String> {
+    let start = Instant::now();
+    loop {
+        let device = open_under(venues, policy, notices, cache)?;
+        if device.work_counts().commands_uncounted == 0 {
+            return Ok(device);
+        }
+        drop(device);
+        if start.elapsed() >= wait {
+            return Err(format!(
+                "the runtime counted no new device's commands for {wait:?}: every recorder slot \
+                 was held by a device not yet torn down, so a device made now records its \
+                 commands uncounted and no cost is read from it"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// The runtime's default device among the physical devices `venues` names, under [`Policy::Exact`].

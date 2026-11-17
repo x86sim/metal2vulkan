@@ -43,6 +43,22 @@
 //! the completion, merges in whole blocks of the square's rows alone: each of those texels ends
 //! holding the CPU's last write (`DIRTY-BESIDE`).
 //!
+//! Two shadowed textures over the same logged bytes, a render target a pass draws into inside rows
+//! 0 to 8 and a texture a kernel reads: the reader's copy in after the pass takes those rows alone,
+//! in a later command buffer and in the pass's own, and reads the pass's texels there: the pass's
+//! merge back is a write the log is told of (cut to the rows of its rectangle, as its merge is),
+//! which lets go of no other shadow's hold (`dirty_pages.rs`, **Holds**). With nothing written
+//! since, the reader copies nothing.
+//!
+//! A command buffer whose pass draws into such a render target inside rows 0 to 8, merged back,
+//! and then fills row 2 of its bytes with a blit, leaves the next command buffer's copy in to take
+//! the fill: the merge back is the shadow's own write, which its copies in leave out, but the
+//! fill beneath it is not, so the command buffer lets go of the shadow's hold.
+//!
+//! A blit's fill of such pages imported in place, with no shadow over them, is told to the log
+//! as the consumer's write twice: at the commit, and once after it ran, before the wait for the
+//! command buffer returns and before its completed handler runs (`DirtyShadows::ran`).
+//!
 //! One wait for a log's publication serves every gated copy in of a commit, two shadows over one
 //! log among them, and a wait the log answers `false` is not made again for them
 //! (`WorkCounts::dirty_waits`).
@@ -55,9 +71,11 @@
 //! Such a shadow sampled by a pass whose first instance records inline (`render/inline_first.rs`)
 //! takes its gated copy in before the pass, as every command before the pass does
 //! (`EncoderCore::hold_pass`): the pass's draws read the bytes the CPU wrote, the first time and
-//! after a write told to the log, and the pass stays one inline instance. So does a texture the
-//! pass only samples, which a discrete GPU makes a device copy (`WorkCounts::device_copy_textures`)
-//! and every other device reads in place (no copy, printed).
+//! after a write told to the log, and the pass stays one inline instance. So does a `Managed`
+//! texture the pass only samples, which a discrete GPU makes a device copy
+//! (`WorkCounts::device_copy_textures`) where its no-copy buffer lies in its pages (its GPU copy
+//! found no room: a two-copy buffer's texture is over its GPU copy, `managed_copy.rs`, and the
+//! leg then has nothing to copy in) and every other device reads in place (no copy, printed).
 //!
 //! Device tests: compiled only under the validation crate's GPU safety cfgs (`m2v_gpu`,
 //! `m2v_cpu_icd`). The kernels are the owned fixture
@@ -66,15 +84,14 @@
 use super::blit_holds::{device, over_host, Host, Scratch, BYTES, WAIT};
 use super::encoder_holds::{bytes_of, render_state};
 use crate::{
-    Buffer, ClearColor, CommandBufferStatus, ComputePipelineState, Device, DirtyPages, DirtyStamp,
-    Error, EventRef, HostMemory, Library, LoadAction, PipelineOptions, Region,
-    RenderPassDescriptor, ResourceOptions, ScissorRect, Size, StoreAction, Texture,
-    TextureDescriptor,
+    Buffer, ClearColor, CommandBufferStatus, ComputePipelineState, CpuCacheMode, Device,
+    DirtyPages, DirtyStamp, Error, EventRef, HazardTrackingMode, HostMemory, Library, LoadAction,
+    PipelineOptions, Region, RenderPassDescriptor, ResourceOptions, ScissorRect, Size, StorageMode,
+    StoreAction, Texture, TextureDescriptor,
 };
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
 use std::num::NonZeroU64;
 use std::ops::Range;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -83,7 +100,7 @@ const ROW: u64 = 256;
 
 /// The test's log: every write it is told of, stamped, with its writer (0 the consumer's).
 #[derive(Default)]
-struct Log {
+pub(super) struct Log {
     next: AtomicU64,
     writes: Mutex<Vec<(u64, Range<u64>, u64)>>,
     /// The wait answers `false` while set.
@@ -96,7 +113,7 @@ struct Log {
 }
 
 impl Log {
-    fn told(&self, range: Range<u64>, writer: u64) {
+    pub(super) fn told(&self, range: Range<u64>, writer: u64) {
         let stamp = self.next.fetch_add(1, Ordering::SeqCst) + 1;
         self.writes.lock().unwrap().push((stamp, range, writer));
     }
@@ -145,8 +162,7 @@ impl DirtyPages for Log {
 }
 
 fn state(device: &Device, kernel: &str) -> ComputePipelineState {
-    let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll");
+    let ll = metal2vulkan_devtools::fixtures_dir().join("examples/runtime_examples.ll");
     let bitcode = metal2vulkan_devtools::llvm_assemble(&ll).unwrap();
     let library = metal2vulkan::library::Library::from_air(&bitcode).unwrap();
     let library: Library = device.new_library_with_compile_library(library);
@@ -199,12 +215,20 @@ fn delta(device: &Device, before: [u64; 5]) -> [u64; 5] {
 
 /// The buffer over `host`, its memory logged by `log`.
 fn over_logged(device: &Device, host: &Host, log: &Arc<Log>) -> Option<Buffer> {
+    over_logged_as(device, host, log, ResourceOptions::default())
+}
+
+/// [`over_logged`], of `options`.
+fn over_logged_as(
+    device: &Device,
+    host: &Host,
+    log: &Arc<Log>,
+    options: ResourceOptions,
+) -> Option<Buffer> {
     // SAFETY: the memory outlives the buffer (dropped after the device), and only the buffer's
     // commands and the test use it while it lives.
     let memory: HostMemory = unsafe { host.memory() }.with_dirty_pages(Arc::clone(log));
-    let made = unsafe {
-        device.new_buffer_with_bytes_no_copy(memory, BYTES as u64, ResourceOptions::default(), None)
-    };
+    let made = unsafe { device.new_buffer_with_bytes_no_copy(memory, BYTES as u64, options, None) };
     match made {
         Ok(buffer) => Some(buffer),
         Err(Error::Unsupported(gap)) => {
@@ -454,6 +478,259 @@ fn a_logged_render_target_loaded_in_a_scissor_copies_only_the_changed_rows() {
     eprintln!("DIRTY-PAGES: scissor frame 3 {third:?}");
     assert_eq!(third[2], 1, "nothing copied in");
     drop(target);
+    drop(buffer);
+    drop(device);
+}
+
+/// One command buffer: a pass that loads `target` and draws `color` inside rows 0 to 8 (the
+/// scissor), then a kernel that inverts `source`'s texels into `inverted`, to completion.
+fn draw_then_invert(
+    device: &Device,
+    target: &Texture,
+    color: [f32; 4],
+    (kernel, source, inverted): (&ComputePipelineState, &Texture, &Texture),
+) {
+    let state = render_state(device, "engine/tob_renders.ll", "tob_rect", "tob_solid");
+    let queue = device.new_command_queue().unwrap();
+    let command_buffer = queue.command_buffer().unwrap();
+    let mut pass = RenderPassDescriptor::new();
+    let attachment = &mut pass.color_attachments[0];
+    attachment.texture = Some(target.clone());
+    attachment.load_action = LoadAction::Load;
+    attachment.store_action = StoreAction::Store;
+    let mut encoder = command_buffer.render_command_encoder(&pass).unwrap();
+    encoder.set_render_pipeline_state(&state).unwrap();
+    (encoder.set_scissor_rect(ScissorRect::new(0, 0, SIDE, 8))).unwrap();
+    let corners = bytes_of(&[-1.0f32, -1.0, 1.0, 1.0], f32::to_le_bytes);
+    encoder.set_vertex_bytes(&corners, 0).unwrap();
+    let color = bytes_of(&color, f32::to_le_bytes);
+    encoder.set_fragment_bytes(&color, 0).unwrap();
+    (encoder.draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0)).unwrap();
+    encoder.end_encoding().unwrap();
+    let mut encoder = command_buffer.compute_command_encoder().unwrap();
+    encoder.set_compute_pipeline_state(kernel).unwrap();
+    encoder.set_texture(Some(source), 0).unwrap();
+    encoder.set_texture(Some(inverted), 1).unwrap();
+    (encoder.dispatch_threads(Size::new(SIDE, SIDE, 1), Size::new(8, 8, 1))).unwrap();
+    encoder.end_encoding().unwrap();
+    command_buffer.commit().unwrap();
+    assert!(command_buffer.wait_until_completed_for(WAIT).is_ok());
+    assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
+}
+
+/// One command buffer: a pass that loads `target` and draws `color` inside rows 0 to 8 (the
+/// scissor), then a blit that fills row 2 of `buffer` with `fill`, to completion.
+fn draw_then_fill(
+    device: &Device,
+    target: &Texture,
+    color: [f32; 4],
+    (buffer, fill): (&Buffer, u8),
+) {
+    let state = render_state(device, "engine/tob_renders.ll", "tob_rect", "tob_solid");
+    let queue = device.new_command_queue().unwrap();
+    let command_buffer = queue.command_buffer().unwrap();
+    let mut pass = RenderPassDescriptor::new();
+    let attachment = &mut pass.color_attachments[0];
+    attachment.texture = Some(target.clone());
+    attachment.load_action = LoadAction::Load;
+    attachment.store_action = StoreAction::Store;
+    let mut encoder = command_buffer.render_command_encoder(&pass).unwrap();
+    encoder.set_render_pipeline_state(&state).unwrap();
+    (encoder.set_scissor_rect(ScissorRect::new(0, 0, SIDE, 8))).unwrap();
+    let corners = bytes_of(&[-1.0f32, -1.0, 1.0, 1.0], f32::to_le_bytes);
+    encoder.set_vertex_bytes(&corners, 0).unwrap();
+    let color = bytes_of(&color, f32::to_le_bytes);
+    encoder.set_fragment_bytes(&color, 0).unwrap();
+    (encoder.draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0)).unwrap();
+    encoder.end_encoding().unwrap();
+    let mut blit = command_buffer.blit_command_encoder().unwrap();
+    blit.fill_buffer(buffer, 2 * ROW..3 * ROW, fill).unwrap();
+    blit.end_encoding().unwrap();
+    command_buffer.commit().unwrap();
+    assert!(command_buffer.wait_until_completed_for(WAIT).is_ok());
+    assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
+}
+
+/// How often `log` was told of a write by the consumer (writer 0) that meets row 2.
+fn told_row_2(log: &Log) -> usize {
+    let writes = log.writes.lock().unwrap();
+    (writes.iter())
+        .filter(|w| w.2 == 0 && w.1.start < 3 * ROW && 2 * ROW < w.1.end)
+        .count()
+}
+
+#[test]
+fn a_write_in_place_is_told_at_the_commit_and_once_after_it_ran() {
+    let scratch = Scratch::new("dirty-pages-told");
+    let host = Host::new();
+    let device = device(&scratch.0);
+    eprintln!("DIRTY-PAGES: device {:?}", device.name());
+    let log = Arc::new(Log::default());
+    let Some(buffer) = over_logged(&device, &host, &log) else {
+        return;
+    };
+    let queue = device.new_command_queue().unwrap();
+    for round in 0..3 {
+        let before = told_row_2(&log);
+        let command_buffer = queue.command_buffer().unwrap();
+        let mut blit = command_buffer.blit_command_encoder().unwrap();
+        blit.fill_buffer(&buffer, 2 * ROW..3 * ROW, 0x55).unwrap();
+        blit.end_encoding().unwrap();
+        let in_handler = Arc::new(AtomicUsize::new(usize::MAX));
+        let (seen, kept) = (Arc::clone(&in_handler), Arc::clone(&log));
+        (command_buffer.add_completed_handler(Box::new(move |_| {
+            seen.store(told_row_2(&kept), Ordering::SeqCst);
+        })))
+        .unwrap();
+        command_buffer.commit().unwrap();
+        assert!(command_buffer.wait_until_completed_for(WAIT).is_ok());
+        assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
+        let at_wait = told_row_2(&log) - before;
+        // The handler may run after the wait returns.
+        let started = std::time::Instant::now();
+        while in_handler.load(Ordering::SeqCst) == usize::MAX {
+            assert!(started.elapsed() < WAIT, "the completed handler ran");
+            std::thread::yield_now();
+        }
+        let told = told_row_2(&log) - before;
+        eprintln!(
+            "DIRTY-PAGES: round {round}: the fill told {told} times, {at_wait} as the wait returned"
+        );
+        assert_eq!(
+            at_wait, 2,
+            "at the commit and once it ran, before the wait returns"
+        );
+        assert_eq!(
+            in_handler.load(Ordering::SeqCst) - before,
+            2,
+            "at the commit and once it ran, before the completed handler"
+        );
+        assert_eq!(told, 2, "and no more after it");
+    }
+    drop(buffer);
+    drop(device);
+}
+
+#[test]
+fn a_fill_beneath_a_merge_reaches_the_shadows_next_copy_in() {
+    let scratch = Scratch::new("dirty-pages-beneath");
+    let host = Host::new();
+    let device = device(&scratch.0);
+    eprintln!("DIRTY-PAGES: device {:?}", device.name());
+    let log = Arc::new(Log::default());
+    let Some(buffer) = over_logged(&device, &host, &log) else {
+        return;
+    };
+    host.fill(0x1010_1010);
+    let shadows = device.work_counts().shadowed_textures;
+    let mut descriptor = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    descriptor.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+    let drawn = buffer.new_texture(&descriptor, 0, ROW).unwrap();
+    let shadowed = device.work_counts().shadowed_textures - shadows;
+    eprintln!("DIRTY-PAGES: {shadowed} render shadow made");
+    if shadowed == 0 {
+        return;
+    }
+    let mut plain = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    plain.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
+    plain.resource_options = ResourceOptions::shared();
+    let target = device.new_texture(&plain).unwrap();
+    let invert = state(&device, "invert_texels");
+    let inverted = |t: [u8; 4]| [255 - t[0], 255 - t[1], 255 - t[2], t[3]];
+    draw_in_scissor(&device, &drawn, [1.0, 0.0, 0.0, 1.0]);
+    draw_then_fill(&device, &drawn, [0.0, 1.0, 0.0, 1.0], (&buffer, 0x55));
+    let before = counts(&device);
+    run(&device, &invert, &drawn, &target);
+    let after = delta(&device, before);
+    eprintln!("DIRTY-PAGES: beneath a merge {after:?}");
+    assert_eq!(texel(&target, 2), inverted([0x55; 4]), "the fill's row");
+    assert_eq!(
+        texel(&target, 0),
+        inverted([0, 255, 0, 255]),
+        "the pass's row"
+    );
+    assert_eq!(
+        texel(&target, 20),
+        inverted([0x10; 4]),
+        "a row neither wrote"
+    );
+    drop(drawn);
+    drop(buffer);
+    drop(device);
+}
+
+#[test]
+fn a_second_shadow_of_logged_pages_copies_in_only_the_rows_a_pass_merged() {
+    let scratch = Scratch::new("dirty-pages-twins");
+    let host = Host::new();
+    let device = device(&scratch.0);
+    eprintln!("DIRTY-PAGES: device {:?}", device.name());
+    let log = Arc::new(Log::default());
+    let Some(buffer) = over_logged(&device, &host, &log) else {
+        return;
+    };
+    host.fill(0x1010_1010);
+    let shadows = device.work_counts().shadowed_textures;
+    let mut descriptor = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    descriptor.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+    let drawn = buffer.new_texture(&descriptor, 0, ROW).unwrap();
+    descriptor.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
+    let read = buffer.new_texture(&descriptor, 0, ROW).unwrap();
+    let shadowed = device.work_counts().shadowed_textures - shadows;
+    eprintln!("DIRTY-PAGES: {shadowed} shadows made");
+    if shadowed < 2 {
+        return;
+    }
+    let mut plain = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    plain.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
+    plain.resource_options = ResourceOptions::shared();
+    let target = device.new_texture(&plain).unwrap();
+    let invert = state(&device, "invert_texels");
+    let inverted = |t: [u8; 4]| [255 - t[0], 255 - t[1], 255 - t[2], t[3]];
+    let old = [0x10; 4];
+    // The reader's first copy in, every row; the pass's first, every row too.
+    run(&device, &invert, &read, &target);
+    draw_in_scissor(&device, &drawn, [1.0, 0.0, 0.0, 1.0]);
+    // A later command buffer: the rows the pass merged alone, read as it drew them.
+    let before = counts(&device);
+    run(&device, &invert, &read, &target);
+    let later = delta(&device, before);
+    eprintln!("DIRTY-PAGES: twins, a later command buffer {later:?}");
+    assert_eq!(
+        texel(&target, 0),
+        inverted([255, 0, 0, 255]),
+        "the pass's row"
+    );
+    assert_eq!(texel(&target, 20), inverted(old), "a row the pass left");
+    assert_eq!((later[0], later[1]), (1, 0), "gated, not whole");
+    assert_eq!(later[4], 8 * ROW, "the pass's eight rows");
+    // Nothing written since: nothing.
+    let before = counts(&device);
+    run(&device, &invert, &read, &target);
+    let idle = delta(&device, before);
+    eprintln!("DIRTY-PAGES: twins, nothing written {idle:?}");
+    assert_eq!(idle[2], 1, "nothing copied in");
+    // The pass's own command buffer: its eight rows again, after the pass; the pass's own copy in
+    // takes nothing (its merge back is its own write).
+    let before = counts(&device);
+    draw_then_invert(
+        &device,
+        &drawn,
+        [0.0, 1.0, 0.0, 1.0],
+        (&invert, &read, &target),
+    );
+    let same = delta(&device, before);
+    eprintln!("DIRTY-PAGES: twins, the pass's own command buffer {same:?}");
+    assert_eq!(
+        texel(&target, 0),
+        inverted([0, 255, 0, 255]),
+        "the pass's row"
+    );
+    assert_eq!(texel(&target, 20), inverted(old), "a row the pass left");
+    assert_eq!((same[0], same[1]), (2, 0), "both gated, neither whole");
+    assert_eq!(same[2], 1, "the pass's copy in, nothing to take");
+    assert_eq!(same[4], 8 * ROW, "the pass's eight rows, for the reader");
+    drop((drawn, read));
     drop(buffer);
     drop(device);
 }
@@ -790,6 +1067,17 @@ fn a_scattered_overwrite_of_logged_pages_merges_back_in_whole_blocks() {
 /// its rows (the next 256-byte block of a row), far right of it, and below it.
 const BESIDE: [(u64, u64); 3] = [(64, 10), (900, 40), (10, 100)];
 
+/// Raises its flag as it goes, on a panic's unwind too: a thread of a `std::thread::scope` that
+/// runs until the flag is raised ends once the thread holding this ends, however it ends, so the
+/// scope (which waits for every thread it started before it returns or unwinds) ends too.
+struct Stops<'a>(&'a AtomicBool);
+
+impl Drop for Stops<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 #[test]
 fn a_pass_storing_its_loaded_area_keeps_a_cpu_write_beside_it() {
     const ROUNDS: usize = 8;
@@ -859,17 +1147,23 @@ fn a_pass_storing_its_loaded_area_keeps_a_cpu_write_beside_it() {
                     }
                 }
             });
-            while !started.load(Ordering::SeqCst) {
+            // Raised as this thread leaves, a panic's unwind included: the scope waits for the
+            // writer, which runs until it is raised.
+            let stops = Stops(&stop);
+            // A writer that ended (a panic) never starts.
+            while !started.load(Ordering::SeqCst) && !writer.is_finished() {
                 std::hint::spin_loop();
             }
-            pass(
-                &device,
-                &target,
-                LoadAction::Load,
-                square,
-                [0.0, 0.0, 0.0, 1.0],
-            );
-            stop.store(true, Ordering::SeqCst);
+            if started.load(Ordering::SeqCst) {
+                pass(
+                    &device,
+                    &target,
+                    LoadAction::Load,
+                    square,
+                    [0.0, 0.0, 0.0, 1.0],
+                );
+            }
+            drop(stops);
             writer.join().unwrap()
         });
         sweeps += last.1;
@@ -1040,23 +1334,34 @@ fn draw_sampled(device: &Device, source: &Texture, target: &Texture) {
 #[test]
 fn a_logged_shadow_sampled_in_an_inline_pass_is_copied_in_before_the_pass() {
     let usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
-    sampled_in_an_inline_pass("dirty-pages-inline", usage);
+    let options = ResourceOptions::default();
+    sampled_in_an_inline_pass("dirty-pages-inline", usage, options);
 }
 
 #[test]
 fn a_logged_device_copy_sampled_in_an_inline_pass_is_copied_in_before_the_pass() {
-    sampled_in_an_inline_pass("dirty-pages-inline-copy", TextureUsage::SHADER_READ);
+    let managed = ResourceOptions::new(
+        StorageMode::Managed,
+        CpuCacheMode::DefaultCache,
+        HazardTrackingMode::Default,
+    );
+    sampled_in_an_inline_pass(
+        "dirty-pages-inline-copy",
+        TextureUsage::SHADER_READ,
+        managed,
+    );
 }
 
-/// A texture of `usage` over logged pages, sampled by a pass recorded inline, its copies in
-/// before the pass (the module docs); nothing where the device reads it in place.
-fn sampled_in_an_inline_pass(name: &str, usage: TextureUsage) {
+/// A texture of `usage` over logged pages of a buffer of `options`, sampled by a pass recorded
+/// inline, its copies in before the pass (the module docs); nothing where the device reads it in
+/// place.
+fn sampled_in_an_inline_pass(name: &str, usage: TextureUsage, options: ResourceOptions) {
     let scratch = Scratch::new(name);
     let host = Host::new();
     let device = device(&scratch.0);
     eprintln!("DIRTY-PAGES: device {:?}", device.name());
     let log = Arc::new(Log::default());
-    let Some(buffer) = over_logged(&device, &host, &log) else {
+    let Some(buffer) = over_logged_as(&device, &host, &log, options) else {
         return;
     };
     host.fill(0x4040_4040);
@@ -1067,6 +1372,7 @@ fn sampled_in_an_inline_pass(name: &str, usage: TextureUsage) {
     let before = made(&device);
     let mut descriptor = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
     descriptor.usage = usage;
+    descriptor.resource_options = options;
     let source = buffer.new_texture(&descriptor, 0, ROW).unwrap();
     let [shadowed, copied] = std::array::from_fn(|i| made(&device)[i] - before[i]);
     eprintln!("DIRTY-PAGES: {usage:?}: {shadowed} shadow, {copied} device copy made");

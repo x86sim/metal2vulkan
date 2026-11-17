@@ -29,6 +29,7 @@
 
 use super::buffer_texture_blits::{hex_rows, texel, texels, Held, Kind, OFF};
 use super::degrade_notices::counts;
+use super::indirect_host_steps::encoding_state_set;
 use super::{
     buffer_with, layer_reported_nothing_at_all, read_buffer, validated_device, Messages,
     ScratchCache, WAIT,
@@ -44,11 +45,10 @@ use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor
 use metal2vulkan_devtools::llvm_assemble;
 use metal2vulkan_runtime::{
     Buffer, ClearColor, CommandBuffer, CommandBufferStatus, CommandQueue, Degradation, Device,
-    Error, IndirectCommandBufferDescriptor, Library, LoadAction, Origin, PipelineOptions, Region,
-    RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions, RuntimeGap,
-    SamplerState, Size, StoreAction, Texture, TextureDescriptor,
+    Error, IndirectCommandBufferDescriptor, IndirectRule, Library, LoadAction, Origin,
+    PipelineOptions, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState,
+    ResourceOptions, RuntimeGap, SamplerState, Size, StoreAction, Texture, TextureDescriptor,
 };
-use std::path::Path;
 
 /// The probe's usage of the textures it renders.
 const RT: TextureUsage = TextureUsage::SHADER_READ
@@ -172,8 +172,7 @@ struct Lane {
 
 impl Lane {
     fn new(device: &Device) -> Lane {
-        let ll =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/public/engine/tob_renders.ll");
+        let ll = metal2vulkan_devtools::engine_dir().join("tob_renders.ll");
         let bitcode = llvm_assemble(&ll).unwrap();
         Lane {
             queue: device.new_command_queue().unwrap(),
@@ -1086,7 +1085,8 @@ fn a_shadowed_pass_executes_commands_the_gpu_may_write() {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Before {
     Nothing,
-    /// A compute encoder that makes the indirect command buffer resident for writing.
+    /// A compute encoder that makes the indirect command buffer resident for writing, after one
+    /// that sets a state that may encode (`indirect_host_steps::encoding_state_set`).
     Writer,
     /// That, and a compute encoder after the pass that makes the shadowed texture resident.
     WriterAndTexture,
@@ -1097,8 +1097,7 @@ fn executed(lane: &Lane, kind: Kind, before: Before, bpr: u64) {
     let device = &lane.device;
     let rgba = PixelFormat::RGBA8Unorm;
     let read = lane.pipeline(("tob_rect", "tob_read"), rgba, 1);
-    let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/public/engine/icb_render_replay_template.ll");
+    let ll = metal2vulkan_devtools::engine_dir().join("icb_render_replay_template.ll");
     let library = device
         .new_library_with_air(&llvm_assemble(&ll).unwrap())
         .unwrap();
@@ -1136,6 +1135,7 @@ fn executed(lane: &Lane, kind: Kind, before: Before, bpr: u64) {
     let o = lane.ordinary(rgba, ALL, None);
     let command_buffer = lane.queue.command_buffer().unwrap();
     if before != Before::Nothing {
+        encoding_state_set(&command_buffer);
         let mut writer = command_buffer.compute_command_encoder().unwrap();
         writer
             .use_resource(icb.as_resource(), ResourceUsage::WRITE)
@@ -1182,7 +1182,9 @@ fn executed(lane: &Lane, kind: Kind, before: Before, bpr: u64) {
         assert!(
             matches!(
                 command_buffer.refusal(),
-                Some(Error::NotImplemented(RuntimeGap::IndirectRenderCommands))
+                Some(Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                    IndirectRule::ResidencyPastCopies
+                )))
             ),
             "{kind:?}: {:?}",
             command_buffer.refusal()

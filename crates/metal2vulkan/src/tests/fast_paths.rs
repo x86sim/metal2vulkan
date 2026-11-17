@@ -6,8 +6,11 @@
 //! classed, and so reaches the ledger.
 
 use crate::device::{
-    BatchOrderPolicy, CompletionPolicy, DevicePolicy, HalfChainPolicy, HeapCompressionPolicy,
-    HostPageTexturePolicy, PipelineWaitPolicy, RenderLoweringPolicy,
+    BatchOrderPolicy, CompletionPolicy, DevicePolicy, DontCareColorPolicy, ExtendedRangeBlitPolicy,
+    HalfChainPolicy, HeapAnswerPolicy, HeapCompressionPolicy, HostPageTexturePolicy,
+    IndirectRecordsPolicy, ManagedCopyInPolicy, PipelineWaitPolicy, QueueSharingPolicy,
+    RateMapRegionPolicy, RenderLoweringPolicy, UnsharedIsolationPolicy, UnstoredDontCarePolicy,
+    VertexReachPolicy, WideLinePolicy, YCbCrInPlacePolicy,
 };
 use crate::pipeline::PrecisionNote;
 use std::collections::BTreeSet;
@@ -57,12 +60,22 @@ fn choices() -> Vec<Choice> {
         containment: _,
         isolation: _,
         // The accuracy choices, below.
-        // The runtime's: a heap's compressed texture's image, when the host sees a command buffer
+        // The runtime's: a heap's compressed texture's image, what a heap texture's size query
+        // answers where its image needs more than Metal's answer, when the host sees a command buffer
         // complete, how a batch begins after the earlier ones of its queue, where a render
-        // encoder's calls are lowered, what holds a sampled texture over host pages, and whether and
+        // encoder's calls are lowered, what holds a sampled texture over host pages, whether and
         // how long a pipeline being made is waited for (the bounds' values:
-        // `the_ledger_states_the_pipeline_wait_bounds`).
+        // `the_ledger_states_the_pipeline_wait_bounds`), which lines draw a wide line, what a
+        // blit through a compressed extended-range texture writes, which `VkQueue` a command
+        // queue submits to, how much of other queues' work goes ahead of an unshared queue's, what
+        // a colour attachment stored `DontCare` keeps, what a pass reads of an attachment it loads
+        // `DontCare` and does not store, which draws pull a vertex layout past a wrapping
+        // fixed-function input, how a rate-mapped pass's draws reach its regions, when a
+        // `Managed` buffer's GPU copy takes the bytes `didModifyRange:` names, and where an
+        // indirect command buffer's records lie where a held pointer import costs every
+        // submission.
         heap_compression: _,
+        heap_answers: _,
         completion: _,
         batch_order: _,
         render_lowering: _,
@@ -70,17 +83,41 @@ fn choices() -> Vec<Choice> {
         pipeline_waits: _,
         pipeline_creation_wait: _,
         pipeline_commit_wait: _,
-        // The translator's: how a `half` chain rounds without `shaderFloat16`.
+        wide_lines: _,
+        extended_range_blits: _,
+        queue_sharing: _,
+        unshared_isolation: _,
+        dont_care_colors: _,
+        unstored_dont_care_loads: _,
+        vertex_reach: _,
+        rate_map_regions: _,
+        managed_copy_in: _,
+        indirect_records: _,
+        // The translator's: how a `half` chain rounds without `shaderFloat16`, and how planes of a
+        // two-plane YCbCr texture read in place are sampled.
         half_chains: _,
+        ycbcr_in_place_reads: _,
     } = p;
     vec![
         choice!(p.heap_compression: HeapCompressionPolicy { Compressed, Uncompressed }),
+        choice!(p.heap_answers: HeapAnswerPolicy { Device, Metal }),
         choice!(p.completion: CompletionPolicy { Grouped, Exact }),
         choice!(p.batch_order: BatchOrderPolicy { Ends, Exact }),
         choice!(p.render_lowering: RenderLoweringPolicy { AtCall, Worker }),
         choice!(p.host_page_textures: HostPageTexturePolicy { InPlace, Shadow }),
         choice!(p.half_chains: HalfChainPolicy { AtExits, EachOperation }),
+        choice!(p.ycbcr_in_place_reads: YCbCrInPlacePolicy { Model, Exact }),
         choice!(p.pipeline_waits: PipelineWaitPolicy { Bounded, Exact }),
+        choice!(p.wide_lines: WideLinePolicy { Device, Exact }),
+        choice!(p.extended_range_blits: ExtendedRangeBlitPolicy { Kept, Canonical }),
+        choice!(p.queue_sharing: QueueSharingPolicy { Adaptive, PerQueue }),
+        choice!(p.unshared_isolation: UnsharedIsolationPolicy { Bounded, Off }),
+        choice!(p.dont_care_colors: DontCareColorPolicy { Driver, Kept }),
+        choice!(p.unstored_dont_care_loads: UnstoredDontCarePolicy { Driver, Cleared }),
+        choice!(p.vertex_reach: VertexReachPolicy { Bounded, Exact }),
+        choice!(p.rate_map_regions: RateMapRegionPolicy { FanOut, Exact }),
+        choice!(p.managed_copy_in: ManagedCopyInPolicy { AtSubmission, AtCommit }),
+        choice!(p.indirect_records: IndirectRecordsPolicy { Untaxed, Carried }),
     ]
 }
 
@@ -129,6 +166,8 @@ fn notes() -> Vec<(&'static str, Ledger)> {
             RestrictedDepthRange,
             DeviceSignedZeroInfNan,
             DeviceInterpolation,
+            DeviceInterpolationOffset,
+            ExtrapolatedInterpolation,
             DeviceAlphaCoverage,
             HalfOutputFastMathBlend,
             UnmeasuredFetchBlend,
@@ -136,6 +175,8 @@ fn notes() -> Vec<(&'static str, Ledger)> {
             FunctionStorageAssumed,
             ColorAttachmentGroups,
             FastMathRewrites,
+            NativeLogicOperation,
+            NativeFloat8,
         ],
         Elsewhere: [
             HalfOutputPrecision,
@@ -183,6 +224,7 @@ fn notes() -> Vec<(&'static str, Ledger)> {
             DeviceSampleLevel,
             NativeNanEncoding,
             NativeMinMax,
+            UnorderedFetchWithinDraw,
         ],
     }
 }
@@ -383,6 +425,24 @@ fn the_runtime_s_heap_compression_choice_keys_no_profile() {
     }
 }
 
+/// The runtime's choice of what a heap texture's size query answers (`heap_answers`) moves no
+/// committed profile's fingerprint: no profile carries it, so no translation follows it.
+#[test]
+fn the_runtime_s_heap_answer_choice_keys_no_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let device = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let metal = committed_profiles_with(DevicePolicy {
+        heap_answers: HeapAnswerPolicy::Metal,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(device.len(), metal.len());
+    for ((stem, d), (other, m)) in device.iter().zip(&metal) {
+        assert_eq!(stem, other);
+        assert_eq!(d.fingerprint(), m.fingerprint(), "{stem}");
+    }
+}
+
 /// The runtime's choice of when the host sees a command buffer complete (`completion`) moves no
 /// committed profile's fingerprint: no profile carries it, so no translation follows it.
 #[test]
@@ -438,7 +498,7 @@ fn the_runtime_s_render_lowering_choice_keys_no_profile() {
     }
 }
 
-/// The runtime's choice of what holds a sampled texture over host pages (`host_page_textures`)
+/// The runtime's choice of what holds a texture over host pages (`host_page_textures`)
 /// moves no committed profile's fingerprint: no profile carries it, so no translation follows it.
 #[test]
 fn the_runtime_s_host_page_textures_choice_keys_no_profile() {
@@ -502,6 +562,300 @@ fn exact_answers_wait_for_every_pipeline() {
     );
 }
 
+/// The runtime's choice of which lines draw a wide line (`wide_lines`) moves no committed
+/// profile's fingerprint: no profile carries it, so no translation follows it.
+#[test]
+fn the_runtime_s_wide_lines_choice_keys_no_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let device = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let exact = committed_profiles_with(DevicePolicy {
+        wide_lines: WideLinePolicy::Exact,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(device.len(), exact.len());
+    for ((stem, d), (other, e)) in device.iter().zip(&exact) {
+        assert_eq!(stem, other);
+        assert_eq!(d.fingerprint(), e.fingerprint(), "{stem}");
+    }
+}
+
+/// `DevicePolicy::exact_answers()` draws a wide line as Metal's parallelogram where the device's
+/// own lines would draw it, and the default draws the device's own.
+#[test]
+fn exact_answers_draw_wide_lines_as_metal_s_parallelogram() {
+    assert_eq!(DevicePolicy::UNTRUSTED.wide_lines, WideLinePolicy::Device);
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.exact_answers().wide_lines,
+        WideLinePolicy::Exact
+    );
+}
+
+/// The runtime's choice of what a blit through a compressed `BGRA10_XR` texture writes
+/// (`extended_range_blits`) moves no committed profile's fingerprint: no profile carries it, so no
+/// translation follows it.
+#[test]
+fn the_runtime_s_extended_range_blits_choice_keys_no_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let kept = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let canonical = committed_profiles_with(DevicePolicy {
+        extended_range_blits: ExtendedRangeBlitPolicy::Canonical,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(kept.len(), canonical.len());
+    for ((stem, k), (other, c)) in kept.iter().zip(&canonical) {
+        assert_eq!(stem, other);
+        assert_eq!(k.fingerprint(), c.fingerprint(), "{stem}");
+    }
+}
+
+/// `DevicePolicy::exact_answers()` writes Metal's canonical encoding through a compressed
+/// `BGRA10_XR` texture's blits, and the default keeps the bytes.
+#[test]
+fn exact_answers_write_metal_s_canonical_extended_range_texels() {
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.extended_range_blits,
+        ExtendedRangeBlitPolicy::Kept
+    );
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.exact_answers().extended_range_blits,
+        ExtendedRangeBlitPolicy::Canonical
+    );
+}
+
+/// The runtime's choice of which `VkQueue` a command queue submits to (`queue_sharing`) moves no
+/// committed profile's fingerprint: no profile carries it, so no translation follows it.
+#[test]
+fn the_runtime_s_queue_sharing_choice_keys_no_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let adaptive = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let per_queue = committed_profiles_with(DevicePolicy {
+        queue_sharing: QueueSharingPolicy::PerQueue,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(adaptive.len(), per_queue.len());
+    for ((stem, a), (other, p)) in adaptive.iter().zip(&per_queue) {
+        assert_eq!(stem, other);
+        assert_eq!(a.fingerprint(), p.fingerprint(), "{stem}");
+    }
+}
+
+/// The runtime's choice of how much of other queues' work goes ahead of an unshared queue's
+/// (`unshared_isolation`) moves no committed profile's fingerprint: no profile carries it, so no
+/// translation follows it.
+#[test]
+fn the_runtime_s_unshared_isolation_choice_keys_no_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let bounded = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let off = committed_profiles_with(DevicePolicy {
+        unshared_isolation: UnsharedIsolationPolicy::Off,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(bounded.len(), off.len());
+    for ((stem, b), (other, o)) in bounded.iter().zip(&off) {
+        assert_eq!(stem, other);
+        assert_eq!(b.fingerprint(), o.fingerprint(), "{stem}");
+    }
+}
+
+/// `DevicePolicy::exact_answers()` keeps every command queue on the `VkQueue` it took at its
+/// creation, and the default shares them where the device's GPU idles between `VkQueue`s.
+#[test]
+fn exact_answers_keep_each_command_queue_on_its_vk_queue() {
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.queue_sharing,
+        QueueSharingPolicy::Adaptive
+    );
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.exact_answers().queue_sharing,
+        QueueSharingPolicy::PerQueue
+    );
+}
+
+/// The runtime's choice of what a colour attachment stored `DontCare` keeps (`dont_care_colors`)
+/// moves no committed profile's fingerprint: no profile carries it, so no translation follows it.
+#[test]
+fn the_runtime_s_dont_care_colors_choice_keys_no_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let driver = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let kept = committed_profiles_with(DevicePolicy {
+        dont_care_colors: DontCareColorPolicy::Kept,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(driver.len(), kept.len());
+    for ((stem, d), (other, k)) in driver.iter().zip(&kept) {
+        assert_eq!(stem, other);
+        assert_eq!(d.fingerprint(), k.fingerprint(), "{stem}");
+    }
+}
+
+/// `DevicePolicy::exact_answers()` keeps a `DontCare` colour's earlier texels, and the default
+/// stores it as the driver stores it.
+#[test]
+fn exact_answers_keep_a_dont_care_colour_s_earlier_texels() {
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.dont_care_colors,
+        DontCareColorPolicy::Driver
+    );
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.exact_answers().dont_care_colors,
+        DontCareColorPolicy::Kept
+    );
+}
+
+/// The runtime's choice of what a pass reads of an attachment it loads `DontCare` and does not
+/// store (`unstored_dont_care_loads`) moves no committed profile's fingerprint: no profile carries
+/// it, so no translation follows it.
+#[test]
+fn the_runtime_s_unstored_dont_care_loads_choice_keys_no_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let driver = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let cleared = committed_profiles_with(DevicePolicy {
+        unstored_dont_care_loads: UnstoredDontCarePolicy::Cleared,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(driver.len(), cleared.len());
+    for ((stem, d), (other, c)) in driver.iter().zip(&cleared) {
+        assert_eq!(stem, other);
+        assert_eq!(d.fingerprint(), c.fingerprint(), "{stem}");
+    }
+}
+
+/// `DevicePolicy::exact_answers()` clears every attachment loaded `DontCare` and not stored, and
+/// the default clears one where its driver clears it no slower.
+#[test]
+fn exact_answers_clear_every_unstored_dont_care_load() {
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.unstored_dont_care_loads,
+        UnstoredDontCarePolicy::Driver
+    );
+    assert_eq!(
+        DevicePolicy::UNTRUSTED
+            .exact_answers()
+            .unstored_dont_care_loads,
+        UnstoredDontCarePolicy::Cleared
+    );
+}
+
+/// `DevicePolicy::exact_answers()` pulls a vertex layout past a wrapping fixed-function input
+/// wherever a draw's reach is stated, GPU memory's too, and the default only where the draw's own
+/// values state it.
+#[test]
+fn exact_answers_pull_every_stated_reach_past_a_wrapping_fetch() {
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.vertex_reach,
+        VertexReachPolicy::Bounded
+    );
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.exact_answers().vertex_reach,
+        VertexReachPolicy::Exact
+    );
+}
+
+/// The runtime's choice of how a rate-mapped pass's draws reach its regions (`rate_map_regions`)
+/// moves no committed profile's fingerprint: no profile carries it, the fan-out and its probe
+/// being variants of their own.
+#[test]
+fn the_runtime_s_rate_map_regions_choice_keys_no_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let fan_out = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let exact = committed_profiles_with(DevicePolicy {
+        rate_map_regions: RateMapRegionPolicy::Exact,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(fan_out.len(), exact.len());
+    for ((stem, f), (other, e)) in fan_out.iter().zip(&exact) {
+        assert_eq!(stem, other);
+        assert_eq!(f.fingerprint(), e.fingerprint(), "{stem}");
+    }
+}
+
+/// `DevicePolicy::exact_answers()` draws every draw of a rate-mapped pass region by region, and
+/// the default fans a host step's triangles out where its probe finds they can be.
+#[test]
+fn exact_answers_draw_every_rate_mapped_draw_region_by_region() {
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.rate_map_regions,
+        RateMapRegionPolicy::FanOut
+    );
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.exact_answers().rate_map_regions,
+        RateMapRegionPolicy::Exact
+    );
+}
+
+/// The runtime's choice of when a `Managed` buffer's GPU copy takes a named range's bytes
+/// (`managed_copy_in`) moves no committed profile's fingerprint: no profile carries it.
+#[test]
+fn the_runtime_s_managed_copy_in_choice_keys_no_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let submission = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let commit = committed_profiles_with(DevicePolicy {
+        managed_copy_in: ManagedCopyInPolicy::AtCommit,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(submission.len(), commit.len());
+    for ((stem, s), (other, c)) in submission.iter().zip(&commit) {
+        assert_eq!(stem, other);
+        assert_eq!(s.fingerprint(), c.fingerprint(), "{stem}");
+    }
+}
+
+/// `DevicePolicy::exact_answers()` takes every `Managed` buffer's named range on the CPU at the
+/// commit, and the default has the GPU copy it from the host copy as the submission runs.
+#[test]
+fn exact_answers_take_a_managed_range_at_the_commit() {
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.managed_copy_in,
+        ManagedCopyInPolicy::AtSubmission
+    );
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.exact_answers().managed_copy_in,
+        ManagedCopyInPolicy::AtCommit
+    );
+}
+
+/// The runtime's choice of where an indirect command buffer's records lie on a device whose held
+/// pointer imports cost every submission (`indirect_records`) moves no committed profile's
+/// fingerprint: no profile carries it.
+#[test]
+fn the_runtime_s_indirect_records_choice_keys_no_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let untaxed = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let carried = committed_profiles_with(DevicePolicy {
+        indirect_records: IndirectRecordsPolicy::Carried,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(untaxed.len(), carried.len());
+    for ((stem, u), (other, c)) in untaxed.iter().zip(&carried) {
+        assert_eq!(stem, other);
+        assert_eq!(u.fingerprint(), c.fingerprint(), "{stem}");
+    }
+}
+
+/// `DevicePolicy::exact_answers()` keeps every indirect command buffer's records in the runtime's
+/// own pages wherever the device imports host pointers, which a recovery keeps, and the default
+/// lays them in pooled memory where a held pointer import costs every submission.
+#[test]
+fn exact_answers_keep_indirect_records_in_the_runtime_s_own_pages() {
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.indirect_records,
+        IndirectRecordsPolicy::Untaxed
+    );
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.exact_answers().indirect_records,
+        IndirectRecordsPolicy::Carried
+    );
+}
+
 /// The ledger's row of the pipeline waits states each bound as the default policy sets it, as
 /// `field = N s`: a changed bound changes its row.
 #[test]
@@ -518,4 +872,37 @@ fn the_ledger_states_the_pipeline_wait_bounds() {
             "docs/FAST-PATHS.md does not state `{named}`, the default's bound"
         );
     }
+}
+
+/// The translator's choice of how a function samples planes read in place
+/// (`ycbcr_in_place_reads`) moves every committed profile's fingerprint: the profile carries it,
+/// so its translations follow it.
+#[test]
+fn the_translator_s_ycbcr_in_place_reads_choice_keys_every_profile() {
+    use crate::spirv::testing::committed_profiles_with;
+    let model = committed_profiles_with(DevicePolicy::UNTRUSTED).expect("profiles");
+    let exact = committed_profiles_with(DevicePolicy {
+        ycbcr_in_place_reads: YCbCrInPlacePolicy::Exact,
+        ..DevicePolicy::UNTRUSTED
+    })
+    .expect("profiles");
+    assert_eq!(model.len(), exact.len());
+    for ((stem, m), (other, e)) in model.iter().zip(&exact) {
+        assert_eq!(stem, other);
+        assert_ne!(m.fingerprint(), e.fingerprint(), "{stem}");
+    }
+}
+
+/// `DevicePolicy::exact_answers()` samples planes read in place as Metal converts and filters
+/// them, and the default by Vulkan's Y′CbCr model.
+#[test]
+fn exact_answers_read_planes_in_place_as_metal() {
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.ycbcr_in_place_reads,
+        YCbCrInPlacePolicy::Model
+    );
+    assert_eq!(
+        DevicePolicy::UNTRUSTED.exact_answers().ycbcr_in_place_reads,
+        YCbCrInPlacePolicy::Exact
+    );
 }

@@ -76,6 +76,12 @@ impl SamplerMaps {
         }
     }
 
+    /// The map the command binds the sampler at `slot` with, where the slot samples a mapped
+    /// texture.
+    pub(super) fn map(&self, slot: SlotRef) -> Option<AddressModeMap> {
+        self.maps.get(&slot).copied()
+    }
+
     /// `state`'s samplers as the command binds them, so the plan's specialization reads the
     /// mapped words.
     pub(super) fn apply(&self, state: &mut BindState) {
@@ -223,8 +229,9 @@ pub(super) fn resolve(
 
 /// The maps one command of `layout` binds its runtime samplers with ([`resolve`]): `tables`
 /// are its stages' argument tables, and `residency` what its encoder made resident. A command
-/// whose tables bind no mapped texture, and whose functions sample no handles or reach no
-/// resident mapped texture, takes none, and reads no more of `layout`.
+/// whose tables bind no mapped texture, and whose encoder made none resident
+/// (`Residency::maps_addresses`, kept as textures are made resident), takes none, and reads no
+/// more of `layout` and no resident texture.
 pub(super) fn sampler_maps(
     layout: &PipelineLayout,
     tables: &[(Stage, &ArgumentTable)],
@@ -233,7 +240,7 @@ pub(super) fn sampler_maps(
     let mapped = |texture: &Texture| !texture.address_mode_map().is_identity();
     let bound = tables.iter().flat_map(|(_, table)| table.textures.values());
     let resident = || residency.into_iter().flat_map(Residency::textures);
-    if !bound.clone().any(mapped) && !resident().any(mapped) {
+    if !bound.clone().any(mapped) && !residency.is_some_and(Residency::maps_addresses) {
         return Ok(SamplerMaps::default());
     }
     let (pairs, handles) = pairs(layout);

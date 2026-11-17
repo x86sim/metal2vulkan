@@ -12,7 +12,18 @@
 //!   `CommandBufferShared::schedule`); neither runs a handler. (A transition to `Scheduled` waits
 //!   for its command buffer's submission handlers, which the thread that took its last batch for
 //!   its queue runs.) A release the scheduler's thread hands off (`Device::let_go_elsewhere`) runs
-//!   in a context of its own, behind no queue's handlers.
+//!   in a context of its own, behind no queue's handlers. A transition to `Completed` of a command
+//!   buffer that waited on the GPU for another queue's command buffer may be posted behind a gate
+//!   ([`Contexts::gate`], [`Contexts::post_behind`]), its place in its context kept, until that
+//!   command buffer's transition, which leads its own context ([`Contexts::leads`]), reaches its
+//!   handlers (`command_buffer/follow.rs`): a gate holds no thread.
+//! - **Done with an item before what it held goes.** The thread that ran an item marks its context
+//!   done with it, and only then lets go of what the item still holds ([`Run::Held`]): a
+//!   transition's hold of its command buffer, whose going lets that command buffer's waiters
+//!   return. So a program whose wait for a command buffer returned finds that command buffer's
+//!   context running nothing of it, however long the host keeps that thread off the CPU after the
+//!   hold went: the transition of the queue's next command buffer leads the context, and another
+//!   queue's command buffer that waited on the GPU for its signal completes after it.
 //! - **Metal's order** (measured on an M4, macOS 27.0.1): while one of a
 //!   queue's handlers blocks, the queue's later transitions wait, even of a command buffer whose
 //!   work already ran; another queue's transitions and handlers go on, on another thread. Metal
@@ -69,13 +80,26 @@ const IDLE: Duration = Duration::from_secs(2);
 /// An item of a queue's context: run once, on one of the device's handler threads, or on the
 /// thread that runs the context itself ([`Contexts::run_here`]).
 pub(crate) trait Run: Send + 'static {
-    /// Run the item; dropping it lets go of what it holds.
-    fn run(self);
+    /// What the item still holds once it ran, which its runner lets go of only once the item's
+    /// context is done with it: what a thread waiting for the item's end waits for (a
+    /// transition's hold of its command buffer, whose going lets that command buffer's waiters
+    /// return). So a thread that saw an item end finds its context running nothing of it.
+    type Held: Send;
+
+    /// Run the item, answering what it still holds ([`Run::Held`]).
+    fn run(self) -> Self::Held;
 
     /// Whether the item runs none of the program's code (no handler, no notice, no release of
     /// the program's), so that a thread that may run none can run it: none by default.
     fn plain(&self) -> bool {
         false
+    }
+
+    /// Whether the item may run on a runtime thread that saw its command buffer complete: it
+    /// runs none of the program's code but its completion-seen handlers
+    /// (`CommandBuffer::add_completion_seen_handler`). Every plain item does.
+    fn runs_where_seen(&self) -> bool {
+        self.plain()
     }
 }
 
@@ -103,10 +127,33 @@ struct Shared<I> {
     spared: AtomicU64,
     /// The identity the next context takes ([`Contexts::fresh`]).
     next: AtomicU64,
+    /// The context whose items a thread pauses after, once it let go of what one held, before it
+    /// looks at the lines again, until the test lets it go: a test's stand-in for a thread the
+    /// host took the CPU from there ([`Contexts::pause_after_items`]).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pause: Mutex<Pause>,
+    /// Signaled when a pause begins and when pauses are let go.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    paused: Condvar,
+}
+
+/// A test's pause of the pool's threads after the items of one context
+/// ([`Contexts::pause_after_items`]).
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+#[derive(Default)]
+struct Pause {
+    /// The context's logical queue.
+    after: Option<u64>,
+    /// The pauses begun: each takes the next number, from 1.
+    made: u64,
+    /// The pauses let go: those numbered up to this one end.
+    released: u64,
 }
 
 struct State<I> {
     lines: Lines<I>,
+    /// The token the next gate takes ([`Contexts::gate`]).
+    gates: u64,
     /// The threads that run no item: waiting for one, or starting.
     free: usize,
     /// The threads sleeping on the condition variable, waiting for a line.
@@ -145,6 +192,7 @@ impl<I: Run> Contexts<I> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 lines: Lines::default(),
+                gates: 0,
                 free: 1,
                 parked: 0,
                 stopping: false,
@@ -153,6 +201,10 @@ impl<I: Run> Contexts<I> {
             woke: AtomicU64::new(0),
             spared: AtomicU64::new(0),
             next: AtomicU64::new(0),
+            #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+            pause: Mutex::default(),
+            #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+            paused: Condvar::new(),
             census: Arc::new(Census {
                 count: Mutex::new(Count {
                     threads: 1,
@@ -181,25 +233,79 @@ impl<I: Run> Contexts<I> {
     }
 
     /// Run `item` in the context of logical queue `queue` on this thread, after the items that
-    /// context holds, where no thread runs that context and those items and `item` are all
-    /// [`plain`](Run::plain): the context runs on this thread meanwhile, so the items posted to
-    /// it wait for `item`, then run on the pool's threads. Else give `item` back, changing
-    /// nothing.
-    pub(crate) fn run_here(&self, queue: u64, item: I) -> Result<(), I> {
-        if !item.plain() {
+    /// context holds, where no thread runs that context and `may_run` holds for those items and
+    /// `item` ([`plain`](Run::plain), or, on a thread that may run completion-seen handlers,
+    /// [`runs_where_seen`](Run::runs_where_seen)): the context runs on this thread meanwhile, so
+    /// the items posted to it wait for `item`, then run on the pool's threads. Else give `item`
+    /// back, changing nothing.
+    pub(crate) fn run_here(&self, queue: u64, item: I, may_run: fn(&I) -> bool) -> Result<(), I> {
+        if !may_run(&item) {
             return Err(item);
         }
-        let Some(before) = lock(&self.shared.state).lines.take_plain(queue, I::plain) else {
+        let Some(before) = lock(&self.shared.state).lines.take_plain(queue, may_run) else {
             return Err(item);
         };
-        for earlier in before {
-            earlier.run();
-        }
-        item.run();
+        let earlier: Vec<I::Held> = before.into_iter().map(Run::run).collect();
+        let held = item.run();
         let mut state = lock(&self.shared.state);
         state.lines.done(queue);
         self.serve(state);
+        drop((earlier, held));
         Ok(())
+    }
+
+    /// A new gate, closed once by the caller, who opens it ([`Contexts::open`]) once it posted
+    /// the item behind it ([`Contexts::post_behind`]) and closed it for whatever else the item
+    /// waits for ([`Contexts::close`]). Its token.
+    pub(crate) fn gate(&self) -> u64 {
+        let mut state = lock(&self.shared.state);
+        state.gates += 1;
+        let token = state.gates;
+        state.lines.close_new(token);
+        token
+    }
+
+    /// Append `item` to the context of logical queue `queue` behind the gate `token`
+    /// ([`Contexts::gate`]): the item keeps its place in its context, and it and the items after it
+    /// run once the gate is open.
+    pub(crate) fn post_behind(&self, queue: u64, item: I, token: u64) {
+        let mut state = lock(&self.shared.state);
+        state.lines.push_behind(queue, item, token);
+        self.serve(state);
+    }
+
+    /// Close the gate `token` once more, where it is not open yet: whether it was not.
+    pub(crate) fn close(&self, token: u64) -> bool {
+        lock(&self.shared.state).lines.close(token)
+    }
+
+    /// Open one closing of the gate `token` of an item of the context of `queue`; once none is
+    /// left, the item runs there in its turn.
+    pub(crate) fn open(&self, queue: u64, token: u64) {
+        let mut state = lock(&self.shared.state);
+        state.lines.open(queue, token);
+        self.serve(state);
+    }
+
+    /// Whether the item `is` picks out leads the context of `queue`: no item of the context runs
+    /// before it ([`Lines::leads`]; `posted` where the caller knows it was posted there).
+    pub(crate) fn leads(&self, queue: u64, is: impl Fn(&I) -> bool, posted: bool) -> bool {
+        lock(&self.shared.state).lines.leads(queue, is, posted)
+    }
+
+    /// Hold the context of logical queue `queue`, which holds no item and runs on no thread (a
+    /// command queue's new place's, `queue.rs`), as a thread that runs it does: what is posted
+    /// there waits until [`release`](Self::release). False where it held an item or ran, changing
+    /// nothing.
+    pub(crate) fn hold(&self, queue: u64) -> bool {
+        lock(&self.shared.state).lines.take_idle(queue)
+    }
+
+    /// Let the context [`hold`](Self::hold) held run what was posted there meanwhile, in order.
+    pub(crate) fn release(&self, queue: u64) {
+        let mut state = lock(&self.shared.state);
+        state.lines.done(queue);
+        self.serve(state);
     }
 
     /// Run `item` in the context of logical queue `queue` on this thread, where no thread runs
@@ -210,10 +316,11 @@ impl<I: Run> Contexts<I> {
         if !item.plain() || !lock(&self.shared.state).lines.take_idle(queue) {
             return Err(item);
         }
-        item.run();
+        let held = item.run();
         let mut state = lock(&self.shared.state);
         state.lines.done(queue);
         self.serve(state);
+        drop(held);
         Ok(())
     }
 
@@ -264,12 +371,18 @@ impl<I: Run> Contexts<I> {
     pub(crate) fn stop(&self) {
         lock(&self.shared.state).stopping = true;
         self.shared.wake.notify_all();
+        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+        self.release_pauses(u64::MAX);
         let census = &self.shared.census;
-        let own = POOL.with(|pool| {
-            pool.borrow()
-                .as_ref()
-                .is_some_and(|pool| Arc::ptr_eq(pool, census))
-        });
+        // A thread whose thread-locals are gone (an exiting thread's, whose `exit` destroys them
+        // before the exit handlers run, `this_thread.rs`) is no handler thread.
+        let own = POOL
+            .try_with(|pool| {
+                pool.borrow()
+                    .as_ref()
+                    .is_some_and(|pool| Arc::ptr_eq(pool, census))
+            })
+            .unwrap_or(false);
         let floor = usize::from(own);
         let mut count = lock(&census.count);
         while count.threads > floor {
@@ -280,11 +393,65 @@ impl<I: Run> Contexts<I> {
         }
     }
 
+    /// Make a pool's thread pause once it let go of what an item of the context of logical queue
+    /// `queue` held, before it looks at the lines again, as a thread the host took the CPU from
+    /// there would, until [`Contexts::release_pauses`] lets its pause go (as the pool stops, every
+    /// pause goes).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn pause_after_items(&self, queue: u64) {
+        lock(&self.shared.pause).after = Some(queue);
+    }
+
+    /// How many pauses the pool's threads began ([`Contexts::pause_after_items`]).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn pauses_made(&self) -> u64 {
+        lock(&self.shared.pause).made
+    }
+
+    /// Wait until the pool's threads began `pauses` pauses, or `within` passed: the pauses begun.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn await_pauses(&self, pauses: u64, within: Duration) -> u64 {
+        let pause = lock(&self.shared.pause);
+        let (pause, _) = (self.shared.paused)
+            .wait_timeout_while(pause, within, |pause| pause.made < pauses)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pause.made
+    }
+
+    /// Let the pauses numbered up to `through` go (each pause takes the next number, from 1).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn release_pauses(&self, through: u64) {
+        let mut pause = lock(&self.shared.pause);
+        pause.released = pause.released.max(through);
+        drop(pause);
+        self.shared.paused.notify_all();
+    }
+
     /// The threads alive and the threads blocked in a wait.
     #[cfg(test)]
     pub(crate) fn census(&self) -> (usize, usize) {
         let count = lock(&self.shared.census.count);
         (count.threads, count.blocked)
+    }
+}
+
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+impl<I> Shared<I> {
+    /// The pause a test asked for once a thread let go of what an item of the context of
+    /// logical queue `queue` held, until the test lets it go ([`Contexts::pause_after_items`]).
+    fn pause_after_item(&self, queue: u64) {
+        let mut pause = lock(&self.pause);
+        if pause.after != Some(queue) {
+            return;
+        }
+        pause.made += 1;
+        let number = pause.made;
+        self.paused.notify_all();
+        drop(
+            (self.paused)
+                .wait_while(pause, |pause| pause.released < number)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
     }
 }
 
@@ -308,9 +475,13 @@ fn run<I: Run>(shared: &Shared<I>, first: bool) {
         if let Some((queue, item)) = state.lines.take() {
             state.free -= 1;
             drop(state);
-            item.run();
+            let held = item.run();
+            // Its line is done with it before what it holds goes ([`Run::Held`]).
+            lock(&shared.state).lines.done(queue);
+            drop(held);
+            #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+            shared.pause_after_item(queue);
             state = lock(&shared.state);
-            state.lines.done(queue);
             state.free += 1;
             continue;
         }
@@ -337,9 +508,12 @@ fn run<I: Run>(shared: &Shared<I>, first: bool) {
     shared.census.gone.notify_all();
 }
 
-/// Whether this thread is one of a pool's handler threads.
+/// Whether this thread is one of a pool's handler threads: not where its thread-locals are gone
+/// (an exiting thread's, whose `exit` destroys them before the exit handlers run,
+/// `this_thread.rs`).
 pub(crate) fn on_handler_thread() -> bool {
-    POOL.with(|pool| pool.borrow().is_some())
+    POOL.try_with(|pool| pool.borrow().is_some())
+        .unwrap_or(false)
 }
 
 /// A handler thread's wait for another queue's context, counted until dropped.

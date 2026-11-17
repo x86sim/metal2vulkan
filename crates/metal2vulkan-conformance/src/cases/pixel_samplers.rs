@@ -28,13 +28,25 @@
 //! `the_recorded_digests_are_the_lanes_m4_answers` hold the recorded M3 answers against the lane's
 //! M4 constants: same question, two chips.
 //!
-//! **What may differ, and what justifies it.** Every pixel source hands the device the coordinate
-//! divided by the size, which the device's sampler reads in its own arithmetic: at a texel edge or
-//! a sub-texel step it may read the neighbouring texel or step, which the runtime announces on
-//! every device (`pixel-sampler-scaling`, and `argument-pixel-sampler-scaling` for `arg`). A
-//! device that converts an 8-bit texel to a float its own way announces `float-sample-filter`.
+//! **What may differ, and what justifies it.** A `const` site hands the device's unnormalized
+//! sampler the coordinate itself, and a nearest `slot` or `arg` site hands the device's normalized
+//! sampler its texel's centre over the size, where the device reads exactly Metal's texel. A linear
+//! `slot` or `arg` site hands it the coordinate divided by the size, which the device's sampler
+//! reads in its own arithmetic: at a sub-texel step it may read the neighbouring step, which the
+//! runtime announces on every device (`pixel-sampler-scaling`, and
+//! `argument-pixel-sampler-scaling` for `arg`). A device that converts an 8-bit texel to a float
+//! its own way announces `float-sample-filter`.
 //! Each notice is declared at the notices site alone, so a texel that differs still fails the case
 //! where it differs, and is a `known-gaps.tsv` row naming the note.
+//!
+//! **Subnormal coordinates.** Four more cases (`pixel-samplers-subnormal-*`, [`subnormals`]) ask
+//! the same four sources of the `RGBA8Unorm` texture, through a nearest filter under each address
+//! mode, at sixteen coordinates whose one axis is a subnormal of either sign, a zero of either
+//! sign, or `-2^-126` beside them (`subnormal_grid`). A nearest `slot` or `arg` site hands the
+//! device its texel's centre `floor(x) + 0.5`, whose `floor` reads a subnormal by the device's
+//! float controls (`device-denormals`, a native note): where a negative subnormal is a texel apart
+//! from zero to Metal's sampler, an address mode that reads texel -1 as texel 0 (clamp to edge,
+//! mirror clamp to edge) answers alike, and clamp to zero and to the border read the border.
 //!
 //! Nothing here can fault a GPU: one small texture, three or four compute passes a case, no loop.
 //! The coordinates do reach outside the texture, which is what the address modes are for.
@@ -69,9 +81,6 @@ const ARGUMENT_ENTRY: &str = "px_sample_argument";
 /// The texture's size: neither side a power of two, as the lane's is.
 const WIDTH: u32 = 5;
 const HEIGHT: u32 = 3;
-
-/// The coordinates each case samples at.
-const SAMPLES: usize = 800;
 
 /// The threads in a threadgroup, chosen so 800 threads are ten whole groups: the group size
 /// changes nothing a sampler does, and a whole-group dispatch keeps the question to the sampler.
@@ -127,10 +136,31 @@ fn grid() -> Vec<[f32; 2]> {
         .collect()
 }
 
-/// The coordinate buffer a source reads: the grid as it stands for a pixel sampler, or divided by
-/// the size for the normalized control.
-fn coordinates(normalized: bool) -> Vec<u8> {
-    grid()
+/// The subnormal cases' coordinates: on `x` at row centre `y = 1.5`, then on `y` at column centre
+/// `x = 2.5`, each of `-2^-149`, `-2^-140`, `-2^-127` (subnormals below zero), `-0`, `+0`,
+/// `2^-149`, `2^-127` (subnormals above it) and `-2^-126` (the least normal below zero, texel -1
+/// under every reading).
+fn subnormal_grid() -> Vec<[f32; 2]> {
+    // A subnormal's bits are its value in units of `2^-149`.
+    let values = [
+        -f32::from_bits(1),
+        -f32::from_bits(1 << 9),
+        -f32::from_bits(1 << 22),
+        -0.0,
+        0.0,
+        f32::from_bits(1),
+        f32::from_bits(1 << 22),
+        -f32::MIN_POSITIVE,
+    ];
+    let on_x = values.iter().map(|&x| [x, 1.5]);
+    let on_y = values.iter().map(|&y| [2.5, y]);
+    on_x.chain(on_y).collect()
+}
+
+/// The coordinate buffer a source reads of `cells`: the cells as they stand for a pixel sampler,
+/// or divided by the size for the normalized control.
+fn coordinates_of(cells: &[[f32; 2]], normalized: bool) -> Vec<u8> {
+    cells
         .iter()
         .flat_map(|&[x, y]| match normalized {
             true => [x / WIDTH as f32, y / HEIGHT as f32],
@@ -188,20 +218,20 @@ fn row_pitch(format: PixelFormat) -> u32 {
         }
 }
 
-/// The layout the results are read under: one row a sample of four lanes, so a diff names the
-/// coordinate and the lane rather than a byte offset.
-fn layout() -> ByteLayout {
+/// The layout `samples` results are read under: one row a sample of four lanes, so a diff names
+/// the coordinate and the lane rather than a byte offset.
+fn layout_of(samples: usize) -> ByteLayout {
     ByteLayout {
         region: Region::Buffer {
             offset: 0,
-            length: u64::from(STRIDE) * SAMPLES as u64,
+            length: u64::from(STRIDE) * samples as u64,
         },
         element: Element::F32,
         row_offset: 0,
         row_elements: LANES,
         row_pitch: STRIDE,
-        rows: SAMPLES as u32,
-        image_pitch: STRIDE * SAMPLES as u32,
+        rows: samples as u32,
+        image_pitch: STRIDE * samples as u32,
         images: 1,
         // Each sample's four lanes fill its row, so there is no padding between them.
         gaps: Gaps::Ignored,
@@ -266,12 +296,23 @@ const NAMES: [&str; 16] = [
 const ARGUMENT_SITE: &str = "arg";
 const CONTROL_SITE: &str = "norm";
 
+/// The four subnormal cases' names, in [`ADDRESSES`]' order.
+const SUBNORMAL_NAMES: [&str; 4] = [
+    "pixel-samplers-subnormal-edge",
+    "pixel-samplers-subnormal-zero",
+    "pixel-samplers-subnormal-border",
+    "pixel-samplers-subnormal-mirror",
+];
+
 /// A case: one format, one filter, one address mode, and the sources it can run.
 pub struct PixelSamplers {
     name: &'static str,
     format: PixelFormat,
     filter: SamplerMinMagFilter,
     address: &'static Address,
+    /// Whether it samples at the subnormal coordinates ([`subnormal_grid`]) rather than the
+    /// probe's grid.
+    subnormal: bool,
 }
 
 /// Every pairing of format, filter and address mode, as the lane sweeps them.
@@ -286,6 +327,7 @@ pub fn all() -> Vec<PixelSamplers> {
                     format,
                     filter,
                     address,
+                    subnormal: false,
                 });
             }
         }
@@ -293,7 +335,31 @@ pub fn all() -> Vec<PixelSamplers> {
     cases
 }
 
+/// The `RGBA8Unorm` texture through a nearest filter under each address mode, at the subnormal
+/// coordinates.
+pub fn subnormals() -> Vec<PixelSamplers> {
+    ADDRESSES
+        .iter()
+        .zip(SUBNORMAL_NAMES)
+        .map(|(address, name)| PixelSamplers {
+            name,
+            format: PixelFormat::RGBA8Unorm,
+            filter: SamplerMinMagFilter::Nearest,
+            address,
+            subnormal: true,
+        })
+        .collect()
+}
+
 impl PixelSamplers {
+    /// The coordinates this case samples at.
+    fn cells(&self) -> Vec<[f32; 2]> {
+        match self.subnormal {
+            true => subnormal_grid(),
+            false => grid(),
+        }
+    }
+
     /// The sampler state this case's sources use: this filter on both axes, this mode on both,
     /// an opaque white border as the probe's states had, and argument-buffer support so an
     /// argument buffer can name it. Pixel coordinates unless `normalized`.
@@ -318,7 +384,7 @@ impl PixelSamplers {
             })
     }
 
-    /// Run one source's 800 samples and emit its results.
+    /// Run one source's samples (800 of the probe's grid) and emit its results.
     fn samples(
         &self,
         side: &mut dyn Side,
@@ -327,7 +393,8 @@ impl PixelSamplers {
         pipeline: Handle,
         bindings: Sources,
     ) -> Result<Node, Abort> {
-        let length = SAMPLES * STRIDE as usize;
+        let samples = self.cells().len();
+        let length = samples * STRIDE as usize;
         let output = made(
             sites,
             &format!("{at}/buffer"),
@@ -344,8 +411,8 @@ impl PixelSamplers {
                 pipeline,
                 &Bindings::new(&textures, &buffers).sampled(&samplers),
                 &[],
-                [SAMPLES as u32, 1, 1],
-                [GROUP, 1, 1],
+                [samples as u32, 1, 1],
+                [GROUP.min(samples as u32), 1, 1],
             ),
         )?;
         let status = made(sites, &format!("{at}/status"), side.wait(command_buffer))?;
@@ -376,7 +443,7 @@ impl PixelSamplers {
         let digest = Digest::sha256(&bytes);
         Ok(Node::leaf(
             at.to_owned(),
-            Observed::bytes(bytes, layout()).digested(digest),
+            Observed::bytes(bytes, layout_of(samples)).digested(digest),
         ))
     }
 }
@@ -455,34 +522,43 @@ impl Case for PixelSamplers {
             Input::bytes("sampler:pixel", &self.sampler_spec(false).words()),
             Input::bytes("sampler:normalized", &self.sampler_spec(true).words()),
             Input::bytes("texture:texels", &texels(self.format)),
-            Input::bytes("coordinates:pixel", &coordinates(false)),
-            Input::bytes("coordinates:normalized", &coordinates(true)),
+            Input::bytes("coordinates:pixel", &coordinates_of(&self.cells(), false)),
+            Input::bytes(
+                "coordinates:normalized",
+                &coordinates_of(&self.cells(), true),
+            ),
             Input::bytes("buffer:blank", &[BLANK]),
         ])
     }
 
     fn allowances(&self) -> Vec<Allowance> {
         // Metal announces nothing, so a notice of ours is a difference at the notices site.
-        // Every venue hands its sampler the pixel coordinate divided by the size (the two pixel
-        // notes). A venue that announces another kind reads as divergent at that site until
-        // whoever adds the venue names it with a run behind it. The device's own conversion of a
-        // texel, its filter and its sRGB decode are native notes the suite declares for every case
-        // (`crate::replay::NATIVE_NOTES`).
+        // Every venue hands a linear `slot` site's sampler the pixel coordinate divided by the
+        // size (`pixel-sampler-scaling`); a nearest one reads its texel's centre and announces
+        // nothing. The `arg` site's state is unknown where the shader is made, so it announces
+        // `argument-pixel-sampler-scaling` whatever its filter. A venue that announces another
+        // kind reads as divergent at that site until whoever adds the venue names it with a run
+        // behind it. The device's own conversion of a texel, its filter and its sRGB decode are
+        // native notes the suite declares for every case (`crate::replay::NATIVE_NOTES`).
         //
         // **Each is a declaration and loosens nothing.** Each sits at the notices site alone, so
         // a texel that differs still fails the case wherever it differs.
-        vec![
-            notice_allowance(Degradation::PixelSamplerScaling.code()),
-            notice_allowance(Degradation::ArgumentPixelSamplerScaling.code()),
-            // The buffer each pass writes its sampled texels into is `Shared`
-            // ([`crate::replay::shared_memory_notice`]).
-            crate::replay::shared_memory_notice(),
-            // The `arg` source samples a texture and a sampler held in an argument buffer, whose
-            // heap set MoltenVK's layout query refuses
-            // ([`crate::replay::set_past_layout_notice`]): announced by all 16 cases of the family
-            // on the M3 Max under MoltenVK 1.4.2, by none on lavapipe.
-            crate::replay::set_past_layout_notice(),
-        ]
+        let scaled = (self.filter == SamplerMinMagFilter::Linear)
+            .then(|| notice_allowance(Degradation::PixelSamplerScaling.code()));
+        scaled
+            .into_iter()
+            .chain([
+                notice_allowance(Degradation::ArgumentPixelSamplerScaling.code()),
+                // The buffer each pass writes its sampled texels into is `Shared`
+                // ([`crate::replay::shared_memory_notice`]).
+                crate::replay::shared_memory_notice(),
+                // The `arg` source samples a texture and a sampler held in an argument buffer, whose
+                // heap set MoltenVK's layout query refuses
+                // ([`crate::replay::set_past_layout_notice`]): announced by all 16 cases of the family
+                // on the M3 Max under MoltenVK 1.4.2, by none on lavapipe.
+                crate::replay::set_past_layout_notice(),
+            ])
+            .collect()
     }
 
     fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {
@@ -529,11 +605,16 @@ impl Case for PixelSamplers {
                 &texels(self.format),
             ),
         )?;
-        let pixel_coordinates = made(sites, "coordinates/pixel", side.buffer(&coordinates(false)))?;
+        let cells = self.cells();
+        let pixel_coordinates = made(
+            sites,
+            "coordinates/pixel",
+            side.buffer(&coordinates_of(&cells, false)),
+        )?;
         let normalized_coordinates = made(
             sites,
             "coordinates/normalized",
-            side.buffer(&coordinates(true)),
+            side.buffer(&coordinates_of(&cells, true)),
         )?;
         let pixel_state = made(
             sites,
@@ -628,6 +709,12 @@ mod tests {
     use super::*;
     use crate::transcript::Observed;
     use std::collections::BTreeSet;
+
+    /// The coordinates each case of the probe's grid samples at.
+    const SAMPLES: usize = 800;
+
+    /// The coordinates each subnormal case samples at ([`subnormal_grid`]).
+    const SUBNORMAL_SAMPLES: usize = 16;
 
     /// What an Apple M4 answered for each configuration, as `runtime_lane::pixel_samplers`' own
     /// probe measured it (macOS 27.0.1, two processes, identical): the case, the source, and the
@@ -950,8 +1037,8 @@ mod tests {
             .collect();
         assert_eq!(crate::sha256_hex(&bytes), GRID_SHA);
         // The pixel coordinate buffer is that grid; the normalized one is it over the size.
-        assert_eq!(coordinates(false), bytes);
-        let normalized = coordinates(true);
+        assert_eq!(coordinates_of(&grid, false), bytes);
+        let normalized = coordinates_of(&grid, true);
         for (index, cell) in grid.iter().enumerate() {
             let at = index * 8;
             let axis = |offset: usize| {
@@ -1152,11 +1239,45 @@ mod tests {
         assert_eq!(checked, 60);
     }
 
+    /// The subnormal cases are the `RGBA8Unorm` texture through a nearest filter under each mode,
+    /// named by it, at sixteen coordinates each of whose one moved axis is a subnormal, a zero, or
+    /// the least normal below zero, the other a texel's centre inside the texture.
+    #[test]
+    fn the_subnormal_cases_ask_at_subnormals() {
+        let cases = subnormals();
+        assert_eq!(cases.len(), 4);
+        for case in &cases {
+            assert_eq!(
+                case.name,
+                format!(
+                    "pixel-samplers-subnormal-{}",
+                    address_name(case.address.mode)
+                )
+            );
+            assert_eq!(case.format, PixelFormat::RGBA8Unorm);
+            assert_eq!(case.filter, SamplerMinMagFilter::Nearest);
+            assert_eq!(case.cells().len(), SUBNORMAL_SAMPLES);
+        }
+        let cells = subnormal_grid();
+        assert_eq!(cells.len(), SUBNORMAL_SAMPLES);
+        for (index, [x, y]) in cells.into_iter().enumerate() {
+            let (moved, centre, at) = match index < SUBNORMAL_SAMPLES / 2 {
+                true => (x, y, 1.5),
+                false => (y, x, 2.5),
+            };
+            assert_eq!(centre, at, "cell {index}");
+            assert!(
+                moved == 0.0 || moved.is_subnormal() || moved == -f32::MIN_POSITIVE,
+                "cell {index}: {moved:e}"
+            );
+        }
+    }
+
     /// The layout covers every result and names the sample as its row, so a diff over 800 samples
     /// says which coordinate moved.
     #[test]
     fn the_layout_names_the_sample() {
-        let layout = layout();
+        let layout = layout_of(SAMPLES);
         assert_eq!(layout.extent(), SAMPLES * STRIDE as usize);
         assert_eq!(layout.at(0, 799, 3), 799 * STRIDE as usize + 3 * 4);
     }

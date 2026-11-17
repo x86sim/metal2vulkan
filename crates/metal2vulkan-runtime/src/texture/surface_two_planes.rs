@@ -61,7 +61,7 @@ use crate::linear_plan::{BufferLayout, LINEAR_ALIGNMENT};
 use crate::shadow::{ShadowBuffer, ShadowCopies, ShadowSource, ShadowTarget};
 use crate::shadow_merge::ScratchSpares;
 use crate::texture_descriptor::{texture_usage, TextureDescriptor, TextureLayout};
-use crate::tracker::UseRange;
+use crate::tracker::{ImagePlace, UseRange};
 use crate::view_plan::ViewRecord;
 use crate::ycbcr::IoSurfaceYCbCr;
 use crate::Device;
@@ -233,25 +233,27 @@ impl Device {
                 aspects: vk::ImageAspectFlags::COLOR,
                 levels: 0..1,
                 layers: 0..1,
+                place: ImagePlace::WHOLE,
             },
             tracked: texels.tracked(),
             drops_writes: false,
+            levels: None,
             backing: texels.backing(),
             merge_scratch: ScratchSpares::default(),
-            touched: AtomicU64::new(0),
             stood: AtomicU64::new(0),
+            standing: Default::default(),
         };
+        let why = "its image holds each texel's colour word and alpha byte side by side, where \
+                   Metal keeps two planes in the surface's bytes: its image is a shadow of those \
+                   planes, which the encoders move into it and back";
+        crate::shadow_log::made(self, call, (descriptor, layout), &texels, why);
         self.degrade(Degradation::ShadowedTexture, || {
             let [width, height, _] = layout.extent;
             let object = format!(
                 "a {} texture of {width}x{height} over a surface's two planes",
                 pf.name()
             );
-            let why = "its image holds each texel's colour word and alpha byte side by side, \
-                       where Metal keeps two planes in the surface's bytes: its image is a shadow \
-                       of those planes, which the encoders move into it and back"
-                .to_owned();
-            (object, why)
+            (object, why.to_owned())
         });
         let storage = Storage::Shadow {
             image: image.shared(),

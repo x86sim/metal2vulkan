@@ -6,22 +6,30 @@
 //!   [`Execute`] as a segment ([`EncoderCore::defer`]), recorded into a `VkCommandBuffer` of its
 //!   own ([`Execute::record`]), behind a barrier from everything before it and with one to
 //!   everything after it, which goes between the encoder's two as its batch is submitted.
-//!   `commit` records it from the CPU's records as they stand then; where the CPU writes the
-//!   buffer's records again before the batch is ready to submit (an event wait holds it,
-//!   [`Execute::rewritten`]), a host step records it again from the records as they stand then,
-//!   waiting for no work on the GPU, and announcing nothing. A CPU write after the batch was
-//!   submitted races the GPU, as on Metal.
-//! - **Records the GPU may write**. A buffer an encoder made resident for writing
-//!   (`IndirectCommandBuffer::gpu_written`, for good) is written by functions as they run, so its
+//!   `commit` records it from the CPU's records as they stand then, reading them a chunk of 256
+//!   commands at a time and recording a chunk's before it reads the next, so a long range's
+//!   records are recorded while the cache still holds them (`kept_commands::pieces`), but the
+//!   range whole where its check, or the command buffer's executed-commands handlers, see every
+//!   command before any is recorded; where the CPU writes the buffer's records again before the
+//!   batch is ready to submit (an event wait holds it, [`Execute::rewritten`]), a host step
+//!   records it again from the records as they stand then, waiting for no work on the GPU, and
+//!   announcing nothing. A CPU write after the batch was submitted races the GPU, as on Metal.
+//! - **Records the GPU may write**. A buffer a route that may write its records met
+//!   (`IndirectCommandBuffer::gpu_written`, for good, `write_routes.rs`: its command buffer made it
+//!   resident for writing and runs a function that may call an indirect-command operation, or a
+//!   blit copied or reset commands into it) is written by functions as they run, so its
 //!   records are known only once the work before the execution completed. Its segment starts a part
 //!   of the encoder, and a batch, of its own. Where every record it may hold is covered, `commit`
 //!   records it to run on the GPU alone (`gpu_execute.rs`); otherwise the scheduler submits the
-//!   batch once every batch submitted before it on any queue completed and its host step recorded
-//!   the segment from the records then (`scheduler`), which the device announces once
+//!   batch once the batches that last wrote its records and its range completed (every batch
+//!   submitted before it on any queue, where Metal tracks neither or the step reads more:
+//!   `scheduler`'s `gate_of`) and its host step recorded the segment from the records then, which
+//!   the device announces once
 //!   (`Degradation::HostReplayedIndirectCommands`). So is a segment `commit` recorded from the
-//!   CPU's records whose buffer an encoder made resident for writing after the commit
-//!   ([`Unforeseen`]). The step compiles nothing: `commit`, or for such a segment the encoder's
-//!   `use_resource` before the scheduler sees the buffer written, settles on its own thread the
+//!   CPU's records whose buffer such a route met after the commit ([`Unforeseen`]). The step
+//!   compiles nothing: `commit`, or for such a segment the call that met the buffer (a later
+//!   commit, a blit's, or a CPU setter's) before the scheduler sees the buffer written, settles on
+//!   its own thread the
 //!   variants every state a record may name needs, and the neutrals their plans bind
 //!   ([`Execute::settle`]); the step makes only what a dispatch on the CPU makes (descriptor sets,
 //!   upload chunks, views and samplers of bound textures) and the `VkPipeline` of a threadgroup
@@ -29,9 +37,10 @@
 //!   record names its pipeline state by its ID among the states made with
 //!   `supportIndirectCommandBuffers` that lived at the commit (`ComputePipelineState::
 //!   indirect_states`); an ID of none runs nothing, as Metal's undefined one may not. A record
-//!   naming the ID of the state the CPU set on its command runs that state's program, though the
-//!   program released the state since (`IndirectCommandBuffer::step_states`); one the GPU wrote,
-//!   the state that held the ID as the GPU last could write the records, released since or not
+//!   naming the ID of the state the CPU set on its command, whose pipeline no kernel wrote since
+//!   (`CommandRecord::kernel_pipeline`), runs that state's program, though the program released
+//!   the state since (`IndirectCommandBuffer::step_states`); one whose pipeline the GPU wrote, the
+//!   state that held the ID as the GPU last could write the records, released since or not
 //!   (`released_programs.rs`).
 //! - **Each command** runs through the plan path as the encoder's dispatch would
 //!   ([`record_dispatch`]): with its pipeline state, or the encoder's when the buffer inherits
@@ -42,13 +51,11 @@
 //!   32 bits, at an index a stage-in layout of `MTLBufferLayoutStrideDynamic` reads, is refused
 //!   (`Unsupported{KernelStageIn, NotImplemented}`): Metal's answer is not measured. A kernel
 //!   buffer set without a stride there, on a buffer whose descriptor supports dynamic attribute
-//!   strides, is refused the runtime's own gap
-//!   (`NotImplemented(RuntimeGap::IndirectCommandUnstridedBuffer)`, `unstrided_buffer`): plain
-//!   Metal takes the command and completes it, and its fetch reads the buffer at stride 2^32 - 1,
-//!   which the 32-bit fetch cannot place (the gap's doc). On a buffer without that support the
-//!   records hold no stride word and Metal reads stride 0, which the plan path gives exactly, so
-//!   the command is taken; and an inheriting buffer's command reads the encoder's buffer set
-//!   without one at stride 0, as the encoder's own dispatch does. A command with no dispatch, no pipeline state, or a threadgroup
+//!   strides, is read at stride 2^32 - 1, as plain Metal's fetch reads it (`unstrided_stride`):
+//!   element 0, and zero for an element past the buffer. On a buffer without that support the
+//!   records hold no stride word and Metal reads stride 0, which the plan path gives exactly; and
+//!   an inheriting buffer's command reads the encoder's buffer set without one at stride 0, as the
+//!   encoder's own dispatch does. A command with no dispatch, no pipeline state, or a threadgroup
 //!   that is empty or holds more threads than the state's `max_total_threads_per_threadgroup` runs
 //!   nothing, as Metal's runs nothing, and its neighbours run (ruling a). A
 //!   command whose dispatch the plan path refuses refuses the commit, with that error, or fails the
@@ -77,9 +84,15 @@
 //!   recorded on the GPU alone (`gpu_execute.rs`), its check having nothing to see, whose check a
 //!   route encoded since gives something to see takes the host step before its batch is submitted
 //!   ([`Execute::outgrown`]).
-//! - **Order.** Between commands, the segment orders as the encoder orders its dispatches (a
-//!   serial encoder's where their uses meet; a concurrent one's not at all), and a command with
-//!   its barrier set runs after every earlier command of the segment.
+//! - **Order.** Between commands, the segment orders nothing but where a command's record sets
+//!   its barrier: that command runs after every earlier command of the segment. So it does in
+//!   either kind of encoder, as Metal's commands do (`MTLIndirectComputeCommand`'s
+//!   `concurrentDispatchThreadgroups`: they "don't automatically serialize access to resources
+//!   with other commands in the indirect command buffer", and a serial encoder "adds a barrier
+//!   before and after the range of commands"): the segment's barriers from everything before it
+//!   and to everything after it are that serial encoder's.
+
+mod kept;
 
 use super::argument_table::ArgumentTable;
 use super::buffer::Buffer;
@@ -87,20 +100,25 @@ use super::command_buffer::CommandBuffer;
 use super::compute::{
     prepare_variants, record_dispatch, validated_imageblock_size, DispatchTables,
 };
-use super::degradation::Degradation;
+use super::degradation::{Degradation, HostStepKey};
 use super::device::lock;
 use super::encoder::{EncoderCore, RecordedSegment};
-use super::error::{internal, invalid, Error, RuntimeGap};
+use super::error::{invalid, Error, RuntimeGap};
 use super::executed_commands::{ExecutedCommand, RecordsRead};
 use super::indirect_command_buffer::{
     IndirectCommandBuffer, IndirectCommandCheck, IndirectCommandCheckNeeds, Reader,
 };
+use super::kept_commands;
 use super::pipeline::{BufferForms, ComputePipelineState, IndirectStates, Variant};
 use super::predication::HostGate;
-use super::residency::Residency;
-use super::tracker::Barrier;
+use super::residency::{whole_use, Residency};
+use super::resource::ResourceKey;
+use super::tracker::{Access, Barrier, EncoderUses, Summary, Use};
 use super::upload::Upload;
+use super::write_routes::replay_why;
 use super::Device;
+use super::{blit, indirect_dispatch};
+use ash::vk;
 use metal2vulkan::bind::indirect_commands::{Action, BufferBinding, BufferStage, CommandRecord};
 use metal2vulkan::bind::{Dispatch, ImageblockSize, ReplayFaults, StageInRegion};
 use metal2vulkan::error::{BindError, Feature, Unsupported};
@@ -152,8 +170,6 @@ pub(super) struct Execute {
     pub(super) pipeline: Option<ComputePipelineState>,
     /// The encoder's bound buffers where the buffer inherits them; else empty.
     pub(super) table: ArgumentTable,
-    /// Whether the encoder runs its dispatches in encoded order.
-    pub(super) ordered: bool,
     /// The check of the block of command predication it was encoded in, if any
     /// (`predication.rs`): a host step records it, and nothing where the counter skips.
     pub(super) gate: Option<HostGate>,
@@ -184,50 +200,119 @@ pub(super) const NOT_READ: u64 = u64::MAX;
 pub(super) enum ExecutionRange {
     /// `executeCommandsInBuffer:withRange:`'s, inside the buffer's size.
     Fixed(Range<u32>),
-    /// `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:`'s: a copy of the
-    /// `MTLIndirectCommandBufferExecutionRange` (`location`, then `length`, each a `u32`), made
-    /// where the execution is encoded behind a barrier from everything before
-    /// (`indirect_dispatch::copy_arguments`), which the host step reads.
-    Indirect(Buffer),
+    /// `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:`'s: the
+    /// `MTLIndirectCommandBufferExecutionRange` (`location`, then `length`, each a `u32`) at
+    /// `offset` of `buffer`, which the host step reads ([`range_from`]).
+    Indirect { buffer: Buffer, offset: u64 },
 }
 
 impl ExecutionRange {
+    /// The commands of a range the call gave; `None` for one a buffer holds.
+    pub(super) fn given(&self) -> Option<u64> {
+        match self {
+            ExecutionRange::Fixed(range) => Some(u64::from(range.end - range.start)),
+            ExecutionRange::Indirect { .. } => None,
+        }
+    }
+}
+
+/// The range of an execution `core` encodes from the [`RANGE_BYTES`] at `offset` of `buffer`
+/// (`executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:`), which its host step reads
+/// ([`ExecutionRange::commands`]). Read there in place where the host maps the bytes the GPU
+/// reads and writes (`Buffer::maps_gpu_bytes`), so the step waits for the batches that wrote
+/// them alone (`CommandBufferShared::step_reads`): the read is noted where the call lies, as a
+/// command that reads them, so the encoder's order, a detach (`detach.rs`) and the hazard state
+/// see it as they saw the copy's. Else read from a copy made here behind a barrier from
+/// everything before (`indirect_dispatch::copy_arguments`), whose batch the step waits for.
+/// Refused as the copy's buffer is.
+pub(super) fn range_from(
+    core: &mut EncoderCore,
+    buffer: &Buffer,
+    offset: u64,
+) -> Result<ExecutionRange, Error> {
+    if buffer.maps_gpu_bytes() {
+        let read = blit::reads(buffer, offset..offset + RANGE_BYTES);
+        core.command(vk::PipelineStageFlags2::TRANSFER, &[read], |_, _| {});
+        core.retain(buffer.clone());
+        let buffer = buffer.clone();
+        return Ok(ExecutionRange::Indirect { buffer, offset });
+    }
+    let copy = indirect_dispatch::copy_arguments(core, buffer, offset, RANGE_BYTES)?;
+    Ok(ExecutionRange::Indirect {
+        buffer: copy,
+        offset: 0,
+    })
+}
+
+impl ExecutionRange {
+    /// What a host step of an execution of `icb`'s commands over this range reads on the host of
+    /// what the GPU may write, for the scheduler's order across queues
+    /// (`CommandBufferShared::footprint`) and for what the step waits for
+    /// (`CommandBufferShared::step_reads`): the records' buffer, and the bytes a range read from
+    /// a buffer is read from, each read in every stage.
+    pub(super) fn host_reads(&self, icb: &IndirectCommandBuffer) -> Vec<Use<ResourceKey>> {
+        let read = Access::new(
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_READ,
+        );
+        let mut reads = vec![whole_use(icb.storage(), read, Access::NONE)];
+        if let ExecutionRange::Indirect { buffer, offset } = self {
+            reads.push(blit::reads_by(buffer, *offset..offset + RANGE_BYTES, read));
+        }
+        reads
+    }
+
     /// Whether the range is read from a buffer, which the GPU may write
     /// ([`ExecutionRange::Indirect`]): a host step records its execution, whoever wrote the
     /// records.
     pub(super) fn indirect(&self) -> bool {
-        matches!(self, ExecutionRange::Indirect(_))
+        matches!(self, ExecutionRange::Indirect { .. })
     }
 
-    /// The commands it runs of a buffer of `size` commands: the range given, or the range the
-    /// copy holds now as Metal's execution takes it (an M3 Max and an M4, for a compute encoder; a
-    /// probe, the same chips, for a render encoder): from `location` to `location + length`,
+    /// A range read from a buffer: its location and length as its bytes hold them now, for the
+    /// encoder trail (`encoder_trail.rs`, **Host steps**); `None` for one given, or bytes no
+    /// mapping holds.
+    pub(super) fn raw(&self) -> Option<[u32; 2]> {
+        let ExecutionRange::Indirect { buffer, offset } = self else {
+            return None;
+        };
+        let [l0, l1, l2, l3, n0, n1, n2, n3] =
+            buffer.read_mapped::<{ RANGE_BYTES as usize }>(*offset)?;
+        Some([
+            u32::from_le_bytes([l0, l1, l2, l3]),
+            u32::from_le_bytes([n0, n1, n2, n3]),
+        ])
+    }
+
+    /// The commands it runs of a buffer of `size` commands: the range given, or the range its
+    /// bytes hold now as Metal's execution takes it (an M3 Max and an M4, for a compute encoder;
+    /// a probe, the same chips, for a render encoder): from `location` to `location + length`,
     /// clamped at the buffer's size, so a location of 2 and a length of 5 in a buffer of 4 run
     /// commands 2 and 3, and a length of 0 or a location at the size runs nothing. Where the
     /// location lies past the size, or `location + length` passes `2^32 - 1` (Metal's GPU then
     /// faults the command buffer, or hangs), it runs nothing and reports `ReplayFaults::RANGE`.
-    pub(super) fn commands(&self, size: u64) -> Result<(Range<u32>, ReplayFaults), Error> {
-        let copy = match self {
-            ExecutionRange::Fixed(range) => return Ok((range.clone(), ReplayFaults::default())),
-            ExecutionRange::Indirect(copy) => copy,
+    /// Bytes no mapping holds now (a no-copy buffer detached since the call, `detach.rs`) run
+    /// nothing.
+    pub(super) fn commands(&self, size: u64) -> (Range<u32>, ReplayFaults) {
+        let (buffer, offset) = match self {
+            ExecutionRange::Fixed(range) => return (range.clone(), ReplayFaults::default()),
+            ExecutionRange::Indirect { buffer, offset } => (buffer, *offset),
         };
-        let contents = copy
-            .contents()
-            .ok_or_else(|| internal("an execution range's copy without host bytes"))?;
-        let mut bytes = [0u8; RANGE_BYTES as usize];
-        // SAFETY: the copy is a `Shared` buffer of at least `RANGE_BYTES`, mapped; the GPU's
-        // write to it completed before the host step (its batch ended with the barrier to the
-        // host), and nothing writes it after.
-        unsafe { std::ptr::copy_nonoverlapping(contents.as_ptr(), bytes.as_mut_ptr(), 8) };
+        // The GPU's writes to the bytes before the host step completed (its gate) and reached
+        // the host (each batch ends with the barrier to the host); nothing of the command buffer
+        // after the execution runs before the step.
+        let Some(bytes) = buffer.read_mapped::<{ RANGE_BYTES as usize }>(offset) else {
+            return (0..0, ReplayFaults::default());
+        };
         let [l0, l1, l2, l3, n0, n1, n2, n3] = bytes;
         let location = u64::from(u32::from_le_bytes([l0, l1, l2, l3]));
         let length = u64::from(u32::from_le_bytes([n0, n1, n2, n3]));
         if location > size || location + length > u64::from(u32::MAX) {
-            return Ok((0..0, ReplayFaults::RANGE));
+            return (0..0, ReplayFaults::RANGE);
         }
         let end = (location + length).min(size);
         // Both lie within the size, which a buffer's `u32` command count holds.
-        Ok((location as u32..end as u32, ReplayFaults::default()))
+        (location as u32..end as u32, ReplayFaults::default())
     }
 }
 
@@ -321,51 +406,148 @@ impl Execute {
         command_buffer: &CommandBuffer,
         states: Option<&[ComputePipelineState]>,
     ) -> Result<RecordedSegment, Error> {
-        let mut core = EncoderCore::segment(command_buffer, self.ordered)?;
         // Its host step inside a block of command predication that skips runs nothing.
         if states.is_some() && self.gate.as_ref().is_some_and(HostGate::skips) {
-            return core.end_segment();
+            return EncoderCore::segment(command_buffer, false)?.end_segment();
         }
-        let max_length = max_length(&core);
+        // Every encoder's resident resources, as the command buffer's are at the commit.
+        let residency = command_buffer.residency()?.kernel();
+        // Commands the CPU encoded, which their chunks' kept recordings may run (`kept.rs`).
+        if states.is_none() {
+            if let Some(keeping) = self.keeping(command_buffer, &residency) {
+                return self.record_kept(command_buffer, &residency, keeping);
+            }
+        }
+        // Its commands run in no order among themselves, but for a record's barrier.
+        let mut core = EncoderCore::segment(command_buffer, false)?;
         // The host step's commands take the large-buffer form, whose variants `settle` made.
         let forms = match states {
             Some(_) => BufferForms::Large,
             None => BufferForms::Bound,
         };
-        let (commands, faults) = self.commands(states)?;
-        // Every encoder's resident resources, as the command buffer's are at the commit.
-        let residency = command_buffer.residency()?.kernel();
-        // What the commands run, for the command buffer's handlers (`executed_commands.rs`).
-        let read = match states {
-            Some(_) => RecordsRead::HostStep,
-            None => RecordsRead::Commit,
-        };
-        command_buffer.report_executed(&self.icb, read, &residency, || {
-            let first = self.range().map_or(0, |(range, _)| u64::from(range.start));
-            let commands = commands
-                .iter()
-                .enumerate()
-                .filter_map(|(at, command)| {
-                    let (record, own) = command.as_ref()?;
+        let (range, mut faults) = self.range();
+        // The caller's check sees each command the execution will record, before it records any,
+        // where it may see something; so do the command buffer's executed-commands handlers,
+        // which hear of the execution once. `commit` reads the rest a chunk at a time
+        // (`kept_commands::pieces`), the host step the records as the GPU and the CPU left them.
+        let check = self.check.as_ref().filter(|_| self.check_sees());
+        let reports = command_buffer.reports_executed();
+        let whole = states.is_some() || check.is_some() || reports;
+        if states.is_none() {
+            // Counted before the records are read: a write meanwhile records it again.
+            self.read_at.store(self.icb.cpu_writes(), Ordering::Release);
+        }
+        let mut misses = 0u32;
+        let forms = (&residency, forms);
+        for piece in kept_commands::pieces(range, whole) {
+            let start = piece.start;
+            let Some(states) = states else {
+                let (commands, released) = self.icb.records(piece, Reader::Commit)?;
+                // The execution announces the commands it runs otherwise than Metal's may, as it
+                // records them.
+                self.icb.degrade_released(&released);
+                if let Some((check, _)) = check {
+                    let read = commands.iter().map(|(record, _)| record);
+                    self.icb.check_read(check, start, read);
+                }
+                if reports {
+                    let executed = commands.iter().map(Some);
+                    let read = (RecordsRead::Commit, &residency);
+                    self.report(command_buffer, read, start, executed);
+                }
+                self.dispatch(&mut core, &commands, forms, &mut misses)?;
+                continue;
+            };
+            let (commands, written) = self.written_commands(piece, states, check)?;
+            faults = ReplayFaults(faults.0 | written.0);
+            // The states the commands name, for the encoder trail, where it is on: each run of
+            // one state noted once (`encoder_trail.rs`, **Host steps**).
+            if command_buffer.device().shared().encoder_trail {
+                let mut notes = crate::encoder_trail::Notes::default();
+                let mut last = None;
+                for own in commands
+                    .iter()
+                    .flatten()
+                    .filter_map(|(_, own)| own.as_ref())
+                {
+                    if last != Some(own) {
+                        notes.compute(own);
+                        last = Some(own);
+                    }
+                }
+                command_buffer.trail_step(notes);
+            }
+            if reports {
+                let executed = commands.iter().map(Option::as_ref);
+                let read = (RecordsRead::HostStep, &residency);
+                self.report(command_buffer, read, start, executed);
+            }
+            self.dispatch(&mut core, commands.iter().flatten(), forms, &mut misses)?;
+        }
+        let mut segment = core.end_segment()?;
+        segment.resident_misses = misses;
+        segment.faults = faults;
+        Ok(segment)
+    }
+
+    /// Hand the command buffer's executed-commands handlers what `executed` runs, commands from
+    /// `start` (`None` where a record runs nothing for a fault), read at `read` under
+    /// `residency`, the command buffer's (`executed_commands.rs`).
+    fn report<'c>(
+        &self,
+        command_buffer: &CommandBuffer,
+        (read, residency): (RecordsRead, &Residency),
+        start: u32,
+        executed: impl Iterator<Item = Option<&'c Command>>,
+    ) {
+        command_buffer.report_executed(&self.icb, read, residency, || {
+            let commands = (u64::from(start)..)
+                .zip(executed)
+                .filter_map(|(index, command)| {
+                    let (record, own) = command?;
                     let (pipeline, _) = self.runnable(record, own.as_ref())?;
                     Some(ExecutedCommand {
-                        index: first + at as u64,
+                        index,
                         can_encode_indirect_commands: pipeline.can_encode_indirect_commands(),
                     })
                 })
                 .collect();
             (commands, false)
         });
-        let mut misses = 0u32;
+    }
+
+    /// Record `commands`' dispatches through `core`, resolving against `residency`, the command
+    /// buffer's, their variants in `forms` ([`record`](Self::record)'s), each resident-set miss
+    /// counted in `misses`. A command's barrier orders it after the commands before it here.
+    fn dispatch<'a>(
+        &self,
+        core: &mut EncoderCore,
+        commands: impl IntoIterator<Item = &'a Command>,
+        (residency, forms): (&Residency, BufferForms),
+        misses: &mut u32,
+    ) -> Result<(), Error> {
+        let max_length = max_length(core);
         let mut ran = false;
-        for (record, own) in commands.iter().flatten() {
+        for (record, own) in commands {
             let Some((pipeline, dispatch)) = self.runnable(record, own.as_ref()) else {
                 continue;
             };
             if record.barrier && ran {
                 core.barrier(Barrier::between_dispatches());
             }
-            let bindings = self.bindings(record, max_length, &residency, &mut misses);
+            let mut bindings = self.bindings(record, max_length, residency, misses);
+            // A buffer set without a stride that a stage-in layout of
+            // `MTLBufferLayoutStrideDynamic` reads is read at `unstrided_stride`'s; one no such
+            // layout reads takes no stride, as the encoder's own dispatch binds it.
+            if let Some(stride) =
+                unstrided_stride(self.icb.descriptor().support_dynamic_attribute_stride)
+            {
+                for &index in &bindings.unstrided {
+                    if pipeline.reads_stage_in_stride(index) {
+                        bindings.table.attribute_strides.insert(index, stride);
+                    }
+                }
+            }
             // A stride past 32 bits that a stage-in layout of `MTLBufferLayoutStrideDynamic`
             // reads: Metal's answer is not measured, and the fetch's `u32` displacement cannot
             // place it.
@@ -378,25 +560,11 @@ impl Execute {
                     Unsupported::not_implemented(Feature::KernelStageIn),
                 )));
             }
-            // A buffer set without a stride that such a layout reads, on a buffer that supports
-            // dynamic attribute strides: Metal takes the command and its fetch reads at stride
-            // 2^32 - 1, which the 32-bit fetch cannot place (`unstrided_buffer`). Without that
-            // support Metal reads stride 0, which the plan path gives exactly.
-            if let Some(refusal) = unstrided_buffer(
-                self.icb.descriptor().support_dynamic_attribute_stride,
-                bindings.unstrided.iter().copied(),
-                |index| pipeline.reads_stage_in_stride(index),
-            ) {
-                return Err(refusal);
-            }
-            let tables = bindings.tables(self, pipeline, record, &residency, forms)?;
-            record_dispatch(&mut core, &tables, CALL, dispatch)?;
+            let tables = bindings.tables(self, pipeline, record, residency, forms)?;
+            record_dispatch(core, &tables, CALL, dispatch)?;
             ran = true;
         }
-        let mut segment = core.end_segment()?;
-        segment.resident_misses = misses;
-        segment.faults = faults;
-        Ok(segment)
+        Ok(())
     }
 
     /// Settle, on the thread that commits or flags the buffer, what the host step needs to
@@ -433,6 +601,40 @@ impl Execute {
             variants.extend(prepare_variants(device, &tables).into_iter().flatten());
         }
         Settled { states, variants }
+    }
+
+    /// What its host step's recording may use that Metal orders, for the scheduler's order across
+    /// queues (`CommandBufferShared::footprint`), with `residency`, its command buffer's: every
+    /// resource made resident, with its usage (`Residency::bound_uses`), and what the step reads
+    /// on the host ([`ExecutionRange::host_reads`]); and where the buffer inherits the encoder's
+    /// buffers, what its commands reach of the encoder's bindings at the call
+    /// (`ArgumentTable::bound_uses`). `None` where its commands may reach more that Metal orders:
+    /// an inherited visible-function table; and inside a block of command predication, whose
+    /// counter the step reads.
+    pub(super) fn bound(&self, residency: &Residency) -> Option<Summary<ResourceKey>> {
+        if self.gate.is_some() || self.preprocess_gate.is_some() {
+            return None;
+        }
+        let inherited = match self.icb.descriptor().inherit_buffers {
+            true => self.table.bound_uses()?,
+            false => Vec::new(),
+        };
+        let mut uses = residency.bound_uses();
+        uses.extend(self.range.host_reads(&self.icb));
+        let aliases = &self.icb.generation().shared().aliases;
+        uses.extend(aliases.augment(&inherited).unwrap_or(inherited));
+        let mut bound = EncoderUses::new(false);
+        bound.record(vk::PipelineStageFlags2::ALL_COMMANDS, &uses, None);
+        Some(bound.finish())
+    }
+
+    /// What its host step reads on the host of what the GPU may write, where that is all the step
+    /// waits for (`Deferred::host_reads`): its records and its range
+    /// ([`ExecutionRange::host_reads`]). `None` inside a block of command predication, whose
+    /// counter the steps before it write and its step reads too (`predication.rs`).
+    pub(super) fn host_reads(&self) -> Option<Vec<Use<ResourceKey>>> {
+        let predicated = self.gate.is_some() || self.preprocess_gate.is_some();
+        (!predicated).then(|| self.range.host_reads(&self.icb))
     }
 
     /// Whether it reads its range from a buffer, which the GPU may write
@@ -496,7 +698,7 @@ impl Execute {
     }
 
     /// The commands it runs ([`ExecutionRange::commands`]).
-    fn range(&self) -> Result<(Range<u32>, ReplayFaults), Error> {
+    fn range(&self) -> (Range<u32>, ReplayFaults) {
         self.range.commands(self.icb.size())
     }
 
@@ -509,48 +711,25 @@ impl Execute {
         }
     }
 
-    /// The commands of the range, in order, `None` where a record runs nothing for a fault, and
-    /// the faults: the CPU's records, or the records as the GPU and the CPU left them, each
-    /// naming its state among `states`.
-    fn commands(
+    /// For the host step, the commands of `range`, the execution's, in order, `None` where a
+    /// record runs nothing for a fault, and the faults: the records as the GPU and the CPU left
+    /// them, each naming its state among `states`, each seen by `check` before any is recorded.
+    fn written_commands(
         &self,
-        states: Option<&[ComputePipelineState]>,
+        range: Range<u32>,
+        states: &[ComputePipelineState],
+        check: Option<&(Mutex<IndirectCommandCheck>, IndirectCommandCheckNeeds)>,
     ) -> Result<(Vec<Option<Command>>, ReplayFaults), Error> {
-        let (range, faults) = self.range()?;
-        // The execution announces the commands it runs otherwise than Metal's may, as it records
-        // them.
-        let Some(states) = states else {
-            let start = range.start;
-            // Counted before the records are read: a write meanwhile records it again.
-            self.read_at.store(self.icb.cpu_writes(), Ordering::Release);
-            let (commands, released) = self.icb.records(range, Reader::Commit)?;
-            self.icb.degrade_released(&released);
-            // The caller's check sees each command `commit` will record, before it records any,
-            // where it may see something.
-            if let Some((check, _)) = self.check.as_ref().filter(|_| self.check_sees()) {
-                let read = commands.iter().map(|(record, _)| record);
-                self.icb.check_read(check, start, read);
-            }
-            return Ok((commands.into_iter().map(Some).collect(), faults));
-        };
-        let written = self.icb.written_records(range.clone())?;
-        // The caller's check sees each command the step will record, before it records any,
-        // where it may see something.
-        if let Some((check, _)) = self.check.as_ref().filter(|_| self.check_sees()) {
+        let mut written = self.icb.written_records(range.clone())?;
+        if let Some((check, _)) = check {
             self.icb
                 .check_recorded(check, range.start, &written.records);
         }
         // A record naming the ID of the state the CPU set runs its program, else the state of its
         // ID among `states` (`IndirectCommandBuffer::step_states`).
-        let (named, released) = self.icb.step_states(range.start, &written.records, states);
+        let released = (self.icb).step_states(range.start, &mut written.records, states);
         self.icb.degrade_released(&released);
-        let commands = written
-            .records
-            .into_iter()
-            .zip(named)
-            .map(|(record, state)| record.map(|record| (record, state)))
-            .collect();
-        Ok((commands, ReplayFaults(written.faults.0 | faults.0)))
+        Ok((written.records, written.faults))
     }
 
     /// The pipeline state and dispatch of `record`, which names `own`, where it runs on Metal:
@@ -586,7 +765,7 @@ impl Execute {
                     continue;
                 };
                 if !binding.names_buffer() {
-                    degrade_nil_offset(self.icb.device(), binding, index);
+                    degrade_nil_offset(self.icb.generation(), binding, index);
                     continue;
                 }
                 let Some(bound) = residency.resolve(binding.address) else {
@@ -595,7 +774,8 @@ impl Execute {
                 };
                 table.buffers.insert(index, bound);
                 // Only a stage-in layout of `MTLBufferLayoutStrideDynamic` reads the stride;
-                // `record` refuses one past 32 bits there.
+                // `record` refuses one past 32 bits there. One set without a stride reads at
+                // [`unstrided_stride`]'s where such a layout reads it (`dispatch`).
                 match binding.attribute_stride.map(u32::try_from) {
                     Some(Ok(stride)) => {
                         table.attribute_strides.insert(index, stride);
@@ -619,32 +799,21 @@ impl Execute {
     }
 }
 
-/// The refusal of an executed indirect command's buffers, where `unstrided` names the indices it
-/// bound without an attribute stride and `reads_stride` the indices its pipeline state's layout of
-/// `MTLBufferLayoutStrideDynamic` reads: the lowest index that is both, as
-/// [`RuntimeGap::IndirectCommandUnstridedBuffer`], and `None` where no layout reads one. Plain
-/// Metal takes such a command, so this is the runtime's own gap and not misuse (the gap's doc).
-/// Both encoders' executions decide it so: a kernel buffer's stage-in layout here, a vertex
-/// buffer's vertex-descriptor layout in `render/executions.rs`.
-///
-/// `dynamic_strides` is the indirect command buffer descriptor's
-/// `support_dynamic_attribute_stride`. A buffer without it holds no stride word in its records at
-/// all, so Metal's fetch reads stride 0, which the plan path gives exactly (`bind::dispatch` and
-/// `bind::graphics` read a binding bound without a stride at stride 0): nothing is refused there,
-/// whatever the layouts read.
-pub(crate) fn unstrided_buffer(
-    dynamic_strides: bool,
-    unstrided: impl IntoIterator<Item = u32>,
-    reads_stride: impl Fn(u32) -> bool,
-) -> Option<Error> {
-    if !dynamic_strides {
-        return None;
-    }
-    unstrided
-        .into_iter()
-        .filter(|&index| reads_stride(index))
-        .min()
-        .map(|index| Error::NotImplemented(RuntimeGap::IndirectCommandUnstridedBuffer { index }))
+/// The stride an executed indirect command's buffer set without one (the plain setter, or the
+/// stride form at `MTLAttributeStrideStatic`) is read at by a layout of
+/// `MTLBufferLayoutStrideDynamic`, on an indirect command buffer whose descriptor supports dynamic
+/// attribute strides where `dynamic_strides`: `2^32 - 1`, the record's 32-bit stride word that
+/// `MTLAttributeStrideStatic` truncates into, which the fetch places past 32 bits (an element past
+/// the buffer reads zero). Measured on an Apple M3 Max under macOS 27.0.1, with markers planted at
+/// byte `2^32 - 1` and at byte `2^32` of a buffer of 4 GiB + 256 bytes: element 1 read the byte
+/// `2^32 - 1` marker, never the byte `2^32` one, from a compute command and from a render command
+/// alike, and the stride form at `attributeStride:0xFFFFFFFF` read the same. `None` without that
+/// support: the records hold no stride word, so Metal's fetch reads stride 0, which the plan path
+/// gives a binding without a stride (the plain setter's command read element 1 at stride 0 in five
+/// runs of five). Both encoders' executions read it: a kernel buffer's stage-in layout here, a
+/// vertex buffer's vertex-descriptor layout in `render/executions.rs`.
+pub(crate) fn unstrided_stride(dynamic_strides: bool) -> Option<u32> {
+    dynamic_strides.then_some(u32::MAX)
 }
 
 /// Announce `Degradation::IndirectNilBufferOffset` for a command's `binding` at `index`, a nil
@@ -667,29 +836,36 @@ pub(super) fn degrade_nil_offset(device: &Device, binding: &BufferBinding, index
     });
 }
 
-/// Announce, once per device, that an execution is replayed on the host (the module's records
-/// the GPU may write, and ranges read from a buffer).
+/// Announce, once per device (`Device::degrade_host_step`'s compute cause), that an execution is
+/// replayed on the host (the module's records the GPU may write, and ranges read from a buffer).
 pub(super) fn degrade_host_replay(device: &Device, execute: &Execute) {
+    // The buffer's records, which a route that may write them met, named (`write_routes.rs`).
     let why = if execute.icb.gpu_written() {
-        "an encoder made it resident for writing, so the GPU may write the records an execution \
-         runs"
+        None
     } else if execute.indirect() {
-        "an execution reads its range from a buffer \
-         (executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:), which the GPU may write"
+        Some(
+            "an execution reads its range from a buffer \
+             (executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:), which the GPU may \
+             write",
+        )
     } else if execute.predicated() {
-        "an execution inside a block of command predication, whose condition is GPU memory"
+        Some("an execution inside a block of command predication, whose condition is GPU memory")
     } else {
         // Recorded again for the CPU's writes since the commit (`Execute::rewritten`), waiting
         // for no work on the GPU.
         return;
     };
-    device.degrade(Degradation::HostReplayedIndirectCommands, || {
+    device.degrade_host_step(HostStepKey::Compute, || {
+        let why = match why {
+            Some(why) => why.to_owned(),
+            None => replay_why(&execute.icb, "the records an execution runs"),
+        };
         (
             format!(
                 "an indirect command buffer of {} commands",
                 execute.icb.size()
             ),
-            why.to_owned(),
+            why,
         )
     });
 }
@@ -700,7 +876,8 @@ struct Bindings {
     lengths: BTreeMap<u32, u32>,
     /// The kernel buffer indices bound with a stride past 32 bits.
     wide_strides: Vec<u32>,
-    /// The kernel buffer indices bound without a stride.
+    /// The kernel buffer indices bound without a stride, which a stage-in layout of
+    /// `MTLBufferLayoutStrideDynamic` reads at [`unstrided_stride`]'s.
     unstrided: Vec<u32>,
 }
 

@@ -10,7 +10,9 @@
 //!   area rounded up to whole tiles of [`TILE`] pixels a side, clipped to the attachment's level,
 //!   in a pass with a draw call (one whose primitives cover nothing, or of no vertex, included),
 //!   and in each layer of a layered pass, with a draw call or not; a pass of one layer without a
-//!   draw call clears the whole level and slice. So for every format measured (`R8Unorm` to `RGBA32Float`, 1 to 16 bytes a pixel, and
+//!   draw call clears the whole level and slice of a texture Metal keeps losslessly compressed,
+//!   and the render area's tiles of one it keeps uncompressed ([`clears_whole`]). So for every
+//!   format measured (`R8Unorm` to `RGBA32Float`, 1 to 16 bytes a pixel, and
 //!   eight `RGBA8Unorm` or four `RGBA32Float` attachments at 4 samples), at 1, 2 and 4 samples,
 //!   with a descriptor's tile of 16x16, for `Depth32Float`, `Depth16Unorm`, `Stencil8` and
 //!   `Depth32Float_Stencil8`, at a level or slice past the first, over render areas of 1x1,
@@ -21,7 +23,31 @@
 //!   (32x32 pixels at 1 and 2 samples, 32x16 at 4, color and depth alike on both chips), the
 //!   tile holds zero before the draws (a color, every color attachment of the pass) or the
 //!   attachment's clear value (depth, stencil); the tiles no primitive touches keep their texels.
-//!   Which tiles those are depends on where the GPU places the vertices.
+//!   Which tiles those are depends on where the GPU places the vertices. Separate depth and
+//!   stencil textures alike, each aspect apart, as one `Depth32Float_Stencil8` texture (an M3
+//!   Max, macOS 27.0.1: a `Depth32Float` and a `Stencil8` texture of 128x128, either or both
+//!   loaded `DontCare` and stored, the other loaded and stored, under draws writing both over
+//!   small rectangles): 32x32 tiles for both aspects. A draw that neither tests nor writes the
+//!   depth and stencil (a depth test `Always` without writes, the default stencil state) leaves
+//!   them their texels in every tile it touches, one texture or separate ones, where the runtime
+//!   clears them (`docs/FAST-PATHS.md`'s known gaps).
+//! - **A `DontCare` load's clear depth** is clamped to `[0, 1]` as a `Clear` load's is (2.0
+//!   reads 1.0, -1.0 reads 0), and a NaN one is Metal's NaN clear (`nan_clear.rs`): the tiles
+//!   hold `0x7fc00000` (a 32-bit float depth) or 0 (`Depth16Unorm`), and a draw tests against it
+//!   as Metal's test orders a NaN, above every value (the M3 Max, macOS 27.0.1, a 32-bit float
+//!   and a 16-bit depth, one texture and separate ones, stored and not, without API validation;
+//!   API validation stops such a pass, as one whose `Clear` load holds it: "clear depth (nan) is
+//!   outside of the range [0..1]").
+//! - **A `DontCare` load** of an attachment the pass does not store (`DontCare`) reads the same
+//!   wherever a fragment reads it: zero (a color) or the pass's clear value (a stencil), never its
+//!   earlier texels (an M3 Max, macOS 27.0.1, lane `dont_care_unstored`: an `RG16Float` second
+//!   color a framebuffer fetch reads and a `Stencil8` a stencil test reads, over 224x128 and
+//!   128x128 targets, in a pass whose first draw reaches some tiles and a later one every tile, a
+//!   pass of the reading draw alone, and a pass of no fetch). Separate depth and stencil textures
+//!   read the same, each aspect apart (a `Depth32Float` and a `Stencil8` texture read by a depth
+//!   and a stencil test over the same targets, with and without API validation): an aspect loaded
+//!   `DontCare` and not stored reads the clear value whether the other aspect is so loaded or is
+//!   loaded and stored, which reads its texels.
 //! - A `Load` keeps the texels past the render area, and a `DontCare` store stores nothing.
 //!
 //! **The runtime** gives the `Clear` load's answer and the `DontCare` load's near-equivalent, as
@@ -31,8 +57,8 @@
 //! command buffer's render commands, or a tile dispatch, is taken as a draw call that draws (both
 //! unmeasured).
 //!
-//! - A `DontCare`-loaded attachment the pass stores (but separate depth and stencil textures, and
-//!   memoryless ones) loads in a pass whose draws reach no tile, and clears to zero (a color) or
+//! - A `DontCare`-loaded attachment the pass stores (but memoryless ones) loads in a pass whose
+//!   draws reach no tile, and clears to zero (a color) or
 //!   its clear value (depth, stencil) in one whose draws reach every tile, both Metal's answer
 //!   ([`PassReach`]). In a pass whose draws reach the tiles their primitives touch, it clears
 //!   too: Metal's answer in each tile a draw touches, and in a tile none touches, where Metal
@@ -42,6 +68,30 @@
 //!   pass's `tileWidth` and `tileHeight`, which set Metal's grid, as measured), a clear before the
 //!   pass, and loads: every other tile keeps its texels, Metal's answer (a draw writes no pixel
 //!   outside them), and a pass whose draws reach no pixel loads, as one whose draws draw nothing.
+//!   An aspect of separate depth and stencil textures takes the same answers in the scratch image
+//!   the pass renders them through (`depth_stencil_scratch.rs`): it loads by the copy into that
+//!   image, and its tiles are cleared after the copy. Where it cannot be copied in (a multisampled
+//!   aspect copied by draws) the scratch clears it over the render area, the near-equivalent
+//!   wherever the draws do not reach every tile, announced (`Degradation::DontCareLoadTiles`).
+//! - A depth whose `DontCare` load clears, at a NaN clear depth, which a Vulkan clear value does
+//!   not hold: a `Depth16Unorm` clears to 0, Metal's answer, and a 32-bit float depth to 1.0, the
+//!   value Metal's test orders a NaN nearest, where a fragment at exactly 1.0 tests otherwise and
+//!   the depth stored holds 1.0, announced (`Degradation::SignedDepthTest`). A clear depth out of
+//!   `[0, 1]` is clamped, Metal's answer (`render_pass.rs`).
+//! - A `DontCare`-loaded attachment the pass does not store (but memoryless ones), in a pass whose
+//!   draws reach a tile, clears to zero (a color) or its clear value (depth, stencil) over the
+//!   render area under `UnstoredDontCarePolicy::Cleared`, and under the default `Driver` on a
+//!   driver measured to run that clear no slower than its `DONT_CARE` load
+//!   (`DriverFact::UnstoredClearNoSlower`) ([`UnstoredLoads`]): by the load operation of the
+//!   pass's first instance, or before the pass where that instance leaves it out (as below); an
+//!   aspect of separate depth and stencil textures by the load operation of the scratch image the
+//!   pass renders them through (`depth_stencil_scratch.rs`), which copies nothing into that
+//!   aspect, each aspect apart. Metal's answer wherever a fragment reads it, so no notice: no
+//!   fragment reads a tile no draw touches. What the pass leaves in it is a
+//!   `DontCare` store's (`kept_bytes.rs`, `dont-care-store`). On every other driver under the
+//!   default it stays `DontCare`, the driver's faster form, announced
+//!   (`Degradation::DontCareUnstoredLoad`). In a pass whose draws reach no tile it stays
+//!   `DontCare`.
 //! - A `DontCare`-loaded memoryless color attachment clears to zero in a pass whose draws reach a
 //!   tile: Metal's answer in every tile a fragment reads it (an Apple M4), and it is
 //!   never stored, so the answer is exact.
@@ -60,6 +110,12 @@
 //!   So is a cleared attachment the pass's first instance leaves out where no whole-subresource
 //!   clear may stand for its load operation (`render.rs`'s `cleared_ahead`), over the render area
 //!   where it stores nothing.
+//! - A depth a pass at custom sample positions clears, on a driver that stores and tests a
+//!   depth its pass clears at the standard positions there
+//!   (`DriverFact::ClearedDepthAtStandardPositions`), is cleared before the pass the same way
+//!   wherever its clear reaches, over the render area where the pass does not store it, a
+//!   memoryless one too, and the pass then loads it: a pass that loads the depth takes the
+//!   positions (`sample_positions.rs`).
 //! - A pass whose first instance records inline clears none before it: that instance, begun at a
 //!   draw that records (of a vertex and an instance at least), renders over the reach its colors
 //!   share, and its load operations' clear reaches it (`render/inline_first.rs`). Unmeasured on
@@ -72,10 +128,12 @@ use super::render_pass::{AspectClear, PassLayout, Target};
 use super::render_target::{self, FramebufferObject, RenderPassObject};
 use super::render_values::{LoadAction, StoreAction};
 use super::resource::ResourceKey;
+use super::texture::heap_tiled::metal_compresses_layout;
+use super::texture_descriptor::TextureLayout;
 use super::tracker::{Barrier, Use};
-use super::values::StorageMode;
 use super::Device;
 use ash::vk;
+use metal2vulkan::device::{DriverFact, UnstoredDontCarePolicy};
 use metal2vulkan::metal::format::ClearRoute;
 use metal2vulkan::metal::PixelFormat;
 use std::collections::BTreeSet;
@@ -97,7 +155,8 @@ pub(super) const TILE: u32 = 32;
 
 /// The extent from the origin that a `Clear` load of an attachment of `extent` clears in a pass
 /// over the render area `area`: the render area rounded up to whole [`TILE`]s, clipped to the
-/// attachment; the whole attachment where `whole` (a pass of one layer without a draw).
+/// attachment; the whole attachment where `whole` (a pass of one layer without a draw, over an
+/// attachment [`clears_whole`] holds for).
 pub(super) fn reach(area: [u32; 2], extent: [u32; 2], whole: bool) -> [u32; 2] {
     if whole {
         return extent;
@@ -110,10 +169,64 @@ pub(super) fn reach(area: [u32; 2], extent: [u32; 2], whole: bool) -> [u32; 2] {
     })
 }
 
-/// The extent from the origin that a `Clear` load of an attachment of `extent` clears in
-/// `layout`'s pass, a pass with a draw call where `called`: [`reach`] over its render area.
-pub(super) fn cleared(layout: &PassLayout, extent: [u32; 2], called: bool) -> [u32; 2] {
-    reach(layout.extent, extent, !called && layout.layers == 1)
+/// The extent from the origin that a `Clear` load of `target`, an attachment's own level and
+/// layers (a stand-in's `own`, of the stand-in's extent), clears in `layout`'s pass, a pass with a
+/// draw call where `called`: [`reach`] over its render area.
+pub(super) fn cleared(layout: &PassLayout, target: &Target, called: bool) -> [u32; 2] {
+    let whole = !called && layout.layers == 1 && clears_whole(target);
+    reach(layout.extent, target.extent, whole)
+}
+
+/// Whether a `Clear` load of `target` in a pass of one layer without a draw call clears its whole
+/// level and slice, past the render area's tiles. On a device that presents an Apple silicon
+/// Mac's compression (`Device::metal_compresses_textures`), where Metal keeps the attachment's
+/// texture (a view's first texture) losslessly compressed (`heap_tiled::metal_compresses_layout`
+/// of its type, level 0, samples, usage and `allowGPUOptimizedContents`; never one over a
+/// buffer): our probes `clearreach2` and `clearreach3` on the M3 Max (macOS 27.0.1), a new
+/// `Private` attachment against an untouched twin, cleared whole where the texture was
+/// compressed and over the render area's tiles where it was not, at every one of 16 color
+/// formats (1 to 16 bytes a texel, float, unorm and integer), `Depth32Float`, `Depth16Unorm`,
+/// `Stencil8` and `Depth32Float_Stencil8` (each aspect), 1, 2 and 4 samples, a level past the
+/// first (one under 16 texels a side included), a slice past the first, a cube's face, a 3D
+/// texture's plane, a view of the same format, of one level, and of another format,
+/// `ShaderWrite` and `PixelFormatView` usage, a level 0 under and at 16 texels a side, and a
+/// texture over a buffer, the property on and off; the consumer's probe alike (`tileclear2`,
+/// jobs m3-max-12716 and m3-max-12735). On a device that presents a Mac keeping no texture
+/// compressed, as a Mac with an Intel or AMD GPU does, always: those Macs disagree (an AMD
+/// Radeon Pro 5300M clears the whole level, an Intel UHD 630 anything from the render area to
+/// the whole texture: jobs m3-max-12736 and m3-max-12737), and the runtime gives the 5300M's
+/// answer.
+pub(super) fn clears_whole(target: &Target) -> bool {
+    let device = target.texture.generation();
+    if !device.metal_compresses_textures() {
+        return true;
+    }
+    let mut root = &target.texture;
+    while let Some(parent) = root.parent_texture() {
+        root = parent;
+    }
+    let narrow = |side: u64| u32::try_from(side).unwrap_or(u32::MAX);
+    let layout = TextureLayout {
+        texture_type: root.texture_type(),
+        pixel_format: root.pixel_format(),
+        extent: [root.width(), root.height(), root.depth()].map(narrow),
+        levels: narrow(root.mipmap_level_count()),
+        layers: narrow(root.array_length()),
+        samples: narrow(root.sample_count()),
+    };
+    let optimized = root.allow_gpu_optimized_contents();
+    !root.over_buffer() && metal_compresses_layout(&layout, root.usage(), optimized)
+}
+
+/// Whether a `Clear` load of an attachment of `extent` that the pass stores, over the render area
+/// `area` in a pass with a draw call where `called`, is cleared before the pass and loaded in it
+/// though its clear reaches no further than the render area ([`ReachClears`]): in a pass without
+/// a draw call over an attachment larger than the render area. A pass's own clear on a device that
+/// renders through Metal (MoltenVK) reaches the whole attachment there (lane `fresh_clear_reach`
+/// on MoltenVK: an uncompressed 128x128 target cleared over 64x64), where Metal's reaches the
+/// render area's tiles of a texture it keeps uncompressed.
+fn own_clear_overreaches(area: [u32; 2], extent: [u32; 2], called: bool) -> bool {
+    !called && (0..2).any(|axis| area[axis] < extent[axis])
 }
 
 /// Whether Metal's `store` keeps an attachment's texels.
@@ -182,7 +295,7 @@ impl PassReach {
 
 /// Whether `target`'s texture is memoryless.
 fn memoryless(target: &Target) -> bool {
-    target.texture.storage_mode() == StorageMode::Memoryless
+    target.texture.is_memoryless()
 }
 
 /// The clear value a `DontCare` load that clears gives a color attachment of `pf`: the format's
@@ -198,10 +311,30 @@ pub(super) fn dont_care_clear(pf: PixelFormat) -> vk::ClearColorValue {
 
 /// Give each `DontCare` load of `layout` that the module docs name its answer in a pass of
 /// `reach`: `Load` where it reaches no tile, else `Clear`, to the format's zero for a color
-/// attachment ([`dont_care_clear`]) and to its clear value for depth and stencil. Which attachments took it, and whether the pass took
-/// the near-equivalent (its draws reach the tiles their primitives touch): the attachment it
-/// names, for the notice.
-pub(super) fn dont_care_loads(layout: &mut PassLayout, reach: PassReach) -> DontCareLoads {
+/// attachment ([`dont_care_clear`]) and to its clear value for depth and stencil. One of an
+/// attachment the pass does not store takes `Clear` wherever the pass reaches a tile, over its
+/// whole render area, by the load operation, where `unstored` clears it (the module docs): no
+/// fragment reads past the tiles its draws touch, and no texel is kept; elsewhere it stays
+/// `DontCare`, and is named for its notice. Which stored attachments took it, and whether the
+/// pass took the near-equivalent (its draws reach the tiles their primitives touch): the
+/// attachment it names, for the notice.
+///
+/// An aspect of separate depth and stencil textures, which the pass renders through its scratch
+/// image (`depth_stencil_scratch.rs`), takes the same answers in that image, each aspect apart.
+/// One the pass stores loads by a copy into the image where `copies_in` holds for it (depth,
+/// stencil); where it does not, it takes `Clear` over the render area, Metal's answer in a pass
+/// whose draws reach every tile and elsewhere the near-equivalent, named for its notice.
+///
+/// A depth that takes `Clear` here whose clear depth is a NaN (only a `Clear` load's NaN is
+/// written, `nan_clear.rs`) clears to Metal's answer where the device can hold it, 0 for a
+/// `Depth16Unorm`, and elsewhere to 1.0, the value Metal's depth test orders a NaN nearest
+/// ([`DontCareLoads::cleared_depth`]).
+pub(super) fn dont_care_loads(
+    layout: &mut PassLayout,
+    reach: PassReach,
+    unstored: UnstoredLoads,
+    copies_in: [bool; 2],
+) -> DontCareLoads {
     let load = match reach {
         PassReach::Nothing => LoadAction::Load,
         PassReach::Every | PassReach::Draws => LoadAction::Clear,
@@ -209,6 +342,8 @@ pub(super) fn dont_care_loads(layout: &mut PassLayout, reach: PassReach) -> Dont
     let drew = reach == PassReach::Draws;
     let mut loads = DontCareLoads {
         named: None,
+        unstored: None,
+        cleared_depth: None,
         colors: Vec::new(),
         depth: false,
         stencil: false,
@@ -228,7 +363,21 @@ pub(super) fn dont_care_loads(layout: &mut PassLayout, reach: PassReach) -> Dont
             }
             continue;
         }
-        if color.load != LoadAction::DontCare || color.memoryless || !stores(color.store) {
+        if color.load != LoadAction::DontCare || color.memoryless {
+            continue;
+        }
+        if !stores(color.store) {
+            match (reach, unstored) {
+                (PassReach::Nothing, _) => {}
+                (_, UnstoredLoads::Cleared) => {
+                    color.load = LoadAction::Clear;
+                    color.clear = dont_care_clear(color.target.texture.pixel_format());
+                }
+                (_, UnstoredLoads::DontCare) => {
+                    let name = || format!("color attachment {index}");
+                    loads.unstored.get_or_insert_with(name);
+                }
+            }
             continue;
         }
         color.load = load;
@@ -240,19 +389,48 @@ pub(super) fn dont_care_loads(layout: &mut PassLayout, reach: PassReach) -> Dont
                 .get_or_insert_with(|| format!("color attachment {index}"));
         }
     }
-    if let Some(ds) = layout
-        .depth_stencil
-        .as_mut()
-        .filter(|ds| ds.separate.is_none())
-    {
-        for (name, aspect, taken) in [
+    if let Some(ds) = layout.depth_stencil.as_mut() {
+        // Separate depth and stencil textures render through the pass's own scratch image
+        // (`depth_stencil_scratch.rs`), whose load operation is each aspect's: each takes the
+        // same answer there, an aspect the pass stores where it is copied in.
+        let separate = ds.separate.is_some();
+        let depth_dont_care = ds
+            .depth
+            .as_ref()
+            .is_some_and(|depth| depth.load == LoadAction::DontCare);
+        for ((name, aspect, taken), copies_in) in [
             ("depth", ds.depth.as_mut(), &mut loads.depth),
             ("stencil", ds.stencil.as_mut(), &mut loads.stencil),
-        ] {
+        ]
+        .into_iter()
+        .zip(copies_in)
+        {
             let Some(aspect) = aspect else {
                 continue;
             };
-            if aspect.load != LoadAction::DontCare || aspect.memoryless || !stores(aspect.store) {
+            if aspect.load != LoadAction::DontCare || aspect.memoryless {
+                continue;
+            }
+            if !stores(aspect.store) {
+                match (reach, unstored) {
+                    (PassReach::Nothing, _) => {}
+                    (_, UnstoredLoads::Cleared) => aspect.load = LoadAction::Clear,
+                    (_, UnstoredLoads::DontCare) => {
+                        let name = || format!("the {name} attachment");
+                        loads.unstored.get_or_insert_with(name);
+                    }
+                }
+                continue;
+            }
+            // A separate texture's aspect that cannot be copied into the scratch image clears
+            // over the render area, which the draws do not bound.
+            if separate && !copies_in {
+                aspect.load = LoadAction::Clear;
+                if reach != PassReach::Every {
+                    loads
+                        .named
+                        .get_or_insert_with(|| format!("the {name} attachment"));
+                }
                 continue;
             }
             aspect.load = load;
@@ -263,21 +441,74 @@ pub(super) fn dont_care_loads(layout: &mut PassLayout, reach: PassReach) -> Dont
                     .get_or_insert_with(|| format!("the {name} attachment"));
             }
         }
+        // A depth this took `Clear` for, at a NaN clear depth: 0 for a `Depth16Unorm` (Metal's
+        // code), 1.0 for a float depth, which Vulkan's clear cannot hold the NaN of.
+        if let Some(depth) = ds
+            .depth
+            .as_mut()
+            .filter(|depth| depth_dont_care && depth.load == LoadAction::Clear)
+        {
+            let nan = matches!(depth.clear, AspectClear::Depth(value) if value.is_nan());
+            let float = ds.depth_format != Some(PixelFormat::Depth16Unorm);
+            if nan {
+                depth.clear = AspectClear::Depth(if float { 1.0 } else { 0.0 });
+            }
+            if let AspectClear::Depth(value) = depth.clear {
+                loads.cleared_depth = Some((value, nan && float));
+            }
+        }
     }
     loads
 }
 
+/// How [`dont_care_loads`] answers a `DontCare` load of an attachment the pass does not store, in
+/// a pass whose draws reach a tile: by the device's policy and its driver's measured cost
+/// ([`UnstoredLoads::of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UnstoredLoads {
+    /// Cleared over the render area, Metal's answer wherever a draw reads it.
+    Cleared,
+    /// Left to the driver's `DONT_CARE` load, the device's faster form, announced.
+    DontCare,
+}
+
+impl UnstoredLoads {
+    /// Under `UnstoredDontCarePolicy::Cleared`, or on a driver measured to clear such an
+    /// attachment no slower than its `DONT_CARE` load (`DriverFact::UnstoredClearNoSlower`),
+    /// cleared; else left `DontCare`.
+    pub(super) fn of(policy: UnstoredDontCarePolicy, facts: &BTreeSet<DriverFact>) -> Self {
+        match policy == UnstoredDontCarePolicy::Cleared
+            || facts.contains(&DriverFact::UnstoredClearNoSlower)
+        {
+            true => UnstoredLoads::Cleared,
+            false => UnstoredLoads::DontCare,
+        }
+    }
+}
+
 /// What [`dont_care_loads`] did: the attachment it names for the notice where the pass took the
-/// near-equivalent, and the color attachments (by index) and depth and stencil aspects whose
-/// `DontCare` load it gave an answer.
+/// near-equivalent, the attachment it names where it left one the pass does not store `DontCare`,
+/// and the color attachments (by index) and depth and stencil aspects whose `DontCare` load it
+/// gave an answer.
 pub(super) struct DontCareLoads {
     pub(super) named: Option<String>,
+    pub(super) unstored: Option<String>,
+    /// The depth's clear value where its `DontCare` load took `Clear`, and whether that value
+    /// stands for a NaN clear depth Metal's tile holds and the device's clear cannot: 1.0, which a
+    /// fragment at exactly 1.0 tests otherwise than Metal's NaN (`signed-depth-test`).
+    pub(super) cleared_depth: Option<(f32, bool)>,
     colors: Vec<usize>,
     depth: bool,
     stencil: bool,
 }
 
 impl DontCareLoads {
+    /// Whether [`dont_care_loads`] gave any attachment's `DontCare` load an answer: the only
+    /// loads the tiles a pass's draws reach bound ([`ReachClears::plan`]).
+    pub(super) fn any(&self) -> bool {
+        !self.colors.is_empty() || self.depth || self.stencil
+    }
+
     /// Whether [`dont_care_loads`] gave color attachment `index`'s `DontCare` load an answer.
     pub(super) fn color(&self, index: usize) -> bool {
         self.colors.contains(&index)
@@ -292,9 +523,46 @@ impl DontCareLoads {
 /// The most distinct pixel rectangles [`DrawnArea`] keeps; past them it is the whole render area.
 const MOST_RECTS: usize = 1024;
 
+/// What [`DrawnArea`] worked out on this thread: its tile counts ([`DrawnArea::covered_tiles`]) and
+/// its grids of the tiles a pass's draws reach ([`DrawnArea::tiles`]), which a pass end works out
+/// only where a count or a clear reads them (`tests/pass_end_tiles.rs`).
+#[cfg(test)]
+pub(super) mod made {
+    use std::cell::Cell;
+    use std::thread::LocalKey;
+
+    thread_local! {
+        pub(super) static COVERED: Cell<u64> = const { Cell::new(0) };
+        pub(super) static GRIDS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// One more of `what` on this thread.
+    pub(super) fn note(what: &'static LocalKey<Cell<u64>>) {
+        what.with(|made| made.set(made.get() + 1));
+    }
+
+    /// The tile counts and the grids worked out on this thread so far.
+    pub(crate) fn so_far() -> [u64; 2] {
+        [COVERED.with(Cell::get), GRIDS.with(Cell::get)]
+    }
+}
+
 /// The words of a row of tiles in [`DrawnArea::covered_tiles`]: 512 tiles, the 16384 pixels of
 /// the widest render area.
 const ROW_WORDS: usize = 8;
+
+/// Set the bits `bits` of `row`, a row of tiles in [`DrawnArea::covered_tiles`], a word at a time.
+fn set_bits(row: &mut [u64; ROW_WORDS], bits: std::ops::Range<u32>) {
+    if bits.is_empty() {
+        return;
+    }
+    for word in bits.start / 64..bits.end.div_ceil(64) {
+        let first = bits.start.max(word * 64) - word * 64;
+        let past = bits.end.min(word * 64 + 64) - word * 64;
+        let ones = u64::MAX >> (64 - (past - first));
+        row[word as usize] |= ones << first;
+    }
+}
 
 /// The pixels a pass's draws may write, as far as the host bounds them: each draw that draws
 /// writes only inside its viewports' pixels within their scissor rectangles
@@ -304,7 +572,7 @@ const ROW_WORDS: usize = 8;
 /// other tile keeps its texels). The whole render area where a draw's pixels are not bounded so:
 /// an execution of render commands, a tile dispatch, a pass through a rasterization-rate map, or
 /// more than [`MOST_RECTS`] distinct rectangles.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct DrawnArea {
     /// Each distinct `[x0, y0, x1, y1]`, half-open, inside the render area.
     rects: Rects,
@@ -312,12 +580,13 @@ pub(super) struct DrawnArea {
 }
 
 /// Distinct pixel rectangles: the first held in place, as a pass's draws mostly reach one (its
-/// render area), so such a pass allocates none for them; the others in a set.
-#[derive(Clone, Debug, Default)]
+/// render area), so such a pass allocates none for them; the others in order, each once, in a
+/// list that keeps its room when cleared ([`DrawnArea::clear`]).
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Rects {
     first: Option<[u32; 4]>,
     /// Empty while `first` is `None`; never holds `first`.
-    rest: BTreeSet<[u32; 4]>,
+    rest: Vec<[u32; 4]>,
 }
 
 impl Rects {
@@ -327,7 +596,9 @@ impl Rects {
             None => self.first = Some(rect),
             Some(first) if first == rect => {}
             Some(_) => {
-                self.rest.insert(rect);
+                if let Err(at) = self.rest.binary_search(&rect) {
+                    self.rest.insert(at, rect);
+                }
             }
         }
     }
@@ -374,6 +645,19 @@ impl DrawnArea {
         }
     }
 
+    /// Whether a pixel of the area may lie inside `area`, `[x0, y0, x1, y1)` (`None` for every
+    /// pixel): one of its rectangles meets it, or it bounds nothing.
+    pub(super) fn meets(&self, area: Option<[u32; 4]>) -> bool {
+        if self.whole {
+            return true;
+        }
+        let Some([b0, b1, b2, b3]) = area else {
+            return self.rects.len() > 0;
+        };
+        (self.rects.iter())
+            .any(|&[a0, a1, a2, a3]| a0.max(b0) < a2.min(b2) && a1.max(b1) < a3.min(b3))
+    }
+
     /// The rectangle `[x0, y0, x1, y1)` bounding every rectangle, half-open in the render area's
     /// pixels: `None` where the area bounds nothing, or holds no rectangle.
     pub(super) fn bounds(&self) -> Option<[u32; 4]> {
@@ -393,6 +677,8 @@ impl DrawnArea {
     /// `None` where it bounds nothing. A count (`WorkCounts::shadow_attachment_tiles_covered`):
     /// what a copy cut to the rectangles' tiles would leave out of one cut to their bounds.
     pub(super) fn covered_tiles(&self) -> Option<(u64, u64)> {
+        #[cfg(test)]
+        made::note(&made::COVERED);
         let [x0, y0, x1, y1] = self.bounds()?;
         let (tx0, ty0) = (x0 / TILE, y0 / TILE);
         let (tx1, ty1) = (x1.div_ceil(TILE), y1.div_ceil(TILE));
@@ -402,22 +688,31 @@ impl DrawnArea {
         if (tx1 - tx0) as usize > ROW_WORDS * 64 {
             return Some((bounded, bounded));
         }
+        // Each rectangle's tiles: its columns from the bounds' first, and its rows.
+        let tiled = |&[rx0, ry0, rx1, ry1]: &[u32; 4]| {
+            (rx0 < rx1 && ry0 < ry1).then(|| {
+                let columns = rx0 / TILE - tx0..rx1.div_ceil(TILE) - tx0;
+                (columns, ry0 / TILE..ry1.div_ceil(TILE))
+            })
+        };
+        // The rows where a rectangle's tiles start or end: every row from one such edge to the
+        // next is reached by the same rectangles, so one row of tiles counts for them all.
+        let mut edges: Vec<u32> = (self.rects.iter().filter_map(tiled))
+            .flat_map(|(_, rows)| [rows.start, rows.end])
+            .collect();
+        edges.sort_unstable();
+        edges.dedup();
         let mut covered = 0;
-        for ty in ty0..ty1 {
-            let (top, bottom) = (ty * TILE, (ty + 1) * TILE);
+        for band in edges.windows(2) {
+            let (top, bottom) = (band[0], band[1]);
             let mut row = [0u64; ROW_WORDS];
-            for &[rx0, ry0, rx1, ry1] in self.rects.iter() {
-                if rx0 >= rx1 || ry0 >= ry1 || ry0 >= bottom || ry1 <= top {
-                    continue;
-                }
-                for tile in rx0 / TILE - tx0..rx1.div_ceil(TILE) - tx0 {
-                    row[(tile / 64) as usize] |= 1 << (tile % 64);
+            for (columns, rows) in self.rects.iter().filter_map(tiled) {
+                if rows.contains(&top) {
+                    set_bits(&mut row, columns);
                 }
             }
-            covered += row
-                .iter()
-                .map(|word| u64::from(word.count_ones()))
-                .sum::<u64>();
+            let tiles: u64 = row.iter().map(|word| u64::from(word.count_ones())).sum();
+            covered += u64::from(bottom - top) * tiles;
         }
         Some((covered, bounded))
     }
@@ -439,6 +734,18 @@ impl DrawnArea {
         }
     }
 
+    /// No rectangle, as a new area: its list's room kept for a next pass's draws
+    /// (`render/draw_room.rs`).
+    pub(super) fn clear(&mut self) {
+        self.whole = false;
+        self.rects.clear();
+    }
+
+    /// The rectangles it holds room for.
+    pub(super) fn room(&self) -> usize {
+        self.rects.rest.capacity()
+    }
+
     /// Bound nothing: the draws may write anywhere in the render area.
     pub(super) fn everywhere(&mut self) {
         self.whole = true;
@@ -450,8 +757,32 @@ impl DrawnArea {
     /// `None` where that is every tile of the render area rounded up to whole tiles, the area is
     /// not bounded, or the pass's sample count has no measured tile size.
     pub(super) fn tiles(&self, layout: &PassLayout) -> Option<DrawnTiles> {
+        #[cfg(test)]
+        made::note(&made::GRIDS);
         let tile = layout.tile.tile.filter(|_| !self.whole)?;
         self.tiles_of(tile, layout.extent)
+    }
+
+    /// Whether [`tiles`](Self::tiles) holds tiles and none is reached: the rectangles reach no
+    /// tile of `layout`'s pass, which a scan of them answers with no grid made.
+    pub(super) fn reaches_no_tile(&self, layout: &PassLayout) -> bool {
+        layout
+            .tile
+            .tile
+            .filter(|_| !self.whole)
+            .is_some_and(|tile| self.reaches_no_tile_of(tile, layout.extent))
+    }
+
+    /// [`reaches_no_tile`](Self::reaches_no_tile) at `tile` pixels a side of a render area of
+    /// `extent`: a grid of tiles, none of which a rectangle overlaps, as
+    /// [`tiles_of`](Self::tiles_of) sets them.
+    fn reaches_no_tile_of(&self, tile: [u32; 2], extent: [u32; 2]) -> bool {
+        let [per_row, rows] = [0, 1].map(|axis| extent[axis].div_ceil(tile[axis]));
+        let overlaps = |&[x0, y0, x1, y1]: &[u32; 4]| {
+            x0 / tile[0] < x1.div_ceil(tile[0]).min(per_row)
+                && y0 / tile[1] < y1.div_ceil(tile[1]).min(rows)
+        };
+        per_row != 0 && rows != 0 && !self.rects.iter().any(overlaps)
     }
 
     /// The tiles of `tile` pixels a side of a render area of `extent` the rectangles reach:
@@ -501,11 +832,6 @@ pub(super) struct DrawnTiles {
 }
 
 impl DrawnTiles {
-    /// Whether no tile is reached.
-    pub(super) fn is_empty(&self) -> bool {
-        self.words.iter().all(|&w| w == 0)
-    }
-
     /// Whether tile `(tx, ty)` is reached: none past the grid.
     pub(super) fn contains(&self, tx: u32, ty: u32) -> bool {
         let t = (ty as usize) * (self.per_row as usize) + tx as usize;
@@ -604,7 +930,11 @@ impl ReachClears {
                 continue;
             }
             let extent = match stores(color.store) {
-                true => cleared(layout, color.target.extent, called),
+                true => cleared(
+                    layout,
+                    color.stand_in.as_ref().map_or(&color.target, |s| &s.own),
+                    called,
+                ),
                 false => area,
             };
             // A color held in sample planes keeps its `Clear` load (`load_in_pass`): its tiles
@@ -612,7 +942,13 @@ impl ReachClears {
             let tiles = bounded
                 .filter(|(loads, _)| loads.colors.contains(&index) && color.planes.is_none())
                 .map(|(_, tiles)| tiles);
-            if extent == area && !left_out.contains(&(index as u32)) && tiles.is_none() {
+            let overreaches =
+                stores(color.store) && own_clear_overreaches(area, color.target.extent, called);
+            if extent == area
+                && !left_out.contains(&(index as u32))
+                && tiles.is_none()
+                && !overreaches
+            {
                 continue;
             }
             let rects = tiles.map_or_else(|| vec![rect(extent)], |t| t.rects(extent));
@@ -630,11 +966,27 @@ impl ReachClears {
                 value: vk::ClearValue { color: color.clear },
             });
         }
-        if let Some(ds) = layout
-            .depth_stencil
-            .as_ref()
-            .filter(|ds| ds.separate.is_none() && !memoryless(&ds.target))
-        {
+        // A depth the pass clears at custom sample positions on a driver that stores and tests
+        // it at the standard ones there (`DriverFact::ClearedDepthAtStandardPositions`): cleared
+        // before the pass, memoryless or unstored too, so that the pass loads it, which takes the
+        // positions. One the pass does not store is cleared over the render area alone.
+        let positioned = !layout.sample_positions.is_empty()
+            && device
+                .properties()
+                .driver_facts
+                .contains(&DriverFact::ClearedDepthAtStandardPositions);
+        let positioned_depth = |ds: &super::render_pass::DepthStencilTarget| {
+            positioned && ds.depth.is_some_and(|a| a.load == LoadAction::Clear)
+        };
+        // Separate depth and stencil textures' scratch image (`depth_stencil_scratch.rs`): only
+        // the tiles of a bounded `DontCare` load, over the render area its copies cover.
+        if let Some(ds) = layout.depth_stencil.as_ref().filter(|ds| {
+            let bounded = bounded.is_some_and(|(loads, _)| loads.depth || loads.stencil);
+            match ds.separate {
+                Some(_) => bounded,
+                None => !memoryless(&ds.target) || positioned_depth(ds),
+            }
+        }) {
             let cleared_aspect = |aspect: Option<&super::render_pass::AspectTarget>| {
                 aspect.is_some_and(|a| {
                     a.load == LoadAction::Clear && !a.memoryless && stores(a.store)
@@ -644,7 +996,11 @@ impl ReachClears {
                 cleared_aspect(ds.depth.as_ref()),
                 cleared_aspect(ds.stencil.as_ref()),
             );
-            let extent = cleared(layout, ds.target.extent, called);
+            let reached = cleared(
+                layout,
+                ds.stand_in.as_ref().map_or(&ds.target, |s| &s.own),
+                called,
+            );
             let mut value = vk::ClearDepthStencilValue::default();
             for aspect in [ds.depth.as_ref(), ds.stencil.as_ref()]
                 .into_iter()
@@ -661,12 +1017,28 @@ impl ReachClears {
                 Some((loads, tiles)) => (Some(tiles), [loads.depth, loads.stencil]),
                 None => (None, [false, false]),
             };
+            let separate = ds.separate.is_some();
+            let forced = positioned_depth(ds) && !separate;
             let parts = [
-                ([depth && !bound[0], stencil && !bound[1]], None),
-                ([depth && bound[0], stencil && bound[1]], tiles),
+                (
+                    [
+                        depth && !bound[0] && !separate,
+                        stencil && !bound[1] && !separate,
+                    ],
+                    None,
+                    reached,
+                ),
+                (
+                    [depth && bound[0], stencil && bound[1]],
+                    tiles,
+                    if separate { area } else { reached },
+                ),
+                ([forced && !depth, false], None, area),
             ];
-            for ([depth, stencil], tiles) in parts {
-                if !(depth || stencil) || (extent == area && tiles.is_none()) {
+            let overreaches = own_clear_overreaches(area, ds.target.extent, called);
+            for ([depth, stencil], tiles, extent) in parts {
+                let reaches = extent != area || tiles.is_some() || (forced && depth) || overreaches;
+                if !(depth || stencil) || !reaches {
                     continue;
                 }
                 let rects = tiles.map_or_else(|| vec![rect(extent)], |t| t.rects(extent));
@@ -713,6 +1085,7 @@ impl ReachClears {
                         .filter(|color| color.load == LoadAction::Clear && color.planes.is_none())
                     {
                         color.load = LoadAction::Load;
+                        color.cleared_ahead = true;
                     }
                 }
                 Reached::DepthStencil { depth, stencil } => {
@@ -800,7 +1173,7 @@ fn rect([width, height]: [u32; 2]) -> vk::Rect2D {
 
 #[cfg(test)]
 mod tests {
-    use super::{dont_care_clear, DrawnArea};
+    use super::{dont_care_clear, made, DrawnArea};
     use ash::vk;
     use metal2vulkan::metal::format::{ClearRoute, ExtendedRange};
     use metal2vulkan::metal::PixelFormat;
@@ -873,12 +1246,90 @@ mod tests {
             // An L: the bounds reach the corner the rectangles leave out.
             (vec![rect(0, 0, 64, 32), rect(0, 32, 32, 32)], Some((3, 4))),
         ];
+        let [counted, _] = made::so_far();
         for (case, (rects, expected)) in cases.iter().enumerate() {
             let mut area = DrawnArea::default();
             area.add(rects);
             assert_eq!(area.covered_tiles(), *expected, "case {case}");
         }
         assert_eq!(DrawnArea::unbounded().covered_tiles(), None);
+        // Each count is noted on this thread, for the tests that hold a pass end to its counts.
+        assert_eq!(made::so_far()[0] - counted, cases.len() as u64 + 1);
+        // Against the tiles counted one at a time, for rectangles spread over a large area.
+        let mut seed = 0x2545_f491_u64;
+        let mut next = |below: u32| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            ((seed >> 33) % u64::from(below)) as u32
+        };
+        for case in 0..200 {
+            let rects: Vec<vk::Rect2D> = (0..1 + next(24))
+                .map(|_| {
+                    rect(
+                        next(3000) as i32,
+                        next(2000) as i32,
+                        1 + next(900),
+                        1 + next(700),
+                    )
+                })
+                .collect();
+            let mut area = DrawnArea::default();
+            area.add(&rects);
+            let [x0, y0, x1, y1] = area.bounds().expect("a rectangle");
+            let (tx0, ty0, tx1, ty1) = (x0 / 32, y0 / 32, x1.div_ceil(32), y1.div_ceil(32));
+            let mut covered = 0;
+            for ty in ty0..ty1 {
+                for tx in tx0..tx1 {
+                    let reached = area.rects.iter().any(|&[rx0, ry0, rx1, ry1]| {
+                        rx0 < (tx + 1) * 32 && tx * 32 < rx1 && ry0 < (ty + 1) * 32 && ty * 32 < ry1
+                    });
+                    covered += u64::from(reached);
+                }
+            }
+            let bounded = u64::from(tx1 - tx0) * u64::from(ty1 - ty0);
+            assert_eq!(
+                area.covered_tiles(),
+                Some((covered, bounded)),
+                "case {case}"
+            );
+        }
+    }
+
+    /// Cleared, an area bounds nothing as a new one does and keeps its list's room; rectangles
+    /// added to it then are a new area's, in the same order, each once.
+    #[test]
+    fn a_cleared_area_is_a_new_one_with_its_room() {
+        let rect = |x: i32, y: i32| vk::Rect2D {
+            offset: vk::Offset2D { x, y },
+            extent: vk::Extent2D {
+                width: 8,
+                height: 8,
+            },
+        };
+        let rects = [
+            rect(40, 0),
+            rect(0, 40),
+            rect(0, 0),
+            rect(40, 0),
+            rect(20, 20),
+        ];
+        let mut kept = DrawnArea::default();
+        kept.add(&rects);
+        kept.everywhere();
+        kept.clear();
+        kept.add(&rects);
+        let room = kept.room();
+        assert!(room >= 3, "{room}");
+        kept.clear();
+        assert_eq!((kept.bounds(), kept.room()), (None, room));
+        let mut reversed = rects;
+        reversed.reverse();
+        kept.add(&reversed);
+        let mut fresh = DrawnArea::default();
+        fresh.add(&reversed);
+        let all = |area: &DrawnArea| area.rects.iter().copied().collect::<Vec<_>>();
+        assert_eq!(all(&kept), all(&fresh));
+        assert_eq!(all(&fresh).len(), 4);
+        assert_eq!(kept.room(), room, "no list made again");
     }
 
     /// The tiles a pass's rectangles reach are the tiles each overlaps, whether one of them
@@ -905,6 +1356,10 @@ mod tests {
             vec![rect(0, 0, 50, 70), rect(50, 0, 50, 70)],
             vec![rect(40, 20, 10, 10)],
             vec![],
+            // Past the grid, across and down: no tile.
+            vec![rect(128, 0, 10, 10)],
+            vec![rect(0, 80, 10, 10), rect(130, 90, 5, 5)],
+            vec![rect(96, 64, 4, 6)],
         ];
         for (case, rects) in cases.iter().enumerate() {
             let mut area = DrawnArea::default();
@@ -919,6 +1374,9 @@ mod tests {
                 })
             };
             let every = (0..rows).all(|ty| (0..per_row).all(|tx| reached(tx, ty)));
+            // The scan with no grid made answers whether the grid holds none.
+            let none = (0..rows).all(|ty| (0..per_row).all(|tx| !reached(tx, ty)));
+            assert_eq!(area.reaches_no_tile_of(tile, extent), none, "case {case}");
             match area.tiles_of(tile, extent) {
                 None => assert!(every, "case {case}"),
                 Some(tiles) => {

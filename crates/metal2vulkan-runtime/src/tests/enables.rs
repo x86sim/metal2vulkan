@@ -1,6 +1,6 @@
 use crate::enables::{
-    host_image_copy_names, linear_color_attachment_names, names_of, Enables, Promotion, CORE_1_3,
-    MEMBERS,
+    host_image_copy_names, linear_color_attachment_names, names_of, Enables, Promotion,
+    ZeroInitializeDeviceMemoryFeatures, CORE_1_3, MEMBERS,
 };
 use crate::error::{Error, RuntimeGap};
 use ash::vk;
@@ -16,8 +16,7 @@ const V1_4: ApiVersion = ApiVersion { major: 1, minor: 4 };
 /// Every committed profile's recommendation at its version capped by `instance` (an instance of
 /// Vulkan 1.2 caps every device at 1.2), as `(file, set, version)`.
 fn recommendations(instance: ApiVersion) -> Vec<(std::path::PathBuf, EnableSet, ApiVersion)> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles");
+    let dir = metal2vulkan_devtools::validation_dir().join("profiles");
     let mut out = Vec::new();
     for entry in std::fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
@@ -74,8 +73,7 @@ fn every_recommended_enable_has_a_member_and_a_name() {
 /// creation (the committed profiles' recommendations cover only the features their captures read).
 #[test]
 fn every_feature_the_rules_enable_has_a_member() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles/roadmap-2022.json");
+    let path = metal2vulkan_devtools::validation_dir().join("profiles/roadmap-2022.json");
     let text = std::fs::read_to_string(path).unwrap();
     for api in [ApiVersion::V1_2, ApiVersion::V1_3, V1_4] {
         let mut extensions: BTreeSet<VkExtension> = VkFeature::ALL
@@ -240,8 +238,7 @@ fn members_are_unique() {
 /// nothing for a feature the description keeps without one.
 #[test]
 fn promotions_are_the_descriptions() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles/roadmap-2022.json");
+    let path = metal2vulkan_devtools::validation_dir().join("profiles/roadmap-2022.json");
     let text = std::fs::read_to_string(path).unwrap();
     let all: BTreeSet<VkFeature> = MEMBERS.iter().map(|member| member.feature).collect();
     let none = BTreeSet::new();
@@ -472,6 +469,53 @@ fn linear_color_attachment_is_enabled_in_its_own_structure() {
     assert_eq!(read(&mut enables), (Some(vk::TRUE), names));
 }
 
+/// The runtime's own `zeroInitializeDeviceMemory` is set in its own structure, of the registry's
+/// structure type, chained into the create info only once enabled, with
+/// `VK_EXT_zero_initialize_device_memory` after host image copy's names.
+#[test]
+fn zero_initialize_device_memory_is_enabled_in_its_own_structure() {
+    let read = |enables: &mut Enables| {
+        enables.with_create_info(&[], |info| {
+            let mut member = None;
+            let mut next = info.p_next.cast::<vk::BaseInStructure>();
+            while !next.is_null() {
+                // SAFETY: every structure of the chain lives for the call, and each begins with
+                // `sType` and `pNext`.
+                let base = unsafe { &*next };
+                if base.s_type
+                    == <ZeroInitializeDeviceMemoryFeatures as vk::TaggedStructure>::STRUCTURE_TYPE
+                {
+                    // SAFETY: a structure of this type is the zero initialize features'.
+                    let zero = unsafe { &*next.cast::<ZeroInitializeDeviceMemoryFeatures>() };
+                    member = Some(zero.zero_initialize_device_memory);
+                }
+                next = base.p_next;
+            }
+            let names: Vec<CString> = (0..info.enabled_extension_count as usize)
+                // SAFETY: the create info's names are its count of live C strings.
+                .map(|i| unsafe { CStr::from_ptr(*info.pp_enabled_extension_names.add(i)) })
+                .map(CStr::to_owned)
+                .collect();
+            (member, names)
+        })
+    };
+    // The registry's `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_DEVICE_MEMORY_FEATURES_EXT`.
+    assert_eq!(
+        <ZeroInitializeDeviceMemoryFeatures as vk::TaggedStructure>::STRUCTURE_TYPE.as_raw(),
+        1_000_620_000
+    );
+    let api = ApiVersion::V1_3;
+    let mut enables = Enables::of(&EnableSet::new(), api, &BTreeSet::new(), &[]).unwrap();
+    assert_eq!(read(&mut enables), (None, Vec::new()));
+    enables.enable_host_image_copy(host_image_copy_names(api));
+    enables.enable_zero_initialize_device_memory();
+    let names = vec![
+        c"VK_EXT_host_image_copy".to_owned(),
+        c"VK_EXT_zero_initialize_device_memory".to_owned(),
+    ];
+    assert_eq!(read(&mut enables), (Some(vk::TRUE), names));
+}
+
 /// A caller's extension whose feature structure the runtime knows (`VK_KHR_`/`VK_EXT_swapchain_
 /// maintenance1`, `VK_KHR_`/`VK_EXT_present_mode_fifo_latest_ready`) takes its structure, once
 /// for both names, chained with every feature set where the device has them; a device without
@@ -564,5 +608,105 @@ fn an_optional_extension_is_enabled_only_with_its_features() {
     assert_eq!(
         enabled,
         [c"VK_KHR_swapchain", c"VK_EXT_swapchain_maintenance1"]
+    );
+}
+
+/// The video extensions whose feature structures the runtime knows (`VK_KHR_video_maintenance1`,
+/// `VK_KHR_video_maintenance2`, `VK_KHR_unified_image_layouts`) take their structures with every
+/// feature the device has set; `unifiedImageLayoutsVideo`, which Vulkan requires of no device
+/// listing the extension, stays disabled where the device lacks it, without a refusal, and a
+/// device without `unifiedImageLayouts` is refused (listed) or leaves the extension out
+/// (optional).
+#[test]
+fn video_extensions_take_their_features_the_optional_one_where_the_device_has_it() {
+    use crate::enables::listed_structures;
+    use crate::error::ExtensionFeature;
+    let names =
+        |names: &[&CStr]| -> Vec<CString> { names.iter().map(|&name| name.to_owned()).collect() };
+    let (maintenance1, maintenance2, unified) = (1_000_515_000, 1_000_586_000, 1_000_527_000);
+    // The `VkBool32` members after `sType` and `pNext` of each chained video structure.
+    let members = |enables: &mut Enables| {
+        enables.with_create_info(&[], |info| {
+            let mut set = Vec::new();
+            let mut next = info.p_next.cast::<vk::BaseInStructure>();
+            while !next.is_null() {
+                // SAFETY: every structure of the chain lives for the call, and each begins with
+                // `sType` and `pNext`.
+                let base = unsafe { &*next };
+                let raw = base.s_type.as_raw();
+                let count = match raw {
+                    _ if raw == unified => 2,
+                    _ if raw == maintenance1 || raw == maintenance2 => 1,
+                    _ => 0,
+                };
+                // SAFETY: each such structure holds `count` `VkBool32` members after `pNext`.
+                let bools: Vec<vk::Bool32> = (0..count)
+                    .map(|at| unsafe { *next.cast::<u8>().add(16 + 4 * at).cast::<vk::Bool32>() })
+                    .collect();
+                if count > 0 {
+                    set.push((raw, bools));
+                }
+                next = base.p_next;
+            }
+            set.sort();
+            set
+        })
+    };
+    let listed = listed_structures(&names(&[
+        c"VK_KHR_video_queue",
+        c"VK_KHR_video_maintenance1",
+        c"VK_KHR_video_maintenance2",
+        c"VK_KHR_unified_image_layouts",
+    ]));
+    assert_eq!(listed.len(), 3, "the video queue takes no structure");
+    let mut enables =
+        Enables::of(&EnableSet::new(), ApiVersion::V1_3, &BTreeSet::new(), &[]).unwrap();
+    enables.enable_listed(&listed, |_| true).unwrap();
+    assert_eq!(
+        members(&mut enables),
+        [
+            (maintenance1, vec![vk::TRUE]),
+            (unified, vec![vk::TRUE, vk::TRUE]),
+            (maintenance2, vec![vk::TRUE]),
+        ]
+    );
+    // Without `unifiedImageLayoutsVideo`: the extension stays, its video member disabled.
+    let mut enables =
+        Enables::of(&EnableSet::new(), ApiVersion::V1_3, &BTreeSet::new(), &[]).unwrap();
+    enables
+        .enable_listed(&listed, |feature| feature != "unifiedImageLayoutsVideo")
+        .unwrap();
+    assert!(members(&mut enables).contains(&(unified, vec![vk::TRUE, vk::FALSE])));
+    // Without `unifiedImageLayouts`: refused when listed, left out when optional.
+    let mut enables =
+        Enables::of(&EnableSet::new(), ApiVersion::V1_3, &BTreeSet::new(), &[]).unwrap();
+    assert_eq!(
+        enables.enable_listed(&listed, |feature| feature != "unifiedImageLayouts"),
+        Err(Error::ExtensionFeature(ExtensionFeature {
+            extension: "VK_KHR_unified_image_layouts",
+            feature: "unifiedImageLayouts",
+        }))
+    );
+    let mut enables =
+        Enables::of(&EnableSet::new(), ApiVersion::V1_3, &BTreeSet::new(), &[]).unwrap();
+    enables.enable_where_featured(
+        &names(&[
+            c"VK_KHR_video_maintenance1",
+            c"VK_KHR_unified_image_layouts",
+        ]),
+        |feature| !feature.starts_with("unifiedImageLayouts"),
+    );
+    assert_eq!(members(&mut enables), [(maintenance1, vec![vk::TRUE])]);
+    let enabled: Vec<&CStr> = enables.names().collect();
+    assert_eq!(enabled, [c"VK_KHR_video_maintenance1"]);
+    // An optional one whose video member alone is missing is enabled.
+    let mut enables =
+        Enables::of(&EnableSet::new(), ApiVersion::V1_3, &BTreeSet::new(), &[]).unwrap();
+    enables.enable_where_featured(&names(&[c"VK_KHR_unified_image_layouts"]), |feature| {
+        feature != "unifiedImageLayoutsVideo"
+    });
+    assert_eq!(
+        members(&mut enables),
+        [(unified, vec![vk::TRUE, vk::FALSE])]
     );
 }

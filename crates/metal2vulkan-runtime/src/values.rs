@@ -112,8 +112,8 @@ impl HazardTrackingMode {
 }
 
 /// `MTLResourceOptions`: the CPU cache mode in bits 0-3, the storage mode in bits 4-7, and the
-/// hazard tracking mode in bits 8-9, as Metal packs them, and Metal's private bit 24
-/// ([`ResourceOptions::PRIVATE_BIT`]).
+/// hazard tracking mode in bits 8-9, as Metal packs them, Metal's private bit 24
+/// ([`ResourceOptions::PRIVATE_BIT`]) and bit 20 ([`ResourceOptions::BIT_20`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ResourceOptions(u64);
 
@@ -131,10 +131,18 @@ impl ResourceOptions {
     ///   faults on splits by the engine that writes (`read_only_view.rs`). What a shader or the
     ///   blit engine writes is dropped with no error -- a blit's fill, a kernel's stores, a vertex-
     ///   or fragment-stage store, a store through an address loaded out of an argument buffer, a
-    ///   pass's visibility result -- and reaches neither the CPU nor a later command buffer. What a
-    ///   render pass's own machinery writes faults the command buffer: a colour attachment over
-    ///   that memory, a resolve into it, a depth or stencil attachment in a heap of the bit, and a
-    ///   blit into a texture over or in it. The runtime makes them as without it, and announces
+    ///   pass's visibility result, a kernel's write to a texture over it, a blit into such a
+    ///   texture -- and reaches neither the CPU nor a later command buffer. What a render pass's
+    ///   own machinery stores out faults the command buffer (`CommandBufferError::PageFault`): a
+    ///   colour attachment over that memory at `Store`, a resolve into it, a depth or stencil
+    ///   attachment in a heap of the bit at `Store` or `CustomSampleDepthStore`. The CPU's
+    ///   `replaceRegion:` of a texture over it writes the pages. The runtime drops the GPU's writes
+    ///   to a no-copy buffer's or heap's memory with it, as Metal does: on macOS its pages are
+    ///   imported through a read-only view of them, announcing nothing; elsewhere it is made over
+    ///   a copy of them whose GPU writes are dropped, announced as
+    ///   `metal2vulkan-degrade-copied-host-pages`, and a pass's store-out into it faults its
+    ///   command buffer as Metal's does. A
+    ///   heap of the runtime's memory with it is made as without it, announcing
     ///   `metal2vulkan-degrade-private-resource-option` once; so does an indirect command buffer
     ///   made with it, which Metal makes and whose GPU-written records under it are not measured;
     /// - a buffer placed in a heap without it is made as without it, as Metal's is, announcing
@@ -144,6 +152,20 @@ impl ResourceOptions {
     ///   (`Problem::UndefinedValue`), as is a Vulkan buffer of the caller's
     ///   (`Device::new_buffer_with_vk_buffer`).
     pub const PRIVATE_BIT: u64 = 1 << 24;
+
+    /// Bit 20 (0x10_0000), an option no Metal header names, whose meaning Metal does not state
+    /// (programs pass it with a buffer's options: 0x100010 for a `Managed` no-copy buffer).
+    /// [`from_raw`](Self::from_raw) takes it. What Metal does with it (an M3 Max under macOS
+    /// 27.0.1 and an AMD Radeon Pro 5300M under macOS 26.7.1, plain and under API validation;
+    /// `crates/metal2vulkan-conformance/probes/resource_option_bit20.m`), and the runtime alike:
+    /// - a buffer of a length, of bytes or over the caller's pages (`newBufferWithBytesNoCopy:`),
+    ///   of every storage mode, is made with it and reports its options without it; so are a
+    ///   heap and a heap's buffer (the M3 Max; Metal's API validation stops the heap's buffer, "unknown
+    ///   bits 0x100000"). The runtime makes each as without it, and nothing reads it;
+    /// - a texture descriptor with it ends Metal's process (its suballocator asserts, "Different
+    ///   MTLResourceOptions used for the same heap index"): refused `Invalid`
+    ///   (`Problem::UndefinedValue`), as with [`PRIVATE_BIT`](Self::PRIVATE_BIT).
+    pub const BIT_20: u64 = 1 << 20;
 
     /// The options of these three modes.
     pub fn new(
@@ -173,10 +195,10 @@ impl ResourceOptions {
     }
 
     /// The options of Metal's raw value `raw`: refused when it sets a bit outside the three
-    /// fields and [`PRIVATE_BIT`](Self::PRIVATE_BIT), or a field to a value its type does not
-    /// define.
+    /// fields, [`PRIVATE_BIT`](Self::PRIVATE_BIT) and [`BIT_20`](Self::BIT_20), or a field to a
+    /// value its type does not define.
     pub fn from_raw(raw: u64) -> Result<ResourceOptions, Error> {
-        if raw & !(Self::DEFINED | Self::PRIVATE_BIT) != 0 {
+        if raw & !(Self::DEFINED | Self::PRIVATE_BIT | Self::BIT_20) != 0 {
             return Err(undefined("MTLResourceOptions", raw));
         }
         let options = ResourceOptions(raw);
@@ -231,6 +253,12 @@ impl ResourceOptions {
             ResourceOptions(self.0 & !Self::PRIVATE_BIT),
             self.0 & Self::PRIVATE_BIT != 0,
         )
+    }
+
+    /// The options without [`BIT_20`](Self::BIT_20), as Metal makes and reports a buffer or a
+    /// heap of them.
+    pub(crate) fn without_bit_20(self) -> ResourceOptions {
+        ResourceOptions(self.0 & !Self::BIT_20)
     }
 }
 

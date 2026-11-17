@@ -4,9 +4,12 @@
 //!
 //! - **The blit chain** of formats every Vulkan device blits and filters linearly, in 2D, 2D
 //!   array, cube and 3D textures: one `vkCmdBlitImage` a level (the work counts say so), the
-//!   compute filter never, each level of a halving chain within a code (a half within a unit in
-//!   the last place) of the bilinear filter in `float` of the level above as the device read it
-//!   back, and `device-filtered-mipmaps` announced once.
+//!   compute filter never, each level of a halving chain within a code of the bilinear filter in
+//!   `float` of the level above as the device read it back (a half within a unit in the last place
+//!   above it and, where the device announced its filter, [`HALF_BELOW_ULPS`] below it), and
+//!   `device-filtered-mipmaps` announced once. On a driver whose blits do not filter a
+//!   volume (`RuntimeDriverDefect::VolumeBlitsUnfiltered`, MoltenVK's) the 3D textures take the
+//!   compute filter instead, each level within a code of the same filter.
 //! - **The compute filter** of every format it computes that the device's blits cannot filter
 //!   (the extended-range formats on every device; on lavapipe also `RGB9E5Float`, which it blits
 //!   into no image, and the 8-bit sRGB formats it holds as their UNORM twins): every level the
@@ -22,6 +25,7 @@ use super::texture_blits::MIPMAPS;
 use super::{layer_reported_nothing_at_all, validated_device, Messages, ScratchCache, WAIT};
 use crate::gpu::TEST_DEVICE;
 use metal2vulkan::bind::MipmapFilterChain;
+use metal2vulkan::error::RuntimeDriverDefect;
 use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
 use metal2vulkan_runtime::{
     CommandQueue, Degradation, Device, Region, ResourceOptions, Texture, TextureDescriptor,
@@ -178,12 +182,23 @@ fn filtered(
     levels.swap_remove(1)
 }
 
+/// How far below the bilinear filter in `float` of the level above a half the device's blit
+/// filters may lie, in units in the last place, where the device announced that the level is its
+/// filter (`device-filtered-mipmaps`); above it, a half lies within one. The device's filter is
+/// the answer, and its precision is the device's: the Radeon 780M under RADV truncates its filter
+/// of a half (job m3-max-11026 at development 1c7a75be62, an `RGBA16Float` cube's level 1: of its
+/// 384 halves, 274 one unit below the filter, 9 two below, none above).
+const HALF_BELOW_ULPS: u16 = 2;
+
 /// The device's blit chain of formats every Vulkan device blits and filters linearly (`R8Unorm`,
 /// `RGBA8Unorm`, `BGRA8Unorm`, `RGBA16Float`), in 2D textures (halving and not, one two texels
-/// high), a 2D array, a cube and 3D textures: one blit a level and no compute filter, each level of a
-/// halving chain within a code (a half within a unit in the last place) of the bilinear filter in
-/// `float` of the level above as the device read it back, and `device-filtered-mipmaps` announced
-/// once, naming the first texture.
+/// high), a 2D array, a cube and 3D textures: one blit a level and no compute filter (but a 3D
+/// texture's compute filter on a driver whose blits do not filter a volume,
+/// `RuntimeDriverDefect::VolumeBlitsUnfiltered`), each level of a halving chain within a code of
+/// the bilinear filter in `float` of the level above as the device read it back (a half within a
+/// unit in the last place above it and [`HALF_BELOW_ULPS`] below it, the device's filter
+/// announced), and `device-filtered-mipmaps` announced once, naming the first
+/// texture.
 #[test]
 fn the_device_s_blit_chain_filters_each_level_and_is_announced() {
     let cache = ScratchCache::new().unwrap();
@@ -192,6 +207,9 @@ fn the_device_s_blit_chain_filters_each_level_and_is_announced() {
         let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
         messages.take_notices();
         let queue = device.new_command_queue().unwrap();
+        // A driver whose blits do not filter a volume: its 3D textures take the compute filter.
+        let volume_blits = (device.properties().driver_defects)
+            .contains(&RuntimeDriverDefect::VolumeBlitsUnfiltered);
         use PixelFormat as P;
         use TextureType as T;
         type Case = (
@@ -216,6 +234,8 @@ fn the_device_s_blit_chain_filters_each_level_and_is_announced() {
         ];
         let mut seed = 0x626c_6974_6368_6169u64;
         let mut checked = 0usize;
+        // Each `RGBA16Float` level's most units in the last place below the filter, and the level.
+        let mut halves_below: Vec<(i32, String)> = Vec::new();
         for (pf, texel, ty, extent, slices, levels, halving) in cases {
             let t = texture(&device, pf, ty, extent, levels, slices);
             let texels = |l: usize| level_extent(extent, l).iter().product::<usize>();
@@ -232,10 +252,13 @@ fn the_device_s_blit_chain_filters_each_level_and_is_announced() {
                 put(&t, slice, 0, extent, texel, &bytes);
             }
             let made = generate(&device, &queue, &t);
+            let want = match ty == T::Type3D && volume_blits {
+                true => Made::Filter,
+                false => Made::Blits(levels as u64 - 1),
+            };
             assert_eq!(
-                made,
-                Made::Blits(levels as u64 - 1),
-                "{pf:?} {ty:?} {extent:?}: a blit a level"
+                made, want,
+                "{pf:?} {ty:?} {extent:?}: a blit a level, or the compute filter of a volume"
             );
             if !halving {
                 continue;
@@ -249,29 +272,61 @@ fn the_device_s_blit_chain_filters_each_level_and_is_announced() {
                 let above = read(l - 1);
                 let want = filtered(pf, ty, level_extent(extent, l - 1), slices, &above);
                 let got = read(l);
-                let near = match pf {
-                    P::RGBA16Float => got
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .zip(want.as_chunks::<2>().0)
-                        .all(|(a, b)| u16::from_le_bytes(*a).abs_diff(u16::from_le_bytes(*b)) <= 1),
-                    _ => got.iter().zip(&want).all(|(a, b)| a.abs_diff(*b) <= 1),
-                };
-                assert!(
-                    near,
+                let what = format!(
                     "{pf:?} {ty:?} {extent:?} level {l}: the blit {got:02x?}, the filter {want:02x?}"
                 );
+                match pf {
+                    // Finite halves in [0, 1): their bits order as their values.
+                    P::RGBA16Float => {
+                        let apart: Vec<i32> = (got.as_chunks::<2>().0.iter())
+                            .zip(want.as_chunks::<2>().0)
+                            .map(|(a, b)| {
+                                i32::from(u16::from_le_bytes(*a))
+                                    - i32::from(u16::from_le_bytes(*b))
+                            })
+                            .collect();
+                        let below = -apart.iter().copied().min().unwrap_or(0).min(0);
+                        let above = apart.iter().copied().max().unwrap_or(0).max(0);
+                        let count = |d: i32| apart.iter().filter(|&&a| a == d).count();
+                        eprintln!(
+                            "blit chain {pf:?} {ty:?} {extent:?} level {l} on {}: of {} halves, \
+                             {} one unit in the last place below the filter, {} two below, {} \
+                             one above; the most {below} below and {above} above",
+                            device.name(),
+                            apart.len(),
+                            count(-1),
+                            count(-2),
+                            count(1)
+                        );
+                        assert!(above <= 1, "{what}");
+                        halves_below.push((below, what));
+                    }
+                    _ => assert!(
+                        got.iter().zip(&want).all(|(a, b)| a.abs_diff(*b) <= 1),
+                        "{what}"
+                    ),
+                }
                 checked += got.len();
             }
         }
         eprintln!(
             "the blit chain on {}: {checked} bytes of halving chains, each within a code of the \
-             bilinear filter in float",
+             bilinear filter in float (a half within one above it and {HALF_BELOW_ULPS} below)",
             device.name()
         );
         let notices = messages.take_notices();
         assert_once(&notices, &MIPMAPS);
+        // A half more than a unit below the filter: the device's own filter, which it announced.
+        let announced = (notices.iter())
+            .filter_map(|message| message.degradation.as_ref())
+            .any(|notice| notice.degradation == Degradation::DeviceFilteredMipmaps);
+        let most_below = match announced {
+            true => i32::from(HALF_BELOW_ULPS),
+            false => 1,
+        };
+        for (below, what) in &halves_below {
+            assert!(*below <= most_below, "{what}");
+        }
         let notice = notices
             .iter()
             .filter_map(|message| message.degradation.as_ref())
@@ -286,11 +341,12 @@ fn the_device_s_blit_chain_filters_each_level_and_is_announced() {
 /// Every format the compute filter computes, from random bytes (every bit pattern: NaNs,
 /// infinities, subnormals, out-of-range codes), in 2D textures (one texel high, a square of a
 /// power of two, one past 65 texels, halving and not), a 2D array, a cube and a 3D
-/// texture: a format the device's blits filter takes its blit chain, and every other takes the
-/// compute filter, each level the device wrote within `MipmapFilterChain::outside_bound` of the
-/// filter on the CPU of the level above as the device read it back. The extended-range formats,
-/// which no blit filters, take the filter on every device. `device-filtered-mipmaps` is
-/// announced once.
+/// texture: a format the device's blits filter takes its blit chain in every shape (but the 3D one
+/// on a driver whose blits do not filter a volume, `RuntimeDriverDefect::VolumeBlitsUnfiltered`,
+/// which takes the compute filter), and every other takes the compute filter in every shape, each
+/// level the device wrote within `MipmapFilterChain::outside_bound` of the filter on the CPU of
+/// the level above as the device read it back. The extended-range formats, which no blit filters,
+/// take the filter on every device. `device-filtered-mipmaps` is announced once.
 #[test]
 fn formats_the_blits_cannot_filter_take_the_compute_filter_level_by_level() {
     let cache = ScratchCache::new().unwrap();
@@ -308,6 +364,9 @@ fn formats_the_blits_cannot_filter_take_the_compute_filter_level_by_level() {
             (TextureType::Cube, [4, 4, 1], 6, 3),
             (TextureType::Type3D, [5, 4, 3], 1, 3),
         ];
+        // A driver whose blits do not filter a volume: its 3D textures take the compute filter.
+        let volume_blits = (device.properties().driver_defects)
+            .contains(&RuntimeDriverDefect::VolumeBlitsUnfiltered);
         let mut seed = 0x51f1_5eed_cafe_f00du64;
         let (mut checked, mut off_model) = (0usize, 0usize);
         let (mut by_filter, mut by_blits) = (Vec::new(), Vec::new());
@@ -358,9 +417,15 @@ fn formats_the_blits_cannot_filter_take_the_compute_filter_level_by_level() {
                 }
             }
             let filter = made[0] == Made::Filter;
+            let filtered_shape =
+                |ty: TextureType| filter || (ty == TextureType::Type3D && volume_blits);
             assert!(
-                made.iter().all(|&m| (m == Made::Filter) == filter),
-                "{pf:?}: one way for every shape: {made:?}"
+                shapes
+                    .iter()
+                    .zip(&made)
+                    .all(|(shape, &m)| (m == Made::Filter) == filtered_shape(shape.0)),
+                "{pf:?}: one way for every shape (the compute filter for a volume where the \
+                 driver's blits do not filter one, {volume_blits}): {made:?}"
             );
             if filter {
                 by_filter.push(pf);

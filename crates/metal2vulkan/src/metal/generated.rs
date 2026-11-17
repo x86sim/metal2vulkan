@@ -1,4 +1,4 @@
-// Generated from the macOS 27.0 SDK Metal.framework headers (names and values).
+// Generated from the macOS 27.2 SDK Metal.framework headers (names and values).
 // Regenerate with scripts/regen-metal-enums/regen_metal_enums.py; do not edit.
 
 metal_enum! {
@@ -216,6 +216,7 @@ metal_enum! {
         Intersection = 6, "MTLFunctionTypeIntersection";
         Mesh = 7, "MTLFunctionTypeMesh";
         Object = 8, "MTLFunctionTypeObject";
+        Extern = 4, "MTLFunctionTypeExtern";
     }
     aliases {
     }
@@ -788,6 +789,12 @@ metal_enum! {
     TriangleFillMode = "MTLTriangleFillMode" {
         Fill = 0, "MTLTriangleFillModeFill";
         Lines = 1, "MTLTriangleFillModeLines";
+        ///
+        /// Not declared by the SDK headers: the raw value 2, which Apple's GL renderer sends
+        /// for `glPolygonMode(GL_POINT)`. Metal draws each triangle's vertices as points of one
+        /// pixel on an Apple M3 Max and an Intel UHD Graphics 630, where a Radeon Pro 5300M
+        /// fills the triangle.
+        Points = 2, "MTLTriangleFillModePoints";
     }
     aliases {
     }

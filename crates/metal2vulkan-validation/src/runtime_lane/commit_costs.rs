@@ -73,7 +73,6 @@ use metal2vulkan_runtime::{
 };
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::time::Instant;
 
 /// The program's live buffers of the working set, each [`BUFFER_BYTES`] long.
@@ -173,8 +172,7 @@ const RECT: [f32; 4] = [-0.5, -0.5, 0.5, 0.5];
 impl Workload {
     pub(super) fn new(device: Device) -> Workload {
         let queue = device.new_command_queue().unwrap();
-        let ll =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/public/engine/tob_renders.ll");
+        let ll = metal2vulkan_devtools::engine_dir().join("tob_renders.ll");
         let library = device
             .new_library_with_air(&llvm_assemble(&ll).unwrap())
             .unwrap();
@@ -650,7 +648,9 @@ impl Bare {
         // SAFETY: the command buffer is executable, the fence unsignaled; the submission is
         // made under the runtime's lock of its `VkQueue`, and the call waits for nothing.
         unsafe {
-            queue.with_vk_queue(|raw, _| driver.queue_submit(raw, &[submit], self.fence).unwrap());
+            queue.with_vk_queue(|_, raw, _| {
+                driver.queue_submit(raw, &[submit], self.fence).unwrap()
+            });
         }
         // Bounded, as every wait of the crate's (`gpu/wait.rs`): one `vkWaitForFences` (or
         // `vkWaitSemaphores`) with the process's bound for a timeout, its result classified
@@ -700,7 +700,9 @@ impl Bare {
         let submit = vk::SubmitInfo::default().command_buffers(&buffers);
         // SAFETY: as `run`'s submission.
         unsafe {
-            queue.with_vk_queue(|raw, _| driver.queue_submit(raw, &[submit], self.fence).unwrap());
+            queue.with_vk_queue(|_, raw, _| {
+                driver.queue_submit(raw, &[submit], self.fence).unwrap()
+            });
         }
         let backend = SubmissionBackend::vulkan(TEST_DEVICE);
         wait::vulkan::wait_for_fence(driver, self.fence, backend, "the bare queries' reset")

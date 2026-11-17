@@ -23,8 +23,11 @@
 //! (`metal::format::srgb_raw_twin`) read through a heap pipeline whose stage records
 //! `PrecisionNote::SrgbTexelDecode`, which the device announced, decodes on the device where a slot
 //! of a format the device holds as its UNORM twin decodes the codes by the device's transfer (a slot
-//! of a format the device samples decodes on the device too, the same words); every other
-//! difference fails. The extended-range
+//! of a format the device samples decodes on the device too, the same words). So is a `half`
+//! read's where the heap pipeline's stage records `PrecisionNote::NativeHalfConversion`, announced,
+//! and the two words narrow to the same `half` within a unit in its last place, or are both NaNs
+//! ([`narrowed_alike`]): the device's narrowing of the `f32` texel, which its compiler may fold
+//! away at one access and not the other. Every other difference fails. The extended-range
 //! `_sRGB` twins, which a heap does not hold (`ExtendedRange::HEAP_READ`), are not read so yet:
 //! their heap dispatch is printed on a `HEAP-READ-UNCOVERED` line, refused or not, and not
 //! counted. A texture the
@@ -35,14 +38,24 @@
 //! slot too, where the function emulates it (`sampler::heap_raw`): a 2D sample or gather through a
 //! constexpr sampler without a mip filter or anisotropy (a `half` gather's of a bfloat form alone),
 //! or through a runtime sampler whose bound state says the same. A difference is printed on a
-//! `HEAP-SAMPLE-DIFFERS` line. A command whose function samples such a texture otherwise (a mip
-//! filter, a `half` gather, a runtime sampler with a mip filter) is refused at bind, printed on a
-//! `HEAP-SAMPLE-REFUSED` line.
+//! `HEAP-SAMPLE-DIFFERS` line, but two the heap pipeline's announced notes explain, printed on a
+//! `HEAP-SAMPLE-ANNOUNCED` line and counted apart: a `half` result's narrowing, as a read's, and a
+//! linear sample of a `BGRA10_XR` or `BGR10_XR` form whose stage records
+//! `PrecisionNote::BicubicFilterArithmetic`, where each blends the same taps by the device's
+//! arithmetic and the words lie within `2^-21` of each other ([`blended_alike`]). A command whose
+//! function samples such a texture otherwise (a mip filter, a `half` gather, a runtime sampler
+//! with a mip filter) is refused at bind, printed on a `HEAP-SAMPLE-REFUSED` line.
+//!
+//! A `half` read through an argument buffer of every code of such a texture is the device's `float`
+//! read of it rounded to the nearest even `half`, and the slot's `half` read, where the stage
+//! records no `PrecisionNote::NativeHalfConversion`, which it does not where the profile takes
+//! `DriverDeviation::MetalHalfConversion` ([`heap_half_reads_of_every_code_round_their_float`]).
 
-use super::degrade_notices::on_device;
+use super::degrade_notices::on_device_with;
+use super::half_conversions;
 use super::host_memory::{not_importable, Mapping, GUEST_PAGE};
 use super::Messages;
-use super::{buffer_with, read_buffer};
+use super::{at_plan, buffer_with, read_buffer};
 use crate::air_library::AirLibrary;
 use metal2vulkan::bind::SamplerDescriptor;
 use metal2vulkan::cache::VariantKey;
@@ -59,8 +72,9 @@ use metal2vulkan::pipeline::{
 use metal2vulkan::Budget;
 use metal2vulkan_devtools::llvm_assemble_text;
 use metal2vulkan_runtime::{
-    CommandBufferStatus, ComputePipelineState, Degradation, Device, Error, HostMemory,
-    PipelineOptions, Region, ResourceOptions, SamplerState, Size, Texture, TextureDescriptor,
+    CommandBufferStatus, ComputePipelineState, Degradation, Device, DeviceOptions, Error,
+    HostMemory, PipelineOptions, Region, ResourceOptions, SamplerState, Size, Texture,
+    TextureDescriptor,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -454,12 +468,72 @@ fn made(device: &Device, format: PixelFormat, bytes: u64) -> Result<Texture, Err
     Ok(texture)
 }
 
+/// The note of a `half` result the device narrows from its `f32` value (`narrow::converted`).
+const NATIVE_HALF: PrecisionNote = PrecisionNote::NativeHalfConversion;
+
+/// The note of an emulated filter's blend of its taps by the device's arithmetic
+/// (`sampler::extended`).
+const FILTER_ARITHMETIC: PrecisionNote = PrecisionNote::BicubicFilterArithmetic;
+
+/// Whether a stage whose notes are `noted` records `note`, and the device announced it.
+fn recorded(
+    noted: &BTreeSet<PrecisionNote>,
+    announced: &BTreeSet<Degradation>,
+    note: PrecisionNote,
+) -> bool {
+    noted.contains(&note) && announced.contains(&Degradation::from_precision_note(note))
+}
+
+/// Whether two results of the same `half` read, sample or gather (four texel words, then any
+/// query words) are the device's narrowing of one value, as `PrecisionNote::NativeHalfConversion`
+/// bounds it: the queries alike, and each texel word the same `half` to within one unit in its
+/// last place, or both a NaN. The device may narrow a `f32` to `half` or keep it unrounded,
+/// whichever its compiler folds the conversion into: the NVIDIA RTX 5080 Laptop rounds a heap
+/// read's texel to nearest even and keeps a slot read's unrounded (`3f10a000` where the slot's is
+/// `3f109091`, the `RGBA8Unorm` code 144), a value past the `half`'s range infinite or finite.
+fn narrowed_alike(a: &[u32], b: &[u32]) -> bool {
+    let steps = |bits: u32| {
+        let h = super::extended_range_targets::half_bits(f32::from_bits(bits));
+        let magnitude = i32::from(h & 0x7fff);
+        if h & 0x8000 == 0 {
+            magnitude
+        } else {
+            -magnitude
+        }
+    };
+    a[4..] == b[4..]
+        && a[..4].iter().zip(&b[..4]).all(|(&x, &y)| {
+            let nan = |w: u32| f32::from_bits(w).is_nan();
+            x == y || (nan(x) && nan(y)) || (steps(x) - steps(y)).abs() <= 1
+        })
+}
+
+/// Whether two `float` results of the same linear sample of a `BGRA10_XR` or `BGR10_XR` form are
+/// the device's blend of one footprint's taps, each by its own arithmetic
+/// (`PrecisionNote::BicubicFilterArithmetic`: its `FMix`, which a compiler may fuse or not): every
+/// word within `2^-21` of the other's. The forms' values lie within `[-0.753, 1.251]`, so two
+/// blends of the same taps rounded apart differ by a few units of `2^-23`; a tap read amiss moves
+/// the blend by its weight (at least `1/256`) times a code (`1/510`), `7.7e-6` at least.
+fn blended_alike(a: &[u32], b: &[u32]) -> bool {
+    a[4..] == b[4..]
+        && a[..4]
+            .iter()
+            .zip(&b[..4])
+            .all(|(&x, &y)| (f32::from_bits(x) - f32::from_bits(y)).abs() <= 2f32.powi(-21))
+}
+
 /// The precision notes the stage of kernel `k` of [`kernel`] records as the device compiles it
 /// under the empty variant key: those the runtime announces as it makes the pipeline state.
 fn stage_notes(device: &Device, heap: bool, texel: Texel) -> BTreeSet<PrecisionNote> {
+    notes_of(device, &kernel(heap, texel))
+}
+
+/// The precision notes the stage of kernel `k` of `text` ([`kernel`]'s or [`sample_kernel`]'s)
+/// records as the device compiles it under the empty variant key.
+fn notes_of(device: &Device, text: &str) -> BTreeSet<PrecisionNote> {
     let compile = device.compile_device();
     let budget = Budget::standard();
-    let bitcode = llvm_assemble_text(&kernel(heap, texel)).unwrap();
+    let bitcode = llvm_assemble_text(text).unwrap();
     let library = Library::from_air(&bitcode).unwrap();
     let function = FunctionDescriptor::new(library.function("k").unwrap());
     let inputs = VariantKey::new().lowering_inputs(Stage::Kernel);
@@ -614,6 +688,8 @@ fn compare(
             let decodes = srgb_raw_twin(format).is_some()
                 && noted.contains(&srgb)
                 && announced.contains(&Degradation::from_precision_note(srgb));
+            // The device's narrowing of a `half` texel, announced.
+            let narrows = texel == Texel::Half && recorded(noted, &announced, NATIVE_HALF);
             let slot = dispatch(device, (&at_slot, false), &texture)
                 .unwrap_or_else(|e| panic!("{format:?} {texel:?} at a slot: {e}"));
             let held = match dispatch(device, (&at_heap, true), &texture) {
@@ -661,27 +737,27 @@ fn compare(
                     device.name()
                 );
             }
-            if let Some(&i) = wrong.first() {
-                let mark = match decodes {
-                    true => {
-                        tally.announced += wrong.len();
-                        "HEAP-READ-ANNOUNCED"
-                    }
-                    false => {
-                        tally.differ += wrong.len();
-                        "HEAP-READ-DIFFERS"
-                    }
-                };
-                println!(
-                    "{mark} {}: {format:?} {texel:?}: {} of {} lanes, first at {:?}: {:08x?}, \
-                     the slot's {:08x?}",
-                    device.name(),
-                    wrong.len(),
-                    lanes.len(),
-                    lanes[i],
-                    held[i],
-                    slot[i]
-                );
+            let (explained, differing): (Vec<usize>, Vec<usize>) = wrong
+                .into_iter()
+                .partition(|&i| decodes || (narrows && narrowed_alike(&held[i], &slot[i])));
+            tally.announced += explained.len();
+            tally.differ += differing.len();
+            for (mark, wrong) in [
+                ("HEAP-READ-ANNOUNCED", &explained),
+                ("HEAP-READ-DIFFERS", &differing),
+            ] {
+                if let Some(&i) = wrong.first() {
+                    println!(
+                        "{mark} {}: {format:?} {texel:?}: {} of {} lanes, first at {:?}: \
+                         {:08x?}, the slot's {:08x?}",
+                        device.name(),
+                        wrong.len(),
+                        lanes.len(),
+                        lanes[i],
+                        held[i],
+                        slot[i]
+                    );
+                }
             }
         }
     }
@@ -700,7 +776,7 @@ fn compare(
 /// the same texture's through a slot, bit for bit, for `float` and `half` results.
 #[test]
 fn heap_extended_reads_are_the_slot_s() {
-    on_device(|device, messages| {
+    on_device_with(at_plan, |device, messages| {
         let floats: &[Texel] = &[Texel::Float, Texel::Half];
         let formats: Vec<(PixelFormat, u64, &[Texel])> = EXTENDED
             .iter()
@@ -727,12 +803,13 @@ fn heap_extended_reads_are_the_slot_s() {
 
 /// The device's heap set holds each texture of a form a heap reads as a binding plan's arrays do
 /// (`bind::heap_element`: its raw view in the unsigned integer class, the neutral in the float
-/// one), so placing one announces nothing (no `UnnamedTextureUnviewable`, which a consumer
-/// writing every live texture's elements through `heap_element` would meet), and its `float`
-/// reads through an argument buffer are the slot's.
+/// one), so placing one announces no `UnnamedTextureUnviewable` (which a consumer writing every
+/// live texture's elements through `heap_element` would meet), and its `float` reads through an
+/// argument buffer are the slot's. The decode's own notice is
+/// [`a_heap_set_holding_a_raw_texture_announces_its_decode`]'s.
 #[test]
 fn the_heap_set_holds_the_forms_a_heap_reads_unannounced() {
-    on_device(|device, messages| {
+    on_device_with(at_plan, |device, messages| {
         let floats: &[Texel] = &[Texel::Float];
         let formats: Vec<(PixelFormat, u64, &[Texel])> = EXTENDED
             .iter()
@@ -759,6 +836,169 @@ fn the_heap_set_holds_the_forms_a_heap_reads_unannounced() {
             "{:?}",
             tally.kinds
         );
+    });
+}
+
+/// A command that binds a heap set holding a texture a heap holds by its raw texels alone
+/// announces `device-pack-conversion`, naming the texture: its function's `float` read decodes the
+/// raw texels by the device's arithmetic, whichever texture the set holds that the function's
+/// handles name. The same command over an `RGBA8Unorm` texture, with no such texture live,
+/// announces no `device-pack-conversion`, nor does the pipeline's making: the stage records the
+/// note only where its command can name such a texture
+/// ([`a_heap_decode_s_stage_note_is_announced_where_its_command_can_name_a_raw_texture`]).
+#[test]
+fn a_heap_set_holding_a_raw_texture_announces_its_decode() {
+    on_device_with(at_plan, |device, messages| {
+        let pack = Degradation::DevicePackConversion;
+        let stage = stage_notes(device, true, Texel::Float);
+        let heap = pipeline(device, true, Texel::Float);
+        let made_with = notices(messages);
+        let plain = made(device, PixelFormat::RGBA8Unorm, 4).unwrap();
+        dispatch(device, (&heap, true), &plain).unwrap();
+        let alone = notices(messages);
+        let raw = made(device, PixelFormat::BGRA10XR, 8).unwrap();
+        dispatch(device, (&heap, true), &raw).unwrap();
+        let held = notices(messages);
+        println!(
+            "HEAP-RAW-NOTICE {}: stage notes {stage:?}; making {made_with:?}; RGBA8Unorm alone \
+             {alone:?}; BGRA10XR held {held:?}",
+            device.name()
+        );
+        assert!(
+            ![&made_with, &alone]
+                .iter()
+                .any(|n| n.iter().any(|(k, _)| *k == pack)),
+            "announced before a raw texture lived"
+        );
+        let object = format!(
+            "BGRA10XR texture at resource ID {}",
+            raw.gpu_resource_id().0
+        );
+        assert!(held.contains(&(pack, object)), "{held:?}");
+    });
+}
+
+/// A heap pipeline whose `float` read decodes a texture a heap holds by its raw texels alone
+/// records `PrecisionNote::DevicePackConversion` as a specialized note, holding where its command
+/// can name such a texture (`SpecKey::HeapRawTextures`), and the runtime announces it there: on a
+/// device whose options ask for `device-pack-conversion` at every occurrence, a dispatch that makes
+/// a `BGRA10XR` texture resident announces the stage's note (its object the kernel) beside the
+/// heap set's notice naming the texture, while the pipeline's making and a dispatch that makes an
+/// `RGBA8Unorm` texture alone resident, with no such texture live, announce neither.
+#[test]
+fn a_heap_decode_s_stage_note_is_announced_where_its_command_can_name_a_raw_texture() {
+    let pack = Degradation::DevicePackConversion;
+    let each = |options: &mut DeviceOptions| {
+        options.announce_each = [pack].into_iter().collect();
+        at_plan(options);
+    };
+    on_device_with(each, |device, messages| {
+        let stage = stage_notes(device, true, Texel::Float);
+        let heap = pipeline(device, true, Texel::Float);
+        let made_with = notices(messages);
+        let plain = made(device, PixelFormat::RGBA8Unorm, 4).unwrap();
+        dispatch(device, (&heap, true), &plain).unwrap();
+        let alone = notices(messages);
+        let raw = made(device, PixelFormat::BGRA10XR, 8).unwrap();
+        dispatch(device, (&heap, true), &raw).unwrap();
+        let held = notices(messages);
+        println!(
+            "HEAP-RAW-STAGE-NOTE {}: stage notes {stage:?}; making {made_with:?}; RGBA8Unorm alone \
+             {alone:?}; BGRA10XR held {held:?}",
+            device.name()
+        );
+        assert!(
+            stage.contains(&PrecisionNote::DevicePackConversion),
+            "{stage:?}"
+        );
+        assert!(
+            ![&made_with, &alone]
+                .iter()
+                .any(|n| n.iter().any(|(k, _)| *k == pack)),
+            "announced before a raw texture lived"
+        );
+        let kernel = "the kernel of a compute pipeline state".to_owned();
+        assert!(held.contains(&(pack, kernel)), "{held:?}");
+        let texture = format!(
+            "BGRA10XR texture at resource ID {}",
+            raw.gpu_resource_id().0
+        );
+        assert!(held.contains(&(pack, texture)), "{held:?}");
+    });
+}
+
+/// A heap linear sample the function filters (`sampler::heap_raw`) records
+/// `PrecisionNote::BicubicFilterArithmetic` as a specialized note, holding where its command can
+/// name a texture the heap holds by its raw texels in a form the function filters
+/// (`SpecKey::HeapRawTextures`), and through a runtime sampler where the bound word filters too;
+/// the runtime announces it there alone: on a device whose options ask for
+/// `bicubic-filter-arithmetic` at every occurrence, a constexpr linear sample's dispatch that makes
+/// an `RGBA8Unorm` texture alone resident (the device's own sample) or an `RGBA16Bfloat` one (whose
+/// sample reads the nearest texel) announces nothing of it, and one that makes a `BGRA10XR` one
+/// resident announces it for the kernel; through the runtime sampler over `BGRA10XR`, a bound
+/// nearest sampler announces nothing of it, and a bound linear one announces it.
+#[test]
+fn a_heap_sample_s_filter_note_is_announced_where_its_command_can_name_a_filtered_raw_texture() {
+    let filter = Degradation::BicubicFilterArithmetic;
+    let each = |options: &mut DeviceOptions| {
+        options.announce_each = [filter].into_iter().collect();
+        at_plan(options);
+    };
+    on_device_with(each, |device, messages| {
+        let lanes = sample_lanes();
+        let linear = SAMPLERS[1].1;
+        let constexpr = sample_kernel(true, Through::Constexpr(linear), Op::Sample, false);
+        let stage = notes_of(device, &constexpr);
+        let heap = pipeline_of(device, &constexpr);
+        let slot = pipeline_of(
+            device,
+            &sample_kernel(true, Through::Slot, Op::Sample, false),
+        );
+        let made_with = notices(messages);
+        let sampler = |f| {
+            let mut d = SamplerDescriptor::new();
+            (d.min_filter, d.mag_filter) = (f, f);
+            d.s_address_mode = SamplerAddressMode::ClampToEdge;
+            d.t_address_mode = SamplerAddressMode::ClampToEdge;
+            device.new_sampler_state(&d).unwrap()
+        };
+        let (nearest, linear) = (
+            sampler(SamplerMinMagFilter::Nearest),
+            sampler(SamplerMinMagFilter::Linear),
+        );
+        let plain = made(device, PixelFormat::RGBA8Unorm, 4).unwrap();
+        let bfloat = made(device, PixelFormat::RGBA16Bfloat, 8).unwrap();
+        let raw = made(device, PixelFormat::BGRA10XR, 8).unwrap();
+        let mut seen = Vec::new();
+        for (name, pipeline, texture, bound) in [
+            ("RGBA8Unorm, constexpr linear", &heap, &plain, None),
+            ("RGBA16Bfloat, constexpr linear", &heap, &bfloat, None),
+            ("BGRA10XR, bound nearest", &slot, &raw, Some(&nearest)),
+            ("BGRA10XR, constexpr linear", &heap, &raw, None),
+            ("BGRA10XR, bound linear", &slot, &raw, Some(&linear)),
+        ] {
+            dispatch_with(device, (pipeline, true), (texture, bound), &lanes).unwrap();
+            let announced = notices(messages)
+                .into_iter()
+                .filter(|(k, _)| *k == filter)
+                .map(|(_, object)| object)
+                .collect::<Vec<_>>();
+            seen.push((name, announced));
+        }
+        println!(
+            "HEAP-FILTER-NOTE {}: stage notes {stage:?}; making {made_with:?}; {seen:?}",
+            device.name()
+        );
+        assert!(stage.contains(&FILTER_ARITHMETIC), "{stage:?}");
+        assert!(
+            !made_with.iter().any(|(k, _)| *k == filter),
+            "announced as it was made"
+        );
+        let kernel = "the kernel of a compute pipeline state".to_owned();
+        for (name, announced) in &seen {
+            let want = name.starts_with("BGRA10XR") && !name.ends_with("nearest");
+            assert_eq!(announced.contains(&kernel), want, "{name}: {announced:?}");
+        }
     });
 }
 
@@ -789,7 +1029,7 @@ const RAW_HELD: [(PixelFormat, u64); 5] = [
 /// to the edge, no mip filter) at sampler slot 0, at [`sample_lanes`].
 #[test]
 fn heap_extended_samples_are_the_slot_s() {
-    on_device(|device, messages| {
+    on_device_with(at_plan, |device, messages| {
         let lanes = sample_lanes();
         let mut runtime = SamplerDescriptor::new();
         runtime.min_filter = SamplerMinMagFilter::Linear;
@@ -820,11 +1060,15 @@ fn heap_extended_samples_are_the_slot_s() {
             Op::Sample,
             true,
         ));
-        let (mut checked, mut differ) = (0, 0);
+        let (mut checked, mut differ, mut explained) = (0, 0, 0);
+        let mut announced = BTreeSet::new();
         let _ = messages.take_notices();
         for (name, through, op, half) in &cases {
             let at_slot = pipeline_of(device, &sample_kernel(false, *through, *op, *half));
-            let at_heap = pipeline_of(device, &sample_kernel(true, *through, *op, *half));
+            let heap_kernel = sample_kernel(true, *through, *op, *half);
+            let at_heap = pipeline_of(device, &heap_kernel);
+            announced.extend(notices(messages).into_iter().map(|(kind, _)| kind));
+            let noted = notes_of(device, &heap_kernel);
             let sampler = matches!(through, Through::Slot).then_some(&runtime);
             for &(format, bytes) in &RAW_HELD {
                 let texture = made(device, format, bytes).unwrap();
@@ -832,27 +1076,50 @@ fn heap_extended_samples_are_the_slot_s() {
                     .unwrap_or_else(|e| panic!("{format:?} {name} {op:?} at a slot: {e}"));
                 let held = dispatch_with(device, (&at_heap, true), (&texture, sampler), &lanes)
                     .unwrap_or_else(|e| panic!("{format:?} {name} {op:?} through a heap: {e}"));
+                // What the dispatch announced: the filter's note holds where the command's heap
+                // can name a texture the function filters (`SpecKey::HeapRawTextures`), so it is
+                // announced at the dispatch that binds one, not as the pipeline is made.
+                announced.extend(notices(messages).into_iter().map(|(kind, _)| kind));
+                // The device's narrowing of a `half` result, and its blend of a linear sample's
+                // taps, each announced.
+                let narrows = *half && recorded(&noted, &announced, NATIVE_HALF);
+                let filtered = matches!(op, Op::Sample)
+                    && (name.contains("linear") || matches!(through, Through::Slot))
+                    && recorded(&noted, &announced, FILTER_ARITHMETIC);
                 checked += lanes.len();
                 let wrong: Vec<usize> = (0..lanes.len()).filter(|&i| held[i] != slot[i]).collect();
-                if let Some(&i) = wrong.first() {
-                    differ += wrong.len();
-                    println!(
-                        "HEAP-SAMPLE-DIFFERS {}: {format:?} {name} {op:?} half {half}: {} of {} \
-                         lanes, first at {:?}: {:08x?}, the slot's {:08x?}",
-                        device.name(),
-                        wrong.len(),
-                        lanes.len(),
-                        lanes[i],
-                        &held[i][..4],
-                        &slot[i][..4]
-                    );
+                let blended =
+                    filtered && matches!(format, PixelFormat::BGRA10XR | PixelFormat::BGR10XR);
+                let (alike, differing): (Vec<usize>, Vec<usize>) =
+                    wrong.into_iter().partition(|&i| {
+                        let (a, b) = (&held[i], &slot[i]);
+                        (narrows && narrowed_alike(a, b)) || (blended && blended_alike(a, b))
+                    });
+                explained += alike.len();
+                differ += differing.len();
+                for (mark, wrong) in [
+                    ("HEAP-SAMPLE-ANNOUNCED", &alike),
+                    ("HEAP-SAMPLE-DIFFERS", &differing),
+                ] {
+                    if let Some(&i) = wrong.first() {
+                        println!(
+                            "{mark} {}: {format:?} {name} {op:?} half {half}: {} of {} lanes, \
+                             first at {:?}: {:08x?}, the slot's {:08x?}",
+                            device.name(),
+                            wrong.len(),
+                            lanes.len(),
+                            lanes[i],
+                            &held[i][..4],
+                            &slot[i][..4]
+                        );
+                    }
                 }
             }
         }
-        let announced = notices(messages);
+        announced.extend(notices(messages).into_iter().map(|(kind, _)| kind));
         println!(
             "HEAP-SAMPLE extended {}: {} cases, {checked} lanes checked, {differ} differ, \
-             announced {announced:?}",
+             {explained} announced, announced {announced:?}",
             device.name(),
             cases.len()
         );
@@ -869,7 +1136,7 @@ fn heap_extended_samples_are_the_slot_s() {
 /// only reads the raw texture.
 #[test]
 fn a_heap_sample_the_function_does_not_emulate_refuses_a_raw_texture() {
-    on_device(|device, _| {
+    on_device_with(at_plan, |device, _| {
         let mut mipmapped = SamplerDescriptor::new();
         mipmapped.min_filter = SamplerMinMagFilter::Linear;
         mipmapped.mag_filter = SamplerMinMagFilter::Linear;
@@ -938,7 +1205,7 @@ fn a_heap_sample_the_function_does_not_emulate_refuses_a_raw_texture() {
 /// command announces nothing, the notice spent).
 #[test]
 fn a_raw_texture_over_a_buffer_announces_its_shadow_only_where_not_named() {
-    on_device(|device, messages| {
+    on_device_with(at_plan, |device, messages| {
         let lanes = sample_lanes();
         let nearest = Through::Constexpr(sampler_words(1, false, 0, false));
         let mip = Through::Constexpr(sampler_words(1, false, 0, true));
@@ -1071,7 +1338,7 @@ fn a_raw_texture_over_a_buffer_announces_its_shadow_only_where_not_named() {
 /// announced (the module docs).
 #[test]
 fn heap_rgbx_reads_are_the_slot_s() {
-    on_device(|device, messages| {
+    on_device_with(at_plan, |device, messages| {
         let formats: Vec<(PixelFormat, u64, &[Texel])> = RGBX
             .iter()
             .map(|&(format, bytes, integer)| (format, bytes, texels_of(integer)))
@@ -1087,5 +1354,115 @@ fn heap_rgbx_reads_are_the_slot_s() {
         );
         assert!(tally.checked > 0);
         assert_eq!(tally.differ, 0, "heap reads differ from the slot's");
+    });
+}
+
+/// A 256 x 256 texture of `format` (texels of `bytes` bytes, one level) whose texel `n` holds
+/// `n` in each of its 16-bit units: every code of each of the format's channels, whether a
+/// channel is a 16-bit unit (a bfloat code, a 10-bit code in its 16-bit container) or a 10-bit
+/// field of a packed 32-bit word (`BGR10_XR`'s, at bits 0, 10 and 20).
+fn every_code(device: &Device, format: PixelFormat, bytes: u64) -> Result<Texture, Error> {
+    let mut descriptor = TextureDescriptor::texture_2d(format, 256, 256, false);
+    descriptor.usage = TextureUsage::SHADER_READ;
+    descriptor.resource_options = ResourceOptions::shared();
+    let texture = device.new_texture(&descriptor)?;
+    let units = bytes / 2;
+    let texels: Vec<u8> = (0..=u16::MAX)
+        .flat_map(|n| (0..units).flat_map(move |_| n.to_le_bytes()))
+        .collect();
+    texture
+        .replace_region(
+            Region::new_2d(0, 0, 256, 256),
+            0,
+            0,
+            &texels,
+            256 * bytes,
+            0,
+        )
+        .unwrap();
+    Ok(texture)
+}
+
+/// A `half` read through an argument buffer of every code of each texture a heap holds by its raw
+/// texels alone ([`RAW_HELD`], [`every_code`]) is the device's `float` read of the same texel
+/// rounded to the nearest even `half` (`half_conversions::half_of`, Metal's `half(float)`), each
+/// lane bit for bit (a NaN a NaN), and the slot's `half` read, where the heap read's stage records
+/// no `PrecisionNote::NativeHalfConversion`: the device's conversion of the decoded texel's
+/// `float` (`narrow::round_texel`). Where the profile takes `DriverDeviation::MetalHalfConversion`
+/// (`VkProperty::MetalHalfConversion`; MoltenVK on the Apple M3 Max's macOS 27 identity) the
+/// stage records no such note. A lane that differs where the stage records it is counted on a
+/// `HEAP-HALF-ROUNDING` line. The padded formats, whose creation the runtime refuses, never reach
+/// a read.
+#[test]
+fn heap_half_reads_of_every_code_round_their_float() {
+    use metal2vulkan::device::VkProperty;
+    on_device_with(at_plan, |device, _| {
+        let measured = device
+            .compile_device()
+            .profile()
+            .enabled()
+            .properties
+            .contains(&VkProperty::MetalHalfConversion);
+        let notes = stage_notes(device, true, Texel::Half);
+        let noted = notes.contains(&PrecisionNote::NativeHalfConversion);
+        assert!(
+            !measured || !noted,
+            "NativeHalfConversion recorded where the profile takes MetalHalfConversion: {notes:?}"
+        );
+        let lanes: Vec<[u32; 4]> = (0..256u32 * 256)
+            .map(|i| [i % 256, i / 256, 0, 0])
+            .collect();
+        let float_heap = pipeline(device, true, Texel::Float);
+        let half_heap = pipeline(device, true, Texel::Half);
+        let half_slot = pipeline(device, false, Texel::Half);
+        let mut checked = 0;
+        for (format, bytes) in RAW_HELD {
+            let texture =
+                every_code(device, format, bytes).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            let read = |state: &ComputePipelineState, heap: bool| {
+                dispatch_with(device, (state, heap), (&texture, None), &lanes)
+                    .unwrap_or_else(|e| panic!("{format:?}: {e}"))
+            };
+            let (floats, halves, slot) = (
+                read(&float_heap, true),
+                read(&half_heap, true),
+                read(&half_slot, false),
+            );
+            let mut differ = 0;
+            for (i, ((f, h), s)) in floats.iter().zip(&halves).zip(&slot).enumerate() {
+                for c in 0..4 {
+                    let (f, h) = (f32::from_bits(f[c]), f32::from_bits(h[c]));
+                    let same = match f.is_nan() {
+                        true => h.is_nan(),
+                        false => {
+                            !h.is_nan()
+                                && half_conversions::half_of(h) == half_conversions::half_of(f)
+                        }
+                    };
+                    let slot_same =
+                        s[c] == f32::to_bits(h) || (h.is_nan() && f32::from_bits(s[c]).is_nan());
+                    if same && slot_same {
+                        continue;
+                    }
+                    assert!(
+                        noted,
+                        "{format:?} texel {i} channel {c}: heap half {h:?} ({:#010x}), its float \
+                         {f:?} ({:#010x}), the slot's half {:#010x} (notes {notes:?})",
+                        h.to_bits(),
+                        f.to_bits(),
+                        s[c]
+                    );
+                    differ += 1;
+                }
+            }
+            checked += 4 * lanes.len();
+            println!(
+                "HEAP-HALF-ROUNDING {} {format:?}: {differ} of {} channels not the float's nearest \
+                 even half, note {noted}",
+                device.name(),
+                4 * lanes.len()
+            );
+        }
+        assert!(checked > 0);
     });
 }

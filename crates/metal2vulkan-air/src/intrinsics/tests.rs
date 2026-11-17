@@ -233,6 +233,11 @@ fn math_conversion_and_atomic_families_decode() {
         "air.clamp.u.v4i32",
         "air.max3.u.i32",
         "air.min3.s.i32",
+        // MSL's integer `median3`, as Apple's compiler spells it.
+        "air.median3.s.i32",
+        "air.median3.u.i32",
+        "air.median3.s.i16",
+        "air.median3.s.v4i32",
         "air.fmedian3.v4f16",
         "air.fast_fmax3.v2f32",
         "air.atan2.f16",
@@ -274,18 +279,100 @@ fn math_conversion_and_atomic_families_decode() {
         "air.convert.f8e5m2.f32.f.f32", // 8-bit float is not a destination type
         "air.convert.u.i1.f.f8e5m2",    // an 8-bit float converts to no `bool`
         "air.convert.s.i32.s.f8e5m2",   // an 8-bit float is read as a float
-        "air.convert.s.i32.u.v2i32",    // lane counts differ
-        "air.convert.f.i32.s.i32",      // kind disagrees with type
-        "air.convert.s.i1.f.f32",       // booleans are `u.i1`
-        "air.pack.unorm4x8.v3f32",      // lane count
-        "air.atomic.global.min.i32",    // integer min spells its sign
-        "air.atomic.global.and.f32",    // no float and
-        "air.atomic.global.add.v2i32",  // no vector atomics
-        "air.atomic.global.xchg.u.i32", // exchange takes no sign
-        "air.atomic.region.add.u.i32",  // unknown space
+        "air.convert.f.f32.s.i32.sat",  // `.sat` follows a rounding
+        "air.convert.f.f32.s.i32.rte.sat", // a float saturates nothing
+        "air.convert.s.i32.f.f32.rtz.sat.sat",
+        "air.convert.s.i32.f.f32.rtu",    // no such rounding
+        "air.convert.f.f32.u.i1.rte",     // a `bool` rounds nothing
+        "air.convert.s.i32.f.f8e5m2.rtz", // nor an 8-bit float
+        "air.convert.s.i32.u.v2i32",      // lane counts differ
+        "air.convert.f.i32.s.i32",        // kind disagrees with type
+        "air.convert.s.i1.f.f32",         // booleans are `u.i1`
+        "air.pack.unorm4x8.v3f32",        // lane count
+        "air.atomic.global.min.i32",      // integer min spells its sign
+        "air.atomic.global.and.f32",      // no float and
+        "air.atomic.global.add.v2i32",    // no vector atomics
+        "air.atomic.global.xchg.u.i32",   // exchange takes no sign
+        "air.atomic.region.add.u.i32",    // unknown space
         "air.load.somewhat_coherent.i32.p1i32",
     ] {
         assert_eq!(classify_self(name), DeclClass::Unknown, "{name}");
+    }
+}
+
+/// The rounding Apple's OpenCL compiler spells after a conversion's types, and `.sat` after it to
+/// an integer, on every `convert_*` it emits (`convert_float4_rte(uchar4)` is
+/// `air.convert.f.v4f32.u.v4i8.rte`, `convert_int_sat(float)` is
+/// `air.convert.s.i32.f.f32.rtz.sat`): the conversion its types name, with the suffix beside it.
+#[test]
+fn a_rounded_or_saturated_convert_decodes_its_suffix_beside_its_types() {
+    use super::Rounding as R;
+    for (suffixed, plain, rounding, saturate) in [
+        (
+            "air.convert.f.v4f32.u.v4i8.rte",
+            "air.convert.f.v4f32.u.v4i8",
+            R::Even,
+            false,
+        ),
+        (
+            "air.convert.f.v4f32.s.v4i32.rte",
+            "air.convert.f.v4f32.s.v4i32",
+            R::Even,
+            false,
+        ),
+        (
+            "air.convert.f.f16.s.i32.rtz",
+            "air.convert.f.f16.s.i32",
+            R::Zero,
+            false,
+        ),
+        (
+            "air.convert.f.f16.f.f32.rtp",
+            "air.convert.f.f16.f.f32",
+            R::Up,
+            false,
+        ),
+        (
+            "air.convert.s.i32.f.f32.rtn",
+            "air.convert.s.i32.f.f32",
+            R::Down,
+            false,
+        ),
+        (
+            "air.convert.s.i32.f.f32.rtz.sat",
+            "air.convert.s.i32.f.f32",
+            R::Zero,
+            true,
+        ),
+        (
+            "air.convert.u.v2i16.s.v2i64.rte.sat",
+            "air.convert.u.v2i16.s.v2i64",
+            R::Even,
+            true,
+        ),
+        (
+            "air.convert.u.i8.u.i32.rtz",
+            "air.convert.u.i8.u.i32",
+            R::Zero,
+            false,
+        ),
+    ] {
+        let (AirIntrinsic::Convert(c), AirIntrinsic::Convert(p)) = (air(suffixed), air(plain))
+        else {
+            panic!("{suffixed} or {plain} is no conversion");
+        };
+        assert_eq!(
+            (c.rounding, c.saturate),
+            (Some(rounding), saturate),
+            "{suffixed}"
+        );
+        assert_eq!((p.rounding, p.saturate), (None, false), "{plain}");
+        let types = Convert {
+            rounding: None,
+            saturate: false,
+            ..c
+        };
+        assert_eq!(types, p, "{suffixed}");
     }
 }
 
@@ -373,7 +460,7 @@ fn atomics_read_their_immediates() {
         let args = [ptr, val, c.i32(order), c.i32(scope), yes];
         assert_eq!(bind(template, &args, &c.table), Ok(Bound::Unknown));
     }
-    // A non-constant immediate is malformed.
+    // A non-constant immediate does not bind (decode keeps the call unbound).
     let args = [ptr, val, val, device, yes];
     assert_eq!(
         bind(template, &args, &c.table),
@@ -655,6 +742,92 @@ fn llvm_math_library_bases_decode() {
         ("llvm.log2.i32", i32s, &[i32s][..]),
     ] {
         assert_eq!(llvm(name, ret, params), DeclClass::Mismatch, "{name}");
+    }
+}
+
+/// `llvm.bitreverse` decodes as the kept integer operation of arity one on every integer width
+/// and vector of one, checked against its declaration like the other integer bases.
+#[test]
+fn llvm_bitreverse_decodes_at_every_integer_width() {
+    let num = |elem, lanes| Operand::Num(NumTy { elem, lanes });
+    for (name, elem, lanes) in [
+        ("llvm.bitreverse.i8", Elem::I8, 1),
+        ("llvm.bitreverse.i16", Elem::I16, 1),
+        ("llvm.bitreverse.i32", Elem::I32, 1),
+        ("llvm.bitreverse.i64", Elem::I64, 1),
+        ("llvm.bitreverse.v4i32", Elem::I32, 4),
+        ("llvm.bitreverse.v2i64", Elem::I64, 2),
+        ("llvm.bitreverse.v3i16", Elem::I16, 3),
+    ] {
+        let ty = num(elem, lanes);
+        assert_eq!(
+            llvm(name, ty, &[ty]),
+            DeclClass::Llvm(LlvmIntrinsic::Int {
+                op: LlvmIntOp::BitReverse,
+                ty: NumTy { elem, lanes },
+            }),
+            "{name}"
+        );
+    }
+    // A declaration that disagrees: the arity, the suffix, a float overload.
+    let (i32s, i64s, f32s) = (num(Elem::I32, 1), num(Elem::I64, 1), num(Elem::F32, 1));
+    for (name, ret, params) in [
+        ("llvm.bitreverse.i32", i32s, &[i32s, i32s][..]),
+        ("llvm.bitreverse.i64", i32s, &[i32s][..]),
+        ("llvm.bitreverse.i32", i64s, &[i64s][..]),
+        ("llvm.bitreverse.f32", f32s, &[f32s][..]),
+    ] {
+        assert_eq!(llvm(name, ret, params), DeclClass::Mismatch, "{name}");
+    }
+}
+
+/// An integer operation on a scalar of a width no `NumTy` names (Metal's compiler leaves
+/// `llvm.bitreverse.i2` in OpenCL C's fences) decodes as its narrow form, checked against its
+/// declaration: every operand the result's width, the suffix spelling it.
+#[test]
+fn llvm_integer_operations_on_narrow_widths_decode() {
+    let m = &mut meter();
+    let mut t = TypeTable::new();
+    let mut decl = |t: &mut TypeTable, ret: u8, params: &[u8]| {
+        let ret = t.intern(Type::Int(ret), m).unwrap();
+        let params: Vec<_> = params
+            .iter()
+            .map(|&w| t.intern(Type::Int(w), m).unwrap())
+            .collect();
+        let f = Type::Function {
+            ret,
+            params: params.into(),
+            vararg: false,
+        };
+        t.intern(f, m).unwrap()
+    };
+    for (name, op, bits, arity) in [
+        ("llvm.bitreverse.i2", LlvmIntOp::BitReverse, 2, 1),
+        ("llvm.ctpop.i3", LlvmIntOp::Ctpop, 3, 1),
+        ("llvm.bswap.i48", LlvmIntOp::Bswap, 48, 1),
+        ("llvm.umax.i24", LlvmIntOp::UMax, 24, 2),
+    ] {
+        let ty = decl(&mut t, bits, &vec![bits; arity]);
+        assert_eq!(
+            classify(name.as_bytes(), sym(), ty, &t),
+            Some(DeclClass::Llvm(LlvmIntrinsic::NarrowInt { op, bits })),
+            "{name}"
+        );
+    }
+    // A declaration that disagrees: an operand of another width, the suffix, the arity, a
+    // `bswap` of a width that is no multiple of 16 bits.
+    for (name, ret, params) in [
+        ("llvm.bitreverse.i2", 2, &[3][..]),
+        ("llvm.bitreverse.i3", 2, &[2][..]),
+        ("llvm.bitreverse.i2", 2, &[2, 2][..]),
+        ("llvm.bswap.i24", 24, &[24][..]),
+    ] {
+        let ty = decl(&mut t, ret, params);
+        assert_eq!(
+            classify(name.as_bytes(), sym(), ty, &t),
+            Some(DeclClass::Mismatch),
+            "{name}"
+        );
     }
 }
 
@@ -993,7 +1166,7 @@ fn markers_are_dropped() {
         );
     }
     let bases: Vec<&str> = BASES.iter().map(|(n, _)| *n).collect();
-    assert_eq!(bases.len(), 31);
+    assert_eq!(bases.len(), 32);
 }
 
 #[test]
@@ -1092,4 +1265,182 @@ fn dropped_family_names_only_the_markers_decode_drops() {
     assert_eq!(dropped_family("llvm.memcpy.p0.p0.i64"), None);
     assert_eq!(dropped_family("llvm.assumed"), None);
     assert_eq!(dropped_family("air.lifetime.start"), None);
+}
+
+#[test]
+fn opencl_native_and_half_functions_read_as_the_fast_form() {
+    let mut decoded = 0;
+    for prefix in ["native_", "half_"] {
+        for &stem in super::math::OPENCL_STEMS {
+            for lanes in [1, 2, 3, 4, 8, 16] {
+                let ty = token(NumTy {
+                    elem: Elem::F32,
+                    lanes,
+                });
+                let name = format!("air.{prefix}{stem}.{ty}");
+                let fast = air(&format!("air.fast_{stem}.{ty}"));
+                assert_eq!(air(&name), fast, "{name}");
+                let AirIntrinsic::Math(m) = fast else {
+                    panic!("{name}");
+                };
+                assert_eq!(m.precision, Precision::Fast, "{name}");
+                decoded += 1;
+            }
+        }
+    }
+    assert_eq!(decoded, 144);
+    for name in [
+        "air.native_divide.f32",    // spelled as arithmetic
+        "air.half_recip.v4f32",     // spelled as arithmetic
+        "air.native_fabs.f32",      // no OpenCL C native_fabs
+        "air.native_cos.f16",       // float types only
+        "air.half_powr.v2f16",      // float types only
+        "air.native_fast_cos.f32",  // one prefix
+        "air.native_cos.s.f32",     // no sign token
+        "air.native_cos.f32.extra", // trailing token
+    ] {
+        assert_eq!(classify_self(name), DeclClass::Unknown, "{name}");
+    }
+}
+
+#[test]
+fn opencl_vector_data_functions_decode_with_their_strides() {
+    use AddrSpace::{Constant as C, Device as G, Thread as P, Threadgroup as L};
+    let v = |name: &str| match air(name) {
+        AirIntrinsic::VectorData(v) => v,
+        other => panic!("{name}: {other:?}"),
+    };
+    let n = |elem, lanes| NumTy { elem, lanes };
+    for (name, op, space, ty, stride) in [
+        (
+            "air.vload.global.v3i32",
+            VectorDataOp::Load,
+            G,
+            n(Elem::I32, 3),
+            3,
+        ),
+        (
+            "air.vload.constant.v16i8",
+            VectorDataOp::Load,
+            C,
+            n(Elem::I8, 16),
+            16,
+        ),
+        (
+            "air.vload.local.v2i64",
+            VectorDataOp::Load,
+            L,
+            n(Elem::I64, 2),
+            2,
+        ),
+        (
+            "air.vload.private.v8i16",
+            VectorDataOp::Load,
+            P,
+            n(Elem::I16, 8),
+            8,
+        ),
+        (
+            "air.vstore.global.v4f32",
+            VectorDataOp::Store,
+            G,
+            n(Elem::F32, 4),
+            4,
+        ),
+        (
+            "air.vload_half.constant.f32",
+            VectorDataOp::LoadHalf { aligned: false },
+            C,
+            n(Elem::F32, 1),
+            1,
+        ),
+        (
+            "air.vload_half.global.v3f32",
+            VectorDataOp::LoadHalf { aligned: false },
+            G,
+            n(Elem::F32, 3),
+            3,
+        ),
+        (
+            "air.vloada_half.global.v3f32",
+            VectorDataOp::LoadHalf { aligned: true },
+            G,
+            n(Elem::F32, 3),
+            4,
+        ),
+        (
+            "air.vloada_half.local.v8f32",
+            VectorDataOp::LoadHalf { aligned: true },
+            L,
+            n(Elem::F32, 8),
+            8,
+        ),
+        (
+            "air.vstore_half.global.rtz.f32",
+            VectorDataOp::StoreHalf {
+                aligned: false,
+                rounding: HalfRounding::Rtz,
+            },
+            G,
+            n(Elem::F32, 1),
+            1,
+        ),
+        (
+            "air.vstore_half.private.rtp.v3f32",
+            VectorDataOp::StoreHalf {
+                aligned: false,
+                rounding: HalfRounding::Rtp,
+            },
+            P,
+            n(Elem::F32, 3),
+            3,
+        ),
+        (
+            "air.vstorea_half.global.rtn.v3f32",
+            VectorDataOp::StoreHalf {
+                aligned: true,
+                rounding: HalfRounding::Rtn,
+            },
+            G,
+            n(Elem::F32, 3),
+            4,
+        ),
+        (
+            "air.vstorea_half.local.rte.v16f32",
+            VectorDataOp::StoreHalf {
+                aligned: true,
+                rounding: HalfRounding::Rte,
+            },
+            L,
+            n(Elem::F32, 16),
+            16,
+        ),
+    ] {
+        let d = v(name);
+        assert_eq!(
+            (d.op, d.space, d.ty, d.stride()),
+            (op, space, ty, stride),
+            "{name}"
+        );
+        let half = matches!(
+            op,
+            VectorDataOp::LoadHalf { .. } | VectorDataOp::StoreHalf { .. }
+        );
+        assert_eq!(d.data(), if half { Elem::F16 } else { ty.elem }, "{name}");
+    }
+    for name in [
+        "air.vload.global.i32",           // one lane is no vload
+        "air.vload.global.v5i32",         // no such width
+        "air.vload.global.v4f16",         // no half vload observed
+        "air.vstore.constant.v4i32",      // no store to constant memory
+        "air.vload.device.v4i32",         // OpenCL's space names
+        "air.vloada_half.global.f32",     // vloada_half has vector forms only
+        "air.vload_half.global.v4i32",    // half forms are of floats
+        "air.vstore_half.global.v4f32",   // a rounding is spelled
+        "air.vstore_half.global.rtx.f32", // no such rounding
+        "air.vstore.global.v4i32.extra",  // trailing token
+        "air.vload.global.rte.v4i32",     // no rounding on a load
+    ] {
+        assert_eq!(classify_self(name), DeclClass::Unknown, "{name}");
+    }
 }

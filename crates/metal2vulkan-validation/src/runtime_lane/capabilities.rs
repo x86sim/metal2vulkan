@@ -10,9 +10,8 @@ use metal2vulkan::error::{Capability, Feature, Unsupported};
 use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
 use metal2vulkan::vk::SampleCountFlags;
 use metal2vulkan_runtime::{
-    CommandBufferStatus, CopyProblem, Device, DeviceProperties, Error, Invalid, Problem, Query,
-    ResourceOptions, RuntimeGap, Size, Texture, TextureDescriptor, TextureProblem,
-    DEFAULT_PROTECTION_OPTIONS,
+    CommandBufferStatus, CopyProblem, Device, Error, Invalid, Nil, Problem, Query, ResourceOptions,
+    RuntimeGap, Size, Texture, TextureDescriptor, TextureProblem, DEFAULT_PROTECTION_OPTIONS,
 };
 use std::time::Duration;
 
@@ -49,10 +48,11 @@ const INTEGER_FORMATS: [PixelFormat; 19] = [
 /// refusal (`NotImplemented` naming the gap the query waits on).
 type Answer = (Option<u64>, Result<String, Error>);
 
-/// Each gated query's answers on `p`: the sample counts 0 to 64, the amplification counts 0 to 2,
-/// Metal's largest (8) and one above it, the rate-map layer counts 0 to 3, and the linear alignment
-/// of `RGBA8Unorm`.
-fn query_answers(p: &DeviceProperties) -> Vec<(Query, Vec<Answer>)> {
+/// Each gated query's answers on `device`: the sample counts 0 to 64, the amplification counts 0
+/// to 2, Metal's largest (8) and one above it, the rate-map layer counts 0 to 3, and the linear
+/// alignment of `RGBA8Unorm` (the device's own query).
+fn query_answers(device: &Device) -> Vec<(Query, Vec<Answer>)> {
+    let p = device.properties();
     fn one<T: std::fmt::Debug>(answer: Result<T, Error>) -> Vec<Answer> {
         vec![(None, answer.map(|value| format!("{value:?}")))]
     }
@@ -86,11 +86,10 @@ fn query_answers(p: &DeviceProperties) -> Vec<(Query, Vec<Answer>)> {
                 Query::RasterizationRateMapLayerCount => each(&[0, 1, 2, 3], |count| {
                     p.supports_rasterization_rate_map_with_layer_count(count)
                 }),
-                Query::MinimumLinearTextureAlignment => {
-                    one(p
-                        .minimum_linear_texture_alignment_for_pixel_format(PixelFormat::RGBA8Unorm))
-                }
+                Query::MinimumLinearTextureAlignment => one(device
+                    .minimum_linear_texture_alignment_for_pixel_format(PixelFormat::RGBA8Unorm)),
                 Query::SamplerReductionMode => gapped(p.supports_sampler_reduction_mode()),
+                Query::PullModelInterpolation => gapped(p.supports_pull_model_interpolation()),
                 other => panic!("{other:?}: a query this test does not ask"),
             };
             (query, answers)
@@ -100,7 +99,8 @@ fn query_answers(p: &DeviceProperties) -> Vec<(Query, Vec<Answer>)> {
 
 /// The runtime device answers Metal's public device queries from their sources: its identity
 /// agrees with the description it was created from, and every property equals the compile
-/// layer's answer for that description. A query whose runtime piece is not built answers its gap
+/// layer's answer for that description, but the threadgroup memory, which is the device's own
+/// limit up to its Mac class's. A query whose runtime piece is not built answers its gap
 /// (`families.rs` tests the GPU families). Every answer is printed, with the device's values
 /// behind the gaps from their sources, as the venue's record. Texture creation agrees with the
 /// texture queries' answers (`textures_are_made_as_the_texture_queries_answer`).
@@ -124,16 +124,38 @@ fn a_runtime_device_answers_its_queries_and_the_apple_only_calls() {
         assert_eq!(p.vendor_id, d.vendor_id);
         assert_eq!(p.device_id, d.device_id);
         assert_eq!(p.api_version, d.api_version);
-        assert_eq!(p.max_buffer_length, metal.max_buffer_length);
+        // The compile layer's answer, at most three quarters of the device's largest device-local
+        // heap, to 16 KiB (`DeviceProperties::max_buffer_length`).
+        println!(
+            "CAPABILITIES {}: max_buffer_length {} of the compile layer's {}",
+            p.name, p.max_buffer_length, metal.max_buffer_length
+        );
+        assert!(
+            p.max_buffer_length == metal.max_buffer_length
+                || (p.max_buffer_length < metal.max_buffer_length
+                    && p.max_buffer_length.is_multiple_of(16 << 10)),
+            "max_buffer_length {} against the compile layer's {}",
+            p.max_buffer_length,
+            metal.max_buffer_length
+        );
         let [width, height, depth] = metal.max_threads_per_threadgroup.map(u64::from);
         assert_eq!(
             p.max_threads_per_threadgroup,
             Size::new(width, height, depth)
         );
+        // The device's own limit, up to what Metal answers on the class of Mac the device
+        // presents: an Apple silicon Mac's 32 KiB (the compile layer's answer), a Mac with an
+        // Intel or AMD GPU's 64 KiB (`MacClass`).
+        let mac = if p.lossless_compression {
+            32 << 10
+        } else {
+            64 << 10
+        };
         assert_eq!(
             p.max_threadgroup_memory_length,
-            u64::from(metal.max_threadgroup_memory_length)
+            u64::from(d.limits.max_compute_shared_memory_size).min(mac)
         );
+        assert!(p.max_threadgroup_memory_length >= u64::from(metal.max_threadgroup_memory_length));
         assert_eq!(p.argument_buffers_support, metal.argument_buffers_tier);
         assert_eq!(p.read_write_texture_support, metal.read_write_texture_tier);
         assert_eq!(
@@ -164,7 +186,7 @@ fn a_runtime_device_answers_its_queries_and_the_apple_only_calls() {
             d.has(VkFeature::Multiview),
             d.limits.max_multiview_view_count
         );
-        for (query, answers) in query_answers(p) {
+        for (query, answers) in query_answers(&device) {
             eprintln!("  {}: {answers:?}", query.selector());
             for (argument, answer) in answers {
                 match query.gap() {
@@ -432,6 +454,75 @@ fn textures_are_made_as_the_texture_queries_answer() {
 /// driver reports (`DeviceProperties::gpu_core_count`) or none, never Apple's GPU's; each private
 /// property with no answer gives none, and they are announced once, naming them, however often
 /// the properties are read.
+/// A buffer one byte past `max_buffer_length` is nil, as plain Metal answers
+/// (`newBufferWithLength:options:` past `maxBufferLength`), in every storage mode, and the
+/// longest Metal's rule allows is its compile layer's answer or three quarters of the device's
+/// largest device-local heap, to 16 KiB (`DeviceProperties::max_buffer_length`), printed as
+/// `MAX-BUFFER-LENGTH`. `Shared` and `Private` storage are refused alike.
+#[test]
+fn a_buffer_past_max_buffer_length_is_nil() {
+    let cache = ScratchCache::new().unwrap();
+    let messages = Messages::default();
+    {
+        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let cap = device.properties().max_buffer_length;
+        let limit = device.compile_device().metal_properties().max_buffer_length;
+        println!(
+            "MAX-BUFFER-LENGTH {}: {cap} ({:.3} GiB) of the compile layer's {limit}",
+            device.name(),
+            cap as f64 / f64::from(1u32 << 30)
+        );
+        for options in [ResourceOptions::shared(), ResourceOptions::private()] {
+            let past = device.new_buffer(cap + 1, options);
+            assert_eq!(
+                past.err(),
+                Some(Error::Nil(Nil::new(
+                    "new_buffer",
+                    Problem::BufferLength { length: cap + 1 }
+                ))),
+                "{options:?}"
+            );
+        }
+    }
+    layer_reported_nothing_at_all(&messages);
+}
+
+/// A `Private` buffer of `max_buffer_length` bytes is made where the device's heap bounds the
+/// length (below the compile layer's answer, the RTX 5080 Laptop GPU's), and one byte more is nil.
+/// It takes three quarters of the device's memory, so it runs only by name.
+#[test]
+#[ignore = "allocates three quarters of the device's memory: run by name with --run-ignored all"]
+fn a_buffer_of_max_buffer_length_is_made_where_the_heap_bounds_it() {
+    let cache = ScratchCache::new().unwrap();
+    let messages = Messages::default();
+    {
+        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let cap = device.properties().max_buffer_length;
+        let limit = device.compile_device().metal_properties().max_buffer_length;
+        if cap == limit {
+            println!(
+                "SKIPPED {}: no heap bounds max_buffer_length ({cap})",
+                device.name()
+            );
+            return;
+        }
+        let made = device.new_buffer(cap, ResourceOptions::private());
+        println!(
+            "MAX-BUFFER-LENGTH {}: a Private buffer of {cap} bytes made: {}",
+            device.name(),
+            made.is_ok()
+        );
+        let made = made.unwrap_or_else(|e| panic!("a buffer of {cap} bytes: {e}"));
+        assert_eq!(made.length(), cap);
+        drop(made);
+        assert!(matches!(
+            device.new_buffer(cap + 1, ResourceOptions::private()),
+            Err(Error::Nil(_))
+        ));
+    }
+    layer_reported_nothing_at_all(&messages);
+}
+
 #[test]
 fn the_device_reports_its_own_core_count() {
     use metal2vulkan_runtime::{Degradation, PrivateCount};

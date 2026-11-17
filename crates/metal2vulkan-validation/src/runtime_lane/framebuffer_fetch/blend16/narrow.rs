@@ -22,12 +22,15 @@
 //!
 //! Where the draw announces none of [`super::NOTES`], every channel is Metal's. On a device that
 //! fetches through the pixel interlock (RADV, ANV, NVIDIA, MoltenVK) the function computes Metal's
-//! blend itself, exactly, announcing none of them, which is asserted. Through input attachments
+//! blend itself, exactly, announcing none of them but `device-color-conversion` for the `float2`
+//! output where the device's store converts its `float` to `half` by its own rule
+//! ([`interlocked_notes`]), which is asserted. Through input attachments
 //! (lavapipe) the device blends; what it announces and how many channels are Metal's is printed.
-//! Each draw prints a `FETCH-BLEND16-NARROW` line, naming its blend.
+//! Each draw prints a `FETCH-BLEND16-NARROW` line, naming its blend. A device that has neither
+//! form skips it (`fetches`).
 
-use super::super::{form, library, through_inputs};
-use super::{half_bits, half_value, Words, NOTES, SIDE, TEXELS};
+use super::super::{fetches, form, library, through_inputs};
+use super::{half_bits, half_value, interlocked_notes, Words, NOTES, SIDE, TEXELS};
 use crate::runtime_lane::buffer_with;
 use crate::runtime_lane::degrade_notices::counts;
 use crate::runtime_lane::resolves::{lane_with, quiet, Lane};
@@ -146,13 +149,17 @@ fn unwritten(lane: &Lane) -> Texture {
 }
 
 /// Each draw's channels are Metal's where it announces none of [`NOTES`], and on a device that
-/// fetches through the pixel interlock it announces none (the module docs).
+/// fetches through the pixel interlock it announces those [`interlocked_notes`] names alone (the
+/// module docs).
 #[test]
 fn a_two_lane_output_into_a_blended_two_channel_fetch_stores_metals_blend() {
     let kinds = NOTES.map(Degradation::from_precision_note);
     let (messages, _cache, lane) = lane_with(|options| {
         options.announce_each = kinds.into_iter().collect();
     });
+    if !fetches(&lane.device) {
+        return;
+    }
     let fixture = library(&lane, "fbl_fetch_blend16_narrow");
     let device = lane.device.name();
     let interlock = !through_inputs(&lane);
@@ -259,7 +266,11 @@ fn a_two_lane_output_into_a_blended_two_channel_fetch_stores_metals_blend() {
             TEXELS,
         );
         if interlock {
-            assert!(noted.is_empty(), "{what}: announced {noted:?}");
+            let expected = interlocked_notes(&lane, case.float);
+            assert!(
+                noted.iter().copied().eq(&expected),
+                "{what}: announced {noted:?}, where the interlock announces {expected:?}"
+            );
         }
         if noted.is_empty() {
             let shown = &wrong[..wrong.len().min(8)];

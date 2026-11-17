@@ -96,10 +96,12 @@ use super::attachment_stand_in::{self, Cause, StandIn};
 use super::binding_view::views_as;
 use super::buffer::Buffer;
 use super::chroma_pairs::is_four_two_two;
+use super::clear_reach;
 use super::clear_value;
 use super::command_buffer::CommandBuffer;
 use super::degradation::Degradation;
 use super::depth_stencil_scratch::{self, Separate};
+use super::encoder::{Overwrite, OverwriteBy};
 use super::error::{invalid, nil, CommandBufferError, Error, Problem, RuntimeGap};
 use super::fresh_unwritten::FreshUnwritten;
 use super::image_plan::{block_family, ImagePlan};
@@ -117,8 +119,10 @@ use super::sample_positions::{self, Sixteenths};
 use super::texture::Texture;
 use super::tile_pass::{self, TilePass, TileRefusal};
 use super::view_plan::ViewRecord;
+use super::visibility::VisibilityResultType;
 use super::Device;
 use ash::vk;
+use metal2vulkan::bind::AstcDecode;
 use metal2vulkan::device::{DriverFact, VkLimit};
 use metal2vulkan::error::{Capability, Feature, Unsupported};
 use metal2vulkan::metal::format::{
@@ -329,6 +333,10 @@ pub struct RenderPassDescriptor {
     pub stencil_attachment: RenderPassStencilAttachmentDescriptor,
     /// `visibilityResultBuffer`: the buffer the encoder's visibility results are written to.
     pub visibility_result_buffer: Option<Buffer>,
+    /// `visibilityResultType`: whether the encoder's visibility results replace the words at
+    /// their offsets (`Reset`, the default) or are taken into them (`Accumulate`), as an Apple M3
+    /// Max answers it ([`VisibilityResultType`]).
+    pub visibility_result_type: VisibilityResultType,
     /// `renderTargetArrayLength`: the layers a layered pass renders (2 or more); 0 or 1 renders
     /// each attachment's slice alone.
     pub render_target_array_length: u64,
@@ -383,7 +391,7 @@ pub enum Attachment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenderPassProblem {
     /// No attachment has a texture and the target width or height is 0: Metal answers nil (an
-    /// [`Error::Nil`](crate::Error::Nil)).
+    /// [`Error::Nil`]).
     ///
     /// Basis: metal-measured (an Apple M3 Max, macOS 27.0.1: plain Metal answers its render command
     /// encoder nil for a descriptor with no attachment and a 0 by 0 target).
@@ -522,7 +530,7 @@ pub enum RenderPassProblem {
     MemorylessResolve(Attachment),
     /// A tile size other than 16x16, 32x16 and 32x32, or a tile with one side 0 (measured:
     /// "Invalid tile dimensions (8, 8)"; plain Metal answers its encoder nil, an
-    /// [`Error::Nil`](crate::Error::Nil)).
+    /// [`Error::Nil`]).
     ///
     /// Basis: metal-documented (Metal asserts "Invalid tile dimensions (8, 8)", for which plain
     /// Metal answers its encoder nil).
@@ -533,7 +541,7 @@ pub enum RenderPassProblem {
         height: u64,
     },
     /// A 32x32 tile at 4 samples (measured: "4X MSAA does not support 32 x 32 tiles"), which
-    /// Metal's validation stops, an [`Error::Invalid`](crate::Error::Invalid). Plain Metal
+    /// Metal's validation stops, an [`Error::Invalid`]. Plain Metal
     /// faults there: its command buffer fails, or it makes no encoder (the re-probe on an M4), so
     /// the refusal is Metal's answer.
     ///
@@ -545,7 +553,7 @@ pub enum RenderPassProblem {
     },
     /// Per-sample storage, the imageblock sample length rounded up to 8 bytes, past 64
     /// (measured: "Per sample storage (72) cannot be greater than (64)"; plain Metal answers its
-    /// encoder nil, an [`Error::Nil`](crate::Error::Nil)).
+    /// encoder nil, an [`Error::Nil`]).
     ///
     /// Basis: metal-documented (Metal asserts "Per sample storage (72) cannot be greater than
     /// (64)", for which plain Metal answers its encoder nil).
@@ -555,7 +563,7 @@ pub enum RenderPassProblem {
     },
     /// A threadgroup memory length past 32768 bytes (measured: "Requested threadgroup memory
     /// length exceeds amount supported by device (32768)"; plain Metal answers its encoder nil, an
-    /// [`Error::Nil`](crate::Error::Nil)).
+    /// [`Error::Nil`]).
     ///
     /// Basis: metal-documented (Metal asserts "Requested threadgroup memory length exceeds amount
     /// supported by device (32768)", for which plain Metal answers its encoder nil).
@@ -565,7 +573,7 @@ pub enum RenderPassProblem {
     },
     /// Tile memory, the per-sample storage of each pixel of a tile plus the threadgroup memory
     /// length, past 32768 bytes (measured: "Total allocated tile memory (40960) cannot be greater
-    /// than (32768)"; plain Metal answers its encoder nil, an [`Error::Nil`](crate::Error::Nil)).
+    /// than (32768)"; plain Metal answers its encoder nil, an [`Error::Nil`]).
     ///
     /// Basis: metal-documented (Metal asserts "Total allocated tile memory (40960) cannot be
     /// greater than (32768)", for which plain Metal answers its encoder nil).
@@ -752,11 +760,19 @@ pub(super) struct ColorTarget {
     /// The clear color of a `Clear` load the device converts with its rounding in question
     /// (`clear_value::rounds_apart`), whose `device-color-conversion` the pass's load operation
     /// does not owe: on a driver whose load operation clears as Metal's `Clear` load action does
-    /// (`DriverFact::ColorClearIsMetals`), of an attachment the pass's render area covers. The
-    /// clear made otherwise, before the pass, of an attachment its first instance leaves out
+    /// (`DriverFact::ColorClearIsMetals`), of an attachment the pass's render area covers. Its
+    /// clear command of a whole level and layer stores the same texel, so a clear made by it
+    /// (an attachment the first instance leaves out cleared before the pass, a memoryless
+    /// backing, a copy of the attachment cleared for a read after a barrier) owes none either;
+    /// a clear made otherwise, as sample planes or by a render pass of the attachment alone
     /// (`render.rs`), announces it ([`degrade_clear_conversion`]). `None` elsewhere: such a
     /// clear's note is announced as the pass is laid out ([`layout`]).
     pub(super) withheld_clear: Option<[f64; 4]>,
+    /// A clear before the pass cleared the attachment over its reach past the render area, which
+    /// the pass then loads (`clear_reach::ReachClears::load_in_pass`): the pass changes its
+    /// texels though its load is `Load`, which a pass that reaches no tile leaves alone otherwise
+    /// (`render/shadows.rs`).
+    pub(super) cleared_ahead: bool,
 }
 
 impl std::fmt::Debug for ColorTarget {
@@ -781,6 +797,7 @@ impl std::fmt::Debug for ColorTarget {
             .field("stand_in", &self.stand_in)
             .field("planes", &self.planes)
             .field("withheld_clear", &self.withheld_clear)
+            .field("cleared_ahead", &self.cleared_ahead)
             .finish()
     }
 }
@@ -967,7 +984,10 @@ pub(super) struct PassLayout {
     /// The samples every attachment has (the rasterization samples without attachments).
     pub(super) samples: u32,
     pub(super) visibility: Option<Buffer>,
-    /// The draws read the color attachments as input attachments in rasterization order: the
+    /// The descriptor's `visibilityResultType`.
+    pub(super) visibility_type: VisibilityResultType,
+    /// The draws read the color attachments as input attachments, in rasterization order where
+    /// the device has it and ordered between draws by barriers where it has no ordered form: the
     /// device's framebuffer fetch does (`framebuffer_fetch::through_inputs`), and the pass has a
     /// color attachment.
     pub(super) fetch_inputs: bool,
@@ -992,6 +1012,7 @@ impl Clone for PassLayout {
             layers: self.layers,
             samples: self.samples,
             visibility: self.visibility.clone(),
+            visibility_type: self.visibility_type,
             fetch_inputs: self.fetch_inputs,
             tile: self.tile,
             sample_positions: self.sample_positions.clone(),
@@ -1009,6 +1030,7 @@ impl Clone for PassLayout {
             layers,
             samples,
             visibility,
+            visibility_type,
             fetch_inputs,
             tile,
             sample_positions,
@@ -1020,6 +1042,7 @@ impl Clone for PassLayout {
         self.layers = *layers;
         self.samples = *samples;
         self.visibility.clone_from(visibility);
+        self.visibility_type = *visibility_type;
         self.fetch_inputs = *fetch_inputs;
         self.tile = *tile;
         self.sample_positions.clone_from(sample_positions);
@@ -1028,6 +1051,56 @@ impl Clone for PassLayout {
 }
 
 impl PassLayout {
+    /// The new textures the pass writes whole before its draws, as its load and store actions
+    /// say ([`Overwrite`], `OverwriteBy::Pass`): each attachment of a texture whose first move
+    /// waits with zeros that may go (`Texture::overwritable`), of one level and one layer, that
+    /// the pass renders itself (no stand-in, sample planes or separate depth and stencil
+    /// textures' scratch), over its whole extent, loading every aspect of its image `Clear` (as
+    /// the descriptor set it, before any `DontCare` load takes a clear) and storing it. Its first
+    /// move's zeros may go where the pass is the first use of the texture among its batch's
+    /// commands (`command_buffer/submit.rs`), which also checks that no other use of the pass
+    /// reads the texture.
+    pub(super) fn overwrites(&self) -> Vec<Overwrite> {
+        let whole = |target: &Target| {
+            let (key, extent, aspects) = target.texture.overwritable()?;
+            (self.layers == 1 && self.extent == extent && target.extent == extent)
+                .then_some((key, aspects))
+        };
+        let cleared = |aspect: &AspectTarget| {
+            aspect.load == LoadAction::Clear
+                && clear_reach::stores(aspect.store)
+                && !aspect.memoryless
+                && !aspect.written_nan
+        };
+        let mut overwrites = Vec::new();
+        for color in self.colors.iter().flatten() {
+            let direct = color.stand_in.is_none() && color.planes.is_none() && !color.memoryless;
+            let clears = color.load == LoadAction::Clear && clear_reach::stores(color.store);
+            if let Some((key, _)) = whole(&color.target).filter(|_| direct && clears) {
+                overwrites.push(Overwrite {
+                    key,
+                    by: OverwriteBy::Pass,
+                });
+            }
+        }
+        if let Some(ds) = self.depth_stencil.as_ref() {
+            let direct = ds.stand_in.is_none() && ds.separate.is_none() && !ds.hidden;
+            if let Some((key, aspects)) = whole(&ds.target).filter(|_| direct) {
+                let depth = !aspects.contains(vk::ImageAspectFlags::DEPTH)
+                    || ds.depth.as_ref().is_some_and(cleared);
+                let stencil = !aspects.contains(vk::ImageAspectFlags::STENCIL)
+                    || ds.stencil.as_ref().is_some_and(cleared);
+                if depth && stencil && !ds.keep_depth && !ds.keep_stencil {
+                    overwrites.push(Overwrite {
+                        key,
+                        by: OverwriteBy::Pass,
+                    });
+                }
+            }
+        }
+        overwrites
+    }
+
     /// Whether the pass has a depth and a stencil: of its attachments, or the hidden ones a draw
     /// or an execution gave it.
     pub(super) fn aspects(&self) -> (bool, bool) {
@@ -1341,7 +1414,7 @@ fn taken_actions(descriptor: &RenderPassDescriptor) -> RenderPassDescriptor {
 
 /// Whether `texture` is memoryless.
 fn memoryless(texture: &Texture) -> bool {
-    texture.storage_mode() == super::values::StorageMode::Memoryless
+    texture.is_memoryless()
 }
 
 /// The largest render target width and height Metal renders: a pass without attachments wider or
@@ -1481,7 +1554,7 @@ pub(super) fn layout(
     descriptor: &RenderPassDescriptor,
 ) -> Result<PassLayout, Error> {
     let device = maker.device();
-    let foreign = || invalid(call, Problem::ForeignObject);
+    let foreign = |other: &Device| other.foreign(call, device);
     let not_yet = || Error::NotImplemented(RuntimeGap::Render);
     // Each attachment's load and store actions as the pass takes them ([`taken_actions`]): a
     // depth attachment's `CustomSampleDepthStore` as `Store` (a color or stencil attachment's is
@@ -1526,13 +1599,39 @@ pub(super) fn layout(
             colors.push(None);
             continue;
         };
+        // An ASTC attachment, of any form and on any device: plain Metal completes the pass and
+        // leaves the texture's blocks as they were, whatever its load and store actions, and
+        // renders the pass's other attachments as it would (an Apple M3 Max under macOS 27.0.1,
+        // our probe `astc_passes_writes_footprints`: every load and store action, with a draw and
+        // without, LDR, sRGB and HDR, Apple's 4x2 and 8x4 footprints among them). No Vulkan
+        // format of a block is an attachment's, so the pass drops it: it loads, clears and
+        // stores nothing, as Metal's does, and its level's extent still bounds the pass. A resolve
+        // of one is not measured: it keeps the format's refusal (`target`).
+        let unresolved = color.resolve_texture.is_none() && !color.store_action.resolves();
+        if unresolved && AstcDecode::of(texture.pixel_format()).is_some() {
+            if !texture.generation().same(device) {
+                return Err(foreign(texture.generation()));
+            }
+            let facts = Facts::of(texture.record());
+            let sub = check_target(
+                call,
+                which,
+                &facts,
+                (color.level, color.slice, color.depth_plane),
+                descriptor.render_target_array_length,
+            )?;
+            extents[attached] = (sub.extent, facts.samples);
+            attached += 1;
+            colors.push(None);
+            continue;
+        }
         // A two-plane YCbCr attachment loads, stores and blends as Metal's tile of halves
         // (`texture/ycbcr_image.rs`); a resolve into or out of one is not measured, nor a load
-        // of one over a surface of a P3 matrix.
+        // of one over a surface of a P3 matrix, nor an `_sRGB` twin's.
         if ycbcr_renders(texture.pixel_format())
             && (color.resolve_texture.is_some()
                 || color.store_action.resolves()
-                || (color.load_action == LoadAction::Load && texture.ycbcr_codes_alone()))
+                || (color.load_action == LoadAction::Load && texture.ycbcr_load_unmeasured()))
         {
             return Err(Error::Unsupported(
                 Unsupported::not_implemented(Feature::Format).naming_format(texture.pixel_format()),
@@ -1644,6 +1743,7 @@ pub(super) fn layout(
             stand_in,
             planes: None,
             withheld_clear,
+            cleared_ahead: false,
         }));
     }
     while colors.last().is_some_and(Option::is_none) {
@@ -1712,8 +1812,8 @@ pub(super) fn layout(
     }
     let extents = &extents[..attached];
     if let Some(buffer) = &descriptor.visibility_result_buffer {
-        if !buffer.device().same(device) {
-            return Err(foreign());
+        if !buffer.generation().same(device) {
+            return Err(foreign(buffer.generation()));
         }
     }
     let (extent, samples) = area(
@@ -1805,6 +1905,7 @@ pub(super) fn layout(
         layers,
         samples,
         visibility: descriptor.visibility_result_buffer.clone(),
+        visibility_type: descriptor.visibility_result_type,
         fetch_inputs,
         tile,
         sample_positions,
@@ -1822,11 +1923,12 @@ fn target(
     subresource: (u64, u64, u64),
     length: u64,
 ) -> Result<Target, Error> {
-    if !texture.device().same(device) {
-        return Err(invalid(call, Problem::ForeignObject));
+    if !texture.generation().same(device) {
+        return Err(texture.generation().foreign(call, device));
     }
     let facts = Facts::of(texture.record());
     let sub = check_target(call, which, &facts, subresource, length)?;
+    texture.check_plane_copied()?;
     // A 2D texture over a buffer renders into its aliasing image, or into its shadow, which the
     // encoder copies in before the pass and back after it (`render/shadows.rs`); a texture
     // buffer renders through its attachment twin, such a texture of one row over its bytes, and a
@@ -1838,6 +1940,8 @@ fn target(
         true => texture.ycbcr_render_shadow(call)?,
         false => texture.pass_texture()?,
     };
+    // A shadow left unmade is made as the pass's attachment (`texture/lazy_shadow.rs`).
+    texture.made_for_use()?;
     let plan = texture.image_plan()?;
     // A 3D attachment is a 2D view of its planes, which its image takes 2D-array compatible
     // (`image_plan.rs`): a device whose portability subset withholds `imageView2DOn3DImage` makes
@@ -1931,7 +2035,9 @@ pub(super) fn degrade_clear_conversion(device: &Device, pf: PixelFormat, color: 
         (
             format!("a {pf:?} color attachment's clear to {color:?}"),
             "the device converts the clear color to the format's codes its own way, where \
-             Vulkan leaves a tie, an sRGB encode and a float's rounding to it and Metal's clear \
+             Vulkan lets it store either of the two codes nearest a normalized channel's value \
+             (it asks for the nearest) and leaves an sRGB encode and a float's rounding to it, \
+             and Metal's clear \
              rounds each channel to nearest, a tie to even (a small float's and a shared \
              exponent's mantissas truncated): a channel can store a code next to Metal's"
                 .to_owned(),
@@ -2117,12 +2223,10 @@ fn depth_stencil(
         false => d.load_action,
     };
     // A new texture's depth pattern, a NaN with the sign set, that the pass loads before a write
-    // covered it: Metal's test compares its magnitude, the device's the value as it is
-    // (`fresh_unwritten.rs`).
+    // covered it: Metal's test compares its magnitude, the device's the value as it is. Logged
+    // for the commit, which weighs it in commit order and announces it (`fresh_unwritten.rs`).
     if let Some(target) = depth.as_ref().filter(|_| d.load_action == LoadAction::Load) {
-        if FreshUnwritten::loads_signed_depth(device, target)? {
-            target.texture.degrade_signed_depth("new_texture");
-        }
+        FreshUnwritten::loads_signed_depth(maker, target)?;
     }
     let clear_depth = match nan {
         Some(NanDepth::Cleared(value)) => value,
@@ -2153,11 +2257,13 @@ fn depth_stencil(
                 depth: None,
                 stencil: t.clone(),
             };
+            // No depth, so no resolve drawn after the pass (`resolve::may_draw`).
             let scratch = depth_stencil_scratch::scratch(
                 maker,
                 &separate,
                 [depth_load, s.load_action],
                 [d.store_action, s.store_action],
+                false,
             )?;
             (scratch, Some(separate))
         }
@@ -2179,11 +2285,21 @@ fn depth_stencil(
                 depth: Some(a.clone()),
                 stencil: b.clone(),
             };
+            // A resolve drawn after the pass reads the scratch image's samples.
+            let drawn = resolve::may_draw(
+                device,
+                a.format,
+                Wanted::of(true, &d.resolve_texture, (0, 0, 0), d.store_action).as_ref(),
+                Wanted::of(true, &s.resolve_texture, (0, 0, 0), s.store_action).as_ref(),
+                d.depth_resolve_filter,
+                s.stencil_resolve_filter,
+            );
             let scratch = depth_stencil_scratch::scratch(
                 maker,
                 &separate,
                 [depth_load, s.load_action],
                 [d.store_action, s.store_action],
+                drawn,
             )?;
             (scratch, Some(separate))
         }

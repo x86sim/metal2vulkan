@@ -4,6 +4,7 @@ use crate::bitstream::{Entry, Reader};
 use crate::budget::{Budget, Meter};
 use crate::error::ContainerError;
 use crate::error::{Feature, Unsupported};
+use metal2vulkan_devtools::metallib::{universal, UniversalHeader};
 
 /// A small bitcode module whose content depends on `seed`: one block with one record.
 fn module_stream(seed: u64) -> Vec<u8> {
@@ -82,6 +83,9 @@ struct Builder {
     inclusive_md_size: bool,
     /// Every function's bitcode is the first function's, written once (a dynamic library).
     shared_bitcode: bool,
+    /// Every function's private-metadata record is the first function's, written once (macOS 11's
+    /// Core Image libraries, where it is empty).
+    shared_private: bool,
     /// Extended-header tags holding the `(offset, size)` of a region written after the trailer,
     /// with the region's bytes (`HDYN`, `ILST`).
     regions: Vec<([u8; 4], Vec<u8>)>,
@@ -97,6 +101,7 @@ impl Builder {
             trailer: vec![],
             inclusive_md_size: false,
             shared_bitcode: false,
+            shared_private: false,
             regions: vec![],
         }
     }
@@ -118,9 +123,16 @@ impl Builder {
                 out.extend(list);
                 out
             };
-            let (pub_at, priv_at) = (public.len(), private.len());
+            let pub_at = public.len();
             public.extend(md(&f.public));
-            private.extend(md(&f.private));
+            let priv_at = match (self.shared_private, private.is_empty()) {
+                (true, false) => 0,
+                _ => {
+                    let at = private.len();
+                    private.extend(md(&f.private));
+                    at
+                }
+            };
             let bc_at = match (self.shared_bitcode, bitcode.is_empty()) {
                 (true, false) => 0,
                 _ => {
@@ -264,23 +276,6 @@ fn dylib(symbols: &[&str]) -> Builder {
     b
 }
 
-/// `slices` (CPU type, bytes) in a universal file.
-fn universal(slices: &[(u32, &[u8])]) -> Vec<u8> {
-    let mut out = UNIVERSAL_MAGIC.to_vec();
-    out.extend_from_slice(&(slices.len() as u32).to_be_bytes());
-    let mut at = 8 + 20 * slices.len();
-    for (cpu, bytes) in slices {
-        for v in [*cpu, 0, at as u32, bytes.len() as u32, 0] {
-            out.extend_from_slice(&v.to_be_bytes());
-        }
-        at += bytes.len();
-    }
-    for (_, bytes) in slices {
-        out.extend_from_slice(bytes);
-    }
-    out
-}
-
 /// A dynamic library's functions are its exports, over one module and one hash; its install
 /// name, its dependencies (in link order), and its imports are read from `HDYN` and `ILST`.
 #[test]
@@ -385,29 +380,73 @@ fn malformed_linkage_regions() {
     );
 }
 
-/// A universal file is read through its AIR slice (`serializeToURL:`'s output); without one, or
-/// with one that is no metallib, it is a container error.
+/// A universal file is read through its AIR slice, in each of the three headers, and the result's
+/// bytes are that slice. Metal's own file without an AIR slice is `NoAirSlice`; a Mach-O one is
+/// `BadMagic`, as other files of its magic are; an AIR slice that is no metallib is `BadMagic`; a
+/// file cut inside its records or its slice is an error.
 #[test]
 fn a_universal_metallib_is_read_through_its_air_slice() {
     let air = dylib(&["f"]).build();
     let gpu = vec![0xCF, 0xFA, 0xED, 0xFE, 1, 2, 3, 4];
-    let bytes = universal(&[(0x0100_0013, &gpu), (0x0100_0017, &air)]);
-    let lib = metallib(&bytes);
-    assert_eq!(lib.linkage.install_name, Some("libD"));
-    assert_eq!(lib.functions.len(), 1);
-    let none = universal(&[(0x0100_0013, &gpu)]);
-    assert_eq!(
-        container_kind(&parse(&none).unwrap_err()),
-        ContainerError::NoAirSlice
-    );
-    let not_mtlb = universal(&[(0x0100_0017, &gpu)]);
-    assert_eq!(
-        container_kind(&parse(&not_mtlb).unwrap_err()),
-        ContainerError::BadMagic
-    );
-    let mut cut = bytes.clone();
-    cut.truncate(40);
-    assert!(parse(&cut).is_err());
+    for header in UniversalHeader::ALL {
+        let bytes = universal(header, &[(0x0100_0013, &gpu), (0x0100_0017, &air)]);
+        let lib = metallib(&bytes);
+        assert_eq!(lib.bytes, &air[..], "{header:?}");
+        assert_eq!(lib.linkage.install_name, Some("libD"), "{header:?}");
+        assert_eq!(lib.functions.len(), 1, "{header:?}");
+        let missing = match header {
+            UniversalHeader::Metal => ContainerError::NoAirSlice,
+            UniversalHeader::MachO | UniversalHeader::MachO64 => ContainerError::BadMagic,
+        };
+        let none = universal(header, &[(0x0100_0013, &gpu)]);
+        assert_eq!(
+            container_kind(&parse(&none).unwrap_err()),
+            missing,
+            "{header:?}"
+        );
+        let not_mtlb = universal(header, &[(0x0100_0017, &gpu)]);
+        assert_eq!(
+            container_kind(&parse(&not_mtlb).unwrap_err()),
+            ContainerError::BadMagic,
+            "{header:?}"
+        );
+        for len in [6, 12, 40, bytes.len() - 1] {
+            let mut cut = bytes.clone();
+            cut.truncate(len);
+            assert!(parse(&cut).is_err(), "{header:?} cut at {len}");
+        }
+    }
+    // A Java class shares FAT_MAGIC: its version reads as a count of 65 records, which a short
+    // file cannot hold and a long one holds no AIR slice among.
+    for len in [8, 2048] {
+        let mut class = FAT_MAGIC.to_vec();
+        class.extend_from_slice(&[0, 0, 0, 65]);
+        class.resize(len, 0);
+        assert_eq!(
+            container_kind(&parse(&class).unwrap_err()),
+            ContainerError::BadMagic,
+            "{len} bytes"
+        );
+    }
+}
+
+/// A `fat_arch_64` record's offset and size are each read as a 64-bit value: a high word that is
+/// not zero in either puts the slice past the file.
+#[test]
+fn a_wide_universal_record_reads_64_bit_offsets_and_sizes() {
+    let air = dylib(&["f"]).build();
+    let bytes = universal(UniversalHeader::MachO64, &[(0x0100_0017, &air)]);
+    assert_eq!(metallib(&bytes).bytes, &air[..]);
+    // The record starts at byte 8: the offset's high word is bytes 16..20, the size's 24..28.
+    for high in [19, 27] {
+        let mut wide = bytes.clone();
+        wide[high] = 1;
+        assert_eq!(
+            container_kind(&parse(&wide).unwrap_err()),
+            ContainerError::BadOffset,
+            "byte {high}"
+        );
+    }
 }
 
 /// A three-function library with public metadata and unknown tags everywhere they occur.
@@ -556,7 +595,8 @@ fn stage_codes() {
         (7, FunctionStage::Mesh),
         (8, FunctionStage::Object),
         (3, FunctionStage::Exported),
-        (5, FunctionStage::Other(5)),
+        (5, FunctionStage::Extern),
+        (9, FunctionStage::Other(9)),
     ] {
         assert_eq!(FunctionStage::from_type_tag(code), stage);
     }
@@ -581,6 +621,128 @@ fn hash_is_verified() {
     );
 }
 
+/// A Core Image kernel library in `metallib -cikernel`'s layout (file type 1; extern functions,
+/// `TYPE` 5, over one module; `HDYN` naming the file and a `UUID`), every function's `HASH` set
+/// to `hash`.
+fn core_image(names: &[&str], hash: [u8; 32]) -> Builder {
+    let functions = names
+        .iter()
+        .map(|name| FnSpec {
+            hash: Some(hash),
+            ..FnSpec::new(name, 5, 4)
+        })
+        .collect();
+    let mut b = Builder::new(functions);
+    b.file_type = 1;
+    b.shared_bitcode = true;
+    b.inclusive_md_size = true;
+    b.regions = vec![(*b"HDYN", hdyn("ci.metallib", &[]))];
+    b.extended.push((*b"UUID", vec![7; 16]));
+    b
+}
+
+/// Apple's `metallib -cikernel` writes a `HASH` that, for some modules, is not the SHA-256 of the
+/// module the library's functions share, and Metal reads the library (the `mtlb` docs). The value
+/// is read as 32 bytes and kept raw; each function's content key is the module's SHA-256. Every
+/// other library's `HASH` stays verified.
+#[test]
+fn a_core_image_library_hash_is_kept_as_read() {
+    let module = FnSpec::new("m", 5, 4).bitcode;
+    let digest = sha256(&module);
+    let names = ["tint", "shift", "invert"];
+    let written = [0x5A; 32];
+    assert_ne!(written, digest);
+    for hash in [written, digest] {
+        let bytes = core_image(&names, hash).build();
+        let lib = metallib(&bytes);
+        assert_eq!(lib.library_type(), LibraryType::Executable);
+        let read: Vec<_> = lib.functions.iter().map(|f| (f.name, f.stage)).collect();
+        assert_eq!(read, names.map(|n| (n, FunctionStage::Extern)));
+        for f in &lib.functions {
+            assert_eq!(f.bitcode, module.as_slice());
+            assert_eq!(f.hash, digest, "{}: the module's own digest", f.name);
+            let kept: Vec<&[u8]> = f
+                .raw_tags
+                .iter()
+                .filter(|t| &t.fourcc == b"HASH")
+                .map(|t| t.bytes)
+                .collect();
+            assert_eq!(kept, [&hash[..]], "{}", f.name);
+        }
+        assert_eq!(lib.linkage.install_name, Some("ci.metallib"));
+    }
+    // The tag is still read strictly: 32 bytes, once, present.
+    let check = |edit: &dyn Fn(&mut FnSpec), want: ContainerError| {
+        let mut b = core_image(&names, written);
+        edit(&mut b.functions[1]);
+        let err = parse(&b.build()).unwrap_err();
+        assert_eq!(container_kind(&err), want, "{err:?}");
+    };
+    check(&|f| f.omit.push(*b"HASH"), ContainerError::MissingTag);
+    check(
+        &|f| f.extra.push((*b"HASH", vec![0; 32])),
+        ContainerError::DuplicateTag,
+    );
+    check(
+        &|f| {
+            f.omit.push(*b"HASH");
+            f.extra.push((*b"HASH", vec![0; 31]));
+        },
+        ContainerError::BadTag,
+    );
+    // The same table as a dynamic library's exports is verified, and refused.
+    let mut dynamic = core_image(&names, written);
+    dynamic.file_type = 2;
+    for f in &mut dynamic.functions {
+        f.type_code = 3;
+    }
+    let err = parse(&dynamic.build()).unwrap_err();
+    assert_eq!(
+        container_kind(&err),
+        ContainerError::HashMismatch,
+        "{err:?}"
+    );
+}
+
+/// macOS 11's own Core Image libraries (format 2.5) name one empty private-metadata record (its
+/// size word and `ENDT`) from every function, over the one module they share. That shared empty
+/// record is read as no tags; a shared record holding a tag, or one shared in an executable
+/// library, stays refused.
+#[test]
+fn a_shared_module_library_shares_one_empty_metadata_record() {
+    let names = ["tint", "shift", "invert"];
+    let module = FnSpec::new("m", 5, 4).bitcode;
+    let mut b = core_image(&names, sha256(&module));
+    b.version = (2, 5);
+    b.shared_private = true;
+    let bytes = b.build();
+    let lib = metallib(&bytes);
+    let read: Vec<_> = lib.functions.iter().map(|f| f.name).collect();
+    assert_eq!(read, names);
+    for f in &lib.functions {
+        assert!(f.private.is_empty(), "{}: no private tags", f.name);
+        assert_eq!(f.bitcode, module.as_slice());
+    }
+    let refused = |b: &Builder, what: &str| {
+        let err = parse(&b.build()).unwrap_err();
+        assert_eq!(
+            container_kind(&err),
+            ContainerError::BadOffset,
+            "{what}: {err:?}"
+        );
+    };
+    let mut tagged = b.clone();
+    tagged.functions[0].private.push((*b"PRIV", vec![9]));
+    refused(&tagged, "a shared record holding a tag");
+    let mut executable = b.clone();
+    executable.file_type = 0;
+    executable.shared_bitcode = false;
+    refused(
+        &executable,
+        "a shared empty record in an executable library",
+    );
+}
+
 #[test]
 fn unsupported_versions_and_library_kinds() {
     let mut b = sample();
@@ -592,11 +754,19 @@ fn unsupported_versions_and_library_kinds() {
     let mut b = sample();
     b.version = (1, 2);
     assert!(parse(&b.build()).is_ok());
+    // A Core Image kernel library (`file_type` 1) is read; a kind Apple's toolchain is not seen
+    // to write is refused.
     let mut b = sample();
     b.file_type = 1;
+    match parse(&b.build()) {
+        Ok(Library::Metallib(ml)) => assert_eq!(ml.library_type(), LibraryType::Executable),
+        other => panic!("{other:?}"),
+    }
+    let mut b = sample();
+    b.file_type = 3;
     match parse(&b.build()).unwrap_err() {
         Error::Unsupported(Unsupported {
-            feature: Feature::LibraryKind(1),
+            feature: Feature::LibraryKind(3),
             ..
         }) => {}
         other => panic!("{other:?}"),

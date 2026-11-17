@@ -116,6 +116,13 @@
 //! through more than one variant of its pipeline (each color group's) rasterizes the same
 //! positions in each.
 //!
+//! A vertex function compiled under `LoweringInputs::region_copies` stores its region's copy at
+//! every return ([`RegionCopy`]): region `first + (DrawIndex / c)·nx + DrawIndex mod c` of the
+//! region table, `[first, c]` its `PushField::RegionBox`, its position through the region's line
+//! and four clip distances after its own, by the emitter a fan-out stage's copies share
+//! (`pipeline::link::fan_out::region_copy`), and 0 as `ViewportIndex`, the recording's one
+//! viewport; those clip distances are `Invariant` too.
+//!
 //! A fragment function compiled for a render pipeline that rasterizes more than one sample
 //! (`LoweringInputs::multisampled`) reads what Metal reads at the pixel center in every invocation
 //! there ([`Source::PixelCenter`]): `[[position]]`'s x and y as `floor(FragCoord.xy) + 0.5`, and,
@@ -140,8 +147,19 @@
 //! A color output in a raster order group is stored like any other: the fragment family runs the
 //! whole body inside the interlock.
 //!
-//! Refused as `NotImplemented`: array varyings, Metal's interpolation functions (`interpolant`),
-//! and a fragment position or barycentric input sampled other than at the pixel center.
+//! An `interpolant` fragment input (Metal's pull-model interpolation) is a float varying of its
+//! form and perspective, which only its interpolation functions read ([`Source::Interpolant`],
+//! [`interpolate`]): `interpolate_at_center` as a center varying is read (through its pixel-center
+//! form where one is), `interpolate_at_centroid`, `_sample` and `_offset` through `GLSL.std.450`'s
+//! `InterpolateAtCentroid`, `InterpolateAtSample` (the index masked to the pipeline's sample count,
+//! as Metal reads sample `i mod n`) and `InterpolateAtOffset` (the offset, which Metal measures
+//! from the pixel's corner at any distance, moved to the device's origin and clamped to its range:
+//! `PrecisionNote::DeviceInterpolationOffset`). `lower::fragment`'s `interpolate` states Metal's
+//! measured answers.
+//!
+//! Refused as `NotImplemented`: array varyings, an `interpolant` used other than as the operand of
+//! its interpolation functions (one chosen at run time), and a fragment position or barycentric
+//! input sampled other than at the pixel center.
 //! A 64-bit interface value is invalid input. A post-tessellation vertex function's inputs are
 //! `lower::tessellation`'s; its outputs are planned here.
 //!
@@ -154,7 +172,7 @@ pub(crate) mod color_write;
 pub(crate) mod extended_color;
 pub mod fetch;
 mod plan;
-mod stage_in;
+pub(crate) mod stage_in;
 pub(crate) mod word_color;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -279,6 +297,11 @@ pub enum Source {
     /// Vulkan's `PrimitiveId` (the variable) shifted right by one, the quad of the list's
     /// triangle, as Metal counts one primitive a quad of its private quads and quad strip.
     QuadPrimitive(Link),
+    /// An `interpolant` (Metal's pull-model interpolation): the variable, which has no value of
+    /// its own and which only the interpolation functions read ([`interpolate`]);
+    /// `interpolate_at_center` through its pixel-center form where `at_pixel`
+    /// ([`Source::PixelCenter`]'s), else as it is.
+    Interpolant { link: Link, at_pixel: bool },
 }
 
 /// One used stage-IO parameter.
@@ -347,6 +370,27 @@ pub struct AmplifiedOutput {
     pub below: PushField,
 }
 
+/// The `ViewportIndex` a vertex function compiled under `LoweringInputs::region_viewports` stores:
+/// interface objects `draw_index`, the `DrawIndex` input, and `viewport`, the `ViewportIndex`
+/// output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RegionViewport {
+    pub draw_index: usize,
+    pub viewport: usize,
+}
+
+/// The region's copy a vertex function compiled under `LoweringInputs::region_copies` stores
+/// (`plan::region_copy`): interface objects `position`, its `Position` output, `draw_index`, the
+/// `DrawIndex` input, `viewport`, the `ViewportIndex` output it stores 0 to, and `clip`, its
+/// `ClipDistance` object and the first of the four elements it writes after its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RegionCopy {
+    pub position: usize,
+    pub draw_index: usize,
+    pub viewport: usize,
+    pub clip: (usize, u32),
+}
+
 /// The private alpha test a fragment function compiled under `LoweringInputs::alpha_test` runs
 /// at each return ([`alpha_test`]): the returned field of its color 0, four `float` lanes (a
 /// `half` output held widened), and the comparison.
@@ -373,6 +417,13 @@ pub struct StageIoPlan {
     /// beyond its own: `Layer` and `ViewportIndex` from the amplification's offsets where it
     /// writes no such index.
     pub amplified: Vec<AmplifiedOutput>,
+    /// A vertex function compiled under `LoweringInputs::region_viewports` that returns outputs:
+    /// its `DrawIndex` input, which it stores to its `ViewportIndex` output at every return.
+    pub region_viewport: Option<RegionViewport>,
+    /// A vertex function compiled under `LoweringInputs::region_copies` that returns outputs: the
+    /// region's copy it stores at every return, its position through the region's line and four
+    /// clip distances keeping the region's pixels.
+    pub region_copy: Option<RegionCopy>,
     /// The color outputs a fragment function compiled under `LoweringInputs::zeroed_colors`
     /// stores zero to at every return, one per such color.
     pub zeroed: Vec<Link>,
@@ -446,6 +497,12 @@ pub struct StageIoPlan {
     /// center as Metal does (`VkProperty::MetalCenterVaryings`): the module requires that
     /// property.
     pub center_varyings_by_device: bool,
+    /// A fragment function reads an interpolant at an offset moved by 7/16, because its device's
+    /// `InterpolateAtOffset` reads Metal's offset plus 7/16
+    /// (`VkProperty::InterpolateAtOffsetFromSevenSixteenths`): the module is marked so
+    /// (`ModuleBuilder::offsets_from_seven_sixteenths`) and requires that property in place of
+    /// `VkProperty::InterpolateAtOffsetCentered`.
+    pub offsets_from_seven_sixteenths: bool,
     /// A fragment function reads a varying the device interpolates and records no
     /// `PrecisionNote::DeviceInterpolation`, because its device interpolates as Metal does
     /// (`VkProperty::MetalInterpolation`): the module requires that property.
@@ -464,6 +521,11 @@ pub struct StageIoPlan {
     /// A vertex function compiled under `LoweringInputs::merged_draws` finds its corner's command
     /// at entry ([`MergedRead`]).
     pub merged: Option<MergedRead>,
+    /// A fragment function compiled under `LoweringInputs::merged_draws` that reads a command's
+    /// buffers reads its command's fragment slot table at entry, from the header at
+    /// `PushField::MergedDrawAddress` and its flat `IoRole::MergedCommand` input, this object
+    /// (`bind::merged_fragment_table`).
+    pub merged_fragment: Option<usize>,
     /// A vertex function compiled under `LoweringInputs::primitive_id_varying` writes the
     /// primitive ID of each vertex's primitive to its varying ([`PrimitiveIdStore`]).
     pub primitive_id: Option<PrimitiveIdStore>,
@@ -475,10 +537,13 @@ pub struct StageIoPlan {
 /// `PushField::MergedDrawAddress` (`bind::replay`'s `merged.rs`, `bind::merged_vertex`). Its
 /// `[[vertex_id]]`, `[[instance_id]]`, `[[base_vertex]]` and `[[base_instance]]` read the
 /// command's ([`Source::Merged`]), and its `RootTableAddress` is the command's vertex slot table.
+/// It writes the command's index to its flat `IoRole::MergedCommand` output, the object
+/// `command`, wherever it returns its outputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MergedRead {
     pub vertex: usize,
     pub instance: usize,
+    pub command: usize,
 }
 
 /// Which of a merged draw's command's values a vertex function reads ([`Source::Merged`]).
@@ -493,8 +558,14 @@ pub enum MergedValue {
 /// The words a merged draw's vertex function adds at entry: the two input builtins' variables,
 /// decorations and interface entries and their loads, the header's loads, the corner's 64-bit
 /// arithmetic, the search's loop (its variables, test, halving, load and selection), the
-/// command's draw's loads, the division and remainder, and the slot table's address.
-pub(super) const MERGED_WORDS: u64 = 600;
+/// command's draw's loads, the division and remainder, the slot table's address, the index
+/// entry's loads and the index read, and the command's output and its stores.
+pub(super) const MERGED_WORDS: u64 = 900;
+
+/// The words a merged draw's fragment function adds at entry: the command's input, its
+/// decorations and interface entry and its load, and the header's loads and the slot table's
+/// address arithmetic.
+pub(super) const MERGED_FRAGMENT_WORDS: u64 = 150;
 
 /// How a vertex function compiled under `LoweringInputs::primitive_id_varying` writes the
 /// primitive ID a fragment function reads from its varying on a device without a fragment
@@ -650,6 +721,9 @@ pub struct Declared {
     /// covered samples is read into at every sample before the loop, where the driver's
     /// interpolation needs the whole quad ([`read_at_every_sample`]).
     pub at_samples: BTreeMap<usize, GlobalId>,
+    /// The region table a vertex function that stores its region's copy reads
+    /// ([`StageIoPlan::region_copy`]).
+    pub region_table: Option<GlobalId>,
 }
 
 /// Plan the entry's stage interface: its outputs and execution modes. A kernel has none (and a
@@ -712,6 +786,70 @@ pub fn select_return(cx: &mut SelectCx<'_>, _at: InstId, v: Option<Value>) -> Re
             cx.lowered_repr(v, ty).map(|_| ())
         }
     }
+}
+
+/// Whether every value the entry returns holds output field `field` (the whole value where it
+/// returns no struct) as a constant none of whose lanes is a NaN (`texture::holds_no_nan`): a
+/// field built by an insertion of such a constant into the returned struct, or a member of a
+/// constant struct. The output then stores no NaN, so no device's encoding of one can show. Any
+/// other value may hold one, and so may an entry that returns none.
+pub(crate) fn returns_no_nan(cx: &SelectCx<'_>, field: u32) -> bool {
+    use crate::air::ir::{Const, InstKind, Type};
+    let e = cx.entry;
+    let Some(func) = e.module.func(e.func) else {
+        return false;
+    };
+    let Some(body) = func.body.as_ref() else {
+        return false;
+    };
+    let returns_struct = match e.module.types().get(func.ty) {
+        Some(Type::Function { ret, .. }) => {
+            matches!(e.module.types().get(*ret), Some(Type::Struct { .. }))
+        }
+        _ => false,
+    };
+    let consts = e.module.consts();
+    // The value field `field` of the returned value `v` holds, where its insertions or its
+    // constant state it.
+    let member = |mut v: Value| -> Option<Value> {
+        if !returns_struct {
+            return Some(v);
+        }
+        for _ in 0..=body.insts.len() {
+            match v {
+                Value::Inst(i) => match body.insts.get(i).map(|x| &x.kind) {
+                    Some(InstKind::InsertValue { agg, val, indices }) => match indices[..] {
+                        [f] if f == field => return Some(*val),
+                        [f, ..] if f == field => return None,
+                        _ => v = *agg,
+                    },
+                    _ => return None,
+                },
+                Value::Const(c) => {
+                    return match consts.get(c).map(|k| &k.value) {
+                        Some(Const::Aggregate(elems)) => {
+                            elems.get(field as usize).map(|&k| Value::Const(k))
+                        }
+                        _ => None,
+                    };
+                }
+                Value::Arg(_) => return None,
+            }
+        }
+        None
+    };
+    let mut returns = 0;
+    for inst in body.insts.values() {
+        let InstKind::Ret(returned) = &inst.kind else {
+            continue;
+        };
+        let held = (*returned).and_then(member);
+        if !held.is_some_and(|v| crate::lower::texture::holds_no_nan(cx, v)) {
+            return false;
+        }
+        returns += 1;
+    }
+    returns > 0
 }
 
 /// The varyings vertex function `e`, compiled under `inputs`, writes the same value at every
@@ -978,6 +1116,19 @@ fn bool_as_uint(cx: &EmitCx<'_>, link: &Link) -> bool {
         )
 }
 
+/// Whether `link` is a `bool` builtin (`FrontFacing`) read into an integer argument, as an older
+/// front end's ABI passes `[[front_facing]]` (`i8`): the argument holds 1 or 0.
+fn bool_builtin_as_int(cx: &EmitCx<'_>, link: &Link) -> bool {
+    matches!(link.form.held, Held::Int { .. })
+        && matches!(
+            cx.plan.families.stage_io.objects.get(link.object),
+            Some(IoObject::Builtin {
+                shape: Shape::Bool,
+                ..
+            })
+        )
+}
+
 /// The `uint` form with the lanes of `form`.
 fn uint_lanes(form: Form) -> Form {
     form.with(Held::Int {
@@ -988,7 +1139,8 @@ fn uint_lanes(form: Form) -> Form {
 
 /// `x`, a value loaded through `link`, as the lowered representation of its form: a narrow
 /// integer masked to its width, a narrow float rounded to its format, a `bool` carried as `uint`
-/// compared with 0, the weights of a [`Place::Weights`] read.
+/// compared with 0, a `bool` builtin read into an integer as 1 or 0, the weights of a
+/// [`Place::Weights`] read.
 fn to_lowered(
     cx: &EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
@@ -1001,17 +1153,7 @@ fn to_lowered(
         let zero = ops::splat(fb, uint_lanes(form), 0)?;
         return fb.binary(BinOp::INotEqual, x, zero);
     }
-    // x86Sim: a `bool` builtin (`FrontFacing`) read into an integer form (an `i8` `bool`
-    // parameter, `plan::input_builtin`): 1 or 0.
-    if matches!(form.held, Held::Int { .. })
-        && matches!(
-            cx.plan.families.stage_io.objects.get(link.object),
-            Some(IoObject::Builtin {
-                shape: Shape::Bool,
-                ..
-            })
-        )
-    {
+    if bool_builtin_as_int(cx, link) {
         let one = ops::splat(fb, form, 1)?;
         let zero = ops::splat(fb, form, 0)?;
         return fb.select(x, one, zero);
@@ -1123,13 +1265,14 @@ fn metal_interpolated_constant(
     fb.convert(ConvOp::Bitcast, r, ft)
 }
 
-/// Fetch every pulled attribute in the function's first block, before the walk emits any
-/// instruction of the body, and hold each value for all its uses. The first block dominates every
-/// block, and the fetch is straight-line code, so each value is defined in a block every use
-/// follows; the body's writes, through the source buffer's slot or any other pointer to its memory,
-/// come after it in program order and never reach it, as Metal's attribute is fetched before its
-/// function runs.
-pub fn emit_entry(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>) -> BResult<()> {
+/// Find what the invocation draws, before any entry hook reads a slot table or an index: the
+/// de-indexed or private list form's raw index (and the private list form's base vertex), and a
+/// merged draw's command, whose slot table is the stage's `RootTableAddress`
+/// (`EmitCx::load_push_field`). The access family's entry hook (`access::dynamic::emit_entry`)
+/// reads a wide buffer parameter's root entry from that table, so this runs before it. A merged
+/// vertex's search is a loop: the hooks after it emit in its merge block, which dominates every
+/// block of the body.
+pub fn emit_draw_entry(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>) -> BResult<()> {
     // The de-indexed or private list form's raw index, read once in the first block, where it
     // dominates every use, and the private list form's base vertex.
     if let Some(c) = cx.plan.families.stage_io.captured_index {
@@ -1153,6 +1296,26 @@ pub fn emit_entry(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>) -> BResult<
         };
         cx.merged_draw = Some(crate::bind::merged_vertex(fb, header, (vertex, instance))?);
     }
+    // A merged draw's fragment function finds its command's fragment slot table before the body,
+    // at the command its vertex wrote, which every read of the command's buffers follows.
+    if let Some(object) = cx.plan.families.stage_io.merged_fragment {
+        let header = cx.push_field(fb, PushField::MergedDrawAddress)?;
+        let g = global(cx, object)?;
+        let p = fb.module().global_value(g)?;
+        let command = fb.load(p, MemAccess::default())?;
+        let table = crate::bind::merged_fragment_table(fb, header, command)?;
+        cx.merged_fragment_table = Some(table);
+    }
+    Ok(())
+}
+
+/// Fetch every pulled attribute at entry, after [`emit_draw_entry`] found what the invocation
+/// draws and before the walk emits any instruction of the body, and hold each value for all its
+/// uses. The block it emits in dominates every block, and the fetch is straight-line code, so each
+/// value is defined in a block every use follows; the body's writes, through the source buffer's
+/// slot or any other pointer to its memory, come after it in program order and never reach it, as
+/// Metal's attribute is fetched before its function runs.
+pub fn emit_entry(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>) -> BResult<()> {
     let pulled: Vec<(u32, fetch::PulledRead)> = cx
         .plan
         .families
@@ -1175,7 +1338,8 @@ pub fn emit_entry(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>) -> BResult<
             | Source::CapturedBaseVertex(_)
             | Source::Merged { .. }
             | Source::Uniform(_)
-            | Source::QuadPrimitive(_) => None,
+            | Source::QuadPrimitive(_)
+            | Source::Interpolant { .. } => None,
         })
         .collect();
     for (param, read) in pulled {
@@ -1275,6 +1439,12 @@ pub fn param_value(
             let x = fb.binary(BinOp::ShiftRightLogical, x, one)?;
             return to_lowered(cx, fb, &link, x);
         }
+        Some(Source::Interpolant { .. }) => {
+            return Err(cx.fail(format!(
+                "interpolant {} read other than by an interpolation function",
+                b.param
+            )))
+        }
         None => return Err(cx.fail(format!("parameter {} has no stage-IO value", b.param))),
     };
     let x = match link.place {
@@ -1356,6 +1526,121 @@ fn pixel_center(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>, link: &Link) 
         }
     };
     to_lowered(cx, fb, link, x)
+}
+
+/// Where an interpolation function reads its interpolant (`lower::fragment`'s `Interpolate`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterpolantAt {
+    /// `interpolate_at_center()`: as a center-sampled varying is read.
+    Center,
+    /// `interpolate_at_centroid()`: `InterpolateAtCentroid`.
+    Centroid,
+    /// `interpolate_at_sample(index)`: `InterpolateAtSample` at `index & (n - 1)`, `n` the
+    /// pipeline's sample count (`SpecKey::SampleCount`, a power of two), the sample Metal reads
+    /// for any index (Metal probes on the Apple M3 Max, macOS 27.0.1: at 1, 2 and 4 samples every
+    /// index to 16, 100, `2^31 - 1` and `2^32 - 1` read sample `index mod n`), where Vulkan leaves
+    /// the position of a sample the pipeline lacks undefined.
+    Sample(ValueId),
+    /// `interpolate_at_offset(offset)`: `InterpolateAtOffset` at `offset - origin`, Metal's offset
+    /// from the pixel's upper-left corner moved to the device's origin, clamped to `[min, max]`,
+    /// the device's `[minInterpolationOffset, maxInterpolationOffset]` (each the `f32`'s bits; a
+    /// NaN to `min`), as Vulkan requires (`PrecisionNote::DeviceInterpolationOffset`).
+    Offset {
+        offset: ValueId,
+        origin: u32,
+        min: u32,
+        max: u32,
+    },
+}
+
+/// One interpolation function's read of the interpolant parameter `param`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterpolantRead {
+    pub param: u32,
+    pub at: InterpolantAt,
+}
+
+/// The value interpolation function `read` returns, in its lowered representation (the
+/// interpolant's form): its variable read where the function says, or zero for an interpolant
+/// no vertex output writes ([`Source::Absent`]).
+pub fn interpolate(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    read: &InterpolantRead,
+) -> BResult<SValue> {
+    use crate::lower::arith::FloatFmt;
+    use crate::spirv::ir::GlslOp;
+    let planned = cx
+        .plan
+        .families
+        .stage_io
+        .params
+        .iter()
+        .find(|p| p.param == read.param)
+        .map(|p| p.source);
+    let (link, at_pixel) = match planned {
+        Some(Source::Interpolant { link, at_pixel }) => (link, at_pixel),
+        Some(Source::Absent(form)) => {
+            return match crate::lower::arith::legal::zero(&form.demote()) {
+                Some(k) => match crate::lower::arith::legal::materialize(fb, &k)? {
+                    Some(x) => Ok(x),
+                    None => Err(cx.fail("an absent interpolant's zero does not materialize")),
+                },
+                None => Err(cx.fail("an absent interpolant of a type without a zero")),
+            };
+        }
+        _ => {
+            return Err(cx.fail(format!(
+                "parameter {} is interpolated but no interpolant",
+                read.param
+            )))
+        }
+    };
+    let f32x2 = Form {
+        held: Held::Float(FloatFmt::F32),
+        lanes: 2,
+    };
+    let x = match read.at {
+        InterpolantAt::Center if at_pixel => return pixel_center(cx, fb, &link),
+        InterpolantAt::Center => {
+            let p = pointer(cx, fb, &link)?;
+            fb.load(p, MemAccess::default())?
+        }
+        InterpolantAt::Centroid => {
+            let p = pointer(cx, fb, &link)?;
+            fb.glsl(GlslOp::InterpolateAtCentroid, &[p])?
+        }
+        InterpolantAt::Sample(index) => {
+            let i = cx.operand(fb, index)?;
+            let u32_ = fb.module().ty(SType::Int {
+                width: 32,
+                signed: false,
+            })?;
+            let count = fb.module().spec(SpecKey::SampleCount, u32_, ConstBits(1))?;
+            let count = fb.module().const_value(count)?;
+            let one = crate::memory::leaf::k32(fb, 1)?;
+            let mask = fb.binary(BinOp::ISub, count, one)?;
+            let s = fb.binary(BinOp::BitwiseAnd, i, mask)?;
+            let p = pointer(cx, fb, &link)?;
+            fb.glsl(GlslOp::InterpolateAtSample, &[p, s])?
+        }
+        InterpolantAt::Offset {
+            offset,
+            origin,
+            min,
+            max,
+        } => {
+            let o = cx.operand(fb, offset)?;
+            let origin = ops::splat(fb, f32x2, u64::from(origin))?;
+            let moved = fb.binary(BinOp::FSub, o, origin)?;
+            let min = ops::splat(fb, f32x2, u64::from(min))?;
+            let max = ops::splat(fb, f32x2, u64::from(max))?;
+            let v = fb.glsl(GlslOp::NClamp, &[moved, min, max])?;
+            let p = pointer(cx, fb, &link)?;
+            fb.glsl(GlslOp::InterpolateAtOffset, &[p, v])?
+        }
+    };
+    to_lowered(cx, fb, &link, x)
 }
 
 /// The sample of the pass of the loop over the covered samples: the fragment family's
@@ -1584,6 +1869,7 @@ pub fn emit_return(
     let (outputs, returned, point) = (plan.outputs.clone(), plan.returned, plan.point_size_default);
     let seconds = plan.rotated_seconds.clone();
     let compensation = plan.compensation;
+    let region_copy = plan.region_copy;
     let depth_clamp = plan.depth_clamp;
     let window_depth = plan.window_depth;
     let primitive_id = plan.primitive_id;
@@ -1620,6 +1906,10 @@ pub fn emit_return(
                     };
                 let part = match compensation.filter(|c| c.position == o.link.object) {
                     Some(c) => compensate(cx, fb, c, part, selected)?,
+                    None => part,
+                };
+                let part = match region_copy.filter(|r| r.position == o.link.object) {
+                    Some(r) => store_region_copy(cx, fb, r, part)?,
                     None => part,
                 };
                 let part = match depth_clamp.filter(|d| d.object == o.link.object) {
@@ -1676,12 +1966,46 @@ pub fn emit_return(
     if let (Some(_), Some(p)) = (v, primitive_id) {
         store_primitive_id(cx, fb, p)?;
     }
+    // A merged draw's command, wherever the function returns its outputs.
+    if let (Some(_), Some(m)) = (v, cx.plan.families.stage_io.merged) {
+        let Some(draw) = cx.merged_draw else {
+            return Err(cx.fail("a merged draw's vertex returned before its entry found it"));
+        };
+        let link = Link {
+            object: m.command,
+            place: Place::Whole,
+            form: Form {
+                held: Held::Int {
+                    bits: 32,
+                    container: 32,
+                },
+                lanes: 1,
+            },
+        };
+        store(cx, fb, &link, draw.command)?;
+    }
     // The indices a draw of one amplification stores though the function writes none.
     let amplified = cx.plan.families.stage_io.amplified.clone();
     for o in &amplified {
         let part = cx.push_field(fb, o.offset)?;
         let part = below_count(cx, fb, part, o.below)?;
         store(cx, fb, &o.link, part)?;
+    }
+    // A rate-mapped pass's region drawn among others: its draw's index selects its viewport.
+    if let (Some(_), Some(r)) = (v, cx.plan.families.stage_io.region_viewport) {
+        let index = fetch::load_builtin(cx, fb, r.draw_index)?;
+        let link = Link {
+            object: r.viewport,
+            place: Place::Whole,
+            form: Form {
+                held: Held::Int {
+                    bits: 32,
+                    container: 32,
+                },
+                lanes: 1,
+            },
+        };
+        store(cx, fb, &link, index)?;
     }
     // The pass's colors the pipeline lacks, which plain Metal zeroes where the draw covers them.
     let zeroed = cx.plan.families.stage_io.zeroed.clone();
@@ -1996,6 +2320,36 @@ fn output_part(
         Some(color) if cx.plan.families.fragment.input_blends.contains_key(&color) => {
             input_blended(cx, fb, (x, returned), color, (o.link.form, part))?
         }
+        // An attachment held with its channels rotated whose blend the function computes over its
+        // input attachment, in Metal's order: the rotation below takes it into the image's.
+        Some(color)
+            if cx
+                .plan
+                .families
+                .fragment
+                .rotated_blends
+                .contains_key(&color) =>
+        {
+            let plan = cx.plan;
+            let Some(rb) = plan.families.fragment.rotated_blends.get(&color) else {
+                return Err(
+                    cx.fail("a rotated input blend of an attachment the plan does not name")
+                );
+            };
+            let v = crate::lower::fragment::rotated_input_texel(
+                cx,
+                fb,
+                (color, rb),
+                (o.link.form, part),
+            )?;
+            color_write::round(cx, fb, color, o.link.form, v)?
+        }
+        // The pipeline's private logic operation over the attachment's input attachment.
+        Some(color) if cx.plan.families.fragment.logic_inputs.contains_key(&color) => {
+            let v =
+                crate::lower::fragment::logic_input_operated(cx, fb, color, (o.link.form, part))?;
+            color_write::round(cx, fb, color, o.link.form, v)?
+        }
         Some(color) => match (
             cx.plan.families.stage_io.words_written.get(&color).copied(),
             cx.plan.families.stage_io.extended.get(&color).copied(),
@@ -2009,6 +2363,14 @@ fn output_part(
                     }
                     None => word,
                 }
+            }
+            // The output's `half`, which the instance's shadow of the attachment holds
+            // (`lower::fragment`'s `input_shadow`), and its encode.
+            (None, Some(e)) if crate::lower::fragment::input_shadow(cx, color).is_some() => {
+                let v = extended_color::held(fb, e.form, o.link.form, part)?;
+                crate::lower::fragment::input_shadow_store(cx, fb, color, v)?;
+                let texel = crate::lower::arith::extended_range::encode(fb, e.form, v)?;
+                extended_color::raw_components(fb, e.form, texel)?
             }
             (None, Some(e)) => extended_color::encode(fb, e, o.link.form, part)?,
             (None, None) => color_write::round(cx, fb, color, o.link.form, part)?,
@@ -2279,6 +2641,62 @@ fn compensate(
     };
     let vec4 = fb.module().ty(SType::Vector { elem: f32_, len: 4 })?;
     fb.composite_construct(vec4, &[sxx, y_out, depth, w])
+}
+
+/// `position`, a vertex function's `float4` position, as its region's copy (`r`,
+/// `LoweringInputs::region_copies`): region `first + (DrawIndex / c)·nx + DrawIndex mod c` of the
+/// region table, in the table's order, `[first, c]` its `PushField::RegionBox` and `nx` the
+/// table's segments of x (a draw of the box's rows of `c` regions in order), its position through
+/// the region's line and its four clip distances stored after the function's own, by the emitter
+/// a fan-out stage's copies share (`pipeline::link::fan_out::region_copy`), and 0 stored as
+/// `ViewportIndex`, the recording's one viewport (the routes' agreement is checked with these
+/// outputs, `ViewportIndex` among them: `bind::fan_out`, **One route per pass**). The clip
+/// distances alone keep the copy to its region's pixels, as a fan-out stage's copies' do: the
+/// recording's scissor is its box's.
+fn store_region_copy(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    r: RegionCopy,
+    position: SValue,
+) -> BResult<SValue> {
+    use crate::pipeline::link::fan_out;
+    let Some(table) = cx.decl.families.stage_io.region_table else {
+        return Err(cx.fail("a region's copy without its region table"));
+    };
+    let boxed = cx.push_field(fb, PushField::RegionBox)?;
+    let first = fb.composite_extract(boxed, &[0])?;
+    let columns = fb.composite_extract(boxed, &[1])?;
+    let draw = fetch::load_builtin(cx, fb, r.draw_index)?;
+    let segments = fan_out::box_segments(fb, table, [first, columns], draw)?;
+    // Viewport 0, the recording's one.
+    let link = Link {
+        object: r.viewport,
+        place: Place::Whole,
+        form: Form {
+            held: Held::Int {
+                bits: 32,
+                container: 32,
+            },
+            lanes: 1,
+        },
+    };
+    let zero = fb.u32_const(0)?;
+    let zero = fb.module().const_value(zero)?;
+    store(cx, fb, &link, zero)?;
+    let f32_ = fb.module().ty(SType::Float { width: 32 })?;
+    let vec4 = fb.module().ty(SType::Vector { elem: f32_, len: 4 })?;
+    let terms = fan_out::region_terms(fb, (table, f32_), segments)?;
+    let (moved, distances) = fan_out::region_copy(fb, &terms, position, vec4)?;
+    let (object, first) = r.clip;
+    let g = global(cx, object)?;
+    let base = fb.module().global_value(g)?;
+    for (k, d) in (first..).zip(distances) {
+        let kc = fb.u32_const(k)?;
+        let kc = fb.module().const_value(kc)?;
+        let p = fb.access_chain(base, &[kc])?;
+        fb.store(p, d, MemAccess::default())?;
+    }
+    Ok(moved)
 }
 
 /// How a return drops a positive NaN depth, which fails Metal's depth test (`clamp_depth`).
@@ -2585,6 +3003,9 @@ pub fn declare(
 ) -> BResult<Declared> {
     let sp = &plan.families.stage_io;
     let mut d = Declared::default();
+    if sp.offsets_from_seven_sixteenths {
+        mb.offsets_from_seven_sixteenths();
+    }
     // The sample-qualified varyings a looping entry reads at every sample before the loop, and
     // how many samples.
     let before_loop = plan
@@ -2665,6 +3086,14 @@ pub fn declare(
     }
     if let Some(g) = sp.invariant.and_then(|i| d.globals.get(i)) {
         mb.invariant(*g)?;
+    }
+    // A region's copy: its clip distances computed alike in every pipeline that draws the
+    // function's region copies, as a fan-out stage's are, and the table it reads.
+    if let Some(r) = sp.region_copy {
+        if let Some(g) = d.globals.get(r.clip.0) {
+            mb.invariant(*g)?;
+        }
+        d.region_table = Some(crate::pipeline::link::fan_out::declare_table(mb)?);
     }
     if sp.invariant_fragment_outputs {
         use crate::spv::BuiltIn as B;

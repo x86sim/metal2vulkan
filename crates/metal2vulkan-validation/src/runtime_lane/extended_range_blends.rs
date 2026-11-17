@@ -26,8 +26,10 @@ use super::extended_range_targets::{
     digest, dispatch, half_bits, half_value, kernel, outputs, reads, COUNT, HEIGHT, SOURCE_HALF,
     WIDTH,
 };
+use super::framebuffer_fetch::fetches;
 use super::resolves::{lane, lane_with, quiet, Lane, FULL, WHITE};
 use super::two_plane_copies::Rng;
+use super::xr_codes::{assert_announced, texel_within};
 use super::{buffer_with, read_buffer};
 use crate::candidate::runtime_samples::{library, shape};
 use metal2vulkan::metal::format::{ClearRoute, ExtendedRange};
@@ -35,7 +37,11 @@ use metal2vulkan::metal::{
     BarrierScope, BlendFactor, ColorWriteMask, IndirectCommandType, PixelFormat, PrimitiveType,
     RenderStages, TextureUsage,
 };
-use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
+use metal2vulkan::pipeline::{
+    ColorAttachmentDescriptor, PrecisionNote, RenderPipelineDescriptor, StageSource,
+};
+use metal2vulkan::vk;
+use metal2vulkan::Budget;
 use metal2vulkan_runtime::{
     BlitOption, Buffer, ClearColor, DebugMessage, Degradation, Error,
     IndirectCommandBufferDescriptor, LoadAction, PipelineOptions, Region, RenderPassDescriptor,
@@ -386,20 +392,27 @@ fn first_texels(got: &[u8], size: usize) -> String {
 
 /// Each format's blends of the probe's `half` outputs over its random texels, of source factor
 /// one, added, with destination factor zero, one, and one minus the source's alpha. Where the
-/// blend computes nothing (one and zero) every format stores Metal's bytes, which is asserted.
-/// Under one and one minus the source's alpha the function blends in the device's arithmetic,
+/// blend computes nothing (one and zero) every format stores the source as a write encodes it,
+/// which is asserted: each code within one of Metal's ([`one_zero_model`], which gives Metal's
+/// digests), the bits Metal does not read Metal's, the device's encode
+/// (`PrecisionNote::DevicePackConversion`, announced). Under one and one minus the source's alpha the function blends in the device's arithmetic,
 /// where Metal's compiler rounds each step to `half` (`extended-range-blend-source`): how many
 /// outputs differ from Metal's is printed, not asserted; the conformance suite's `xr-blend-*`
 /// cases hold Metal's bytes and each site the device's arithmetic moves.
 #[test]
 fn blends_of_half_outputs_into_extended_range_texels() {
     let (messages, _cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let name = lane.device.name().to_owned();
     let halves = halves();
     let read = kernel(&lane, "xr2p_read_float");
     let size = (WIDTH as u64, HEIGHT as u64);
     let mut wrong = Vec::new();
     let mut moved = Vec::new();
+    // The texels and alpha bytes of the blends of one and zero within a code of Metal's.
+    let mut near = 0;
     let mut checked = 0;
     for (pf, probe) in FORMATS {
         let form = ExtendedRange::of(pf).expect("an extended-range format");
@@ -415,29 +428,53 @@ fn blends_of_half_outputs_into_extended_range_texels() {
             draw(&lane, &t, &halves, color).unwrap_or_else(|e| panic!("{case}: the pipeline: {e}"));
             let got = lane.read(&t, (0, 0), texel as u64, BlitOption::None);
             checked += 1;
-            // The device's arithmetic answers a blend that computes something.
-            let differs = match dst {
-                BlendFactor::Zero => &mut wrong,
-                _ => &mut moved,
+            let bytes: Vec<u8> = match alpha.is_empty() {
+                true => Vec::new(),
+                false => reads(&lane, &read, &t, size)
+                    .chunks(16)
+                    .map(|v| {
+                        let a = f32::from_le_bytes([v[12], v[13], v[14], v[15]]);
+                        (a * 255.0).round_ties_even() as u8
+                    })
+                    .collect(),
             };
+            // A blend of one and zero stores the source, encoded by the device's conversion: each
+            // code within one of Metal's (the model's, which gives Metal's digests).
+            if dst == BlendFactor::Zero {
+                let (want, want_alpha) = one_zero_model(form, &halves);
+                let mut differ = 0;
+                for (g, w) in got.chunks(texel).zip(want.chunks(texel)) {
+                    match (g == w, texel_within(form, g, w)) {
+                        (true, _) => {}
+                        (false, true) => near += 1,
+                        (false, false) => differ += 1,
+                    }
+                }
+                for (g, w) in bytes.iter().zip(&want_alpha) {
+                    match (g == w, g.abs_diff(*w) <= 1) {
+                        (true, _) => {}
+                        (false, true) => near += 1,
+                        (false, false) => differ += 1,
+                    }
+                }
+                if differ > 0 {
+                    wrong.push(format!(
+                        "{case}: {differ} texels and alpha bytes past a code of Metal's, the first \
+                         texels {}",
+                        first_texels(&got, texel)
+                    ));
+                }
+                continue;
+            }
+            // The device's arithmetic answers a blend that computes something.
             if digest(&got) != metal(&format!("{case}.out0")) {
-                differs.push(format!(
+                moved.push(format!(
                     "{case}.out0: the first texels {}",
                     first_texels(&got, texel)
                 ));
             }
-            if alpha.is_empty() {
-                continue;
-            }
-            let bytes: Vec<u8> = reads(&lane, &read, &t, size)
-                .chunks(16)
-                .map(|v| {
-                    let a = f32::from_le_bytes([v[12], v[13], v[14], v[15]]);
-                    (a * 255.0).round_ties_even() as u8
-                })
-                .collect();
-            if digest(&bytes) != metal(&format!("{case}.outa")) {
-                differs.push(format!(
+            if !alpha.is_empty() && digest(&bytes) != metal(&format!("{case}.outa")) {
+                moved.push(format!(
                     "{case}.outa: the first alpha bytes {:02x?}",
                     &bytes[..8]
                 ));
@@ -449,7 +486,8 @@ fn blends_of_half_outputs_into_extended_range_texels() {
     }
     println!(
         "XR-BLENDS {name}: {checked} blends of {COUNT} texels checked, {} outputs of one and zero \
-         and {} of the device's arithmetic differ from Metal",
+         past a code of Metal's ({near} texels and alpha bytes within one) and {} of the device's \
+         arithmetic differ from Metal",
         wrong.len(),
         moved.len()
     );
@@ -458,6 +496,7 @@ fn blends_of_half_outputs_into_extended_range_texels() {
         "{} outputs differ from Metal",
         wrong.len()
     );
+    assert_announced(&messages, near, "the blends of one and zero");
     quiet(lane, &messages);
 }
 
@@ -495,12 +534,16 @@ pub(super) const STORED_CODES: [Degradation; 1] = [Degradation::ExtendedRangeBle
 /// shadow of what the first instance stored: it blends onto the codes the first stored and
 /// announces `extended-range-blends-stored-codes` once, naming the color (the M3 Max's run of the
 /// same probes). A pass of one blended draw, and one of two unblended
-/// draws, announce none. A device with raster-order attachment access (lavapipe), which blends over
-/// the color's input attachment and holds no shadow, announces it at the pass of two draws already,
-/// once for the device.
+/// draws, announce none. A device with raster-order attachment access blends over the color's
+/// input attachment, and holds the shadow beside it where its functions read and write it there
+/// (lavapipe, `framebuffer_fetch::holds_extended_shadows`), announcing alike; one that holds none
+/// announces it at the pass of two draws already, once for the device.
 #[test]
 fn a_blend_onto_an_earlier_draw_announces_the_stored_codes_only_past_its_shadow() {
     let (messages, _cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let halves = halves();
     let pf = PixelFormat::RGB10A82PXR10;
     let form = ExtendedRange::of(pf).expect("an extended-range format");
@@ -512,7 +555,7 @@ fn a_blend_onto_an_earlier_draw_announces_the_stored_codes_only_past_its_shadow(
         color.destination_alpha_blend_factor = BlendFactor::OneMinusSourceAlpha;
         color
     };
-    let shadowed = !super::framebuffer_fetch::through_inputs(&lane);
+    let shadowed = super::framebuffer_fetch::holds_extended_shadows(&lane);
     let t = filled(&lane, pf, (&plane, &alpha));
     if let Err(e) = draws(
         &lane,
@@ -574,12 +617,17 @@ fn a_blend_onto_an_earlier_draw_announces_the_stored_codes_only_past_its_shadow(
 /// (`render/extended_shadow.rs`). A second draw a memory barrier later, in an instance of its
 /// own, still holds it: the shadow, once started, lasts through the pass's splits. A pass that
 /// clears to zero, every channel a code's value, announces none. A device with raster-order
-/// attachment access (lavapipe), which blends over the color's input attachment and holds no
-/// shadow, announces `extended-range-blends-stored-codes` at the first pass between two codes, once
-/// for the device.
+/// attachment access blends over the color's input attachment, and holds the shadow beside it
+/// where its functions read and write it there (lavapipe,
+/// `framebuffer_fetch::holds_extended_shadows`), announcing none alike; one that holds none
+/// announces `extended-range-blends-stored-codes` at the first pass between two codes, once for
+/// the device.
 #[test]
 fn a_blend_onto_a_clear_between_two_codes_reads_the_clears_half() {
     let (messages, _cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let halves = halves();
     let pf = PixelFormat::RGB10A82PXR10;
     let form = ExtendedRange::of(pf).expect("an extended-range format");
@@ -594,7 +642,7 @@ fn a_blend_onto_a_clear_between_two_codes_reads_the_clears_half() {
         .unwrap_or_else(|e| panic!("the pipeline: {e}"));
     let cleared = counts(&messages.take_notices());
     assert!(!cleared.contains_key(&STORED_CODES[0]), "{cleared:?}");
-    let shadowed = !super::framebuffer_fetch::through_inputs(&lane);
+    let shadowed = super::framebuffer_fetch::holds_extended_shadows(&lane);
     let between = Some(ClearColor::new(0.0, 0.0, 0.0, 0.5));
     for (count, split) in [(1, false), (2, true)] {
         draws(&lane, &t, &halves, blended, (between, count, split))
@@ -620,6 +668,9 @@ fn a_blend_onto_a_clear_between_two_codes_reads_the_clears_half() {
 #[test]
 fn a_blend_into_extended_range_announces_its_source_note() {
     let (messages, _cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let pf = PixelFormat::RGB10A82PXR10;
     let source = Degradation::ExtendedRangeBlendSource;
     let float_source = Degradation::ExtendedRangeFloatBlendSource;
@@ -918,6 +969,18 @@ pub(super) fn tile_of(word: u32, alpha: u8) -> [f32; 4] {
     [color(20), color(10), color(0), a].map(|v| half_away(f64::from(v)))
 }
 
+/// The tile value of an `RGB10A8_2P_XR10` texel of color word `word` and alpha byte `alpha` where
+/// the device drops its conversion pair to `half` and back (`PrecisionNote::NativeHalfConversion`'s
+/// bound, `lower::arith::narrow::converted`): each color code clamped to 1022, `float(code - 384)`
+/// times the `f32` nearest `1 / 510`, alpha `float(alpha)` times the `f32` nearest `1 / 255`, as
+/// `lower::arith::extended_range` decodes them, unrounded.
+fn tile_unrounded(word: u32, alpha: u8) -> [f32; 4] {
+    let color = |shift: u32| (((word >> shift) & 0x3FF).min(1022) as i32 - 384) as f32;
+    let n = [color(20), color(10), color(0), f32::from(alpha)];
+    let r = [510.0f32, 510.0, 510.0, 255.0].map(|d| 1.0 / d);
+    std::array::from_fn(|k| n[k] * r[k])
+}
+
 /// `x` rounded to `half`, nearest even, as an `f32`.
 fn half_even(x: f32) -> f32 {
     half_value(half_bits(x))
@@ -953,14 +1016,23 @@ fn tile_read(held: [f32; 4]) -> [f32; 4] {
 /// store, where Metal's pass zeroes color 2's color words' top two bits (`extended-range-bits-kept`
 /// says so, `render/tile_store.rs`). The pipeline is made on every device:
 /// one that fetches through the interlock writes the storage form and holds color 0's `half` shadow
-/// from the second draw on (`render/extended_shadow.rs`), one with raster-order attachment access
-/// reads an input attachment of the raw texels and writes the raw output, each draw reading the
-/// codes the one before stored, which the runtime announces (`extended-range-blends-stored-codes`).
+/// from the second draw on (`render/extended_shadow.rs`); one with raster-order attachment access
+/// reads an input attachment of the raw texels and writes the raw output, and holds the shadow
+/// beside it from the second draw on where its functions read and write it there (lavapipe,
+/// `framebuffer_fetch::holds_extended_shadows`; Mesa 26.2.6 holds all 8,192 texels on Metal's
+/// rule), else each draw reads the codes the one before stored, which the runtime announces
+/// (`extended-range-blends-stored-codes`). There, where the fragment stage records
+/// `PrecisionNote::NativeHalfConversion`, the device's conversion to `half` and back may be
+/// dropped (the note's bound): a texel through the codes then holds as Metal's rule or as the same
+/// draws over each fetch's unrounded decode (`tile_unrounded`).
 #[test]
 fn a_fetched_two_plane_attachment_written_unblended_stores_metals_write() {
     use crate::air_library::AirLibrary;
     use metal2vulkan_devtools::{engine_dir, llvm_assemble};
     let (messages, _cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let name = lane.device.name().to_owned();
     let pf = PixelFormat::RGB10A82PXR10;
     let form = ExtendedRange::of(pf).expect("an extended-range format");
@@ -991,6 +1063,18 @@ fn a_fetched_two_plane_attachment_written_unblended_stores_metals_write() {
         .device
         .new_render_pipeline_state(&pipeline, &PipelineOptions::default())
         .unwrap_or_else(|e| panic!("the guest's pipeline on {name}: {e}"));
+    let unrounded = lane
+        .device
+        .compile_device()
+        .compile_render_pipeline(&pipeline, &Budget::standard())
+        .unwrap_or_else(|e| panic!("the guest's pipeline's compile on {name}: {e}"))
+        .stages
+        .iter()
+        .filter(|s| s.stage == vk::ShaderStage::FRAGMENT)
+        .any(|s| {
+            s.precision_notes
+                .contains(&PrecisionNote::NativeHalfConversion)
+        });
     let through = match super::framebuffer_fetch::through_inputs(&lane) {
         true => "input attachments",
         false => "the pixel interlock",
@@ -1044,15 +1128,15 @@ fn a_fetched_two_plane_attachment_written_unblended_stores_metals_write() {
         }
     })
     .unwrap_or_else(|e| panic!("the pass on {name}: {e}"));
-    // Metal's rule, texel by texel: through the shadow in the interlock, else through the codes.
-    let shadowed = !super::framebuffer_fetch::through_inputs(&lane);
-    let mut want_plane = Vec::with_capacity(4 * COUNT);
-    let mut want_alpha = Vec::with_capacity(COUNT);
-    for (i, (word, &a)) in plane.chunks(4).zip(&alpha).enumerate() {
+    // Metal's rule, texel by texel: through the shadow where the device holds it, else through
+    // the codes.
+    let shadowed = super::framebuffer_fetch::holds_extended_shadows(&lane);
+    // The texel the three draws leave from `word` and `a`, each fetch through the codes decoded by
+    // `fetch`.
+    let drawn = |i: usize, word: u32, a: u8, fetch: fn(u32, u8) -> [f32; 4]| -> [u32; 2] {
         let (x, y) = ((i % WIDTH) as f32 + 0.5, (i / WIDTH) as f32 + 0.5);
-        let word = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
         let mut texel = [word, u32::from(a)];
-        let mut d = tile_of(word, a);
+        let mut d = fetch(word, a);
         for _ in 0..3 {
             let source = [x, y, 1.0, -0.5];
             let out: [f64; 4] = std::array::from_fn(|k| f64::from((source[k] + d[k]) * 0.5));
@@ -1060,11 +1144,22 @@ fn a_fetched_two_plane_attachment_written_unblended_stores_metals_write() {
             texel = [raw[0], raw[1]];
             d = match shadowed {
                 true => tile_read(out.map(|v| half_even(v as f32))),
-                false => tile_of(texel[0], texel[1] as u8),
+                false => fetch(texel[0], texel[1] as u8),
             };
         }
+        texel
+    };
+    let mut want_plane = Vec::with_capacity(4 * COUNT);
+    let mut want_alpha = Vec::with_capacity(COUNT);
+    let mut device_rule = Vec::with_capacity(COUNT);
+    for (i, (word, &a)) in plane.chunks(4).zip(&alpha).enumerate() {
+        let word = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+        let texel = drawn(i, word, a, tile_of);
         want_plane.extend(texel[0].to_le_bytes());
         want_alpha.push(texel[1] as u8);
+        if unrounded && !shadowed {
+            device_rule.push(drawn(i, word, a, tile_unrounded));
+        }
     }
     let got = lane.read(&t, (0, 0), 4, BlitOption::None);
     let read = kernel(&lane, "xr2p_read_float");
@@ -1086,8 +1181,20 @@ fn a_fetched_two_plane_attachment_written_unblended_stores_metals_write() {
             .collect()
     };
     let (got_words, want_words) = (words(&got), words(&want_plane));
-    let differ: Vec<String> = (0..COUNT)
+    let unrounded_at = |i: usize| {
+        (device_rule.get(i))
+            .is_some_and(|t| got_words[i] == t[0] && u32::from(got_alpha[i]) == t[1])
+    };
+    let off = |i: &usize| {
+        let i = *i;
+        (got_words[i] != want_words[i] || got_alpha[i] != want_alpha[i]) && !unrounded_at(i)
+    };
+    let held_unrounded = (0..COUNT)
         .filter(|&i| got_words[i] != want_words[i] || got_alpha[i] != want_alpha[i])
+        .filter(|&i| unrounded_at(i))
+        .count();
+    let differ: Vec<String> = (0..COUNT)
+        .filter(off)
         .take(4)
         .map(|i| {
             format!(
@@ -1096,9 +1203,7 @@ fn a_fetched_two_plane_attachment_written_unblended_stores_metals_write() {
             )
         })
         .collect();
-    let count = (0..COUNT)
-        .filter(|&i| got_words[i] != want_words[i] || got_alpha[i] != want_alpha[i])
-        .count();
+    let count = (0..COUNT).filter(off).count();
     // Color 2, loaded and unwritten, keeps its bytes, the device's store, where Metal's pass
     // zeroes its color words' top two bits in each tile a draw reaches.
     let kept = lane.read(&other, (0, 0), 4, BlitOption::None) == other_plane
@@ -1106,7 +1211,13 @@ fn a_fetched_two_plane_attachment_written_unblended_stores_metals_write() {
         && lane.read(&covered, (0, 0), 4, BlitOption::None) == covered_texels;
     println!(
         "XR-FETCH-UNBLENDED {name}: made, through {through}; {count} of {COUNT} texels differ \
-         from Metal's rule{}; colors 1 and 2 {}",
+         from Metal's rule{}{}; colors 1 and 2 {}",
+        match unrounded {
+            true => format!(
+                " and the unrounded fetch's (native-half-conversion), {held_unrounded} held by it"
+            ),
+            false => String::new(),
+        },
         if differ.is_empty() {
             String::new()
         } else {
@@ -1117,4 +1228,54 @@ fn a_fetched_two_plane_attachment_written_unblended_stores_metals_write() {
     assert_eq!(count, 0, "texels differ from Metal's rule on {name}");
     assert!(kept, "colors 1 and 2 changed on {name}");
     quiet(lane, &messages);
+}
+
+/// Metal's texels after a blend of source factor one and destination factor zero of the probe's
+/// `half` outputs `halves` into a target of `form`: each output clamped first as Metal's blend
+/// clamps its source (a color lane to the codes 0 and 1022's values rounded to `half`,
+/// `-0.7529296875` and `1.2509765625`, `BGRA10_XR_sRGB`'s to their tile values `-0.52734375` and
+/// `1.6689453125`; alpha to `[0, 1]`; a NaN to the low end; `lower::arith::extended_range`'s
+/// measured source range), then stored as a kernel write stores it, the destination's codes and
+/// unread bits gone: plane 0's bytes and a two-plane form's alpha bytes.
+fn one_zero_model(form: ExtendedRange, halves: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let (lo, hi) = match form {
+        ExtendedRange::Bgra10 { srgb: true } => (-1080.0 / 2048.0, 1709.0 / 1024.0),
+        _ => (-1542.0 / 2048.0, 1281.0 / 1024.0),
+    };
+    let (mut plane, mut alpha) = (Vec::new(), Vec::new());
+    for texel in halves.as_chunks::<8>().0 {
+        let color = [0, 1, 2, 3].map(|c| {
+            let x = half_value(u16::from_le_bytes([texel[2 * c], texel[2 * c + 1]]));
+            let (lo, hi) = if c == 3 { (0.0, 1.0) } else { (lo, hi) };
+            f64::from(if x.is_nan() { lo } else { x.clamp(lo, hi) })
+        });
+        let raw = form.clear_texel(color, ClearRoute::ThroughHalf);
+        match form {
+            ExtendedRange::Bgra10 { .. } => {
+                plane.extend(raw.iter().flat_map(|&f| (f as u16).to_le_bytes()));
+            }
+            ExtendedRange::Planes { .. } => {
+                plane.extend(raw[0].to_le_bytes());
+                alpha.push(raw[1] as u8);
+            }
+            _ => plane.extend(raw[0].to_le_bytes()),
+        }
+    }
+    (plane, alpha)
+}
+
+/// The model of a blend of one and zero gives Metal's digests of each format's texels and alpha
+/// bytes.
+#[test]
+fn the_one_zero_model_gives_metal_s_digests() {
+    let halves = halves();
+    for (pf, probe) in FORMATS {
+        let form = ExtendedRange::of(pf).expect("an extended-range format");
+        let (plane, alpha) = one_zero_model(form, &halves);
+        let case = format!("rt.{probe}.h.one_zero");
+        assert_eq!(digest(&plane), metal(&format!("{case}.out0")), "{case}");
+        if !alpha.is_empty() {
+            assert_eq!(digest(&alpha), metal(&format!("{case}.outa")), "{case}");
+        }
+    }
 }

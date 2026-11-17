@@ -11,26 +11,29 @@
 //! its own ([`keyed_assembly`]), the compatible render pass's formats and samples, the encoder's
 //! fixed-function state the pipeline does not make dynamic, and the pass's sample positions
 //! (`sample_positions.rs`). In a pass whose draws fetch through input attachments, every pipeline
-//! orders its color attachment accesses by rasterization (`framebuffer_fetch.rs`). A mesh pipeline
+//! orders its color attachment accesses by rasterization where the device has that access
+//! (`framebuffer_fetch.rs`). A mesh pipeline
 //! has no vertex input and no input assembly; its key's topology only enables the depth bias
 //! (`render/mesh.rs`). An emulated mesh function's pipeline leaves its compute stage out, which a
 //! pipeline of its own runs (`objects.rs`), and draws its synthesized vertex stage's list of the
 //! mesh's topology.
 
 use super::creation_log;
+use super::interlocked_writes;
 use super::kept::Place;
 use super::libraries::{Linked, Part};
-use super::objects::{RawPipeline, VariantObjects};
+use super::objects::{RawPipeline, StageObject, VariantObjects};
 use crate::degradation::BoundFormats;
-use crate::error::{internal, vulkan, Error};
+use crate::error::{internal, vulkan, DeadlockCause, Error};
 use crate::render_target::{PassShape, RenderPassObject};
 use crate::shader_cache::driver::Making;
 use crate::shader_cache::{found_in_cache, REPORTED_STAGES};
 use ash::vk;
 use metal2vulkan::cache::Hash256;
 use metal2vulkan::cache::SpecializationKey;
+use metal2vulkan::error::RuntimeDriverDefect;
 use metal2vulkan::metal::state::DepthStencilState;
-use metal2vulkan::pipeline::{RenderPipeline, VertexStride};
+use metal2vulkan::pipeline::{BandPrimitive, RenderPipeline, VertexStride};
 use std::sync::atomic::AtomicBool;
 
 /// What one `VkPipeline` of a render variant is made from, beside the variant.
@@ -41,7 +44,8 @@ pub(crate) struct GraphicsKey {
     /// The draw's topology and whether its input assembly restarts primitives.
     pub(crate) topology: metal2vulkan::vk::PrimitiveTopology,
     pub(crate) primitive_restart: bool,
-    /// The pass the pipeline draws in.
+    /// The pass the pipeline draws in, as a key holds it: its resolves left out, which render
+    /// pass compatibility ignores (`PassShape::keyed`).
     pub(crate) pass: PassShape,
     /// The per-bind strides the pipeline keeps static (by Vulkan binding): the draw's
     /// `vertex_strides` on a profile without dynamic strides, empty with them.
@@ -51,11 +55,17 @@ pub(crate) struct GraphicsKey {
     /// The pass's sample positions in sixteenths of a pixel, empty for the device's own
     /// (`sample_positions.rs`).
     pub(crate) sample_positions: Vec<[u8; 2]>,
+    /// The draw reads a texture its render pass instance renders, in place, in the feedback loop
+    /// layout (`render/snapshot.rs`, in place): the pipeline is made with
+    /// `VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT`, as a variant that reads
+    /// through snapshots is (`GraphicsState::snapshot_reads`).
+    pub(crate) feedback_loop: bool,
 }
 
 /// A [`GraphicsKey`] of a draw's own values, borrowed: what a draw compares with the key its state
 /// last found made, and makes a key of only where it looks one up (`begin_graphics_pipeline`).
-/// Each field is the key's of the same name.
+/// Each field is the key's of the same name; the pass is the instance's whole shape, which the key
+/// holds without its resolves (`PassShape::keyed`).
 #[derive(Clone, Copy)]
 pub(crate) struct DrawKey<'a> {
     pub(crate) specialization: &'a SpecializationKey,
@@ -65,10 +75,11 @@ pub(crate) struct DrawKey<'a> {
     pub(crate) strides: &'a [(u32, u32)],
     pub(crate) fixed: FixedState,
     pub(crate) sample_positions: &'a [[u8; 2]],
+    pub(crate) feedback_loop: bool,
 }
 
 impl DrawKey<'_> {
-    /// Whether `key` is this one.
+    /// Whether `key` is this one's (its pass as a key holds it, `PassShape::keys_as`).
     pub(crate) fn is(&self, key: &GraphicsKey) -> bool {
         let GraphicsKey {
             specialization,
@@ -78,26 +89,29 @@ impl DrawKey<'_> {
             strides,
             fixed,
             sample_positions,
+            feedback_loop,
         } = key;
         self.specialization == specialization
             && self.topology == *topology
             && self.primitive_restart == *primitive_restart
-            && self.pass == pass
+            && self.pass.keys_as(pass)
             && self.strides == &strides[..]
             && self.fixed == *fixed
             && self.sample_positions == &sample_positions[..]
+            && self.feedback_loop == *feedback_loop
     }
 
-    /// The key, owned.
+    /// The key, owned: the pass as a key holds it (`PassShape::keyed`).
     pub(crate) fn key(&self) -> GraphicsKey {
         GraphicsKey {
             specialization: self.specialization.clone(),
             topology: self.topology,
             primitive_restart: self.primitive_restart,
-            pass: self.pass.clone(),
+            pass: self.pass.keyed(),
             strides: self.strides.to_vec(),
             fixed: self.fixed,
             sample_positions: self.sample_positions.to_vec(),
+            feedback_loop: self.feedback_loop,
         }
     }
 }
@@ -185,6 +199,10 @@ pub(crate) struct FixedState {
     /// `VkPipelineRasterizationProvokingVertexStateCreateInfoEXT` with
     /// `VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT`, never dynamic.
     pub(crate) provoking_last: bool,
+    /// The `lineWidth` the draw rasterizes lines at, as `f32` bits: 1 but where a line Apple's
+    /// `setLineWidth:` widens is drawn by the device's own lines (`render/line_width.rs`), never
+    /// dynamic. A pipeline of another width than 1 chains no Bresenham line mode.
+    pub(crate) line_width: u32,
 }
 
 /// The depth clip and clamp of a draw through a viewport depth range past `[0, 1]`
@@ -284,9 +302,10 @@ pub(crate) enum Notices<'a> {
 /// reads (the Framebuffer chapter, `VkPipelineColorBlendStateCreateFlagBits`). The validation
 /// layer's synchronization checks (1.4.357, and its main of 2026-10-18) do not read the flag and
 /// report such a read after an earlier draw's write; the name lets a reader tell those reports
-/// from others.
-pub(crate) const RASTER_ORDER_PIPELINE: &std::ffi::CStr =
-    c"metal2vulkan: a pipeline reading its input attachments in rasterization order";
+/// from others, and the validation crate's lanes match it whole, so it is the pipeline's name
+/// alone, in place of its functions' names (`VariantObjects::pipeline_name`).
+pub(crate) const RASTER_ORDER_PIPELINE: &str =
+    "metal2vulkan: a pipeline reading its input attachments in rasterization order";
 
 /// What one `VkPipeline` of a render variant is made of beside the variant's modules and layout,
 /// owned: each part's state, from which its create infos are built
@@ -320,6 +339,8 @@ pub(crate) struct GraphicsContent {
     ///
     /// [`bresenham_lines`]: metal2vulkan::device::VkFeature::BresenhamLines
     bresenham_lines: bool,
+    /// `lineWidth` ([`FixedState::line_width`]).
+    line_width: f32,
     cull_mode: vk::CullModeFlags,
     front_face: vk::FrontFace,
     depth_bias: bool,
@@ -343,9 +364,14 @@ pub(crate) struct GraphicsContent {
     /// A mesh pipeline: no vertex input and no input assembly.
     meshes: bool,
     /// The pipeline reads textures its pass renders through snapshots
-    /// (`GraphicsState::snapshot_reads`, `render/snapshot.rs`): made whole, with
+    /// (`GraphicsState::snapshot_reads`, `render/snapshot.rs`) or in place
+    /// ([`GraphicsKey::feedback_loop`]): made whole, with
     /// `VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT`.
     feedback_loop: bool,
+    /// Its fragment stage declares an interlock execution mode (`interlocked_writes`) on a
+    /// driver whose fast-linked pipelines do not order it
+    /// (`RuntimeDriverDefect::FastLinkedInterlocksUnordered`): made whole.
+    unlinked_interlock: bool,
 }
 
 /// One stage of a [`GraphicsContent`]: its index among the variant's modules, its flags, its
@@ -475,14 +501,48 @@ impl<'a> Infos<'a> {
     }
 }
 
+/// What a part's digest names (`GraphicsContent::part_named`).
+#[derive(Clone, Copy)]
+enum Naming {
+    /// Its library (`libraries.rs`), made against the pass: the pass whole, and the depth bias the
+    /// content holds.
+    Library,
+    /// The record of the driver's data a making of its shaders is made under
+    /// (`GraphicsContent::record_parts`): the pass without its attachments' formats, and no depth
+    /// bias, neither of which reaches a stage's conversion.
+    Record,
+}
+
+/// The record names of a making's two parts that hold shaders
+/// (`GraphicsContent::record_parts`).
+pub(crate) struct PartRecords {
+    pre_rasterization: Hash256,
+    fragment_shader: Hash256,
+}
+
+impl PartRecords {
+    /// The record a library of `part` is made under; `None` for a part that holds no shader,
+    /// whose library is made with no cache.
+    fn of(&self, part: Part) -> Option<&Hash256> {
+        match part {
+            Part::PreRasterization => Some(&self.pre_rasterization),
+            Part::FragmentShader => Some(&self.fragment_shader),
+            Part::VertexInput | Part::FragmentOutput => None,
+        }
+    }
+}
+
 impl GraphicsContent {
     /// Whether its pipeline links from the four libraries: one with vertex input that rasterizes
-    /// (a mesh pipeline, or one that discards every primitive, is made whole), and that reads no
-    /// texture through a snapshot, whose creation flag is made whole too ([`feedback_loop`]).
+    /// (a mesh pipeline, or one that discards every primitive, is made whole), that reads no
+    /// texture through a snapshot, whose creation flag is made whole too ([`feedback_loop`]),
+    /// and whose fragment stage runs in no interlock its driver's fast link leaves unordered
+    /// ([`unlinked_interlock`]).
     ///
     /// [`feedback_loop`]: GraphicsContent::feedback_loop
+    /// [`unlinked_interlock`]: GraphicsContent::unlinked_interlock
     pub(crate) fn links(&self) -> bool {
-        !self.meshes && !self.rasterizer_discard && !self.feedback_loop
+        !self.meshes && !self.rasterizer_discard && !self.feedback_loop && !self.unlinked_interlock
     }
 
     /// The digest of each part's state, in [`Part::ALL`]'s order: the names of its libraries
@@ -497,37 +557,24 @@ impl GraphicsContent {
         pipeline: &RenderPipeline,
         key: &GraphicsKey,
     ) -> [Hash256; 4] {
-        self.named(objects, pipeline, key, Some(self.depth_bias))
+        Part::ALL.map(|part| self.part_named(part, objects, pipeline, key, Naming::Library))
     }
 
-    /// [`names`](Self::names), with `depth_bias` named in the pre-rasterization part's state in
-    /// place of this content's: a library names its own (`Some`), a record names none
-    /// (`None`, [`record`](Self::record)).
-    fn named(
-        &self,
-        objects: &VariantObjects,
-        pipeline: &RenderPipeline,
-        key: &GraphicsKey,
-        depth_bias: Option<bool>,
-    ) -> [Hash256; 4] {
-        Part::ALL.map(|part| self.part_named(part, objects, pipeline, key, depth_bias))
-    }
-
-    /// The digest of `part`'s state alone, as [`named`](Self::named) describes every part's: one
-    /// part, so a caller that wants two of the four names the two.
+    /// The digest of `part`'s state alone, as `naming` names it: as [`names`](Self::names)
+    /// describes every part's for its library, or for the record of a making of its shaders
+    /// ([`Naming::Record`]). One part, so a caller that wants two of the four names the two.
     ///
-    /// A record is two of them ([`record`](Self::record)) and computing all four cost it the two
-    /// it throws away -- six `Debug` formats of fifteen, the vertex input's and the colour
-    /// attachments' among them -- at every making of every pipeline. Each part's digest starts
-    /// its own [`Making`], so naming one says nothing about another and the two a record keeps
-    /// are byte for byte what the whole array held.
+    /// A record is two of them ([`record_parts`](Self::record_parts)) and computing all four
+    /// cost it the two it throws away -- six `Debug` formats of fifteen, the vertex input's and
+    /// the colour attachments' among them -- at every making of every pipeline. Each part's
+    /// digest starts its own [`Making`], so naming one says nothing about another.
     fn part_named(
         &self,
         part: Part,
         objects: &VariantObjects,
         pipeline: &RenderPipeline,
         key: &GraphicsKey,
-        depth_bias: Option<bool>,
+        naming: Naming,
     ) -> Hash256 {
         use metal2vulkan::vk::ShaderStage;
         let graphics = &pipeline.graphics;
@@ -576,10 +623,20 @@ impl GraphicsContent {
             )
         };
         let named = Making::new(part.kind()).text(&graphics.dynamic_states);
-        // The vertex input part takes no pass; the others are made against it.
-        let named = match part {
-            Part::VertexInput => named,
-            _ => named.text(&key.pass),
+        // The vertex input part takes no pass; the others are made against it, and a record
+        // names it without its attachments' formats, which reach no stage's conversion through
+        // it (`PassShape::without_formats`).
+        let named = match (part, naming) {
+            (Part::VertexInput, _) => named,
+            (_, Naming::Library) => named.text(&key.pass),
+            (_, Naming::Record) => named.text(&key.pass.without_formats()),
+        };
+        // A library names the depth bias it holds; a record names none ([`record_parts`]).
+        //
+        // [`record_parts`]: Self::record_parts
+        let depth_bias = match naming {
+            Naming::Library => Some(self.depth_bias),
+            Naming::Record => None,
         };
         match part {
             Part::VertexInput => named
@@ -599,6 +656,7 @@ impl GraphicsContent {
                     key.fixed.depth_clamp,
                     key.fixed.polygon_mode,
                     key.fixed.provoking_last,
+                    key.fixed.line_width,
                     key.fixed.cull_mode,
                     key.fixed.front_face,
                     depth_bias,
@@ -624,28 +682,72 @@ impl GraphicsContent {
         }
     }
 
-    /// What names the record of a making of `pipeline` (the variant's compiled pipeline) for
-    /// `key` (`shader_cache/driver.rs`): everything that reaches the driver's conversion of one
-    /// of its stages, and nothing else.
+    /// The names of the records of its two parts that hold shaders, its pre-rasterization and
+    /// fragment shader parts ([`Naming::Record`]): what names the record a library of either is
+    /// made under, where the device links its pipelines (`link`), and with them the record of a
+    /// whole pipeline's making ([`record`](Self::record)).
     ///
-    /// That is the names of the two parts that hold shaders, its pre-rasterization and fragment
-    /// shader libraries ([`names`](Self::names)) -- each of them the layout's description, its own
-    /// stages' SPIR-V with the constants they declare and their values, the pass, the dynamic
-    /// states and its part's state -- with the vertex input, which reaches MoltenVK's conversion
-    /// configuration as its vertex stage's inputs, and whether the pipeline rasterizes points
-    /// ([`renders_points`], the one way the topology reaches that configuration).
+    /// Each is its part's name as its library's ([`names`](Self::names)) but for two things that
+    /// reach no stage's conversion. Each is the layout's description, its own stages' SPIR-V with
+    /// the constants they declare and their values, the dynamic states and its part's state, and
+    /// the pass without its attachments' formats (`PassShape::without_formats`): a format the
+    /// translation reads is in the stage's words and constants already. So a state's pipelines
+    /// over passes that differ only in an attachment's format share one record and one cache,
+    /// where each format's making compiled the stages again (3.3 to 3.7 s each for a 203,016-word
+    /// fragment module on ANV, the Iris Xe), and its library made against each pass is found in
+    /// that cache.
     ///
     /// The depth bias is left out of the pre-rasterization part's state here, where a library
     /// names it: Metal biases triangles alone, so a state's line pipeline has the bias off where
     /// its triangle sibling has it on, and the bias reaches no stage's conversion. So the two
     /// share one record and one cache, where naming it made the line pipeline convert its stages
-    /// again (120 ms and more for a 271k-word fragment module).
+    /// again (120 ms and more for a 271k-word fragment module). Where the device links its
+    /// pipelines from libraries, a pre-rasterization library is made under this record too, and a
+    /// part's record names no topology (the point class is named by a whole pipeline's record
+    /// alone, [`record`](Self::record)), so a state's points' pre-rasterization library, whose
+    /// state differs from its triangles' only in the bias, is made in its triangles' cache and
+    /// writes no record of its own: the driver reported it found there on ANV (Iris Xe), RADV
+    /// (RX 7900 XTX, Radeon 780M) and NVIDIA (RTX 3090, RTX 5080 Laptop)
+    /// (`runtime_lane::pipeline_records`).
+    fn record_parts(
+        &self,
+        objects: &VariantObjects,
+        pipeline: &RenderPipeline,
+        key: &GraphicsKey,
+    ) -> PartRecords {
+        PartRecords {
+            pre_rasterization: self.part_named(
+                Part::PreRasterization,
+                objects,
+                pipeline,
+                key,
+                Naming::Record,
+            ),
+            fragment_shader: self.part_named(
+                Part::FragmentShader,
+                objects,
+                pipeline,
+                key,
+                Naming::Record,
+            ),
+        }
+    }
+
+    /// What names the record of a whole making of `pipeline` (the variant's compiled pipeline)
+    /// for `key` (`shader_cache/driver.rs`), its parts' records `parts`
+    /// ([`record_parts`](Self::record_parts)): everything that reaches the driver's conversion of
+    /// one of its stages, and nothing else.
+    ///
+    /// That is the records of the two parts that hold shaders, with the vertex input, which
+    /// reaches MoltenVK's conversion configuration as its vertex stage's inputs, and whether the
+    /// pipeline rasterizes points ([`renders_points`], the one way the topology reaches that
+    /// configuration).
     ///
     /// So a state's sweep over blend factors, write masks, the logic operation, the fragment
-    /// output interface or the topology's class but points is one record and one cache: on
-    /// MoltenVK a cache per blend state converted every stage of every making, 64 over 32 states
-    /// of one vertex-and-fragment pair where one shared cache converts 2
-    /// (`shader_cache/driver.rs`). Each part's name still holds its part's own fixed-function
+    /// output interface, its attachments' formats or the topology's class but points is one
+    /// record and one cache: on MoltenVK a cache per blend state converted every stage of every
+    /// making, 64 over 32 states of one vertex-and-fragment pair where one shared cache converts
+    /// 2 (`shader_cache/driver.rs`). Each part's name still holds its part's own fixed-function
     /// state, cull mode and front face among it, which reaches no conversion either, so such a
     /// sweep keeps records apart where it need not: that costs a conversion, never a wrong
     /// pipeline, since the driver keys each pipeline by everything its creation reads.
@@ -654,16 +756,12 @@ impl GraphicsContent {
         objects: &VariantObjects,
         pipeline: &RenderPipeline,
         key: &GraphicsKey,
+        parts: &PartRecords,
     ) -> Making {
-        // Its two parts that hold shaders, and not the two it would throw away
-        // ([`part_named`](Self::part_named)).
-        let pre_rasterization =
-            self.part_named(Part::PreRasterization, objects, pipeline, key, None);
-        let fragment = self.part_named(Part::FragmentShader, objects, pipeline, key, None);
         objects
             .making("graphics")
-            .digest(&pre_rasterization)
-            .digest(&fragment)
+            .digest(&parts.pre_rasterization)
+            .digest(&parts.fragment_shader)
             .text(&(&pipeline.vertex_input, renders_points(key.topology)))
     }
 
@@ -753,7 +851,7 @@ impl GraphicsContent {
             .cull_mode(self.cull_mode)
             .front_face(self.front_face)
             .depth_bias_enable(self.depth_bias)
-            .line_width(1.0);
+            .line_width(self.line_width);
         if self.depth_clip.is_some() {
             raster = raster.push_next(&mut depth_clip);
         }
@@ -772,12 +870,14 @@ impl GraphicsContent {
         // takes the rectangle's own fill rule at the ends, so a line's first and last pixels and
         // every boundary pixel differ from Metal's (measured on llvmpipe and on an RTX 5080,
         // which both set it; MoltenVK does not, and its lines are Metal's own). Bresenham's mode
-        // is Metal's rule, and every device profile this tree holds offers it.
+        // is Metal's rule, and every device profile this tree holds offers it. A wider line is
+        // the device's own (`render/line_width.rs`), in Vulkan's default mode.
         let mut line = vk::PipelineRasterizationLineStateCreateInfoEXT::default()
             .line_rasterization_mode(vk::LineRasterizationModeEXT::BRESENHAM);
         let multisample_allows_bresenham =
             !self.alpha_to_coverage && !self.alpha_to_one && !self.sample_shading;
         if self.bresenham_lines
+            && self.line_width == 1.0
             && multisample_allows_bresenham
             && rasterizes_lines(self.topology, self.polygon_mode)
         {
@@ -850,7 +950,7 @@ impl GraphicsContent {
             // "The feedback loop attachment is a color attachment, and the bound pipeline was
             // created with VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT" (the Render
             // Pass chapter, feedback loops). The device enabled `attachmentFeedbackLoopLayout`
-            // wherever a draw asks for the variant (`render/snapshot.rs`).
+            // wherever a draw asks for the variant or reads in place (`render/snapshot.rs`).
             flags: match self.feedback_loop {
                 true => vk::PipelineCreateFlags::COLOR_ATTACHMENT_FEEDBACK_LOOP_EXT,
                 false => vk::PipelineCreateFlags::empty(),
@@ -912,6 +1012,25 @@ pub(crate) fn color_write_masks(
 }
 
 impl VariantObjects {
+    /// The SPIR-V words of the stages `part`'s library compiles (`compile_memory.rs`): the
+    /// fragment stage's for the fragment shader part, the others' for the pre-rasterization part.
+    fn part_words(&self, part: Part) -> usize {
+        let fragment = |stage: &&StageObject| stage.stage == vk::ShaderStageFlags::FRAGMENT;
+        match part {
+            Part::FragmentShader => self
+                .stages
+                .iter()
+                .filter(fragment)
+                .map(StageObject::words)
+                .sum(),
+            Part::PreRasterization => (self.stages.iter())
+                .filter(|stage| !fragment(stage))
+                .map(StageObject::words)
+                .sum(),
+            Part::VertexInput | Part::FragmentOutput => 0,
+        }
+    }
+
     /// The state of `pipeline`'s (the variant's compiled pipeline) `VkPipeline` for `key`
     /// ([`GraphicsContent`]): everything its making takes beside the variant's modules, layout
     /// and pass.
@@ -995,9 +1114,15 @@ impl VariantObjects {
             })
             .collect();
         // Metal biases triangles only: the bias is enabled by the topology, and its factors are
-        // dynamic state (`metal::state::depth_bias`).
+        // dynamic state (`metal::state::depth_bias`). A band's patches are lines, or triangles
+        // whose edges Metal biases.
+        let biased = match graphics.line_band.map(|band| band.primitive) {
+            Some(BandPrimitive::Lines) => metal2vulkan::vk::PrimitiveTopology::LINE_LIST,
+            Some(BandPrimitive::Triangles) => metal2vulkan::vk::PrimitiveTopology::TRIANGLE_LIST,
+            None => key.topology,
+        };
         let bias = metal2vulkan::metal::state::depth_bias(
-            key.topology,
+            biased,
             0.0,
             0.0,
             0.0,
@@ -1038,14 +1163,18 @@ impl VariantObjects {
                 })
                 .collect();
         // In a pass whose draws fetch through input attachments every pipeline orders its color
-        // attachment accesses by rasterization (`framebuffer_fetch.rs`), so a fetch reads what an
-        // earlier fragment of any pipeline wrote.
+        // attachment accesses by rasterization where the device has that access
+        // (`framebuffer_fetch.rs`), so a fetch reads what an earlier fragment of any pipeline
+        // wrote; without it the pass orders its draws by barriers alone.
         if graphics.rasterization_order_attachment_access && !key.pass.fetch_inputs {
             return Err(internal(
                 "a pipeline fetching in rasterization order outside a pass that does",
             ));
         }
-        let blend_flags = match key.pass.fetch_inputs {
+        let raster_order = crate::framebuffer_fetch::inputs_in_raster_order(
+            self.device.compile_device().profile(),
+        );
+        let blend_flags = match key.pass.fetch_inputs && raster_order {
             true => {
                 vk::PipelineColorBlendStateCreateFlags::RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXT
             }
@@ -1077,6 +1206,7 @@ impl VariantObjects {
                 .enabled()
                 .features
                 .contains(&metal2vulkan::device::VkFeature::BresenhamLines),
+            line_width: f32::from_bits(key.fixed.line_width),
             cull_mode: key.fixed.cull_mode.into(),
             front_face: key.fixed.front_face.into(),
             depth_bias: bias.enable,
@@ -1101,12 +1231,23 @@ impl VariantObjects {
             blends,
             blend_flags,
             logic_op: graphics.logic_op.map(Into::into),
-            patch_control_points: graphics.tessellation.map(|t| t.patch_control_points),
+            // A band's patches are each primitive's vertices.
+            patch_control_points: match graphics.line_band {
+                Some(band) => Some(band.primitive.patch_control_points()),
+                None => graphics.tessellation.map(|t| t.patch_control_points),
+            },
             meshes: pipeline
                 .stages
                 .iter()
                 .any(|stage| stage.stage == metal2vulkan::vk::ShaderStage::MESH_EXT),
-            feedback_loop: graphics.snapshot_reads,
+            feedback_loop: graphics.snapshot_reads || key.feedback_loop,
+            unlinked_interlock: (self.device.properties().driver_defects)
+                .contains(&RuntimeDriverDefect::FastLinkedInterlocksUnordered)
+                && pipeline.stages.iter().any(|stage| {
+                    let flags: vk::ShaderStageFlags = stage.stage.into();
+                    flags == vk::ShaderStageFlags::FRAGMENT
+                        && interlocked_writes::facts(&stage.spirv).interlocks
+                }),
         })
     }
 
@@ -1141,11 +1282,11 @@ impl VariantObjects {
         let mut stages = [vk::PipelineCreationFeedback::default(); REPORTED_STAGES];
         let mut reported_stages = 0;
         let driver_reports = shared.shader_cache.driver_reports() && libraries.is_none();
-        // Its record is named by what reaches the driver's conversion of one of its stages
-        // (`GraphicsContent::record`), so a sweep over blend state or the fragment output
-        // interface is one record and one cache.
+        // Its records are named by what reaches the driver's conversion of one of its stages
+        // (`GraphicsContent::record_parts`), so a sweep over blend state, the fragment output
+        // interface or the attachments' formats is one record and one cache.
         let named = split.then(std::time::Instant::now);
-        let making = content.record(self, pipeline, key);
+        let parts = content.record_parts(self, pipeline, key);
         if let Some(at) = named {
             creation_log::note(|| "record".to_owned(), at.elapsed());
         }
@@ -1176,16 +1317,24 @@ impl VariantObjects {
         if let Some(at) = awaited {
             creation_log::note(|| "turn".to_owned(), at.elapsed());
         }
+        // A large pipeline's words of the process's limit, waited for without the turn
+        // (`compile_memory.rs`); a linked one's libraries hold their own as each is made.
+        let words = match libraries {
+            None => shared.compile_memory(self.stages.iter().map(StageObject::words).sum()),
+            Some(_) => None,
+        };
         let started = std::time::Instant::now();
         let (created, withheld) = crate::driver_facts::expecting(expected, || {
             content.with_infos(self, render_pass.raw, |infos| match libraries {
                 Some(libraries) => {
                     let names = content.names(self, pipeline, key);
-                    let linked = claimed.unwrap_or_else(|| libraries.claim(shared, &names));
-                    self.linked(infos, &names, linked)
-                        .map(|(raw, linked)| (raw, Some(linked)))
+                    let linked = claimed
+                        .unwrap_or_else(|| libraries.claim(shared, &names, self.shared_layout()));
+                    self.linked(infos, &parts, linked)
+                        .map(|(raw, linked, made)| (raw, Some(linked), made))
                 }
                 None => {
+                    let making = content.record(self, pipeline, key, &parts);
                     let info = infos.whole();
                     let count = info.stage_count as usize;
                     reported_stages = if count <= REPORTED_STAGES { count } else { 0 };
@@ -1218,29 +1367,40 @@ impl VariantObjects {
                         let record = creation_log::record_text(creation_log::take_record());
                         creation_log::note(|| format!("pipeline (made{record})"), at.elapsed());
                     }
-                    made.map_err(|(_, error)| vulkan(error))
+                    made.ok_or(Error::from(DeadlockCause::Exiting))
+                        .and_then(|made| made.map_err(|(_, error)| vulkan(error)))
                         .and_then(|created| {
                             created
                                 .first()
                                 .copied()
                                 .ok_or_else(|| internal("the driver made no pipeline"))
                         })
-                        .map(|raw| (raw, None))
+                        .map(|raw| (raw, None, true))
                 }
             })
         });
         shared.counts.driver_diagnostics_withheld(withheld);
-        let (raw, linked) = created?;
+        let (raw, linked, made_here) = created?;
         let created_in = started.elapsed();
+        drop(words);
         let kept_at = split.then(std::time::Instant::now);
-        if content.blend_flags.contains(
-            vk::PipelineColorBlendStateCreateFlags::RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXT,
-        ) {
-            shared.name_pipeline(raw, RASTER_ORDER_PIPELINE);
-        }
         drop(leader);
         drop(turn);
-        shared.counts.variant_pipeline_made();
+        // A linked pipeline another variant of the same link made is that variant's making: named
+        // and counted there, and taken here with no driver call.
+        match made_here {
+            true => {
+                let raster_order = content.blend_flags.contains(
+                    vk::PipelineColorBlendStateCreateFlags::RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXT,
+                );
+                shared.name_pipeline(raw, || match raster_order {
+                    true => RASTER_ORDER_PIPELINE.to_owned(),
+                    false => self.pipeline_name(None),
+                });
+                shared.counts.variant_pipeline_made();
+            }
+            false => shared.counts.linked_pipeline_shared(),
+        }
         if driver_reports {
             shared
                 .shader_cache
@@ -1251,6 +1411,7 @@ impl VariantObjects {
             raw,
             created_in,
             keep: None,
+            doomed: AtomicBool::new(false),
             unannounced: AtomicBool::new(matches!(notices, Notices::FirstDraw)),
             linked,
         }
@@ -1269,22 +1430,46 @@ impl VariantObjects {
         Ok(made)
     }
 
-    /// The pipeline of `infos` linked, without link-time optimization, from `linked`, the
-    /// libraries of its parts named `names`: each made here where no caller made it or is
-    /// making it, through the device's shader cache under its name, else waited for.
+    /// The pipeline of `infos` linked, without link-time optimization, from `linked`'s libraries,
+    /// with whether it was linked here: the device's linked
+    /// pipeline of that link (`libraries.rs`), linked here where no caller linked it or is
+    /// linking it, else the one another variant of the same link linked, waited for. Linking it
+    /// makes each library where no caller made it or is making it, a library of shaders through
+    /// the device's shader cache under its part's record in `records`, else waits for it.
     fn linked(
         &self,
         infos: &Infos<'_>,
-        names: &[Hash256; 4],
+        records: &PartRecords,
         linked: Linked,
-    ) -> Result<(vk::Pipeline, Linked), Error> {
+    ) -> Result<(vk::Pipeline, Linked, bool), Error> {
+        let split = creation_log::splitting();
+        let asked = split.then(std::time::Instant::now);
+        let mut made = false;
+        let raw = linked.pipeline().made(|| {
+            made = true;
+            self.link(infos, records, &linked)
+        })?;
+        if let (false, Some(at)) = (made, asked) {
+            creation_log::note(|| "link (another caller's)".to_owned(), at.elapsed());
+        }
+        Ok((raw, linked, made))
+    }
+
+    /// Link the pipeline of `infos` from `linked`'s libraries, those of shaders made under their
+    /// parts' records `records`, as [`linked`](Self::linked) says.
+    fn link(
+        &self,
+        infos: &Infos<'_>,
+        records: &PartRecords,
+        linked: &Linked,
+    ) -> Result<vk::Pipeline, Error> {
         let shared = self.device.shared();
         let split = creation_log::splitting();
         let mut raws = [vk::Pipeline::null(); 4];
-        for ((part, library), (raw, name)) in Part::ALL
+        for ((part, library), raw) in Part::ALL
             .into_iter()
-            .zip(&linked.0)
-            .zip(raws.iter_mut().zip(names))
+            .zip(linked.parts())
+            .zip(raws.iter_mut())
         {
             // The creation log's split: how long the part took, and whether this making made it.
             let asked = split.then(std::time::Instant::now);
@@ -1293,31 +1478,41 @@ impl VariantObjects {
                 let mut flag =
                     vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(part.flag());
                 let info = infos.part(part, &mut flag);
-                let create = |cache| {
-                    // SAFETY: every pointer in `info` outlives the call; the pipeline cache is
-                    // the making's own, destroyed once the call returned, or none.
-                    unsafe { shared.vk().create_graphics_pipelines(cache, &[info], None) }
-                };
-                // A part with shaders is made through the device's shader cache, under a record
-                // of its own; one without holds nothing a record would keep.
-                let made = match part.holds_shaders() {
-                    true => {
+                // A part with shaders is made through the device's shader cache, under its
+                // part's record (`GraphicsContent::record_parts`), with what its driver reports
+                // of it; one without holds nothing a record would keep.
+                let made = match records.of(part) {
+                    Some(record) => {
                         let _ = creation_log::take_record();
-                        let made =
-                            shared.make_pipelines(Making::new(part.kind()).digest(name), create);
+                        // Its own stages' words (`compile_memory.rs`).
+                        let _words = shared.compile_memory(self.part_words(part));
+                        let made = shared.make_graphics_pipeline(
+                            Making::new(part.kind()).digest(record),
+                            || self.pipeline_name(Some(part.kind())),
+                            info,
+                        );
                         made_here = Some(creation_log::take_record());
+                        made?
+                    }
+                    None => {
+                        made_here = Some(None);
+                        // SAFETY: every pointer in `info` outlives the call.
+                        let made = unsafe {
+                            shared.vk().create_graphics_pipelines(
+                                vk::PipelineCache::null(),
+                                &[info],
+                                None,
+                            )
+                        };
+                        let made = made.map_err(|(_, error)| vulkan(error))?;
+                        let made = (made.first().copied())
+                            .ok_or_else(|| internal("the driver made no pipeline library"))?;
+                        shared.name_pipeline(made, || self.pipeline_name(Some(part.kind())));
                         made
                     }
-                    false => {
-                        made_here = Some(None);
-                        create(vk::PipelineCache::null())
-                    }
                 };
-                let made = made.map_err(|(_, error)| vulkan(error))?;
                 shared.counts.pipeline_library_made(part);
-                made.first()
-                    .copied()
-                    .ok_or_else(|| internal("the driver made no pipeline library"))
+                Ok(made)
             })?;
             if let Some(at) = asked {
                 let how = match made_here {
@@ -1328,13 +1523,14 @@ impl VariantObjects {
             }
         }
         let mut libraries = vk::PipelineLibraryCreateInfoKHR::default().libraries(&raws);
+        // The link's layout, which its key names: the variant's own (`infos.layout`).
         let info = vk::GraphicsPipelineCreateInfo::default()
-            .layout(infos.layout)
+            .layout(linked.layout())
             .push_next(&mut libraries);
         let linking = split.then(std::time::Instant::now);
-        // SAFETY: every pointer in `info` outlives the call, and each library it links is made
-        // and held by `linked` for as long as the pipeline lives. A driver's making, which the exit
-        // waits for longer on a pool's thread.
+        // SAFETY: every pointer in `info` outlives the call, and each library it links and the
+        // layout it is linked with are made and held by `linked`'s link for as long as the
+        // pipeline lives. A driver's making, which the exit waits for longer on a pool's thread.
         let created = crate::exit_guard::driver_making(|| unsafe {
             shared
                 .vk()
@@ -1343,13 +1539,14 @@ impl VariantObjects {
         if let Some(at) = linking {
             creation_log::note(|| "link".to_owned(), at.elapsed());
         }
-        let created = created.map_err(|(_, error)| vulkan(error))?;
+        let created = created
+            .ok_or(DeadlockCause::Exiting)?
+            .map_err(|(_, error)| vulkan(error))?;
         shared.counts.pipeline_linked();
-        let raw = created
+        created
             .first()
             .copied()
-            .ok_or_else(|| internal("the driver linked no pipeline"))?;
-        Ok((raw, linked))
+            .ok_or_else(|| internal("the driver linked no pipeline"))
     }
 }
 
@@ -1378,6 +1575,7 @@ mod tests {
             depth_range: None,
             masks_color: false,
             provoking_last: false,
+            line_width: 1.0_f32.to_bits(),
         }
     }
 

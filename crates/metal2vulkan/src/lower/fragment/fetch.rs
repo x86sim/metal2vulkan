@@ -2,12 +2,14 @@
 //!
 //! **Where.** Metal orders a fetch after every earlier fragment of the pixel, across draws.
 //! Vulkan orders an input-attachment read so only under rasterization-order attachment access
-//! (`color`). A device without that access but with `fragmentShaderPixelInterlock`
+//! (`color`; a device with neither form reads the input attachment ordered between draws alone,
+//! [`fetch_unordered`]). A device without that access but with `fragmentShaderPixelInterlock`
 //! ([`interlock_orders`]: RADV, ANV, and MoltenVK where measured) orders a fetch instead through
 //! the ordered pixel interlock, the mechanism of raster order groups and imageblocks: each color
 //! attachment the function reads becomes a storage image of the attachment
-//! (`ResourceKind::TileAttachment(n)`), read at the fragment's pixel (the integer part of
-//! `FragCoord.xy`) at each use, and, when the function writes that attachment through its first
+//! (`ResourceKind::TileAttachment(n)`), read once at the fragment's pixel (the integer part of
+//! `FragCoord.xy`) before the body, the texel every use takes, and, when the function writes that
+//! attachment through its first
 //! (index 0) output, written there at the return in place of the output
 //! (`GraphicsState::storage_attachments`; colors it writes but does not read stay ordinary outputs,
 //! but those the pipeline's state names: an extended-range attachment it blends, below, and a color
@@ -69,7 +71,11 @@
 //!   to Metal's `(0, 0, 0, r)` and every one written to it holding Metal's alpha in red
 //!   ([`metal_order`], [`image_order`]), so a read, a merge of the channels a write mask keeps
 //!   (in Metal's channels, of which only alpha is stored) and the per-sample forms are Metal's
-//!   (probe `a8`'s uses on an M3 Max under macOS 27.0.1); an
+//!   (probe `a8`'s uses on an M3 Max under macOS 27.0.1); an `ARGB8Unorm` attachment through its
+//!   `R8G8B8A8_UNORM` image, whose red, green, blue and alpha hold Metal's alpha, red, green and
+//!   blue (`StorageView::rotated`), every texel read from it rotated into Metal's order and every
+//!   one written to it out of it ([`metal_order`], [`image_order`]), blended as `RGBA8Unorm`
+//!   (below; Metal stores the format as `RGBA8Unorm` with its channels rotated); an
 //!   8-bit sRGB format the device renders (`R8Unorm_sRGB`, `RG8Unorm_sRGB`, `RGBA8Unorm_sRGB`,
 //!   `BGRA8Unorm_sRGB`) through a view of the attachment in the unsigned integer format of its
 //!   texel (`R8_UINT`, `R16_UINT`, `R32_UINT`; `StorageView::uint_view`), whose bytes the function
@@ -165,14 +171,23 @@
 //! channel with blending disabled stores the
 //! texel Metal's unblended write stores, a `float` output rounded to `half` and encoded as a
 //! kernel's write (`stage_io::extended_color::texel`). An unblended write that stores some of its
-//! channels is not built; one whose mask covers none of them stores nothing, as above.
+//! channels encodes them so and keeps the others' codes from the texel it reads first
+//! (`extended_range::encode_keeping`), as Metal keeps a masked channel's code: the form a mask of
+//! some of the codes one word holds takes (`BGR10_XR`'s, the two-plane forms' color word,
+//! `color_writes::merged_extended`), which no mask of the raw components gives. One whose mask
+//! covers none of them stores nothing, as above. A bfloat attachment's unblended write stores the
+//! code Metal's render pass stores, as its color attachment's write does
+//! (`stage_io::extended_color::bfloat_output`), and keeps the code of each channel a mask leaves
+//! out, a component of its own; its blend is Metal's pipeline error, and a fetch of it is refused.
 //!
 //! **The `half` shadow**: Metal's tile memory holds such an attachment as `half` through a render
 //! pass and rounds it to the codes only at the store, so a blend or a fetch onto what an earlier
 //! draw of the pass wrote sees that draw's `half`, not its codes. A function compiled for an
-//! instance that holds the attachment's shadow (`LoweringInputs::extended_shadows`, one sample)
-//! declares a second storage image of the attachment's extent in `Rgba16f`
-//! (`ResourceKind::ExtendedShadow`), each texel what the tile holds. A read takes Metal's read of
+//! instance that holds the attachment's shadow (`LoweringInputs::extended_shadows`) declares a
+//! second storage image of the attachment's extent in `Rgba16f` (`ResourceKind::ExtendedShadow`),
+//! each texel what the tile holds, holding the samples as the attachment's storage image holds
+//! them (one; multisampled, read and written at the invocation's `SampleId`; or planes, one layer
+//! per sample), so a per-sample function reads and writes its own sample's. A read takes Metal's read of
 //! the shadow's texel (`extended_range::tile_read`: the color lanes clamped to the blend's source
 //! range, alpha to `[0, 1]`, a NaN to the low end, `BGR10_XR`'s alpha 1), a blend reads its
 //! destination so, and every write stores the value it computed, unclamped, the blend's result or
@@ -181,8 +196,10 @@
 //! read clamps); channels a write mask keeps stay as the shadow and the codes held them. Every
 //! value the shadow holds is a `half`, so the device's conversions both ways are exact, and the
 //! codes always hold the encode of the last `half` written to each channel. A shadowed attachment
-//! the storage form does not take, or of a padded or bfloat form, or of more than one sample, is
-//! refused whatever the policy (the runtime keeps such a draw off the shadow).
+//! the storage form does not take, or of a padded or bfloat form, is refused whatever the policy
+//! (the runtime keeps such a draw off the shadow). On a device that orders fetch through
+//! rasterization-order input attachments the attachment keeps its input attachment, and the
+//! function reads and writes the shadow beside it inside the interlock (`input_shadow`).
 //!
 //! **A 16-bit float attachment's blend** (`R16Float`, `RG16Float`, `RGBA16Float`): no Vulkan blend
 //! applies to a storage write, so the shader computes Metal's: the write reads the texel at the pixel inside the interlock, blends the function's `half`
@@ -233,7 +250,8 @@
 //! storage form (`VariantKey::interlocked_colors`) and its blend is exact; elsewhere the variant
 //! is refused and the render pass splits around the draw, whose blend is the device's.
 //!
-//! **An 8-bit unorm attachment's blend** (`R8Unorm`, `RG8Unorm`, `RGBA8Unorm`, `BGRA8Unorm`) of a
+//! **An 8-bit unorm attachment's blend** (`R8Unorm`, `RG8Unorm`, `RGBA8Unorm`, `BGRA8Unorm`, and
+//! `ARGB8Unorm` as `RGBA8Unorm` in Metal's channel order) of a
 //! `half4` or `float4` output the shader computes as Metal does ([`unorm8_blended`]): the write
 //! reads the texel at the pixel inside the interlock in Metal's channel order, clamps the output to
 //! `[0, 1]` (a NaN to 0), reads each code `c` as `h(c / 255)` (`f(c / 255)` for a `float4` output)
@@ -253,7 +271,12 @@
 //! value), so the blend is Metal's wherever the module states its math (`HalfOutputPrecision` for
 //! one naming none). A format without alpha's fast-math lerp, common factor or contracted pair
 //! (Metal sums those in forms of their own) and an output of fewer lanes take the generic blend
-//! (below), as do a factor of the second source and a second (index 1) output.
+//! (below), as do a factor of the second source and a second (index 1) output. An `ARGB8Unorm`
+//! attachment whose blend no Vulkan state on its image gives (`color_writes::shader_rotated_blend`)
+//! takes this form whether or not the function reads it, as the device blends it in no other: the
+//! pipeline's state names it (`LoweringInputs::framebuffer_fetch`): Metal's blend where the module
+//! states its math, else the same arithmetic, noted as a module stating none is
+//! (`output_precision::half_output_note`).
 //!
 //! **A 32-bit float attachment's blend** (`R32Float`, `RG32Float`, `RGBA32Float`) takes the generic
 //! blend below where the function reads the attachment. Every device the translation targets blends
@@ -297,8 +320,8 @@ use crate::device::profile::DriverWorkaround;
 use crate::device::requirements::{FormatUsage, VkFeature};
 use crate::device::DeviceProfile;
 use crate::error::{
-    Attachment, Capability, DescriptorError, Error, ExtendedRangeBlend, Feature, RuntimeInput,
-    Unsupported,
+    Attachment, Capability, DescriptorError, Error, ExtendedRangeBlend, Feature, MetalAnswer,
+    RuntimeInput, Unsupported,
 };
 use crate::lower::arith::{extended_range, narrow, ops, pack, FloatFmt, Form, Held};
 use crate::lower::emit::EmitCx;
@@ -313,7 +336,9 @@ use crate::metal::format::{
 use crate::metal::ColorWriteMask;
 use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::facts::RuntimeFact;
-use crate::pipeline::lower_inputs::{BlendEquation, FetchedAttachment, FramebufferFetchInputs};
+use crate::pipeline::lower_inputs::{
+    BlendEquation, ExtendedRangeColor, FetchedAttachment, FramebufferFetchInputs,
+};
 use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, SampledType, Stage};
 use crate::pipeline::StorageAttachmentUse;
 use crate::spirv::builder::constructs::{ArmEnd, ArmFn};
@@ -341,6 +366,35 @@ pub(crate) fn inputs_order(p: &DeviceProfile) -> bool {
     p.fields().fragment.rasterization_order_color_access
 }
 
+/// Whether `p` orders framebuffer fetch in neither form: no rasterization-order color attachment
+/// access and no `fragmentShaderPixelInterlock`. A fetch there reads the input attachment, which
+/// the consumer's barrier of the subpass's dependency on itself orders after the earlier draws'
+/// writes but not after an overlapping earlier fragment of the same draw
+/// (`PrecisionNote::UnorderedFetchWithinDraw`, `color`); a blend or a merge the function computes
+/// over its own read ([`unordered_extended_fetch`]) is refused.
+pub(crate) fn fetch_unordered(p: &DeviceProfile) -> bool {
+    !interlock_orders(p) && !inputs_order(p)
+}
+
+/// The refusal of a blend into an extended-range attachment, or of a write of some of the codes
+/// one of its words holds (`color_writes::merged_extended`), on a device that orders framebuffer
+/// fetch in neither form ([`fetch_unordered`]): the function computes the blend, or merges the
+/// codes, over its own read of the attachment's codes, which no device's blend unit or write mask
+/// does, and that read must be ordered after every earlier fragment's write of the pixel, through
+/// the pixel interlock (the storage form) or rasterization-order color attachment access (over the
+/// input attachment).
+pub(crate) fn unordered_extended_fetch() -> Unsupported {
+    Unsupported::needs_any_of(
+        Feature::FramebufferFetch,
+        vec![
+            vec![Capability::Feature(VkFeature::FragmentShaderPixelInterlock)],
+            vec![Capability::Feature(
+                VkFeature::RasterizationOrderColorAttachmentAccess,
+            )],
+        ],
+    )
+}
+
 /// Whether `pf` is a 16-bit float color format, whose blend of a `half` output of a module
 /// without fast math Metal computes in `half` arithmetic, and of one with fast math in the fast
 /// forms it folds into the function ([`extended_range::blend::BlendMath`]).
@@ -349,11 +403,16 @@ pub(crate) fn half_float_format(pf: crate::metal::PixelFormat) -> bool {
     matches!(pf, P::R16Float | P::RG16Float | P::RGBA16Float)
 }
 
-/// Whether `pf` is an 8-bit unorm color format held directly, whose blend Metal computes in the
-/// arithmetic of the output's type over the clamped output ([`extended_range::Blend::unorm8`]).
+/// Whether `pf` is an 8-bit unorm color format, whose blend Metal computes in the arithmetic of
+/// the output's type over the clamped output ([`extended_range::Blend::unorm8`]): one held
+/// directly, or `ARGB8Unorm`, which Metal blends as `RGBA8Unorm` with its channels rotated and
+/// whose image the function reads and writes in Metal's order ([`StorageView::rotated`]).
 pub(crate) fn unorm8_format(pf: crate::metal::PixelFormat) -> bool {
     use crate::metal::PixelFormat as P;
-    matches!(pf, P::R8Unorm | P::RG8Unorm | P::RGBA8Unorm | P::BGRA8Unorm)
+    matches!(
+        pf,
+        P::R8Unorm | P::RG8Unorm | P::RGBA8Unorm | P::BGRA8Unorm | P::ARGB8Unorm
+    )
 }
 
 /// Whether `pf` is an 8-bit sRGB color format, whose blend Metal computes as its unorm twin's over
@@ -673,6 +732,9 @@ pub(crate) struct ColorUse {
     /// The function's math, which picks the extended-range blends Metal's model holds
     /// (`extended_range::blend::BlendMath`).
     pub math: extended_range::blend::BlendMath,
+    /// The pipeline's private logic operation the function computes over the codes of the
+    /// attachments it writes (`LoweringInputs::logic_operation`, `logic`).
+    pub logic_op: Option<vk::LogicOp>,
 }
 
 /// How the storage form's image holds the attachment's samples.
@@ -751,6 +813,15 @@ pub struct StorageView {
     /// `R8_UNORM`'s, a texel read from the image, `(r, 0, 0, 1)`, is Metal's `(0, 0, 0, r)`, and a
     /// texel written to it holds Metal's alpha in red ([`metal_order`], [`image_order`]).
     pub alpha_in_red: bool,
+    /// The attachment's image holds Metal's channels rotated (`ARGB8Unorm` in `R8G8B8A8_UNORM`,
+    /// `metal::format::FormatEmulation::RotatedView`): its red, green, blue and alpha are Metal's
+    /// alpha, red, green and blue, so a texel read from the image is rotated into Metal's order and
+    /// one written to it out of it ([`metal_order`], [`image_order`]).
+    pub rotated: bool,
+    /// The pipeline's private logic operation a write computes over the codes of the texel it
+    /// reads first (`logic::operated`), of an attachment whose channels it serves
+    /// (`logic::channels`). `None` for no write, and for every other attachment.
+    pub logic_op: Option<vk::LogicOp>,
 }
 
 impl StorageView {
@@ -936,6 +1007,7 @@ pub(crate) fn storage_form(
             .flatten()
             .ok_or(Error::InvalidDescriptor(DescriptorError::ColorAttachment {
                 index: color,
+                metal: MetalAnswer::NilWithError,
             }))?;
     let pf = attachment.pixel_format;
     // A packed 16-bit attachment the device samples but does not render renders through a view of
@@ -990,15 +1062,22 @@ pub(crate) fn storage_form(
     // form gates its write on that bit, and a write at one sample on bit 0. A kept channel of a
     // signed normalized format beside a written one is not modelled either: its two codes of -1
     // read alike, so writing back what was read would not keep the texel's bits. A write that
-    // stores some of an extended-range attachment's channels is built unblended where it stores
-    // every one, and under a blend Metal's model covers, which the shader computes: no device
-    // blends the raw texels. A write whose mask covers none of the format's channels stores
+    // stores some of an extended-range attachment's channels is built unblended (the codes of the
+    // channels it keeps merged from the texel), and under a blend Metal's model covers, which the
+    // shader computes: no device blends the raw texels. A write whose mask covers none of the format's channels stores
     // nothing, so nothing a store depends on (the blend, coverage, the sample mask, the depth and
     // stencil tests) bears on it; and a blend of one and zero, added, for color and alpha stores
     // the source as blending disabled does, a signed normalized NaN aside, and a 16-bit float
     // attachment's blend without fast math, which keeps the destination's product by zero (a NaN
     // of an infinite or NaN texel, the sum's zero sign).
     let stores = writes && kept != ColorWriteMask::ALL;
+    // The pipeline's private logic operation, which a write that stores computes over the codes
+    // of an attachment whose channels it serves (`logic`); a float attachment ignores it, as
+    // Metal's does. Metal's operation reads a signed normalized channel's codes through its value
+    // too, so a kept channel written back as it was read is Metal's there.
+    let logic_op = use_
+        .logic_op
+        .filter(|_| stores && super::logic::channels(pf).is_some());
     // The blend of an extended-range attachment the write stores, which the shader computes
     // where Metal's measured model holds it (`extended_range::Blend`), its gap refused by name.
     // And the blend of a 16-bit float attachment, which no Vulkan blend applies to a storage
@@ -1058,7 +1137,7 @@ pub(crate) fn storage_form(
         && word.is_none()
         && !(half_blend || unorm8_blend);
     let blend = attachment.equation.filter(|_| {
-        (extended.is_some_and(|e| !e.padded())
+        (extended.is_some()
             || half_blend
             || unorm8_blend
             || word_blend
@@ -1089,15 +1168,19 @@ pub(crate) fn storage_form(
     let alpha_in_red = emulation == FormatEmulation::AlphaInRed
         && crate::metal::format::alpha_in_red(pf, p)
         && word.is_none();
-    // An unblended write of every channel stores Metal's write of the output. A padded 10-bit
-    // attachment's tile value and blends are not measured: no storage form.
+    // An `ARGB8Unorm` attachment is read and written through its `R8G8B8A8_UNORM` image, the
+    // function rotating Metal's channels into and out of the image's.
+    let rotated = emulation == FormatEmulation::RotatedView;
+    // The logic operation reads the codes of a texel held directly; a word view's, and a write
+    // under alpha to coverage, are refused naming it (`logic`).
+    if logic_op.is_some() && (word.is_some() || inputs.alpha_to_coverage) {
+        let gap = Feature::PrivateRenderState(crate::error::PrivateRenderField::LogicOperation);
+        return Ok(Err(Unsupported::not_implemented(gap)));
+    }
+    // An unblended write of every channel stores Metal's write of the output.
     let not_modelled = inputs.amplified
-        || extended.is_some_and(ExtendedRange::padded)
-        || (emulation != FormatEmulation::Direct && extended.is_none() && !alpha_in_red)
-        || (extended.is_some()
-            && stores
-            && !shader_blends
-            && (attachment.blending_enabled || !kept.is_empty()))
+        || (emulation != FormatEmulation::Direct && extended.is_none() && !alpha_in_red && !rotated)
+        || (extended.is_some() && stores && !shader_blends && attachment.blending_enabled)
         || (srgb && uint_view.is_none())
         // An `RGB9E5Float` word's mantissas share its exponent: no field is kept apart.
         || (word == Some(WordAttachment::Rgb9e5) && stores && merged)
@@ -1107,7 +1190,7 @@ pub(crate) fn storage_form(
                 .contains(ColorWriteMask::UNSPECIALIZED))
         || (stores
             && (blends
-                || (snorm && merged)
+                || (snorm && merged && logic_op.is_none())
                 || inputs.alpha_to_coverage
                 || (inputs.depth_or_stencil && !use_.early_tests && !use_.draw_tested)));
     if not_modelled {
@@ -1199,6 +1282,8 @@ pub(crate) fn storage_form(
             rgba_view,
             word,
             alpha_in_red,
+            rotated,
+            logic_op,
         })),
         _ => {
             // A BGRA-order format no declaration reaches, whose RGBA-order twin lacks something
@@ -1226,9 +1311,11 @@ pub(crate) fn storage_form(
 /// of one sample with no depth or stencil attachment. `Ok` where the device orders fetch through
 /// the pixel interlock alone ([`interlock_orders`]) and that storage form is exact there; `Ok`
 /// where it orders fetch through rasterization-order input attachments and the function's blend
-/// over the attachment's input attachment holds (`input_blend`: a form Metal's model blends, not a
-/// padded or bfloat one, which stays `NotImplemented(Format)` as `stage_io::extended_color` refuses
-/// it); else what blocks it, without either ordering the interlock it needs.
+/// over the attachment's input attachment holds (`input_blend`); else what blocks it, without
+/// either ordering the two it needs one of ([`unordered_extended_fetch`]). A bfloat format, which
+/// Metal blends nowhere (its pipeline validation asserts; link refuses such a blend
+/// `InvalidDescriptor(ColorAttachment)`), answers `NotRepresentable(Format)`, as the runtime's
+/// formats answer what Metal refuses.
 pub(crate) fn extended_range_blend(
     pf: crate::metal::PixelFormat,
     p: &DeviceProfile,
@@ -1237,6 +1324,9 @@ pub(crate) fn extended_range_blend(
     let Some(form) = ExtendedRange::of(pf) else {
         return Err(Unsupported::not_implemented(Feature::Format));
     };
+    if form.bfloat() {
+        return Err(Unsupported::not_representable(Feature::Format));
+    }
     let equation = BlendEquation {
         source_rgb: F::One,
         destination_rgb: F::OneMinusSourceAlpha,
@@ -1246,18 +1336,11 @@ pub(crate) fn extended_range_blend(
         alpha_operation: O::Add,
     };
     if !interlock_orders(p) {
-        let f = p.fields().fragment;
-        if !f.rasterization_order_color_access {
-            return Err(Unsupported::needs(
-                Feature::FramebufferFetch,
-                Capability::Feature(VkFeature::FragmentShaderPixelInterlock),
-            ));
+        if fetch_unordered(p) {
+            return Err(unordered_extended_fetch());
         }
         // The blend over the input attachment: the attachment's raw format a color attachment,
         // and the blend Metal's model's.
-        if form.padded() || form.bfloat() {
-            return Err(Unsupported::not_implemented(Feature::Format));
-        }
         let usages = BTreeSet::from([FormatUsage::ColorAttachment]);
         match crate::metal::format::vk_format(pf, &usages, p) {
             Ok(_) => {}
@@ -1288,6 +1371,7 @@ pub(crate) fn extended_range_blend(
         early_tests: false,
         draw_tested: false,
         math: extended_range::blend::BlendMath::Fast,
+        logic_op: None,
     };
     match storage_form(0, &inputs, false, use_, p) {
         Ok(form) => form.map(drop),
@@ -1365,7 +1449,7 @@ pub(super) fn body_facts(cx: &SelectCx<'_>) -> BodyFacts {
 /// constant index (another index is refused when the parameter is planned). Each such
 /// parameter's type is checked here, so a function no pipeline state would make lowerable is
 /// refused before it needs one.
-fn colors_read(cx: &SelectCx<'_>, used: &BTreeSet<u32>) -> Result<BTreeSet<u32>, Error> {
+pub(super) fn colors_read(cx: &SelectCx<'_>, used: &BTreeSet<u32>) -> Result<BTreeSet<u32>, Error> {
     let mut out = BTreeSet::new();
     for b in cx
         .entry
@@ -1446,10 +1530,11 @@ pub(super) fn plan(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     );
     // A draw may move a color the function writes through its first output into the storage
     // form: a color its render pass instance keeps out of its subpass for other draws'
-    // interlocked form (`VariantKey::interlocked_colors`), or an extended-range color whose `half`
-    // shadow the instance holds (`VariantKey::extended_shadows`), both single-sampled, so no
-    // driver drops their writes under early tests. The plan of the pipeline as compiled, which
-    // stores no color so, selects the tests such a draw's variant needs from this.
+    // interlocked form (`VariantKey::interlocked_colors`, single-sampled), or an extended-range
+    // color whose `half` shadow the instance holds (`VariantKey::extended_shadows`), whose
+    // variant at more than one sample [`storage_form`] refuses where the driver drops its writes
+    // under early tests. The plan of the pipeline as compiled, which stores no color so, selects
+    // the tests such a draw's variant needs from this.
     let movable = stored_before_tests(&body, (declared_early, exports), (true, false));
     if (movable.tested || movable.untested)
         && returns(|r| matches!(r, OutputRole::RenderTarget { index: 0, .. }))
@@ -1459,8 +1544,8 @@ pub(super) fn plan(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         });
     }
     let blended = blended_extended_range(cx)?;
-    // A bfloat attachment's blend has no model (Metal's validation refuses one): no storage form
-    // blends it.
+    // A blend into a bfloat attachment is Metal's pipeline error (its validation asserts that the
+    // format is not blendable), which link refuses whatever the function writes there.
     let bfloat = blended.iter().find(|&&(color, _)| {
         cx.inputs
             .extended_range_colors
@@ -1468,8 +1553,11 @@ pub(super) fn plan(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             .is_some_and(|e| e.form.bfloat())
     });
     if let Some(&(color, _)) = bfloat {
-        let refused = Unsupported::not_implemented(Feature::Format);
-        return Err(refused.at_attachment(Attachment::Color(color)).into());
+        let invalid = DescriptorError::ColorAttachment {
+            index: color,
+            metal: MetalAnswer::EndsProcess,
+        };
+        return Err(Error::InvalidDescriptor(invalid));
     }
     let fetched = colors_read(cx, &body.used)?;
     let mut read = fetched.clone();
@@ -1578,6 +1666,7 @@ pub(super) fn plan(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             early_tests,
             draw_tested: (tested || untested) && !early_tests,
             math: blend_math(cx),
+            logic_op: cx.inputs.logic_operation,
         };
         let tied = |e: Error| e.at_attachment(Attachment::Color(color));
         let form =
@@ -1606,7 +1695,10 @@ pub(super) fn plan(cx: &mut SelectCx<'_>) -> Result<(), Error> {
                 a.blending_enabled && a.equation.is_some_and(|eq| eq.reads_second_source())
             });
         if reads_second && second.is_none() {
-            let invalid = DescriptorError::ColorAttachment { index: color };
+            let invalid = DescriptorError::ColorAttachment {
+                index: color,
+                metal: MetalAnswer::NilWithError,
+            };
             return Err(Error::InvalidDescriptor(invalid));
         }
         let generic_of = |view: StorageView, exact: &mut bool| {
@@ -1685,6 +1777,15 @@ pub(super) fn plan(cx: &mut SelectCx<'_>) -> Result<(), Error> {
                         sixteen_exact = false;
                         Ok((view, None))
                     }
+                    // A blend into an attachment held with its channels rotated
+                    // (`StorageView::rotated`), which no Vulkan state on its image may give
+                    // (`color_writes::shader_rotated_blend`): Metal's 8-bit unorm blend wherever
+                    // the module states its math, else a near-equivalent the function notes,
+                    // taken whether or not the function reads the attachment.
+                    (Some(Ok(_)), Some((_, 4))) if view.rotated => {
+                        sixteen_exact = cx.entry.compile.fast_math.is_some();
+                        Ok((view, None))
+                    }
                     (Some(Ok(b)), Some((_, lanes))) => {
                         let stated = cx.entry.compile.fast_math.is_some();
                         // An output of fewer lanes whose color blend reads the source alpha stores
@@ -1728,18 +1829,15 @@ pub(super) fn plan(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             },
             Err(blocked) => Err(blocked),
         };
-        // The instance's `half` shadow of an extended-range attachment, which holds one sample
-        // per pixel, of a form whose tile memory is measured (not a padded or bfloat one). The
-        // shadow is the attachment's tile value only where every write of it keeps it, so a
-        // shadowed attachment the storage form does not take is refused whatever the policy: an
-        // unordered input attachment would neither read nor write it.
+        // The instance's `half` shadow of an extended-range attachment, held as the
+        // attachment's storage image holds its samples (one, multisampled or planes), of a form
+        // whose shadow is built (not a padded or bfloat one). The shadow is the
+        // attachment's tile value only where every write of it keeps it, so a shadowed attachment
+        // the storage form does not take is refused whatever the policy: an unordered input
+        // attachment would neither read nor write it.
         let shadowed = cx.inputs.extended_shadows.contains(&color);
         let form = match form {
-            Ok((view, _))
-                if shadowed
-                    && (view.extended.is_none_or(|e| e.padded() || e.bfloat())
-                        || view.samples != StorageSamples::One) =>
-            {
+            Ok((view, _)) if shadowed && view.extended.is_none_or(|e| e.padded() || e.bfloat()) => {
                 return Err(tied(not_implemented().into()));
             }
             Err(blocked) if shadowed => return Err(tied(blocked.into())),
@@ -1777,6 +1875,13 @@ pub(super) fn plan(cx: &mut SelectCx<'_>) -> Result<(), Error> {
                         let note = crate::lower::arith::output_precision::half_output_note(cx);
                         cx.precision.insert(note);
                     }
+                }
+                // The logic operation's codes of a normalized output, the device's `float`
+                // product rounded to nearest even, where Metal rounds the exact product (`logic`).
+                let normalized = super::logic::channels(view.pixel_format)
+                    .is_some_and(super::logic::reads_float);
+                if view.logic_op.is_some() && normalized {
+                    cx.precision.insert(PrecisionNote::DeviceColorConversion);
                 }
                 // The channels a partial write mask keeps, as the draw's word.
                 if view.kept_at_draw {
@@ -1915,6 +2020,7 @@ fn class_of(form: Form, numeric: SampledType, color: u32, write: bool) -> Result
     if !ok {
         return Err(Error::InvalidDescriptor(DescriptorError::ColorAttachment {
             index: color,
+            metal: MetalAnswer::NilWithError,
         }));
     }
     if write && numeric == SampledType::Sint && !matches!(form.held, Held::Int { bits: 32, .. }) {
@@ -1940,7 +2046,10 @@ pub(super) fn select_read(cx: &mut SelectCx<'_>, c: ColorInput) -> Result<(), Er
         return Err(refused.at_attachment(Attachment::Color(c.color)).into());
     }
     class_of(c.form, sc.view.read_class(), c.color, false)?;
-    // An extended-range texel converts by the device's arithmetic.
+    // An extended-range or padded 10-bit texel converts by the device's arithmetic, its read the
+    // tile value of its codes ([`value`]). After a clear or an earlier draw of the pass Metal's
+    // tile holds their `half`, which the codes do not keep: the runtime announces
+    // `extended-range-blends-stored-codes` there.
     if let Some(e) = sc.view.extended {
         cx.families.arith.converts(e);
     }
@@ -2029,6 +2138,12 @@ pub fn select_output(
         return Err(cx.invariant("a storage-form output of an attachment of another form"));
     };
     class_of(form, sc.view.read_class(), color, true)?;
+    // The logic operation takes a normalized channel's `float` or `half` output and an integer
+    // channel's 32-bit one (`logic::takes`).
+    let logic = super::logic::channels(sc.view.pixel_format);
+    if sc.view.logic_op.is_some() && !logic.is_some_and(|ch| super::logic::takes(ch, form)) {
+        return Err(super::logic::refused(color));
+    }
     // An extended-range attachment's blend is of a `half4` output, or of a `float4` one where
     // the blend takes it ([`plan`]), and an `_sRGB` one's encodes by the device's `Pow`.
     let output4 = (form.lanes == 4).then(|| form.float_fmt()).flatten();
@@ -2046,6 +2161,12 @@ pub fn select_output(
             return Err(Unsupported::not_implemented(Feature::Format).into());
         }
         cx.families.arith.converts(e);
+        // A bfloat attachment's `float` output rounds to `half` by the pipeline's
+        // `textureWriteRoundingMode` (`bfloat_written`), which link holds the pipeline's to.
+        if e.bfloat() && form.float_fmt() == Some(crate::lower::arith::FloatFmt::F32) {
+            let mode = cx.inputs.texture_write_rounding;
+            cx.families.stage_io.interface.texture_write_rounding = Some(mode);
+        }
     }
     let pf = cx
         .inputs
@@ -2057,6 +2178,7 @@ pub fn select_output(
     if color_output_components(pf).is_some_and(|n| form.lanes < n) {
         return Err(Error::InvalidDescriptor(DescriptorError::ColorAttachment {
             index: color,
+            metal: MetalAnswer::NilWithError,
         }));
     }
     plan_sample(cx)?;
@@ -2100,7 +2222,8 @@ pub fn select_output(
                 .insert(color, rules);
         }
     } else {
-        stage_io::color_write::plan(cx, color, form);
+        let nan_free = stage_io::returns_no_nan(cx, field);
+        stage_io::color_write::plan(cx, color, form, nan_free);
         // An 8-bit unorm blend's result is the storage image's to convert, the device's
         // conversion ([`unorm8_blended`]).
         if sc.view.blend.is_some() && !sc.view.generic_blend && unorm8_format(sc.view.pixel_format)
@@ -2265,6 +2388,12 @@ pub(super) fn words(cx: &SelectCx<'_>, uses: u64, rets: u64) -> u64 {
         .filter_map(|sc| sc.view.word)
         .map(|w| stage_io::word_color::encode_words(w) + 4 * 24 + 40)
         .fold(0u64, u64::saturating_add);
+    // A logic-operated write reads its texel and operates on each channel's codes.
+    let logic = fetch
+        .values()
+        .filter(|sc| sc.view.logic_op.is_some())
+        .count() as u64;
+    let logic_write = READ.saturating_add(super::logic::WRITE_WORDS);
     let write = WRITE
         .saturating_mul(written)
         .saturating_add(READ.saturating_mul(merged))
@@ -2274,6 +2403,7 @@ pub(super) fn words(cx: &SelectCx<'_>, uses: u64, rets: u64) -> u64 {
         .saturating_add(stage_io::extended_color::WORDS.saturating_mul(unblended))
         .saturating_add(srgb_write.saturating_mul(srgb_writes))
         .saturating_add(word_write)
+        .saturating_add(logic_write.saturating_mul(logic))
         .saturating_add((READ + WRITE + 8).saturating_mul(shadowed))
         .saturating_add((2 * EXCHANGE).saturating_mul(exchanged))
         .saturating_add((EXCHANGE + super::color::ALPHA_IN_RED_WORDS).saturating_mul(moved))
@@ -2307,17 +2437,23 @@ pub(super) fn declare(mb: &mut ModuleBuilder, color: u32, sc: &StorageColor) -> 
 }
 
 /// Declare the `half` shadow of extended-range attachment `color` that the draw's render pass
-/// instance holds (`StorageColor::shadowed`): a single-sample 2D `Rgba16f` storage image of
-/// `float` texels (`ResourceKind::ExtendedShadow`), each Metal's tile value of the texel. Every
-/// value it holds is a `half`, so the device's conversions both ways are exact.
-pub(super) fn declare_shadow(mb: &mut ModuleBuilder, color: u32) -> BResult<GlobalId> {
+/// instance holds (`StorageColor::shadowed`): a 2D `Rgba16f` storage image of `float` texels
+/// (`ResourceKind::ExtendedShadow`), each Metal's tile value of the texel, holding the samples as
+/// the attachment's storage image holds them (`samples`: one, a multisampled image of the
+/// pipeline's samples, or planes, one layer per sample). Every value it holds is a `half`, so the
+/// device's conversions both ways are exact.
+pub(super) fn declare_shadow(
+    mb: &mut ModuleBuilder,
+    color: u32,
+    samples: StorageSamples,
+) -> BResult<GlobalId> {
     let sampled_type = mb.ty(SType::Float { width: 32 })?;
     let ty = mb.ty(SType::Image(ImageType {
         sampled_type,
         dim: Dim::D2,
         depth: false,
-        arrayed: false,
-        multisampled: false,
+        arrayed: samples == StorageSamples::Planes,
+        multisampled: samples == StorageSamples::Multisampled,
         usage: ImageUsage::Storage,
         format: crate::spv::ImageFormat::Rgba16f,
     }))?;
@@ -2329,13 +2465,15 @@ pub(super) fn declare_shadow(mb: &mut ModuleBuilder, color: u32) -> BResult<Glob
     mb.resource(slot, StorageClass::UniformConstant, ty)
 }
 
-/// The shadow of attachment `color` and the invocation's pixel, its texel there
-/// ([`declare_shadow`]).
-fn shadow_and_texel(
+/// The shadow of attachment `color`, held as `samples` ([`declare_shadow`]), the texel of the
+/// invocation's sample, and the access's image operands, as [`image_and_texel`] gives the
+/// attachment's own.
+pub(super) fn shadow_and_texel(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
     color: u32,
-) -> BResult<(SValue, SValue)> {
+    samples: StorageSamples,
+) -> BResult<(SValue, SValue, ImageOperands)> {
     let Some(g) = cx
         .decl
         .families
@@ -2348,8 +2486,8 @@ fn shadow_and_texel(
     };
     let p = fb.module().global_value(g)?;
     let image = fb.load(p, MemAccess::default())?;
-    let pixel = pixel(cx, fb)?;
-    Ok((image, pixel))
+    let (at, ops) = sample_texel(cx, fb, samples)?;
+    Ok((image, at, ops))
 }
 
 /// The tile value the shadow of attachment `color`, held in `range`, holds at the invocation's
@@ -2362,9 +2500,13 @@ fn shadow_read(
     color: u32,
     range: ExtendedRange,
 ) -> BResult<SValue> {
-    let (image, at) = shadow_and_texel(cx, fb, color)?;
+    let samples = match cx.plan.families.fragment.fetch.get(&color) {
+        Some(sc) => sc.view.samples,
+        None => return Err(cx.fail(format!("attachment {color} is not in the storage form"))),
+    };
+    let (image, at, ops) = shadow_and_texel(cx, fb, color, samples)?;
     let mem = memory_model::coherence(cx.plan).texel(fb)?;
-    let texel = fb.read(image, at, &ImageOperands::default(), mem)?;
+    let texel = fb.read(image, at, &ops, mem)?;
     extended_range::tile_read(fb, range, texel)
 }
 
@@ -2398,10 +2540,22 @@ fn image_and_texel(
     };
     let p = fb.module().global_value(g)?;
     let image = fb.load(p, MemAccess::default())?;
+    let (at, ops) = sample_texel(cx, fb, samples)?;
+    Ok((image, at, ops))
+}
+
+/// The texel of the invocation's sample in a storage image holding the samples as `samples`, and
+/// the access's image operands: the invocation's [`pixel`] with its [`operands`], or, for planes,
+/// the pixel and the invocation's `SampleId` as the layer.
+fn sample_texel(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    samples: StorageSamples,
+) -> BResult<(SValue, ImageOperands)> {
     let pixel = pixel(cx, fb)?;
     if samples != StorageSamples::Planes {
         let ops = operands(cx, fb)?;
-        return Ok((image, pixel, ops));
+        return Ok((pixel, ops));
     }
     let Some(layer) = sample(cx, fb)? else {
         return Err(cx.fail("a planes access without its SampleId"));
@@ -2414,7 +2568,7 @@ fn image_and_texel(
     let x = fb.composite_extract(pixel, &[0])?;
     let y = fb.composite_extract(pixel, &[1])?;
     let texel = fb.composite_construct(uvec3, &[x, y, layer])?;
-    Ok((image, texel, ImageOperands::default()))
+    Ok((texel, ImageOperands::default()))
 }
 
 /// The texel of storage-form attachment `sc`'s image at the invocation's pixel (and sample) of
@@ -2434,27 +2588,33 @@ fn read_texel(
 }
 
 /// Texel `texel` of storage-form attachment `sc`'s image, in Metal's channel order: an attachment
-/// viewed in its RGBA-order twin ([`StorageView::rgba_view`]) has red and blue exchanged, and one
+/// viewed in its RGBA-order twin ([`StorageView::rgba_view`]) has red and blue exchanged, one
 /// whose image holds Metal's alpha in red ([`StorageView::alpha_in_red`]) reads `(r, 0, 0, 1)` as
-/// Metal's `(0, 0, 0, r)`; any other is as it is. Every texel read from the attachment's image
-/// goes through here ([`read_texel`]), and every one written to it through [`image_order`].
+/// Metal's `(0, 0, 0, r)`, and one holding Metal's channels rotated ([`StorageView::rotated`])
+/// reads Metal's red, green, blue and alpha from the image's green, blue, alpha and red; any other
+/// is as it is. Every texel read from the attachment's image goes through here ([`read_texel`]),
+/// and every one written to it through [`image_order`].
 fn metal_order(fb: &mut FunctionBuilder<'_>, sc: &StorageColor, texel: SValue) -> BResult<SValue> {
-    match (sc.view.rgba_view, sc.view.alpha_in_red) {
-        (Some(_), _) => fb.vector_shuffle(texel, texel, &[2, 1, 0, 3]),
-        (None, true) => super::color::alpha_in_red(fb, texel),
-        (None, false) => Ok(texel),
+    match (sc.view.rgba_view, sc.view.alpha_in_red, sc.view.rotated) {
+        (Some(_), _, _) => fb.vector_shuffle(texel, texel, &[2, 1, 0, 3]),
+        (None, true, _) => super::color::alpha_in_red(fb, texel),
+        (None, false, true) => fb.vector_shuffle(texel, texel, &[1, 2, 3, 0]),
+        (None, false, false) => Ok(texel),
     }
 }
 
 /// Metal-ordered texel `texel` of storage-form attachment `sc`, in its image's channel order:
-/// [`metal_order`]'s exchange of red and blue, which is its own inverse, and for an image holding
-/// Metal's alpha in red, Metal's alpha in every lane (the image keeps its red). Every texel
-/// written to the attachment's image goes through here ([`emit_return`]).
+/// [`metal_order`]'s exchange of red and blue, which is its own inverse, for an image holding
+/// Metal's alpha in red, Metal's alpha in every lane (the image keeps its red), and for one holding
+/// Metal's channels rotated, Metal's alpha, red, green and blue as the image's red, green, blue
+/// and alpha (the inverse of [`metal_order`]'s rotation). Every texel written to the attachment's
+/// image goes through here ([`emit_return`]).
 fn image_order(fb: &mut FunctionBuilder<'_>, sc: &StorageColor, texel: SValue) -> BResult<SValue> {
-    match (sc.view.rgba_view, sc.view.alpha_in_red) {
-        (Some(_), _) => fb.vector_shuffle(texel, texel, &[2, 1, 0, 3]),
-        (None, true) => fb.vector_shuffle(texel, texel, &[3, 3, 3, 3]),
-        (None, false) => Ok(texel),
+    match (sc.view.rgba_view, sc.view.alpha_in_red, sc.view.rotated) {
+        (Some(_), _, _) => fb.vector_shuffle(texel, texel, &[2, 1, 0, 3]),
+        (None, true, _) => fb.vector_shuffle(texel, texel, &[3, 3, 3, 3]),
+        (None, false, true) => fb.vector_shuffle(texel, texel, &[3, 0, 1, 2]),
+        (None, false, false) => Ok(texel),
     }
 }
 
@@ -2518,8 +2678,30 @@ fn as_held(fb: &mut FunctionBuilder<'_>, texel: SValue, numeric: SampledType) ->
     fb.convert(ConvOp::Bitcast, texel, uvec4)
 }
 
-/// The value of storage-form color input `c` in its lowered representation, read at its pixel
-/// (as `color::value` reads an input attachment).
+/// The texel the function reads of storage-form attachment `color` at its pixel (and sample):
+/// its shadow's, where the instance holds one, else its image's. The function reads it once,
+/// before its body (`fragment::emit_entry`), and every use takes it ([`value`]): Metal hands the
+/// function one value of the attachment, and one read keeps the image's accesses in the
+/// interlock to that read and the writes at the returns.
+pub(super) fn texel(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    color: u32,
+) -> BResult<SValue> {
+    let Some(sc) = cx.plan.families.fragment.fetch.get(&color).copied() else {
+        return Err(cx.fail(format!("attachment {color} is not in the storage form")));
+    };
+    match (sc.shadowed, sc.view.extended) {
+        // The instance's shadow holds the tile value itself.
+        (true, Some(range)) => shadow_read(cx, fb, color, range),
+        (true, None) => Err(cx.fail("a shadow of an attachment of another form")),
+        (false, _) => read_texel(cx, fb, color, &sc),
+    }
+}
+
+/// The value of storage-form color input `c` in its lowered representation, from the texel the
+/// function read at its pixel before its body ([`texel`]; as `color::value` reads an input
+/// attachment).
 pub(super) fn value(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
@@ -2528,15 +2710,8 @@ pub(super) fn value(
     let Some(sc) = cx.plan.families.fragment.fetch.get(&c.color).copied() else {
         return Err(cx.fail(format!("attachment {} is not in the storage form", c.color)));
     };
-    let texel = match (sc.shadowed, sc.view.extended) {
-        // The instance's shadow holds the tile value itself.
-        (true, Some(range)) => Some(shadow_read(cx, fb, c.color, range)?),
-        (true, None) => return Err(cx.fail("a shadow of an attachment of another form")),
-        (false, _) => None,
-    };
-    let texel = match texel {
-        Some(held) => held,
-        None => read_texel(cx, fb, c.color, &sc)?,
+    let Some(&(_, texel)) = cx.fetched.iter().find(|&&(color, _)| color == c.color) else {
+        return Err(cx.fail(format!("attachment {} was not read at entry", c.color)));
     };
     let texel = match (sc.view.extended, sc.view.uint_view) {
         (Some(_), _) if sc.shadowed => texel,
@@ -2616,6 +2791,15 @@ pub(super) fn emit_return(
                 held = shadow;
                 texel
             }
+            // A bfloat attachment's write, never shadowed (`plan`).
+            (Some(range), None) if range.bfloat() => {
+                bfloat_written(cx, fb, color, &sc, range, (form, part))?
+            }
+            (Some(range), None) if sc.view.merges() => {
+                let (texel, shadow) = merged_extended(cx, fb, color, &sc, range, (form, part))?;
+                held = shadow;
+                texel
+            }
             (Some(range), None) if !sc.shadowed => {
                 stage_io::extended_color::texel(fb, range, form, part)?
             }
@@ -2642,6 +2826,11 @@ pub(super) fn emit_return(
                     Some(eq) => half_blended(cx, fb, color, &sc, eq, (form, part))?,
                     None => part,
                 };
+                // The pipeline's private logic operation over the texel's codes.
+                let part = match sc.view.logic_op {
+                    Some(op) => logic_operated(cx, fb, color, &sc, op, (form, part))?,
+                    None => part,
+                };
                 let part = if sc.view.merges() {
                     merge(cx, fb, color, &sc, form, part)?
                 } else {
@@ -2656,8 +2845,8 @@ pub(super) fn emit_return(
         let (image, at, ops) = image_and_texel(cx, fb, color, sc.view.samples)?;
         texels.push((image, at, texel, ops));
         if let Some(held) = held {
-            let (image, at) = shadow_and_texel(cx, fb, color)?;
-            texels.push((image, at, held, ImageOperands::default()));
+            let (image, at, ops) = shadow_and_texel(cx, fb, color, sc.view.samples)?;
+            texels.push((image, at, held, ops));
         }
     }
     let mem = memory_model::coherence(cx.plan).texel(fb)?;
@@ -2698,6 +2887,32 @@ pub(super) fn emit_return(
 
 /// One storage write: the image, the texel's coordinate, the texel, and the image operands.
 type Write = (SValue, SValue, SValue, ImageOperands);
+
+/// The output `part` of `form` (one to four `f32` lanes of a `half` or `float` output, or `u32`
+/// lanes of an integer one) to attachment `color` under the pipeline's private logic operation
+/// `op` (`StorageView::logic_op`): the texel read first at the invocation's pixel (and sample),
+/// inside the interlock, in Metal's channel order ([`read_texel`]; a signed integer texel's bits),
+/// and the value whose code is the operation of the output's code over the texel's
+/// (`logic::operated`). The channels a write mask keeps are [`merge`]'s to take back from the
+/// texel.
+fn logic_operated(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    color: u32,
+    sc: &StorageColor,
+    op: vk::LogicOp,
+    (form, part): (Form, SValue),
+) -> BResult<SValue> {
+    let Some(channels) = super::logic::channels(sc.view.pixel_format) else {
+        return Err(cx.fail("a logic operation of an attachment it does not serve"));
+    };
+    if !super::logic::takes(channels, form) {
+        return Err(cx.fail("a logic operation of an output it does not take"));
+    }
+    let texel = read_texel(cx, fb, color, sc)?;
+    let texel = as_held(fb, texel, sc.view.numeric)?;
+    super::logic::operated(fb, op, channels, (form, part), texel)
+}
 
 /// The output `part` of `form` (one to four `f32` lanes: a `half` output's `half`s, or a `float`
 /// one's `float`s) blended into 16-bit float attachment `color` by Metal's blend `eq`
@@ -3025,6 +3240,90 @@ pub(super) fn blend_constant(
 /// Under the instance's shadow (`StorageColor::shadowed`) the destination is the shadow's texel,
 /// Metal's tile value, and the write stores the blend's result there too (the second texel), the
 /// kept channels as the shadow held them; the codes texel is read only to keep channels.
+/// The raw texel an unblended write of output `part` (of `form`) to extended-range attachment
+/// `color` (held in `range`) stores under a write mask of some of its channels
+/// (`StorageView::kept`): the output's `half` as the unblended write takes it
+/// (`stage_io::extended_color::held`), encoded as the kernel write encodes it, the codes of the
+/// channels the mask keeps taken from the texel read first inside the interlock
+/// (`extended_range::encode_keeping`), as Metal keeps a masked channel's code. Under the instance's
+/// shadow (`StorageColor::shadowed`) the shadow's texel too: the written channels' `half`s, the
+/// kept ones as the shadow held them.
+fn merged_extended(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    color: u32,
+    sc: &StorageColor,
+    range: ExtendedRange,
+    (form, part): (Form, SValue),
+) -> BResult<(SValue, Option<SValue>)> {
+    let v = stage_io::extended_color::held(fb, range, form, part)?;
+    let kept = [
+        vk::ColorComponentFlags::R,
+        vk::ColorComponentFlags::G,
+        vk::ColorComponentFlags::B,
+        vk::ColorComponentFlags::A,
+    ]
+    .map(|c| sc.view.kept.contains(c));
+    let texel = read_texel(cx, fb, color, sc)?;
+    let stored = extended_range::encode_keeping(fb, range, v, (texel, kept))?;
+    let held = match sc.shadowed {
+        true => {
+            let shadow = shadow_read(cx, fb, color, range)?;
+            let lanes: Vec<u32> = kept
+                .iter()
+                .zip(0..4u32)
+                .map(|(&kept, lane)| match kept {
+                    true => 4 + lane,
+                    false => lane,
+                })
+                .collect();
+            Some(fb.vector_shuffle(v, shadow, &lanes)?)
+        }
+        false => None,
+    };
+    Ok((stored, held))
+}
+
+/// The raw texel an unblended write of output `part` (of `form`) to bfloat attachment `color`
+/// (held in `range`) stores: the code Metal's render pass stores of it, as the attachment's color
+/// attachment stores it (`stage_io::extended_color::bfloat_output`, at the pipeline's
+/// `textureWriteRoundingMode`, [`StorageColor::nearest_even`]), the channels a write mask keeps
+/// ([`StorageView::kept`]) as the texel read first inside the interlock holds them. Each channel is
+/// a component of its own, so a kept channel keeps its code.
+fn bfloat_written(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    color: u32,
+    sc: &StorageColor,
+    range: ExtendedRange,
+    (form, part): (Form, SValue),
+) -> BResult<SValue> {
+    let rounding = match sc.nearest_even {
+        true => crate::metal::TextureWriteRoundingMode::NearestEven,
+        false => crate::metal::TextureWriteRoundingMode::TowardZero,
+    };
+    let e = ExtendedRangeColor::new(range, false).with_rounding(rounding);
+    let stored = stage_io::extended_color::bfloat_output(fb, e, form, part)?;
+    if !sc.view.merges() {
+        return Ok(stored);
+    }
+    let texel = read_texel(cx, fb, color, sc)?;
+    let lanes: Vec<u32> = [
+        vk::ColorComponentFlags::R,
+        vk::ColorComponentFlags::G,
+        vk::ColorComponentFlags::B,
+        vk::ColorComponentFlags::A,
+    ]
+    .into_iter()
+    .zip(0..4u32)
+    .map(|(c, lane)| match sc.view.kept.contains(c) {
+        true => 4 + lane,
+        false => lane,
+    })
+    .collect();
+    fb.vector_shuffle(stored, texel, &lanes)
+}
+
 fn blended(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
@@ -3060,7 +3359,7 @@ fn blended(
         }
     };
     let constant = blend_constant(cx, fb, &b)?;
-    let ranges = Some(extended_range::blend::extended_ranges(range));
+    let ranges = extended_range::blend::extended_ranges(range);
     let v = extended_range::blend::native(fb, &b, ranges, (part, s1, d), constant)?;
     if !sc.view.merges() {
         let texel = extended_range::encode(fb, range, v)?;

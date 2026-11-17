@@ -23,6 +23,9 @@
 //!   probe's cases drew on an M4 wherever the map was made while no map of layers had been
 //!   released. Made after one was, Metal draws physical rows 0 to 15 (an M4 and an M3 Max alike),
 //!   the runtime nothing, and announces it.
+//! - Over a map of many regions, a direct draw, whose regions a device with the multi-draw route
+//!   draws several at a time, shades bit for bit what the same draw from an indirect buffer,
+//!   drawn region by region, shades, plain and indexed.
 
 use super::degrade_notices::{
     assert_made_once, counts, made_render_kinds, shared_in_system_memory,
@@ -30,13 +33,17 @@ use super::degrade_notices::{
 use super::rate_maps::descriptor;
 use super::renders::map_render;
 use super::{
-    buffer_with, layer_reported_nothing_at_all, validated_device, Messages, ScratchCache, WAIT,
+    at_plan, buffer_with, layer_reported_nothing_at_all, validated_device_with, Messages,
+    ScratchCache, WAIT,
 };
 use crate::candidate::runtime_case::{render_pipeline_descriptor, render_pipeline_state};
 use crate::gpu::TEST_DEVICE;
 use crate::store::CorpusStore;
+use metal2vulkan::bind::{RateMapDescriptor, RateMapLayerDescriptor};
+use metal2vulkan::device::VkFeature;
 use metal2vulkan::metal::Mutability;
-use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureType, TextureUsage};
+use metal2vulkan::metal::{IndexType, PixelFormat, PrimitiveType, TextureType, TextureUsage};
+use metal2vulkan_runtime::DeviceOptions;
 use metal2vulkan_runtime::{
     Buffer, ClearColor, CommandBuffer, CommandBufferError, CommandBufferStatus, CommandQueue,
     Degradation, Device, Error, EventRef, Invalid, LoadAction, Problem, RasterizationRateMap,
@@ -45,7 +52,6 @@ use metal2vulkan_runtime::{
     TextureDescriptor, Viewport,
 };
 use std::collections::BTreeSet;
-use std::path::Path;
 
 /// The public case whose pipeline the passes draw.
 const CASE: &str = "fragment-positions-in-a-half-quality-rate-mapped-pass";
@@ -65,7 +71,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(device: &Device) -> Fixture {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+        let root = metal2vulkan_devtools::validation_dir().join("corpus");
         let store = CorpusStore::new(&root);
         let case = (0..64)
             .flat_map(|shard| store.read_case_shard(shard).unwrap())
@@ -269,7 +275,7 @@ fn shaded_in(target: &Texture, slice: u64) -> (usize, [u64; 4], [[f32; 2]; 2]) {
 fn a_rate_mapped_pass_shades_its_physical_pixels_region_by_region() {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
-    let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+    let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
     let fixture = Fixture::new(&device);
     let half = fixture.map(0.5);
     let whole = (33 * 33, [0, 0, 32, 32], [[0.5, 0.5], [32.5, 32.5]]);
@@ -361,9 +367,15 @@ pub(super) const ZERO_LAYER_AFTER_RELEASE: [Degradation; 1] =
 /// of its own (a device's released maps of layers decide what its later maps of no layers draw),
 /// then fail on any validation message.
 fn fresh(test: impl FnOnce(&Fixture, &Messages)) {
+    fresh_with(|_| {}, test)
+}
+
+/// [`fresh`], `adjust` applied to the options of each device it makes (`at_plan` gives them
+/// their queue plan).
+fn fresh_with(adjust: fn(&mut DeviceOptions), test: impl FnOnce(&Fixture, &Messages)) {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
-    let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+    let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), adjust).unwrap();
     let fixture = Fixture::new(&device);
     test(&fixture, &messages);
     layer_reported_nothing_at_all(&messages);
@@ -394,7 +406,7 @@ fn a_pass_over_a_map_of_no_layers_draws_nothing() {
     };
     let whole = (33 * 33, [0, 0, 32, 32], [[0.5, 0.5], [32.5, 32.5]]);
     // `none8` and `half8`.
-    fresh(|fixture, _| {
+    fresh_with(at_plan, |fixture, _| {
         let target = filled(fixture, 8);
         fixture.draw_in(&plain(&target), corner).unwrap();
         assert_eq!(
@@ -403,7 +415,7 @@ fn a_pass_over_a_map_of_no_layers_draws_nothing() {
             "none8"
         );
     });
-    fresh(|fixture, _| {
+    fresh_with(at_plan, |fixture, _| {
         let target = filled(fixture, 8);
         fixture
             .draw(&fixture.map_of(8, &[(0.5, 0.5)]), &target, corner)
@@ -418,7 +430,7 @@ fn a_pass_over_a_map_of_no_layers_draws_nothing() {
         ("zero64", 64, 64, false),
         ("zero256on8", 256, 8, true),
     ] {
-        fresh(|fixture, messages| {
+        fresh_with(at_plan, |fixture, messages| {
             let target = filled(fixture, side);
             fixture
                 .draw(&fixture.map_of(screen, &[]), &target, |encoder| {
@@ -432,7 +444,7 @@ fn a_pass_over_a_map_of_no_layers_draws_nothing() {
         });
     }
     // `none64` and `half64`.
-    fresh(|fixture, _| {
+    fresh_with(at_plan, |fixture, _| {
         let target = filled(fixture, 64);
         fixture.draw_in(&plain(&target), |_| {}).unwrap();
         assert_eq!(
@@ -448,7 +460,7 @@ fn a_pass_over_a_map_of_no_layers_draws_nothing() {
     });
     // `after_half64`: a pass over a map of one layer, the map released, then one of none, which
     // Metal draws (its rows 0 to 15) and the runtime does not: announced, once.
-    fresh(|fixture, messages| {
+    fresh_with(at_plan, |fixture, messages| {
         {
             let half = fixture.map_of(64, &[(0.5, 0.5)]);
             let target = filled(fixture, 64);
@@ -469,7 +481,7 @@ fn a_pass_over_a_map_of_no_layers_draws_nothing() {
         assert_made_once(messages, &ZERO_LAYER_AFTER_RELEASE, &first);
     });
     // `beside_half64`: a map of one layer live beside one of none.
-    fresh(|fixture, messages| {
+    fresh_with(at_plan, |fixture, messages| {
         let half = fixture.map_of(64, &[(0.5, 0.5)]);
         let empty = fixture.map_of(64, &[]);
         let target = filled(fixture, 64);
@@ -481,7 +493,7 @@ fn a_pass_over_a_map_of_no_layers_draws_nothing() {
         assert!(!announced_after_release(messages), "beside_half64");
     });
     // `seq`: passes over a map of none, one of one layer, and the first again.
-    fresh(|fixture, messages| {
+    fresh_with(at_plan, |fixture, messages| {
         let empty = fixture.map_of(64, &[]);
         let half = fixture.map_of(64, &[(0.5, 0.5)]);
         for (name, over, zero) in [
@@ -500,7 +512,7 @@ fn a_pass_over_a_map_of_no_layers_draws_nothing() {
     });
     // `zero_before_release`: a map of none made before a map of one layer is
     // released draws nothing on Metal after the release too, and announces nothing here.
-    fresh(|fixture, messages| {
+    fresh_with(at_plan, |fixture, messages| {
         let empty = fixture.map_of(64, &[]);
         {
             let half = fixture.map_of(64, &[(0.5, 0.5)]);
@@ -688,6 +700,72 @@ fn a_reset_shows_in_every_pass_not_yet_submitted() {
     });
 }
 
+/// A reset from the identity to half quality shows in a pass whose draw's `VkPipeline` was still
+/// being made as it was encoded (`render/pending.rs`) and was made before the reset: after the
+/// draw, and after `commit` while the command buffer waits for an event the CPU signals after
+/// the reset. The runtime encodes the pass again in its place (`command_buffer/reencode.rs`):
+/// the half-quality map's 33 by 33 physical pixels, as Metal's GPU reads the map as it runs the
+/// pass, and without a notice. Where the device made the draw's pipeline before the draw (a
+/// device without the multi-draw route, whose variant a rate-mapped draw takes), the reset shows
+/// as in [`a_reset_shows_in_a_pass_not_yet_submitted`].
+#[test]
+fn a_reset_shows_in_a_pass_whose_pipeline_was_made_after_its_draw() {
+    let half = (33 * 33, [0, 0, 32, 32], [[0.5, 0.5], [32.5, 32.5]]);
+    for held in [false, true] {
+        fresh(|fixture, messages| {
+            let device = &fixture.device;
+            let map = reset_map(fixture, 1.0, true);
+            let target = fixture.target(64);
+            let to = descriptor(SCREEN, SCREEN, &[(0.5, 0.5)]);
+            let queue = device.new_command_queue().unwrap();
+            let command_buffer = queue.command_buffer().unwrap();
+            let event = device.new_shared_event().unwrap();
+            if held {
+                (command_buffer.encode_wait_for_event(EventRef::from(&event), 1)).unwrap();
+            }
+            let before = device.work_counts();
+            let mut encoder = command_buffer
+                .render_command_encoder(&pass(&map, &target))
+                .unwrap();
+            encoder.set_render_pipeline_state(&fixture.state).unwrap();
+            (encoder.set_fragment_buffer(Some(&fixture.screen), 0, 0)).unwrap();
+            (encoder.draw_primitives(PrimitiveType::Triangle, 0, 3, 1, 0)).unwrap();
+            // Its pipeline made: the making counted, and a moment for its outcome to land.
+            let pended = device.work_counts().draws_unkept_making > before.draws_unkept_making;
+            if pended {
+                let deadline = std::time::Instant::now() + WAIT;
+                while device.work_counts().variant_pipelines_made == before.variant_pipelines_made {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "held {held}: never made"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if !held {
+                map.reset_using_descriptor(&to).unwrap();
+            }
+            encoder.end_encoding().unwrap();
+            command_buffer.commit().unwrap();
+            if held {
+                map.reset_using_descriptor(&to).unwrap();
+                event.set_signaled_value(1);
+            }
+            command_buffer.wait_until_completed_for(WAIT).unwrap();
+            assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
+            let case = format!("held {held}, pended {pended}");
+            eprintln!("RESET-AFTER-MAKING {case}");
+            assert_eq!(shaded(&target), half, "{case}");
+            let kinds = counts(&messages.take_notices());
+            assert!(
+                !kinds.contains_key(&Degradation::RateMapResetUnencoded),
+                "{case}: {kinds:?}"
+            );
+        });
+    }
+}
+
 /// Our probe `rs`'s resets to another screen (the M3 Max under macOS 27.0.1, each case in a
 /// process of its own, repeated alike): a pass over the identity of a mutable map of `taken`
 /// pixels a side, reset to the identity of `now` pixels after its encoder opened, after
@@ -718,7 +796,7 @@ fn a_reset_to_another_screen_keeps_the_screen_the_pass_took() {
             [[0.5, 0.5], [edge, edge]],
         )
     };
-    fresh(|fixture, messages| {
+    fresh_with(at_plan, |fixture, messages| {
         let device = &fixture.device;
         let identity = |side: u32| descriptor(side, side, &[(1.0, 1.0)]);
         let map_of = |side: u32| {
@@ -792,7 +870,7 @@ fn passes(
 /// runs. The runtime answers so, each hang on a queue of its own (a queue's second revokes it).
 #[test]
 fn a_pass_of_no_draw_call_over_a_mutable_map_hangs_until_one_drew() {
-    fresh(|fixture, _| {
+    fresh_with(at_plan, |fixture, _| {
         let device = &fixture.device;
         let hangs = |command_buffer: &CommandBuffer, case: &str| {
             assert_eq!(
@@ -914,7 +992,7 @@ pub(super) const RESET_UNENCODED: [Degradation; 1] = [Degradation::RateMapResetU
 /// announces [`RESET_UNENCODED`], once for two such command buffers.
 #[test]
 fn a_pass_the_runtime_cannot_encode_again_draws_by_the_map_it_took() {
-    fresh(|fixture, messages| {
+    fresh_with(at_plan, |fixture, messages| {
         let device = &fixture.device;
         let identity = (16 * 64, [0, 0, 15, 63], [[0.5, 0.5], [15.5, 63.5]]);
         for _ in 0..2 {
@@ -955,7 +1033,7 @@ fn a_pass_the_runtime_cannot_encode_again_draws_by_the_map_it_took() {
 fn rate_mapped_passes_are_refused_where_metal_or_the_runtime_refuses_them() {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
-    let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+    let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
     let fixture = Fixture::new(&device);
     let half = fixture.map(0.5);
     let queue = device.new_command_queue().unwrap();
@@ -1017,4 +1095,210 @@ fn rate_mapped_passes_are_refused_where_metal_or_the_runtime_refuses_them() {
         )))
     );
     layer_reported_nothing_at_all(&messages);
+}
+
+/// The side of the screen [`regions_drawn_several_at_a_time_shade_as_region_by_region`] draws:
+/// at [`FALLING`], its plan holds 36 regions, more than one multi-draw takes on any device here
+/// (16 viewports), its last batch a part of one.
+const BATCHED_SCREEN: u32 = 256;
+
+/// A quality falling from 1 at the centre to 0.3 at the edges, the consumer's.
+const FALLING: [f32; 5] = [0.3, 0.6, 1.0, 0.6, 0.3];
+
+/// A map of a [`BATCHED_SCREEN`] screen at [`FALLING`] quality on both axes.
+fn falling(device: &Device) -> RasterizationRateMap {
+    let mut map = RateMapDescriptor::new([BATCHED_SCREEN; 2]);
+    map.layers = vec![RateMapLayerDescriptor::new(
+        FALLING.to_vec(),
+        FALLING.to_vec(),
+    )];
+    device.new_rasterization_rate_map(&map).unwrap()
+}
+
+/// The case's triangle drawn into `target` over `map`: from an indirect buffer where `indirect`,
+/// through `indices` where `indexed`, through `viewport` where one is given; the draw commands the
+/// device recorded for it, `[plain, multi-draw, indirect]`. Each draw makes a command queue of its
+/// own, so a test of more than one makes its device with its queue plan ([`at_plan`]).
+fn counted_draw(
+    fixture: &Fixture,
+    (map, target): (&RasterizationRateMap, &Texture),
+    (indirect, indexed, viewport): (bool, bool, Option<Viewport>),
+    indices: &Buffer,
+) -> [u64; 3] {
+    let device = &fixture.device;
+    let arguments: &[u32] = match indexed {
+        // `indexCount`, `instanceCount`, `indexStart`, `baseVertex`, `baseInstance`.
+        true => &[3, 1, 0, 0, 0],
+        // `vertexCount`, `instanceCount`, `vertexStart`, `baseInstance`.
+        false => &[3, 1, 0, 0],
+    };
+    let arguments: Vec<u8> = arguments.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let arguments = buffer_with(device, &arguments).unwrap();
+    let before = device.work_counts().commands_recorded;
+    let queue = device.new_command_queue().unwrap();
+    let command_buffer = queue.command_buffer().unwrap();
+    let mut encoder = command_buffer
+        .render_command_encoder(&pass(map, target))
+        .unwrap();
+    encoder.set_render_pipeline_state(&fixture.state).unwrap();
+    encoder
+        .set_fragment_buffer(Some(&fixture.screen), 0, 0)
+        .unwrap();
+    if let Some(viewport) = viewport {
+        encoder.set_viewport(viewport).unwrap();
+    }
+    let triangle = PrimitiveType::Triangle;
+    let u16 = IndexType::UInt16;
+    match (indirect, indexed) {
+        (false, false) => encoder.draw_primitives(triangle, 0, 3, 1, 0),
+        (true, false) => encoder.draw_primitives_indirect(triangle, &arguments, 0),
+        (false, true) => encoder.draw_indexed_primitives(triangle, 3, u16, indices, 0, 1, 0, 0),
+        (true, true) => {
+            encoder.draw_indexed_primitives_indirect(triangle, u16, indices, 0, &arguments, 0)
+        }
+    }
+    .unwrap();
+    encoder.end_encoding().unwrap();
+    command_buffer.commit().unwrap();
+    command_buffer.wait_until_completed_for(WAIT).unwrap();
+    assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
+    let after = device.work_counts().commands_recorded;
+    [
+        (after.cmd_draw + after.cmd_draw_indexed) - (before.cmd_draw + before.cmd_draw_indexed),
+        (after.cmd_draw_multi + after.cmd_draw_multi_indexed)
+            - (before.cmd_draw_multi + before.cmd_draw_multi_indexed),
+        (after.cmd_draw_indirect + after.cmd_draw_indexed_indirect)
+            - (before.cmd_draw_indirect + before.cmd_draw_indexed_indirect),
+    ]
+}
+
+/// Every byte of `target`'s first slice.
+fn texel_bytes(target: &Texture) -> Vec<u8> {
+    let side = target.width();
+    let mut bytes = vec![0u8; (side * side * 16) as usize];
+    target
+        .get_bytes(
+            &mut bytes,
+            side * 16,
+            0,
+            Region::new_2d(0, 0, side, side),
+            0,
+            0,
+        )
+        .unwrap();
+    bytes
+}
+
+/// A draw whose regions the device draws several at a time, each a draw of a multi-draw through
+/// the viewport and scissor at its index (`VK_EXT_multi_draw`, with `multiViewport`,
+/// `shaderOutputViewportIndex` and `shaderDrawParameters`), shades bit for bit the pixels the
+/// same draw from an indirect buffer shades, which the runtime draws region by region: over a
+/// [`BATCHED_SCREEN`] screen at [`FALLING`] quality, plain and indexed, every physical pixel
+/// shaded at its centre. The device's command counts show each route ran: the direct draw
+/// records multi-draws, fewer commands than regions, where the device has the route and plain
+/// draws elsewhere; the indirect one an indirect draw a region.
+#[test]
+fn regions_drawn_several_at_a_time_shade_as_region_by_region() {
+    fresh_with(at_plan, |fixture, _| {
+        let device = &fixture.device;
+        let map = falling(device);
+        let physical = map.physical_size_for_layer(0);
+        let enabled = &device.enabled().features;
+        let route = [
+            VkFeature::MultiDraw,
+            VkFeature::MultiViewport,
+            VkFeature::ShaderOutputViewportIndex,
+            VkFeature::ShaderDrawParameters,
+        ]
+        .iter()
+        .all(|f| enabled.contains(f));
+        let indices: Vec<u8> = [0u16, 1, 2, 0]
+            .iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        let indices = buffer_with(device, &indices).unwrap();
+        for indexed in [false, true] {
+            let side = u64::from(BATCHED_SCREEN);
+            let (direct, from_buffer) = (fixture.target(side), fixture.target(side));
+            let direct_counts =
+                counted_draw(fixture, (&map, &direct), (false, indexed, None), &indices);
+            let indirect_counts = counted_draw(
+                fixture,
+                (&map, &from_buffer),
+                (true, indexed, None),
+                &indices,
+            );
+            // A draw a region (its arguments read on the CPU where nothing bounds an indexed
+            // draw's index fetch, `DrawCommands::indirect_needs_arguments`).
+            let [plain, multi, from_arguments] = indirect_counts;
+            let regions = plain + from_arguments;
+            eprintln!(
+                "indexed {indexed}: {regions} regions; direct [plain, multi, indirect] \
+                 {direct_counts:?}, from a buffer {indirect_counts:?}; route {route}"
+            );
+            assert_eq!(multi, 0, "indexed {indexed}");
+            assert!(regions > 16, "indexed {indexed}: {regions} regions");
+            match route {
+                true => {
+                    let [plain, multi, _] = direct_counts;
+                    assert!(multi > 0 && plain + multi < regions, "indexed {indexed}");
+                }
+                false => assert_eq!(direct_counts, [regions, 0, 0], "indexed {indexed}"),
+            }
+            let (count, _, _) = shaded(&direct);
+            let expected = physical.width * physical.height;
+            assert_eq!(count as u64, expected, "indexed {indexed}");
+            assert!(
+                texel_bytes(&direct) == texel_bytes(&from_buffer),
+                "indexed {indexed}: the batched draw's pixels differ from the region by region \
+                 draw's"
+            );
+        }
+    });
+}
+
+/// A draw whose viewport reaches part of the screen records only the regions whose pixels it
+/// reaches: over a [`BATCHED_SCREEN`] screen at [`FALLING`] quality, a viewport over the screen's
+/// left quarter draws fewer regions than the whole screen's, region by region from an indirect
+/// buffer, and the direct draw shades bit for bit what that draw shades, inside the left half of
+/// the physical columns.
+#[test]
+fn a_viewport_over_part_of_the_screen_draws_only_the_regions_it_reaches() {
+    fresh_with(at_plan, |fixture, _| {
+        let device = &fixture.device;
+        let map = falling(device);
+        let physical = map.physical_size_for_layer(0);
+        let indices = buffer_with(device, &[0u8; 8]).unwrap();
+        let side = u64::from(BATCHED_SCREEN);
+        let screen = f64::from(BATCHED_SCREEN);
+        let quarter = Viewport::new(0.0, 0.0, screen / 4.0, screen, 0.0, 1.0);
+        let whole = fixture.target(side);
+        let [plain, _, from_arguments] =
+            counted_draw(fixture, (&map, &whole), (true, false, None), &indices);
+        let regions = plain + from_arguments;
+        let (direct, from_buffer) = (fixture.target(side), fixture.target(side));
+        counted_draw(
+            fixture,
+            (&map, &direct),
+            (false, false, Some(quarter)),
+            &indices,
+        );
+        let [plain, _, from_arguments] = counted_draw(
+            fixture,
+            (&map, &from_buffer),
+            (true, false, Some(quarter)),
+            &indices,
+        );
+        let reached = plain + from_arguments;
+        eprintln!("the left quarter's viewport: {reached} of {regions} regions drawn");
+        assert!(reached > 0 && reached < regions, "{reached} of {regions}");
+        let (count, [x0, y0, x1, y1], _) = shaded(&direct);
+        assert!(count > 0, "the quarter shades");
+        assert_eq!([x0, y0, y1], [0, 0, physical.height - 1]);
+        assert!(x1 < physical.width / 2, "the quarter shades to column {x1}");
+        assert!(
+            texel_bytes(&direct) == texel_bytes(&from_buffer),
+            "the direct draw's pixels differ from the region by region draw's"
+        );
+    });
 }

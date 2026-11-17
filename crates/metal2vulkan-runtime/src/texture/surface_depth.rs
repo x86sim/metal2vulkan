@@ -14,10 +14,11 @@
 //! elements' bytes alone ([`element_runs`]: a tile of partial extent leaves bytes between its
 //! elements), up to the last element's byte. A view in the texture's own format (the whole of
 //! it: such a texture has one level and one slice) renders into the texture's twin. The twin's
-//! other aspect is never copied: it starts as zeros and a pass's store of it reaches no byte.
-//! An `X32_Stencil8` view of a `Depth32Float_Stencil8` texture, whose stencil the plane does not
-//! hold, renders into a private image of its own, which no byte reaches: Metal's pass on it loads
-//! 0 and changes no byte, and a kernel reads 0 through it. Refused as the
+//! other aspect is never copied: it starts at zero, never as its memory lies, and a pass's store of
+//! it reaches no byte. An `X32_Stencil8` view of a `Depth32Float_Stencil8` texture, whose stencil
+//! the plane does not hold, renders into a private image of its own, which starts at zero and
+//! which no byte reaches: Metal's pass on it loads 0 and changes no byte, and a kernel reads 0
+//! through it. Refused as the
 //! runtime's gap (`NotImplemented(SurfaceDepthStencil)`): a device the moves do not fit, and a
 //! view in another format of a plane that holds its stencil (an `X32_Stencil8` texture's view
 //! as `Depth32Float_Stencil8`, unmeasured). A blit through a view takes the plane's unit
@@ -28,15 +29,17 @@ use super::super::buffer_texture::Texels;
 use super::super::copy_plan::{surface_depth_unit, CopyUnit};
 use super::super::error::{internal, Error, RuntimeGap};
 use super::super::image_plan::{plan_image, ImagePlan};
+use super::super::resource::Identity;
 use super::super::shadow::{ShadowBuffer, ShadowCopies, ShadowSource, ShadowTarget};
 use super::super::shadow_merge::ScratchSpares;
 use super::super::texture_descriptor::{texture_usage, TextureDescriptor, TextureLayout};
-use super::super::tracker::UseRange;
+use super::super::tracker::{ImagePlace, UseRange};
 use super::super::values::ResourceOptions;
 use super::super::view_plan::ViewRecord;
-use super::heap::{heap_plane_layout, heap_planes};
+use super::super::Device;
+use super::heap::{copies_into, heap_plane_layout};
 use super::heap_tiled::{Elements, HeapTiledCopies, TiledLayout, TiledTexture};
-use super::{image_error, IdUse, Image, Storage, Texture};
+use super::{image_error, IdUse, Image, Start, Storage, Texture};
 use ash::vk;
 use metal2vulkan::metal::format::aspects;
 use metal2vulkan::metal::TextureType;
@@ -74,7 +77,7 @@ impl Texture {
                 let storage = Storage::Image(image.shared());
                 let record = ViewRecord::of_descriptor(&layout, &descriptor);
                 Ok(Texture::made(
-                    self.device(),
+                    self.generation(),
                     storage,
                     record,
                     None,
@@ -84,7 +87,7 @@ impl Texture {
         }
         let unit = surface_depth_unit(pf).ok_or_else(gap)?;
         texels.twin(pf, || {
-            let device = self.device();
+            let device = self.generation();
             let [width, height, _] = record.extent();
             let [w, h] = [u64::from(width), u64::from(height)];
             let bytes = u64::from(unit.bytes);
@@ -117,23 +120,18 @@ impl Texture {
             let (format, plan_pf, extent) = (plan.format, plan.pixel_format, plan.extent);
             // The plane's aspect alone moves between the image and the tiles.
             let (planes, tight_len) = heap_plane_layout(format, plan_pf, extent, 1, 1);
-            let (regions, _) = heap_planes(format, plan_pf, extent, 1, 1);
             let planes: Vec<_> = planes
                 .into_iter()
                 .filter(|plane| plane.aspect == unit.aspect)
                 .collect();
-            let aspect = unit.aspect.into();
-            let regions: Vec<_> = regions
-                .into_iter()
-                .filter(|region| region.image_subresource.aspect_mask == aspect)
-                .collect();
             // The plane's aspect alone: one part, of the planes given.
             let tiled = TiledTexture::one(tiled);
-            if !HeapTiledCopies::fit(device, &tiled, &planes, tight_len) {
-                return Err(gap());
-            }
+            let moves = HeapTiledCopies::moves(device, &tiled, (planes, tight_len), format)
+                .ok_or_else(gap)?;
+            let regions = copies_into(moves.planes(), 1);
+            let aspect = unit.aspect.into();
             let (raw, at) = texels.buffer.at(base);
-            let mut staging = HeapTiledCopies::staging(device, &tiled, at, hazard)?;
+            let mut staging = HeapTiledCopies::staging(device, &tiled, tight_len, at, hazard)?;
             let start = staging.into.dst_offset;
             staging.into.size = span;
             staging.back = runs
@@ -144,8 +142,7 @@ impl Texture {
                     size: run.end - run.start,
                 })
                 .collect();
-            let shape = (&planes[..], tight_len, 1);
-            let tiles = HeapTiledCopies::new(device, &staging, tiled, shape, &regions, hazard)?;
+            let tiles = HeapTiledCopies::new(device, &staging, tiled, (moves, 1), regions)?;
             let (truth, tracked) = texels.buffer.tracked(base..end);
             let copies = ShadowCopies {
                 source: ShadowSource::Bytes {
@@ -164,14 +161,27 @@ impl Texture {
                     aspects: aspect,
                     levels: 0..1,
                     layers: 0..1,
+                    place: ImagePlace::WHOLE,
                 },
                 tracked: texels.tracked(),
                 drops_writes: false,
+                levels: None,
                 backing: texels.backing(),
                 merge_scratch: ScratchSpares::default(),
-                touched: AtomicU64::new(0),
                 stood: AtomicU64::new(0),
+                standing: Default::default(),
             };
+            let why = "a depth or stencil texture's tiled twin over a surface plane: Metal lays \
+                       the plane's elements in its tiles, which no image's memory holds, so its \
+                       passes render into an image of their own that the encoders move into the \
+                       tiles and back";
+            crate::shadow_log::made(
+                device,
+                "render_command_encoder",
+                (&descriptor, &layout),
+                texels,
+                why,
+            );
             let storage = Storage::Shadow {
                 image: image.shared(),
                 texels: Arc::new(texels.tiled_span(base..end, bytes)),
@@ -190,7 +200,7 @@ impl Texture {
         check: impl FnOnce(&ImagePlan) -> Result<(), Error>,
     ) -> Result<(Image, TextureLayout, TextureDescriptor), Error> {
         const CALL: &str = "render_command_encoder";
-        let device = self.device();
+        let device = self.generation();
         let record = self.record();
         let [width, height, _] = record.extent();
         let options = texels.options();
@@ -221,7 +231,14 @@ impl Texture {
             resource_options: ResourceOptions::private(),
             ..descriptor
         };
-        let image = device.new_image(plan, &layout, &private, hazard)?;
+        // It starts at zero: no copy writes its other aspect (the module docs), whose memory may
+        // hold a released texture's texels, of another process of a consumer whose processes
+        // share the device (a recycled image's, `recycle.rs`), and a pass whose `DontCare` load
+        // of it the driver leaves (`Degradation::DontCareUnstoredLoad`) reads them.
+        let identity = Identity::new(hazard, false);
+        let start = Start::ZeroUnpatterned;
+        let owner = Device::runtime_owner;
+        let image = device.new_image_starting(plan, &layout, &private, identity, start, owner)?;
         Ok((image, layout, descriptor))
     }
 

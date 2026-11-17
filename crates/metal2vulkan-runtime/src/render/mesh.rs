@@ -34,11 +34,17 @@
 //!   render encoder's steps (`render.rs`). A mesh pipeline has no vertex input and no input
 //!   assembly; its key takes a triangle list, under which Vulkan biases the depth of a mesh
 //!   function's triangles and of none of its lines or points, as Metal does.
+//! - **A partial object threadgroup** of `drawMeshThreads` runs as Metal runs it: the draw
+//!   launches the whole object threadgroups the threads fill, rounded up, and the last along an
+//!   axis answers the threads left as its `threads_per_threadgroup` (and its simdgroup and
+//!   quadgroup counts and thread positions), its invocations past them returning before the
+//!   object function's body, or, where the body holds a `threadgroup_barrier`, walking it to each
+//!   barrier without running anything else of it (the binder's region flag,
+//!   `RuntimeFact::PartialObjectThreadgroups`), on a device with `VK_EXT_mesh_shader` and emulated
+//!   alike.
 //! - **Refused**, as the binder refuses them: a threadgroup or a grid past the device's limits
 //!   for its stage (`Unsupported{MeshShading}` naming the limit; an object grid only on a device
-//!   that does not fold object grids), a `drawMeshThreads` that
-//!   leaves a partial object threadgroup (`NotImplemented(MeshShading)`: splitting the draw into
-//!   regions of their own threadgroup sizes would reorder its primitives), and an object
+//!   that does not fold object grids), and an object
 //!   function's arena with the lengths `setObjectThreadgroupMemoryLength:atIndex:` set
 //!   ([`RenderCommandEncoder::set_object_threadgroup_memory_length`]) past the device's workgroup
 //!   memory for the object stage (`Unsupported{ThreadgroupMemorySize}` naming the limit).
@@ -104,6 +110,7 @@ use crate::device::functions::Vk;
 use crate::draw_source::DrawSource;
 use crate::encoder::EncoderCore;
 use crate::error::{internal, invalid, Error, Problem};
+use crate::live_bind::LiveBind;
 use crate::owned_kernel::{OwnedKernel, OwnedModule, OwnedSets};
 use crate::pipeline::RawPipeline;
 use crate::resource::ResourceKey;
@@ -371,6 +378,7 @@ impl RenderLowering {
     /// The lowering of [`RenderCommandEncoder::draw_mesh_threadgroups`].
     pub(crate) fn draw_mesh_threadgroups(
         &mut self,
+        live: &mut LiveBind,
         groups: Size,
         threads_per_object_group: Size,
         threads_per_mesh_group: Size,
@@ -386,12 +394,13 @@ impl RenderLowering {
         let grid = MeshGrid::Threadgroups(axes(CALL, groups)?);
         let object = axes(CALL, threads_per_object_group)?;
         let mesh = axes(CALL, threads_per_mesh_group)?;
-        self.draw_mesh(CALL, grid, object, mesh)
+        self.draw_mesh(live, CALL, grid, object, mesh)
     }
 
     /// The lowering of [`RenderCommandEncoder::draw_mesh_threads`].
     pub(crate) fn draw_mesh_threads(
         &mut self,
+        live: &mut LiveBind,
         threads: Size,
         threads_per_object_group: Size,
         threads_per_mesh_group: Size,
@@ -407,7 +416,7 @@ impl RenderLowering {
         let grid = MeshGrid::Threads(axes(CALL, threads)?);
         let object = axes(CALL, threads_per_object_group)?;
         let mesh = axes(CALL, threads_per_mesh_group)?;
-        self.draw_mesh(CALL, grid, object, mesh)
+        self.draw_mesh(live, CALL, grid, object, mesh)
     }
 
     /// The direct mesh draw of `grid` for `call`, its object and mesh threadgroups of `object`
@@ -415,6 +424,7 @@ impl RenderLowering {
     /// an indirect command buffer's mesh command (`render/executions.rs`).
     pub(super) fn draw_mesh(
         &mut self,
+        live: &mut LiveBind,
         call: &'static str,
         grid: MeshGrid,
         object: [u32; 3],
@@ -440,12 +450,20 @@ impl RenderLowering {
                 threads_per_mesh_group: mesh,
             },
         };
-        self.draw(call, Assembly::Meshes, draw, DrawBuffers::default(), empty)
+        self.draw(
+            live,
+            call,
+            Assembly::Meshes,
+            draw,
+            DrawBuffers::default(),
+            empty,
+        )
     }
 
     /// The lowering of [`RenderCommandEncoder::draw_mesh_threadgroups_indirect`].
     pub(crate) fn draw_mesh_threadgroups_indirect(
         &mut self,
+        live: &mut LiveBind,
         indirect_buffer: &Buffer,
         indirect_buffer_offset: u64,
         threads_per_object_group: Size,
@@ -460,7 +478,7 @@ impl RenderLowering {
             )))
         });
         const CALL: &str = "draw_mesh_threadgroups_indirect";
-        self.core.check_device(CALL, indirect_buffer.device())?;
+        self.core.check_device(CALL, indirect_buffer.generation())?;
         // Arguments at an offset that is not a multiple of 4 draw nothing (the module docs).
         let aligned = indirect_buffer_offset.is_multiple_of(4);
         check_arguments(
@@ -493,7 +511,7 @@ impl RenderLowering {
             indirect: Some(indirect),
             ..DrawBuffers::default()
         };
-        self.draw(CALL, Assembly::Meshes, draw, buffers, false)
+        self.draw(live, CALL, Assembly::Meshes, draw, buffers, false)
     }
 
     /// Whether a mesh draw of `object` and `mesh` threads in its object and mesh threadgroups
@@ -815,8 +833,9 @@ impl RenderCommandEncoder {
         threads_per_mesh_group: Size,
     ) -> Result<(), Error> {
         match self.lowers_at_call() {
-            true => self.at_call(|lowering| {
+            true => self.draw_at_call(|lowering, live| {
                 lowering.draw_mesh_threadgroups(
+                    live,
                     groups,
                     threads_per_object_group,
                     threads_per_mesh_group,
@@ -842,8 +861,9 @@ impl RenderCommandEncoder {
         threads_per_mesh_group: Size,
     ) -> Result<(), Error> {
         match self.lowers_at_call() {
-            true => self.at_call(|lowering| {
+            true => self.draw_at_call(|lowering, live| {
                 lowering.draw_mesh_threads(
+                    live,
                     threads,
                     threads_per_object_group,
                     threads_per_mesh_group,
@@ -879,8 +899,9 @@ impl RenderCommandEncoder {
         threads_per_mesh_group: Size,
     ) -> Result<(), Error> {
         match self.lowers_at_call() {
-            true => self.at_call(|lowering| {
+            true => self.draw_at_call(|lowering, live| {
                 lowering.draw_mesh_threadgroups_indirect(
+                    live,
                     indirect_buffer,
                     indirect_buffer_offset,
                     threads_per_object_group,
@@ -928,7 +949,7 @@ impl MeshWork {
     /// and buffers are.
     pub(crate) fn new(core: &EncoderCore, dispatch: &MeshDispatch) -> Result<MeshWork, Error> {
         let device = core.device().clone();
-        let queue = core.command_buffer().command_queue().id();
+        let queue = core.command_buffer().queue_place().id();
         let mut state = core.command_buffer().state();
         let mut words = dispatch.work.clone();
         let mut set = |at: usize, value: u32| match words.get_mut(at) {
@@ -1012,7 +1033,7 @@ impl Scan {
             None => status,
         };
         set[MeshScanModule::RECORDS_BINDING as usize] = work.records;
-        let owned = OwnedSets::write(&device, &kernel, &[set.to_vec()])?;
+        let owned = OwnedSets::write(&device, &kernel, &[set])?;
         let sets = owned.sets.clone();
         core.retain(owned);
         Ok(Scan { kernel, sets })

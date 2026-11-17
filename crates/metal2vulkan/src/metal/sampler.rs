@@ -105,16 +105,132 @@ pub struct SamplerUse {
     /// The sampled texture has an integer format: border colors are then `INT_*`, and every
     /// filter is nearest.
     pub integer_texture: bool,
+    /// The shader hands a pixel sampler's coordinate in texels to the device's unnormalized
+    /// sampler (`VkSamplerCreateInfo::unnormalizedCoordinates`), at level 0 of a view of one level
+    /// and one layer, without an offset or a comparison: the sampler's state is one of pixel
+    /// coordinates, one minification and magnification filter, no mip filter or anisotropy, and
+    /// `s` and `t` clamped to the edge, to zero or to the border.
+    pub unnormalized: bool,
+    /// The GPU the device presents adds a sampler descriptor's `lodBias` to every sample's level,
+    /// as a Mac with an Intel or AMD GPU does: [`vk_sampler`] makes the device's `mipLodBias`
+    /// of it ([`device_lod_bias`]). Without it (the default) the sampler samples as an Apple GPU
+    /// of the families the runtime claims does, every level as with no bias. Not a fact of the
+    /// function: the consumer states it per bind, from the Mac it presents (the runtime's
+    /// `MacClass`), and a plan's uses leave it unset.
+    pub lod_bias: bool,
 }
 
 impl SamplerUse {
-    /// A use with the given comparison and texture numeric type.
+    /// A use with the given comparison and texture numeric type, in normalized coordinates, of
+    /// no LOD bias.
     pub fn new(compare: bool, integer_texture: bool) -> SamplerUse {
         SamplerUse {
             compare,
             integer_texture,
+            unnormalized: false,
+            lod_bias: false,
         }
     }
+
+    /// This use, reading texel coordinates through the device's unnormalized sampler where
+    /// `unnormalized` holds.
+    pub fn with_unnormalized(self, unnormalized: bool) -> SamplerUse {
+        SamplerUse {
+            unnormalized,
+            ..self
+        }
+    }
+
+    /// This use, adding the descriptor's `lodBias` to every sample's level where `lod_bias`
+    /// holds ([`SamplerUse::lod_bias`]).
+    pub fn with_lod_bias(self, lod_bias: bool) -> SamplerUse {
+        SamplerUse { lod_bias, ..self }
+    }
+}
+
+/// The LOD bias a device's sampler adds to every sample's level for a sampler descriptor's
+/// `lodBias`, on a GPU that adds it ([`SamplerUse::lod_bias`]; [`device_lod_bias`]). Vulkan adds
+/// a sampler's `mipLodBias` to every sample's level, an explicit level's included, and takes one
+/// of at most `maxSamplerLodBias` (`VUID-VkSamplerCreateInfo-mipLodBias-01069`), and a
+/// portability subset without `samplerMipLodBias` none but 0. Each variant but `Exact` is a
+/// near-equivalent, which the runtime announces as it makes the state
+/// (`Degradation::CappedLodBias`).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DeviceLodBias {
+    /// The descriptor's bias, which the device's sampler takes as it is (0 included).
+    Exact(f32),
+    /// A bias past the device's `maxSamplerLodBias`, an infinity included: the device's sampler
+    /// adds that limit, of the bias's sign. Metal's GPU clamps the biased level into the
+    /// texture's levels (an AMD Radeon Pro 5300M and an Intel UHD 630), so this reads Metal's
+    /// level wherever the level with the limit added already reaches the last level the sampler
+    /// reads (a positive bias) or level 0 (a negative one).
+    Capped(f32),
+    /// A bias other than 0 on a device whose portability subset withholds `samplerMipLodBias`
+    /// (MoltenVK): the device's sampler adds none.
+    Withheld,
+    /// A NaN bias: the device's sampler adds none. What a Mac's GPU samples for it is not
+    /// measured.
+    NotANumber,
+}
+
+impl DeviceLodBias {
+    /// The bias the device's sampler adds: its `mipLodBias`.
+    pub fn bias(self) -> f32 {
+        match self {
+            DeviceLodBias::Exact(bias) | DeviceLodBias::Capped(bias) => bias,
+            DeviceLodBias::Withheld | DeviceLodBias::NotANumber => 0.0,
+        }
+    }
+}
+
+/// The LOD bias the device of `profile` adds to every sample's level for a sampler descriptor's
+/// `lod_bias`, on a GPU that adds it ([`DeviceLodBias`]): the bias where the device takes it,
+/// `-0.0` as `0.0`; else the nearest it takes.
+pub fn device_lod_bias(lod_bias: f32, profile: &DeviceProfile) -> DeviceLodBias {
+    if lod_bias.is_nan() {
+        return DeviceLodBias::NotANumber;
+    }
+    // Adding `0.0` takes `-0.0` to `0.0`.
+    let bias = lod_bias + 0.0;
+    if bias == 0.0 {
+        return DeviceLodBias::Exact(bias);
+    }
+    if (profile.fields().enabled).portability_withholds(VkFeature::SamplerMipLodBias) {
+        return DeviceLodBias::Withheld;
+    }
+    let limit = f32::from_bits(profile.fields().limits.max_sampler_lod_bias_bits).max(0.0);
+    if bias.abs() > limit {
+        DeviceLodBias::Capped(limit.copysign(bias))
+    } else {
+        DeviceLodBias::Exact(bias)
+    }
+}
+
+/// Whether the device's unnormalized sampler (`VkSamplerCreateInfo::unnormalizedCoordinates`)
+/// reads a sampler of `desc` in pixel coordinates as it is: pixel coordinates, one minification
+/// and magnification filter (nearest or linear), no mip filter and no anisotropy, and on the `s`
+/// and `t` axes clamping to the edge, to zero or to its border, which the device's
+/// `CLAMP_TO_EDGE` and `CLAMP_TO_BORDER` are. These are Vulkan's limits on such a sampler
+/// (`VUID-VkSamplerCreateInfo-unnormalizedCoordinates-01072` to `-01076`; a comparison,
+/// `-01077`, is the use's), and the Metal Shading Language's rule for a constexpr `coord::pixel`
+/// sampler.
+pub(crate) fn unnormalized_reads(desc: &SamplerDescriptor) -> bool {
+    let clamps = |m: SamplerAddressMode| {
+        matches!(
+            m,
+            SamplerAddressMode::ClampToEdge
+                | SamplerAddressMode::ClampToZero
+                | SamplerAddressMode::ClampToBorderColor
+        )
+    };
+    !desc.normalized_coordinates
+        && desc.min_filter == desc.mag_filter
+        && desc.min_filter != SamplerMinMagFilter::Cubic
+        && desc.mip_filter == SamplerMipFilter::NotMipmapped
+        && desc.max_anisotropy <= 1
+        && clamps(desc.s_address_mode)
+        && clamps(desc.t_address_mode)
 }
 
 /// The `(minLod, maxLod)` of a sampler without a mip filter whose descriptor clamps the level to
@@ -144,6 +260,17 @@ pub const NOT_MIPMAPPED_MAX_LOD: f32 = 0.25;
 /// The last level a word's level field names: past every texture's last level (Metal's largest
 /// textures have 15 levels, the last level 14), so a bound at or past it clamps nothing.
 pub(crate) const LAST_WORD_LEVEL: u32 = 15;
+
+/// The `minLod` of a mipmapped sampler whose descriptor raises the level to `lo`: `lo` at or above
+/// 0, and at most [`LAST_WORD_LEVEL`]. Vulkan clamps the level into `[minLod, maxLod]` and then to
+/// the view's last level, so every bound at or past `LAST_WORD_LEVEL`, which is past every
+/// texture's last level, reads the last level alike; the device is handed the one it can hold. A
+/// driver may convert the bound to a fixed-point level: lavapipe on x86-64 (Mesa 26.0.8 and
+/// 26.2.4) reads a `minLod` of `f32::MAX` as level 0, where Metal's `lodMinClamp` of `FLT_MAX`
+/// reads the last level.
+pub(crate) fn mipmapped_min_lod(lo: f32) -> f32 {
+    lo.clamp(0.0, LAST_WORD_LEVEL as f32)
+}
 
 /// Metal's level clamp bound `c` on the sixty-fourths grid of its level and weight: its value at or
 /// above 0, truncated onto sixty-fourths. Metal clamps a sample's level into the sampler's clamp
@@ -301,13 +428,39 @@ pub(crate) fn vk_filtering(
 /// a nearest mip filter's next level past one half; MoltenVK hands the clamp to Metal's sampler,
 /// which does so itself.
 ///
-/// Refusals are [`check_sampler`]'s, for the descriptor's shape and the use.
+/// Its `mipLodBias` follows the GPU the device presents ([`SamplerUse::lod_bias`]). Vulkan adds
+/// `mipLodBias` to every sample's level, an explicit one's included (the specification's
+/// "Level-of-Detail Operation"). An Apple GPU of the families the runtime claims samples every
+/// level as with no bias ([`SamplerDescriptor::lod_bias`]): without `lod_bias` it is 0, whatever
+/// the descriptor's. A Mac with an Intel or AMD GPU adds the bias to every sample's level, an
+/// explicit level's, a gradient's and an implicit one's alike, and clamps the sum into the
+/// texture's levels (an AMD Radeon Pro 5300M and an Intel UHD 630, as the consumer's probe
+/// measured them): with `lod_bias` it is [`device_lod_bias`]'s, the descriptor's bias within the
+/// device's `maxSamplerLodBias` and where a portability subset withholds `samplerMipLodBias`
+/// none, never a refusal; the device clamps its sum with a sample's own `Bias` into that limit, as
+/// it clamps the sample's bias alone. A use that reads texel coordinates takes none: such a
+/// sampler reads level 0 by one filter, so a bias selects nothing.
+///
+/// A use that reads texel coordinates ([`SamplerUse::unnormalized`]) takes the device's
+/// unnormalized sampler: its filters, address modes and border as above, the nearest mip mode at
+/// the level clamp `[0, 0]` (which Vulkan requires; a pixel sampler reads level 0 by one filter),
+/// and no anisotropy or comparison.
+///
+/// Refusals are [`check_sampler`]'s, for the descriptor's shape and the use; a use that reads
+/// texel coordinates through any other sampler state than [`SamplerUse::unnormalized`] names, or
+/// with a comparison, is an internal error.
 pub fn vk_sampler(
     desc: &SamplerDescriptor,
     use_: SamplerUse,
     profile: &DeviceProfile,
 ) -> Result<vk::SamplerDesc, Error> {
     check_sampler(&desc.shape(), use_, profile)?;
+    if use_.unnormalized && (use_.compare || !unnormalized_reads(desc)) {
+        return Err(Error::Internal(crate::error::InternalError::new(
+            crate::error::InternalKind::Invariant,
+            "an unnormalized sampler of a state the device's cannot read so",
+        )));
+    }
     let limits = &profile.fields().limits;
     let modes = [
         desc.s_address_mode,
@@ -331,10 +484,11 @@ pub fn vk_sampler(
     // Metal filters a `maxAnisotropy` rounded up to a power of two (3 as 4, 5 to 7 as 8, 9 to 15
     // as 16, a runtime and a constexpr sampler alike), so the device is handed that degree where
     // it is handed anisotropy at all (`device_anisotropy`).
-    let max_anisotropy = device_anisotropy(desc, use_, profile).then(|| {
-        let limit = f32::from_bits(limits.max_sampler_anisotropy_bits).max(1.0);
-        (desc.max_anisotropy.next_power_of_two() as f32).min(limit)
-    });
+    let max_anisotropy =
+        (device_anisotropy(desc, use_, profile) && !use_.unnormalized).then(|| {
+            let limit = f32::from_bits(limits.max_sampler_anisotropy_bits).max(1.0);
+            (desc.max_anisotropy.next_power_of_two() as f32).min(limit)
+        });
 
     let (lo, hi) = (desc.lod_min_clamp, desc.lod_max_clamp);
     let linear_mip = if use_.integer_texture {
@@ -357,6 +511,7 @@ pub fn vk_sampler(
             .properties
             .contains(&VkProperty::MetalSampler);
     let (mipmap_mode, min_lod, max_lod) = match desc.mip_filter {
+        _ if use_.unnormalized => (vk::SamplerMipmapMode::NEAREST, 0.0, 0.0),
         SamplerMipFilter::NotMipmapped if own_anisotropic => {
             (vk::SamplerMipmapMode::NEAREST, 0.0, 0.0)
         }
@@ -364,8 +519,8 @@ pub fn vk_sampler(
             let (min_lod, max_lod) = not_mipmapped_lods(lo, hi);
             (vk::SamplerMipmapMode::NEAREST, min_lod, max_lod)
         }
-        SamplerMipFilter::Nearest => (vk::SamplerMipmapMode::NEAREST, lo.max(0.0), hi),
-        SamplerMipFilter::Linear => (linear_mip, lo.max(0.0), hi),
+        SamplerMipFilter::Nearest => (vk::SamplerMipmapMode::NEAREST, mipmapped_min_lod(lo), hi),
+        SamplerMipFilter::Linear => (linear_mip, mipmapped_min_lod(lo), hi),
     };
     let filter = |f| {
         if use_.integer_texture {
@@ -382,7 +537,10 @@ pub fn vk_sampler(
         address_mode_u: address[0],
         address_mode_v: address[1],
         address_mode_w: address[2],
-        mip_lod_bias: 0.0,
+        mip_lod_bias: match use_.lod_bias && !use_.unnormalized {
+            true => device_lod_bias(desc.lod_bias, profile).bias(),
+            false => 0.0,
+        },
         max_anisotropy,
         compare: use_.compare.then(|| compare_op(desc.compare_function)),
         min_lod,
@@ -391,6 +549,7 @@ pub fn vk_sampler(
         reduction: vk::SamplerReductionMode::WEIGHTED_AVERAGE,
         border_components: None,
         ycbcr: None,
+        unnormalized: use_.unnormalized,
     })
 }
 
@@ -689,6 +848,37 @@ fn through(m: vk::ComponentMapping, texel: [bool; 4]) -> [bool; 4] {
 pub(crate) const BORDER_COLORS: [[bool; 4]; 3] =
     [[false; 4], [false, false, false, true], [true; 4]];
 
+/// The `SpecKey::BorderTexels` of a texture of `pf` made with `swizzle`: bit `3c + b` is set where
+/// channel `c` (0 red to 3 alpha) of Metal's border texel ([`border_texel`]) for border color `b`
+/// (`MTLSamplerBorderColor`'s value, as [`BORDER_COLORS`] orders them) reads 1, not 0: the texel a
+/// Metal 4.1 read through a sampler hands back at an index outside the level on a border axis
+/// (`lower::texture::Through`). A color format's channels are its own
+/// ([`channels`](crate::metal::format::channels)). A depth or stencil format reads as red, green
+/// and blue, alpha 1: an Apple M3 Max (macOS 27.0.1) reads `Depth32Float` through a
+/// `texture2d<float>` as `(d, d, d, 1)` and its border as `(0, 0, 0, 1)`, `(0, 0, 0, 1)` and
+/// `(1, 1, 1, 1)` for the three colors; the other depth and stencil formats take that rule, an
+/// inference. `None` for a format of no stated channels (the placeholders).
+pub(crate) fn border_texels(pf: PixelFormat, swizzle: TextureSwizzleChannels) -> Option<u32> {
+    let present = match crate::metal::format::is_depth_stencil(pf) {
+        true => [true, true, true, false],
+        false => crate::metal::format::channels(pf)?,
+    };
+    let mut bits = 0;
+    for (b, color) in (0u32..).zip(BORDER_COLORS) {
+        for (c, one) in (0u32..).zip(border_texel(pf, present, swizzle, color)) {
+            if one {
+                bits |= 1 << (3 * c + b);
+            }
+        }
+    }
+    Some(bits)
+}
+
+/// The [`border_texels`] of a slot bound to nothing, whose neutral texture reads zero: a
+/// four-channel format's without a swizzle (alpha 1 under opaque black, every channel 1 under
+/// opaque white).
+pub(crate) const NEUTRAL_BORDER_TEXELS: u32 = 0b110_100_100_100;
+
 /// Metal's texel at the border of a texture of `pf` whose channels are `present` (red, green, blue,
 /// alpha), made with `swizzle`, for the border color `color` (`[r, g, b, a]`, each 0 or 1): each
 /// channel the format has is the color's, but `A8Unorm`'s alpha, which is the color's red, and a
@@ -933,6 +1123,14 @@ impl SamplerWord {
         | Self::ADDRESS[1]
         | Self::ADDRESS[2]
         | Self::BORDER;
+    /// The fields a Metal 4.1 read through a runtime sampler reads of its word
+    /// (`lower::texture::Through`): the address modes, which decide whether an index outside the
+    /// level reads the edge or the border texel; the border color; and the mip filter, which decides
+    /// whether the read reads at its level or the base level. The filters, coordinates,
+    /// comparison, reduction and anisotropy change nothing the read hands back (measured on an Apple
+    /// M3 Max), so samplers that differ only there share its pipeline.
+    pub const READ_STATE: u32 =
+        Self::MIP_FILTER | Self::ADDRESS[0] | Self::ADDRESS[1] | Self::ADDRESS[2] | Self::BORDER;
     /// The word of `desc`.
     pub fn of(desc: &SamplerDescriptor) -> SamplerWord {
         let mut w = 0;
@@ -970,21 +1168,15 @@ impl SamplerWord {
         SamplerWord(w)
     }
 
-    /// The bits a sample without comparison through a pixel sampler tests to read its texel
-    /// exactly by a fetch (the rule for a constexpr sampler), on an image of `plane` axes (1 to 3)
-    /// whose texels are `integer` or not: the word masked by them is
+    /// The bits a sample through a pixel sampler tests to read the texel its coordinate names at
+    /// that texel's centre (the rule for a constexpr sampler), of a texture whose texels are
+    /// `integer` or not: the word masked by them is
     /// [`PIXEL_COORDINATES`](Self::PIXEL_COORDINATES) exactly for a sampler with pixel
-    /// coordinates that reads one level isotropically (no mip filter, not anisotropic), clamps
-    /// each of the image's plane axes to the edge, and filters nearest unless the texture is
-    /// integer, whose sample is nearest whatever the filters say.
-    pub fn exact_fetch(plane: u8, integer: bool) -> u32 {
+    /// coordinates that reads one level isotropically (no mip filter, not anisotropic) and filters
+    /// nearest unless the texture is integer, whose sample is nearest whatever the filters say.
+    /// Its address modes and border are the device sampler's own, at any value.
+    pub fn nearest_pixel(integer: bool) -> u32 {
         let mut mask = Self::PIXEL_COORDINATES | Self::MIP_FILTER | Self::ANISOTROPIC;
-        for address in Self::ADDRESS
-            .into_iter()
-            .take(usize::from(plane.clamp(1, 3)))
-        {
-            mask |= address;
-        }
         if !integer {
             mask |= Self::MIN_LINEAR | Self::MAG_LINEAR;
         }
@@ -1018,6 +1210,7 @@ mod tests {
             max_anisotropy: 1,
             compare_function: CompareFunction::Never,
             reduction_mode: SamplerReductionMode::WeightedAverage,
+            lod_bias: 0.0,
         }
     }
 
@@ -1166,6 +1359,159 @@ mod tests {
         assert_eq!(s.reduction, vk::SamplerReductionMode::WEIGHTED_AVERAGE);
     }
 
+    /// A descriptor's LOD bias makes, on every committed device and for every use, the binding
+    /// shape its zero bias makes, and the Vulkan sampler its zero bias makes but for its
+    /// `mipLodBias`: without `SamplerUse::lod_bias` (an Apple GPU of the families the runtime
+    /// claims, which samples every level as with no bias) 0; with it (a Mac with an Intel or AMD
+    /// GPU) `device_lod_bias`'s, the bias within the device's `maxSamplerLodBias` and none through
+    /// a portability subset that withholds `samplerMipLodBias`, and 0 for a use of texel
+    /// coordinates. Refused nowhere: past the limit, NaN or infinite, and withheld.
+    #[test]
+    fn a_lod_bias_is_the_device_s_where_the_use_adds_it() {
+        use crate::bind::state::BoundSampler;
+        use SamplerMinMagFilter::{Linear, Nearest};
+        let biases = [
+            1.0,
+            -1.0,
+            0.5,
+            -0.0,
+            15.999,
+            16.0,
+            -16.0,
+            16.5,
+            -17.0,
+            100.0,
+            -1000.0,
+            f32::MAX,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        let (mut checked, mut past_limit, mut withheld) = (0, 0, 0);
+        for (stem, description) in committed_descriptions() {
+            let dev = Device::new(description, DevicePolicy::default()).unwrap();
+            let p = dev.profile();
+            let limit = f32::from_bits(p.fields().limits.max_sampler_lod_bias_bits);
+            if p.fields()
+                .enabled
+                .portability_withholds(VkFeature::SamplerMipLodBias)
+            {
+                withheld += 1;
+            }
+            let mut descs = Vec::new();
+            for mip in [
+                SamplerMipFilter::NotMipmapped,
+                SamplerMipFilter::Nearest,
+                SamplerMipFilter::Linear,
+            ] {
+                for (min, mag) in [(Linear, Linear), (Linear, Nearest), (Nearest, Linear)] {
+                    let mut d = metal_default();
+                    (d.mip_filter, d.min_filter, d.mag_filter) = (mip, min, mag);
+                    d.lod_min_clamp = 1.0;
+                    d.lod_max_clamp = 3.0;
+                    for (compare, integer) in
+                        [(false, false), (true, false), (false, true), (true, true)]
+                    {
+                        descs.push((d, SamplerUse::new(compare, integer)));
+                    }
+                }
+            }
+            let mut pixel = metal_default();
+            pixel.normalized_coordinates = false;
+            pixel.mag_filter = Linear;
+            pixel.min_filter = Linear;
+            descs.push((pixel, SamplerUse::default().with_unnormalized(true)));
+            for (unbiased, plain) in descs {
+                let want = vk_sampler(&unbiased, plain, p);
+                let shape = BoundSampler::new(unbiased).shape();
+                for bias in biases {
+                    let mut d = unbiased;
+                    d.lod_bias = bias;
+                    for use_ in [plain, plain.with_lod_bias(true)] {
+                        let added = match use_.lod_bias && !use_.unnormalized {
+                            true => device_lod_bias(bias, p).bias(),
+                            false => 0.0,
+                        };
+                        assert!(added.abs() <= limit, "{stem}: bias {bias}");
+                        let got = vk_sampler(&d, use_, p).map(|mut s| {
+                            assert_eq!(
+                                s.mip_lod_bias.to_bits(),
+                                added.to_bits(),
+                                "{stem}: bias {bias}, {use_:?}"
+                            );
+                            s.mip_lod_bias = 0.0;
+                            s
+                        });
+                        assert_eq!(got, want, "{stem}: bias {bias}, {d:?} {use_:?}");
+                        checked += 1;
+                    }
+                    assert_eq!(BoundSampler::new(d).shape(), shape, "{stem}: bias {bias}");
+                    past_limit += usize::from(bias.abs() > limit);
+                }
+            }
+        }
+        // The cases above reach a device that withholds `samplerMipLodBias` (MoltenVK) and biases
+        // past every device's limit.
+        assert!(withheld > 0 && past_limit > 0, "{withheld} {past_limit}");
+        assert!(checked > 0);
+    }
+
+    /// The bias a device adds for a descriptor's `lod_bias` where the GPU it presents adds it: the
+    /// bias, `-0` as `0`, within `maxSamplerLodBias`; the limit of its sign past it, an infinity
+    /// included; none for a NaN; and none for a bias other than 0 through a portability subset
+    /// that withholds `samplerMipLodBias`, whose 0 is exact.
+    #[test]
+    fn the_device_lod_bias_is_the_bias_within_what_the_device_takes() {
+        use DeviceLodBias::{Capped, Exact, NotANumber, Withheld};
+        let mut floor = committed_descriptions()
+            .into_iter()
+            .find(|(s, _)| s == "vk12-floor")
+            .unwrap()
+            .1;
+        floor.limits.max_sampler_lod_bias_bits = 15.5f32.to_bits();
+        let floor = Device::new(floor, DevicePolicy::default()).unwrap();
+        let p = floor.profile();
+        assert!(!(p.fields().enabled).portability_withholds(VkFeature::SamplerMipLodBias));
+        let exact = |b: f32| match device_lod_bias(b, p) {
+            Exact(got) => got.to_bits(),
+            other => panic!("bias {b}: {other:?}"),
+        };
+        for b in [0.0, 1.0, -1.0, 0.25, 15.5, -15.5] {
+            assert_eq!(exact(b), b.to_bits(), "bias {b}");
+        }
+        assert_eq!(exact(-0.0), 0f32.to_bits());
+        for (b, want) in [
+            (15.75, 15.5),
+            (16.0, 15.5),
+            (-100.0, -15.5),
+            (f32::MAX, 15.5),
+            (f32::INFINITY, 15.5),
+            (f32::NEG_INFINITY, -15.5),
+        ] {
+            assert_eq!(device_lod_bias(b, p), Capped(want), "bias {b}");
+        }
+        assert_eq!(device_lod_bias(f32::NAN, p), NotANumber);
+        assert_eq!(device_lod_bias(-f32::NAN, p).bias().to_bits(), 0);
+        let (stem, mvk) = committed_descriptions()
+            .into_iter()
+            .map(|(stem, d)| (stem, Device::new(d, DevicePolicy::default()).unwrap()))
+            .find(|(_, dev)| {
+                (dev.profile().fields().enabled).portability_withholds(VkFeature::SamplerMipLodBias)
+            })
+            .expect("a committed device withholds samplerMipLodBias");
+        let p = mvk.profile();
+        for b in [1.0, -1.0, 0.25, 100.0, f32::INFINITY] {
+            assert_eq!(device_lod_bias(b, p), Withheld, "{stem}: bias {b}");
+            assert_eq!(
+                device_lod_bias(b, p).bias().to_bits(),
+                0,
+                "{stem}: bias {b}"
+            );
+        }
+        assert_eq!(device_lod_bias(0.0, p), Exact(0.0), "{stem}");
+        assert_eq!(device_lod_bias(f32::NAN, p), NotANumber, "{stem}");
+    }
+
     /// A sampler without a mip filter reads the base level, its minification filter exactly where
     /// Metal's level raised to `lodMinClamp` and lowered to `lodMaxClamp` is above 0 (the device's
     /// `λ > 0`), as Metal chooses between a min and a mag filter that differ.
@@ -1192,6 +1538,48 @@ mod tests {
                 let device = l.clamp(s.min_lod, s.max_lod) > 0.0;
                 let metal = l.max(lo).min(hi) > 0.0;
                 assert_eq!(device, metal, "{lo} {hi} at {l}");
+            }
+        }
+    }
+
+    /// A mipmapped sampler hands the device a `minLod` it can hold, at most [`LAST_WORD_LEVEL`],
+    /// and every view's level under it is the level under the descriptor's own clamps: a
+    /// `lodMinClamp` of `f32::MAX` reads the last level, which lavapipe on x86-64 read as level 0
+    /// when handed `f32::MAX` itself.
+    #[test]
+    fn a_mipmapped_samplers_min_lod_is_held_past_every_last_level() {
+        let dev = device(&[], &[]);
+        for mip_filter in [SamplerMipFilter::Nearest, SamplerMipFilter::Linear] {
+            for (lo, hi) in [
+                (0.0, f32::MAX),
+                (1.5, f32::MAX),
+                (14.0, f32::MAX),
+                (15.0, f32::MAX),
+                (16.0, 20.0),
+                (1000.0, f32::MAX),
+                (f32::MAX, f32::MAX),
+                (-2.0, 3.0),
+            ] {
+                let mut d = metal_default();
+                d.mip_filter = mip_filter;
+                d.lod_min_clamp = lo;
+                d.lod_max_clamp = hi;
+                let s = vk_sampler(&d, SamplerUse::default(), dev.profile()).unwrap();
+                assert_eq!(
+                    s.min_lod,
+                    lo.clamp(0.0, LAST_WORD_LEVEL as f32),
+                    "{lo} {hi}"
+                );
+                assert!(s.min_lod <= s.max_lod, "{lo} {hi}");
+                // Vulkan's level: the clamped level, then the view's last level `q`.
+                for q in 0..LAST_WORD_LEVEL {
+                    let last = q as f32;
+                    for l in [-1.0f32, 0.0, 0.5, 1.0, 1.5, 7.0, 14.0, 15.0, 100.0] {
+                        let device = l.clamp(s.min_lod, s.max_lod).clamp(0.0, last);
+                        let metal = l.max(lo).min(hi).clamp(0.0, last);
+                        assert_eq!(device, metal, "{lo} {hi} at {l} of {q}");
+                    }
+                }
             }
         }
     }
@@ -2080,11 +2468,11 @@ mod tests {
         assert_eq!(of(&|d| d.lod_average = true), 0);
     }
 
-    /// The word answers the pixel samplers' predicates. A sampler with normalized coordinates
-    /// answers neither. A pixel sampler's exact fetch ([`SamplerWord::exact_fetch`]) needs one
-    /// isotropic level (no mip filter, not anisotropic), clamping to the edge on each of the
-    /// image's plane axes (the others do not matter), and nearest filters unless the texture is
-    /// integer.
+    /// The word's linear predicate (`SamplerWord::LINEAR_FILTER` masked to `SamplerWord::LINEAR`)
+    /// holds for linear minification and magnification filters of one isotropic level, whatever
+    /// the coordinates, addressing, border, comparison and reduction; the state an emulated
+    /// sample reads (`SamplerWord::LINEAR_STATE`) is every field but the comparison, the
+    /// reduction, the level clamps and the cubic filter.
     #[test]
     fn a_sampler_word_answers_the_linear_predicate() {
         use SamplerMinMagFilter as F;
@@ -2215,63 +2603,55 @@ mod tests {
         assert_eq!(lods(&d, SamplerUse::default()).0, 0.0);
     }
 
+    /// The word answers the pixel samplers' predicates. A sampler with normalized coordinates
+    /// answers neither. A pixel sampler's sample at its texel's centre
+    /// ([`SamplerWord::nearest_pixel`]) needs one isotropic level (no mip filter, not
+    /// anisotropic) and nearest filters unless the texture is integer, whatever its address modes
+    /// and border.
     #[test]
     fn a_sampler_word_answers_the_pixel_predicates() {
         use SamplerMinMagFilter as F;
         let holds = |d: &SamplerDescriptor, mask: u32| {
             (SamplerWord::of(d).0 & mask) == SamplerWord::PIXEL_COORDINATES
         };
-        let fetch = |d: &SamplerDescriptor, plane: u8, integer: bool| {
-            holds(d, SamplerWord::exact_fetch(plane, integer))
-        };
+        let centre =
+            |d: &SamplerDescriptor, integer: bool| holds(d, SamplerWord::nearest_pixel(integer));
         let normalized = metal_default();
         assert!(!holds(&normalized, SamplerWord::PIXEL_COORDINATES));
         let mut pixel = metal_default();
         pixel.normalized_coordinates = false;
         assert!(holds(&pixel, SamplerWord::PIXEL_COORDINATES));
-        for plane in 1..=3 {
-            for integer in [false, true] {
-                assert!(!fetch(&normalized, plane, integer));
-                assert!(fetch(&pixel, plane, integer), "{plane} {integer}");
-            }
+        for integer in [false, true] {
+            assert!(!centre(&normalized, integer));
+            assert!(centre(&pixel, integer), "{integer}");
         }
         for (min, mag) in [
             (F::Nearest, F::Nearest),
             (F::Linear, F::Nearest),
             (F::Nearest, F::Linear),
+            (F::Linear, F::Linear),
         ] {
             let mut d = pixel;
             d.min_filter = min;
             d.mag_filter = mag;
             let nearest = min == F::Nearest && mag == F::Nearest;
-            assert_eq!(fetch(&d, 2, false), nearest, "{min:?} {mag:?}");
-            assert!(fetch(&d, 2, true), "{min:?} {mag:?}");
+            assert_eq!(centre(&d, false), nearest, "{min:?} {mag:?}");
+            assert!(centre(&d, true), "{min:?} {mag:?}");
         }
         for mip in [SamplerMipFilter::Nearest, SamplerMipFilter::Linear] {
             let mut d = pixel;
             d.mip_filter = mip;
-            assert!(!fetch(&d, 1, true), "{mip:?}");
+            assert!(!centre(&d, true), "{mip:?}");
         }
         let mut d = pixel;
         d.max_anisotropy = 2;
-        assert!(!fetch(&d, 1, true));
+        assert!(!centre(&d, true));
         for &mode in SamplerAddressMode::ALL {
-            let edge = mode == SamplerAddressMode::ClampToEdge;
-            for axis in 0..3u8 {
+            for &border in SamplerBorderColor::ALL {
                 let mut d = pixel;
-                match axis {
-                    0 => d.s_address_mode = mode,
-                    1 => d.t_address_mode = mode,
-                    _ => d.r_address_mode = mode,
-                }
-                for plane in 1..=3u8 {
-                    let read = axis < plane;
-                    assert_eq!(
-                        fetch(&d, plane, false),
-                        edge || !read,
-                        "{axis} {plane} {mode:?}"
-                    );
-                }
+                (d.s_address_mode, d.t_address_mode, d.r_address_mode) = (mode, mode, mode);
+                d.border_color = border;
+                assert!(centre(&d, false), "{mode:?} {border:?}");
             }
         }
     }

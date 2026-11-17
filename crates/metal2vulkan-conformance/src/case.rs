@@ -173,8 +173,7 @@ pub enum ArgumentSlot {
 ///
 /// Every field of the descriptor is here, and both sides set every one of them, so a field a case
 /// leaves alone is Metal's own default **set by the case** rather than a field one leg never
-/// touched. The one Metal property left out is `lodBias`, which the runtime's
-/// `SamplerDescriptor` has no counterpart for, so a case stating it could reach only one leg.
+/// touched.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SamplerSpec {
     pub min_filter: SamplerMinMagFilter,
@@ -201,6 +200,8 @@ pub struct SamplerSpec {
     pub compare_function: CompareFunction,
     /// `reductionMode`: how a linear footprint's texels are combined.
     pub reduction_mode: SamplerReductionMode,
+    /// `lodBias`: what the sampler adds to a sample's level, where the GPU applies it.
+    pub lod_bias: f32,
     /// `supportArgumentBuffers`: whether the state has a GPU resource ID, which is what an
     /// argument buffer needs of it ([`ArgumentSlot::Sampler`]). Metal gives a state made without
     /// it no resource ID at all.
@@ -210,7 +211,8 @@ pub struct SamplerSpec {
 impl SamplerSpec {
     /// `MTLSamplerDescriptor`'s defaults: nearest filtering without mipmaps, clamp to edge on all
     /// three axes, transparent black borders, normalized coordinates, LOD clamps `[0, FLT_MAX]`,
-    /// no quad-averaged level, no anisotropy, no comparison, and weighted-average reduction.
+    /// no quad-averaged level, no anisotropy, no comparison, weighted-average reduction, and no
+    /// LOD bias.
     pub const fn new() -> Self {
         Self {
             min_filter: SamplerMinMagFilter::Nearest,
@@ -227,6 +229,7 @@ impl SamplerSpec {
             max_anisotropy: 1,
             compare_function: CompareFunction::Never,
             reduction_mode: SamplerReductionMode::WeightedAverage,
+            lod_bias: 0.0,
             support_argument_buffers: false,
         }
     }
@@ -258,7 +261,7 @@ impl SamplerSpec {
     /// is a change to the case's inputs.
     ///
     /// **A field is a word only where it is not Metal's default.** `supportArgumentBuffers`
-    /// established the pattern and the eight fields added beside it keep it, for one reason: a
+    /// established the pattern and the nine fields added beside it keep it, for one reason: a
     /// state at the default of every one of them fingerprints exactly as it did before those
     /// fields existed, so every committed recording stays the answer to the inputs it was taken
     /// from and not one of them decays. The two forms still fingerprint apart — one carries the
@@ -311,6 +314,10 @@ impl SamplerSpec {
         }
         if self.reduction_mode != default.reduction_mode {
             tagged(7, self.reduction_mode.as_raw());
+        }
+        // As the clamps, by its bits.
+        if self.lod_bias.to_bits() != default.lod_bias.to_bits() {
+            tagged(8, self.lod_bias.to_bits());
         }
         words.iter().flat_map(|word| word.to_le_bytes()).collect()
     }
@@ -457,6 +464,10 @@ pub struct Failure {
     /// What the venue lacks, where the typed refusal names capabilities a device could enable or
     /// a measured driver defect ([`device_gap`]). `None` where the refusal is ours to answer for.
     pub lacks: Option<String>,
+    /// The typed runtime error's own text where the failure is one ([`Failure::of`]); `None` for
+    /// a failure outside the runtime's typed errors. What a run that stopped at it reports
+    /// ([`Abort::stopped`]).
+    refusal: Option<String>,
 }
 
 impl Failure {
@@ -468,6 +479,7 @@ impl Failure {
                 payload: Box::new(Value::Lines(vec![error.to_string()])),
             },
             lacks: device_gap(error),
+            refusal: Some(error.to_string()),
         }
     }
 
@@ -495,6 +507,7 @@ impl Failure {
                 payload: Box::new(payload),
             },
             lacks: None,
+            refusal: None,
         }
     }
 
@@ -558,6 +571,7 @@ impl Failure {
         Self {
             error: Value::fields([(part, Value::Uint(index as u64)), (REFUSED, self.error)]),
             lacks: self.lacks,
+            refusal: self.refusal,
         }
     }
 }
@@ -612,6 +626,20 @@ pub struct Abort {
     pub failure: Failure,
 }
 
+impl Abort {
+    /// The line a run that stopped here reports, then the site: what the venue lacks where the
+    /// refusal is its own gap, else the typed runtime error the call answered, else that the call
+    /// did not answer (a failure outside the runtime's typed errors).
+    pub fn stopped(&self) -> String {
+        let what = match (&self.failure.lacks, &self.failure.refusal) {
+            (Some(lacks), _) => lacks.clone(),
+            (None, Some(error)) => format!("refused {error}"),
+            (None, None) => "a call did not answer".to_owned(),
+        };
+        format!("{what}, at {}", self.at)
+    }
+}
+
 /// The venue a side runs on: what a result carries so a report can say where it ran. A case never
 /// branches on any of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -622,6 +650,17 @@ pub struct Venue {
     pub driver: String,
     /// The API version the device runs.
     pub api: String,
+    /// Whether the device presents a Mac that keeps textures losslessly compressed
+    /// (`DeviceProperties::lossless_compression`), as the Apple silicon Mac every recording was
+    /// taken on does: what a venue's own answer (`Justification::WithoutCompression`) holds by.
+    pub lossless_compression: bool,
+    /// For a CPU implementation (`DeviceKind::Cpu`), the host's widest vector instruction set
+    /// ([`host_vector_isa`]), which its shader compiler targets; `None` for a GPU. The device's
+    /// name and driver do not carry it, and its answers follow it: one llvmpipe build (Mesa 26.2.6,
+    /// LLVM 23.1.4) stored a code from Metal's at 6,496 texels of `fetch-ordered-rgba8unorm-srgb`'s
+    /// `x3` on a host with AVX-512 (a Ryzen 7 7840HS) and at 6,304 on one with AVX2 alone (an
+    /// i9-13900H).
+    pub host: Option<String>,
 }
 
 impl Venue {
@@ -633,7 +672,51 @@ impl Venue {
 
 impl std::fmt::Display for Venue {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(out, "{} ({}, API {})", self.device, self.driver, self.api)
+        write!(out, "{}", self.device)?;
+        if let Some(host) = &self.host {
+            write!(out, " on {host}")?;
+        }
+        write!(out, " ({}, API {})", self.driver, self.api)
+    }
+}
+
+/// The host's widest vector instruction set, as a CPU implementation's shader compiler takes it:
+/// `x86-64 AVX-512` (with its `F`, `BW`, `DQ` and `VL` subsets), `x86-64 AVX2` (with `FMA`),
+/// `x86-64 AVX`, `x86-64 SSE4.1` or `x86-64 SSE2`; `AArch64 SVE` or `AArch64 NEON`; else the
+/// architecture's name. llvmpipe's compiler takes the host's own features (Mesa's
+/// `util_get_cpu_caps`), so a venue is a device on such a host ([`Venue::host`]).
+pub fn host_vector_isa() -> String {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let avx512 = std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512dq")
+            && std::arch::is_x86_feature_detected!("avx512vl");
+        let tier = if avx512 {
+            "AVX-512"
+        } else if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+        {
+            "AVX2"
+        } else if std::arch::is_x86_feature_detected!("avx") {
+            "AVX"
+        } else if std::arch::is_x86_feature_detected!("sse4.1") {
+            "SSE4.1"
+        } else {
+            "SSE2"
+        };
+        format!("x86-64 {tier}")
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        match std::arch::is_aarch64_feature_detected!("sve") {
+            true => "AArch64 SVE".to_owned(),
+            false => "AArch64 NEON".to_owned(),
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        std::env::consts::ARCH.to_owned()
     }
 }
 
@@ -1138,6 +1221,31 @@ pub trait Side {
     ) -> Answer<crate::mesh_descriptors::MeshDescriptorFacts> {
         let _ = (library, spec);
         Err(Failure::unavailable("mesh_descriptor_facts"))
+    }
+
+    /// `newRenderPipelineStateWithMeshDescriptor:options:reflection:error:` of the descriptor
+    /// `spec` states, and what the made state answers of its limits
+    /// ([`Creation`](crate::pipeline_limits::Creation)). A refusal of Metal's rule is an `Ok`, for
+    /// the reasons [`crate::pipeline_limits`] states; the state is kept by neither side.
+    fn mesh_pipeline_limits(
+        &mut self,
+        library: Handle,
+        spec: &crate::pipeline_limits::MeshLimitsSpec<'_>,
+    ) -> Answer<crate::pipeline_limits::Creation<crate::pipeline_limits::MeshStateLimits>> {
+        let _ = (library, spec);
+        Err(Failure::unavailable("mesh_pipeline_limits"))
+    }
+
+    /// `newComputePipelineStateWithDescriptor:options:reflection:error:` of the descriptor `spec`
+    /// states, and what the made state answers of its limit, as
+    /// [`mesh_pipeline_limits`](Side::mesh_pipeline_limits) does for a mesh state.
+    fn compute_pipeline_limits(
+        &mut self,
+        library: Handle,
+        spec: &crate::pipeline_limits::ComputeLimitsSpec<'_>,
+    ) -> Answer<crate::pipeline_limits::Creation<crate::pipeline_limits::ComputeStateLimits>> {
+        let _ = (library, spec);
+        Err(Failure::unavailable("compute_pipeline_limits"))
     }
 
     /// What a **render pass descriptor** answers of itself
@@ -1937,6 +2045,18 @@ pub trait Side {
         Err(Failure::unavailable("command_buffer_facts"))
     }
 
+    /// What two command buffers with nothing encoded answer
+    /// ([`crate::empty_command_buffers::EmptyCommandBuffers`]): one on an idle queue, its
+    /// statuses in its handlers and after its wait and the shape of its four timing getters; one
+    /// committed behind a fill of [`crate::empty_command_buffers::FILL_BYTES`] of its queue, the
+    /// order of the two's completed handlers, the fill's status in the empty one's, and its kernel
+    /// and GPU times against the fill's. Times are recorded as signs and orders, never as times.
+    fn empty_command_buffers(
+        &mut self,
+    ) -> Answer<crate::empty_command_buffers::EmptyCommandBuffers> {
+        Err(Failure::unavailable("empty_command_buffers"))
+    }
+
     /// A command queue's limit on uncompleted command buffers, by the probe both sides run
     /// ([`crate::queue_slots`]): the queue is made with `max` as its
     /// `maxCommandBufferCount` (`newCommandQueue` where `max` is `None`), and at most `cap` command
@@ -2143,6 +2263,21 @@ pub trait Side {
     /// pending, which is a relation between two moments of one command buffer's life.
     fn signal_before_a_wait(&mut self) -> Answer<crate::event_orders::SignalBeforeWait> {
         Err(Failure::unavailable("signal_before_a_wait"))
+    }
+
+    /// What the wait-behind-a-running-signal probe observed
+    /// ([`crate::event_orders::WaitBehindRunningSignal`]) on an `MTLSharedEvent` where `shared`,
+    /// else an `MTLEvent`: a command buffer that waits for a signal another queue's command buffer
+    /// submitted ahead of it and is still running.
+    ///
+    /// One call, because the fact is a relation between two command buffers' states at one
+    /// moment: the waiting one's status read while the signalling one still runs.
+    fn event_wait_behind_a_running_signal(
+        &mut self,
+        shared: bool,
+    ) -> Answer<crate::event_orders::WaitBehindRunningSignal> {
+        let _ = shared;
+        Err(Failure::unavailable("event_wait_behind_a_running_signal"))
     }
 
     /// What the scheduled-handler order probe observed
@@ -2358,6 +2493,11 @@ pub trait Side {
     }
 }
 
+/// Metal's largest tile threadgroup: the `maxTotalThreadsPerThreadgroup` an Apple M3 Max answers
+/// for a tile state whose descriptor states no limit, and so the limit a case states where it
+/// means Metal's own maximum ([`TilePipelineSpec::max_total_threads_per_threadgroup`]).
+pub const METAL_TILE_THREADS: u32 = 1024;
+
 /// A tile render pipeline a case makes: `MTLTileRenderPipelineDescriptor`'s facts the cases state.
 ///
 /// The attachment formats are the case's own rather than one fixed format, because a tile
@@ -2369,28 +2509,30 @@ pub struct TilePipelineSpec<'a> {
     pub entry: &'a str,
     /// The color attachment formats, at attachment index 0 up in this order.
     pub attachments: &'a [PixelFormat],
-    /// `maxTotalThreadsPerThreadgroup`: `None` is Metal's 0, the pipeline's own maximum.
-    pub max_total_threads_per_threadgroup: Option<u32>,
+    /// `maxTotalThreadsPerThreadgroup`, which every case states and each side sets, as the compute
+    /// limit cases state theirs ([`crate::pipeline_limits::ComputeLimitsSpec`]); 0 is Metal's
+    /// default, the pipeline's own maximum. A state of no limit is answered from the compiler's
+    /// history: Metal keeps a tile pipeline it compiled and answers a later descriptor of the same
+    /// function that differs only in `requiredThreadsPerThreadgroup` with the first one's limit,
+    /// in the same process or a later one (an Apple M3 Max, macOS 27.0.1), so a re-record of a
+    /// state of no limit could take another pipeline's answer. A stated limit separates the
+    /// pipelines, as the validation oracle's tile pipelines state theirs; a case that means
+    /// Metal's own maximum states [`METAL_TILE_THREADS`].
+    pub max_total_threads_per_threadgroup: u32,
     /// `threadgroupSizeMatchesTileSize`.
     pub threadgroup_size_matches_tile_size: bool,
 }
 
 impl<'a> TilePipelineSpec<'a> {
-    /// The tile function `entry` over `attachments`, with Metal's defaults for the rest.
-    pub const fn new(entry: &'a str, attachments: &'a [PixelFormat]) -> Self {
+    /// The tile function `entry` over `attachments`, under a `maxTotalThreadsPerThreadgroup` of
+    /// `limit`, with Metal's defaults for the rest.
+    pub const fn new(entry: &'a str, attachments: &'a [PixelFormat], limit: u32) -> Self {
         Self {
             entry,
             attachments,
-            max_total_threads_per_threadgroup: None,
+            max_total_threads_per_threadgroup: limit,
             threadgroup_size_matches_tile_size: false,
         }
-    }
-
-    /// The descriptor with `maxTotalThreadsPerThreadgroup` set to `limit`.
-    #[must_use]
-    pub const fn limited(mut self, limit: u32) -> Self {
-        self.max_total_threads_per_threadgroup = Some(limit);
-        self
     }
 
     /// The descriptor with `threadgroupSizeMatchesTileSize` set.
@@ -2407,11 +2549,7 @@ impl<'a> TilePipelineSpec<'a> {
         for format in self.attachments {
             out.extend(format.as_raw().to_le_bytes());
         }
-        out.extend(
-            self.max_total_threads_per_threadgroup
-                .unwrap_or(0)
-                .to_le_bytes(),
-        );
+        out.extend(self.max_total_threads_per_threadgroup.to_le_bytes());
         out.push(u8::from(self.threadgroup_size_matches_tile_size));
         out
     }

@@ -24,8 +24,9 @@
 //! read and pass as given on every device; a draw's denormal stores zero, as Metal's, but where
 //! the drawing stage leaves a `float` denormal to the device (`device-denormals`), which may keep
 //! it; where the driver has `DriverFact::DepthImageKeepsDenormals` the clear's, the CPU's and
-//! the blit's read back as given; where it has `DriverFact::DepthTestKeepsDenormals` too, each one
-//! read back as given tests as Metal's; and `depth-denormals` is announced exactly where the
+//! the blit's read back as given, but a negative one the upload clamps to 0 on a device whose
+//! uploads clamp (`degrade_notices::clamps_depth_uploads`); where it has
+//! `DriverFact::DepthTestKeepsDenormals` too, each one read back as given tests as Metal's; and `depth-denormals` is announced exactly where the
 //! driver lacks either fact.
 //!
 //! **Signs**: Metal's depth test compares the fragment's depth with the stored value's magnitude,
@@ -60,7 +61,10 @@
 //! and each pass that loads it announces `signed-depth-test`. On a device that may clamp the
 //! pattern, each target reads zero and draws and stores as over a zero depth, announced
 //! (`fresh-pattern-zeroed`) at its first load. A new target cleared first loads its clear,
-//! announcing neither (`FRESH-SIGNED-DEPTH` lines).
+//! announcing neither (`FRESH-SIGNED-DEPTH` lines). On a device without Metal's compression
+//! (`DeviceProperties::lossless_compression` false) a new target holds no pattern: it reads zero,
+//! filled at its first use (`fresh_contents` checks those zeros), so its draws and stores are
+//! unchecked here and its passes announce neither.
 
 use super::degrade_notices::{assert_made_once, assert_once_allowing, bound_value_kinds};
 use super::degrade_notices::{clamps_depth_uploads, forced, loses_depth_denormals};
@@ -69,7 +73,7 @@ use super::degrade_notices::{made_compute_kinds, made_render_kinds, shared_in_sy
 use super::depth_compares::run;
 use super::render_state::library;
 use super::{
-    buffer_with, layer_reported_nothing_at_all, read_buffer, validated_device,
+    at_plan, buffer_with, layer_reported_nothing_at_all, read_buffer, validated_device,
     validated_device_with,
 };
 use super::{Messages, ScratchCache, WAIT};
@@ -578,13 +582,11 @@ fn depth_images_hold_denormals_as_their_drivers_claim() {
         let facts = &device.properties().driver_facts;
         let keeps = facts.contains(&DriverFact::DepthImageKeepsDenormals);
         let tests = facts.contains(&DriverFact::DepthTestKeepsDenormals);
+        let clamps = clamps_depth_uploads(&device);
         // The uploads into the depth images (the blit's, into a render target, may store a
         // negative value), the draws' `Shared` buffers, and the white pipeline's making.
         let mut first = forced(&[
-            (
-                Degradation::RestrictedDepthUpload,
-                clamps_depth_uploads(&device),
-            ),
+            (Degradation::RestrictedDepthUpload, clamps),
             (Degradation::SignedDepthTest, signs_depth_tests(&device)),
             (
                 Degradation::SharedInSystemMemory,
@@ -648,8 +650,15 @@ fn depth_images_hold_denormals_as_their_drivers_claim() {
                     );
                     continue;
                 }
+                // What the upload gives the image: a negative denormal clamped to 0 where uploads
+                // clamp (`bind::clamped_depth`), each other value as it is.
+                let given = match clamps {
+                    true => metal2vulkan::bind::clamped_depth(bits),
+                    false => bits,
+                };
                 if keeps {
-                    assert_eq!(held, 16, "{at}: read {read:08x?}");
+                    let stored = read.iter().filter(|&&w| w == given).count();
+                    assert_eq!(stored, 16, "{at}: given {given:08x}, read {read:08x?}");
                 }
                 if held == 16 && tests {
                     let metals = if negative { 0 } else { 16 };
@@ -847,7 +856,7 @@ fn a_stored_depth_reads_samples_and_compares_as_metal_s() {
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let name = device.name().to_owned();
         // The device keeps such a value, and its depth test is Metal's own or compares it as it
         // is.
@@ -1274,6 +1283,8 @@ fn a_new_target_s_pattern_loaded_unwritten_draws_as_the_device_tests_it() {
         let keeps = !clamps_depth_uploads(&device);
         // The device keeps the pattern and its test is not Metal's own.
         let signs = signs_depth_tests(&device);
+        // No pattern at all: a new target reads zero, filled at its first use.
+        let zero_filled = super::fresh_contents::zero_filled(&device);
         let lane = Lane::new(device);
         let white = |pf: PixelFormat| {
             let mut d = white_descriptor(&lane.library);
@@ -1319,6 +1330,9 @@ fn a_new_target_s_pattern_loaded_unwritten_draws_as_the_device_tests_it() {
                 // Metal's; where its test is not, every other the pattern, with or without its
                 // sign; elsewhere the target reads zero, announced, and draws and stores as over a
                 // zero depth.
+                if zero_filled {
+                    continue;
+                }
                 let (draws, unwritten) = match keeps {
                     true => (over_pattern, 0x7fff_ffff),
                     false => (over_zero, 0),
@@ -1346,7 +1360,7 @@ fn a_new_target_s_pattern_loaded_unwritten_draws_as_the_device_tests_it() {
             );
             // A device whose test is not Metal's announces its test at each pass that loads a
             // target's pattern.
-            let signed = if signs { targets } else { 0 };
+            let signed = if signs && !zero_filled { targets } else { 0 };
             assert_eq!(
                 of(Degradation::SignedDepthTest),
                 signed,
@@ -1363,7 +1377,7 @@ fn a_new_target_s_pattern_loaded_unwritten_draws_as_the_device_tests_it() {
             );
             // A device that may clamp the pattern writes none: zero, announced where each target's
             // pass first loads it.
-            let zeroed = if keeps { 0 } else { targets };
+            let zeroed = if keeps || zero_filled { 0 } else { targets };
             assert_eq!(
                 of(Degradation::FreshPatternZeroed),
                 zeroed,

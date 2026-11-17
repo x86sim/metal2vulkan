@@ -1,10 +1,11 @@
 //! Pipeline records (`warm/record.rs`, `warm/codec.rs`): each kind's descriptor, every field away
 //! from its default, reads back from its record's bytes equal; a record carried as bytes is the
-//! same record; one library named twice is named once; and bytes of another record format, or
-//! damaged, cut or foreign bytes, are no record. CPU only: a record compiles nothing. The
+//! same record, a compute record's dispatches with it; one library named twice is named once; a
+//! record's dispatches are bounded; and bytes of another record format, or damaged, cut or foreign
+//! bytes, are no record. CPU only: a record compiles nothing. The
 //! functions are those of the owned fixtures `validation/fixtures/public/engine/ob3_*.air`.
 
-use crate::warm::codec::{self, Pipeline, MAGIC, RECORD_FORMAT};
+use crate::warm::codec::{self, Pipeline, RecordedDispatch, MAGIC, MOST_DISPATCHES, RECORD_FORMAT};
 use crate::PipelineRecord;
 use metal2vulkan::library::{Function, FunctionConstantValue, FunctionConstantValues, Library};
 use metal2vulkan::metal::{self, DataType, PixelFormat};
@@ -17,13 +18,10 @@ use metal2vulkan::pipeline::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::Path;
 
 /// The library of the committed AIR of fixture `stem`.
 fn library(stem: &str) -> Library {
-    let air = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/fixtures/public/engine")
-        .join(format!("{stem}.air"));
+    let air = metal2vulkan_devtools::engine_dir().join(format!("{stem}.air"));
     Library::from_air(&std::fs::read(air).expect("the committed AIR")).expect("a library")
 }
 
@@ -45,11 +43,13 @@ fn constants() -> FunctionConstantValues {
         )
 }
 
-/// A stage of `f` with constants and linked functions in every list and a group.
+/// A stage of `f`, specialized, with constants and linked functions in every list and a group,
+/// one under a specialized name.
 fn stage(f: Function) -> StageSource {
     let linked = function("ob3_texture_array", "ob3_texture_array");
     let mut functions = LinkedFunctions::new()
         .with_function(LinkedFunction::new(linked.clone()).with_constants(constants()))
+        .with_function(LinkedFunction::new(linked.clone()).with_specialized_name("custom_fn"))
         .with_private_function(linked.clone());
     functions
         .binary_functions
@@ -57,7 +57,7 @@ fn stage(f: Function) -> StageSource {
     functions
         .groups
         .insert("group".into(), vec![LinkedFunction::new(linked)]);
-    let mut descriptor = FunctionDescriptor::new(f);
+    let mut descriptor = FunctionDescriptor::new(f).with_specialized(true);
     descriptor.constants = constants();
     descriptor.linked = functions;
     StageSource::Function(descriptor)
@@ -108,7 +108,24 @@ fn compute() -> Pipeline {
     d.support_adding_binary_functions = true;
     d.buffers = mutability();
     d.needs_custom_border_color_samplers = true;
-    Pipeline::Compute(d, 2)
+    Pipeline::Compute(d, 2, dispatches())
+}
+
+/// A dispatch record's dispatches: a `dispatchThreadgroups:` with no threadgroup memory, and a
+/// `dispatchThreads:` with a ragged edge and two threadgroup memory lengths.
+fn dispatches() -> Vec<RecordedDispatch> {
+    vec![
+        RecordedDispatch {
+            threads_per_group: [128, 1, 1],
+            threads: None,
+            threadgroup_lengths: Vec::new(),
+        },
+        RecordedDispatch {
+            threads_per_group: [8, 8, 1],
+            threads: Some([13, 8, 1]),
+            threadgroup_lengths: vec![(0, 8720), (30, 16)],
+        },
+    ]
 }
 
 fn render() -> Pipeline {
@@ -170,6 +187,7 @@ fn render() -> Pipeline {
     p.needs_custom_border_color_samplers = true;
     p.vertex_amplification_mode = 1;
     p.explicit_visibility_group_id = 4;
+    p.open_gl_mode_enabled = true;
     Pipeline::Render(d, [1, 3])
 }
 
@@ -187,6 +205,15 @@ fn mesh() -> Pipeline {
     d.alpha_to_one = true;
     d.support_indirect_command_buffers = true;
     d.texture_write_rounding_mode = metal::TextureWriteRoundingMode::NearestEven;
+    d.max_total_threads_per_object_threadgroup = Some(64);
+    d.max_total_threads_per_mesh_threadgroup = Some(32);
+    d.max_total_threadgroups_per_mesh_grid = Some(8);
+    d.object_threadgroup_size_is_multiple_of_thread_execution_width = true;
+    d.mesh_threadgroup_size_is_multiple_of_thread_execution_width = true;
+    d.payload_memory_length = Some(256);
+    d.max_vertex_amplification_count = 2;
+    d.required_threads_per_object_threadgroup = Some([32, 2, 1]);
+    d.required_threads_per_mesh_threadgroup = Some([16, 1, 1]);
     Pipeline::Mesh(d)
 }
 
@@ -218,6 +245,7 @@ fn every_kind_reads_back_field_for_field() {
                 function("ob3_texture_array", "ob3_texture_array"),
             ))),
             0,
+            Vec::new(),
         ),
         Pipeline::Render(
             RenderPipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(
@@ -329,4 +357,41 @@ fn a_record_of_another_format_or_damaged_is_dropped() {
     assert_eq!(swapped.len(), 2);
     assert!(codec::decode(&two.to_bytes(), two.libraries()).is_ok());
     assert!(codec::decode(&two.to_bytes(), &swapped).is_err());
+}
+
+/// A compute record holds at most `MOST_DISPATCHES` dispatches: one with more is not made, and
+/// bytes that claim more, though their checksum holds, read as no record; the bound itself reads
+/// back.
+#[test]
+fn a_record_holds_a_bounded_list_of_dispatches() {
+    let kernel = || {
+        ComputePipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(function(
+            "ob3_texture_array",
+            "ob3_texture_array",
+        ))))
+    };
+    let one = |n: u32| RecordedDispatch {
+        threads_per_group: [n, 1, 1],
+        threads: None,
+        threadgroup_lengths: Vec::new(),
+    };
+    let most: Vec<_> = (1..=MOST_DISPATCHES as u32).map(one).collect();
+    assert!(PipelineRecord::of(&Pipeline::Compute(kernel(), 0, most.clone())).is_ok());
+    let mut more = most;
+    more.push(one(MOST_DISPATCHES as u32 + 1));
+    assert!(PipelineRecord::of(&Pipeline::Compute(kernel(), 0, more)).is_err());
+    // A record of no dispatch ends in its count of them; claiming n, each of the fewest bytes a
+    // dispatch takes (its threadgroup, no grid, no lengths), reads for n up to the bound alone.
+    let none = PipelineRecord::of(&Pipeline::Compute(kernel(), 0, Vec::new())).unwrap();
+    let claiming = |n: usize| {
+        let bytes = none.to_bytes();
+        let mut body = bytes[..bytes.len() - 32 - 4].to_vec();
+        body.extend_from_slice(&(n as u32).to_le_bytes());
+        body.extend(std::iter::repeat_n(0, n * (12 + 1 + 4)));
+        body.extend_from_slice(&[0; 32]);
+        codec::decode(&resealed(body), none.libraries())
+    };
+    assert!(claiming(0).is_ok(), "the record itself, as a control");
+    assert!(claiming(MOST_DISPATCHES).is_ok());
+    assert!(claiming(MOST_DISPATCHES + 1).is_err());
 }

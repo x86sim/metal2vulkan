@@ -2744,10 +2744,10 @@ fn a_venue_profile_is_a_capture_of_the_venues_own_device() {
     );
     // A driver update declared without recapturing the profile.
     let error = refusal("intel-irisxe-rplp-anv", &|venue| {
-        venue.devices[0].identity.driver_info = "Mesa 26.2.5-arch1.1".into();
+        venue.devices[0].identity.driver_info = "Mesa 26.2.7-arch1.1".into();
     });
     assert!(
-        error.contains("driver_info: Mesa 26.2.5-arch1.1 (Mesa 26.2.4-arch3.1)"),
+        error.contains("driver_info: Mesa 26.2.7-arch1.1 (Mesa 26.2.6-arch3.1)"),
         "{error}"
     );
 }
@@ -3569,7 +3569,7 @@ fn a_deferred_near_equivalent_stays_open_with_its_reason() {
 /// ordinary mismatch, which the list reviews.
 #[test]
 fn an_announced_deferred_near_equivalent_stays_open_with_its_reason() {
-    use crate::observation::{EXECUTOR_DEGRADES, RUNTIME_DEGRADES};
+    use crate::observation::RUNTIME_DEGRADES;
     use metal2vulkan_runtime::Degradation;
     let drawn = case(1, "drawn");
     let row = new_row(&drawn, Backend::Vulkan, LAVAPIPE, &DEVICE, &METAL);
@@ -3622,8 +3622,6 @@ fn an_announced_deferred_near_equivalent_stays_open_with_its_reason() {
         judged(announcing(RUNTIME_DEGRADES, &[cost, rate_map])),
         deferred
     );
-    // The platform executor's own notices are the same vocabulary, read alike.
-    assert_eq!(judged(announcing(EXECUTOR_DEGRADES, &[rate_map])), deferred);
     let ordinary = Some((Verdict::Reviewed, None));
     assert_eq!(judged(row.clone()), ordinary);
     assert_eq!(

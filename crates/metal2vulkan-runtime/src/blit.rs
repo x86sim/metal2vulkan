@@ -10,24 +10,29 @@
 //! - **Fills.** `vkCmdFillBuffer` writes only whole 32-bit words at offsets that are multiples of
 //!   4, while Metal fills any byte range with one byte value: [`fill_pieces`] splits a fill into
 //!   the words and the at most 3 bytes before and after them, which are copied from 4 bytes of the
-//!   value ([`fill_word`]) in a small pattern buffer of the encoder. The words go as
-//!   `word_fill.rs` records them: `vkCmdFillBuffer`, or transfers on a driver measured to compile
-//!   its fill per command pool.
+//!   value ([`fill_word`]) in a small pattern buffer of the encoder. The words go as one
+//!   `vkCmdFillBuffer` (`word_fill.rs`).
 //! - **Heap shadows** (`shadow.rs`). A heap's texture held as a shadow of the heap's bytes (a
-//!   depth or stencil texture, or one of a heap over host pages, `texture/heap.rs`) is an image to
-//!   a blit: a command that uses its image copies it in from the bytes first where the encoder has
-//!   not, and what a command writes through it is copied back by `shadow.rs`'s rules, as the
-//!   encoder ends at the latest. A copy that writes every texel of a one-level, one-slice such
-//!   texture replaces them (`shadow::overwritten`): it takes no copy in and no keep. A blit writes
-//!   one destination, so none writes such a texture's bytes two ways.
+//!   depth or stencil texture, or one of a heap over host pages, `texture/heap.rs`), and a tiled
+//!   texture of more than one level over a buffer's bytes (`Buffer::new_tiled_texture`), is an
+//!   image to a blit: a command that uses its image copies it in from the bytes first where the
+//!   encoder has not, and what a command writes through it is copied back by `shadow.rs`'s rules,
+//!   as the encoder ends at the latest; a tiled texture's copy is taken at use and never copied
+//!   back (`shadow.rs`'s **Copies taken at use**). A copy that writes every texel such a texture's
+//!   bytes hold (of a one-level, one-slice one) replaces them (`shadow::overwritten`): it takes no
+//!   copy in and no keep. A blit writes one destination, so none writes such a texture's bytes
+//!   two ways.
 
 use super::blit_fill::FillTiles;
 use super::buffer::Buffer;
 use super::command_buffer::CommandBuffer;
 use super::degradation::Degradation;
 use super::encoder::{EncoderCore, Replayed};
+use super::encoder_fold::Joining;
 use super::error::{invalid, Error, Problem};
 use super::fresh_unwritten::FreshRead;
+use super::managed_copy::{AtCompletion, CopyBack, Staging, SyncTarget};
+use super::managed_sync::{SyncCopy, Target};
 use super::replay::{BlitCall, CallLog, Replay, Resource};
 use super::resource::{ResourceKey, ResourceRef};
 use super::shadow::{self, Covered, ShadowCopies};
@@ -162,8 +167,9 @@ pub struct BlitCommandEncoder {
     /// The copies of the heap shadows among the textures the encoder's blits named
     /// ([`BlitCommandEncoder::see`]), each once.
     shadows: Vec<Arc<ShadowCopies>>,
-    /// Its calls so far, where the device had a buffer over host pages as it opened
-    /// (`replay.rs`): `None` where it logs nothing, or no longer.
+    /// Its calls so far (`replay.rs`), which encode it again at a rebind of a buffer over host
+    /// pages it named, or at a commit whose failure fails some of its group's encoders and not it
+    /// (`encoder_fold.rs`): `None` where it logs nothing (encoding again).
     log: Option<CallLog<BlitCall>>,
     /// The protection options it was made under where they end Metal's process at its first
     /// command (`command_buffer/protection.rs`): each command is refused.
@@ -183,14 +189,26 @@ impl CommandBuffer {
     /// `blitCommandEncoder`. Refused while another encoder of this command buffer is open,
     /// after one was abandoned, and after commit.
     pub fn blit_command_encoder(&self) -> Result<BlitCommandEncoder, Error> {
-        let core = EncoderCore::open(self, "blit_command_encoder", EncoderKind::Blit, true)?;
+        let _for = self.notices_for();
+        // It joins the group of compute and blit encoders before it, recording into their
+        // `VkCommandBuffer`, where it may (`encoder_fold.rs`); and it logs its calls
+        // (`replay.rs`), which encode it again at a rebind of a buffer over host pages it named,
+        // or at a commit whose failure fails some of its group's encoders and not it.
+        // The protection options it dies under at its first command, as Metal's process ends
+        // there, read under the core's one lock of the state.
+        let (core, aborts) = EncoderCore::open(
+            self,
+            "blit_command_encoder",
+            EncoderKind::Blit,
+            (true, Some(Joining::Blit)),
+            |state| state.protection_aborts(),
+        )?;
         Ok(BlitCommandEncoder {
             core,
             pattern: None,
             shadows: Vec::new(),
-            log: (self.device().shared().rebinds.any())
-                .then(|| self.device().shared().scheduler.spare_logs().blit()),
-            aborts: self.protected_blit(),
+            log: Some(self.device().shared().scheduler.spare_logs().blit()),
+            aborts,
             fill_tiles: FillTiles::default(),
         })
     }
@@ -231,6 +249,7 @@ impl BlitCommandEncoder {
         call: impl FnOnce(&mut CallLog<BlitCall>) -> BlitCall,
         run: impl FnOnce(&mut Self) -> Result<T, Error>,
     ) -> Result<T, Error> {
+        let _for = self.core.notices_for();
         self.refuse_aborted()?;
         let at = match self.log.as_mut().filter(|log| !log.muted()) {
             Some(log) => {
@@ -341,11 +360,11 @@ impl BlitCommandEncoder {
         Ok(())
     }
 
-    /// Note `texture`, which a blit names: where it is a heap shadow, whose image the blit uses
-    /// (a texture over a buffer blits on its bytes, `blit_texture.rs`), its commands take its
-    /// copies.
+    /// Note `texture`, which a blit names: where it is a heap shadow or a tiled texture of more
+    /// than one level, whose image the blit uses (a texture over a buffer blits on its bytes,
+    /// `blit_texture.rs`, `Texture::blit_texels`), its commands take its copies.
     pub(super) fn see(&mut self, texture: &Texture) {
-        if texture.over_buffer() {
+        if texture.blit_texels().is_some() {
             return;
         }
         if let Some(copies) = texture.shadow() {
@@ -392,8 +411,9 @@ impl BlitCommandEncoder {
             },
             |this| {
                 const CALL: &str = "copy_from_buffer_to_buffer";
-                this.core.check_device(CALL, source_buffer.device())?;
-                this.core.check_device(CALL, destination_buffer.device())?;
+                this.core.check_device(CALL, source_buffer.generation())?;
+                this.core
+                    .check_device(CALL, destination_buffer.generation())?;
                 if size == 0 {
                     return Ok(());
                 }
@@ -403,6 +423,10 @@ impl BlitCommandEncoder {
                         out_of_bounds(CALL, source_offset, size, source_buffer.length())
                     })?;
                 let to = bytes_in(CALL, destination_offset, size, destination_buffer.length())?;
+                // A source whose GPU writes are dropped is read in place through its read twin,
+                // where it has one (`read_twin.rs`).
+                let twin = this.core.read_source(source_buffer);
+                let source_buffer = twin.as_ref().unwrap_or(source_buffer);
                 // Read as a blit's: a no-copy buffer's import released while idle is imported again
                 // (`host_residency.rs`).
                 let (source, source_at) = this.core.blit_at(source_buffer, source_offset)?;
@@ -478,10 +502,6 @@ impl BlitCommandEncoder {
                         },
                     )?;
                 }
-                this.core.retain(source_buffer.clone());
-                if source_buffer != destination_buffer {
-                    this.core.retain(destination_buffer.clone());
-                }
                 Ok(())
             },
         )
@@ -490,9 +510,9 @@ impl BlitCommandEncoder {
     /// `fillBuffer:range:value:`: every byte of `range` becomes `value`, for any range, as on
     /// Metal.
     ///
-    /// The range's whole words are filled as `word_fill.rs` records them (`vkCmdFillBuffer`, or
-    /// transfers on a driver that compiles its fill per command pool); the at most 3 bytes at each
-    /// end are copied from the encoder's pattern buffer (1 KiB, made at its first unaligned fill).
+    /// The range's whole words are filled as one `vkCmdFillBuffer` (`word_fill.rs`); the at most
+    /// 3 bytes at each end are copied from the encoder's pattern buffer (1 KiB, made at its first
+    /// unaligned fill).
     ///
     /// An empty range fills nothing, wherever it lies, and the encoder's other commands run, as
     /// plain Metal does (Metal's validation stops it).
@@ -508,7 +528,7 @@ impl BlitCommandEncoder {
             |_| BlitCall::FillBuffer(buffer.clone(), range.clone(), value),
             |this| {
                 const CALL: &str = "fill_buffer";
-                this.core.check_device(CALL, buffer.device())?;
+                this.core.check_device(CALL, buffer.generation())?;
                 let size = range.end.saturating_sub(range.start);
                 if size == 0 {
                     return Ok(());
@@ -553,7 +573,6 @@ impl BlitCommandEncoder {
                         );
                     }
                 })?;
-                this.core.retain(buffer.clone());
                 if split {
                     this.core
                         .device()
@@ -581,7 +600,7 @@ impl BlitCommandEncoder {
             return Ok(pattern.clone());
         }
         let pattern = self.core.device().write_combined_buffer(PATTERN_LENGTH)?;
-        let Some(contents) = pattern.contents() else {
+        let Some(contents) = pattern.mapped_contents() else {
             return Err(Error::Vulkan(super::error::VkResultCode(
                 vk::Result::ERROR_MEMORY_MAP_FAILED.as_raw(),
             )));
@@ -599,7 +618,9 @@ impl BlitCommandEncoder {
     /// with unified memory a managed buffer is host-coherent memory the GPU uses itself, and a
     /// texture's CPU access copies from its image, so nothing more is recorded. On one without, a
     /// managed buffer's bytes, or a texture's over one, are copied to its host copy, which
-    /// `contents` maps (`managed.rs`), after the encoder's earlier commands.
+    /// `contents` maps (`managed.rs`), after the encoder's earlier commands: those the GPU wrote
+    /// since the buffer's last copy out, every other byte holding there what the GPU's copy holds
+    /// (`managed_sync.rs`), all of them where those writes are not known.
     ///
     /// On a resource of another storage mode it records nothing, as plain Metal does (RT2
     /// `managed.synchronize.shared`, `.private`: `Shared` and `Private` buffers
@@ -615,38 +636,101 @@ impl BlitCommandEncoder {
                 if resource.storage_mode() != StorageMode::Managed {
                     return Ok(());
                 }
-                let (buffer, range) = match resource {
-                    ResourceRef::Buffer(buffer) => (buffer, 0..buffer.length()),
-                    ResourceRef::Texture(texture) => match texture.buffer_texels() {
-                        // Where the GPU or the CPU finds the texels (an IOSurface plane's two
-                        // layouts).
-                        Some(texels) => (&texels.buffer, texels.span()),
-                        None => return Ok(()),
-                    },
-                    ResourceRef::IndirectCommandBuffer(_) => return Ok(()),
-                };
-                let Some(host) = buffer.host_copy() else {
-                    return Ok(());
-                };
-                if range.is_empty() {
-                    return Ok(());
+                match resource {
+                    ResourceRef::Buffer(buffer) => {
+                        this.synchronize_bytes(buffer, 0..buffer.length())
+                    }
+                    ResourceRef::Texture(texture) => this.synchronize_texels(texture),
+                    ResourceRef::IndirectCommandBuffer(_) => Ok(()),
                 }
-                let (own, start) = buffer.at(range.start);
-                let copy = region(start, range.start, range.end - range.start);
-                this.command(&[reads(buffer, range)], |device, raw| {
-                    // SAFETY: the encoder's command buffer is recording; the buffer and its host
-                    // copy are live and retained until it completes, and the range lies in both
-                    // (the host copy holds the buffer's bytes from its byte 0).
-                    unsafe { device.cmd_copy_buffer(raw, own, host, &[copy]) };
-                })?;
-                this.core.retain(buffer.clone());
-                Ok(())
             },
         )
     }
 
+    /// The copy of a `Managed` texture's bytes over a buffer to the buffer's host copy, for
+    /// `synchronize_resource` and `synchronize_texture`: where the GPU or the CPU finds the texels
+    /// (an IOSurface plane's two layouts), in the buffer. Those past its length lie in the
+    /// texture's `Shared` tail, which takes no synchronization (`buffer_texture.rs`), and a texture
+    /// of an image alone takes none, its CPU access copying from its image.
+    pub(super) fn synchronize_texels(&mut self, texture: &Texture) -> Result<(), Error> {
+        let Some(texels) = texture.buffer_texels() else {
+            return Ok(());
+        };
+        let span = texels.span();
+        let end = span.end.min(texels.buffer.length());
+        self.synchronize_bytes(&texels.buffer, span.start.min(end)..end)
+    }
+
+    /// The copy of `range` of a `Managed` buffer's own bytes to its host copy, which `contents`
+    /// maps (`managed.rs`), after the encoder's earlier commands, of the bytes the GPU wrote since
+    /// the buffer's last copy out (`managed_sync.rs`); nothing where it has none (a device with
+    /// unified memory) or the range is empty.
+    fn synchronize_bytes(&mut self, buffer: &Buffer, range: Range<u64>) -> Result<(), Error> {
+        let Some(host) = buffer.host_copy() else {
+            return Ok(());
+        };
+        if range.is_empty() {
+            return Ok(());
+        }
+        let device = self.core.device().clone();
+        let own = buffer.at(range.start);
+        let bytes = range.end - range.start;
+        // A two-copy buffer over the caller's pages (`managed_copy.rs`): the range the program
+        // asked, which the command copies out of.
+        if buffer.caller_copy().is_some() {
+            (device.shared().counts).managed_asked(bytes, false);
+        }
+        let read = reads(buffer, range.clone());
+        let (to, uses) = match host {
+            SyncTarget::Own(host) => (Target::Own(host), vec![read]),
+            // A blit's copy into the buffer over the caller's pages, their import
+            // (`managed_copy.rs`): a write of them, as a copy into a no-copy buffer.
+            SyncTarget::Import(import) => {
+                let (host, at) = self.core.blit_at(&import, range.start)?;
+                (
+                    Target::Import(host, at),
+                    vec![read, writes(&import, range.clone())],
+                )
+            }
+            // Pages no import maps: a copy into a staging buffer, which the command buffer's
+            // completion copies into them (`managed_copy.rs`).
+            SyncTarget::Pages(pages) => {
+                let staging = Staging::new(&device, bytes)?;
+                let uses = vec![read, writes(&staging.buffer, 0..bytes)];
+                self.core.retain_shared(staging.buffer.held());
+                (Target::Pages(CopyBack::new(staging, pages)), uses)
+            }
+        };
+        let copy = Arc::new(SyncCopy::new(&device, buffer, range, own, to));
+        // Its completion copies a staging buffer into the pages and lets go of what it took.
+        (self.core.command_buffer()).at_completion(AtCompletion::Synced(Arc::clone(&copy)));
+        // The heap shadows over the bytes it reads, copied back first, as for any command.
+        let mut shadows = shadow::copies_used(self.shadows.iter(), &uses);
+        shadow::overwritten(&mut shadows, &uses, &[]);
+        let copies = self.core.plan_shadows(&shadows, &uses)?;
+        self.core.shadow_copies(&copies);
+        self.core.sync_out(TRANSFER, &uses, &copy);
+        self.core.shadows_used(&shadows, &uses, &[]);
+        self.core.retain_shared(buffer.held());
+        Ok(())
+    }
+
+    /// `label`: the label [`set_label`](Self::set_label) gave it, or `None`, as Metal's is `nil`
+    /// until set.
+    pub fn label(&self) -> Option<String> {
+        self.core.command_buffer().open_encoder_label()
+    }
+
+    /// `setLabel:`: label it `label`, which its command buffer's ended encoders keep
+    /// ([`CommandBuffer::ended_encoders`](crate::CommandBuffer::ended_encoders)) and the
+    /// runtime's notices naming the command buffer state, as [`CommandBuffer::set_label`](crate::CommandBuffer::set_label)'s.
+    pub fn set_label(&mut self, label: &str) {
+        self.core.command_buffer().label_open_encoder(label);
+    }
+
     /// `endEncoding`.
     pub fn end_encoding(self) -> Result<(), Error> {
+        let _for = self.core.notices_for();
         // The core's shadows copy back what the blits wrote through heap shadows. The fill tiles
         // are their command buffer's, which holds them until it completes.
         let BlitCommandEncoder {
@@ -660,6 +744,6 @@ impl BlitCommandEncoder {
         if let Some(pattern) = pattern {
             core.retain(pattern);
         }
-        core.end_with_replay(EncoderKind::Blit, None, log.map(Replay::Blit))
+        core.end_with_replay(EncoderKind::Blit, (None, None), log.map(Replay::Blit), None)
     }
 }

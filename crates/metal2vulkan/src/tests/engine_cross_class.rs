@@ -37,7 +37,8 @@ use crate::pipeline::sym::{
     Axis, ResourceKind, ResourceSlot, SampledType, SlotClass, SlotRef, SpecKey, Stage,
 };
 use crate::pipeline::testing::{
-    link_and_validate, llvm_assemble, meter, profile, typed_module_with, AssembleError,
+    device_nan_bits, link_and_validate, llvm_assemble, meter, profile, typed_module_with,
+    AssembleError,
 };
 use crate::pipeline::StageSource;
 use crate::pipeline::{ComputePipeline, ComputePipelineDescriptor, FunctionDescriptor};
@@ -342,9 +343,10 @@ fn run(
 /// Every read through a slot of another class gives the words the slot of the texture's own
 /// class gives, a `half` result their low 16 bits: Metal's rule. A `ushort` result of an integer
 /// texture is the low 16 bits too, of a float texture the `half` read's bits. Where the module
-/// widens a `half` from its bits by the device and records `PrecisionNote::NativeNanEncoding` (both
-/// profiles here, which have `shaderFloat16`), a `half` result's NaN is the device's widening's,
-/// so a NaN pattern need only come back a NaN.
+/// widens a `half` from its bits by the device and records `PrecisionNote::NativeNanEncoding` or
+/// requires `VkProperty::MetalNanMoves` (both profiles here, which have `shaderFloat16`;
+/// `device_nan_bits`), a `half` result's NaN is the device's widening's, which the interpreter is
+/// not, so a NaN pattern need only come back a NaN.
 #[test]
 fn accesses_through_another_class_are_the_native_words() {
     use SampledType as S;
@@ -392,18 +394,18 @@ fn accesses_through_another_class_are_the_native_words() {
             let want = run(&own, native, &inputs(None), p, class, &what);
             let consts = FunctionConstantValues::defaults();
             let device_nans = ty == Ty::Half
-                && compile_bitcode(
-                    &cross,
-                    EntryRef::Name("k"),
-                    &consts,
-                    p,
-                    &inputs(Some(class)),
-                    &mut meter(),
-                    SPIRV_WORDS,
-                )
-                .unwrap_or_else(|e| panic!("{what}: {e}"))
-                .precision
-                .contains(&PrecisionNote::NativeNanEncoding);
+                && device_nan_bits(
+                    &compile_bitcode(
+                        &cross,
+                        EntryRef::Name("k"),
+                        &consts,
+                        p,
+                        &inputs(Some(class)),
+                        &mut meter(),
+                        SPIRV_WORDS,
+                    )
+                    .unwrap_or_else(|e| panic!("{what}: {e}")),
+                );
             let nan = |h: u32| h & 0x7C00 == 0x7C00 && h & 0x3FF != 0;
             let lanes = (SIDE * SIDE * 4) as usize;
             let lane_of = |b: &[u8], t: Ty, lane: usize| match t {
@@ -842,6 +844,66 @@ fn a_texture_an_argument_buffer_holds_is_read_in_its_own_class() {
     assert!(compiled > 0, "no committed profile has the sampled heap");
 }
 
+/// A `half` read of a texture an argument buffer holds merges its class arms as the texel's `half`
+/// bits (`emit::read_crossed`), widened once after the merge: on every committed profile with a
+/// sampled heap, the module merges a vector of four `u32`s and merges no texel struct, stays inside
+/// the plan's word estimate and passes L3. A member of another class then keeps its words' low 16
+/// bits wherever the value is stored unchanged, where a merge of each arm's widened `half` selected
+/// against a null handle's zero is a move Metal's compiler does not fold back to the bits (on the
+/// Apple M3 Max a NaN's bits became `0x7E00`). A `float` read, which widens nothing, still merges
+/// its texel structs.
+#[test]
+fn an_argument_buffer_half_read_merges_its_arms_bits() {
+    use crate::error::{Error, Feature, Unsupported};
+    use crate::spirv::ir::Type as SType;
+    let inputs = LowerInputs::new();
+    let mut compiled = 0;
+    for ty in [Ty::Half, Ty::Float] {
+        let name = format!("held read {ty:?}");
+        let Some(bc) = assemble(&name, &held_kernel(Held::Read, ty)) else {
+            return;
+        };
+        for (stem, p) in crate::spirv::testing::committed_profiles().expect("profiles") {
+            let what = format!("{name} on {stem}");
+            let m = match typed_module_with(&bc, "k", &p, &inputs) {
+                Ok((_, m)) => m,
+                Err(Error::Unsupported(Unsupported {
+                    feature: Feature::ArgumentBufferTextures,
+                    ..
+                })) => continue,
+                Err(e) => panic!("{what}: {e}"),
+            };
+            validate(&bc, &inputs, &p, &what);
+            let phis: Vec<&SType> = m
+                .blocks()
+                .iter()
+                .flat_map(|b| &b.phis)
+                .map(|phi| {
+                    let ty = m.value(phi.result).expect("a phi's value").ty;
+                    m.types().get(ty).expect("a phi's type")
+                })
+                .collect();
+            let bits = phis.iter().any(|t| match t {
+                SType::Vector { elem, len: 4 } => matches!(
+                    m.types().get(*elem),
+                    Ok(SType::Int {
+                        width: 32,
+                        signed: false
+                    })
+                ),
+                _ => false,
+            });
+            let texels = phis.iter().any(|t| matches!(t, SType::Struct { .. }));
+            match ty {
+                Ty::Half => assert!(bits && !texels, "{what}: {phis:?}"),
+                _ => assert!(texels, "{what}: {phis:?}"),
+            }
+            compiled += 1;
+        }
+    }
+    assert!(compiled > 0, "no committed profile has the sampled heap");
+}
+
 /// A kernel writing the `ty` texel `src[gid.x + 16 gid.y]` (buffer 0) to `access::write` texture
 /// slot 0 at its thread's texel `gid`.
 fn write_kernel(ty: Ty) -> String {
@@ -1173,12 +1235,11 @@ fn integer_writes_into_narrow_floats_take_the_devices_conversion() {
             let img = images.into_iter().next().expect("image");
             for n in 0..SIDE * SIDE {
                 let at = img.index(0, 0, 0, [n % SIDE, n / SIDE, 0]).expect("texel");
-                for c in 0..4 {
+                for (c, &stored) in img.texels[at].iter().enumerate().take(4) {
                     assert_eq!(
-                        img.texels[at][c],
+                        stored,
                         lane(n, c),
-                        "{what}: texel {n} lane {c} stored {:#x}",
-                        img.texels[at][c]
+                        "{what}: texel {n} lane {c} stored {stored:#x}"
                     );
                 }
             }

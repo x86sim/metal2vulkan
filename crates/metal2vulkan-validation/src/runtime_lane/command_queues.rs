@@ -12,8 +12,12 @@
 //! [`WAIT`].
 
 use super::host_memory::Mapping;
-use super::{layer_reported_nothing_at_all, validated_device, Messages, ScratchCache};
+use super::{
+    at_plan, layer_reported_nothing_at_all, validated_device_with, Messages, ScratchCache,
+};
 use crate::gpu::TEST_DEVICE;
+use metal2vulkan::device::QueueSharingPolicy;
+use metal2vulkan_runtime::DeviceOptions;
 use metal2vulkan_runtime::{
     BufferContents, BufferDescriptor, CommandBuffer, CommandQueue, DeadlockCause, Deallocator,
     Degradation, Device, Error, EventRef, HostMemory, Invalid, KeepAlive, Problem, ResourceOptions,
@@ -41,10 +45,16 @@ const DEALLOCATING: Duration = Duration::from_secs(2);
 /// Run `test` on a validated device, then check that once everything is dropped (the device
 /// last) the layer reported nothing.
 fn on_device(test: impl FnOnce(&Device)) {
+    on_device_with(|_| {}, test)
+}
+
+/// [`on_device`], `adjust` applied to the options of each device it makes (`at_plan` gives them
+/// their queue plan).
+fn on_device_with(adjust: fn(&mut DeviceOptions), test: impl FnOnce(&Device)) {
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), adjust).unwrap();
         test(&device);
     }
     layer_reported_nothing_at_all(&messages);
@@ -79,7 +89,7 @@ fn answered(answer: &mpsc::Receiver<Result<CommandBuffer, Error>>) -> Result<Com
 /// returns once one held uncommitted is dropped; another queue's make goes on meanwhile.
 #[test]
 fn a_queue_holds_as_many_uncompleted_command_buffers_as_metal_s() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         match device.new_command_queue_with_max_command_buffer_count(0) {
             Err(Error::Invalid(invalid)) => assert_eq!(
                 invalid,
@@ -119,7 +129,7 @@ fn a_queue_holds_as_many_uncompleted_command_buffers_as_metal_s() {
 /// once they ran, and a make after `wait_until_completed` returned never blocks.
 #[test]
 fn a_committed_command_buffer_gives_its_slot_back_once_completed() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let queue = device
             .new_command_queue_with_max_command_buffer_count(2)
             .unwrap();
@@ -264,7 +274,7 @@ fn a_command_buffer_s_slot_comes_back_as_its_completed_handlers_return() {
 /// another full queue, the make blocks until that queue's command buffer completed, and returns.
 #[test]
 fn a_handler_s_make_on_a_full_queue_returns_where_a_slot_can_come_back() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let (sender, answers) = mpsc::channel();
         // Its own queue, full with its own command buffer.
         let own = device
@@ -373,7 +383,7 @@ fn a_presenting_queue_s_lock_holds_no_other_queue_where_the_device_reserved_one(
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), at_plan).unwrap();
         let shared_kinds = || -> usize {
             messages
                 .take_notices()
@@ -388,7 +398,7 @@ fn a_presenting_queue_s_lock_holds_no_other_queue_where_the_device_reserved_one(
             .collect();
         let presenting = device.new_command_queue_for_presenting().unwrap();
         // SAFETY: the handle is compared only, inside and after the call; nothing is submitted.
-        let raw = |queue: &CommandQueue| unsafe { queue.with_vk_queue(|raw, _| raw) };
+        let raw = |queue: &CommandQueue| unsafe { queue.with_vk_queue(|_, raw, _| raw) };
         let reserved = queues.iter().all(|queue| raw(queue) != raw(&presenting));
         let second = device.new_command_queue_for_presenting().unwrap();
         assert_eq!(
@@ -407,7 +417,7 @@ fn a_presenting_queue_s_lock_holds_no_other_queue_where_the_device_reserved_one(
                 // SAFETY: the closure keeps no handle and calls nothing of the runtime's; it waits
                 // only for this test's release.
                 unsafe {
-                    presenting.with_vk_queue(|_, _| {
+                    presenting.with_vk_queue(|_, _, _| {
                         held.send(()).unwrap();
                         let _ = released.recv_timeout(WAIT);
                     })
@@ -432,6 +442,115 @@ fn a_presenting_queue_s_lock_holds_no_other_queue_where_the_device_reserved_one(
         }
         release.send(()).unwrap();
         holder.join().unwrap();
+    }
+    layer_reported_nothing_at_all(&messages);
+}
+
+/// The kind a command queue takes as it moves onto a `VkQueue` with another queue's work in flight
+/// ([`a_queue_joining_another_s_busy_vk_queue_is_announced_once`]).
+pub(super) const QUEUE_SHARING: [Degradation; 1] = [Degradation::QueueSharing];
+
+/// The rounds [`a_queue_joining_another_s_busy_vk_queue_is_announced_once`] makes at least, each a
+/// joiner of its own, so that more than one queue may join.
+const JOINERS: usize = 3;
+
+/// The rounds [`a_queue_joining_another_s_busy_vk_queue_is_announced_once`] makes at most, where
+/// the device shares and no queue joined yet.
+const JOIN_ROUNDS: usize = 16;
+
+/// A command queue that makes a command buffer while it holds no other uncompleted one, beside a
+/// queue whose short command buffers keep its `VkQueue` busy, joins that `VkQueue` where the device
+/// shares (`QueueSharingPolicy::Adaptive`, set here over the lane's `exact_answers()`, on a device
+/// whose check finds its GPU idle between `VkQueue`s: NVIDIA's), and the device announces
+/// `queue-sharing` once however many queues join: each notice a join (`WorkCounts::queue_joins`,
+/// above 0 where the device shares), never one without. On a device that shares no `VkQueue`
+/// (lavapipe, RADV, MoltenVK) nothing joins and nothing is announced, and the test says why.
+///
+/// A joiner joins only where it looks while the busy `VkQueue` still has a batch in flight whose
+/// oldest has run under half a millisecond (`queue_share.rs`), and the busy queue's 24 fills are
+/// about that much of an RTX 3090's work: on a loaded host the test's thread or the completions'
+/// can miss that window (`WorkCounts::picks_with_none_busy`,
+/// `WorkCounts::joins_withheld_from_old_heads`), or a fill sliced between other processes' work
+/// can mark the busy queue long for good (`WorkCounts::queues_gone_long`). So each of
+/// [`JOIN_ROUNDS`] rounds, at least [`JOINERS`] of them, takes a busy queue and a joiner of its own,
+/// until a queue joined; the failure names what each look found.
+#[test]
+fn a_queue_joining_another_s_busy_vk_queue_is_announced_once() {
+    use metal2vulkan_runtime::ResourceOptions;
+    let cache = ScratchCache::new().unwrap();
+    let messages = Messages::default();
+    {
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |options| {
+            options.policy.queue_sharing = QueueSharingPolicy::Adaptive;
+            at_plan(options)
+        })
+        .unwrap();
+        assert!(device.settle_queue_switch_check(WAIT), "the check settles");
+        let shares = device.shares_vk_queues();
+        if !shares {
+            println!(
+                "{} shares no VkQueue, so no queue joins: {}",
+                device.name(),
+                device.queue_switch_check_report()
+            );
+        }
+        let sharing_kinds = || -> usize {
+            messages
+                .take_notices()
+                .into_iter()
+                .filter_map(|message| message.degradation)
+                .filter(|notice| QUEUE_SHARING.contains(&notice.degradation))
+                .count()
+        };
+        // 16 MiB a fill: tens of microseconds each on the RTX 5080 Laptop GPU, so the busy queue's
+        // oldest batch is young when a joiner looks and no command buffer runs long.
+        let buffer = device
+            .new_buffer(16 << 20, ResourceOptions::private())
+            .unwrap();
+        let fill = |queue: &CommandQueue| {
+            let command_buffer = queue.command_buffer().unwrap();
+            let mut blit = command_buffer.blit_command_encoder().unwrap();
+            blit.fill_buffer(&buffer, 0..(16 << 20), 0x5a).unwrap();
+            blit.end_encoding().unwrap();
+            command_buffer.commit().unwrap();
+            command_buffer
+        };
+        let mut rounds = 0;
+        while rounds < JOINERS
+            || (shares && rounds < JOIN_ROUNDS && device.work_counts().queue_joins == 0)
+        {
+            rounds += 1;
+            let (busy, joiner) = (
+                device.new_command_queue().unwrap(),
+                device.new_command_queue().unwrap(),
+            );
+            let kept: Vec<CommandBuffer> = (0..24).map(|_| fill(&busy)).collect();
+            // Submitted, so the busy `VkQueue` has work in flight as the joiner makes its own.
+            kept.last().unwrap().wait_until_scheduled().unwrap();
+            let joined = fill(&joiner);
+            joined.wait_until_completed_for(WAIT).unwrap();
+            for command_buffer in kept {
+                command_buffer.wait_until_completed_for(WAIT).unwrap();
+            }
+        }
+        let counts = device.work_counts();
+        let joins = counts.queue_joins;
+        let found = format!(
+            "{joins} joins in {rounds} rounds where the device shares: {shares}; looks that found \
+             no other VkQueue busy {}, that passed over a busy one's old oldest batch {}, or an \
+             unshared queue's {}; queues gone long {}",
+            counts.picks_with_none_busy,
+            counts.joins_withheld_from_old_heads,
+            counts.joins_withheld_from_unshared,
+            counts.queues_gone_long
+        );
+        println!("{}: {found}", device.name());
+        assert_eq!(joins > 0, shares, "{found}");
+        assert_eq!(
+            sharing_kinds(),
+            usize::from(joins > 0),
+            "announced once, where a queue joined ({joins} joins)"
+        );
     }
     layer_reported_nothing_at_all(&messages);
 }

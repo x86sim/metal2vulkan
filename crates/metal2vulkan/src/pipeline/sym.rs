@@ -285,6 +285,17 @@ pub enum SyntheticBinding {
     HandleTable,
     /// The pipeline constant blob, a read-only storage buffer.
     ConstantBlob,
+    /// A rate-mapped pass's region table (`bind::fan_out`), a read-only storage buffer of a
+    /// fan-out variant's geometry stage (`GraphicsState::region_fan_out`), declared with the
+    /// vertex stage's symbols.
+    RateMapRegions,
+    /// A fan-out probe's flags (`GraphicsState::region_fan_out`), a storage buffer of `u32`s its
+    /// geometry stage writes into at the pushed index (`PushField::RegionProbe`,
+    /// `bind::fan_out::PROBE_DRAW_WORDS` a draw): a flag, the copies its draw emits, the marks
+    /// of its triangles too wide for few copies, its first and last flagged triangle, the
+    /// count of its flagged triangles, and the bits of its blocks that hold one. Declared with
+    /// the vertex stage's symbols.
+    RateMapFlags,
     /// The render encoder's tessellation factor buffer (`setTessellationFactorBuffer:offset:
     /// instanceStride:`), a read-only storage buffer of a tessellation pipeline's synthesized
     /// control stage, declared with the vertex stage's symbols.
@@ -413,7 +424,10 @@ pub enum ResourceKind {
     /// The `half` shadow of extended-range color attachment `n` (`ResourceSlot::index` too) for
     /// the draw's render pass instance (`VariantKey::extended_shadows`): an `RGBA16_SFLOAT` 2D
     /// storage image of the attachment's extent holding Metal's tile value of each texel, which
-    /// the function's interlocked storage form reads and writes beside the attachment's codes.
+    /// the function's interlocked storage form reads and writes beside the attachment's codes. In
+    /// a multisampled pipeline it holds the samples as the attachment's storage image does: a
+    /// multisampled image of the pipeline's samples, or a 2D array of one layer per sample
+    /// (`StorageAttachmentView::SamplePlanes`'s shape).
     ExtendedShadow(u32),
     /// The snapshot of the texture bound at fragment texture slot `n` (`ResourceSlot::index` too)
     /// for a draw that reads it through one (`LoweringInputs::snapshot_textures`): an
@@ -426,6 +440,16 @@ pub enum ResourceKind {
     /// image sampler whose immutable sampler is the device's conversion of this
     /// (`vk::SamplerDesc::ycbcr`), whose image the consumer views with the same conversion.
     YCbCrPlanes(crate::bind::YCbCrPlanesSampler),
+    /// The constexpr samplers one heap sampling chooses among by its sampler handle: an array of
+    /// one immutable sampler per candidate, each made for this use (with comparison or without,
+    /// of an integer texture or not), indexed by the handle's distance from the first
+    /// candidate's. `ResourceSlot::index` numbers the stage's arrays; the stage's interface lists
+    /// each one's samplers in element order (`StageInterface::sampler_arrays`), which link bakes
+    /// into the layout.
+    SamplerArray {
+        compare: bool,
+        integer: bool,
+    },
 }
 
 /// What a bound acceleration structure holds: the binder binds a top-level structure, so a
@@ -470,12 +494,18 @@ impl SamplerRef {
 /// How a combined image sampler samples: its sampler, and the use facts that change or check the
 /// `VkSampler` (`metal::sampler::SamplerUse`): depth comparison, which is static in AIR, whether
 /// the texture is an integer one (integer border colors), whether it samples a cube with explicit
-/// gradients (no anisotropy).
+/// gradients (no anisotropy), and whether it reads a pixel sampler's texel coordinates through the
+/// device's unnormalized sampler.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CombinedSampler {
     pub sampler: SamplerRef,
+    /// The shader hands the binding a pixel sampler's coordinate in texels: its `VkSampler` is
+    /// the device's unnormalized one (`SamplerUse::unnormalized`), and its image a view of the
+    /// texture's first level alone (`bind::ImageViewDesc::level`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub unnormalized: bool,
     /// The shader samples with depth comparison through this binding.
     pub compare: bool,
     /// The texture's sampled type is an integer type.
@@ -483,42 +513,59 @@ pub struct CombinedSampler {
 }
 
 impl CombinedSampler {
-    /// Sampler `sampler` used with `compare` on a texture that is `integer` or not.
+    /// Sampler `sampler` used with `compare` on a texture that is `integer` or not, in normalized
+    /// coordinates.
     pub fn new(sampler: SamplerRef, compare: bool, integer: bool) -> CombinedSampler {
         CombinedSampler {
             sampler,
             compare,
             integer,
+            unnormalized: false,
+        }
+    }
+
+    /// This use, reading texel coordinates where `unnormalized` holds
+    /// ([`CombinedSampler::unnormalized`]).
+    pub fn with_unnormalized(self, unnormalized: bool) -> CombinedSampler {
+        CombinedSampler {
+            unnormalized,
+            ..self
         }
     }
 
     /// The use as a heap sampler symbol's index, or a separate sampler's: bit 0 comparison, bit 1
-    /// an integer texel.
+    /// an integer texel, bit 2 texel coordinates.
     pub fn heap_index(&self) -> u32 {
-        u32::from(self.compare) | (u32::from(self.integer) << 1)
+        u32::from(self.compare)
+            | (u32::from(self.integer) << 1)
+            | (u32::from(self.unnormalized) << 2)
     }
 
     /// Sampler `sampler` with the use a heap or separate sampler symbol's index `index` states
     /// ([`CombinedSampler::heap_index`]).
     pub fn from_heap_index(sampler: SamplerRef, index: u32) -> CombinedSampler {
         CombinedSampler::new(sampler, index & 1 != 0, index & 2 != 0)
+            .with_unnormalized(index & 4 != 0)
     }
 
-    /// The use's rank in a separate texture symbol's index: comparison, then an integer texel,
-    /// from the most significant bit down, so the ranks order as the uses' fields do in
-    /// `CombinedSampler`'s derived order.
+    /// The use's rank in a separate texture symbol's index: texel coordinates, comparison, then
+    /// an integer texel, from the most significant bit down, so the ranks order as the uses'
+    /// fields do in `CombinedSampler`'s derived order.
     fn use_rank(&self) -> u32 {
-        (u32::from(self.compare) << 1) | u32::from(self.integer)
+        (u32::from(self.unnormalized) << 2)
+            | (u32::from(self.compare) << 1)
+            | u32::from(self.integer)
     }
 
     /// Sampler `sampler` with the use of rank `rank` ([`CombinedSampler::use_rank`]).
     fn from_use_rank(sampler: SamplerRef, rank: u32) -> CombinedSampler {
-        CombinedSampler::new(sampler, rank & 2 != 0, rank & 1 != 0)
+        CombinedSampler::new(sampler, rank & 2 != 0, rank & 1 != 0).with_unnormalized(rank & 4 != 0)
     }
 
     /// The use the binder (and link, for a constexpr sampler) builds the `VkSampler` for.
     pub fn sampler_use(&self) -> crate::metal::sampler::SamplerUse {
         crate::metal::sampler::SamplerUse::new(self.compare, self.integer)
+            .with_unnormalized(self.unnormalized)
     }
 }
 
@@ -779,6 +826,14 @@ pub enum SpecKey {
     /// which an emulated anisotropic sample reads. A slot bound to an isotropic sampler, or to
     /// none, takes 0.
     SamplerAnisotropy(SlotRef),
+    /// Boolean: the runtime sampler bound to the slot is a nearest pixel sampler of one level
+    /// (default false): it reads pixel coordinates (`normalizedCoordinates` false) through nearest
+    /// minification and magnification filters, without a mip filter and isotropically (its word
+    /// masked by `SamplerWord::nearest_pixel(false)` is `SamplerWord::PIXEL_COORDINATES`). Where it
+    /// holds, a pixel sample through the slot hands the device its texel's centre, from which the
+    /// device's sampler reads exactly the texel Metal's reads. A slot bound to a normalized sampler,
+    /// or to none, takes false, so a normalized sampler's filter makes no pipeline of its own.
+    NearestPixelSampler(SlotRef),
     /// Boolean: the descriptor range bound at the buffer slot, which the function reads through a
     /// uniform view, starts at the bind offset, so its `SlotBindOffset` residual is 0 (default
     /// false): the slot holds inline bytes, which the consumer places at an aligned offset, or a
@@ -789,6 +844,85 @@ pub enum SpecKey {
     /// which a driver can load into registers ahead of the shader (Mesa's ANV does so only for a
     /// uniform load at a constant offset); elsewhere at the residual plus the offset.
     RangeAtBindOffset(SlotRef),
+    /// The word of the runtime sampler bound to the slot (`u32`: its whole
+    /// [`SamplerWord`](crate::metal::sampler::SamplerWord), its address modes as the bound
+    /// texture's map sends them), read by a specialized note's test alone
+    /// ([`SpecTest`](crate::pipeline::SpecTest)): no stage declares it as a constant and no
+    /// pipeline's key carries it, so the bound sampler decides the note without a `VkPipeline` of
+    /// its own. A plan gives it (`BindingPlan::specialized_value`), and the runtime reads such a
+    /// test at each draw or dispatch (`StageModule::note_clauses_bound`); where the sampler is not
+    /// known (a reading of the module alone, `StageModule::precision_notes_under`), such a test
+    /// holds. A slot bound to no sampler takes 0.
+    BoundSamplerWord(SlotRef),
+    /// Boolean: a texture the stage's handles can name is of a two-plane YCbCr class (its
+    /// `metal::texel_format::TexelFormat::PACKED` field `YCbCr2048`, `YCbCr8192` or
+    /// `YCbCrExtended8192`): a heap member of the command reaching the stage, one it makes
+    /// resident (`BindShape::used`) or binds at a texture slot of the stage
+    /// (`bind::heap`'s members). Read by a specialized note's test alone
+    /// ([`SpecTest`](crate::pipeline::SpecTest)), as [`BoundSamplerWord`](Self::BoundSamplerWord)
+    /// is: a plan gives it (`BindingPlan::specialized_value`), and where it is not known such a
+    /// test holds. A texture the command neither names nor makes resident, which a handle loaded
+    /// from memory may still reach and whose read Metal leaves undefined, is not counted.
+    HeapYCbCrTextures(Stage),
+    /// Two bits: 1 where a texture the stage's handles can name is one a heap holds by its raw
+    /// texels alone (`bind::heap::heap_raw_form`: an unswizzled, not sparse texture of one sample
+    /// of a form of `ExtendedRange::HEAP_READ`, whose texels the function's `float` read, sample
+    /// or gather decodes by the device's arithmetic, `PrecisionNote::DevicePackConversion`), and 2
+    /// where one such is of a form whose linear sample the function filters by the device's
+    /// arithmetic (not a bfloat form, whose sample reads the nearest texel under either filter,
+    /// `PrecisionNote::BicubicFilterArithmetic`): of the heap members of the command reaching the
+    /// stage, as for [`HeapYCbCrTextures`](Self::HeapYCbCrTextures), and given by a plan, as that
+    /// is. A stage whose `float` read, sample, gather or query of a heap may meet such a texture
+    /// declares it as a constant (default 3), whose bit 1 gates the raw arms
+    /// (`lower::texture::heap_raw_form`): where it is 0 they are dead code at pipeline creation,
+    /// exactly, since no handle the command names then carries a raw form's class. A pipeline's
+    /// key carries it there, and a specialized note's test reads it from the key; elsewhere such a
+    /// test reads the plan's value, as for [`HeapYCbCrTextures`](Self::HeapYCbCrTextures).
+    HeapRawTextures(Stage),
+    /// Four bits: the families of the float textures the stage's handles can name whose texel may
+    /// hold a NaN a `half` write stores (`lower::texture::half_write_nans`), each a bit of
+    /// `bind::heap::nan_family`: 1 a 16-bit float format, 2 a 32-bit float one, 4 a packed
+    /// small float one (`RG11B10Float`, `RGB9E5Float`), 8 a float format of none of those and
+    /// none whose texels hold no NaN (normalized, sRGB, extended-range); of the heap members of
+    /// the command reaching the stage, as for [`HeapYCbCrTextures`](Self::HeapYCbCrTextures), and
+    /// read by a specialized note's test alone, given by a plan, as that is.
+    HeapNanFamilies(Stage),
+    /// Boolean: a sampler state an argument buffer's sampler handle can name filters: one of the
+    /// bind state's argument samplers (`BindState::argument_samplers`, every live state, its
+    /// shape in `BindShape`) has a linear minification, magnification or mip filter, anisotropy,
+    /// or a cubic filter. Which state an argument buffer holds is in its memory, which no plan
+    /// reads. Read by a specialized note's test alone, given by a plan, as
+    /// [`HeapYCbCrTextures`](Self::HeapYCbCrTextures) is.
+    FilteringArgumentSampler,
+    /// Boolean: an element that a kernel's `[[stage_in]]` fetch of a thread-position step reads
+    /// in this dispatch region may lie past the first `2^32` bytes from its bind offset (default
+    /// true). Each such element is the region's origin plus the thread's position over the step
+    /// rate, clamped to the region's last element. Where an element lies there, the fetch's reach
+    /// check reads it as zero (`lower::stage_io::fetch`). The binder sets the key to false only
+    /// where every element of the region (or of the grid, in a region of size 0 on the axis)
+    /// fits, at the layout's stride and the end of its attributes' bytes. A false key drops the
+    /// check; it answers the same everywhere it holds. An indexed step's element is whatever its
+    /// index buffer holds, which bounds nothing, so an indexed step runs its check whatever the
+    /// key says.
+    StageInReach,
+    /// Metal's border texels of the texture bound to the slot (`u32`, default a four-channel
+    /// format's without a swizzle): bit `3c + b` is set where channel `c` (0 red to 3 alpha) of the
+    /// texel a read through a sampler hands back at an index outside the level on a border axis
+    /// reads 1 for border color `b` (`MTLSamplerBorderColor`'s value), the format's channels and
+    /// the texture's swizzle deciding it (`metal::sampler::border_texels`,
+    /// `RuntimeFact::BorderTexels`).
+    BorderTexels(SlotRef),
+    /// Boolean (`u32`, default 1): a texture the stage's handles can name is a 4:4:4 two-plane
+    /// YCbCr one whose writes Metal stores into its planes (`metal::format::ycbcr_writes_stored`)
+    /// that a storage class can hold (its usage writes): a heap member of the command reaching the
+    /// stage, as for [`HeapYCbCrTextures`](Self::HeapYCbCrTextures), given by a plan
+    /// (`bind::plan::slots::heap_ycbcr_writes`). A stage with a `float` or `half` write through a
+    /// heap handle declares it as a constant, under which its handle-table search carries the
+    /// entry's `memory::handles::FLAG_YCBCR_WRITES` and the write marks the texel it stores in
+    /// such a member's write shadow (`lower::texture::emit`): where it is 0 the search carries
+    /// nothing for it and the write's test is dead code at pipeline creation, exactly, since no
+    /// handle the command names then names such a texture. A pipeline's key carries it.
+    HeapYCbCrWrites(Stage),
 }
 
 impl SpecKey {
@@ -892,6 +1026,13 @@ pub enum PushField {
     /// window holds it (at most 44 bytes before it there: `SnapshotPhase` is a fragment
     /// function's): the draw of each chunk writes it alone, between its draws.
     TessellationChunk,
+    /// The box of regions a recording of a rate-mapped pass's regions draws (`uvec2`;
+    /// `RegionFanOut::RegionCopies`, `LoweringInputs::region_copies`): its first region, in the
+    /// region table's order, and its columns `c`, at least 1. Its vertex function draws region
+    /// `first + (DrawIndex / c)·nx + DrawIndex mod c`, `nx` the table's segments of x: the box's
+    /// rows of `c` regions each, in order. Placed with the amplification fields, so the vertex
+    /// window holds it, as a recording writes it before its draws.
+    RegionBox,
     /// Region base and grid of a multi-region dispatch.
     DispatchRegion,
     /// Device address (`u64`) of the region record a device-replay variant's dispatch reads its
@@ -969,9 +1110,19 @@ pub enum PushField {
     /// reads this field and the two before it in its own push window
     /// (`GraphicsState::emulated_tessellation`).
     ControlPointIndexOffset,
+    /// The draw's band of a pipeline variant that draws its lines as bands
+    /// (`VariantKey::line_band`, `link::band`): one `vec4` of the synthesized evaluation stage's
+    /// own push range, `[sx, sy, h, 0]`, the half extent of the draw's Vulkan viewport 0 (its
+    /// height negative, as the runtime's viewports are) and half the band's width in pixels
+    /// (`BindState::line_band`).
+    LineBand,
+    /// The index a fan-out probe writes its flag at (`u32`; `GraphicsState::region_fan_out`,
+    /// `link::fan_out`): one field of the synthesized geometry stage's own push range.
+    RegionProbe,
     /// The stride (`u32`) the compute encoder binds the kernel buffer at this Metal index with
-    /// (`setBuffer:offset:attributeStride:atIndex:` and its forms), 0 where it binds none, which
-    /// a `[[stage_in]]` layout of `MTLBufferLayoutStrideDynamic` fetches at
+    /// (`setBuffer:offset:attributeStride:atIndex:` and its forms, its low 32 bits,
+    /// `MTLAttributeStrideStatic`'s `2^32 - 1` included), 0 where it binds none, which a
+    /// `[[stage_in]]` layout of `MTLBufferLayoutStrideDynamic` fetches at
     /// (`RuntimeFact::StageInStride`).
     StageInStride(u32),
     /// The draw's viewport compensation for a vertex function compiled under
@@ -1051,6 +1202,11 @@ pub enum PushField {
     /// conversion (`bind::YCbCrInPlace::words`), from the bound texture's facts
     /// (`TextureFacts::ycbcr_in_place`).
     YCbCrInPlace(SlotRef),
+    /// The rows of the 2D texture bound to the slot in its texel buffer view, read and written in
+    /// place (`RuntimeFact::TexelRows`, `LoweringInputs::texel_rows`): one `uvec4`, the texture's
+    /// width and height, its rows in texels and its first texel in the view
+    /// (`bind::TexelRows::words`), from the bound texture's facts (`TextureFacts::texel_rows`).
+    TexelRows(SlotRef),
     /// The value a draw or dispatch binds for specialization key `key`, carried as data rather
     /// than specialized: one `u32` holding exactly the value the binder computes for the key's
     /// specialization constant from the bound textures and samplers (a boolean key as 1 or 0; a

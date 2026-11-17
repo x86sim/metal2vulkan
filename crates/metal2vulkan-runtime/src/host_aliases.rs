@@ -5,11 +5,17 @@
 //! the surface's pages (`Buffer::new_texture_with_iosurface_plane`), so two textures of one surface
 //! lay over two buffers. Metal orders two textures over one IOSurface as it orders one resource's
 //! accesses: in one encoder, in one command buffer and across one queue's command buffers (an M4,
-//! macOS 27.0.1, plain and under API validation; across queues only as
-//! the program orders them).
+//! macOS 27.0.1, plain and under API validation). Across queues, a command buffer committed after
+//! another and reaching the same surface through another texture ran after it, reading its
+//! writes, in every run on an M3 Max (macOS 27.0.1), a Radeon Pro 5300M and a UHD 630 (macOS
+//! 26.7.1) with both textures tracked, and with both untracked but once on the 5300M; a texture
+//! of another surface ran alongside (`metal2vulkan-conformance`'s
+//! `probes/cross_queue_surface_order.m`). The x86 Macs' GPUs took a later commit of another queue
+//! first now and then even over one tracked buffer, which is the order across queues the
+//! scheduler keeps (`scheduler/order.rs`).
 //!
 //! - **One memory, one key.** A no-copy buffer made over exactly the bytes a live one covers
-//!   (the same first byte and length; not a heap's) joins it: the device notes the first such
+//!   (the same first byte and length; not a heap's own) joins it: the device notes the first such
 //!   buffer's key as the memory's ([`Alias`]), and each command's uses of a buffer that joined
 //!   carry a use of the memory's key too, of the same bytes and access ([`HostAliases::augment`],
 //!   `EncoderCore`). The tracker orders those as one resource's, inside an encoder, between
@@ -19,6 +25,16 @@
 //! - **One memory, one import.** A buffer that joins a memory, of the memory class of a live
 //!   import of it, lies in that import's `VkBuffer` (`HostImport`, `Device::buffer_in_import`):
 //!   one resource to the driver, where the tracker's barriers are not all the ordering there is.
+//!   It reads the import as the first buffer does, through the import, so an import the device
+//!   may release while idle stays releasable beside it (`host_residency.rs`, "Several buffers in
+//!   one import").
+//!   A copied host buffer (`copied.rs`) joins the memory as an import does, and a later buffer of
+//!   either class lies in its copy while no import of its class lives ([`Kind::Copy`]): the copy
+//!   is the runtime's own memory of one class whatever the storage mode, and two copies of one
+//!   memory agree only through the pages, at a completion's merge back and a commit's copy in, so
+//!   a read committed before the write's completion read the bytes from before it (the
+//!   consumer's two textures over one surface past its import gate, every texel stale in one
+//!   command buffer and across queues an event ordered).
 //!   MoltenVK records no barrier between blits and leaves their order to Metal's hazard
 //!   tracking, which is by `MTLBuffer`: two imports were two, and a blit's write through one
 //!   raced a read through the other in one encoder and in one command buffer (an M4: mixed texels);
@@ -30,9 +46,38 @@
 //!   and its keep-alive goes then too, since those buffers keep the same bytes mapped
 //!   (`buffer.rs`'s `HostPages`). Copies between two such buffers are copies within one `VkBuffer`,
 //!   moved as within one buffer (`blit.rs`, `blit_texture.rs`). A buffer rebound onto the bytes a
-//!   live buffer was made over, of the class of its import, lies in that import too, joining no key
+//!   live buffer was made over or rebound onto, of the class of its import, lies in that import
+//!   too, joining no key
 //!   (`Device::rebind_host_pages`; a heap's own buffer, and bytes with a texture's aliasing image
-//!   over them, import their own).
+//!   over them, import their own), and in a live copy of them where its textures were planned at
+//!   the offset the copy lays the bytes at (its first byte) and no image in place rides on it.
+//! - **One page, one import.** `VK_EXT_external_memory_host` leaves undefined a host allocation
+//!   imported twice into one device ("Some platforms do not allow locking the same physical pages
+//!   for device access multiple times, so attempting to do it may result in undefined behavior"),
+//!   so a page a live import holds is never imported again while it lives
+//!   ([`HostAliases::within`], looked up by the bytes the live buffers and heaps were made over
+//!   or rebound onto, rounded out to the import's unit). A heap's own import is noted as a
+//!   buffer's is, joining no key ([`HostAliases::hold`]): a buffer over exactly a heap's bytes
+//!   lies in its import, and a heap over exactly a live import's bytes lies in that import. So is
+//!   the import a rebound buffer's new pages are, its own or the one it lies in
+//!   (`Device::rebind_host_pages`): a buffer made or rebound over exactly those bytes lies in it. A buffer whose pages a live
+//!   import holds all of is bound inside that import's memory at their offset, with a `VkBuffer`
+//!   of its own and no import (`Device::bind_in_import`, `WorkCounts::object_churn
+//!   .buffers_bound_in_import`), which keeps the import imported for good while it lives (no
+//!   residency release, `host_residency.rs`). A buffer or heap whose pages a live import holds
+//!   some of, and not all, and a heap whose pages a live import holds more of than its own bytes,
+//!   are a copy of the pages instead (`copied.rs`, `WorkCounts::copied_over_live_imports`), but
+//!   where every such import is of dma-bufs and the new pages come with a source of dma-bufs:
+//!   they then import the source's dma-bufs, never their pointer, on a device whose barriers
+//!   order blits through two imports of the same pages (`Device::imports_beside`,
+//!   `WorkCounts::object_churn.dma_buf_imports_beside_live`). The clause above is of host
+//!   pointers; two imports of dma-bufs of the same pages are two aliases of external memory,
+//!   which Vulkan's memory aliasing rules define (Vulkan 1.4, 12.11), their uses ordered by the
+//!   bytes they lie over (below). A guest RAM's chunk is not imported while a live import of an object's own holds some of its
+//!   pages, and a run is never imported alone by its pointer while its chunk's import is made
+//!   (`host_ram.rs`). `WorkCounts::object_churn.imports_inside_live` counts the imports made where
+//!   one held some of the pages all the same (two buffers made at once over them, or an object's
+//!   own import made as a chunk's over its pages was being made), a chunk's among them.
 //! - **Ownership stays the buffer's.** The added uses are hazard tracking's alone: what a command
 //!   holds and lists (`EncoderCore::touch`, rebind holds, `used_resources`) is named by the
 //!   command's own uses, each buffer by its own key.
@@ -40,10 +85,15 @@
 //!   (`ShadowCopies::meets`), so a write through the other buffer, or a texture over it, makes
 //!   the shadow copy in again, as a write through its own buffer does.
 //! - **Not joined.** Buffers over memory that overlaps without being the same range, a heap's
-//!   bytes, and the memory a rebound buffer takes, keep their own keys: Metal orders no two
+//!   bytes (a heap's own copy too), and the memory a rebound buffer takes, keep their own keys,
+//!   and a buffer whose GPU writes are dropped imports a read-only view of its own, or is a copy
+//!   of its own (a copy shared with it would take its writes): Metal orders no two
 //!   no-copy buffers over one allocation (the same probe's `host` cases read stale or mixed
-//!   texels), so the runtime's joining of the same range is the IOSurface's ordering, which a
-//!   race over plain no-copy buffers may also give. A rebound buffer leaves the memory it was
+//!   texels), and across queues neither: a later commit of another queue through a second
+//!   buffer over the allocation ran alongside the first on all three Macs above, reading stale
+//!   or mixed words (`probes/cross_queue_surface_order.m`'s `nocopy-two`). So the runtime's
+//!   joining of the same range is the IOSurface's ordering, which a race over plain no-copy
+//!   buffers may also give. A rebound buffer leaves the memory it was
 //!   made over, keeping the key it joined (`Device::rebind_host_pages`); its pages stay in the
 //!   import while commands recorded before the rebind hold them. Two buffers made at once over
 //!   the same memory may each import it (each joins after its import): they share the key, not
@@ -57,11 +107,16 @@
 //!   use of a key's bytes carries a use of its range's key and of the key of each other range those
 //!   bytes overlap, clipped to them ([`HostAliases::augment`]). So two keys over overlapping bytes
 //!   are ordered where they overlap, whatever made them, at a cost of one lookup a use while no two
-//!   ranges meet, and of one use added per range met otherwise. Each range keeps the ranges that
-//!   meet it, so a use reads them there rather than looking them up by address, but where they
-//!   outnumber the classes of length that lookup visits ([`Placements::sharing`]). A remap
-//!   reported keeps a placement: it orders more than the pages need, never less. A heap's own
-//!   buffer is placed as a buffer is.
+//!   ranges meet, and of one use added per range met otherwise. An encoder keeps the keys it
+//!   found, each with what a use of its bytes takes ([`Quiet`]): while no buffer joins a memory,
+//!   is placed, moves or goes, its commands whose uses of bytes name only those take no lock and
+//!   work the uses they take out from what it keeps. An encoder that ends gives its keys to the
+//!   device's next encoder to open ([`HostAliases::give_quiet`]), so a frame of many passes over
+//!   the same buffers looks each key up once while nothing changes, not once a pass.
+//!   Each range keeps the ranges that meet it, so a use reads them there rather than looking them
+//!   up by address, but where they outnumber the classes of length that lookup visits
+//!   ([`Placements::sharing`]). A remap reported keeps a placement: it orders more than the pages
+//!   need, never less. A heap's own buffer is placed as a buffer is.
 //! - **Same address, same pages.** Sharing an import assumes the pages at the bytes' addresses
 //!   are the ones the import holds: Metal's `newBufferWithBytesNoCopy:` wires the pages at the
 //!   address when it makes each buffer, so a buffer made after the caller replaced the pages
@@ -98,6 +153,43 @@ pub(super) struct Alias {
     pub(super) key: ResourceKey,
 }
 
+/// What a memory's import is to the buffers made over the memory later ([`HostAliases::import`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
+    /// An import of the caller's pages, in memory of this class: a later buffer of the class lies
+    /// in it.
+    Import(MemoryClass),
+    /// A copy of the caller's pages in memory of the runtime's own (`copied.rs`): a later buffer
+    /// of either class lies in it while no import of its class lives, as the copy's memory is of
+    /// one class whatever the buffer's storage mode, the memory a copy of its own would take.
+    Copy,
+}
+
+/// What the live imports hold of the pages a new import would take ([`HostAliases::within`]).
+pub(super) enum Within<I> {
+    /// No live import holds any of them: the new import is their only one.
+    Free,
+    /// A live import holds all of them: a buffer over them is bound inside its memory.
+    Inside(Arc<I>),
+    /// Live imports hold some of them, none all: these, each live import of the memories whose
+    /// bytes meet them. A new import of them would import a page twice: of the pages' pointer,
+    /// or beside an import of their pointer, it is a copy of them instead; of dma-bufs beside
+    /// imports of dma-bufs alone, it is made (`Device::imports_beside`).
+    Meets(Vec<Arc<I>>),
+}
+
+impl<I> Within<I> {
+    /// The live imports that hold some of the pages: none where they are free, the one they lie
+    /// inside, or those that meet them.
+    pub(super) fn held_by(&self) -> &[Arc<I>] {
+        match self {
+            Within::Free => &[],
+            Within::Inside(import) => std::slice::from_ref(import),
+            Within::Meets(met) => met,
+        }
+    }
+}
+
 /// The device's no-copy buffers by the host memory they were made over (the module docs), and
 /// the imports of it they lie in (`I`: a `HostImport`, but in unit tests).
 pub(super) struct HostAliases<I = HostImport> {
@@ -113,9 +205,158 @@ pub(super) struct HostAliases<I = HostImport> {
     placed: AtomicUsize,
     /// How many times the buffers that joined a memory or the placements changed: while it
     /// stands, [`augment`](Self::augment) gives the same uses for the same uses
-    /// (`noted_apart.rs`). Each change counts once it is made, under the lock.
+    /// (`noted_apart.rs`, [`Quiet`]). Each change counts once it is made, under the lock.
     version: AtomicU64,
+    /// How many times uses were looked up under the lock ([`augment_into`](Self::augment_into),
+    /// `WorkCounts::host_alias_lookups`).
+    lookups: AtomicU64,
     inner: Mutex<Inner<I>>,
+    /// The keys ended encoders found, newest last, for the encoders opening next
+    /// ([`quiet`](Self::quiet)): at most [`SPARE_QUIETS`], each of at most [`QUIET_KEPT`] keys.
+    spare_quiets: Mutex<Vec<Quiet>>,
+}
+
+/// The most sets of keys found the device keeps for encoders to open with ([`Quiet`]): one for
+/// each thread that encodes at once, as a window server's few do.
+const SPARE_QUIETS: usize = 8;
+
+/// The most keys found an ended encoder's set may hold to be kept ([`HostAliases::give_quiet`]):
+/// one of more goes, so what the device keeps stays bounded.
+const QUIET_KEPT: usize = 256;
+
+/// The keys found while the host aliases stood at `version` ([`HostAliases::augment_into`]), each
+/// with the uses a use of its bytes takes then ([`Takes`]): none for a key over which no buffer
+/// joined another's memory and whose range of bytes, if any, holds no other key and meets no
+/// other range ([`Placed::crowded`]); else its memory's key, its range's first key and the keys of
+/// the ranges its own meets, where its range keeps those ([`Placements::sharing`]). An encoder
+/// keeps them, so a command whose uses of bytes name only such keys takes no lock and reads
+/// nothing the device's other encoders write while no buffer joins a memory, is placed, moves or
+/// goes: each use takes the uses it took when its key was found, worked out from what the key
+/// keeps (a draw's uses of a buffer placed in a heap over host pages that another range meets,
+/// as the consumer's upload chunks lie in its guest RAM, the bytes moving draw after draw); a
+/// change of the version forgets them. An encoder opens with the keys an ended one gave back
+/// ([`HostAliases::quiet`]): they hold for any encoder of the device while the version stands,
+/// since what a key takes is a function of the buffers joined and placed alone, and the first
+/// command that finds the version changed forgets them as it would its own.
+#[derive(Default)]
+pub(super) struct Quiet {
+    version: u64,
+    keys: KeyMap<ResourceKey, Takes>,
+}
+
+/// What a use of a key's bytes takes while the host aliases stand ([`Quiet`]): a use of its
+/// memory's key, where it joined one, and those its range of bytes gives
+/// ([`Placements::sharing`]), as [`augmented`] adds them.
+struct Takes {
+    /// The key of the memory it joined.
+    joined: Option<ResourceKey>,
+    /// Its range's, where its range is crowded: none where it takes nothing of it.
+    range: Option<Kept>,
+}
+
+/// A crowded range of bytes a key lies over, as its uses read it ([`Placements::sharing`]): its
+/// first byte's host address and its length, the key its keys' uses share where it is another,
+/// and the ranges it keeps that meet it, each with its key.
+struct Kept {
+    at: (u64, u64),
+    first: Option<ResourceKey>,
+    meets: Vec<((u64, u64), ResourceKey)>,
+}
+
+impl Takes {
+    /// Whether a use takes nothing.
+    fn nothing(&self) -> bool {
+        self.joined.is_none() && self.range.as_ref().is_none_or(Kept::nothing)
+    }
+
+    /// Add to `add` the uses `used`, a use of `bytes` of the key, takes, in [`augmented`]'s order.
+    fn add_to(
+        &self,
+        used: &Use<ResourceKey>,
+        bytes: &std::ops::Range<u64>,
+        add: &mut impl FnMut(Use<ResourceKey>),
+    ) {
+        if let Some(key) = self.joined {
+            add(Use {
+                key,
+                ..used.clone()
+            });
+        }
+        if let Some(range) = &self.range {
+            range.share(bytes, |key, shared| {
+                // The memory's key carries the same bytes already.
+                if Some(key) != self.joined || shared != *bytes {
+                    add(Use {
+                        key,
+                        range: UseRange::Bytes(shared),
+                        ..used.clone()
+                    });
+                }
+            });
+        }
+    }
+}
+
+impl Kept {
+    /// Whether a use of its bytes takes nothing of it: its key is its first, and none meets it.
+    fn nothing(&self) -> bool {
+        self.first.is_none() && self.meets.is_empty()
+    }
+
+    /// For a use of `bytes` of a key over it, each other key those bytes share and the bytes of
+    /// it they are, to `each`, as [`Placements::sharing`] gives them from what a range keeps.
+    fn share(
+        &self,
+        bytes: &std::ops::Range<u64>,
+        mut each: impl FnMut(ResourceKey, std::ops::Range<u64>),
+    ) {
+        if let Some(first) = self.first {
+            each(first, bytes.clone());
+        }
+        share_met(self.at, &self.meets, bytes, each);
+    }
+}
+
+/// For a use of `bytes` (counted from the first byte of `at`, the range of host bytes its key lies
+/// over), the ranges of `meets` those bytes meet, each with its key and clipped to it (counted
+/// from its first byte), to `each`, in order.
+fn share_met(
+    at: (u64, u64),
+    meets: &[((u64, u64), ResourceKey)],
+    bytes: &std::ops::Range<u64>,
+    mut each: impl FnMut(ResourceKey, std::ops::Range<u64>),
+) {
+    // The host bytes the use covers, within the key's own.
+    let start = at.0.saturating_add(bytes.start.min(at.1));
+    let end = at.0.saturating_add(bytes.end.min(at.1));
+    for &(other, key) in meets {
+        let from = start.max(other.0);
+        let to = end.min(other.0.saturating_add(other.1));
+        if from < to {
+            each(key, from - other.0..to - other.0);
+        }
+    }
+}
+
+impl Quiet {
+    /// Forget the keys found while the host aliases stood at a version other than `version`.
+    fn stand(&mut self, version: u64) {
+        if self.version != version {
+            self.keys.clear();
+            self.version = version;
+        }
+    }
+
+    /// Whether `used` takes no other use as it is: it is of no bytes, or of a key found quiet.
+    fn holds(&self, used: &Use<ResourceKey>) -> bool {
+        !matches!(used.range, UseRange::Bytes(_))
+            || self.keys.get(&used.key).is_some_and(Takes::nothing)
+    }
+
+    /// Whether what `used` takes is known: it is of no bytes, or of a key found.
+    fn knows(&self, used: &Use<ResourceKey>) -> bool {
+        !matches!(used.range, UseRange::Bytes(_)) || self.keys.contains_key(&used.key)
+    }
 }
 
 impl<I> Default for HostAliases<I> {
@@ -126,6 +367,8 @@ impl<I> Default for HostAliases<I> {
             noted: AtomicUsize::new(0),
             placed: AtomicUsize::new(0),
             version: AtomicU64::new(0),
+            lookups: AtomicU64::new(0),
+            spare_quiets: Mutex::new(Vec::new()),
             inner: Mutex::new(Inner {
                 made_over: KeyMap::default(),
                 memories: Memories::default(),
@@ -162,76 +405,129 @@ struct Over {
 
 /// A memory live buffers were made over.
 struct Memory<I> {
-    /// The first such buffer's key: the memory's.
-    key: ResourceKey,
+    /// The first such buffer's key: the memory's. `None` while a heap's own buffer alone was
+    /// made over it ([`HostAliases::hold`]), which a later buffer lies in without joining.
+    key: Option<ResourceKey>,
     /// How many live buffers were made over it.
     buffers: usize,
-    /// Its imports a buffer made, by memory class: a later buffer of the class lies in it while
-    /// it lives.
-    imports: Vec<(MemoryClass, Weak<I>)>,
+    /// Its imports a buffer made, by kind: a later buffer lies in one while it lives
+    /// ([`HostAliases::import`]).
+    imports: Vec<(Kind, Weak<I>)>,
     /// The serial it was noted with ([`Over`]).
     serial: u64,
 }
 
 impl<I> HostAliases<I> {
     /// The live import of `class` of `memory`, the bytes a live buffer was made over (its first
-    /// byte's host address and its length): a buffer made over them lies in it.
+    /// byte's host address and its length), else its live copy ([`Kind::Copy`]): a buffer of
+    /// `class` made over them lies in it.
     pub(super) fn import(&self, memory: (u64, u64), class: MemoryClass) -> Option<Arc<I>> {
         let inner = lock(&self.inner);
         let memory = inner.memories.get(memory)?;
-        memory
-            .imports
-            .iter()
-            .filter(|(made, _)| *made == class)
-            .find_map(|(_, import)| import.upgrade())
+        let live = |kind: Kind| {
+            (memory.imports.iter())
+                .filter(|(made, _)| *made == kind)
+                .find_map(|(_, import)| import.upgrade())
+        };
+        live(Kind::Import(class)).or_else(|| live(Kind::Copy))
     }
 
-    /// Whether a live import of `class` was made over memory that holds all of `memory` and more
-    /// (`WorkCounts::object_churn.imports_inside_live`): a buffer over part of a live no-copy
-    /// buffer's bytes, which imports its own.
-    pub(super) fn inside_live(&self, memory: (u64, u64), class: MemoryClass) -> bool {
+    /// What the live imports noted hold of the pages `window` (the first byte's host address and
+    /// the length of whole import units, `unit` bytes each, a new import's window): an import of
+    /// any class, not a copy, whose bytes rounded out to `unit` hold them all, which a buffer over
+    /// them lies inside ([`Within::Inside`]); else the live imports that hold some of them
+    /// ([`Within::Meets`]), beside which a new import would hold a page a second time; else none
+    /// ([`Within::Free`]). `VK_EXT_external_memory_host` leaves a host allocation imported twice
+    /// into a device undefined ("Some platforms do not allow locking the same physical pages for
+    /// device access multiple times"), so no page an import of its pointer holds is imported
+    /// again, nor by its pointer beside any import; two imports of dma-bufs of the same pages are
+    /// two aliases of external memory (`Device::imports_beside`).
+    pub(super) fn within(&self, window: (u64, u64), unit: u64) -> Within<I> {
         let inner = lock(&self.inner);
-        let end = memory.0.saturating_add(memory.1);
-        let found = inner
-            .memories
-            .overlapping(memory.0, end)
-            .filter(|&(start, length)| {
-                (start, length) != memory
-                    && start <= memory.0
-                    && end <= start.saturating_add(length)
-            })
-            .any(|at| {
-                inner.memories.get(at).is_some_and(|noted| {
-                    (noted.imports.iter())
-                        .any(|(made, import)| *made == class && import.strong_count() > 0)
-                })
-            });
-        found
+        let unit = unit.max(1);
+        let (start, end) = (window.0, window.0.saturating_add(window.1));
+        let mut met = Vec::new();
+        for at in inner.memories.overlapping(start, end) {
+            let Some(noted) = inner.memories.get(at) else {
+                continue;
+            };
+            let mut live = (noted.imports.iter())
+                .filter(|(made, _)| matches!(made, Kind::Import(_)))
+                .filter_map(|(_, import)| import.upgrade())
+                .peekable();
+            let Some(first) = live.peek() else {
+                continue;
+            };
+            let from = at.0 - at.0 % unit;
+            let to =
+                at.0.saturating_add(at.1)
+                    .div_ceil(unit)
+                    .saturating_mul(unit);
+            if from <= start && end <= to {
+                return Within::Inside(Arc::clone(first));
+            }
+            met.extend(live);
+        }
+        match met.is_empty() {
+            true => Within::Free,
+            false => Within::Meets(met),
+        }
     }
 
     /// Note the buffer of `key`, made over `memory` (its first byte's host address and its
-    /// length) and lying in `import`, of memory class `class`: it joins the memory a live buffer
-    /// was made over, or its key becomes the memory's; later buffers of `class` over the memory
-    /// lie in `import` unless a live import of it is noted already.
+    /// length) and lying in `import`, of `kind`: it joins the memory a live buffer was made over,
+    /// or its key becomes the memory's; later buffers over the memory lie in `import`, where
+    /// [`import`](Self::import) finds it, unless a live import of its kind is noted already.
     pub(super) fn join(
         &self,
         key: ResourceKey,
         memory: (u64, u64),
-        class: MemoryClass,
+        kind: Kind,
         import: &Arc<I>,
     ) -> Option<Alias> {
         let mut inner = lock(&self.inner);
+        // A joining buffer's note always has a key: its own, where the memory had none.
+        let owner = self.note(&mut inner, key, memory, (kind, import), true)?;
+        if owner == key {
+            return None;
+        }
+        let alias = Alias { key: owner };
+        Arc::make_mut(&mut inner.aliases).insert(key, alias);
+        self.any.store(true, Ordering::Relaxed);
+        self.changed();
+        Some(alias)
+    }
+
+    /// Note a heap's own buffer of `key`, made over `memory` and lying in `import`, of `kind`, as
+    /// [`join`](Self::join) notes a buffer, but joining no key: a later buffer over the memory
+    /// lies in `import` ([`import`](Self::import)), and one over part of it inside it
+    /// ([`within`](Self::within)), each keeping its own key (a heap's bytes join none, "Not
+    /// joined" in the module docs); the first such buffer's key becomes the memory's.
+    pub(super) fn hold(&self, key: ResourceKey, memory: (u64, u64), kind: Kind, import: &Arc<I>) {
+        let mut inner = lock(&self.inner);
+        self.note(&mut inner, key, memory, (kind, import), false);
+    }
+
+    /// Note the buffer of `key` over `memory`, lying in `import` of its kind, its key the
+    /// memory's where it `joins` and the memory has none: the memory's key.
+    fn note(
+        &self,
+        inner: &mut Inner<I>,
+        key: ResourceKey,
+        memory: (u64, u64),
+        (kind, import): (Kind, &Arc<I>),
+        joins: bool,
+    ) -> Option<ResourceKey> {
         let Inner {
             made_over,
             memories,
-            aliases,
             serial,
-            placements: _,
-        } = &mut *inner;
+            ..
+        } = inner;
         let noted = memories.get_or_insert_with(memory, || {
             *serial += 1;
             Memory {
-                key,
+                key: None,
                 buffers: 0,
                 imports: Vec::new(),
                 serial: *serial,
@@ -241,8 +537,11 @@ impl<I> HostAliases<I> {
         noted
             .imports
             .retain(|(_, import)| import.strong_count() > 0);
-        if !noted.imports.iter().any(|(made, _)| *made == class) {
-            noted.imports.push((class, Arc::downgrade(import)));
+        if !noted.imports.iter().any(|(made, _)| *made == kind) {
+            noted.imports.push((kind, Arc::downgrade(import)));
+        }
+        if joins && noted.key.is_none() {
+            noted.key = Some(key);
         }
         let owner = noted.key;
         let over = Over {
@@ -251,14 +550,7 @@ impl<I> HostAliases<I> {
         };
         made_over.insert(key, over);
         self.noted.store(memories.len(), Ordering::Relaxed);
-        if owner == key {
-            return None;
-        }
-        let alias = Alias { key: owner };
-        Arc::make_mut(aliases).insert(key, alias);
-        self.any.store(true, Ordering::Relaxed);
-        self.changed();
-        Some(alias)
+        owner
     }
 
     /// The memory the buffer of `key` joined, if it joined one.
@@ -334,6 +626,31 @@ impl<I> HostAliases<I> {
         })
     }
 
+    /// Whether some key lies over a byte of the host bytes `start..end` now ([`Placements`]: a
+    /// buffer over host pages, made or rebound there, a heap's own buffer, a guest RAM chunk's
+    /// copies' key), but a range only one key lies over, its first, which `quiet` answers true
+    /// of: what a staged copy's host step reads by the CPU, ordered after no GPU work, where no
+    /// other key may be written (`host_ram/copy.rs`). A key lies over its bytes until its buffer
+    /// went, after every command buffer that used it.
+    pub(super) fn others_over(
+        &self,
+        start: u64,
+        end: u64,
+        quiet: impl Fn(ResourceKey) -> bool,
+    ) -> bool {
+        if start >= end || self.placed.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let inner = lock(&self.inner);
+        let ranges = &inner.placements.ranges;
+        let mut found = ranges.overlapping(start, end);
+        found.any(|at| {
+            ranges
+                .get(at)
+                .is_none_or(|placed| placed.keys != 1 || !placed.first || !quiet(placed.key))
+        })
+    }
+
     /// The buffer of `key` is gone.
     pub(super) fn forget(&self, key: ResourceKey) {
         let mut inner = lock(&self.inner);
@@ -401,16 +718,20 @@ impl<I> HostAliases<I> {
     /// as they are).
     pub(super) fn augment(&self, uses: &[Use<ResourceKey>]) -> Option<Vec<Use<ResourceKey>>> {
         let mut all = Vec::new();
-        self.augment_into(uses, &mut all).then_some(all)
+        self.augment_into(uses, &mut all, None).then_some(all)
     }
 
     /// [`augment`](Self::augment) into `all`, emptied first: whether a use took another (`all`
     /// then holds `uses` and the uses they took; else it stays empty), so a caller that keeps
-    /// `all` makes no vector at each call.
+    /// `all` makes no vector at each call. The keys a given `quiet` holds while the version
+    /// stands take no other use, and the keys found to take none join them, so a caller that
+    /// keeps `quiet` too looks up no command whose uses of bytes name only such keys: one load of
+    /// the version.
     pub(super) fn augment_into(
         &self,
         uses: &[Use<ResourceKey>],
         all: &mut Vec<Use<ResourceKey>>,
+        mut quiet: Option<&mut Quiet>,
     ) -> bool {
         all.clear();
         let joined = self.any.load(Ordering::Relaxed);
@@ -418,10 +739,58 @@ impl<I> HostAliases<I> {
         if !joined && !crowded {
             return false;
         }
+        if let Some(quiet) = quiet.as_deref_mut() {
+            // Read before the lock: a change made after it forgets the keys at the next command.
+            quiet.stand(self.version());
+            if uses.iter().all(|used| quiet.holds(used)) {
+                return false;
+            }
+            // Every key found: the uses each took then, with no lock.
+            if uses.iter().all(|used| quiet.knows(used)) {
+                return augmented_known(quiet, uses, all);
+            }
+        }
+        self.lookups.fetch_add(1, Ordering::Relaxed);
         let inner = lock(&self.inner);
-        let aliases = joined.then_some(&*inner.aliases);
-        let placements = crowded.then_some(&inner.placements);
-        augmented(aliases, placements, uses, all)
+        // What lies under the lock now, not the flags read before it: a key found here holds
+        // while the version read before them stands, and a change since then forgets it.
+        augmented(
+            (Some(&inner.aliases), Some(&inner.placements)),
+            uses,
+            all,
+            quiet,
+        )
+    }
+
+    /// How many times [`augment_into`](Self::augment_into) looked uses up under the lock
+    /// (`WorkCounts::host_alias_lookups`).
+    pub(super) fn lookups(&self) -> u64 {
+        self.lookups.load(Ordering::Relaxed)
+    }
+
+    /// The keys an encoder opening starts from ([`Quiet`]): the newest set an ended encoder gave
+    /// back ([`give_quiet`](Self::give_quiet)), else none. Where no buffer joined a memory and no
+    /// placed range is crowded, no command looks a key up ([`augment_into`](Self::augment_into)'s
+    /// first check), so it starts from none, taking no lock.
+    pub(super) fn quiet(&self) -> Quiet {
+        if !self.any.load(Ordering::Relaxed) && !self.crowded.load(Ordering::Relaxed) {
+            return Quiet::default();
+        }
+        lock(&self.spare_quiets).pop().unwrap_or_default()
+    }
+
+    /// Keep `quiet`, the keys an ended encoder found, for the next encoder to open
+    /// ([`quiet`](Self::quiet)): where it holds any, at most [`QUIET_KEPT`] of them, found at the
+    /// version that stands, and fewer than [`SPARE_QUIETS`] sets are kept; else it goes.
+    pub(super) fn give_quiet(&self, quiet: Quiet) {
+        if quiet.keys.is_empty() || quiet.keys.len() > QUIET_KEPT || quiet.version != self.version()
+        {
+            return;
+        }
+        let mut spare = lock(&self.spare_quiets);
+        if spare.len() < SPARE_QUIETS {
+            spare.push(quiet);
+        }
     }
 }
 
@@ -442,10 +811,71 @@ fn release<I>(memories: &mut Memories<Memory<I>>, over: Over) {
 
 /// [`HostAliases::augment_into`] over, where given, `aliases` (the buffers that joined a memory)
 /// and `placements`, into `all`, empty: the uses added follow `uses`, which go in at the first.
-/// Whether any was added.
+/// Whether any was added. The uses of keys `quiet` knows take what it keeps of them; the others'
+/// keys join it with what they take, where their ranges keep what meets them (a range met by more
+/// is looked up at each use).
 pub(super) fn augmented(
-    aliases: Option<&KeyMap<ResourceKey, Alias>>,
-    placements: Option<&Placements>,
+    (aliases, placements): (Option<&KeyMap<ResourceKey, Alias>>, Option<&Placements>),
+    uses: &[Use<ResourceKey>],
+    all: &mut Vec<Use<ResourceKey>>,
+    mut quiet: Option<&mut Quiet>,
+) -> bool {
+    let mut add = |added: Use<ResourceKey>| {
+        if all.is_empty() {
+            all.reserve(2 * uses.len());
+            all.extend_from_slice(uses);
+        }
+        all.push(added);
+    };
+    for used in uses {
+        let UseRange::Bytes(bytes) = &used.range else {
+            continue;
+        };
+        if let Some(takes) = quiet.as_deref().and_then(|quiet| quiet.keys.get(&used.key)) {
+            takes.add_to(used, bytes, &mut add);
+            continue;
+        }
+        let joined = aliases
+            .and_then(|aliases| aliases.get(&used.key))
+            .map(|alias| alias.key);
+        let found = placements.map_or(Found::Alone, |placements| placements.found(used.key));
+        let range = match found {
+            Found::Alone => None,
+            Found::Kept(range) => Some(range),
+            // Met by more than its range keeps: looked up by address at each use.
+            Found::LookedUp => {
+                let takes = Takes {
+                    joined,
+                    range: None,
+                };
+                takes.add_to(used, bytes, &mut add);
+                if let Some(placements) = placements {
+                    placements.sharing(used.key, bytes, |key, range| {
+                        if Some(key) != joined || range != *bytes {
+                            add(Use {
+                                key,
+                                range: UseRange::Bytes(range),
+                                ..used.clone()
+                            });
+                        }
+                    });
+                }
+                continue;
+            }
+        };
+        let takes = Takes { joined, range };
+        takes.add_to(used, bytes, &mut add);
+        if let Some(quiet) = quiet.as_deref_mut() {
+            quiet.keys.insert(used.key, takes);
+        }
+    }
+    !all.is_empty()
+}
+
+/// [`augmented`] of `uses`, whose keys `quiet` knows every one of, into `all`, empty: whether any
+/// was added.
+fn augmented_known(
+    quiet: &Quiet,
     uses: &[Use<ResourceKey>],
     all: &mut Vec<Use<ResourceKey>>,
 ) -> bool {
@@ -460,30 +890,21 @@ pub(super) fn augmented(
         let UseRange::Bytes(bytes) = &used.range else {
             continue;
         };
-        let joined = aliases
-            .and_then(|aliases| aliases.get(&used.key))
-            .map(|alias| alias.key);
-        if let Some(key) = joined {
-            add(Use {
-                key,
-                ..used.clone()
-            });
+        if let Some(takes) = quiet.keys.get(&used.key) {
+            takes.add_to(used, bytes, &mut add);
         }
-        let Some(placements) = placements else {
-            continue;
-        };
-        placements.sharing(used.key, bytes, |key, range| {
-            // The memory's key carries the same bytes already.
-            if Some(key) != joined || range != *bytes {
-                add(Use {
-                    key,
-                    range: UseRange::Bytes(range),
-                    ..used.clone()
-                });
-            }
-        });
     }
     !all.is_empty()
+}
+
+/// What a use of a key's bytes takes of its range ([`Placements::found`]).
+enum Found {
+    /// Nothing: it lies over no bytes, or over a range that is not crowded.
+    Alone,
+    /// What its crowded range keeps.
+    Kept(Kept),
+    /// Its range is met by more ranges than it keeps: its uses look those up by address.
+    LookedUp,
 }
 
 /// The bytes each buffer over host pages lies over now, by key, and the ranges of bytes some key
@@ -623,53 +1044,73 @@ impl Placements {
     /// meet the key's own range, which it keeps: they are read from there while no more than the
     /// classes of length the lookup by address visits (a range query each, where a kept range is
     /// a comparison); a use of a range met by more, as one over many others' bytes is, looks up
-    /// those its bytes meet (`WorkCounts::host_range_lookups`).
+    /// those its bytes meet (`WorkCounts::host_range_lookups`). Whether the key's uses may share
+    /// another's at all: it lies over a crowded range ([`Placed::crowded`]), whatever `bytes`.
     pub(super) fn sharing(
         &self,
         key: ResourceKey,
         bytes: &std::ops::Range<u64>,
         mut each: impl FnMut(ResourceKey, std::ops::Range<u64>),
-    ) {
+    ) -> bool {
         let Some(&at) = self.at.get(&key) else {
-            return;
+            return false;
         };
         let Some(own) = self.ranges.get(at) else {
-            return;
+            return false;
         };
         if !own.crowded() {
-            return;
+            return false;
         }
         if own.key != key {
             each(own.key, bytes.clone());
         }
         if own.meets.is_empty() {
-            return;
+            return true;
         }
+        if own.meets.len() <= self.ranges.held_classes() {
+            share_met(at, &own.meets, bytes, each);
+            return true;
+        }
+        self.looked_up.set(self.looked_up.get() + 1);
         // The host bytes the use covers, within the key's own.
         let start = at.0.saturating_add(bytes.start.min(at.1));
         let end = at.0.saturating_add(bytes.end.min(at.1));
-        let mut clipped = |other: (u64, u64), key: ResourceKey| {
-            let from = start.max(other.0);
-            let to = end.min(other.0.saturating_add(other.1));
-            if from < to {
-                each(key, from - other.0..to - other.0);
-            }
-        };
-        if own.meets.len() <= self.ranges.held_classes() {
-            for &(other, key) in &own.meets {
-                clipped(other, key);
-            }
-            return;
-        }
-        self.looked_up.set(self.looked_up.get() + 1);
         for other in self.ranges.overlapping(start, end) {
             if other == at {
                 continue;
             }
             if let Some(range) = self.ranges.get(other) {
-                clipped(other, range.key);
+                let from = start.max(other.0);
+                let to = end.min(other.0.saturating_add(other.1));
+                if from < to {
+                    each(range.key, from - other.0..to - other.0);
+                }
             }
         }
+        true
+    }
+
+    /// What a use of `key`'s bytes takes of the range it lies over, whatever the bytes, as
+    /// [`sharing`](Self::sharing) gives it: nothing, what its range keeps, or a lookup by
+    /// address at each use.
+    fn found(&self, key: ResourceKey) -> Found {
+        let Some(&at) = self.at.get(&key) else {
+            return Found::Alone;
+        };
+        let Some(own) = self.ranges.get(at) else {
+            return Found::Alone;
+        };
+        if !own.crowded() {
+            return Found::Alone;
+        }
+        if own.meets.len() > self.ranges.held_classes() {
+            return Found::LookedUp;
+        }
+        Found::Kept(Kept {
+            at,
+            first: (own.key != key).then_some(own.key),
+            meets: own.meets.clone(),
+        })
     }
 }
 

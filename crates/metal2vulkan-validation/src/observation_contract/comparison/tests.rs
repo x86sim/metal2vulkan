@@ -67,6 +67,7 @@ fn every_precision_note_has_its_table_row() {
         (N::ViewBaseTexelOffset, Allowance::Recorded),
         (N::DeviceColorConversion, Allowance::Recorded),
         (N::DeviceInterpolation, Allowance::Unbounded),
+        (N::ExtrapolatedInterpolation, Allowance::Unbounded),
         (N::QuadsSplitByClipping, Allowance::Unbounded),
         (N::VertexSimdgroupGrouping, Allowance::Unbounded),
         (N::FragmentSimdgroupGrouping, Allowance::Unbounded),
@@ -75,6 +76,9 @@ fn every_precision_note_has_its_table_row() {
         (N::DeviceAlphaCoverage, Allowance::Unbounded),
         (N::RotatedBlendRounding, Allowance::Unbounded),
         (N::ComputedSampleDepth, Allowance::Unbounded),
+        (N::UnorderedFetchWithinDraw, Allowance::Unbounded),
+        (N::NativeLogicOperation, Allowance::Unbounded),
+        (N::NativeFloat8, Allowance::Unbounded),
     ];
     for (note, expected) in rows {
         assert_eq!(allowance(note), expected, "{note:?}");

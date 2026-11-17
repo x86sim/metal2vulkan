@@ -66,13 +66,11 @@
 //!   though the command buffer failed already and keeps that first code (move14: the consumer's
 //!   review; Metal runs it over the new pages).
 
-use super::checks::metal_submissions;
 use super::rebound_use::{ReboundAt, ReboundUse, Recording};
 use super::{write_fields, CommandBufferShared, Resident, State};
 use crate::error::{internal, CommandBufferError, Error};
 use crate::live_buffers::LiveTable;
 use crate::rebind::{SubmittedHolds, Submitting};
-use crate::residency::Residency;
 use crate::upload::Upload;
 use crate::used_resources::UsedResources;
 use crate::values::CommandBufferStatus;
@@ -228,7 +226,7 @@ impl State {
             }) if table.generation() != now => {}
             _ => return Ok(()),
         }
-        let fresh = self.fresh_ranges();
+        let fresh = self.fresh_ranges(device);
         self.remake_resident(device, &fresh)
     }
 
@@ -242,7 +240,7 @@ impl State {
     fn point_replay_tables(&mut self, device: &Device, moved: bool) -> Result<(), Error> {
         let live = device.shared().live_buffers.table(device)?;
         if moved {
-            let ranges = live.ranges().chain(self.fresh_ranges());
+            let ranges = live.ranges().chain(self.fresh_ranges(device));
             let (bytes, count) = ResidentSet::replay_bytes(ranges);
             let len = bytes.len() as u64;
             let upload =
@@ -265,10 +263,9 @@ impl State {
     }
 
     /// The ranges of what its encoders made resident, as it lies now.
-    fn fresh_ranges(&self) -> Vec<ResidentRange> {
-        self.residency
-            .as_ref()
-            .map(Residency::resident_ranges)
+    fn fresh_ranges(&mut self, device: &Device) -> Vec<ResidentRange> {
+        (self.joined_residency(&device.shared().counts))
+            .map(|residency| residency.resident_ranges())
             .unwrap_or_default()
     }
 
@@ -426,14 +423,7 @@ impl State {
         if verdicts.is_empty() {
             return Vec::new();
         }
-        let encoders = self.ended.iter().map(|record| {
-            (
-                record.kind,
-                record.event_waits_before,
-                record.event_signals_before,
-            )
-        });
-        metal_submissions(encoders)
+        self.metal_submissions()
             .into_iter()
             .filter_map(|(_, encoders)| {
                 let mut failure = None;
@@ -581,14 +571,17 @@ impl State {
         }
         due.sort_by_key(|(encoders, _)| encoders.start);
         let State {
-            recorded, retained, ..
+            recorded,
+            retained,
+            ended,
+            ..
         } = self;
         let failing = |encoder: &usize| due.iter().any(|(encoders, _)| encoders.contains(encoder));
         for part in recorded[range.start..]
             .iter_mut()
             .filter(|part| failing(&part.encoder))
         {
-            State::fail_part(part, retained);
+            State::fail_part(part, ended, retained);
         }
         self.unrunnable
             .extend(due.iter().flat_map(|(encoders, _)| encoders.clone()));

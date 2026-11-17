@@ -314,6 +314,24 @@ impl<S: Side, W: Watcher> Side for Watching<S, W> {
         self.inner.mesh_descriptor_facts(library, spec)
     }
 
+    fn mesh_pipeline_limits(
+        &mut self,
+        library: Handle,
+        spec: &crate::pipeline_limits::MeshLimitsSpec<'_>,
+    ) -> Answer<crate::pipeline_limits::Creation<crate::pipeline_limits::MeshStateLimits>> {
+        let _span = self.watch("mesh_pipeline_limits");
+        self.inner.mesh_pipeline_limits(library, spec)
+    }
+
+    fn compute_pipeline_limits(
+        &mut self,
+        library: Handle,
+        spec: &crate::pipeline_limits::ComputeLimitsSpec<'_>,
+    ) -> Answer<crate::pipeline_limits::Creation<crate::pipeline_limits::ComputeStateLimits>> {
+        let _span = self.watch("compute_pipeline_limits");
+        self.inner.compute_pipeline_limits(library, spec)
+    }
+
     fn heap_buffer_size_and_align(
         &mut self,
         query: &crate::device_queries::HeapBufferQuery,
@@ -748,6 +766,13 @@ impl<S: Side, W: Watcher> Side for Watching<S, W> {
         self.inner.command_buffer_facts()
     }
 
+    fn empty_command_buffers(
+        &mut self,
+    ) -> Answer<crate::empty_command_buffers::EmptyCommandBuffers> {
+        let _span = self.watch("empty_command_buffers");
+        self.inner.empty_command_buffers()
+    }
+
     fn sparse_tile_size_in_bytes(&mut self, page: crate::sparse_query::QueryPage) -> Answer<u64> {
         let _span = self.watch("sparse_tile_size_in_bytes");
         self.inner.sparse_tile_size_in_bytes(page)
@@ -894,6 +919,14 @@ impl<S: Side, W: Watcher> Side for Watching<S, W> {
         self.inner.signal_before_a_wait()
     }
 
+    fn event_wait_behind_a_running_signal(
+        &mut self,
+        shared: bool,
+    ) -> Answer<crate::event_orders::WaitBehindRunningSignal> {
+        let _span = self.watch("event_wait_behind_a_running_signal");
+        self.inner.event_wait_behind_a_running_signal(shared)
+    }
+
     fn scheduled_handler_order(
         &mut self,
     ) -> Answer<crate::scheduled_handlers::ScheduledHandlerOrder> {
@@ -1031,6 +1064,8 @@ mod tests {
                 device: "stub".to_owned(),
                 driver: "stub".to_owned(),
                 api: "stub".to_owned(),
+                lossless_compression: true,
+                host: None,
             }
         }
 
@@ -1182,6 +1217,8 @@ mod tests {
                     device: "slow".to_owned(),
                     driver: "slow".to_owned(),
                     api: "slow".to_owned(),
+                    lossless_compression: true,
+                    host: None,
                 }
             }
             fn library(&mut self, _source: &ShaderSource<'_>) -> Answer<Handle> {

@@ -10,6 +10,9 @@
 //! `VkQueue`s that did such work: no new resource waits for one, so making one waits for no GPU
 //! work. That work is recorded first in the submission's one command buffer, before the host
 //! calls' staged copies and the work, as a batch's is in its own (`command_buffer/submit.rs`).
+//! A handle handed out (`Buffer::vk_buffer`, `Texture::vk_image`) takes only its own first work,
+//! after no other queue's batches (`Device::settle_mine`); a buffer's fills alone go to the
+//! staging queue where the device reserved one (`staging.rs`).
 //!
 //! The one submission no one waits for is a no-copy buffer's sparse binding of its dma-bufs
 //! (`dma_buf.rs`), on the same queue and timeline: it would wait behind the queue's work in
@@ -24,24 +27,46 @@ use crate::error::{vulkan, Error};
 use crate::exit_guard::{self, Call};
 use crate::release;
 use crate::resource::ResourceKey;
+use crate::submit_failure::{submit_failed, Failed};
+use crate::texture::first_move::{last_of_each, FirstMoves, Mine, Taken};
+use crate::tracker::Point;
 use crate::work_counts::Begun;
 use ash::vk;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+/// How far an internal submission's first work reaches ([`Device::submit_internal_taking`]).
+#[derive(Clone, Copy, Debug)]
+enum Reach {
+    /// The device's: every new resource's first work but moves of images bound to host pages
+    /// its commands do not name, after the staging queue's queued copies, the last binding of a
+    /// no-copy buffer's dma-bufs and the batches on the other `VkQueue`s that did first work.
+    Device,
+    /// A handle's own ([`Device::settle_mine`]): after the batches on the other `VkQueue`s that
+    /// did first work only where `after_other_queues`.
+    Mine { after_other_queues: bool },
+}
+
+/// The device's own timelines outside the batches ([`Device::own_completed`]).
+pub(crate) const OWN_TIMELINES: usize = 3;
+
 /// How long one wait for an internal submission lasts before it is repeated.
 const WAIT_SLICE: Duration = Duration::from_millis(100);
 
 /// A timeline the device's own submissions signal outside the batches (the internal ones here,
-/// the staging queue's copies, `staging.rs`), and the value through which the host saw them
-/// complete. Each batch with work waits for it at that value, once per value on its `VkQueue`
-/// (`command_buffer/submit.rs`), which makes what they wrote visible to the batch and to every
-/// later command there: the submission's "second synchronization scope of each semaphore wait
-/// operation defined by this command includes every command in the same batch that the wait
-/// operation is defined in, and all commands that occur later in submission order", and the
-/// wait's "second access scope includes all memory access performed by the device"
-/// (`vkQueueSubmit`, semaphore waiting).
+/// the staging queue's copies and the fill queue's fills, `staging.rs`), and the value through which the host saw them
+/// complete. What they wrote through that value is visible to every submission made after the
+/// host saw it, a batch or an internal one, with no wait or barrier of its own: the signal's
+/// "first access scope includes all memory access performed by the device" (semaphore
+/// signaling), which makes those writes available to the device domain, and each later
+/// `vkQueueSubmit` "performs a memory domain operation from host to device, and a visibility
+/// operation with source scope of the device domain and destination scope of all agents and
+/// references on the device" (the memory model's availability, visibility and domain
+/// operations). A batch with work still waits for it at that value, once per value on its
+/// `VkQueue`, where its driver does not stall on semaphore operations, and starts with
+/// `Barrier::after_completed` (`tracker.rs`) where it does (`command_buffer/submit.rs`); an
+/// internal submission takes neither.
 #[derive(Default)]
 pub(crate) struct OwnTimeline {
     semaphore: OnceLock<vk::Semaphore>,
@@ -57,10 +82,20 @@ impl OwnTimeline {
         (value > 0).then_some((semaphore, value))
     }
 
+    /// The timeline's semaphore, once made.
+    fn semaphore(&self) -> Option<vk::Semaphore> {
+        self.semaphore.get().copied()
+    }
+
     /// The timeline was made: `semaphore`.
     pub(super) fn made(&self, semaphore: vk::Semaphore) {
-        // A device makes each of its two own timelines once.
+        // A device makes each of its own timelines once.
         let _ = self.semaphore.set(semaphore);
+    }
+
+    /// The value through which the host saw its submissions complete (0 before the first).
+    pub(super) fn value(&self) -> u64 {
+        self.completed.load(Ordering::Acquire)
     }
 
     /// The host saw the timeline reach `value`.
@@ -161,8 +196,64 @@ impl Device {
         named: impl Fn(ResourceKey) -> bool,
         record: impl FnOnce(&Vk, vk::CommandBuffer),
     ) -> Result<(), Error> {
+        self.submit_internal_taking(|firsts| firsts.take(&named), Reach::Device, record)
+    }
+
+    /// Make the first work of a handle handed out now (`Buffer::vk_buffer`,
+    /// `Buffer::export_memory_fd`, `Texture::vk_image`), and wait for it: `mine` alone
+    /// ([`FirstMoves::take_mine`]), the rest left for the device's next submission. Its sources
+    /// are the host's (the device's zeros, staging buffers, a `Managed` buffer's host copy) and
+    /// its destinations new, so it waits for no other work of the device's: fills alone, on a
+    /// device that reserved a staging queue, run there (a copy engine, or a queue of compute work
+    /// beside the device's own), behind nothing but its earlier copies (`staging.rs`); the rest alone on the device's first `VkQueue`, behind what
+    /// was submitted there before, and, where `after_other_queues` (an image in a buffer's memory
+    /// whose fill a batch took), on the GPU after the batches on the other `VkQueue`s that did
+    /// first work. The device's submissions take their place in the order once it was made, as
+    /// they do after any submission (`texture/first_move.rs`), and a batch made after it waits
+    /// for it on the GPU until the host saw it complete, which the host has once this returns.
+    pub(crate) fn settle_mine(&self, mine: Mine, after_other_queues: bool) -> Result<(), Error> {
         if self.is_lost() {
-            return Err(Error::DeviceLost);
+            return Err(self.lost_refusal());
+        }
+        if !self.has_staging_queue() || mine.image.is_some() {
+            return self.submit_internal_taking(
+                |firsts| firsts.take_mine(mine),
+                Reach::Mine { after_other_queues },
+                |_, _| {},
+            );
+        }
+        let shared = self.shared();
+        let raw = shared.vk();
+        // Its place in the order is held from its take until its submission was made, so no
+        // batch is made between without it.
+        let taken = shared.textures.first_moves.take_mine(mine);
+        if !taken.has_first() {
+            return Ok(());
+        }
+        let mut staging = self.staging_lock()?;
+        let value = staging.submit(|_, command_buffer, flags| {
+            // SAFETY: recording for the staging queue's family, outside a render pass: fills of
+            // buffers alone, each shared with that family, as their sources are (`sharing.rs`);
+            // the submission is made before any that uses them (the order is held) and waited
+            // for below.
+            unsafe { taken.record((raw, &shared.counts), command_buffer, flags) }
+        })?;
+        // What it works on, held until it completed.
+        let _held = taken.submitted(None);
+        drop(staging);
+        self.wait_staging(value)
+    }
+
+    /// [`submit_internal`](Self::submit_internal), its first work what `take` takes, reaching
+    /// as far as `reach` says.
+    fn submit_internal_taking<'a>(
+        &'a self,
+        take: impl FnOnce(&'a FirstMoves) -> Taken<'a>,
+        reach: Reach,
+        record: impl FnOnce(&Vk, vk::CommandBuffer),
+    ) -> Result<(), Error> {
+        if self.is_lost() {
+            return Err(self.lost_refusal());
         }
         let shared = self.shared();
         let raw = shared.vk();
@@ -174,15 +265,45 @@ impl Device {
         if internal.is_none() {
             *internal = Some(Internal::new(self)?);
         }
-        let taken = firsts.take(&named);
+        let taken = take(firsts);
+        // The copies queued for the staging queue, submitted there first, which this waits for on
+        // the GPU (below), holding what they copied until it completed
+        // (`texture/staging_copy.rs`). A handle's own work reads none of them.
+        let _staged = match reach {
+            Reach::Device => self.flush_staging()?,
+            Reach::Mine { .. } => None,
+        };
         let Some(objects) = internal.as_mut() else {
             unreachable!("made above");
         };
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        let waits = firsts.waits(0, |point| {
-            shared.queues[point.queue].completed_value() >= point.value
-        });
+        let after_other_queues = match reach {
+            Reach::Device => true,
+            Reach::Mine { after_other_queues } => after_other_queues,
+        };
+        // Every one: its work may reach any resource.
+        let mut waits = match after_other_queues {
+            true => {
+                let completed =
+                    |point: Point| shared.queues[point.queue].completed_value() >= point.value;
+                last_of_each(firsts.waits(0, completed).into_iter().map(|(at, _)| at))
+            }
+            false => Vec::new(),
+        };
+        // And, where it took a move that keeps a buffer's bytes by copies around its transition
+        // (`texture/first_move.rs`'s `GpuKeep`), every earlier submission on the device's other
+        // `VkQueue`s not seen complete, whose commands may access those bytes while the
+        // transition rewrites them.
+        if taken.keeps() {
+            let others = (shared.queues.iter().enumerate().skip(1))
+                .filter(|(_, slot)| slot.submitted_value() > slot.completed_value())
+                .map(|(queue, slot)| Point {
+                    queue,
+                    value: slot.submitted_value(),
+                });
+            waits = last_of_each(waits.into_iter().chain(others));
+        }
         // SAFETY: the command buffer is not pending (every submission is waited for below) and
         // the internal lock is held; beginning it resets it (the pool resets command buffers).
         unsafe { raw.begin_command_buffer(objects.buffer, &begin) }.map_err(vulkan)?;
@@ -215,10 +336,24 @@ impl Device {
         // SAFETY: the fence is unsignaled or signaled and not pending.
         unsafe { raw.reset_fences(&[objects.fence]) }.map_err(vulkan)?;
         let buffers = [objects.buffer];
-        // And the last binding of a no-copy buffer's dma-bufs, until it completed.
+        // And the last binding of a no-copy buffer's dma-bufs, and the staging and fill queues'
+        // last submissions, until each completed: a handle's own work uses none.
+        let (binding, staging, filled) = match reach {
+            Reach::Device => (
+                self.binding_wait(),
+                self.staging_wait(),
+                self.fill_queue_wait(),
+            ),
+            Reach::Mine { .. } => (None, None, None),
+        };
+        if staging.is_some() {
+            shared.counts.staging_gpu_wait();
+        }
         let waits: Vec<(vk::Semaphore, u64)> = (waits.iter())
             .map(|point| (shared.queues[point.queue].timeline, point.value))
-            .chain(self.binding_wait())
+            .chain(binding)
+            .chain(staging)
+            .chain(filled)
             .collect();
         let wait_semaphores: Vec<vk::Semaphore> = waits.iter().map(|wait| wait.0).collect();
         let wait_values: Vec<u64> = waits.iter().map(|wait| wait.1).collect();
@@ -240,24 +375,58 @@ impl Device {
         // The first work waits as the work's does (a heap's fill another queue did comes before
         // a move of an image placed in it).
         let submits = [submit];
+        // What the submission carries, to its value: the device's pending audit's
+        // (`pending_audit.rs`), where it is on.
+        let carried = (objects.timeline, value);
+        if let Some(audit) = raw.pending_audit() {
+            audit.submitted(raw, carried, &[&buffers[..]]);
+        }
         // Where freed memory waits for the work in flight, it waits for this until it completed
         // (`freed_memory.rs`).
         let _own = (shared.parking.get()).map(|parking| parking.own_submission(self));
         // SAFETY: the queue is used under its lock; the command buffers are executable; every
         // signal of the timeline is above its value. Where the queue's failures are relayed, a
         // failure of this submission loses the device (`relay.rs`).
-        let made = shared.use_queue(0, By::Runtime, Uses::OneSignalling, |queue| unsafe {
+        // On the device's in-place check's thread, which runs beside the program's
+        // (`in_place_check.rs`), the device's loader word is held across the call and the relay's
+        // mark after it, taken inside the queue's lock, and, where the word was found
+        // overwritten, through the wait for the submission and for the mark, kept for it
+        // (MoltenVK names the device as it logs each and as the work completes, `loader_word.rs`),
+        // as the device's other checks hold it.
+        let checking = crate::in_place::checking();
+        let uses = shared.queue_uses();
+        let use_queue = |queue: vk::Queue| unsafe {
+            let word = checking.then(|| shared.loader_word.held());
             // No buffer of addresses goes while it encodes (`freed_memory.rs`).
             let _gate = (shared.parking.get()).map(|parking| parking.submitting());
             let buffers = submits
                 .iter()
                 .map(|info| info.command_buffer_count as usize);
             shared.counts.queue_submitted(submits.len(), buffers.sum());
-            raw.queue_submit(queue, &submits, objects.fence)
-        });
+            (word, raw.queue_submit(queue, &submits, objects.fence))
+        };
+        let ((word, made), mark) =
+            uses.use_queue_kept(0, By::Runtime, Uses::OneSignalling, checking, use_queue);
+        // SAFETY: the device is live while `self` is.
+        let word = word.and_then(|held| unsafe { shared.loader_word.step_hold(Some(held)) });
         // A `vkQueueSubmit` that fails leaves what its submissions reference as it was, or loses
         // the device: the work goes back as `taken` drops.
         if let Err(error) = made {
+            if let Some(audit) = raw.pending_audit() {
+                audit.withdrawn(carried, &[&buffers[..]]);
+            }
+            let failed = Failed {
+                what: "an internal submission",
+                queue: Some(0),
+                result: error,
+                infos: &submits,
+                fence: Some(objects.fence),
+            };
+            submit_failed(self, &failed, |carried, _| {
+                let role = "the internal command buffer: first work, staged copies, a host call's";
+                carried.roles.push((objects.buffer, role.to_owned()));
+            });
+            shared.loader_word.end_step(word, mark);
             return Err(self.failed(error));
         }
         objects.signalled = value;
@@ -272,6 +441,7 @@ impl Device {
                 Ok(()) => {
                     firsts.internal_completed(value);
                     shared.internal_done.reached(value);
+                    shared.loader_word.end_step(word, mark);
                     return Ok(());
                 }
                 Err(vk::Result::TIMEOUT) => continue,
@@ -291,7 +461,7 @@ impl Device {
         binds: &[vk::SparseMemoryBind],
     ) -> Result<(vk::Semaphore, u64), Error> {
         if self.is_lost() {
-            return Err(Error::DeviceLost);
+            return Err(self.lost_refusal());
         }
         let shared = self.shared();
         let raw = shared.vk();
@@ -331,12 +501,31 @@ impl Device {
 
     /// The device's own timelines outside the batches, each at the value through which the host
     /// saw its submissions complete ([`OwnTimeline`]): the internal one, then the staging
-    /// queue's.
-    pub(crate) fn own_completed(&self) -> [Option<(vk::Semaphore, u64)>; 2] {
+    /// queue's, then the fill queue's ([`OWN_TIMELINES`]).
+    pub(crate) fn own_completed(&self) -> [Option<(vk::Semaphore, u64)>; OWN_TIMELINES] {
         let shared = self.shared();
+        let done = |queue: &Option<super::staging::StagingQueue>| {
+            queue.as_ref().and_then(|queue| queue.done.completed())
+        };
         [
             shared.internal_done.completed(),
-            shared.staging_done.completed(),
+            done(&shared.staging),
+            done(&shared.fill_queue),
+        ]
+    }
+
+    /// The semaphores of the device's own timelines outside the batches, where made, in
+    /// [`own_completed`](Self::own_completed)'s order: what a failed submission's line names
+    /// them by (`submit_failure.rs`).
+    pub(crate) fn own_semaphores(&self) -> [Option<vk::Semaphore>; OWN_TIMELINES] {
+        let shared = self.shared();
+        let semaphore = |queue: &Option<super::staging::StagingQueue>| {
+            queue.as_ref().and_then(|queue| queue.done.semaphore())
+        };
+        [
+            shared.internal_done.semaphore(),
+            semaphore(&shared.staging),
+            semaphore(&shared.fill_queue),
         ]
     }
 

@@ -6,6 +6,9 @@
 //! object, `Repr::TgTyped`, a `Workgroup` variable; `memory::alloca`, `memory::plan::SharedPlan`)
 //! are `u32` byte offsets from their [`Home`]'s start, demoted as `DemoteTy::ArenaOffset`:
 //!
+//! - a null (or undefined) private pointer is offset 0: where a pointer into the private arena may
+//!   be null, the arena keeps its first word for it (`memory::plan::ArenaLayout::null_word`), so
+//!   no object lies there and a pointer cell's zero bytes read back as null;
 //! - an alloca placed in the private arena is its plan offset; a typed alloca's, a constant
 //!   global's and a typed threadgroup object's address are 0; a static threadgroup global's
 //!   address is its plan offset (a
@@ -19,7 +22,10 @@
 //! - `icmp` of two pointers into one arena or one typed object compares their offsets, which are
 //!   exact within an object and order an arena's objects by the plan's layout (an order MSL
 //!   leaves unspecified); a pointer whose roots are objects only (no null, no `Dynamic`) is
-//!   never null, so its unsigned or equality compare with the null constant is a constant;
+//!   never null, so its unsigned or equality compare with the null constant is a constant; a
+//!   private pointer that may be null compares its offset with 0, below every object as Metal's
+//!   null is below every address;
+//! - a `phi` whose constant incoming values are all null takes offset 0 from each;
 //! - a non-atomic load or store of a scalar or 2–4-lane vector is one word-composed leaf
 //!   (`memory::leaf`) in the arena's word memory (`memory::arena::ArenaMem`), or, in a typed
 //!   object, an `OpLoad`/`OpStore` of the held form through an access chain whose dynamic indices
@@ -30,11 +36,17 @@
 //! **Containment** of an arena access is on unless the profile's containment is `UnsafeOff` (no
 //! robustness feature covers arenas): with `inb` the normative check against the arena's exact byte
 //! size, a load reads at `select(inb, off, 0)` and yields `select(inb, v, 0)`, and a store sits in
-//! a builder-closed `if_(inb)`. A typed access's dynamic indices are **clamped** under
-//! `GuestIsolation::On` (`memory::alloca`): each to its level's last element, so the access never
-//! leaves its object; a constant index is in range by construction. Each dynamic index is the
-//! defining `getelementptr`'s own operand where the GEP's dynamic indices line up one to one with
-//! the path's dynamic levels (`lined_up`), and is recovered from the pointer's offset otherwise.
+//! a builder-closed `if_(inb)`. A dereference of a null private pointer (undefined in Metal) reads
+//! or writes the kept first word, or an object's bytes at a field's offset: inside the arena
+//! under containment, and unchecked under `UnsafeOff`. A typed access's dynamic indices are
+//! **contained** under
+//! `GuestIsolation::On` (`memory::alloca`), so the access never leaves its object: a thread's own
+//! object's (an alloca's) are checked against their levels' lengths, a load past a level reading
+//! zero and a store past one sitting in a builder-closed `if_` that drops it; a threadgroup or
+//! constant object's are each clamped to the level's last element. A constant index is in range by
+//! construction. Each dynamic index is the defining `getelementptr`'s own operand where the GEP's
+//! dynamic indices line up one to one with the path's dynamic levels (`lined_up`), and is
+//! recovered from the pointer's offset otherwise.
 //!
 //! The offset shape of a typed access is read from its pointer's definitions: an alloca or a global
 //! address is `Exact(0)`, a GEP adds its constant and a dynamic multiple of each of its strides
@@ -58,8 +70,9 @@
 //!
 //! Not lowered here (`Unsupported{Lowering(Access), NotImplemented}`): pointers into these homes
 //! stored anywhere else or converted to integers, a compare of pointers into different homes or
-//! of a pointer that may be null, a signed compare with null, a phi with a constant pointer
-//! operand, a `select` on a constant condition, and aggregate accesses.
+//! of a threadgroup or typed pointer that may be null, a signed compare with null, a phi with a
+//! constant pointer operand other than a private pointer's null, a `select` on a constant
+//! condition, and aggregate accesses.
 //!
 //! **An integer threadgroup address** (`inttoptr` of an integer literal) names a byte of Metal's
 //! threadgroup layout, which the arena is (`memory::plan` places the static objects as Metal does).
@@ -155,7 +168,9 @@ pub struct TypedAccess {
     /// where its dynamic indices line up one to one with the path's dynamic levels
     /// (`lined_up`); `None` recovers each from the pointer's offset.
     pub indices: Option<Vec<(ValueId, IndexForm)>>,
-    /// Each dynamic index is clamped to its level's last element (`GuestIsolation::On`).
+    /// Each dynamic index is contained (`GuestIsolation::On`): checked against its level's length
+    /// where the access is [`checked`](Self::checked), clamped to its level's last element
+    /// otherwise.
     pub clamped: bool,
     /// A volatile access: its load or store carries `Volatile`.
     pub volatile: bool,
@@ -169,11 +184,25 @@ pub struct TypedAccess {
 }
 
 impl TypedAccess {
+    /// A contained access of a thread's own typed object (an alloca) is checked: a load past a
+    /// level reads zero and a store past one is dropped, so a store never changes an element it
+    /// does not address, as Metal's store past the array changes none of the array's. A threadgroup
+    /// or constant object's contained access clamps each index to its level's last element
+    /// (`memory::alloca`).
+    pub fn checked(&self) -> bool {
+        self.clamped && matches!(self.home, Home::Alloca(_))
+    }
+
     fn words(&self) -> u32 {
         let chain = 8u32.saturating_add(self.path.steps.len() as u32);
         let levels = self.path.dynamic().count() as u32;
         let dynamic = 24 * levels;
-        let clamp = if self.clamped { 32 * levels } else { 0 };
+        // A checked access's value select or store guard, beside its per-level checks.
+        let clamp = match (self.clamped, self.checked()) {
+            (false, _) => 0,
+            (true, false) => 32 * levels,
+            (true, true) => (32 * levels).saturating_add(32),
+        };
         // A fragment's shuffle, and the rebuilt value's chunks.
         let fragment = match &self.fragment {
             Some(DemoteTy::Composite(chunks)) => 12u32.saturating_add(chunks.len() as u32),
@@ -880,19 +909,40 @@ pub(super) fn local_ptr(cx: &SelectCx<'_>, v: Value, home: Home) -> Result<Local
                 offset32(e.offset)?.wrapping_add(displacement as u32),
             ))
         }
+        // The null pointer (or an undefined one) of an arena that keeps its first word for it.
+        (Const::Null | Const::Undef | Const::Poison, Home::Arena(arena))
+            if arena_null(cx, arena) =>
+        {
+            Ok(LocalPtr::Offset(0))
+        }
         _ => Err(refuse()),
     }
 }
 
+/// Whether `arena` keeps its first word for the null pointer, so a pointer into it that may be
+/// null is null at offset 0 (`memory::plan::ArenaLayout::null_word`): the private arena, where
+/// some pointer into it may be null.
+fn arena_null(cx: &SelectCx<'_>, arena: Arena) -> bool {
+    arena == Arena::Private && cx.memory.priv_arena.null_word
+}
+
 /// The lowered representation of an arena or typed-object pointer `v`
 /// (`DemoteTy::ArenaOffset`), `None` for any other pointer. A phi with a constant incoming
-/// pointer is refused (its copy would need the constant materialized in the incoming block).
+/// pointer is refused (its copy would need the constant materialized in the incoming block),
+/// but for the null pointer into an arena that keeps its first word for it, whose copy stores
+/// offset 0.
 pub fn lowered_pointer(cx: &SelectCx<'_>, v: Value) -> Result<Option<DemoteTy>, Error> {
-    if home_of(cx, v).is_none() {
+    let Some(home) = home_of(cx, v) else {
         return Ok(None);
-    }
-    if super::phis::incoming(cx, v)?.is_some_and(|i| i.constant) {
-        return Err(refuse());
+    };
+    if let Some(i) = super::phis::incoming(cx, v)? {
+        let null_only = match home {
+            Home::Arena(arena) => arena_null(cx, arena) && !i.not_null,
+            _ => false,
+        };
+        if i.constant && !null_only {
+            return Err(refuse());
+        }
     }
     Ok(Some(DemoteTy::ArenaOffset))
 }
@@ -1039,7 +1089,8 @@ pub(crate) fn access(
         super::tile_memory::written(cx)?;
     }
     let align = align.map_or(1, |a| a.bytes());
-    let leaf = leaf::leaf_of(cx.entry, cx.profile, &cx.memory.layouts, ty, align)?;
+    let proven = cx.memory.proven_align(cx.entry, ptr);
+    let leaf = leaf::leaf_of(cx.entry, cx.profile, &cx.memory.layouts, ty, align, proven)?;
     let ptr = access_ptr(cx, ptr, arena, u64::from(leaf.bytes))?;
     let value = stored_value(cx, value)?;
     Ok(LocalAccess {
@@ -1689,12 +1740,6 @@ fn compare(
         ),
         _ => false,
     };
-    // A pointer that may be null or may be any arena offset.
-    let nullable = |cx: &SelectCx<'_>, v: Value| {
-        cx.memory
-            .roots_of(v)
-            .is_none_or(|r| r.iter().any(|r| matches!(r, Root::Null | Root::Dynamic)))
-    };
     let (ptr, against_null) = match (null(cx, a), null(cx, b)) {
         (false, true) => (a, Some(pred)),
         (true, false) => (b, Some(swapped(pred))),
@@ -1702,6 +1747,17 @@ fn compare(
         (false, false) => (a, None),
     };
     let home = home_of(cx, ptr).ok_or_else(refuse)?;
+    // In an arena that keeps its first word for null, a pointer that may be null is null at
+    // offset 0, below every object's address, as Metal's null is below every object's: its
+    // offset compares as its address does.
+    let null_at_zero = matches!(home, Home::Arena(arena) if arena_null(cx, arena));
+    // A pointer that may be any arena offset, or that may be null where null has no offset.
+    let nullable = |cx: &SelectCx<'_>, v: Value| {
+        cx.memory.roots_of(v).is_none_or(|r| {
+            r.iter()
+                .any(|r| *r == Root::Dynamic || (*r == Root::Null && !null_at_zero))
+        })
+    };
     let Some(against_null) = against_null else {
         if home_of(cx, b) != Some(home) || nullable(cx, a) || nullable(cx, b) {
             return Err(refuse());
@@ -1716,6 +1772,26 @@ fn compare(
     };
     if nullable(cx, ptr) {
         return Err(refuse());
+    }
+    let may_be_null = cx
+        .memory
+        .roots_of(ptr)
+        .is_some_and(|r| r.contains(&Root::Null));
+    if may_be_null {
+        // Null at offset 0 (`null_at_zero`): an unsigned or equality compare of the offsets.
+        if matches!(
+            against_null,
+            IntPredicate::Sgt | IntPredicate::Sge | IntPredicate::Slt | IntPredicate::Sle
+        ) {
+            return Err(refuse());
+        }
+        use_home(cx, home, m)?;
+        return Ok(Some(LocalStrategy::Compare {
+            home,
+            pred: against_null,
+            a: local_ptr(cx, ptr, home)?,
+            b: LocalPtr::Offset(0),
+        }));
     }
     // `ptr` against null, whose address is below every object's.
     let result = match against_null {
@@ -1870,22 +1946,28 @@ pub(super) fn emit_access_at(
     }
 }
 
-/// The access-chain indices of `a`'s path. Each dynamic one is the defining GEP's operand where
-/// they line up (`TypedAccess::indices`), or is recovered from the pointer's offset level by level
-/// (`(rem - start) / stride`, the next level's `rem` being `(rem - start) % stride`,
-/// `memory::alloca`); when `a.clamped`, each is clamped to its level's last element,
-/// `min(idx, len - 1)`, so the chain never leaves the object.
+/// The access-chain indices of `a`'s path, and the check's condition where `a` is checked
+/// ([`TypedAccess::checked`]). Each dynamic index is the defining GEP's operand where they line up
+/// (`TypedAccess::indices`), or is recovered from the pointer's offset level by level (`(rem -
+/// start) / stride`, the next level's `rem` being `(rem - start) % stride`, `memory::alloca`).
+/// When `a.clamped`, a checked access's condition is every level's `idx < len`, a load reading
+/// each level at `select(idx < len, idx, 0)` (a store's chain is built under the condition); any
+/// other access clamps each index to its level's last element, `min(idx, len - 1)`. Either way the
+/// chain never leaves the object.
 fn chain_indices(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
     a: &TypedAccess,
-) -> BResult<Vec<SValue>> {
+    load: bool,
+) -> BResult<(Vec<SValue>, Option<SValue>)> {
     let levels = a.path.dynamic().count();
     let mut rem = match (levels, &a.indices) {
         (0, _) | (_, Some(_)) => None,
         _ => Some(ptr_value(cx, fb, a.ptr)?),
     };
     let mut seen = 0;
+    let checked = a.checked();
+    let mut ok: Option<SValue> = None;
     let mut out = Vec::with_capacity(a.path.steps.len());
     for step in &a.path.steps {
         let d = match step {
@@ -1943,14 +2025,30 @@ fn chain_indices(
             out.push(idx);
             continue;
         }
-        let last = k32(fb, d.len.saturating_sub(1))?;
-        out.push(fb.glsl(GlslOp::UMin, &[idx, last])?);
+        if !checked {
+            let last = k32(fb, d.len.saturating_sub(1))?;
+            out.push(fb.glsl(GlslOp::UMin, &[idx, last])?);
+            continue;
+        }
+        let len = k32(fb, d.len)?;
+        let in_range = fb.binary(BinOp::ULessThan, idx, len)?;
+        ok = Some(match ok {
+            None => in_range,
+            Some(all) => fb.binary(BinOp::LogicalAnd, all, in_range)?,
+        });
+        out.push(if load {
+            let zero = k32(fb, 0)?;
+            fb.select(in_range, idx, zero)?
+        } else {
+            idx
+        });
     }
-    Ok(out)
+    Ok((out, ok))
 }
 
-/// Load or store (`stored`) typed access `a` through an access chain of its path, clamped when
-/// `a.clamped`.
+/// Load or store (`stored`) typed access `a` through an access chain of its path, contained when
+/// `a.clamped` ([`chain_indices`]): a checked load past a level yields zero and a checked store
+/// past one is dropped.
 fn emit_typed(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
@@ -1969,7 +2067,7 @@ fn emit_typed(
     let Some(g) = found else {
         return Err(cx.fail(format!("typed object {:?} is not declared", a.home)));
     };
-    let mut idx = chain_indices(cx, fb, a)?;
+    let (mut idx, ok) = chain_indices(cx, fb, a, stored.is_none())?;
     // One held element of a matrix's fragment is that lane of it.
     if let Some(alloca::FragmentPart::Lane(i)) = a.part {
         idx.push(k32(fb, i)?);
@@ -2002,17 +2100,36 @@ fn emit_typed(
         }
         (stored, _) => stored,
     };
-    let p = fb.access_chain(base, &idx)?;
-    match stored {
-        None => {
+    match (stored, ok) {
+        (None, ok) => {
+            let p = fb.access_chain(base, &idx)?;
             let v = fb.load(p, load_access)?;
+            let v = match ok {
+                None => v,
+                Some(ok) => {
+                    let ty = fb.value_ty(v)?;
+                    let z = fb.module().constant(Constant::Null { ty })?;
+                    let z = fb.module().const_value(z)?;
+                    fb.select(ok, v, z)?
+                }
+            };
             match &a.fragment {
                 Some(d) => rebuild(cx, fb, d, v).map(Some),
                 None => Ok(Some(v)),
             }
         }
-        Some(v) => {
+        (Some(v), None) => {
+            let p = fb.access_chain(base, &idx)?;
             fb.store(p, v, store_access)?;
+            Ok(None)
+        }
+        (Some(v), Some(ok)) => {
+            let then: ArmFn<'_, ()> = Box::new(move |fb, _| {
+                let p = fb.access_chain(base, &idx)?;
+                fb.store(p, v, store_access)?;
+                Ok(ArmEnd::FallThrough(Vec::new()))
+            });
+            fb.if_(&mut (), ok, then, None)?;
             Ok(None)
         }
     }

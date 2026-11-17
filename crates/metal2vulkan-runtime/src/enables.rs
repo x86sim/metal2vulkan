@@ -82,6 +82,70 @@ unsafe impl vk::TaggedStructure for ShaderFmaFeatures {
 // SAFETY: the registry lists `VkDeviceCreateInfo` in the structure's `structextends`.
 unsafe impl vk::ExtendsDeviceCreateInfo for ShaderFmaFeatures {}
 
+/// `VkPhysicalDeviceShaderFloat8FeaturesEXT`, which `ash 0.38` predates, laid out as the registry
+/// defines it (structure type 1000567000).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ShaderFloat8Features {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    shader_float8: vk::Bool32,
+    shader_float8_cooperative_matrix: vk::Bool32,
+}
+
+impl Default for ShaderFloat8Features {
+    fn default() -> Self {
+        ShaderFloat8Features {
+            s_type: <Self as vk::TaggedStructure>::STRUCTURE_TYPE,
+            p_next: std::ptr::null_mut(),
+            shader_float8: vk::FALSE,
+            shader_float8_cooperative_matrix: vk::FALSE,
+        }
+    }
+}
+
+// SAFETY: the layout is the registry's `VkPhysicalDeviceShaderFloat8FeaturesEXT`, which begins
+// with `sType` and `pNext` as every chained structure must, and this is its structure type.
+unsafe impl vk::TaggedStructure for ShaderFloat8Features {
+    const STRUCTURE_TYPE: vk::StructureType = vk::StructureType::from_raw(1_000_567_000);
+}
+// SAFETY: the registry lists `VkDeviceCreateInfo` in the structure's `structextends`.
+unsafe impl vk::ExtendsDeviceCreateInfo for ShaderFloat8Features {}
+
+/// `VkPhysicalDeviceZeroInitializeDeviceMemoryFeaturesEXT`, which `ash 0.38` predates, laid out
+/// as the registry defines it (extension number 621).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct ZeroInitializeDeviceMemoryFeatures {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    pub(crate) zero_initialize_device_memory: vk::Bool32,
+}
+
+impl Default for ZeroInitializeDeviceMemoryFeatures {
+    fn default() -> Self {
+        ZeroInitializeDeviceMemoryFeatures {
+            s_type: <Self as vk::TaggedStructure>::STRUCTURE_TYPE,
+            p_next: std::ptr::null_mut(),
+            zero_initialize_device_memory: vk::FALSE,
+        }
+    }
+}
+
+// SAFETY: the layout is the registry's `VkPhysicalDeviceZeroInitializeDeviceMemoryFeaturesEXT`,
+// which begins with `sType` and `pNext` as every chained structure must, and this is its structure
+// type.
+unsafe impl vk::TaggedStructure for ZeroInitializeDeviceMemoryFeatures {
+    const STRUCTURE_TYPE: vk::StructureType = vk::StructureType::from_raw(1_000_620_000);
+}
+// SAFETY: the registry lists `VkDeviceCreateInfo` in the structure's `structextends`.
+unsafe impl vk::ExtendsDeviceCreateInfo for ZeroInitializeDeviceMemoryFeatures {}
+// SAFETY: the registry lists `VkPhysicalDeviceFeatures2` in the structure's `structextends`.
+unsafe impl vk::ExtendsPhysicalDeviceFeatures2 for ZeroInitializeDeviceMemoryFeatures {}
+
+/// `VK_EXT_zero_initialize_device_memory`'s name.
+pub(crate) const ZERO_INITIALIZE_DEVICE_MEMORY: &CStr = c"VK_EXT_zero_initialize_device_memory";
+
 /// `VkPhysicalDeviceDepthClampControlFeaturesEXT`, which `ash 0.38` predates, laid out as the
 /// registry defines it (extension number 583).
 #[repr(C)]
@@ -171,6 +235,68 @@ unsafe impl vk::TaggedStructure for FifoLatestReadyFeatures {
 unsafe impl vk::ExtendsDeviceCreateInfo for FifoLatestReadyFeatures {}
 // SAFETY: the registry lists `VkPhysicalDeviceFeatures2` in the structure's `structextends`.
 unsafe impl vk::ExtendsPhysicalDeviceFeatures2 for FifoLatestReadyFeatures {}
+
+/// `VkPhysicalDeviceVideoMaintenance2FeaturesKHR`, which `ash 0.38` predates, laid out as the
+/// registry defines it (extension number 587).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VideoMaintenance2Features {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    video_maintenance2: vk::Bool32,
+}
+
+impl Default for VideoMaintenance2Features {
+    fn default() -> Self {
+        VideoMaintenance2Features {
+            s_type: <Self as vk::TaggedStructure>::STRUCTURE_TYPE,
+            p_next: std::ptr::null_mut(),
+            video_maintenance2: vk::FALSE,
+        }
+    }
+}
+
+// SAFETY: the layout is the registry's `VkPhysicalDeviceVideoMaintenance2FeaturesKHR`, which
+// begins with `sType` and `pNext` as every chained structure must, and this is its structure type.
+unsafe impl vk::TaggedStructure for VideoMaintenance2Features {
+    const STRUCTURE_TYPE: vk::StructureType = vk::StructureType::from_raw(1_000_586_000);
+}
+// SAFETY: the registry lists `VkDeviceCreateInfo` in the structure's `structextends`.
+unsafe impl vk::ExtendsDeviceCreateInfo for VideoMaintenance2Features {}
+// SAFETY: the registry lists `VkPhysicalDeviceFeatures2` in the structure's `structextends`.
+unsafe impl vk::ExtendsPhysicalDeviceFeatures2 for VideoMaintenance2Features {}
+
+/// `VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR`, which `ash 0.38` predates, laid out as the
+/// registry defines it (extension number 528).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UnifiedImageLayoutsFeatures {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    unified_image_layouts: vk::Bool32,
+    unified_image_layouts_video: vk::Bool32,
+}
+
+impl Default for UnifiedImageLayoutsFeatures {
+    fn default() -> Self {
+        UnifiedImageLayoutsFeatures {
+            s_type: <Self as vk::TaggedStructure>::STRUCTURE_TYPE,
+            p_next: std::ptr::null_mut(),
+            unified_image_layouts: vk::FALSE,
+            unified_image_layouts_video: vk::FALSE,
+        }
+    }
+}
+
+// SAFETY: the layout is the registry's `VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR`, which
+// begins with `sType` and `pNext` as every chained structure must, and this is its structure type.
+unsafe impl vk::TaggedStructure for UnifiedImageLayoutsFeatures {
+    const STRUCTURE_TYPE: vk::StructureType = vk::StructureType::from_raw(1_000_527_000);
+}
+// SAFETY: the registry lists `VkDeviceCreateInfo` in the structure's `structextends`.
+unsafe impl vk::ExtendsDeviceCreateInfo for UnifiedImageLayoutsFeatures {}
+// SAFETY: the registry lists `VkPhysicalDeviceFeatures2` in the structure's `structextends`.
+unsafe impl vk::ExtendsPhysicalDeviceFeatures2 for UnifiedImageLayoutsFeatures {}
 
 /// The name of `VK_KHR_pipeline_binary` (extension number 484), which `ash 0.38` predates and the
 /// vocabulary does not hold.
@@ -305,6 +431,13 @@ const LINEAR_COLOR_ATTACHMENT: [&CStr; 2] = [
     c"VK_KHR_format_feature_flags2",
 ];
 
+/// The names of `VK_EXT_pageable_device_local_memory` and of `VK_EXT_memory_priority`, which it
+/// requires (the registry's `depends`).
+pub(super) const PAGEABLE_DEVICE_LOCAL_MEMORY: [&CStr; 2] = [
+    ash::ext::pageable_device_local_memory::NAME,
+    ash::ext::memory_priority::NAME,
+];
+
 /// The names of `VK_EXT_graphics_pipeline_library` and of `VK_KHR_pipeline_library`, which it
 /// requires (the registry's `depends`).
 pub(super) const GRAPHICS_PIPELINE_LIBRARY: [&CStr; 2] = [
@@ -355,6 +488,7 @@ pub(super) enum Structure {
     RasterOrder,
     Maintenance8,
     ShaderFma,
+    ShaderFloat8,
     /// `VkPhysicalDeviceMaintenance5FeaturesKHR`.
     Maintenance5,
     /// `VkPhysicalDeviceHostImageCopyFeaturesEXT`, outside the vocabulary: linked only by
@@ -373,6 +507,8 @@ pub(super) enum Structure {
     ProvokingVertex,
     /// `VkPhysicalDeviceLineRasterizationFeaturesEXT`.
     LineRasterization,
+    /// `VkPhysicalDeviceMultiDrawFeaturesEXT`.
+    MultiDraw,
     RayQuery,
     Acceleration,
     /// `VkPhysicalDeviceMeshShaderFeaturesEXT`.
@@ -396,9 +532,21 @@ pub(super) enum Structure {
     /// `VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR`, outside the vocabulary: linked
     /// only by [`Enables::enable_listed`], where the caller lists its extension.
     FifoLatestReady,
+    /// `VkPhysicalDeviceVideoMaintenance1FeaturesKHR`, outside the vocabulary: linked only by
+    /// [`Enables::enable_listed`], where the caller lists its extension.
+    VideoMaintenance1,
+    /// `VkPhysicalDeviceVideoMaintenance2FeaturesKHR`, outside the vocabulary: linked only by
+    /// [`Enables::enable_listed`], where the caller lists its extension.
+    VideoMaintenance2,
+    /// `VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR`, outside the vocabulary: linked only by
+    /// [`Enables::enable_listed`], where the caller lists its extension.
+    UnifiedImageLayouts,
     /// `VkPhysicalDeviceLinearColorAttachmentFeaturesNV`, outside the vocabulary: linked only by
     /// [`Enables::enable_linear_color_attachment`].
     LinearColorAttachment,
+    /// `VkPhysicalDeviceZeroInitializeDeviceMemoryFeaturesEXT`, outside the vocabulary: linked
+    /// only by [`Enables::enable_zero_initialize_device_memory`].
+    ZeroInitializeDeviceMemory,
     /// `VkPhysicalDevicePipelineBinaryFeaturesKHR`, outside the vocabulary: linked only by
     /// [`Enables::turn_driver_pipeline_cache_off`].
     PipelineBinary,
@@ -411,6 +559,9 @@ pub(super) enum Structure {
     /// `VkPhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT`, outside the vocabulary: linked only by
     /// [`Enables::enable_ycbcr_2plane_444`], below Vulkan 1.3.
     Ycbcr2Plane444,
+    /// `VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT`, outside the vocabulary: linked
+    /// only by [`Enables::enable_pageable_device_local_memory`].
+    PageableDeviceLocalMemory,
 }
 
 /// Vulkan 1.4.
@@ -466,6 +617,7 @@ impl Structure {
             | Structure::RasterOrder
             | Structure::Maintenance8
             | Structure::ShaderFma
+            | Structure::ShaderFloat8
             | Structure::BorderColorSwizzle
             | Structure::DepthBiasControl
             | Structure::DepthClipEnable
@@ -473,6 +625,7 @@ impl Structure {
             | Structure::ListRestart
             | Structure::ProvokingVertex
             | Structure::LineRasterization
+            | Structure::MultiDraw
             | Structure::RayQuery
             | Structure::Acceleration
             | Structure::MeshShader
@@ -483,11 +636,16 @@ impl Structure {
             | Structure::GeneratedCommands
             | Structure::SwapchainMaintenance1
             | Structure::FifoLatestReady
+            | Structure::VideoMaintenance1
+            | Structure::VideoMaintenance2
+            | Structure::UnifiedImageLayouts
             | Structure::LinearColorAttachment
+            | Structure::ZeroInitializeDeviceMemory
             | Structure::PipelineBinary
             | Structure::InternalCacheControl
             | Structure::GraphicsPipelineLibrary
-            | Structure::Ycbcr2Plane444 => None,
+            | Structure::Ycbcr2Plane444
+            | Structure::PageableDeviceLocalMemory => None,
         }
     }
 
@@ -519,6 +677,7 @@ impl Structure {
             Structure::RasterOrder => &[X::ExtRasterizationOrderAttachmentAccess],
             Structure::Maintenance8 => &[X::KhrMaintenance8],
             Structure::ShaderFma => &[X::KhrShaderFma],
+            Structure::ShaderFloat8 => &[X::ExtShaderFloat8],
             Structure::Maintenance5 => &[X::KhrMaintenance5],
             Structure::HostImageCopy => &[],
             Structure::BorderColorSwizzle => &[X::ExtBorderColorSwizzle],
@@ -528,6 +687,7 @@ impl Structure {
             Structure::ListRestart => &[X::ExtPrimitiveTopologyListRestart],
             Structure::ProvokingVertex => &[X::ExtProvokingVertex],
             Structure::LineRasterization => &[X::ExtLineRasterization],
+            Structure::MultiDraw => &[X::ExtMultiDraw],
             Structure::RayQuery => &[X::KhrRayQuery],
             Structure::Acceleration => &[X::KhrAccelerationStructure],
             Structure::MeshShader => &[X::ExtMeshShader],
@@ -541,11 +701,16 @@ impl Structure {
             Structure::GeneratedCommands
             | Structure::SwapchainMaintenance1
             | Structure::FifoLatestReady
+            | Structure::VideoMaintenance1
+            | Structure::VideoMaintenance2
+            | Structure::UnifiedImageLayouts
             | Structure::LinearColorAttachment
+            | Structure::ZeroInitializeDeviceMemory
             | Structure::PipelineBinary
             | Structure::InternalCacheControl
             | Structure::GraphicsPipelineLibrary
-            | Structure::Ycbcr2Plane444 => &[],
+            | Structure::Ycbcr2Plane444
+            | Structure::PageableDeviceLocalMemory => &[],
         }
     }
 }
@@ -582,6 +747,7 @@ struct FeatureChain {
     raster_order: vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT<'static>,
     maintenance8: Maintenance8Features,
     shader_fma: ShaderFmaFeatures,
+    shader_float8: ShaderFloat8Features,
     maintenance5: vk::PhysicalDeviceMaintenance5FeaturesKHR<'static>,
     host_image_copy: vk::PhysicalDeviceHostImageCopyFeaturesEXT<'static>,
     border_color_swizzle: vk::PhysicalDeviceBorderColorSwizzleFeaturesEXT<'static>,
@@ -591,6 +757,7 @@ struct FeatureChain {
     list_restart: vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT<'static>,
     provoking_vertex: vk::PhysicalDeviceProvokingVertexFeaturesEXT<'static>,
     line_rasterization: vk::PhysicalDeviceLineRasterizationFeaturesEXT<'static>,
+    multi_draw: vk::PhysicalDeviceMultiDrawFeaturesEXT<'static>,
     ray_query: vk::PhysicalDeviceRayQueryFeaturesKHR<'static>,
     acceleration_structure: vk::PhysicalDeviceAccelerationStructureFeaturesKHR<'static>,
     mesh_shader: vk::PhysicalDeviceMeshShaderFeaturesEXT<'static>,
@@ -604,11 +771,16 @@ struct FeatureChain {
     generated_commands: GeneratedCommandsFeatures,
     swapchain_maintenance1: vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT<'static>,
     fifo_latest_ready: FifoLatestReadyFeatures,
+    video_maintenance1: vk::PhysicalDeviceVideoMaintenance1FeaturesKHR<'static>,
+    video_maintenance2: VideoMaintenance2Features,
+    unified_image_layouts: UnifiedImageLayoutsFeatures,
     linear_color_attachment: vk::PhysicalDeviceLinearColorAttachmentFeaturesNV<'static>,
+    zero_initialize_device_memory: ZeroInitializeDeviceMemoryFeatures,
     pipeline_binary: PipelineBinaryFeatures,
     internal_cache_control: InternalCacheControl,
     graphics_pipeline_library: vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT<'static>,
     ycbcr_2plane_444: vk::PhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT<'static>,
+    pageable_device_local_memory: vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT<'static>,
 }
 
 /// One `VkBool32` member of a [`FeatureChain`] structure, named by the vocabulary.
@@ -652,6 +824,7 @@ members! {
     Core.core.dual_src_blend => DualSrcBlend;
     Core.core.logic_op => LogicOp;
     Core.core.alpha_to_one => AlphaToOne;
+    Core.core.wide_lines => WideLines;
     Core.core.independent_blend => IndependentBlend;
     Core.core.shader_clip_distance => ShaderClipDistance;
     Core.core.shader_cull_distance => ShaderCullDistance;
@@ -772,6 +945,7 @@ members! {
     Maintenance8.maintenance8.maintenance8 => Maintenance8;
     ShaderFma.shader_fma.shader_fma_float16 => ShaderFmaFloat16;
     ShaderFma.shader_fma.shader_fma_float32 => ShaderFmaFloat32;
+    ShaderFloat8.shader_float8.shader_float8 => ShaderFloat8;
     Maintenance5.maintenance5.maintenance5 => Maintenance5;
     BorderColorSwizzle.border_color_swizzle.border_color_swizzle => BorderColorSwizzle;
     BorderColorSwizzle.border_color_swizzle.border_color_swizzle_from_image => BorderColorSwizzleFromImage;
@@ -784,6 +958,7 @@ members! {
     ListRestart.list_restart.primitive_topology_patch_list_restart => PrimitiveTopologyPatchListRestart;
     ProvokingVertex.provoking_vertex.provoking_vertex_last => ProvokingVertexLast;
     LineRasterization.line_rasterization.bresenham_lines => BresenhamLines;
+    MultiDraw.multi_draw.multi_draw => MultiDraw;
     RayQuery.ray_query.ray_query => RayQuery;
     Acceleration.acceleration_structure.acceleration_structure => AccelerationStructure;
     MeshShader.mesh_shader.task_shader => TaskShader;
@@ -805,6 +980,7 @@ members! {
     PortabilitySubset.portability_subset.image_view2_d_on3_d_image => ImageView2DOn3DImage;
     PortabilitySubset.portability_subset.separate_stencil_mask_ref => SeparateStencilMaskRef;
     PortabilitySubset.portability_subset.image_view_format_swizzle => ImageViewFormatSwizzle;
+    PortabilitySubset.portability_subset.point_polygons => PointPolygons;
 }
 
 members! {
@@ -916,6 +1092,8 @@ const EXTENSIONS: &[(VkExtension, &CStr)] = {
         ),
         (X::ExtProvokingVertex, c"VK_EXT_provoking_vertex"),
         (X::ExtLineRasterization, c"VK_EXT_line_rasterization"),
+        (X::ExtMultiDraw, c"VK_EXT_multi_draw"),
+        (X::ExtShaderFloat8, c"VK_EXT_shader_float8"),
         (X::KhrRayQuery, c"VK_KHR_ray_query"),
         (
             X::KhrAccelerationStructure,
@@ -981,17 +1159,21 @@ const EXTENSIONS: &[(VkExtension, &CStr)] = {
 };
 
 /// One feature of an extension outside the vocabulary that a caller may list
-/// (`DeviceOptions::device_extensions`): its structure, its name, and its member.
+/// (`DeviceOptions::device_extensions`): its structure, its name, its member, and whether Vulkan
+/// requires it of every device that lists the extension (the specification's feature
+/// requirements): a required one the device lacks refuses the extension, an optional one is
+/// enabled where the device has it.
 struct ListedFeature {
     structure: Structure,
     name: &'static str,
     member: fn(&mut FeatureChain) -> &mut vk::Bool32,
+    required: bool,
 }
 
 /// Each name of an extension outside the vocabulary whose features the runtime enables where
 /// the caller lists it, with its feature structure (the `KHR` and `EXT` names of one extension
 /// share one).
-const LISTED: [(&CStr, Structure); 4] = [
+const LISTED: [(&CStr, Structure); 7] = [
     (
         c"VK_KHR_swapchain_maintenance1",
         Structure::SwapchainMaintenance1,
@@ -1008,19 +1190,52 @@ const LISTED: [(&CStr, Structure); 4] = [
         c"VK_EXT_present_mode_fifo_latest_ready",
         Structure::FifoLatestReady,
     ),
+    (c"VK_KHR_video_maintenance1", Structure::VideoMaintenance1),
+    (c"VK_KHR_video_maintenance2", Structure::VideoMaintenance2),
+    (
+        c"VK_KHR_unified_image_layouts",
+        Structure::UnifiedImageLayouts,
+    ),
 ];
 
 /// Every feature of [`LISTED`]'s structures.
-const LISTED_FEATURES: [ListedFeature; 2] = [
+const LISTED_FEATURES: [ListedFeature; 6] = [
     ListedFeature {
         structure: Structure::SwapchainMaintenance1,
         name: "swapchainMaintenance1",
         member: |chain| &mut chain.swapchain_maintenance1.swapchain_maintenance1,
+        required: true,
     },
     ListedFeature {
         structure: Structure::FifoLatestReady,
         name: "presentModeFifoLatestReady",
         member: |chain| &mut chain.fifo_latest_ready.present_mode_fifo_latest_ready,
+        required: true,
+    },
+    ListedFeature {
+        structure: Structure::VideoMaintenance1,
+        name: "videoMaintenance1",
+        member: |chain| &mut chain.video_maintenance1.video_maintenance1,
+        required: true,
+    },
+    ListedFeature {
+        structure: Structure::VideoMaintenance2,
+        name: "videoMaintenance2",
+        member: |chain| &mut chain.video_maintenance2.video_maintenance2,
+        required: true,
+    },
+    ListedFeature {
+        structure: Structure::UnifiedImageLayouts,
+        name: "unifiedImageLayouts",
+        member: |chain| &mut chain.unified_image_layouts.unified_image_layouts,
+        required: true,
+    },
+    // Vulkan requires it only of a device whose video layouts `GENERAL` serves.
+    ListedFeature {
+        structure: Structure::UnifiedImageLayouts,
+        name: "unifiedImageLayoutsVideo",
+        member: |chain| &mut chain.unified_image_layouts.unified_image_layouts_video,
+        required: false,
     },
 ];
 
@@ -1062,6 +1277,15 @@ pub(super) unsafe fn listed_reported(
         if has(Structure::FifoLatestReady) {
             features = features.push_next(&mut c.fifo_latest_ready);
         }
+        if has(Structure::VideoMaintenance1) {
+            features = features.push_next(&mut c.video_maintenance1);
+        }
+        if has(Structure::VideoMaintenance2) {
+            features = features.push_next(&mut c.video_maintenance2);
+        }
+        if has(Structure::UnifiedImageLayouts) {
+            features = features.push_next(&mut c.unified_image_layouts);
+        }
         // SAFETY: the caller's contract; the chain lives for the call, of structures the listed
         // extensions define.
         unsafe { instance.get_physical_device_features2(physical, &mut features) };
@@ -1102,6 +1326,7 @@ macro_rules! link_extensions {
             RasterOrder => raster_order,
             Maintenance8 => maintenance8,
             ShaderFma => shader_fma,
+            ShaderFloat8 => shader_float8,
             Maintenance5 => maintenance5,
             HostImageCopy => host_image_copy,
             BorderColorSwizzle => border_color_swizzle,
@@ -1111,6 +1336,7 @@ macro_rules! link_extensions {
             ListRestart => list_restart,
             ProvokingVertex => provoking_vertex,
             LineRasterization => line_rasterization,
+            MultiDraw => multi_draw,
             RayQuery => ray_query,
             Acceleration => acceleration_structure,
             MeshShader => mesh_shader,
@@ -1124,11 +1350,16 @@ macro_rules! link_extensions {
             GeneratedCommands => generated_commands,
             SwapchainMaintenance1 => swapchain_maintenance1,
             FifoLatestReady => fifo_latest_ready,
+            VideoMaintenance1 => video_maintenance1,
+            VideoMaintenance2 => video_maintenance2,
+            UnifiedImageLayouts => unified_image_layouts,
             LinearColorAttachment => linear_color_attachment,
+            ZeroInitializeDeviceMemory => zero_initialize_device_memory,
             PipelineBinary => pipeline_binary,
             InternalCacheControl => internal_cache_control,
             GraphicsPipelineLibrary => graphics_pipeline_library,
-            Ycbcr2Plane444 => ycbcr_2plane_444
+            Ycbcr2Plane444 => ycbcr_2plane_444,
+            PageableDeviceLocalMemory => pageable_device_local_memory
         )
     };
     (@ $info:ident, $chain:ident, $linked:ident; $($variant:ident => $field:ident),*) => {
@@ -1235,6 +1466,22 @@ impl Enables {
         self.push_name(ash::ext::ycbcr_2plane_444_formats::NAME.to_owned());
     }
 
+    /// Enables `VK_EXT_pageable_device_local_memory` and its `pageableDeviceLocalMemory`, with
+    /// `VK_EXT_memory_priority`, which it requires (the registry's `depends`), the runtime's own
+    /// need outside the vocabulary: the driver may move device-local memory to host-local memory
+    /// to make room, rather than fail an allocation (the extension's description), as Metal pages
+    /// a discrete GPU's resources (`memory.rs`'s `overflow_candidates`), on a device that lists
+    /// both and has the feature. Every allocation keeps the default priority.
+    pub(super) fn enable_pageable_device_local_memory(&mut self) {
+        self.chain
+            .pageable_device_local_memory
+            .pageable_device_local_memory = vk::TRUE;
+        self.linked.insert(Structure::PageableDeviceLocalMemory);
+        for name in PAGEABLE_DEVICE_LOCAL_MEMORY {
+            self.push_name(name.to_owned());
+        }
+    }
+
     /// Enables the portability subset's `imageViewFormatReinterpretation`, the runtime's own need
     /// outside the vocabulary (Metal's texture views of another component layout,
     /// `view_plan.rs`), on a device whose subset has it and whose set enables the subset.
@@ -1295,6 +1542,17 @@ impl Enables {
         }
     }
 
+    /// Enables `VK_EXT_zero_initialize_device_memory` and its `zeroInitializeDeviceMemory`, the
+    /// runtime's own need outside the vocabulary: a `Shared` or `Managed` texture's image that
+    /// copies on the host starts in memory the driver zeroed, with no write of the host's
+    /// (`texture/host_copy.rs`).
+    pub(super) fn enable_zero_initialize_device_memory(&mut self) {
+        let features = &mut self.chain.zero_initialize_device_memory;
+        features.zero_initialize_device_memory = vk::TRUE;
+        self.linked.insert(Structure::ZeroInitializeDeviceMemory);
+        self.push_name(ZERO_INITIALIZE_DEVICE_MEMORY.to_owned());
+    }
+
     /// Enables `VK_KHR_pipeline_binary`, with its `pipelineBinaries` where `binaries` (the device
     /// has it), and makes the device with its driver's internal pipeline cache off
     /// (`VkDevicePipelineBinaryInternalCacheControlKHR::disableInternalCache`), the runtime's own
@@ -1327,9 +1585,10 @@ impl Enables {
 
     /// Enables every feature of `listed`'s structures ([`listed_structures`] of the caller's
     /// extensions) that `reported` ([`listed_reported`]) says the device has, chaining each
-    /// structure. A feature the device lacks refuses the device, naming the extension the caller
-    /// listed and the feature ([`Error::ExtensionFeature`]): the extension is never enabled
-    /// without its features.
+    /// structure. A required feature the device lacks ([`ListedFeature::required`]) refuses the
+    /// device, naming the extension the caller listed and the feature
+    /// ([`Error::ExtensionFeature`]): the extension is never enabled without its required
+    /// features. An optional one the device lacks stays disabled.
     pub(super) fn enable_listed(
         &mut self,
         listed: &[(&'static CStr, Structure)],
@@ -1341,6 +1600,9 @@ impl Enables {
                 .filter(|feature| feature.structure == structure)
             {
                 if !reported(feature.name) {
+                    if !feature.required {
+                        continue;
+                    }
                     return Err(Error::ExtensionFeature(ExtensionFeature {
                         extension: extension.to_str().unwrap_or_default(),
                         feature: feature.name,
@@ -1355,10 +1617,10 @@ impl Enables {
 
     /// Enables each of the caller's optional extensions `names` (`DeviceOptions::
     /// optional_device_extensions`, each listed by the device), where `reported`
-    /// ([`listed_reported`] of their [`listed_structures`]) says the device has every feature of
-    /// its structure that the runtime knows ([`LISTED`]), chaining the structure with those
-    /// features set; an extension of no known structure is enabled as it is. One the device lacks
-    /// a feature of is left out.
+    /// ([`listed_reported`] of their [`listed_structures`]) says the device has every required
+    /// feature of its structure that the runtime knows ([`LISTED`]), chaining the structure with
+    /// those features set, and each optional one the device has; an extension of no known
+    /// structure is enabled as it is. One the device lacks a required feature of is left out.
     pub(super) fn enable_where_featured(
         &mut self,
         names: &[CString],
@@ -1375,10 +1637,10 @@ impl Enables {
                         .iter()
                         .filter(move |feature| feature.structure == structure)
                 };
-                if !features().all(|feature| reported(feature.name)) {
+                if !features().all(|feature| !feature.required || reported(feature.name)) {
                     continue;
                 }
-                for feature in features() {
+                for feature in features().filter(|feature| reported(feature.name)) {
                     *(feature.member)(&mut self.chain) = vk::TRUE;
                 }
                 self.linked.insert(structure);

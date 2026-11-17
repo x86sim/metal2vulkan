@@ -334,6 +334,8 @@ pub struct RecordView<'a> {
     pipeline: Option<NonZeroU64>,
     /// The state word says a reset retained it ([`CommandRecord::retained_pipeline`]).
     retained: bool,
+    /// The state word says a kernel wrote it ([`CommandRecord::kernel_pipeline`]).
+    kernel: bool,
 }
 
 impl<'a> RecordView<'a> {
@@ -342,17 +344,17 @@ impl<'a> RecordView<'a> {
     pub fn new(bytes: &'a [u8]) -> Result<RecordView<'a>, RecordError> {
         let (action, barrier) = validate_record(bytes)?;
         let pipeline = NonZeroU64::new(get_u64(bytes, 2));
-        let retained = match get_word(bytes, layout::STATE as usize / 4) {
-            0 => false,
-            layout::RETAINED if pipeline.is_some() => true,
-            _ => return Err(RecordError::PipelineState),
-        };
+        let state = get_word(bytes, layout::STATE as usize / 4);
+        if state & !layout::STATE_BITS != 0 || (state != 0 && pipeline.is_none()) {
+            return Err(RecordError::PipelineState);
+        }
         Ok(RecordView {
             bytes,
             action,
             barrier,
             pipeline,
-            retained,
+            retained: state & layout::RETAINED != 0,
+            kernel: state & layout::KERNEL_PIPELINE != 0,
         })
     }
 
@@ -374,6 +376,11 @@ impl<'a> RecordView<'a> {
     /// [`CommandRecord::retained_pipeline`].
     pub fn retained_pipeline(&self) -> Option<NonZeroU64> {
         self.pipeline.filter(|_| self.retained)
+    }
+
+    /// [`CommandRecord::kernel_pipeline`].
+    pub fn kernel_pipeline(&self) -> bool {
+        self.kernel
     }
 
     /// Slot `slot` of `stage`'s buffers, as [`Bindings::buffers`] holds it; none past
@@ -426,25 +433,38 @@ impl<'a> RecordView<'a> {
 
     /// The whole record ([`CommandRecord::decode`]).
     pub fn record(&self) -> CommandRecord {
-        let mut record = CommandRecord {
-            action: self.action,
-            barrier: self.barrier,
-            bindings: Bindings {
-                pipeline: self.pipeline(),
-                ..Default::default()
-            },
-            retained_pipeline: self.retained_pipeline(),
-            stage_in_region: self.stage_in_region(),
-            imageblock_size: self.imageblock_size(),
-            ..Default::default()
-        };
-        for (index, binding) in record.bindings.buffers.iter_mut().flatten().enumerate() {
+        let mut record = CommandRecord::default();
+        self.record_into(&mut record);
+        record
+    }
+
+    /// The whole record ([`record`](Self::record)) written over `record`, each of its fields
+    /// this one's, as `*record = self.record()` leaves it: a consumer that reads many records
+    /// into storage it holds decodes each in place, with no record made and moved there.
+    pub fn record_into(&self, record: &mut CommandRecord) {
+        let CommandRecord {
+            action,
+            barrier,
+            bindings: Bindings { pipeline, buffers },
+            threadgroup_memory_lengths,
+            stage_in_region,
+            imageblock_size,
+            retained_pipeline,
+            kernel_pipeline,
+        } = record;
+        *action = self.action;
+        *barrier = self.barrier;
+        *pipeline = self.pipeline();
+        *retained_pipeline = self.retained_pipeline();
+        *kernel_pipeline = self.kernel;
+        *stage_in_region = self.stage_in_region();
+        *imageblock_size = self.imageblock_size();
+        for (index, binding) in buffers.iter_mut().flatten().enumerate() {
             *binding = binding_at(self.bytes, index);
         }
-        for (index, length) in record.threadgroup_memory_lengths.iter_mut().enumerate() {
+        for (index, length) in threadgroup_memory_lengths.iter_mut().enumerate() {
             *length = self.threadgroup_memory_length(index).unwrap_or(0);
         }
-        record
     }
 }
 

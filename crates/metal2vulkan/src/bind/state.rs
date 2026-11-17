@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 
 use crate::bind::ResidentRange;
 use crate::device::profile::Limits;
@@ -15,6 +16,7 @@ use crate::pipeline::artifact::RuntimeDependency;
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::lower_inputs::ViewportCompensation;
 use crate::pipeline::sym::{SlotClass, Stage};
+use crate::spirv::ir::intern::FxHasher;
 
 /// Everything bound for one draw or dispatch.
 #[non_exhaustive]
@@ -35,6 +37,14 @@ pub struct BindState {
     /// whether its pixel format has an alpha: a heap read the shader bounds-checks reads Metal's
     /// out-of-bounds alpha from it, so a texture's facts must be the resident texture's.
     pub used_resources: Vec<UsedResource>,
+    /// The consumer lists `used_resources` in token order: each entry's token at least the one
+    /// before it, so a token's entries lie together. A heap member then finds its entries by
+    /// search, at the logarithm of their count (a debug build asserts the order), rather than
+    /// every command's instantiation reading every entry, and a comparison with a shape
+    /// ([`has_shape`](Self::has_shape)) reads the list in place, making none of its shape. Not
+    /// part of the shape; `false` (the default): listed in any order.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub used_in_token_order: bool,
     /// The render encoder's vertex amplification (`setVertexAmplificationCount:viewMappings:`);
     /// Metal's default of a count of 1 without view mappings otherwise.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -122,6 +132,44 @@ pub struct BindState {
     /// every other draw.
     #[cfg_attr(feature = "serde", serde(default))]
     pub private_list: bool,
+    /// The Metal vertex buffer indices of the layouts the draw fetches in fixed function that the
+    /// device's fixed-function input cannot fetch for it: the runtime names those a draw may fetch
+    /// past `2^32` bytes of their bind offset, on a driver whose fixed-function vertex input takes
+    /// that displacement modulo `2^32`, and every one of a draw replay's state
+    /// (`draw_replay_vertex_layouts`), whose commands bind their own buffers. The plan pulls them
+    /// in the pulled-vertex-buffer variant (`VariantKey::pulled_vertex_buffers`), as it pulls a
+    /// layout bound at an offset or stride fixed-function input cannot fetch, and needs no buffer
+    /// bound at them; a layout the pipeline does not fetch in fixed function is left as it is.
+    /// Part of the shape (`BindShape::far_vertex_buffers`); empty for every other draw.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub far_vertex_buffers: BTreeSet<u32>,
+    /// The draw records a rasterization-rate-mapped pass's regions several at a time, each one
+    /// draw of a `vkCmdDrawMultiEXT` or `vkCmdDrawMultiIndexedEXT` whose index selects its
+    /// viewport and scissor: the pipeline runs the variant whose vertex function stores
+    /// `ViewportIndex` as `DrawIndex` (`VariantKey::region_viewports`), and its `VkPipeline` takes
+    /// as many viewports as a command draws regions. The plan's variant draws so only for a vertex
+    /// pipeline without tessellation drawn in one pass of no views (`bind::graphics`'s module
+    /// docs). Part of the shape (`BindShape::region_viewports`); `false` for every other draw.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub region_viewports: bool,
+    /// The draw records a rasterization-rate-mapped pass's triangles once, through one viewport
+    /// over the whole target, the variant's triangle stage fanning each out to the regions it
+    /// touches (`VariantKey::region_fan_out`, `GraphicsState::region_fan_out`), or probing which
+    /// of the draw's triangles it cannot ([`RegionFanOut::Probe`](crate::pipeline::RegionFanOut)),
+    /// and the index of the pair of words a probe writes (`PushField::RegionProbe`,
+    /// `WriteSource::RateMapFlags`; 0 for a draw); or records them region by region through that
+    /// viewport, its vertex function putting each vertex in its region as the triangle stage
+    /// puts a copy's ([`RegionFanOut::RegionCopies`](crate::pipeline::RegionFanOut)), and the first
+    /// region, in the region table's order, of the draw's recording (`PushField::RegionBox`, a
+    /// box of one column), which the consumer pushes again, with its box's columns, for each of
+    /// its recordings. The
+    /// consumer sets it only for a draw of triangles. The plan's variant fans out only a vertex
+    /// pipeline without tessellation drawn in one pass of no views, whose stages synthesize no
+    /// geometry stage of their own and draw no band (`bind::graphics`'s module docs). Its variant
+    /// is part of the shape (`BindShape::region_fan_out`), its index only of the draw's bytes;
+    /// `None` for every other draw.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub region_fan_out: Option<(crate::pipeline::RegionFanOut, u32)>,
     /// Where the heap arrays (set 1) hold the command's heap members and argument samplers
     /// ([`HeapPlacement`]). Only the instantiated tables and the elements the consumer writes
     /// ([`BindingPlan::heap_elements`]) depend on it, so it is not part of the shape.
@@ -138,6 +186,20 @@ pub struct BindState {
     /// as it is under any other value the plan does not find its own.
     #[cfg_attr(feature = "serde", serde(default))]
     pub view_base_alignment: u32,
+    /// Whether the consumer reads every uniform view at its residual: it draws and dispatches
+    /// with each plan's key at every `SpecKey::RangeAtBindOffset` 0, its residual form, as the
+    /// runtime does on a device whose driver loads no uniform read at a constant offset ahead of
+    /// the shader. A uniform view's descriptor range then need not start at its bind offset, and
+    /// instantiation binds one that a run of bind offsets of the bound buffer shares (the buffer
+    /// from its start where it fits the view's maximum range), its `SlotBindOffset` residual the
+    /// rest: a command that moves only such a slot's offset binds the same descriptor, keeps its
+    /// set 0 and pushes only its residual. False, the default, starts each uniform view's range at
+    /// its bind offset aligned down to the view base alignment, which a key reading it at its bind
+    /// offset alone (`RangeAtBindOffset` 1) needs. Either reads the same bytes. Only the descriptor
+    /// ranges and residuals a command's instantiation writes depend on it, so it is not part of
+    /// the shape.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub uniform_views_at_residual: bool,
     /// The render encoder's viewport count (`setViewports:count:`): a vertex function's
     /// `[[viewport_array_index]]` at or past it draws through viewport 0, as Metal's does
     /// (`PushField::ViewportCount`). Metal's default is one viewport; 0, the default here, and 1
@@ -211,6 +273,15 @@ pub struct BindState {
     /// for every other draw.
     #[cfg_attr(feature = "serde", serde(default))]
     pub mesh_last_first: bool,
+    /// What the draw draws as bands of triangles, where it draws its lines or its triangles'
+    /// edges so, and its band (`PushField::LineBand`): `[sx, sy, h, f]`, the half extent of its
+    /// Vulkan viewport 0 (its height negative, as the viewport is), half the band's width in
+    /// pixels, and of triangles its front face's sign, 1 `CLOCKWISE` and -1 `COUNTER_CLOCKWISE`
+    /// (0 for lines; `LineBandState`, `pipeline::link::band`). Its variant is part of the shape
+    /// (`BindShape::line_band`, `VariantKey::line_band`), its values only of the draw's bytes;
+    /// `None` for every other draw.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub line_band: Option<(crate::pipeline::BandPrimitive, [f32; 4])>,
     /// Allocations a pointer may reach that the consumer lists apart from `used_resources`, at
     /// their own lengths: the resident set holds them beside the bound buffers and the used
     /// resources, and a replay's extents count them (the runtime's live buffers of their own,
@@ -218,6 +289,19 @@ pub struct BindState {
     /// resident sets of the root tables depend on them, so they are not part of the shape.
     #[cfg_attr(feature = "serde", serde(default))]
     pub resident_ranges: Vec<ResidentRange>,
+    /// The consumer points every root table of the command at a resident set it uploads apart
+    /// (a [`ResidentSet`](crate::bind::ResidentSet), written over the table's own fields with
+    /// [`RootTable::resident_fields`](crate::bind::RootTable::resident_fields)) that holds every
+    /// allocation of `used_resources` (each `Buffer` and `Heap` entry with both addresses) and of
+    /// `resident_ranges`, at their padded lengths, as a root table's own set would, and every
+    /// range the table lists ([`RootTable::resident_ranges`](crate::bind::RootTable::resident_ranges)).
+    /// A root table's own resident set then holds the command's bound buffers alone, and lists
+    /// only those: a command's instantiation costs its bindings, not every resource made
+    /// resident. A table never pointed so resolves only its bound buffers. Only the root tables
+    /// depend on it, so it is not part of the shape; `false` (the default): each root table holds
+    /// the whole set.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub resident_apart: bool,
     /// The color attachments the draw's render pass instance leaves out of its subpass, read and
     /// written as storage images in the pixel interlock by its other draws, that the draw's
     /// render pipeline does not itself read or write so: a fragment function that writes one of
@@ -694,6 +778,7 @@ impl BindState {
             depth_clamp_range: self.depth_clamp_range.is_some(),
             rotated_weights: self.rotated_weights,
             mesh_last_first: self.mesh_last_first,
+            line_band: self.line_band.map(|(primitive, _)| primitive),
             interlocked_colors: self.interlocked_colors.clone(),
             fragment_tests: self.fragment_tests,
             extended_shadows: self.extended_shadows.clone(),
@@ -701,14 +786,18 @@ impl BindState {
             primitive_id_indices: self.primitive_id_indices,
             quad_primitive_ids: self.quad_primitive_ids,
             private_list: self.private_list,
+            far_vertex_buffers: self.far_vertex_buffers.clone(),
+            region_viewports: self.region_viewports,
+            region_fan_out: self.region_fan_out.map(|(mode, _)| mode),
         }
     }
 
     /// Whether `shape` is this state's shape: `self.shape() == *shape`, answered without making
     /// the shape, so a consumer that keeps the shapes it made can find a state's among them
-    /// without allocating. Its used resources' shape alone is made, where it lists any and every
-    /// other field matches; [`position_of_shape`](Self::position_of_shape) makes it once for
-    /// many shapes.
+    /// without allocating. Its used resources' shape alone is made, where it lists any in no
+    /// token order ([`used_in_token_order`](Self::used_in_token_order)) and every other field
+    /// matches; [`position_of_shape`](Self::position_of_shape) makes it once for many shapes. A
+    /// list in token order is compared in place, making nothing.
     pub fn has_shape(&self, shape: &BindShape) -> bool {
         self.is_shape(shape, &mut None)
     }
@@ -716,7 +805,7 @@ impl BindState {
     /// The position among `shapes` of the first that is this state's shape (of which
     /// [`has_shape`](Self::has_shape) answers true), found without making the shape: its used
     /// resources' shape is made at most once, however many shapes it is compared with, and only
-    /// where it lists any and a shape's every other field matches.
+    /// where it lists any in no token order and a shape's every other field matches.
     pub fn position_of_shape<'s>(
         &self,
         shapes: impl IntoIterator<Item = &'s BindShape>,
@@ -728,11 +817,56 @@ impl BindState {
     }
 
     /// Whether `shape` is this state's shape ([`has_shape`](Self::has_shape)), its used
-    /// resources' shape taken from `made`, or made into it where it is needed first.
+    /// resources' compared in place where they are listed in token order, else their shape taken
+    /// from `made`, or made into it where it is needed first.
     fn is_shape(&self, shape: &BindShape, made: &mut Option<BTreeMap<u32, UsedShape>>) -> bool {
+        // Last: the one field compared through a shape made of it.
+        self.has_shape_beside_used(shape)
+            && match (self.used_resources.is_empty(), self.used_in_token_order) {
+                (true, _) => shape.used.is_empty(),
+                (false, true) => self.used_in_order_are(&shape.used),
+                (false, false) => *made.get_or_insert_with(|| self.used_shape()) == shape.used,
+            }
+    }
+
+    /// Whether `used`, a shape's used resources, is [`used_shape`](Self::used_shape)'s answer for
+    /// `used_resources` listed in token order: each token's entries, which lie together, unioned
+    /// as `used_shape` unions them and compared with the shape's entry of that token, in place.
+    fn used_in_order_are(&self, used: &BTreeMap<u32, UsedShape>) -> bool {
+        let listed = &self.used_resources;
+        debug_assert!(
+            listed.windows(2).all(|w| w[0].token <= w[1].token),
+            "used resources listed in token order are not"
+        );
+        let mut shapes = used.iter();
+        let mut listed = listed.iter().peekable();
+        while let Some(first) = listed.next() {
+            let mut made = UsedShape {
+                class: UsedClass::of(first.class),
+                usage: first.usage,
+                stages: first.stages,
+            };
+            while let Some(again) = listed.next_if(|u| u.token == first.token) {
+                made.usage |= again.usage;
+                made.stages |= again.stages;
+            }
+            match shapes.next() {
+                Some((token, shape)) if *token == first.token && *shape == made => {}
+                Some(_) | None => return false,
+            }
+        }
+        shapes.next().is_none()
+    }
+
+    /// Whether `shape` is this state's shape but for its used resources' ([`BindShape::used`]),
+    /// which are not looked at: every other field compared as [`has_shape`](Self::has_shape)
+    /// compares it. A consumer that keeps the shapes a state took while its used resources stayed
+    /// as they are finds the state's among them so: the answer costs the state's slots and
+    /// fields, not the resources it lists as used.
+    pub fn has_shape_beside_used(&self, shape: &BindShape) -> bool {
         let BindShape {
             stages,
-            used,
+            used: _,
             vertex_amplification,
             imageblock_size,
             render_target_array_length,
@@ -748,6 +882,7 @@ impl BindState {
             depth_clamp_range,
             rotated_weights,
             mesh_last_first,
+            line_band,
             interlocked_colors,
             fragment_tests,
             extended_shadows,
@@ -755,14 +890,15 @@ impl BindState {
             primitive_id_indices,
             quad_primitive_ids,
             private_list,
+            far_vertex_buffers,
+            region_viewports,
+            region_fan_out,
         } = shape;
         let tables = self.stages.iter().filter(|(_, t)| !t.has_empty_shape());
         tables.clone().count() == stages.len()
-            && tables
-                .zip(stages)
-                .all(|((stage, t), (of, s))| {
-                    stage == of && t.has_shape(s, self.view_base_alignment)
-                })
+            && tables.zip(stages).all(|((stage, t), (of, s))| {
+                stage == of && t.has_shape(s, self.view_base_alignment)
+            })
             && self.vertex_amplification == *vertex_amplification
             && self.imageblock_size == *imageblock_size
             && self.render_target_array_length == *render_target_array_length
@@ -778,6 +914,7 @@ impl BindState {
             && self.depth_clamp_range.is_some() == *depth_clamp_range
             && self.rotated_weights == *rotated_weights
             && self.mesh_last_first == *mesh_last_first
+            && self.line_band.map(|(primitive, _)| primitive) == *line_band
             && self.interlocked_colors == *interlocked_colors
             && self.fragment_tests == *fragment_tests
             && self.extended_shadows == *extended_shadows
@@ -785,11 +922,62 @@ impl BindState {
             && self.primitive_id_indices == *primitive_id_indices
             && self.quad_primitive_ids == *quad_primitive_ids
             && self.private_list == *private_list
-            // Last: the one field compared through a shape made of it.
-            && match self.used_resources.is_empty() {
-                true => used.is_empty(),
-                false => *made.get_or_insert_with(|| self.used_shape()) == *used,
-            }
+            && self.far_vertex_buffers == *far_vertex_buffers
+            && self.region_viewports == *region_viewports
+            && self.region_fan_out.map(|(mode, _)| mode) == *region_fan_out
+    }
+
+    /// The key of this state's shape beside its used resources, worked out in place, making no
+    /// shape: [`BindShape::key_beside_used`]'s answer for every shape of which
+    /// [`has_shape_beside_used`](Self::has_shape_beside_used) answers true. A consumer that keeps
+    /// shapes with their keys compares whole only those whose key is the state's: a shape of
+    /// another key is not its shape. A hash of every field the comparison reads: two shapes of
+    /// one key may still differ, and it is fixed within a build alone.
+    pub fn shape_key_beside_used(&self) -> u64 {
+        let mut key = FxHasher::default();
+        let alignment = self.view_base_alignment;
+        for (stage, t) in self.stages.iter().filter(|(_, t)| !t.has_empty_shape()) {
+            let buffers =
+                (t.buffers.iter()).map(|(i, b)| (*i, b.shape(t.class_alignment(*i, alignment))));
+            let textures = t.textures.iter().map(|(i, x)| (*i, x.shape()));
+            let samplers = t.samplers.iter().map(|(i, s)| (*i, s.shape()));
+            key_stage(&mut key, *stage, (buffers, textures, samplers));
+            t.threadgroup_lengths.hash(&mut key);
+        }
+        KeyRest {
+            vertex_amplification: &self.vertex_amplification,
+            imageblock_size: self.imageblock_size,
+            render_target_array_length: self.render_target_array_length,
+            tessellation_factor_buffer: self.tessellation_factors.buffer.is_some(),
+            render_area: self.render_area,
+            argument_samplers: (
+                capacity_class(self.argument_samplers.len()),
+                (self.argument_samplers.iter())
+                    .fold(0, |all, s| all | sampler_key(&s.desc.shape())),
+            ),
+            function_tables: FunctionTablesShape::of(&self.function_tables),
+            tile_threadgroup: &self.tile_threadgroup,
+            viewport_compensation: self.viewport_compensation.map(|c| c.compensation),
+            zeroed_colors: &self.zeroed_colors,
+            dropped_colors: &self.dropped_colors,
+            kept_imageblock_bytes: self.kept_imageblock_bytes,
+            depth_clamp_range: self.depth_clamp_range.is_some(),
+            rotated_weights: self.rotated_weights,
+            mesh_last_first: self.mesh_last_first,
+            line_band: self.line_band.map(|(primitive, _)| primitive),
+            interlocked_colors: &self.interlocked_colors,
+            fragment_tests: self.fragment_tests,
+            extended_shadows: &self.extended_shadows,
+            snapshot_textures: &self.snapshot_textures,
+            primitive_id_indices: self.primitive_id_indices,
+            quad_primitive_ids: self.quad_primitive_ids,
+            private_list: self.private_list,
+            far_vertex_buffers: &self.far_vertex_buffers,
+            region_viewports: self.region_viewports,
+            region_fan_out: self.region_fan_out.map(|(mode, _)| mode),
+        }
+        .hash(&mut key);
+        key.finish()
     }
 
     /// `used_resources` by token ([`BindShape::used`]): one token names one resource, and listing
@@ -797,13 +985,8 @@ impl BindState {
     fn used_shape(&self) -> BTreeMap<u32, UsedShape> {
         let mut used: BTreeMap<u32, UsedShape> = BTreeMap::new();
         for u in &self.used_resources {
-            let class = match u.class {
-                ResourceClass::Buffer => UsedClass::Buffer,
-                ResourceClass::Texture(facts) => UsedClass::Texture(facts.shape()),
-                ResourceClass::Heap => UsedClass::Heap,
-            };
             let e = used.entry(u.token).or_insert(UsedShape {
-                class,
+                class: UsedClass::of(u.class),
                 usage: metal::ResourceUsage::empty(),
                 stages: metal::RenderStages::empty(),
             });
@@ -1065,6 +1248,48 @@ impl BoundBuffer {
             } => BufferShape::Bytes { attribute_stride },
         }
     }
+
+    /// Whether this binding and `other` have one shape under `view_base_alignment`, as their
+    /// [`shape`](Self::shape)s compare: a length or bind offset the two share is not classed.
+    pub fn same_shape(&self, other: &BoundBuffer, view_base_alignment: u32) -> bool {
+        match (*self, *other) {
+            (
+                BoundBuffer::Buffer {
+                    length,
+                    offset,
+                    device_address,
+                    attribute_stride,
+                    ..
+                },
+                BoundBuffer::Buffer {
+                    length: other_length,
+                    offset: other_offset,
+                    device_address: other_address,
+                    attribute_stride: other_stride,
+                    ..
+                },
+            ) => {
+                attribute_stride == other_stride
+                    && device_address.is_some() == other_address.is_some()
+                    && (length == other_length
+                        || length_class(length) == length_class(other_length))
+                    && (offset == other_offset
+                        || offset_alignment(offset, view_base_alignment)
+                            == offset_alignment(other_offset, view_base_alignment))
+            }
+            (
+                BoundBuffer::Bytes {
+                    attribute_stride, ..
+                },
+                BoundBuffer::Bytes {
+                    attribute_stride: other_stride,
+                    ..
+                },
+            ) => attribute_stride == other_stride,
+            (BoundBuffer::Buffer { .. }, BoundBuffer::Bytes { .. })
+            | (BoundBuffer::Bytes { .. }, BoundBuffer::Buffer { .. }) => false,
+        }
+    }
 }
 
 /// The alignment class of bind offset `offset` (a buffer's,
@@ -1112,7 +1337,9 @@ impl TextureFacts {
     /// storage slot's level views and pushed level count, its swizzle, its address-mode map, its
     /// [`offset_base_axes`](Self::offset_base_axes), and whether its planes are read in place
     /// ([`ycbcr_in_place`](Self::ycbcr_in_place), whose words the slot's push field carries, not
-    /// the shape) and through which device conversion where they are held as an image. Its array length only changes the view's subresource range, which is every
+    /// the shape) and through which device conversion where they are held as an image, and whether
+    /// its rows are read and written in place ([`texel_rows`](Self::texel_rows), whose words the
+    /// slot's push field carries). Its array length only changes the view's subresource range, which is every
     /// layer.
     ///
     /// The level count is stated whatever the usage: plain Metal writes a texture made without
@@ -1133,6 +1360,7 @@ impl TextureFacts {
             offset_base_axes: self.offset_base_axes(),
             ycbcr_in_place: self.ycbcr_in_place.is_some(),
             ycbcr_planes_sampler: self.ycbcr_in_place.and_then(|p| p.planes_sampler()),
+            texel_rows: self.texel_rows.is_some(),
         }
     }
 }
@@ -1263,10 +1491,9 @@ pub enum BoundBuffer {
         /// `MTLBufferLayoutStrideDynamic` reads the bytes at; `None` for the plain setters, which
         /// such a layout reads at stride 0, as plain Metal reads them.
         /// `MTLAttributeStrideStatic` is `Some(u32::MAX)`, its low 32 bits: an M4 read element 0
-        /// of inline bytes bound so and zeros past it, where a buffer bound so reads stride 0;
-        /// the binder refuses a layout that reads inline bytes at that stride
-        /// ([`BindError::MissingVertexStride`](crate::error::BindError::MissingVertexStride), and
-        /// a kernel's stage-in `NotImplemented(KernelStageIn)`).
+        /// of inline bytes bound so and zeros past it, which the pulled fetch, a vertex
+        /// attribute's or a kernel stage-in's, reads at that stride (every element past the first
+        /// lies past the bytes).
         #[cfg_attr(feature = "serde", serde(default))]
         attribute_stride: Option<u32>,
     },
@@ -1347,6 +1574,15 @@ pub struct TextureFacts {
     /// image. `None` for every other texture.
     #[cfg_attr(feature = "serde", serde(default))]
     pub ycbcr_in_place: Option<crate::bind::YCbCrInPlace>,
+    /// The texture's rows in a texel buffer view of its buffer's bytes, where its image is a
+    /// shadow ([`TexelRows`](crate::bind::TexelRows), the runtime's extension): a 2D texture over a
+    /// buffer the device makes no image over. A slot whose function only reads, writes or asks
+    /// the size of it (`RuntimeFact::TexelRows`) takes its rows variant (`VariantKey::texel_rows`),
+    /// which binds that view ([`WriteSource::TexelRows`](crate::bind::WriteSource)) and pushes
+    /// these words (`PushField::TexelRows`); any other slot binds the texture's image. `None` for
+    /// every other texture.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub texel_rows: Option<crate::bind::TexelRows>,
 }
 
 impl TextureFacts {
@@ -1365,6 +1601,7 @@ impl TextureFacts {
             parent_relative_level: 0,
             parent_base_size: [0; 3],
             ycbcr_in_place: None,
+            texel_rows: None,
         }
     }
 
@@ -1434,13 +1671,27 @@ pub struct SamplerDescriptor {
     /// `Never` (the Metal default) on a sampler used without comparison.
     pub compare_function: metal::CompareFunction,
     pub reduction_mode: metal::SamplerReductionMode,
+    /// `lodBias`: any value, NaN and the infinities included, as Metal takes it, its validation
+    /// layer too. What it changes is the GPU's (`metal::sampler::SamplerUse::lod_bias`). An Apple
+    /// GPU of the families the runtime claims, which lists the bias under Apple10 alone, samples
+    /// every level as with a bias of 0 (an Apple M3 Max on macOS 27.0.1, Apple9: implicit,
+    /// biased, explicit-level, gradient and clamped samples in fragment functions and kernels,
+    /// float and integer textures, every mip filter, biases from -1000 to 1000): there the Vulkan
+    /// sampler's `mipLodBias` is 0 whatever it holds. A Mac with an Intel or AMD GPU adds it to
+    /// every sample's level and clamps the sum into the texture's levels (an AMD Radeon Pro 5300M
+    /// and an Intel UHD 630: explicit-level, gradient and implicit samples): there it is the
+    /// device's `mipLodBias`, within the device's limit
+    /// ([`device_lod_bias`](crate::metal::sampler::device_lod_bias)). Metal makes another sampler
+    /// state for another bias.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub lod_bias: f32,
 }
 
 impl SamplerDescriptor {
     /// `MTLSamplerDescriptor`'s defaults: nearest filtering without mipmaps, clamp to edge,
     /// transparent black borders, normalized coordinates, LOD clamps `[0, FLT_MAX]`, no
-    /// anisotropy, no comparison, and weighted-average reduction. The fields are public; set the
-    /// ones that differ.
+    /// anisotropy, no comparison, weighted-average reduction, and no LOD bias. The fields are
+    /// public; set the ones that differ.
     pub fn new() -> SamplerDescriptor {
         SamplerDescriptor {
             min_filter: metal::SamplerMinMagFilter::Nearest,
@@ -1457,6 +1708,7 @@ impl SamplerDescriptor {
             max_anisotropy: 1,
             compare_function: metal::CompareFunction::Never,
             reduction_mode: metal::SamplerReductionMode::WeightedAverage,
+            lod_bias: 0.0,
         }
     }
 }
@@ -1607,6 +1859,10 @@ pub struct BindShape {
     /// (`VariantKey::mesh_last_first`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub mesh_last_first: bool,
+    /// What `BindState.line_band` draws as bands: the variant that draws its lines, or its
+    /// triangles' edges, so (`VariantKey::line_band`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub line_band: Option<crate::pipeline::BandPrimitive>,
     /// `BindState.interlocked_colors`: the variant whose fragment function writes those it writes
     /// through the interlocked storage form (`VariantKey::interlocked_colors`).
     #[cfg_attr(feature = "serde", serde(default))]
@@ -1638,6 +1894,21 @@ pub struct BindShape {
     /// list form runs the variant that draws it so (`VariantKey::private_list`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub private_list: bool,
+    /// `BindState.far_vertex_buffers`: the layouts a draw pulls where the device's fixed-function
+    /// input cannot fetch them for it (past 4 GiB on a wrapping driver, or every one of a draw
+    /// replay's), in the pulled-vertex-buffer variant (`VariantKey::pulled_vertex_buffers`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub far_vertex_buffers: BTreeSet<u32>,
+    /// `BindState.region_viewports`: a draw of a rate-mapped pass's regions several at a time
+    /// runs the variant whose vertex function stores `ViewportIndex` as `DrawIndex`
+    /// (`VariantKey::region_viewports`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub region_viewports: bool,
+    /// `BindState.region_fan_out`'s variant: a draw of a rate-mapped pass's triangles once, its
+    /// variant's triangle stage fanning them out to their regions, or probing which it cannot, or
+    /// region by region through its vertex function's copies (`VariantKey::region_fan_out`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub region_fan_out: Option<crate::pipeline::RegionFanOut>,
 }
 
 impl BindShape {
@@ -1694,6 +1965,115 @@ impl BindShape {
         }
         Cow::Owned(projected)
     }
+
+    /// Its key beside its used resources ([`BindState::shape_key_beside_used`], which answers
+    /// it for a state of which [`BindState::has_shape_beside_used`] answers true): a hash of
+    /// every field but `used`. Shapes equal but for `used` have one key.
+    pub fn key_beside_used(&self) -> u64 {
+        let mut key = FxHasher::default();
+        for (stage, s) in &self.stages {
+            let buffers = s.buffers.iter().map(|(i, b)| (*i, *b));
+            let textures = s.textures.iter().map(|(i, t)| (*i, *t));
+            let samplers = s.samplers.iter().map(|(i, x)| (*i, *x));
+            key_stage(&mut key, *stage, (buffers, textures, samplers));
+            s.threadgroup_lengths.hash(&mut key);
+        }
+        KeyRest {
+            vertex_amplification: &self.vertex_amplification,
+            imageblock_size: self.imageblock_size,
+            render_target_array_length: self.render_target_array_length,
+            tessellation_factor_buffer: self.tessellation_factor_buffer,
+            render_area: self.render_area,
+            argument_samplers: (
+                self.argument_samplers.class,
+                (self.argument_samplers.shapes.iter()).fold(0, |all, s| all | sampler_key(s)),
+            ),
+            function_tables: self.function_tables,
+            tile_threadgroup: &self.tile_threadgroup,
+            viewport_compensation: self.viewport_compensation,
+            zeroed_colors: &self.zeroed_colors,
+            dropped_colors: &self.dropped_colors,
+            kept_imageblock_bytes: self.kept_imageblock_bytes,
+            depth_clamp_range: self.depth_clamp_range,
+            rotated_weights: self.rotated_weights,
+            mesh_last_first: self.mesh_last_first,
+            line_band: self.line_band,
+            interlocked_colors: &self.interlocked_colors,
+            fragment_tests: self.fragment_tests,
+            extended_shadows: &self.extended_shadows,
+            snapshot_textures: &self.snapshot_textures,
+            primitive_id_indices: self.primitive_id_indices,
+            quad_primitive_ids: self.quad_primitive_ids,
+            private_list: self.private_list,
+            far_vertex_buffers: &self.far_vertex_buffers,
+            region_viewports: self.region_viewports,
+            region_fan_out: self.region_fan_out,
+        }
+        .hash(&mut key);
+        key.finish()
+    }
+}
+
+/// One stage's slots into a shape key ([`BindShape::key_beside_used`]): the stage, then each
+/// class's count and its slots' shapes in index order, as a state's table and a shape's give them.
+fn key_stage(
+    key: &mut FxHasher,
+    stage: Stage,
+    (buffers, textures, samplers): (
+        impl ExactSizeIterator<Item = (u32, BufferShape)>,
+        impl ExactSizeIterator<Item = (u32, TextureShape)>,
+        impl ExactSizeIterator<Item = (u32, BoundSamplerShape)>,
+    ),
+) {
+    stage.hash(key);
+    key.write_usize(buffers.len());
+    buffers.for_each(|slot| slot.hash(key));
+    key.write_usize(textures.len());
+    textures.for_each(|slot| slot.hash(key));
+    key.write_usize(samplers.len());
+    samplers.for_each(|slot| slot.hash(key));
+}
+
+/// An argument sampler shape's part of a shape key: the samplers' parts are or-ed, so the
+/// shape's set of them and a state's list, which may repeat one, have one key
+/// ([`BindShape::key_beside_used`]).
+fn sampler_key(shape: &SamplerShape) -> u64 {
+    let mut key = FxHasher::default();
+    shape.hash(&mut key);
+    key.finish()
+}
+
+/// The fields of a shape beside its stages that its key holds, of the types the shape holds them
+/// in (the argument samplers as their class and their shapes' or-ed parts), so a state's key and
+/// a shape's hash them alike ([`BindShape::key_beside_used`]).
+#[derive(Hash)]
+struct KeyRest<'a> {
+    vertex_amplification: &'a VertexAmplification,
+    imageblock_size: ImageblockSize,
+    render_target_array_length: u32,
+    tessellation_factor_buffer: bool,
+    render_area: [u32; 2],
+    argument_samplers: (u8, u64),
+    function_tables: FunctionTablesShape,
+    tile_threadgroup: &'a TileThreadgroupMemory,
+    viewport_compensation: Option<ViewportCompensation>,
+    zeroed_colors: &'a BTreeMap<u32, metal::PixelFormat>,
+    dropped_colors: &'a BTreeSet<u32>,
+    kept_imageblock_bytes: Option<u32>,
+    depth_clamp_range: bool,
+    rotated_weights: bool,
+    mesh_last_first: bool,
+    line_band: Option<crate::pipeline::BandPrimitive>,
+    interlocked_colors: &'a BTreeSet<u32>,
+    fragment_tests: FragmentTests,
+    extended_shadows: &'a BTreeSet<u32>,
+    snapshot_textures: &'a BTreeSet<u32>,
+    primitive_id_indices: Option<metal::IndexType>,
+    quad_primitive_ids: bool,
+    private_list: bool,
+    far_vertex_buffers: &'a BTreeSet<u32>,
+    region_viewports: bool,
+    region_fan_out: Option<crate::pipeline::RegionFanOut>,
 }
 
 /// The projection of `BindState::argument_samplers` that can change a plan: the capacity class of
@@ -1730,8 +2110,16 @@ impl ArgumentSamplersShape {
     /// Whether it is the shape of `samplers` (`ArgumentSamplersShape::of(samplers) == *self`),
     /// answered without making that shape for up to [`SHAPES_AT_ONCE`](Self::SHAPES_AT_ONCE)
     /// samplers: each sampler's shape is among `shapes`, and each of `shapes` is some sampler's.
-    /// More are answered by making it.
+    /// More are answered by making it. The class is compared first, and a list of none (a state
+    /// that binds no argument buffer's samplers, every draw's of most programs) is the shape of
+    /// no sampler at once, with no sampler's shape worked out.
     fn is_of(&self, samplers: &[ArgumentSampler]) -> bool {
+        if self.class != capacity_class(samplers.len()) {
+            return false;
+        }
+        if samplers.is_empty() {
+            return self.shapes.is_empty();
+        }
         if samplers.len() > Self::SHAPES_AT_ONCE {
             return Self::of(samplers) == *self;
         }
@@ -1740,11 +2128,9 @@ impl ArgumentSamplersShape {
             *shape = Some(sampler.desc.shape());
         }
         let seen = &seen[..samplers.len()];
-        self.class == capacity_class(samplers.len())
-            && seen
-                .iter()
-                .flatten()
-                .all(|shape| self.shapes.contains(shape))
+        seen.iter()
+            .flatten()
+            .all(|shape| self.shapes.contains(shape))
             && self.shapes.iter().all(|shape| seen.contains(&Some(*shape)))
     }
 
@@ -1869,6 +2255,17 @@ pub enum UsedClass {
     Heap,
 }
 
+impl UsedClass {
+    /// The kind of a used resource of `class`.
+    fn of(class: ResourceClass) -> UsedClass {
+        match class {
+            ResourceClass::Buffer => UsedClass::Buffer,
+            ResourceClass::Texture(facts) => UsedClass::Texture(facts.shape()),
+            ResourceClass::Heap => UsedClass::Heap,
+        }
+    }
+}
+
 /// The shape of one stage's argument tables.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1963,6 +2360,11 @@ pub enum TextureShape {
         /// (`VariantKey::ycbcr_planes_sampled`).
         #[cfg_attr(feature = "serde", serde(default))]
         ycbcr_planes_sampler: Option<crate::bind::YCbCrPlanesSampler>,
+        /// The texture's rows are read and written in place where a slot's function only reads,
+        /// writes or asks the size of it ([`TextureFacts::texel_rows`]): such a slot takes its
+        /// rows variant (`VariantKey::texel_rows`).
+        #[cfg_attr(feature = "serde", serde(default))]
+        texel_rows: bool,
     },
     Buffer {
         pixel_format: metal::PixelFormat,
@@ -1988,6 +2390,13 @@ impl TextureShape {
     /// its neutral.
     pub(crate) fn out_of_bounds_alpha(&self) -> Option<u64> {
         crate::metal::format::out_of_bounds_alpha_one(self.pixel_format()).map(u64::from)
+    }
+
+    /// The `SpecKey::BorderTexels` of a slot bound to this texture: Metal's border texels of its
+    /// pixel format and swizzle (`metal::sampler::border_texels`). `None` for a placeholder pixel
+    /// format, whose slot reads its neutral.
+    pub(crate) fn border_texels(&self) -> Option<u64> {
+        crate::metal::sampler::border_texels(self.pixel_format(), self.swizzle()).map(u64::from)
     }
 
     /// The bound texture's swizzle: a texture's or a texture buffer's.

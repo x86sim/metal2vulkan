@@ -46,21 +46,60 @@ hang the host. So everything that opens a device is explicit, bounded and refusa
 | none | GPU-free tests only | none | the gate |
 | `--cfg m2v_cpu_icd` | Vulkan execution tests | a CPU ICD only (lavapipe, SwiftShader) | Linux CI, with `LP_NUM_THREADS=1` |
 | `--cfg m2v_gpu` | Vulkan and Metal execution tests | a real GPU | explicitly, on a host with a GPU |
+| `--cfg m2v_gpu --cfg m2v_gpu_hazards` | the GPU hazards too | a real GPU | only to test that feature, by name |
 
-The two are mutually exclusive. Lint the gated code without running it, in its own target
-directory:
+`m2v_cpu_icd` and `m2v_gpu` are mutually exclusive; `m2v_gpu_hazards` adds to `m2v_gpu` and means
+nothing alone. Lint the gated code without running it, in its own target directory:
 
 ```sh
 CARGO_TARGET_DIR=target/gpucfg RUSTFLAGS='-Dwarnings --cfg m2v_gpu' \
+  cargo clippy -p metal2vulkan-validation --all-targets --all-features -- -D warnings
+CARGO_TARGET_DIR=target/gpuhazards RUSTFLAGS='-Dwarnings --cfg m2v_gpu --cfg m2v_gpu_hazards' \
   cargo clippy -p metal2vulkan-validation --all-targets --all-features -- -D warnings
 ```
 
 A site that stops announcing, or any other failing assertion, still compiles: the lint sees none of
 it, and only a run does.
 
+**A GPU hazard** is a device test that, on purpose, faults a real GPU (a GPU write into read-only
+host pages), holds one for long (a command buffer past about a second, or a dispatch that spins on
+a word the GPU may never see the host raise, which only its cap ends), or allocates toward the
+device's limits (multi-GiB buffers, heaps or no-copy ranges, `max_buffer_length`). On Apple's GPUs
+the recovery from a fault fails other processes' command buffers in flight (`.config/nextest.toml`
+has the measurement). So on a GPU a hazard compiles only under `m2v_gpu_hazards`, which no sweep,
+lane, stress loop or gate may pass: `--run-ignored all` and test filters cannot reach it. Under
+`m2v_cpu_icd` it compiles and runs as any device test, since a CPU ICD cannot take a GPU down. Its
+doc comment says which hazard it is. Run one only to test that feature, by name, alone:
+
+```sh
+CARGO_TARGET_DIR=target/gpuhazards RUSTFLAGS='--cfg m2v_gpu --cfg m2v_gpu_hazards' \
+  cargo nextest run -p metal2vulkan-validation --all-features \
+  -E 'test(=runtime_lane::host_memory::a_gpu_fault_fails_its_command_buffer_and_the_queue_runs_on)'
+```
+
+**Work past a CPU device's reach** compiles only under `m2v_gpu`: a device test whose command
+buffer a CPU device cannot run within Metal's bound on one. The runtime's watchdog fails a queue's
+front batch that goes 20.2 s without its timeline advancing as Metal's timed-out command buffer
+(`GpuHang`, the runtime's `command_buffer/stall.rs`), on every device. The two dispatches past
+2^32 threads in `runtime_lane::indirect_dispatches` are such tests: each took 24 s on lavapipe
+with 16 CPU threads to itself, and 0.1 to 0.3 s on an RX 7900 XTX and a Radeon 780M.
+
 - **Device selection is an argument.** Every device-opening binary takes `--device-type cpu|gpu`,
   with no default. `cpu` matches only a CPU device and never falls back to a GPU; `gpu` takes the
   loader's first GPU. `corpus-metal` takes only `gpu`.
+- **A GPU of few channels runs three device tests at a time.** NVIDIA's driver gives each
+  `VkQueue` a channel, and a runtime device of the queue plan takes 18: an RTX 2080 holds 10 such
+  devices at once, so its device tests run with `cargo nextest run --profile few-channels`
+  (`.config/nextest.toml` has the measurement). Past that, the driver refuses a device the plan's
+  queues and the runtime makes it with its least plan's three, announcing
+  `metal2vulkan-degrade-least-queue-plan`: a test may then pass on fewer queues than the plan's.
+- **The runtime's own device tests take four `VkQueue`s, not the plan's 18.** Its test build's
+  `DeviceOptions::default()` holds queue limits of a round robin of two and none for presenting
+  (`TEST_QUEUE_LIMITS`, `device/create.rs`), as the runtime lane's devices hold theirs
+  (`LANE_QUEUE_LIMITS`): NVIDIA's driver makes and destroys one device at a time across processes,
+  each queue adding to both. A test whose work needs more (a command queue made while the test
+  holds two others, a presenting, reserved or extra queue) panics where it asks for it, on every
+  device, and makes its device with `queue_limits: None`.
 - **Waits are bounded.** Every host wait on device work goes through `src/gpu/wait.rs` (10 seconds
   by default; `--gpu-wait-timeout SECONDS` raises it for one command). A test fails if an
   unbounded wait appears elsewhere.
@@ -78,7 +117,7 @@ it, and only a run does.
 The device lane is what `--cfg m2v_gpu` adds: the delta between the workspace's test list with the
 cfg and without it. `scripts/device-lane/device-lane` derives that delta from two
 `cargo nextest list` runs, shards it by area, runs the shards one after another, and holds the run
-to the lane.
+to the lane. Its builds set `RUSTFLAGS` to `--cfg m2v_gpu` alone, so the lane holds no GPU hazard.
 
 ```sh
 scripts/device-lane/device-lane --profile debug                      # the whole lane
@@ -93,12 +132,10 @@ scripts/device-lane/device-lane --profile release \
 - `--list-only` opens no device. `--filter EXPR` intersects a nextest filterset with the lane, and
   the report then says the coverage is of that slice alone, never of the lane. An expression that
   leaves the whole lane selected narrowed nothing, and stops the run.
-- `--wrap 'CMD ARG...'` prefixes each shard run. On a host whose GPU is shared, give it that
-  host's GPU lock and a resident-memory cap: macOS does not enforce `ulimit -v`, and a device test
-  has no worker boundary of its own. Every build and every listing stays outside it. Each shard is
-  compiled by its own `cargo nextest run --no-run` pass first, so the wrapped half has nothing to
-  compile: a lock held across a compile is the form that has wedged this one before, and a sibling
-  cargo on the same target directory can invalidate it between two shards.
+- Each shard is compiled by its own `cargo nextest run --no-run` pass first, so its run has nothing
+  to compile and its time is the tests' alone; a sibling cargo on the same target directory can
+  invalidate a build between two shards. The lane assumes the GPU is its own for the run: on a
+  shared host, run it under the host's exclusive GPU hold.
 - The cfg and plain legs keep separate target directories (`--cfg-target`, `--plain-target`),
   since `RUSTFLAGS` is part of a build's fingerprint. `--help` lists every option.
 
@@ -141,13 +178,17 @@ a layer the loader answers `VK_ERROR_LAYER_NOT_PRESENT` for and says so as the d
 claim of what the layer reported therefore states what it holds, against the layers the instance
 enabled and nothing else: where the layer was dropped the claim is not exercised, and the test
 prints `LANE-LAYER-ABSENT <test>: ...` and a count per message list instead of passing on an empty
-list. Three forms state it, and no lane test reads a message list for emptiness any other way:
+list. Five forms state it, and no lane test reads a message list for emptiness any other way:
 
 | Form | The claim |
 |---|---|
 | `layer_reported_nothing_at_all(&messages)` | The widest claim, and the one the lane states oftenest: whatever the layer checked of the work so far, it reported nothing of it |
 | `layer_reported_nothing(&messages, claim)` | The same, of the narrower `claim` the test names, which leads the failure and the `LANE-LAYER-ABSENT` line |
-| `nothing_reported_without_the_layer(&messages, claim)` | A device the test made without the validation layer, to time something: the claim is the driver's own messages and the runtime's, so the layer's absence takes nothing from it. It fails where such a device did ask for the layer after all | A host whose layer manifest names its library by a bare
+| `layer_reported_nothing_but_apart_writes(&messages, claim, &writes)` (`runtime_lane::apart_writes`) | The same, but a write after write the layer reports on a buffer whose every write the test noted as it placed it (`NotedWrites`: a dispatch's, a draw's, a fill's, a bounded draw's or a patch draw's) passes in three cases. **Apart** (a `LAYER-APART-WRITES` line): two noted writes or more, each one Vulkan command's, no two sharing a byte. The layer takes a shader's storage buffer as written over its descriptor's whole range, which the runtime binds wider than the bytes the shader provably writes (from the offset alignment down, in 16-byte granules) and orders by (`sync_coverage::disjoint_words_of_one_block_are_a_hazard_to_the_layer_alone`); no order of writes that share no byte changes one. **Idle draw** (`LAYER-IDLE-DRAW`): the two `vkCmdDrawIndexedIndirect` of one draw the index bounds pass bounds, reported as recorded, one such draw noted per command buffer, on a device that announced `indirect-index-bounds-pass`: at most one of the two draws. **Idle chunk** (`LAYER-IDLE-CHUNK`): two `vkCmdDrawIndirect` chunk draws of emulated patch draws, reported as recorded, the patch draws of each command buffer noted apart, on a device that announced `emulated-tessellation-draws`: a test keeps each patch draw below `2^30` triangles and the scan writes a `vertexCount` of 0 past them, so at most one chunk of a draw draws. A read after a write, a write after a read, a copy's access, two noted writes of one byte, and either split form reported otherwise fail as above |
+| `layer_reported_nothing_but_announced_stage_races(&messages, claim, &buffers)` (`runtime_lane::stage_races`) | The same, but a hazard between a later draw's vertex stage and an earlier draw's fragment stage of one pass, reported as recorded, on a buffer the test names, passes with a `LAYER-STAGE-RACE` line where the device announced the difference it is: a read after a write under `in-place-vertex-reads`, a write after a read or a write under `fragments-before-geometry`. Metal runs a pass's vertex functions before its fragments; Vulkan orders the draws only through the pass's barriers |
+| `nothing_reported_without_the_layer(&messages, claim)` | A device the test made without the validation layer, to time something: the claim is the driver's own messages and the runtime's, so the layer's absence takes nothing from it. It fails where such a device did ask for the layer after all |
+
+A host whose layer manifest names its library by a bare
 filename (which the loader looks for on the system library search path) provides no layer at all,
 and a lane run there is evidence for everything but the layer's checks. The executor's own Vulkan
 context refuses to open without the layer instead (`candidate::platform::device`).

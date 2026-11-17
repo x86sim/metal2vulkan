@@ -221,9 +221,9 @@ enum Plan {
     FromInt(CastOp),
     /// A function pointer stored to memory: its word, zero-extended to the pointer's 8 bytes.
     WordStore,
-    /// A call through a word the function constants settle ([`Fact::Settled`]): a call of this
-    /// refused declaration with the word, so SCCP deletes it or refuses the constant where the call
-    /// stood, and the post-check refuses it if it survives, as the call through the pointer was.
+    /// A call through a word an unsupplied function constant leaves undefined ([`Fact::Settled`]):
+    /// a call of this refused declaration with the word, so SCCP deletes it, and the post-check
+    /// refuses it if it survives, as the call through the pointer was.
     Unfolded(FuncId),
 }
 
@@ -533,7 +533,7 @@ impl Escapes {
                         symbol: DiagName::new(String::from_utf8_lossy(&s.0)),
                     }),
                     Some(Stub::Refused(e)) => e.clone(),
-                    Some(Stub::Resolved(_)) | None => {
+                    Some(Stub::Resolved { .. }) | None => {
                         return Err(invariant("a word of a stub that is not unresolved"))
                     }
                 };
@@ -601,7 +601,7 @@ fn constant_target(
         return None;
     };
     let target = match stubs.get(*f) {
-        Some(link::Stub::Resolved(def)) => *def,
+        Some(link::Stub::Resolved { call, .. }) => *call,
         _ => *f,
     };
     let func = parts.funcs.get(target)?;
@@ -867,8 +867,8 @@ struct IdOp {
     index: Option<Value>,
 }
 
-/// The function constant `v` holds the address of, a stub's linked definition for a resolved
-/// stub's, with its word when it has one.
+/// The function constant `v` holds the address of, what a call to a resolved stub calls (its
+/// linked definition, or the definition's adapter) for the stub's, with its word when it has one.
 fn addr_word(parts: &ModuleParts, stubs: &Stubs, cx: &Cx<'_>, v: Value) -> Option<(FuncId, u32)> {
     let Value::Const(c) = v else {
         return None;
@@ -877,7 +877,7 @@ fn addr_word(parts: &ModuleParts, stubs: &Stubs, cx: &Cx<'_>, v: Value) -> Optio
         return None;
     };
     let target = match stubs.get(*f) {
-        Some(Stub::Resolved(def)) => *def,
+        Some(Stub::Resolved { call, .. }) => *call,
         _ => *f,
     };
     cx.words.word(target).map(|w| (target, w))
@@ -1199,10 +1199,10 @@ fn analyze(
     }
     // What the function constants bound so far decide of the values a use needs as words, by
     // SCCP's fixpoint over the body as it stands (`sccp::facts`). A call whose callee they make one
-    // function's address is a direct call to it. A call whose callee is computed from an unsupplied
-    // constant is settled: it is left as it was before item 27, so SCCP refuses the constant where
-    // the call stands (or deletes the call), and no switch is built over every function its pointer
-    // might be. A value they settle is no word.
+    // function's address is a direct call to it. A call whose callee is undefined, computed from
+    // an unsupplied constant, is settled: a call of a refused declaration (SCCP deletes it, or the
+    // post-check refuses it), and no switch is built over every function its pointer might be. A
+    // value they settle is no word.
     let mut settled: BTreeSet<InstId> = BTreeSet::new();
     if !indirect.is_empty() || !demand.is_empty() {
         scoped(m, |m, scratch| {

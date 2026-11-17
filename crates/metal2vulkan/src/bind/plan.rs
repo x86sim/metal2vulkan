@@ -62,9 +62,10 @@ pub struct BindingPlan {
 
 impl BindingPlan {
     /// The value this plan's bound resources give `key` where a stage reads it as data
-    /// (`PushField::Specialized`), the value instantiation pushes; `None` for a key no stage reads
-    /// so. A pipeline's key no longer carries such a value, so a runtime reads a stage's notes that
-    /// test it through `StageModule::precision_notes_bound` with this.
+    /// (`PushField::Specialized`), the value instantiation pushes, or where a stage's specialized
+    /// note alone tests it (`SpecKey::BoundSamplerWord`, the bound sampler's word), which nothing
+    /// pushes; `None` for any other key. A pipeline's key carries no such value, so a runtime
+    /// reads a stage's notes that test it through `StageModule::precision_notes_bound` with this.
     pub fn specialized_value(&self, key: SpecKey) -> Option<u64> {
         let resources = match (&self.compute, &self.graphics) {
             (Some(c), _) => &c.resources,
@@ -152,6 +153,11 @@ pub struct ComputeTemplate {
     /// without a region is `BindError::MissingStageInRegion`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) stage_in_region: bool,
+    /// The kernel's `[[stage_in]]` fetches of a thread-position step, whose elements decide each
+    /// region's `SpecKey::StageInReach` (`dispatch::stage_in_reach`); empty where the kernel
+    /// declares no such key.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) stage_in_grid: Vec<crate::pipeline::stage_io::StageInFetch>,
 }
 
 /// The pipeline and device facts a render plan instantiates with: the buffer slots of both stages,
@@ -231,6 +237,15 @@ pub struct GraphicsTemplate {
     /// write.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) storage_kept: u32,
+    /// A band variant's (`GraphicsState::line_band`): the byte offset of its evaluation stage's
+    /// push range, where its draws push `BindState::line_band` (`PushField::LineBand`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) line_band: Option<u32>,
+    /// A fan-out probe variant's (`GraphicsState::region_fan_out`): the byte offset of its
+    /// geometry stage's push range, where its draws push the index of their flag
+    /// (`BindState::region_fan_out`, `PushField::RegionProbe`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) region_probe: Option<u32>,
 }
 
 /// What a mesh draw of a mesh render pipeline instantiates: the pipeline's specialization layout
@@ -256,6 +271,11 @@ pub(crate) struct MeshTemplate {
     /// stage's limits (`bind::mesh_arguments`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub folded: bool,
+    /// The object function runs a partial threadgroup as Metal does
+    /// (`RuntimeFact::PartialObjectThreadgroups`): a `drawMeshThreads` whose threads leave one
+    /// draws it, its region flagged `lower::dispatch::NONUNIFORM`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub partial_groups: bool,
     /// An emulated mesh function's records: each draw dispatches its mesh threadgroups and
     /// draws their primitives (`DrawCommands::mesh_dispatch`).
     #[cfg_attr(feature = "serde", serde(default))]
@@ -457,7 +477,8 @@ pub(crate) struct ResourceTemplate {
     pub texture_integer_channels: Vec<(SlotRef, u32)>,
     /// The value the binder pushes for each key a function reads as a push field
     /// (`PushField::Specialized`): its specialization constant's, from the bound resources
-    /// (`slots::bound_value`).
+    /// (`slots::bound_value`); and the value of each key a specialized note's test alone reads
+    /// (`SpecKey::BoundSamplerWord`), which nothing pushes (`slots::record_noted`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub specialized: Vec<(crate::pipeline::sym::SpecKey, u32)>,
     /// Each stage's sampler table.
@@ -558,6 +579,12 @@ pub(crate) struct LocalRules {
     pub stage_flags: vk::PipelineShaderStageCreateFlags,
     /// The emulated simdgroups' scratch (`RuntimeFact::SimdgroupEmulation`).
     pub scratch: Option<ScratchRule>,
+    /// A region of one row needs no whole subgroups (`RuntimeFact::RowLockstep`).
+    pub rows: bool,
+    /// The masks of axes whose unit-axes variant relieves the kernel's predicated walk
+    /// (`RuntimeFact::UnitAxes`'s `relief`: bit `m − 1` for mask `m`), 0 where none does or the
+    /// pipeline is that variant.
+    pub unit_relief: u8,
     /// The pipeline is a tile function (`RuntimeFact::TileFunction`): its threads take Metal's
     /// tile-dispatch layout, built for the threadgroups `dispatch::tile_layout_measured` takes,
     /// dispatched by threadgroups.
@@ -623,6 +650,15 @@ pub enum WriteSource {
     /// `GENERAL`. Only a slot under its planes-image variant binds it
     /// (`VariantKey::ycbcr_planes_sampled`, `BindingSource::YCbCrPlanes`).
     YCbCrPlanesImage { slot: SlotRef },
+    /// The rows of the 2D texture bound at `slot`, read and written in place
+    /// (`TextureFacts::texel_rows`, `bind::texel_rows`): a texel buffer in `format` over the
+    /// texture's bytes, from its first texel, or before it where the device's texel buffer offset
+    /// alignment asks, through its last row's last texel ([`TexelRows::elements`]); uniform where
+    /// the slot's function only reads the texture, storage where it writes it. Only a slot under
+    /// its rows variant binds it (`VariantKey::texel_rows`).
+    ///
+    /// [`TexelRows::elements`]: crate::bind::TexelRows::elements
+    TexelRows { slot: SlotRef, format: vk::Format },
     /// The texture buffer bound at `slot`, as a texel buffer view.
     TexelBuffer {
         slot: SlotRef,
@@ -668,6 +704,21 @@ pub enum WriteSource {
     /// The encoder's tessellation factor buffer (`BindState::tessellation_factors`), a
     /// read-only storage buffer of the control stage over the draw's `DescriptorRange`.
     TessellationFactors,
+    /// A rate-mapped pass's region table (`SyntheticBinding::RateMapRegions`) of a fan-out
+    /// variant's draw (`GraphicsState::region_fan_out`): a read-only storage buffer of
+    /// [`fan_out::TABLE_BYTES`](crate::bind::fan_out::TABLE_BYTES) bytes holding
+    /// [`fan_out::table`](crate::bind::fan_out::table) of the draw's one viewport over the
+    /// pass's regions, bound whole.
+    RateMapRegions,
+    /// A fan-out probe's flags (`SyntheticBinding::RateMapFlags`,
+    /// [`RegionFanOut::Probe`](crate::pipeline::RegionFanOut)): a storage buffer of `u32`s the
+    /// consumer keeps for its probes, `bind::fan_out::PROBE_DRAW_WORDS` zeros at each draw's index
+    /// (`BindState::region_fan_out`) before the draw, where the draw writes 1 into the first for
+    /// a triangle it cannot fan out, adds into the counts after it the copies it would emit of
+    /// the others, marks those after them for a triangle too wide for few copies, and for a
+    /// flagged triangle raises its first's and last's words, adds one into its flagged count and
+    /// sets its block's bit (`GraphicsState::region_fan_out`); bound whole.
+    RateMapFlags,
     /// The top-level structure of the acceleration structure bound at buffer slot `slot`
     /// (`setAccelerationStructure:atBufferIndex:`): the bound instance structure itself when
     /// `level` is `Instance`, and, when `level` is `Primitive`, the top-level structure of one
@@ -879,7 +930,9 @@ pub struct ImageViewDesc {
     /// `VariantKey::swizzled_storage`, which a Vulkan storage view could not swizzle, and
     /// for the sampled view of a swizzled extended-range texture at a slot of it, whose raw codes
     /// the view's swizzle would move before the function decodes them, and of a swizzled packed
-    /// normalized texture, whose codes the function converts by each channel's own scale. `false`
+    /// normalized texture, whose codes the function converts by each channel's own scale. Set too,
+    /// under no variant, for the storage view of a swizzled texture at a slot the function only
+    /// queries: it reads and writes no texel, and no swizzle reaches what a query answers. `false`
     /// for every other view, on which the consumer composes the texture's swizzle with
     /// `components` (and a swizzled storage view is the consumer's refusal).
     #[cfg_attr(feature = "serde", serde(default))]
@@ -1002,6 +1055,16 @@ pub enum PlanDiagnostic {
         element: u32,
         source: HeapSource,
     },
+    /// The texture bound at storage slot `slot` (a function's write, or read and write) is an
+    /// ASTC texture, whose blocks no storage view stores into: plain Metal completes the
+    /// function's writes, storing bytes no format defines into the blocks, and reads the blocks'
+    /// decode through a slot that also reads them. A neutral of the declared type is written
+    /// instead (its writes dropped, its reads zero, its size queries the neutral's), which leaves
+    /// the texture's blocks as they were; the runtime announces it (`astc-storage-neutral`).
+    AstcStorageNeutral {
+        slot: SlotRef,
+        substituted: NeutralResource,
+    },
 }
 
 /// How a draw or dispatch uses one resource: staging, writeback, and hazard facts. A plan's `uses`
@@ -1062,6 +1125,9 @@ pub enum AccessClass {
     /// (`WriteSource::YCbCrInPlace`) or the image of them the device's conversion samples
     /// (`WriteSource::YCbCrPlanesImage`): a read of the planes' bytes, not of the texture's image.
     YCbCrPlanes,
+    /// A 2D texture's rows, read or written in place through the slot's texel buffer
+    /// (`WriteSource::TexelRows`): a use of the rows' bytes, not of the texture's image.
+    TexelRows,
 }
 
 /// A byte range relative to the bound offset.

@@ -32,7 +32,7 @@ use super::formats::{FormatRow, Missing};
 use super::{Column, Facts, FormatCapability, Framework, Refusal, RowState};
 use crate::capabilities::Query;
 use crate::error::RuntimeGap;
-use crate::framebuffer_fetch::{renders_through_words, through_inputs, through_storage};
+use crate::framebuffer_fetch::{renders_through_words, through_storage};
 use crate::rate_mapped_pass::RegionRefusal;
 use metal2vulkan::device::{
     DriverWorkaround, OpBits, StageSimd, SubgroupOp, VkExtension, VkFeature, VkProperty,
@@ -213,11 +213,14 @@ pub enum FeatureRow {
     RenderDynamicLibraries,
     /// "Compute dynamic libraries".
     ComputeDynamicLibraries,
-    /// "Mesh shading".
+    /// "Mesh shading". A device that runs mesh functions natively (`VK_EXT_mesh_shader` and
+    /// `meshShader`) needs `taskShader`; one that runs them as compute work
+    /// (`DeviceProfile::emulates_mesh_shading`) needs nothing more.
     MeshShading,
-    /// "Indirect mesh draw arguments".
+    /// "Indirect mesh draw arguments": as [`MeshShading`](Self::MeshShading).
     IndirectMeshDrawArguments,
-    /// "Indirect command buffers containing mesh draws".
+    /// "Indirect command buffers containing mesh draws": as [`MeshShading`](Self::MeshShading),
+    /// after the indirect command buffers' own gap.
     IcbMeshDraws,
     /// "MetalFX spatial upscaling".
     MetalFxSpatialUpscaling,
@@ -973,7 +976,11 @@ impl FeatureRow {
                 f.properties.supports_sampler_reduction_mode(),
                 Query::SamplerReductionMode,
             )]),
-            // `SamplerDescriptor::lod_bias` (Apple10): not on the runtime's sampler descriptor.
+            // `SamplerDescriptor::lod_bias` (Apple10): on a device presenting an Apple silicon
+            // Mac the runtime samples it as an Apple9 GPU does, every level as with no bias (an
+            // Apple M3 Max on macOS 27.0.1); on one presenting a Mac with an Intel or AMD GPU,
+            // whose GPUs add it though the table lists it under Apple10 alone, it adds it as they
+            // do (`MacClass::IntelOrAmd`). Apple10's biased level is not built.
             F::SamplerLodBias => first([gap(G::Textures)]),
             // 16-bit coordinates in a texture read, a texture's swizzle, `Shared` and `Managed`
             // depth/stencil textures, and the clamp-to-edge read: the compile layer and the
@@ -1014,18 +1021,13 @@ impl FeatureRow {
             // and two-channel 8-bit sRGB formats on NVIDIA and ANV, and on NVIDIA the packed
             // 16-bit ones and `RGB9E5Float`) does not fetch an attachment
             // of it (`NotImplemented(Format)` per pipeline): the row's gap there. A device with
-            // neither form has no ordered fetch.
+            // neither form fetches through input attachments ordered between draws, the
+            // overlapping fragments of one draw unordered, logged
+            // (`PrecisionNote::UnorderedFetchWithinDraw`).
             F::ProgrammableBlending => first([
-                match (through_inputs(f.profile), through_storage(f.profile)) {
-                    (true, _) => None,
-                    (false, true) if renders_through_words(f.profile) => {
-                        not_implemented(Feature::FramebufferFetch)
-                    }
-                    (false, true) => None,
-                    (false, false) => Some(refused(Unsupported::needs(
-                        Feature::FramebufferFetch,
-                        Capability::Feature(VkFeature::RasterizationOrderColorAttachmentAccess),
-                    ))),
+                match through_storage(f.profile) && renders_through_words(f.profile) {
+                    true => not_implemented(Feature::FramebufferFetch),
+                    false => None,
                 },
             ]),
             // Separate depth and stencil textures of one pass: their resolve of a stencil drawn
@@ -1339,12 +1341,12 @@ impl FeatureRow {
             F::IcbRendering | F::IcbRenderMemoryBarriers | F::IcbRasterAndDepthStencilState => {
                 first([
                     addressed(f, Feature::GpuEncodedIndirectCommands),
-                    gap(G::IndirectRenderCommands),
+                    gap(G::IndirectRenderCommands(crate::IndirectRule::FamilyRow)),
                 ])
             }
             F::IcbTessellation => first([
                 addressed(f, Feature::GpuEncodedIndirectCommands),
-                gap(G::IndirectRenderCommands),
+                gap(G::IndirectRenderCommands(crate::IndirectRule::FamilyRow)),
             ]),
             // Imageblocks. A kernel's run (`set_imageblock_size`, step 9's first piece), and a tile
             // function's in a tile dispatch, whose refusals are the tile shaders row's. A fragment
@@ -1384,27 +1386,14 @@ impl FeatureRow {
             F::TileShaders | F::ImageblockSampleCoverageControl | F::NonsquareTileDispatch => {
                 first([not_implemented(Feature::TileShading)])
             }
-            // Mesh pipelines (`new_mesh_render_pipeline_state`, the encoder's mesh draws):
-            // `meshShader` and `taskShader`, then what the binder does not implement yet: a
-            // `drawMeshThreads` that leaves a partial object threadgroup. Indirect mesh draws
-            // read the counts an arguments pass writes (`render/mesh_arguments.rs`); an indirect
-            // command buffer's mesh draws are render commands first.
-            F::MeshShading | F::IndirectMeshDrawArguments => first([
-                needs_features(
-                    f,
-                    Feature::MeshShading,
-                    &[VkFeature::MeshShader, VkFeature::TaskShader],
-                ),
-                not_implemented(Feature::MeshShading),
-            ]),
+            // Mesh pipelines (`new_mesh_render_pipeline_state`, the encoder's mesh draws): the
+            // stages ([`mesh_stages`]). Indirect mesh draws read the counts an arguments pass
+            // writes (`render/mesh_arguments.rs`); an indirect command buffer's mesh draws are
+            // render commands first.
+            F::MeshShading | F::IndirectMeshDrawArguments => first([mesh_stages(f)]),
             F::IcbMeshDraws => first([
-                needs_features(
-                    f,
-                    Feature::MeshShading,
-                    &[VkFeature::MeshShader, VkFeature::TaskShader],
-                ),
-                gap(G::IndirectRenderCommands),
-                not_implemented(Feature::MeshShading),
+                mesh_stages(f),
+                gap(G::IndirectRenderCommands(crate::IndirectRule::FamilyRow)),
             ]),
             // Ray tracing: ray queries and acceleration structures on device addresses, then the
             // runtime's acceleration structures.
@@ -1550,6 +1539,20 @@ pub(super) fn needs_features(f: &Facts<'_>, feature: Feature, features: &[VkFeat
         .map(|&x| Capability::Feature(x))
         .collect();
     (!missing.is_empty()).then(|| refused(Unsupported::needs_any_of(feature, vec![missing])))
+}
+
+/// A mesh pipeline's object and mesh stages: `meshShader` and `taskShader` where the device runs
+/// them natively; nothing where it runs them as compute work
+/// (`DeviceProfile::emulates_mesh_shading`, which every device can).
+fn mesh_stages(f: &Facts<'_>) -> Check {
+    if f.profile.emulates_mesh_shading() {
+        return None;
+    }
+    needs_features(
+        f,
+        Feature::MeshShading,
+        &[VkFeature::MeshShader, VkFeature::TaskShader],
+    )
 }
 
 /// `feature`, refused where the device was created without every feature of each of

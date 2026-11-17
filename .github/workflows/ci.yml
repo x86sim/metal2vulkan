@@ -25,9 +25,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        # The dated nightly and components rust-toolchain.toml names.
+        run: rustup toolchain install
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -150,8 +149,8 @@ jobs:
           status=0
           for row in \
             metal2vulkan=0 \
-            metal2vulkan-air=3 \
-            metal2vulkan-runtime=70 \
+            metal2vulkan-air=0 \
+            metal2vulkan-runtime=0 \
             metal2vulkan-validation=0 \
             metal2vulkan-conformance=0 \
             metal2vulkan-devtools=0

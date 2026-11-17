@@ -88,12 +88,14 @@ fn independence_needed(widths: &BTreeSet<u8>) -> Independence {
     }
 }
 
+mod level_reads;
 mod own_pixel;
 mod snapshot;
 mod writes;
 
+pub use level_reads::level_reads;
 pub use own_pixel::own_pixel_textures;
-pub use snapshot::{snapshot_copies_alone, snapshot_textures};
+pub use snapshot::{snapshot_copies_alone, snapshot_textures, Judged};
 pub use writes::writes_memory;
 
 #[cfg(test)]
@@ -118,6 +120,9 @@ pub struct ModuleView<'a> {
     pub(crate) enabling: &'a std::collections::BTreeMap<GlobalId, Cap>,
     /// The user varyings decorated `PerPrimitiveEXT`.
     pub(crate) per_primitive: &'a BTreeSet<GlobalId>,
+    /// The `InterpolateAtOffset` offsets are Metal's moved by 7/16
+    /// (`ModuleBuilder::offsets_from_seven_sixteenths`).
+    pub(crate) offsets_from_seven_sixteenths: bool,
 }
 
 /// The enabling capabilities of builtin `b` in direction `dir` that lowering chooses among by
@@ -508,6 +513,11 @@ impl Deriver<'_> {
                     self.cap(Cap::Float64);
                     self.feat(VkFeature::ShaderFloat64);
                 }
+                Type::Float8 { .. } => {
+                    self.cap(Cap::Float8EXT);
+                    self.feat(VkFeature::ShaderFloat8);
+                    self.ext(SpirvExtension::ExtFloat8);
+                }
                 Type::RuntimeArray { stride: None, .. } => {
                     self.cap(Cap::RuntimeDescriptorArray);
                     self.feat(VkFeature::RuntimeDescriptorArray);
@@ -718,13 +728,19 @@ impl Deriver<'_> {
         ty: TypeId,
     ) -> BResult<()> {
         use crate::spv::BuiltIn as B;
-        // A mesh entry's outputs are arrayed per vertex or per primitive, and a geometry entry's
-        // per-vertex inputs per vertex: a builtin's own array, a clip or cull distance's, is that
-        // array's element.
+        // A mesh entry's outputs are arrayed per vertex or per primitive, and a geometry or
+        // evaluation entry's per-vertex inputs and a control entry's per-vertex inputs and
+        // outputs per vertex: a builtin's own array, a clip or cull distance's, is that array's
+        // element.
+        let arrays_vertices = matches!(
+            (self.model, dir),
+            (
+                ExecModel::Geometry | ExecModel::TessellationEvaluation,
+                IoDir::Input
+            ) | (ExecModel::TessellationControl, _)
+        );
         let arrayed = (self.model == ExecModel::MeshEXT && dir == IoDir::Output)
-            || (self.model == ExecModel::Geometry
-                && dir == IoDir::Input
-                && crate::spirv::builder::geometry_per_vertex(b));
+            || (arrays_vertices && crate::spirv::builder::geometry_per_vertex(b));
         let array_len = |d: &Self| -> BResult<Option<u32>> {
             let own = match (arrayed, d.ty(ty)?) {
                 (false, _) => ty,
@@ -761,9 +777,17 @@ impl Deriver<'_> {
         if b == B::DrawIndex && matches!(self.model, ExecModel::TaskEXT | ExecModel::MeshEXT) {
             return Ok(());
         }
-        // A geometry stage's point size, input or output, is `GeometryPointSize`'s.
-        if b == B::PointSize && self.model == ExecModel::Geometry {
-            self.cap(Cap::GeometryPointSize);
+        // A geometry stage's point size, input or output, is `GeometryPointSize`'s, and a
+        // tessellation stage's `TessellationPointSize`'s.
+        let point_size = match self.model {
+            ExecModel::Geometry => Some(Cap::GeometryPointSize),
+            ExecModel::TessellationControl | ExecModel::TessellationEvaluation => {
+                Some(Cap::TessellationPointSize)
+            }
+            _ => None,
+        };
+        if let Some(cap) = point_size.filter(|_| b == B::PointSize) {
+            self.cap(cap);
             self.feat(VkFeature::ShaderTessellationAndGeometryPointSize);
             return Ok(());
         }
@@ -988,7 +1012,12 @@ impl Deriver<'_> {
     // ---- Instructions ----
 
     fn subgroup(&mut self, op: SubgroupOp) {
-        self.prop(VkProperty::SubgroupStage(self.stage));
+        // A geometry module's are the geometry stage's, though its Metal stage is the vertex
+        // function's (`metal_stage`).
+        self.prop(match self.model {
+            ExecModel::Geometry => VkProperty::SubgroupGeometryStage,
+            _ => VkProperty::SubgroupStage(self.stage),
+        });
         self.prop(VkProperty::SubgroupOperation(SubgroupOp::Basic));
         self.prop(VkProperty::SubgroupOperation(op));
     }
@@ -1152,9 +1181,14 @@ impl Deriver<'_> {
                 self.cap(Cap::InterpolationFunction);
                 self.feat(VkFeature::SampleRateShading);
                 // An offset is read from the pixel center only where the device does as
-                // GLSL.std.450 states.
+                // GLSL.std.450 states; a module whose offsets are Metal's moved by 7/16 needs the
+                // device that reads them so.
                 if *op == GlslOp::InterpolateAtOffset {
-                    self.prop(VkProperty::InterpolateAtOffsetCentered);
+                    self.prop(if self.m.offsets_from_seven_sixteenths {
+                        VkProperty::InterpolateAtOffsetFromSevenSixteenths
+                    } else {
+                        VkProperty::InterpolateAtOffsetCentered
+                    });
                 }
             }
             Inst::RayQuery(RayQueryInst::Initialize { flags, .. }) => {
@@ -1529,6 +1563,7 @@ pub const ALL_SPIRV_EXTENSIONS: &[SpirvExtension] = &[
     SpirvExtension::ExtMeshShader,
     SpirvExtension::KhrQuadControl,
     SpirvExtension::KhrPostDepthCoverage,
+    SpirvExtension::ExtFloat8,
 ];
 
 /// The `OpExtension` name of a SPIR-V extension.
@@ -1561,5 +1596,6 @@ pub fn spirv_extension_name(e: SpirvExtension) -> &'static str {
         SpirvExtension::ExtMeshShader => "SPV_EXT_mesh_shader",
         SpirvExtension::KhrQuadControl => "SPV_KHR_quad_control",
         SpirvExtension::KhrPostDepthCoverage => "SPV_KHR_post_depth_coverage",
+        SpirvExtension::ExtFloat8 => "SPV_EXT_float8",
     }
 }

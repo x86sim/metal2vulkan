@@ -761,7 +761,7 @@ MTLBinaryArchive.h	MTLBinaryArchive	property	device		I	runtime	BinaryArchive::de
 MTLBinaryArchive.h	MTLBinaryArchive	method	addComputePipelineFunctionsWithDescriptor:error:		I	runtime	BinaryArchive::add_compute_pipeline_functions			
 MTLBinaryArchive.h	MTLBinaryArchive	method	addRenderPipelineFunctionsWithDescriptor:error:		I	runtime	BinaryArchive::add_render_pipeline_functions			
 MTLBinaryArchive.h	MTLBinaryArchive	method	addTileRenderPipelineFunctionsWithDescriptor:error:		I	runtime	BinaryArchive::add_tile_render_pipeline_functions			
-MTLBinaryArchive.h	MTLBinaryArchive	method	addMeshRenderPipelineFunctionsWithDescriptor:error:		M			a mesh pipeline's functions in a binary archive	S	archive
+MTLBinaryArchive.h	MTLBinaryArchive	method	addMeshRenderPipelineFunctionsWithDescriptor:error:		I	runtime	BinaryArchive::add_mesh_render_pipeline_functions			
 MTLBinaryArchive.h	MTLBinaryArchive	method	addLibraryWithDescriptor:error:		M			a library's functions in a binary archive (macOS 15)	S	archive
 MTLBinaryArchive.h	MTLBinaryArchive	method	serializeToURL:error:		I	runtime	BinaryArchive::serialize_to_url			
 MTLBinaryArchive.h	MTLBinaryArchive	method	addFunctionWithDescriptor:library:error:		M			one function in a binary archive	S	archive
@@ -853,7 +853,7 @@ MTLCommandBuffer.h	MTLCommandBuffer	property	device		I	runtime	CommandBuffer::de
 MTLCommandBuffer.h	MTLCommandBuffer	property	commandQueue		I	runtime	CommandBuffer::command_queue			
 MTLCommandBuffer.h	MTLCommandBuffer	property	retainedReferences		M			YES for every runtime command buffer (it retains what it uses)	S	cmdbuf
 MTLCommandBuffer.h	MTLCommandBuffer	property	errorOptions		M			encoder execution status (`MTLCommandBufferErrorOptionEncoderExecutionStatus`): which encoder faulted, in the error's `encoderInfos`	M	cmdbuf
-MTLCommandBuffer.h	MTLCommandBuffer	property	label		M			a label a program sets and reads back	S	labels
+MTLCommandBuffer.h	MTLCommandBuffer	property	label		I	runtime	CommandBuffer::label, CommandBuffer::set_label			
 MTLCommandBuffer.h	MTLCommandBuffer	property	kernelStartTime		I	runtime	CommandBuffer::kernel_start_time			
 MTLCommandBuffer.h	MTLCommandBuffer	property	kernelEndTime		I	runtime	CommandBuffer::kernel_end_time			
 MTLCommandBuffer.h	MTLCommandBuffer	property	logs		M			shader logging	M	logging
@@ -889,7 +889,7 @@ MTLCommandBuffer.h	MTLCommandBuffer	method	useResidencySet:		M			residency sets	
 MTLCommandBuffer.h	MTLCommandBuffer	method	useResidencySets:count:		M			residency sets	M	residency
 MTLCommandEncoder.h	MTLCommandEncoder	protocol	MTLCommandEncoder		I	runtime	ComputeCommandEncoder			
 MTLCommandEncoder.h	MTLCommandEncoder	property	device		M			every encoder's device	S	labels
-MTLCommandEncoder.h	MTLCommandEncoder	property	label		M			every encoder's label	S	labels
+MTLCommandEncoder.h	MTLCommandEncoder	property	label		I	runtime	BlitCommandEncoder::label, BlitCommandEncoder::set_label, ComputeCommandEncoder::label, ComputeCommandEncoder::set_label, RenderCommandEncoder::label, RenderCommandEncoder::set_label, ResourceStateCommandEncoder::label, ResourceStateCommandEncoder::set_label			
 MTLCommandEncoder.h	MTLCommandEncoder	method	endEncoding		I	runtime	ComputeCommandEncoder::end_encoding	each encoder's `end_encoding(self)`		
 MTLCommandEncoder.h	MTLCommandEncoder	method	barrierAfterQueueStages:beforeStages:		M			a barrier between this encoder's stages and earlier work of the queue (macOS 26)	M	barriers
 MTLCommandEncoder.h	MTLCommandEncoder	method	insertDebugSignpost:		M			debug signposts: no effect on results	S	labels
@@ -1064,10 +1064,10 @@ MTLDevice.h	MTLDevice	property	readWriteTextureSupport		I	runtime	DeviceProperti
 MTLDevice.h	MTLDevice	property	argumentBuffersSupport		I	runtime	DeviceProperties.argument_buffers_support			
 MTLDevice.h	MTLDevice	property	rasterOrderGroupsSupported		I	runtime	DeviceProperties::are_raster_order_groups_supported			
 MTLDevice.h	MTLDevice	property	supports32BitFloatFiltering		I	runtime	DeviceProperties.supports_32bit_float_filtering			
-MTLDevice.h	MTLDevice	property	supports32BitMSAA		M			capability query; the family rows hold the answer	S	queries
+MTLDevice.h	MTLDevice	property	supports32BitMSAA		I	runtime	Device::supports_32bit_msaa			
 MTLDevice.h	MTLDevice	property	supportsQueryTextureLOD		M			capability query; the family rows hold the answer (`FeatureRow::QueryTextureLod`)	S	queries
 MTLDevice.h	MTLDevice	property	supportsBCTextureCompression		M			capability query; the family rows hold the answer (`FeatureRow::BcPixelFormats`)	S	queries
-MTLDevice.h	MTLDevice	property	supportsPullModelInterpolation		M			capability query	S	queries
+MTLDevice.h	MTLDevice	property	supportsPullModelInterpolation		I	runtime	DeviceProperties::supports_pull_model_interpolation			
 MTLDevice.h	MTLDevice	property	barycentricCoordsSupported	yes	M			capability query (deprecated name of the next)	S	queries
 MTLDevice.h	MTLDevice	property	supportsShaderBarycentricCoordinates		M			capability query; the family rows hold the answer (`FeatureRow::BarycentricCoordinates`)	S	queries
 MTLDevice.h	MTLDevice	property	currentAllocatedSize		M			the runtime's sub-allocator knows the total	S	queries
@@ -1110,14 +1110,14 @@ MTLDevice.h	MTLDevice	method	newFence		I	runtime	Device::new_fence
 MTLDevice.h	MTLDevice	method	supportsFeatureSet:	yes	M			deprecated feature sets; would answer from the family rows	S	queries
 MTLDevice.h	MTLDevice	method	supportsFamily:		I	runtime	Device::supports_family			
 MTLDevice.h	MTLDevice	method	supportsTextureSampleCount:		I	runtime	DeviceProperties::supports_texture_sample_count			
-MTLDevice.h	MTLDevice	method	minimumLinearTextureAlignmentForPixelFormat:		I	runtime	DeviceProperties::minimum_linear_texture_alignment_for_pixel_format			
+MTLDevice.h	MTLDevice	method	minimumLinearTextureAlignmentForPixelFormat:		I	runtime	Device::minimum_linear_texture_alignment_for_pixel_format			
 MTLDevice.h	MTLDevice	method	minimumTextureBufferAlignmentForPixelFormat:		M			the alignment `Buffer::new_texture` checks a texture buffer's offset against	S	queries
 MTLDevice.h	MTLDevice	method	newRenderPipelineStateWithTileDescriptor:options:reflection:error:		I	runtime	Device::new_tile_render_pipeline_state_with_reflection			
 MTLDevice.h	MTLDevice	method	newRenderPipelineStateWithTileDescriptor:options:completionHandler:		I	runtime	Device::new_tile_render_pipeline_state_with_reflection	handler form		
 MTLDevice.h	MTLDevice	method	newRenderPipelineStateWithMeshDescriptor:options:reflection:error:		I	runtime	Device::new_mesh_render_pipeline_state_with_reflection			
 MTLDevice.h	MTLDevice	method	newRenderPipelineStateWithMeshDescriptor:options:completionHandler:		I	runtime	Device::new_mesh_render_pipeline_state_with_reflection	handler form		
 MTLDevice.h	MTLDevice	property	maxThreadgroupMemoryLength		I	runtime	DeviceProperties.max_threadgroup_memory_length			
-MTLDevice.h	MTLDevice	property	maxArgumentBufferSamplerCount		M			capability query (the runtime's live sampler limit)	S	queries
+MTLDevice.h	MTLDevice	property	maxArgumentBufferSamplerCount		I	runtime	DeviceProperties.max_argument_buffer_sampler_count			
 MTLDevice.h	MTLDevice	property	programmableSamplePositionsSupported		I	runtime	DeviceProperties::are_programmable_sample_positions_supported			
 MTLDevice.h	MTLDevice	method	getDefaultSamplePositions:count:		M			the standard positions a pass without `sample_positions` rasterizes at	S	queries
 MTLDevice.h	MTLDevice	method	newArgumentEncoderWithArguments:		I	runtime	Device::new_argument_encoder_with_arguments			
@@ -1730,7 +1730,7 @@ MTLRenderPass.h	MTLRenderPassDescriptor	method	setSamplePositions:count:		I	runt
 MTLRenderPass.h	MTLRenderPassDescriptor	method	getSamplePositions:count:		I	runtime	RenderPassDescriptor.sample_positions			
 MTLRenderPass.h	MTLRenderPassDescriptor	property	rasterizationRateMap		I	runtime	RenderPassDescriptor.rasterization_rate_map			
 MTLRenderPass.h	MTLRenderPassDescriptor	property	sampleBufferAttachments		M			counter sample buffers (`RuntimeGap::CounterSampleBuffers`)	M	counters
-MTLRenderPass.h	MTLRenderPassDescriptor	property	visibilityResultType		M			accumulating visibility results across passes (macOS 15)	S	visibility
+MTLRenderPass.h	MTLRenderPassDescriptor	property	visibilityResultType		I	runtime	RenderPassDescriptor.visibility_result_type			
 MTLRenderPass.h	MTLRenderPassDescriptor	property	supportColorAttachmentMapping		M			color attachment mapping (`RuntimeGap::ColorAttachmentMapping`)	M	colormap
 MTLRenderPass.h		function	MTLClearColorMake		I	runtime	ClearColor::new			
 MTLRenderPipeline.h	MTLRenderPipelineColorAttachmentDescriptor	class	MTLRenderPipelineColorAttachmentDescriptor		I	translator	ColorAttachmentDescriptor			
@@ -1809,11 +1809,11 @@ MTLRenderPipeline.h	MTLRenderPipelineState	property	threadgroupSizeMatchesTileSi
 MTLRenderPipeline.h	MTLRenderPipelineState	property	imageblockSampleLength		I	runtime	RenderPipelineState::imageblock_sample_length			
 MTLRenderPipeline.h	MTLRenderPipelineState	method	imageblockMemoryLengthForDimensions:		I	runtime	RenderPipelineState::imageblock_memory_length_for_dimensions			
 MTLRenderPipeline.h	MTLRenderPipelineState	property	supportIndirectCommandBuffers		I	runtime	RenderPipelineState::support_indirect_command_buffers			
-MTLRenderPipeline.h	MTLRenderPipelineState	property	maxTotalThreadsPerObjectThreadgroup		M			a mesh state's thread queries	S	queries
-MTLRenderPipeline.h	MTLRenderPipelineState	property	maxTotalThreadsPerMeshThreadgroup		M			a mesh state's thread queries	S	queries
-MTLRenderPipeline.h	MTLRenderPipelineState	property	objectThreadExecutionWidth		M			a mesh state's thread queries	S	queries
-MTLRenderPipeline.h	MTLRenderPipelineState	property	meshThreadExecutionWidth		M			a mesh state's thread queries	S	queries
-MTLRenderPipeline.h	MTLRenderPipelineState	property	maxTotalThreadgroupsPerMeshGrid		M			a mesh state's thread queries	S	queries
+MTLRenderPipeline.h	MTLRenderPipelineState	property	maxTotalThreadsPerObjectThreadgroup		I	runtime	RenderPipelineState::max_total_threads_per_object_threadgroup			
+MTLRenderPipeline.h	MTLRenderPipelineState	property	maxTotalThreadsPerMeshThreadgroup		I	runtime	RenderPipelineState::max_total_threads_per_mesh_threadgroup			
+MTLRenderPipeline.h	MTLRenderPipelineState	property	objectThreadExecutionWidth		I	runtime	RenderPipelineState::object_thread_execution_width			
+MTLRenderPipeline.h	MTLRenderPipelineState	property	meshThreadExecutionWidth		I	runtime	RenderPipelineState::mesh_thread_execution_width			
+MTLRenderPipeline.h	MTLRenderPipelineState	property	maxTotalThreadgroupsPerMeshGrid		I	runtime	RenderPipelineState::max_total_threadgroups_per_mesh_grid			
 MTLRenderPipeline.h	MTLRenderPipelineState	property	gpuResourceID		I	runtime	RenderPipelineState::gpu_resource_id			
 MTLRenderPipeline.h	MTLRenderPipelineState	method	functionHandleWithFunction:stage:		I	runtime	RenderPipelineState::function_handle			
 MTLRenderPipeline.h	MTLRenderPipelineState	method	newVisibleFunctionTableWithDescriptor:stage:		I	runtime	RenderPipelineState::new_visible_function_table			
@@ -1821,8 +1821,8 @@ MTLRenderPipeline.h	MTLRenderPipelineState	method	newIntersectionFunctionTableWi
 MTLRenderPipeline.h	MTLRenderPipelineState	method	newRenderPipelineStateWithAdditionalBinaryFunctions:error:		I	runtime	RenderPipelineState::new_render_pipeline_state_with_additional_binary_functions			
 MTLRenderPipeline.h	MTLRenderPipelineState	property	shaderValidation		M			shader validation (`RuntimeGap::ShaderValidation`, not scheduled)	L	shadervalidation
 MTLRenderPipeline.h	MTLRenderPipelineState	property	requiredThreadsPerTileThreadgroup		I	runtime	RenderPipelineState::required_threads_per_tile_threadgroup			
-MTLRenderPipeline.h	MTLRenderPipelineState	property	requiredThreadsPerObjectThreadgroup		M			a mesh state's thread queries	S	queries
-MTLRenderPipeline.h	MTLRenderPipelineState	property	requiredThreadsPerMeshThreadgroup		M			a mesh state's thread queries	S	queries
+MTLRenderPipeline.h	MTLRenderPipelineState	property	requiredThreadsPerObjectThreadgroup		I	runtime	RenderPipelineState::required_threads_per_object_threadgroup			
+MTLRenderPipeline.h	MTLRenderPipelineState	property	requiredThreadsPerMeshThreadgroup		I	runtime	RenderPipelineState::required_threads_per_mesh_threadgroup			
 MTLRenderPipeline.h	MTLRenderPipelineColorAttachmentDescriptorArray	class	MTLRenderPipelineColorAttachmentDescriptorArray		I	translator	RenderPipelineDescriptor.color_attachments	an array		
 MTLRenderPipeline.h	MTLRenderPipelineColorAttachmentDescriptorArray	method	objectAtIndexedSubscript:		I	translator	RenderPipelineDescriptor.color_attachments			
 MTLRenderPipeline.h	MTLRenderPipelineColorAttachmentDescriptorArray	method	setObject:atIndexedSubscript:		I	translator	RenderPipelineDescriptor.color_attachments			
@@ -1852,12 +1852,12 @@ MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	label		I	runtime	Pi
 MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	objectFunction		I	translator	MeshPipelineDescriptor.object			
 MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	meshFunction		I	translator	MeshPipelineDescriptor.mesh			
 MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	fragmentFunction		I	translator	MeshPipelineDescriptor.fragment			
-MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	maxTotalThreadsPerObjectThreadgroup		M			a mesh pipeline's thread limits: the translator's `MeshPipelineDescriptor` has no field	S	mesh-descriptor
-MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	maxTotalThreadsPerMeshThreadgroup		M			a mesh pipeline's thread limits: the translator's `MeshPipelineDescriptor` has no field	S	mesh-descriptor
-MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	objectThreadgroupSizeIsMultipleOfThreadExecutionWidth		M			a compile hint the translator's `MeshPipelineDescriptor` has no field for	S	mesh-descriptor
-MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	meshThreadgroupSizeIsMultipleOfThreadExecutionWidth		M			a compile hint the translator's `MeshPipelineDescriptor` has no field for	S	mesh-descriptor
-MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	payloadMemoryLength		M			the object payload's length: the translator's `MeshPipelineDescriptor` has no field	S	mesh-descriptor
-MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	maxTotalThreadgroupsPerMeshGrid		M			the mesh grid's limit: the translator's `MeshPipelineDescriptor` has no field	S	mesh-descriptor
+MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	maxTotalThreadsPerObjectThreadgroup		I	translator	MeshPipelineDescriptor.max_total_threads_per_object_threadgroup			
+MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	maxTotalThreadsPerMeshThreadgroup		I	translator	MeshPipelineDescriptor.max_total_threads_per_mesh_threadgroup			
+MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	objectThreadgroupSizeIsMultipleOfThreadExecutionWidth		I	translator	MeshPipelineDescriptor.object_threadgroup_size_is_multiple_of_thread_execution_width			
+MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	meshThreadgroupSizeIsMultipleOfThreadExecutionWidth		I	translator	MeshPipelineDescriptor.mesh_threadgroup_size_is_multiple_of_thread_execution_width			
+MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	payloadMemoryLength		I	translator	MeshPipelineDescriptor.payload_memory_length			
+MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	maxTotalThreadgroupsPerMeshGrid		I	translator	MeshPipelineDescriptor.max_total_threadgroups_per_mesh_grid			
 MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	objectBuffers		M			buffer mutability per stage: the translator's `MeshPipelineDescriptor` has no field (render and compute descriptors have `buffers`)	S	mesh-descriptor
 MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	meshBuffers		M			buffer mutability per stage: the translator's `MeshPipelineDescriptor` has no field	S	mesh-descriptor
 MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	fragmentBuffers		M			buffer mutability per stage: the translator's `MeshPipelineDescriptor` has no field	S	mesh-descriptor
@@ -1865,7 +1865,7 @@ MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	rasterSampleCount		
 MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	alphaToCoverageEnabled		I	translator	MeshPipelineDescriptor.alpha_to_coverage			
 MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	alphaToOneEnabled		I	translator	MeshPipelineDescriptor.alpha_to_one			
 MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	rasterizationEnabled		I	translator	MeshPipelineDescriptor.rasterization_enabled			
-MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	maxVertexAmplificationCount		M			vertex amplification of mesh pipelines: the translator's `MeshPipelineDescriptor` has no field	S	mesh-descriptor
+MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	maxVertexAmplificationCount		I	translator	MeshPipelineDescriptor.max_vertex_amplification_count	a count above 1 is refused: a mesh pipeline's vertex amplification is not built		
 MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	colorAttachments		I	translator	MeshPipelineDescriptor.color_attachments			
 MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	depthAttachmentPixelFormat		I	translator	MeshPipelineDescriptor.depth_format			
 MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	stencilAttachmentPixelFormat		I	translator	MeshPipelineDescriptor.stencil_format			
@@ -1876,8 +1876,8 @@ MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	meshLinkedFunctions
 MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	fragmentLinkedFunctions		I	translator	FunctionDescriptor.linked	the fragment stage's `StageSource::Function`		
 MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	method	reset		I	translator	MeshPipelineDescriptor::new	a plain value: assign a new one		
 MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	shaderValidation		M			shader validation (`RuntimeGap::ShaderValidation`, not scheduled)	L	shadervalidation
-MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	requiredThreadsPerObjectThreadgroup		M			required threadgroup sizes of a mesh pipeline: the translator's `MeshPipelineDescriptor` has no field	S	mesh-descriptor
-MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	requiredThreadsPerMeshThreadgroup		M			required threadgroup sizes of a mesh pipeline: the translator's `MeshPipelineDescriptor` has no field	S	mesh-descriptor
+MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	requiredThreadsPerObjectThreadgroup		I	translator	MeshPipelineDescriptor.required_threads_per_object_threadgroup			
+MTLRenderPipeline.h	MTLMeshRenderPipelineDescriptor	property	requiredThreadsPerMeshThreadgroup		I	translator	MeshPipelineDescriptor.required_threads_per_mesh_threadgroup			
 MTLResidencySet.h	MTLResidencySetDescriptor	class	MTLResidencySetDescriptor		M			residency sets (`RuntimeGap::ResidencySets`)	M	residency
 MTLResidencySet.h	MTLResidencySetDescriptor	property	label		M			residency sets (`RuntimeGap::ResidencySets`)	M	residency
 MTLResidencySet.h	MTLResidencySetDescriptor	property	initialCapacity		M			residency sets (`RuntimeGap::ResidencySets`)	M	residency
@@ -1950,7 +1950,7 @@ MTLSampler.h	MTLSamplerDescriptor	property	normalizedCoordinates		I	translator	S
 MTLSampler.h	MTLSamplerDescriptor	property	lodMinClamp		I	translator	SamplerDescriptor.lod_min_clamp			
 MTLSampler.h	MTLSamplerDescriptor	property	lodMaxClamp		I	translator	SamplerDescriptor.lod_max_clamp			
 MTLSampler.h	MTLSamplerDescriptor	property	lodAverage		I	translator	SamplerDescriptor.lod_average			
-MTLSampler.h	MTLSamplerDescriptor	property	lodBias		M			a sampler's LOD bias (a family row's gap; Metal's rounding unmeasured)	M	lod-bias
+MTLSampler.h	MTLSamplerDescriptor	property	lodBias		I	translator	SamplerDescriptor.lod_bias			
 MTLSampler.h	MTLSamplerDescriptor	property	compareFunction		I	translator	SamplerDescriptor.compare_function			
 MTLSampler.h	MTLSamplerDescriptor	property	supportArgumentBuffers		I	runtime	SamplerStateOptions.support_argument_buffers			
 MTLSampler.h	MTLSamplerDescriptor	property	label		M			labels of samplers, depth/stencil states, functions, libraries and texture handles	S	labels

@@ -11,8 +11,8 @@
 blessing it asserts. Every verb takes `--root DIR` (the repository, the default being this
 script's own two directories up) and `--table FILE`.
 
-It reads source text only: no build, no toolchain, no rustdoc, whose JSON surface is nightly-only
-while this fleet is pinned to stable. So it is the same five seconds on any checkout, under any
+It reads source text only: no build, no toolchain, no rustdoc, whose JSON surface is unstable and
+changes between nightlies. So it is the same five seconds on any checkout, under any
 feature set: a `#[cfg]`-gated item is read as present, with its gate kept in the signature.
 
 The surface is the set of names a consumer may write -- the module roots the crates export, their
@@ -132,6 +132,7 @@ VIS = re.compile(r"^pub(\s*\([^)]*\))?\s+")
 KEEP_ATTRS = re.compile(r"^#\[(cfg|cfg_attr|non_exhaustive|derive|repr|must_use|deprecated|"
                         r"track_caller|doc\(hidden)")
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+BARE_ARG = re.compile(r"[A-Za-z_][A-Za-z0-9_]*,")
 MACROCALL = re.compile(r"^([a-z_][a-z0-9_]*)\s*!\s*[{(\[]")
 MODIFIERS = ("default ", "unsafe ", "async ", 'extern "C" ', 'extern "system" ', "const ")
 KINDS = ("fn ", "struct ", "enum ", "trait ", "type ", "const ", "static ", "mod ", "union ")
@@ -756,6 +757,11 @@ def collect(crate, names, real, home, extra=()):
                         if nm is None:
                             continue
                         add("macro-decl", key(nm), it.name + "! " + nm)
+                        # A member is a line that starts with an identifier. Where `cargo fmt`
+                        # wrapped a call one argument per line, a member line that is only its
+                        # identifier and a comma takes the literal on the next line with it:
+                        # `TypeId,` then `"t"` reads as `TypeId, "t"`, as the unwrapped call did.
+                        member = None
                         at = it.body[0]
                         while at < it.body[1]:
                             eol = code.find("\n", at)
@@ -767,8 +773,15 @@ def collect(crate, names, real, home, extra=()):
                                 line = norm(raw)
                                 mo = IDENT.match(line)
                                 if mo and line not in ("}", "{"):
-                                    add("macro-member", key(nm, "::" + mo.group(0)), line)
+                                    if member:
+                                        add("macro-member", *member)
+                                    member = [key(nm, "::" + mo.group(0)), line]
+                            elif (member and BARE_ARG.fullmatch(member[1]) and not bare.strip()
+                                  and raw.lstrip().startswith(('"', "'", 'r"', "r#", 'b"'))):
+                                member[1] += " " + norm(raw)
                             at = eol + 1
+                        if member:
+                            add("macro-member", *member)
     return recs, defs
 
 

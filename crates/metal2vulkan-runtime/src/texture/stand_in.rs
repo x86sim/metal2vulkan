@@ -1,6 +1,7 @@
 //! The images a texture over detached bytes presents: a stand-in of its image's plan, zero and
 //! never written, which its views, its heap-set elements and its attachments name while its bytes
-//! are detached (`detach.rs`).
+//! are detached (`detach.rs`). A tiled texture of more than one level keeps its own image instead,
+//! a copy of the bytes taken at use (`shadow.rs`).
 //!
 //! - **What Metal answers** (an M4 under macOS 27.0.1): a texture over detached
 //!   bytes keeps its descriptor's metadata (every size and level query answers it, its views'

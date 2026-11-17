@@ -15,8 +15,9 @@
 //!   byte-exact.
 //! - Out-of-bounds threadgroup indices are contained; with containment off no check is emitted.
 //! - Typed allocas and closed constant globals are `Private` arrays indexed by access chains; their
-//!   dynamic indices are clamped under `GuestIsolation::On` (an out-of-range load is 0, an
-//!   out-of-range store is dropped) and unclamped without it.
+//!   dynamic indices are contained under `GuestIsolation::On` (a typed alloca's out-of-range load
+//!   is 0 and its out-of-range store is dropped; a constant global's out-of-range load reads the
+//!   level's last element) and unclamped without it.
 //!
 //! `llvm-as` assembles the kernels; without it the tests skip visibly.
 
@@ -695,10 +696,9 @@ fn typed_alloca_body() -> String {
     s
 }
 
-/// A typed alloca is a `Private` array indexed by access chains; its dynamic indices are clamped
-/// under isolation (an out-of-range index reaches the level's last element, on a load and a
-/// store) and exact in range, including a 12-byte (non-power-of-two) stride. Without isolation no
-/// clamp is emitted.
+/// A typed alloca is a `Private` array indexed by access chains; its dynamic indices are checked
+/// under isolation (an out-of-range load is 0, an out-of-range store is dropped) and exact in
+/// range, including a 12-byte (non-power-of-two) stride. Without isolation no check is emitted.
 #[test]
 fn typed_alloca_indices_are_clamped_under_isolation() {
     let Some(bc) = assemble("typed", &two_word_kernel("typed", "", &typed_alloca_body())) else {
@@ -723,10 +723,12 @@ fn typed_alloca_indices_are_clamped_under_isolation() {
         let want: Vec<u32> = (0..32u32)
             .flat_map(|t| {
                 let mut a: Vec<u32> = (10..18).collect();
-                a[(t + 4).min(7) as usize] = 999;
+                if t + 4 < 8 {
+                    a[(t + 4) as usize] = 999;
+                }
                 a[(t & 7) as usize] = t * 100;
                 let v0 = a[((t & 7) ^ 5) as usize];
-                let x = a[t.min(7) as usize];
+                let x = if t < 8 { a[t as usize] } else { 0 };
                 [v0, x + 3 * (t & 3) + 2]
             })
             .collect();
@@ -820,9 +822,9 @@ fn nested_levels_body() -> String {
 
 /// An alloca indexed dynamically at several nested array levels (non-power-of-two strides, a struct
 /// member between the levels, vector leaves) is typed: an access chain whose indices are the
-/// accesses' own GEP indices, exact in range, and clamped at every level under isolation (an
-/// out-of-range index reaches its level's last element, on a load and a store). Without isolation
-/// no clamp is emitted.
+/// accesses' own GEP indices, exact in range, and checked at every level under isolation (an
+/// out-of-range load is 0, an out-of-range store is dropped). Without isolation no check is
+/// emitted.
 #[test]
 fn typed_allocas_index_nested_levels_dynamically() {
     let Some(bc) = assemble(
@@ -849,9 +851,11 @@ fn typed_allocas_index_nested_levels_dynamically() {
                     .map(|i| (0..5).map(|j| 100 + 5 * i + j).collect())
                     .collect();
                 c[(t % 3) as usize][((7 * t) % 5) as usize] = 900 + t;
-                c[t.min(2) as usize][0] = 777;
+                if t < 3 {
+                    c[t as usize][0] = 777;
+                }
                 let x = c[((t + 1) % 3) as usize][((3 * t) % 5) as usize];
-                let z = c[t.min(2) as usize][t.min(4) as usize];
+                let z = if t < 3 { c[t as usize][t as usize] } else { 0 };
                 let (di, dj, ej) = (t & 1, t % 3, (t >> 1) & 1);
                 [x + z, 60 + 3 * di + dj + 10 + 2 * di + ej]
             })
@@ -1453,10 +1457,12 @@ fn the_recorded_shapes_are_released_when_selection_ends() {
 
 /// A kernel whose alloca `a` is a struct DAG `depth` levels deep: `%e1 = { i32, i32 }` and
 /// `%e{k} = { %e{k-1}, %e{k-1} }`, `2^depth` leaves through `depth + 1` types. It stores `t` at
-/// byte 0 and 7 at byte 4, then `v0` reads byte 0 and `v1` byte 4. With `constant`, `v0` also
-/// adds word 0 of `@g`, a closed constant of the same type, all zero. Every access is a plain
-/// `i32` load or store at a constant offset, so `a` and `@g` are typed objects within the
-/// function's room of unshared type size.
+/// byte 0 (twice, so no one store decides the read and `a` stays: `canon::forward`) and 7 at byte
+/// 4, then `v0` reads byte 0 and `v1` byte 4. With `constant`, `v0` also
+/// adds word 1 of `@g`, a closed constant of the same type, all zero, read at its byte address
+/// (SCCP reads an integer field at a typed address as its constant, which would leave no load of
+/// `@g` to plan). Every access is a plain `i32` load or store at a constant offset, so `a` and
+/// `@g` are typed objects within the function's room of unshared type size.
 fn struct_dag_kernel(depth: u32, constant: bool) -> String {
     let mut types = String::from("%e1 = type { i32, i32 }\n");
     for k in 2..=depth {
@@ -1465,12 +1471,13 @@ fn struct_dag_kernel(depth: u32, constant: bool) -> String {
     let read = if constant {
         types +=
             &format!("@g = internal addrspace(2) constant %e{depth} zeroinitializer, align 4\n");
-        "  %x = load i32, ptr %a, align 4\n  %y = load i32, ptr addrspace(2) @g, align 4\n  %v0 = add i32 %x, %y"
+        "  %x = load i32, ptr %a, align 4\n  %gq = getelementptr inbounds i8, ptr addrspace(2) @g, i32 4\n  %y = load i32, ptr addrspace(2) %gq, align 4\n  %v0 = add i32 %x, %y"
     } else {
         "  %v0 = load i32, ptr %a, align 4"
     };
     let body = format!(
         r#"  %a = alloca %e{depth}, align 4
+  store i32 %t, ptr %a, align 4
   store i32 %t, ptr %a, align 4
   %q = getelementptr inbounds i8, ptr %a, i32 4
   store i32 7, ptr %q, align 4
@@ -1599,9 +1606,11 @@ fn a_struct_dag_keeps_its_values_typed_or_untyped() {
 /// DAG of `struct_dag_kernel`. Its unshared type size is the DAG's 32,752 (`i32` and `%e1` to
 /// `%e13`) and `%big`'s `32,767 + extra`: with 17 extra members exactly `alloca::MAX_UNSHARED`
 /// (65,536), with 18 one more. With `constant`, `%big` is the type of `@g`, a closed constant whose
-/// DAG halves are zero and whose extra member `i` is `i + 1`, and `v0 = t + @g.2`, `v1 = @g.18`;
-/// otherwise of the alloca `a`, which stores `t` at byte 0 and 7 in member 2 (byte 65,536) and
-/// reads them back as `v0` and `v1`.
+/// DAG halves are zero and whose extra member `i` is `i + 1`, and `v0 = t + @g.2`, `v1 = @g.18`,
+/// each read at its byte address (65,536 and 65,600: SCCP reads an integer field at a typed
+/// address as its constant, which would leave no load of `@g` to plan); otherwise of the alloca
+/// `a`, which stores `t` at byte 0 and 7 in member 2 (byte 65,536) and reads them back as `v0` and
+/// `v1`.
 fn room_kernel(extra: u32, constant: bool) -> String {
     let mut types = String::from("%e1 = type { i32, i32 }\n");
     for k in 2..=13 {
@@ -1616,10 +1625,10 @@ fn room_kernel(extra: u32, constant: bool) -> String {
         types += &format!(
             "@g = internal addrspace(2) constant %big {{ %e13 zeroinitializer, %e13 zeroinitializer{ints} }}, align 4\n"
         );
-        r#"  %p2 = getelementptr inbounds %big, ptr addrspace(2) @g, i32 0, i32 2
+        r#"  %p2 = getelementptr inbounds i8, ptr addrspace(2) @g, i32 65536
   %g2 = load i32, ptr addrspace(2) %p2, align 4
   %v0 = add i32 %t, %g2
-  %q = getelementptr inbounds %big, ptr addrspace(2) @g, i32 0, i32 18
+  %q = getelementptr inbounds i8, ptr addrspace(2) @g, i32 65600
   %v1 = load i32, ptr addrspace(2) %q, align 4"#
             .to_string()
     } else {

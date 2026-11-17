@@ -35,7 +35,7 @@
 
 use super::degrade_notices::counts;
 use super::extended_range_blends::STORED_CODES;
-use super::framebuffer_fetch::through_inputs;
+use super::framebuffer_fetch::{fetches, through_inputs};
 use super::resolves::{lane, quiet, Lane};
 use crate::air_library::AirLibrary;
 use crate::runtime_lane::{buffer_with, read_buffer};
@@ -49,7 +49,6 @@ use metal2vulkan_runtime::{
     BlitOption, ClearColor, Library, LoadAction, PipelineOptions, RenderPassDescriptor,
     RenderPipelineState, StoreAction,
 };
-use std::path::Path;
 
 /// The pass's color format.
 const COLOR: PixelFormat = PixelFormat::RGB10A82PXR10;
@@ -67,7 +66,7 @@ const SECOND: [u32; 3] = [894, 639, 384];
 
 /// `smw_writers`' library on `lane`'s device.
 fn library(lane: &Lane) -> Library {
-    let ll = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/public/engine/smw_writers.ll");
+    let ll = metal2vulkan_devtools::engine_dir().join("smw_writers.ll");
     lane.device
         .new_library_with_air(&llvm_assemble(&ll).unwrap())
         .unwrap()
@@ -127,6 +126,9 @@ fn depth(compare: CompareFunction, write: bool) -> DepthStencilDescriptor {
 #[test]
 fn a_moved_writer_keeps_what_metals_later_tests_drop() {
     let (messages, cache, lane) = lane();
+    if !fetches(&lane.device) {
+        return;
+    }
     let device = lane.device.name();
     let library = library(&lane);
     let first = pipeline(&lane, &library, "smw_plain", (true, false));

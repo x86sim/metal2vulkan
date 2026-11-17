@@ -12,6 +12,10 @@
 //!   map as a `u32` count and its entries in order. A function is its library's place in the
 //!   record's list and its index in the library's table. Bytes of an unknown enum value, a
 //!   `bool` other than 0 or 1, a count past the bytes left, or bytes left over are no record.
+//! - **A compute record's dispatches.** After a compute descriptor's fields, the dispatches of it
+//!   the record names ([`RecordedDispatch`]: none in a creation's own record, one in a dispatch's,
+//!   `warm/record.rs`), at most [`MOST_DISPATCHES`], each with at most 31 threadgroup lengths: more
+//!   is no record.
 //! - **What cannot be written.** A stage the compile layer already compiled
 //!   (`StageSource::Compiled`), and a value of a non-exhaustive enum this codec does not know,
 //!   make no record ([`Unwritable`]): the creation is made, unrecorded, and counted.
@@ -42,7 +46,15 @@ use std::collections::{BTreeMap, HashMap};
 pub(crate) const MAGIC: &[u8; 8] = b"M2VPREC\0";
 
 /// The record format: bumped whenever a record's bytes change meaning (the module docs).
-pub(crate) const RECORD_FORMAT: u32 = 1;
+pub(crate) const RECORD_FORMAT: u32 = 7;
+
+/// The most dispatches a compute record holds ([`RecordedDispatch`]): bytes that hold more are no
+/// record.
+pub(crate) const MOST_DISPATCHES: usize = 16;
+
+/// The most threadgroup memory lengths a recorded dispatch holds: one per index Metal's
+/// `setThreadgroupMemoryLength:atIndex:` takes (31).
+const MOST_LENGTHS: usize = 31;
 
 /// The length of a record's header (magic and format) and of its checksum.
 const HEADER: usize = 8 + 4;
@@ -50,10 +62,11 @@ const CHECKSUM: usize = 32;
 
 /// What a record describes: one pipeline state creation's descriptor, and how many of its
 /// stages' last binary functions were added without the stage's support flag
-/// (`new_*_pipeline_state_with_additional_binary_functions`).
+/// (`new_*_pipeline_state_with_additional_binary_functions`); for a compute state, the
+/// dispatches of it whose pipelines its program made (none in the creation's own record).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Pipeline {
-    Compute(ComputePipelineDescriptor, usize),
+    Compute(ComputePipelineDescriptor, usize, Vec<RecordedDispatch>),
     /// The vertex stage's count, then the fragment stage's.
     Render(RenderPipelineDescriptor, [usize; 2]),
     Mesh(MeshPipelineDescriptor),
@@ -72,6 +85,19 @@ impl Pipeline {
     }
 }
 
+/// A dispatch of a compute state, as a record keeps it (`warm/record.rs`): Metal's call, as much
+/// of it as decides the `VkPipeline`s of its regions -- `dispatchThreadgroups:` of one threadgroup
+/// of `threads_per_group`, or, where `threads` is set, `dispatchThreads:` of that many threads
+/// (on each axis one whole threadgroup and the grid's ragged edge, if any) -- and the encoder's
+/// `setThreadgroupMemoryLength:atIndex:` lengths, by index. Inputs only: the regions, their
+/// specialization and their keys are this build's own, made again from it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct RecordedDispatch {
+    pub(crate) threads_per_group: [u32; 3],
+    pub(crate) threads: Option<[u32; 3]>,
+    pub(crate) threadgroup_lengths: Vec<(u32, u32)>,
+}
+
 /// A creation this codec cannot write (the module docs).
 #[derive(Debug)]
 pub(crate) struct Unwritable;
@@ -85,9 +111,10 @@ pub(crate) fn encode(pipeline: &Pipeline) -> Result<(Vec<u8>, Vec<Library>), Unw
     let mut w = Writer::default();
     w.u8(pipeline.kind());
     match pipeline {
-        Pipeline::Compute(d, added) => {
+        Pipeline::Compute(d, added, dispatches) => {
             w.compute(d)?;
             w.usize(*added);
+            w.dispatches(dispatches)?;
         }
         Pipeline::Render(d, [vertex, fragment]) => {
             w.render(d)?;
@@ -147,7 +174,7 @@ pub(crate) fn decode(bytes: &[u8], libraries: &[Library]) -> Result<Pipeline, Un
         return Err(Unreadable);
     }
     let pipeline = match r.u8()? {
-        1 => Pipeline::Compute(r.compute()?, r.usize()?),
+        1 => Pipeline::Compute(r.compute()?, r.usize()?, r.dispatches()?),
         2 => Pipeline::Render(r.render()?, [r.usize()?, r.usize()?]),
         3 => Pipeline::Mesh(r.mesh()?),
         4 => Pipeline::Tile(r.tile()?, r.usize()?),
@@ -219,6 +246,30 @@ impl Writer {
         }
     }
 
+    /// A compute record's dispatches: their count, then each one's threadgroup, its grid where
+    /// it is a `dispatchThreads:` and its threadgroup lengths. More than the bounds is unwritable.
+    fn dispatches(&mut self, v: &[RecordedDispatch]) -> Result<(), Unwritable> {
+        if v.len() > MOST_DISPATCHES {
+            return Err(Unwritable);
+        }
+        self.u32(count(v.len())?);
+        for dispatch in v {
+            for n in dispatch.threads_per_group {
+                self.u32(n);
+            }
+            self.threads(dispatch.threads);
+            if dispatch.threadgroup_lengths.len() > MOST_LENGTHS {
+                return Err(Unwritable);
+            }
+            self.u32(count(dispatch.threadgroup_lengths.len())?);
+            for (index, length) in &dispatch.threadgroup_lengths {
+                self.u32(*index);
+                self.u32(*length);
+            }
+        }
+        Ok(())
+    }
+
     fn pixel_format(&mut self, v: Option<metal::PixelFormat>) {
         self.opt_u32(v.map(metal::PixelFormat::as_raw));
     }
@@ -283,6 +334,11 @@ impl Writer {
         for f in v {
             self.function(&f.function)?;
             self.constants(&f.constants)?;
+            self.bool(f.specialized_name.is_some());
+            if let Some(name) = &f.specialized_name {
+                self.bytes(name.as_bytes())?;
+            }
+            self.bool(f.specialized);
             self.bool(f.precompiled);
         }
         Ok(())
@@ -321,6 +377,7 @@ impl Writer {
         };
         self.function(&f.function)?;
         self.constants(&f.constants)?;
+        self.bool(f.specialized);
         self.linked(&f.linked)?;
         self.dynamic(&f.libraries)
     }
@@ -428,6 +485,7 @@ impl Writer {
         self.bool(p.needs_custom_border_color_samplers);
         self.u64(p.vertex_amplification_mode);
         self.u32(p.explicit_visibility_group_id);
+        self.bool(p.open_gl_mode_enabled);
     }
 
     fn compute(&mut self, d: &ComputePipelineDescriptor) -> Result<(), Unwritable> {
@@ -441,6 +499,7 @@ impl Writer {
         self.bool(d.support_adding_binary_functions);
         self.mutability(&d.buffers)?;
         self.bool(d.needs_custom_border_color_samplers);
+        self.bool(d.open_cl_mode_enabled);
         Ok(())
     }
 
@@ -482,7 +541,17 @@ impl Writer {
         self.bool(d.alpha_to_coverage);
         self.bool(d.alpha_to_one);
         self.bool(d.support_indirect_command_buffers);
-        self.rounding(d.texture_write_rounding_mode)
+        self.rounding(d.texture_write_rounding_mode)?;
+        self.opt_u32(d.max_total_threads_per_object_threadgroup);
+        self.opt_u32(d.max_total_threads_per_mesh_threadgroup);
+        self.opt_u32(d.max_total_threadgroups_per_mesh_grid);
+        self.bool(d.object_threadgroup_size_is_multiple_of_thread_execution_width);
+        self.bool(d.mesh_threadgroup_size_is_multiple_of_thread_execution_width);
+        self.opt_u32(d.payload_memory_length);
+        self.u32(d.max_vertex_amplification_count);
+        self.threads(d.required_threads_per_object_threadgroup);
+        self.threads(d.required_threads_per_mesh_threadgroup);
+        Ok(())
     }
 
     fn tile(&mut self, d: &TileRenderPipelineDescriptor) -> Result<(), Unwritable> {
@@ -586,6 +655,33 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// [`Writer::dispatches`]' list: more than its bounds is no record.
+    fn dispatches(&mut self) -> Result<Vec<RecordedDispatch>, Unreadable> {
+        // Each dispatch is at least its threadgroup, its grid's flag and its lengths' count.
+        let n = self.count(12 + 1 + 4)?;
+        if n > MOST_DISPATCHES {
+            return Err(Unreadable);
+        }
+        (0..n)
+            .map(|_| {
+                let threads_per_group = [self.u32()?, self.u32()?, self.u32()?];
+                let threads = self.threads()?;
+                let lengths = self.count(8)?;
+                if lengths > MOST_LENGTHS {
+                    return Err(Unreadable);
+                }
+                let threadgroup_lengths = (0..lengths)
+                    .map(|_| Ok((self.u32()?, self.u32()?)))
+                    .collect::<Result<_, Unreadable>>()?;
+                Ok(RecordedDispatch {
+                    threads_per_group,
+                    threads,
+                    threadgroup_lengths,
+                })
+            })
+            .collect()
+    }
+
     /// A Metal enum or option set, by its checked `TryFrom<u32>`.
     fn raw<T: TryFrom<u32>>(&mut self) -> Result<T, Unreadable> {
         T::try_from(self.u32()?).map_err(|_| Unreadable)
@@ -661,12 +757,18 @@ impl<'a> Reader<'a> {
         for _ in 0..n {
             let function = self.function()?;
             let constants = self.constants()?;
+            let specialized_name = match self.bool()? {
+                true => Some(self.string()?),
+                false => None,
+            };
+            let specialized = self.bool()?;
             let precompiled = self.bool()?;
-            out.push(
-                LinkedFunction::new(function)
-                    .with_constants(constants)
-                    .with_precompiled(precompiled),
-            );
+            let mut linked = LinkedFunction::new(function)
+                .with_constants(constants)
+                .with_specialized(specialized)
+                .with_precompiled(precompiled);
+            linked.specialized_name = specialized_name;
+            out.push(linked);
         }
         Ok(out)
     }
@@ -702,6 +804,7 @@ impl<'a> Reader<'a> {
     fn stage(&mut self) -> Result<StageSource, Unreadable> {
         let mut f = FunctionDescriptor::new(self.function()?);
         f.constants = self.constants()?;
+        f.specialized = self.bool()?;
         f.linked = self.linked()?;
         f.libraries = self.dynamic()?;
         Ok(StageSource::Function(f))
@@ -812,6 +915,7 @@ impl<'a> Reader<'a> {
         p.needs_custom_border_color_samplers = self.bool()?;
         p.vertex_amplification_mode = self.u64()?;
         p.explicit_visibility_group_id = self.u32()?;
+        p.open_gl_mode_enabled = self.bool()?;
         Ok(p)
     }
 
@@ -826,6 +930,7 @@ impl<'a> Reader<'a> {
         d.support_adding_binary_functions = self.bool()?;
         d.buffers = self.mutability()?;
         d.needs_custom_border_color_samplers = self.bool()?;
+        d.open_cl_mode_enabled = self.bool()?;
         Ok(d)
     }
 
@@ -869,6 +974,15 @@ impl<'a> Reader<'a> {
         d.alpha_to_one = self.bool()?;
         d.support_indirect_command_buffers = self.bool()?;
         d.texture_write_rounding_mode = self.rounding()?;
+        d.max_total_threads_per_object_threadgroup = self.opt_u32()?;
+        d.max_total_threads_per_mesh_threadgroup = self.opt_u32()?;
+        d.max_total_threadgroups_per_mesh_grid = self.opt_u32()?;
+        d.object_threadgroup_size_is_multiple_of_thread_execution_width = self.bool()?;
+        d.mesh_threadgroup_size_is_multiple_of_thread_execution_width = self.bool()?;
+        d.payload_memory_length = self.opt_u32()?;
+        d.max_vertex_amplification_count = self.u32()?;
+        d.required_threads_per_object_threadgroup = self.threads()?;
+        d.required_threads_per_mesh_threadgroup = self.threads()?;
         Ok(d)
     }
 

@@ -14,22 +14,27 @@
 //! - a layout of a fixed stride reads at its own, whatever stride the buffer is bound with.
 
 use super::{
-    buffer_with, layer_reported_nothing_at_all, read_buffer, validated_device, Messages,
-    ScratchCache, WAIT,
+    at_plan, buffer_with, layer_reported_nothing_at_all, read_buffer, validated_device_with,
+    Messages, ScratchCache, WAIT,
 };
 use crate::air_library::AirLibrary;
 use crate::gpu::TEST_DEVICE;
-use metal2vulkan::metal::{AttributeFormat, IndirectCommandType, StepFunction};
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
+use metal2vulkan::metal::IndirectCommandType;
+use metal2vulkan::metal::{AttributeFormat, StepFunction};
 use metal2vulkan::pipeline::{
     ComputePipelineDescriptor, StageInputAttributeDescriptor, StageInputDescriptor,
     StageInputLayoutDescriptor, StageSource,
 };
-use metal2vulkan_devtools::llvm_assemble;
+use metal2vulkan_devtools::{llvm_assemble, llvm_assemble_text};
+use metal2vulkan_runtime::DeviceOptions;
 use metal2vulkan_runtime::{
-    Buffer, CommandBufferStatus, ComputeCommandEncoder, ComputePipelineState, Device, Error,
-    IndirectCommandBufferDescriptor, PipelineOptions, Region, ResourceOptions, RuntimeGap, Size,
+    Buffer, CommandBufferStatus, ComputeCommandEncoder, ComputePipelineState, Device,
+    PipelineOptions, Region, Size,
 };
-use std::path::Path;
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
+use metal2vulkan_runtime::{Error, IndirectCommandBufferDescriptor, ResourceOptions, RuntimeGap};
+use std::path::PathBuf;
 
 /// The grid: 5 by 3 threads.
 const W: u32 = 5;
@@ -38,14 +43,20 @@ const H: u32 = 3;
 /// The elements each source buffer holds.
 const ELEMENTS: u32 = 16;
 
+/// The fixture's opaque-pointer text.
+fn fixture() -> PathBuf {
+    metal2vulkan_devtools::engine_dir().join("kernel_stage_in.ll")
+}
+
 /// The fixture's pipeline: its layouts 1 and 2 of `MTLBufferLayoutStrideDynamic` where
 /// `dynamic`, else of 24 and 8 bytes; layout 3 constant.
 fn pipeline(device: &Device, dynamic: bool) -> ComputePipelineState {
-    let ll =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/public/engine/kernel_stage_in.ll");
-    let library = device
-        .new_library_with_air(&llvm_assemble(&ll).unwrap())
-        .unwrap();
+    pipeline_of(device, &llvm_assemble(&fixture()).unwrap(), dynamic)
+}
+
+/// [`pipeline`] of the fixture's form `bitcode`.
+fn pipeline_of(device: &Device, bitcode: &[u8], dynamic: bool) -> ComputePipelineState {
+    let library = device.new_library_with_air(bitcode).unwrap();
     let function = library.new_function_with_name("stage_in_fetch").unwrap();
     let mut input = StageInputDescriptor::new();
     for (index, format, offset, buffer) in [
@@ -199,10 +210,16 @@ fn read_at(what: &str, words: &[u32], s1: u32, s2: u32) {
 
 /// Run `test` on a validated device of the lane, then fail on any validation message.
 fn on_device(test: impl FnOnce(&Device)) {
+    on_device_with(|_| {}, test)
+}
+
+/// [`on_device`], `adjust` applied to the options of each device it makes (`at_plan` gives them
+/// their queue plan).
+fn on_device_with(adjust: fn(&mut DeviceOptions), test: impl FnOnce(&Device)) {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), adjust).unwrap();
         test(&device);
     }
     layer_reported_nothing_at_all(&messages);
@@ -213,7 +230,7 @@ fn on_device(test: impl FnOnce(&Device)) {
 /// offset form after a stride form, read at stride 0.
 #[test]
 fn a_dynamic_layout_reads_the_bound_stride_as_metal() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let pipeline = pipeline(device, true);
         for (s1, s2) in [(24, 8), (0, 16), (12, 2), (6, 0), (25, 3)] {
             let words = dispatched(device, &pipeline, |e, s| {
@@ -262,7 +279,7 @@ fn a_dynamic_layout_reads_the_bound_stride_as_metal() {
 /// takes them).
 #[test]
 fn a_stride_past_32_bits_reads_at_its_low_32_bits() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let pipeline = pipeline(device, true);
         for (s1, s2) in [(24u32, 8u32), (0, 16), (12, 2)] {
             let wide = |s: u32, k: u64| (k << 32) | u64::from(s);
@@ -309,6 +326,30 @@ fn a_stride_past_32_bits_reads_at_its_low_32_bits() {
     });
 }
 
+/// A stage-in attribute whose location carries the attribute's name as its user key, as Apple's
+/// OpenGL front end writes a kernel's (`attrib_0`), fetches what the unnamed one fetches: an
+/// attribute binds by its location. The M3 Max made a pipeline of both forms and answered the same
+/// words (`stage_in_user_key.m`).
+#[test]
+fn a_stage_in_attribute_named_by_its_user_key_fetches_as_metal() {
+    let text = std::fs::read_to_string(fixture()).unwrap();
+    let mut keyed = text.clone();
+    for n in 0..5 {
+        let at = format!("!\"air.stage_in\", !\"air.location_index\", i32 {n}, i32 1, ");
+        keyed = keyed.replace(&at, &format!("{at}!\"attrib_{n}\", "));
+    }
+    assert_ne!(keyed, text, "the fixture's stage-in nodes");
+    on_device(|device| {
+        let pipeline = pipeline_of(device, &llvm_assemble_text(&keyed).unwrap(), false);
+        let words = dispatched(device, &pipeline, |e, s| {
+            for (index, buffer) in s.layouts.iter().enumerate() {
+                e.set_buffer(Some(buffer), 0, index as u32 + 1).unwrap();
+            }
+        });
+        read_at("user keys", &words, 24, 8);
+    });
+}
+
 /// A layout of a fixed stride reads at its own whatever stride its buffer is bound with.
 #[test]
 fn a_fixed_layout_reads_its_own_stride_whatever_the_bind() {
@@ -327,6 +368,7 @@ fn a_fixed_layout_reads_its_own_stride_whatever_the_bind() {
 /// The owned fixture `ob3_stage_input` (each thread writes the `uint` attribute it fetched to
 /// `out[t]`, buffer 0), its attribute at offset 0 of layout 1, stepping by the thread's x at a
 /// fixed stride of 6, made with `supportIndirectCommandBuffers`.
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
 fn strided_pipeline(device: &Device) -> ComputePipelineState {
     stage_in_pipeline(device, StepFunction::ThreadPositionInGridX)
 }
@@ -334,8 +376,7 @@ fn strided_pipeline(device: &Device) -> ComputePipelineState {
 /// `strided_pipeline` stepping by `step` (a constant step at rate 0, which reads the
 /// attribute's offset alone).
 pub(super) fn stage_in_pipeline(device: &Device, step: StepFunction) -> ComputePipelineState {
-    let ll =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/public/engine/ob3_stage_input.ll");
+    let ll = metal2vulkan_devtools::engine_dir().join("ob3_stage_input.ll");
     let library = device
         .new_library_with_air(&llvm_assemble(&ll).unwrap())
         .unwrap();
@@ -368,7 +409,9 @@ pub(super) fn stage_in_pipeline(device: &Device, step: StepFunction) -> ComputeP
 /// buffer; a dispatch of one thread over a region from element 715827883 (bytes `2^32 + 2` to
 /// `2^32 + 6`) is refused, and an indirect command buffer's command of it refuses the commit.
 /// Skipped, printed, where the device's `max_buffer_length` holds no such buffer (RADV, ANV and
-/// lavapipe hold at most `2^32` bytes).
+/// lavapipe hold at most `2^32` bytes). A GPU hazard (`m2v_gpu_hazards`): the buffer is 4 GiB and
+/// 4 KiB, device memory or imported host memory.
+#[cfg(any(m2v_cpu_icd, m2v_gpu_hazards))]
 #[test]
 fn stage_in_fetches_past_4_gib_of_a_buffer_are_refused() {
     const LENGTH: u64 = (1 << 32) + 4096;

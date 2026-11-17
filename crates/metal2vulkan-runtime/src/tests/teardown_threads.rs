@@ -17,7 +17,9 @@
 //!   before it gave back its variant (`pool::held::settled_hold`) lets the command buffer complete
 //!   and its completed handler run, but not its wait return, until the piece let go (its trail,
 //!   `trails.rs`): the program's drops after the wait tear the device down on its own thread,
-//!   before the last drop returns.
+//!   before the last drop returns. Nor a render state's creation return, whose predicted
+//!   pipeline's piece is held so: the program's drops of the state and the device right after it
+//!   tear the device down on its own thread too.
 //! - **The scheduler**: a committed command buffer held at its submission (its submission check
 //!   blocked on the scheduler's thread). The teardown ends on the scheduler, whose submitted
 //!   batch's hold goes after its lock, or on the queue's handler thread, which releases what the
@@ -42,6 +44,31 @@
 //!   block waiting for that mark and the release of freed memory that a later command buffer's
 //!   completion posted, held too, as the program's wait for that command buffer returns. The
 //!   teardown frees the block and runs its deallocator, before the last drop returns.
+//! - **Not a handler thread after a keep-alive's release**: a no-copy buffer released with a
+//!   keep-alive alone posts its import's free and the keep-alive's drop to a handler thread
+//!   (`buffer.rs`), held in the keep-alive's drop. The release holds the device as a holder's, so
+//!   the program's drop of the device right after it waits for it and tears the device down on
+//!   the program's thread, its `VkDevice` gone as the drop returns.
+//! - **Not the queue-switch check's thread**: a device whose first command queue starts its check
+//!   of the GPU's idling between `VkQueue`s (`queue_switch_check.rs`), held between two of its
+//!   rounds, holds nothing of the device: the program's drops tear the device down on its own
+//!   thread before the last drop returns, the teardown stopping the check and waiting for it at
+//!   most one step and its release of its objects, within the 16 ms the owner allows a wait. A
+//!   device that runs no check (one family of one `VkQueue`, or no calibrated timestamps) skips
+//!   it, saying so.
+//! - **Nor the submission checks' thread**: a device's checks of its submissions
+//!   (`submit_check.rs`), which start as it is made, held between two of their steps, hold
+//!   nothing of it either: the program's drop tears the device down on its own thread before it
+//!   returns, the teardown stopping the checks at their next step. A device whose checks ended
+//!   before the hold skips it, saying so.
+//! - **Not the runtime's own holders' threads**: the check of textures over host pages
+//!   (`in_place_check.rs`), held before a round while it holds the device, the warm pass
+//!   (`warm/pass.rs`), held before a record while it holds it, and the pool's making of a render
+//!   execution's draw replay kernels (`owned_kernel.rs`), held before a kernel while it holds it. The program's last drop stops the
+//!   holds and waits for them (`device/holds.rs`), so the device is torn down on the program's
+//!   thread before that drop returns. A device whose check makes no round (its policy takes no
+//!   texture in place, or it makes no class's pages) skips the check's case, saying so. A program
+//!   handle's drop short of the last returns while another thread holds the registry's lock.
 //!
 //! The teardown's end is seen through the device's message sink, whose last share the instance
 //! drops after `vkDestroyInstance`, the teardown's last step: the sink owns a value that, dropped,
@@ -52,8 +79,9 @@
 //! fixture `validation/fixtures/public/examples/runtime_examples.ll` (`llvm-as`).
 
 use super::dispatch_pending as pending;
-use super::freed_memory::{unused, Host, Runs};
+use super::freed_memory::{kept_alive, unused, Host, Runs};
 use super::layer_claim::Watched;
+use crate::device::holds::Holder;
 use crate::device::lock;
 use crate::device::prime::SHADER;
 use crate::exit_guard;
@@ -68,7 +96,7 @@ use crate::{
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -202,8 +230,7 @@ fn watched(cache: &Path) -> (Device, Ending) {
 /// (`pipeline/predicted.rs`), which a triangle strip shares where the topology is dynamic, and not
 /// a line strip's, of another class.
 fn state(device: &Device) -> RenderPipelineState {
-    let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll");
+    let ll = metal2vulkan_devtools::fixtures_dir().join("examples/runtime_examples.ll");
     let bitcode = metal2vulkan_devtools::llvm_assemble(&ll).unwrap();
     let library = metal2vulkan::library::Library::from_air(&bitcode).unwrap();
     let library = device.new_library_with_compile_library(library);
@@ -337,6 +364,40 @@ fn a_device_dropped_after_a_wait_goes_on_the_program_s_thread_while_its_piece_tr
     assert!(
         releasing.join().unwrap(),
         "the wait met the piece's open trail"
+    );
+}
+
+/// A render state's creation whose making the pool settled, its piece held before it gives back
+/// the variant it took (`pool::held::settled_hold`): the creation returns only once its wait met
+/// the piece's trail and the piece let go (`trails.rs`), so the program's drops of the state and
+/// the device right after it tear the device down on its thread, before the last drop returns.
+/// Before, the creation returned at the settle while the piece held the variant, and the device
+/// went on the pool's or the reaper's thread after the program's last drop returned:
+/// `render_stage_digests`' second device over the same options revived the first, its memo warm,
+/// or met a directory its teardown had not finished writing, under a loaded host.
+#[test]
+fn a_device_dropped_after_a_creation_goes_on_the_program_s_thread_while_its_piece_trails() {
+    let scratch = Scratch::new("creation-trail");
+    let (device, ending) = watched(&scratch.0);
+    let settled = held::settled_hold();
+    let made = device.work_counts().creation_pipelines_made;
+    // Released once a wait met the piece's open trail.
+    let releasing = std::thread::spawn(move || {
+        let met = blocked::reached(1, WAIT);
+        drop(settled);
+        met
+    });
+    let state = state(&device);
+    assert!(
+        device.work_counts().creation_pipelines_made > made,
+        "the creation made its predicted pipeline"
+    );
+    drop(state);
+    drop(device);
+    ending.ended_here();
+    assert!(
+        releasing.join().unwrap(),
+        "the creation's wait met the piece's open trail"
     );
 }
 
@@ -485,7 +546,7 @@ fn the_watch_of_the_program_s_marks_leaves_the_device_to_the_program_s_thread() 
     let queue = device.new_command_queue().unwrap();
     parking.held.hold();
     // SAFETY: the closure uses the queue for nothing.
-    unsafe { queue.with_vk_queue(|_, _| ()) };
+    unsafe { queue.with_vk_queue(|_, _, _| ()) };
     parking.held.until_waiting(1, WAIT);
     let releasing = let_go_once_torn_down(&device);
     drop(queue);
@@ -521,7 +582,7 @@ fn a_release_of_freed_memory_leaves_the_device_to_the_program_s_thread() {
     };
     parking.held.hold();
     // SAFETY: the closure uses the queue for nothing.
-    unsafe { queue.with_vk_queue(|_, _| ()) };
+    unsafe { queue.with_vk_queue(|_, _, _| ()) };
     parking.held.until_waiting(1, WAIT);
     drop(import);
     assert_eq!(
@@ -554,4 +615,356 @@ fn a_release_of_freed_memory_leaves_the_device_to_the_program_s_thread() {
         .watched
         .layer_reported_nothing("the teardown that freed the block left no object and used none");
     drop(host);
+}
+
+/// A keep-alive whose drop says it began, then waits until the test lets it go.
+struct HeldKeepAlive {
+    began: mpsc::Sender<String>,
+    go: mpsc::Receiver<()>,
+}
+
+impl Drop for HeldKeepAlive {
+    fn drop(&mut self) {
+        let _ = self.began.send(program_thread());
+        let _ = self.go.recv_timeout(WAIT);
+    }
+}
+
+/// A no-copy buffer released with a keep-alive alone posts its import's free and the keep-alive's
+/// drop to a handler thread (`buffer.rs`), held here in the keep-alive's drop. The release holds
+/// the device as a holder's (`device/holds.rs`), so the program's last drop, right after it, stops
+/// the holds and waits for it: the device is torn down on the program's thread, its `VkDevice`
+/// gone as the drop returns. With the program's handles in the release, the drop returned at once
+/// with the `VkDevice` live, its last handle going on the handler thread, whose teardown a
+/// process's exit then left to the driver's exit (docs/FAST-PATHS.md, known gaps).
+#[test]
+fn a_keep_alive_s_posted_release_leaves_the_device_to_the_program_s_thread() {
+    let scratch = Scratch::new("keep-alive");
+    let host = Host::new();
+    let (device, ending) = watched(&scratch.0);
+    let (began, released) = mpsc::channel();
+    let (go, wait) = mpsc::channel();
+    let keep_alive = HeldKeepAlive { began, go: wait };
+    let Some(buffer) = kept_alive(&device, &host, Box::new(keep_alive)) else {
+        return;
+    };
+    let posted = device.work_counts().host_import_releases_posted;
+    drop(buffer);
+    let on = released
+        .recv_timeout(WAIT)
+        .expect("the keep-alive's drop began");
+    assert_eq!(
+        on, HANDLERS,
+        "the keep-alive was dropped off the handler threads"
+    );
+    assert_eq!(
+        device.work_counts().host_import_releases_posted,
+        posted + 1,
+        "the release posted its free"
+    );
+    let holds = Arc::clone(&device.shared().holds);
+    let lineage = Arc::clone(&device.shared().lineage);
+    // Lets the keep-alive go once the last drop stopped the holds, or once the drop returned
+    // without stopping them (it was not the program's last).
+    let returned = Arc::new(AtomicBool::new(false));
+    let releasing = std::thread::spawn({
+        let (holds, returned) = (Arc::clone(&holds), Arc::clone(&returned));
+        move || {
+            let began = Instant::now();
+            while !holds.stopping() && !returned.load(Ordering::SeqCst) && began.elapsed() < WAIT {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = go.send(());
+        }
+    });
+    drop(device);
+    let live = lineage.counts().0;
+    let torn_down = ending.thread.try_recv();
+    returned.store(true, Ordering::SeqCst);
+    releasing.join().unwrap();
+    assert_eq!(live, 0, "the VkDevice outlived the program's last drop");
+    assert_eq!(
+        torn_down,
+        Ok(program_thread()),
+        "the device was not torn down on this thread before its last drop returned"
+    );
+    assert!(
+        holds.waited().is_some(),
+        "the last drop waited for the posted release"
+    );
+    ending.watched.layer_reported_nothing(
+        "the teardown after the keep-alive's release left no object and used none",
+    );
+    drop(host);
+}
+
+/// A device whose check of its GPU's idling between `VkQueue`s runs, held between two of its rounds
+/// (`queue_switch_check.rs`): the check holds no device handle, so the program's last drop tears
+/// the device down on its own thread before it returns, and the teardown's wait for the check (it
+/// stops at its next step and lets its objects go) is within [`RELEASE`]. Without the hold the
+/// check runs some milliseconds after the first command queue, the window in which a check that
+/// held its device took the last drop's teardown to its own thread.
+#[test]
+fn a_running_queue_switch_check_leaves_the_device_to_the_program_s_thread() {
+    let scratch = Scratch::new("switch");
+    let (device, ending) = watched(&scratch.0);
+    let switch = Arc::clone(&device.shared().queue_switch);
+    if crate::queue_switch_check::pair(&device).is_none()
+        || !crate::queue_switch_check::timed(&device)
+    {
+        println!(
+            "SKIPPED {}: the device runs no queue-switch check",
+            device.name()
+        );
+        return;
+    }
+    switch.held.hold();
+    let queue = device.new_command_queue().unwrap();
+    switch.held.until_waiting(1, WAIT);
+    let releasing = std::thread::spawn({
+        let switch = Arc::clone(&switch);
+        move || switch.release_once_stopping()
+    });
+    let dropping = Instant::now();
+    drop(queue);
+    drop(device);
+    let dropped = dropping.elapsed();
+    let torn_down = ending.thread.try_recv();
+    switch.held.release();
+    releasing.join().unwrap();
+    assert_eq!(
+        torn_down,
+        Ok(program_thread()),
+        "the device was not torn down on this thread before its last drop returned"
+    );
+    let waited = switch
+        .stop_waited()
+        .expect("the teardown waited for the running check");
+    let [release, shares] = switch.last_steps();
+    println!(
+        "the last drop took {dropped:?}, of which the wait for the check {waited:?} (its objects' \
+         release {release:?}, its shares' drop {shares:?})"
+    );
+    assert!(
+        waited < RELEASE,
+        "the teardown waited {waited:?} for the check"
+    );
+    ending
+        .watched
+        .layer_reported_nothing("the teardown that stopped the check left no object and used none");
+}
+
+/// A device whose submission checks run, held between two of their steps (`submit_check.rs`):
+/// the checks hold no device handle, so the program's last drop tears the device down on its own
+/// thread before it returns. Unheld, they run some milliseconds after the device is made, the
+/// window in which checks that held their device took a last drop's teardown on one of the
+/// runtime's threads to their own.
+#[test]
+fn running_submit_checks_leave_the_device_to_the_program_s_thread() {
+    let scratch = Scratch::new("submit");
+    let (device, ending) = watched(&scratch.0);
+    let checks = Arc::clone(&device.shared().submit_checks);
+    checks.held.hold();
+    // The checks started as the device was made: they wait at their next step, or ended.
+    let deadline = Instant::now() + WAIT;
+    while checks.held.waiting() == 0 && !device.settle_submit_checks(Duration::ZERO) {
+        assert!(
+            Instant::now() < deadline,
+            "the checks neither held nor ended"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    if checks.held.waiting() == 0 {
+        checks.held.release();
+        println!(
+            "SKIPPED {}: the device's submission checks ended before the hold",
+            device.name()
+        );
+        return;
+    }
+    let releasing = std::thread::spawn({
+        let checks = Arc::clone(&checks);
+        move || checks.release_once_stopping()
+    });
+    drop(device);
+    let torn_down = ending.thread.try_recv();
+    checks.held.release();
+    releasing.join().unwrap();
+    assert_eq!(
+        torn_down,
+        Ok(program_thread()),
+        "the device was not torn down on this thread before its last drop returned"
+    );
+    ending.watched.layer_reported_nothing(
+        "the teardown that stopped the checks left no object and used none",
+    );
+}
+
+/// The device whose holds `holder` takes, `holder` held at its next step while it holds the device
+/// (`device/holds.rs`); `start` sets it going. `None` where it ended without reaching the hold,
+/// which `ended` answers.
+fn held_at_a_step(
+    device: &Device,
+    holder: Holder,
+    start: impl FnOnce(),
+    ended: impl Fn() -> bool,
+) -> Option<Arc<crate::device::holds::Holds>> {
+    let holds = Arc::clone(&device.shared().holds);
+    let held = holds.held(holder);
+    held.hold();
+    start();
+    let started = Instant::now();
+    while held.waiting() == 0 {
+        if ended() {
+            held.release();
+            return None;
+        }
+        assert!(
+            started.elapsed() < WAIT,
+            "{holder:?} never reached its hold"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Some(holds)
+}
+
+/// Drop `device`, the program's last handle, while `holder` holds it at its hold, letting the
+/// hold go once the drop stopped the holds: the device is torn down on this thread before the
+/// drop returns, having waited for the holder, and nothing failed meanwhile.
+fn dropped_while_held(
+    device: Device,
+    ending: &Ending,
+    holds: &Arc<crate::device::holds::Holds>,
+    holder: Holder,
+) {
+    let releasing = std::thread::spawn({
+        let holds = Arc::clone(holds);
+        move || holds.release_once_stopping(holder)
+    });
+    let dropping = Instant::now();
+    drop(device);
+    let dropped = dropping.elapsed();
+    let torn_down = ending.thread.try_recv();
+    holds.held(holder).release();
+    releasing.join().unwrap();
+    assert_eq!(
+        torn_down,
+        Ok(program_thread()),
+        "the device was not torn down on this thread before its last drop returned"
+    );
+    let waited = holds.waited().expect("the last drop waited for the holder");
+    println!("the last drop took {dropped:?}, of which the wait for {holder:?} {waited:?}");
+    ending.watched.layer_reported_nothing(&format!(
+        "the teardown that stopped {holder:?} left no object and used none"
+    ));
+}
+
+/// A device whose check of textures over host pages runs (`in_place_check.rs`), held before one
+/// of its rounds, while it holds the device and its class's buffer: the program's last drop stops
+/// the check there and waits for it to let them go, so the device is torn down on the program's
+/// thread before the drop returns. Without the wait the check's thread lets the device go last,
+/// after the drop returned.
+#[test]
+fn a_running_in_place_check_leaves_the_device_to_the_program_s_thread() {
+    let scratch = Scratch::new("in-place");
+    let (device, ending) = watched(&scratch.0);
+    let policy = device.compile_device().policy().host_page_textures;
+    if policy != metal2vulkan::device::HostPageTexturePolicy::InPlace {
+        println!(
+            "SKIPPED {}: the device takes no texture in place ({policy:?})",
+            device.name()
+        );
+        return;
+    }
+    let checks = |device: &Device| device.shared().in_place.wait(Duration::ZERO);
+    let start = || {
+        device.settle_in_place_checks(Duration::ZERO);
+    };
+    let Some(holds) = held_at_a_step(&device, Holder::InPlaceCheck, start, || checks(&device))
+    else {
+        println!(
+            "SKIPPED {}: the device's check of textures in place made no round ({:?})",
+            device.name(),
+            device.in_place_check_report()
+        );
+        return;
+    };
+    dropped_while_held(device, &ending, &holds, Holder::InPlaceCheck);
+}
+
+/// A device's warm pass over records an earlier device made over the same directory, held before
+/// its first record while it holds the device (`warm/pass.rs`): the program's last drop stops the
+/// pass there and waits for it to let the device go, so the device is torn down on the program's
+/// thread before the drop returns.
+#[test]
+fn a_running_warm_pass_leaves_the_device_to_the_program_s_thread() {
+    let scratch = Scratch::new("warm");
+    let records = super::warm::recorded(&scratch.0);
+    let (device, ending) = watched(&scratch.0);
+    let start = || device.warm(records, u64::MAX);
+    let holds = held_at_a_step(&device, Holder::WarmPass, start, || false)
+        .expect("the warm pass reaches its hold");
+    dropped_while_held(device, &ending, &holds, Holder::WarmPass);
+}
+
+/// The pool's making of a render execution's draw replay kernels, which the creation of a render
+/// state that supports indirect command buffers begins and does not wait for
+/// (`Device::begin_draw_replay_kernels`), held before a kernel while it holds the device: the
+/// program's drops of the state and the device right after the creation stop the making there and
+/// wait for it to let the device go, so the device is torn down on the program's thread before
+/// the last drop returns. Were its handle the program's (an upgrade of a weak handle), that drop
+/// would return with the device live and the pool's thread would let it go last, which an exit
+/// leaves undone. A device whose executions take no GPU form (it reaches buffers by no device
+/// address) begins no making, and skips the case, saying so.
+#[test]
+fn a_running_draw_replay_kernels_making_leaves_the_device_to_the_program_s_thread() {
+    let scratch = Scratch::new("draw-replay-kernels");
+    let (device, ending) = watched(&scratch.0);
+    let needs = device.compile_device().profile().addressed_needs();
+    if !needs.is_empty() {
+        println!(
+            "SKIPPED {}: the device reaches buffers by no device address ({needs:?})",
+            device.name()
+        );
+        return;
+    }
+    let mut state = None;
+    let start = || {
+        state = Some(super::indirect_command_buffer_device::render_state(
+            &device, true,
+        ));
+    };
+    let holds = held_at_a_step(&device, Holder::DrawReplayKernels, start, || false)
+        .expect("the draw replay kernels' making reaches its hold");
+    drop(state);
+    dropped_while_held(device, &ending, &holds, Holder::DrawReplayKernels);
+}
+
+/// A program handle's drop that leaves the program other handles counts it gone without the holds
+/// registry's lock (`device/holds.rs`): the drops of the handles the program's objects, command
+/// buffers and encoders make, a draw's among them, share no lock. One dropped on another thread
+/// while this thread holds the lock returns; the program's last drop then tears the device down
+/// here. A drop that waited for the lock would not return until the lock went.
+#[test]
+fn a_program_handle_s_drop_short_of_the_last_takes_no_lock() {
+    let scratch = Scratch::new("program-drop");
+    let (device, ending) = watched(&scratch.0);
+    let other = device.clone();
+    let holds = Arc::clone(&device.shared().holds);
+    let (returned, dropping) = holds.locked(|| {
+        let (sender, dropped) = mpsc::channel();
+        let dropping = std::thread::spawn(move || {
+            drop(other);
+            let _ = sender.send(());
+        });
+        (dropped.recv_timeout(WAIT).is_ok(), dropping)
+    });
+    dropping.join().unwrap();
+    assert!(
+        returned,
+        "a program handle's drop short of the last waited for the registry's lock"
+    );
+    drop(holds);
+    drop(device);
+    ending.ended_here();
 }

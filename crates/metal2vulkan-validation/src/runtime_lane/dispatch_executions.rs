@@ -10,8 +10,9 @@
 //!
 //! - each command its own state, group count and buffers, a command never written and a reset
 //!   command nothing, in a serial and in a concurrent encoder, with commands times states indirect
-//!   dispatches and nothing announced; the serial encoder's with a barrier between every two
-//!   commands, the concurrent encoder's, whose records no route could set a barrier in, with none;
+//!   dispatches and nothing announced; with no barrier between the commands in either encoder, as
+//!   no route could set a barrier in the records (Metal's serial encoder adds a barrier before and
+//!   after the range alone);
 //! - a concurrent encoder's execution whose buffer's records the CPU sets a barrier in after the
 //!   commit, before its batch is submitted (it waits for an event), recorded again with the
 //!   barriers, still on the GPU alone;
@@ -36,6 +37,10 @@
 //!   a check that looks for nothing still uncalled; where the CPU sets such a state after the
 //!   commit, before the batch is submitted, the host step records the execution instead and calls
 //!   the check. Each runs the same; the host step is announced once.
+//! - a command naming a buffer the program released before the execution, with the buffer made
+//!   resident for reading (`commit` records the CPU's records), for reading and writing, or for
+//!   writing in an earlier encoder (on the GPU alone), runs with that slot unbound, reading zero,
+//!   and the command buffer's report counts the miss; nothing is announced.
 
 use super::degrade_notices::assert_made_once;
 use super::generated_executions::flat_template;
@@ -273,9 +278,11 @@ impl Setup {
     }
 
     /// Make the buffer resident for writing in an encoder of `command_buffer` that writes
-    /// nothing: from then on the GPU may write its records, so an execution reads them on the
-    /// GPU or in a host step.
+    /// nothing, after one that sets a state that may encode indirect commands
+    /// (`indirect_host_steps::encoding_state_set`): from then on the GPU may write its records, so
+    /// an execution reads them on the GPU or in a host step.
     fn writable(&self, command_buffer: &CommandBuffer) {
+        indirect_host_steps::encoding_state_set(command_buffer);
         let mut encoder = command_buffer.compute_command_encoder().unwrap();
         encoder
             .use_resource(self.icb.as_resource(), ResourceUsage::WRITE)
@@ -352,13 +359,48 @@ fn dispatches_indirect(device: &Device) -> u64 {
 }
 
 /// The pipeline barriers `device` replayed so far.
-fn barriers(device: &Device) -> u64 {
+pub(super) fn barriers(device: &Device) -> u64 {
     device.work_counts().commands_recorded.cmd_pipeline_barrier
+}
+
+/// The barrier command buffers `device`'s scheduler recorded to keep so far
+/// (`WorkCounts::barrier_buffers_kept` and `stamped_buffers_kept`): a `VkQueue` whose command
+/// buffers do not end at a fence (every one but MoltenVK's) records each list of a batch's own
+/// barriers once, at its first use, and its later batches submit that command buffer again
+/// (`command_buffer/kept_barriers.rs`). So a queue's first command buffers record barriers
+/// [`barriers`] counts that the next ones of the same shape do not: on the RTX 5080 Laptop GPU,
+/// four in the first execution and five in the first behind an event wait, two on lavapipe.
+fn kept_recorded(device: &Device) -> u64 {
+    let counts = device.work_counts();
+    counts.barrier_buffers_kept + counts.stamped_buffers_kept
+}
+
+/// How many times [`own_barriers`] runs a counted window at most.
+const WINDOW_RUNS: usize = 3;
+
+/// The barriers a run of `window` counted (what it returns) in a run that recorded no barrier
+/// command buffer to keep ([`kept_recorded`]): the commands' and their encoders' own. A queue
+/// keeps each list of a batch's barriers it meets, recorded once; a counted run may meet one the
+/// uncounted runs before it did not, and record it to keep, its barriers counted with the
+/// commands'. That run is not counted, and the window runs again, at most [`WINDOW_RUNS`] times:
+/// a list recorded again at each of its uses fails every run.
+pub(super) fn own_barriers(device: &Device, at: &str, mut window: impl FnMut() -> u64) -> u64 {
+    for _ in 0..WINDOW_RUNS {
+        let kept_before = kept_recorded(device);
+        let counted = window();
+        if kept_recorded(device) == kept_before {
+            return counted;
+        }
+    }
+    panic!(
+        "{at}: each of {WINDOW_RUNS} runs recorded barrier command buffers to keep, so the \
+         barriers counted are not the commands' own alone"
+    );
 }
 
 /// Whether `command_buffer` ran a flat variant: the GPU-alone path's execution record, where the
 /// host step's runs the variants its dispatches plan.
-fn ran_flat(command_buffer: &CommandBuffer) -> bool {
+pub(super) fn ran_flat(command_buffer: &CommandBuffer) -> bool {
     command_buffer
         .executions()
         .iter()
@@ -395,44 +437,59 @@ const STEPPED: [Degradation; 2] = [HOST_STEPS[0], Degradation::SplitDispatch];
 
 /// Every command runs its own state, group count and buffers, and the unwritten and reset ones
 /// nothing, in a serial and in a concurrent encoder: on the GPU alone, one indirect dispatch per
-/// command and state, the execution record listing the flat variants, nothing announced. The
-/// serial encoder's commands take a barrier between every two, the concurrent encoder's none: no
-/// route set a barrier in the buffer's records.
+/// command and state, the execution record listing the flat variants, nothing announced. Neither
+/// encoder's commands take a barrier between them, as no route set a barrier in the buffer's
+/// records: the serial encoder records as many barriers as the concurrent one, its barriers before
+/// and after the range alone. Both encoders run twice, and the second time is
+/// counted: the first records the queue's kept barrier command buffers ([`kept_recorded`]), and
+/// the second counts a run that recorded none ([`own_barriers`]), so its barriers are the
+/// commands' and their encoder's own.
 #[test]
 fn each_command_runs_its_own_state_and_group_count() {
     on_device(|device, messages| {
         let queue = device.new_command_queue().unwrap();
         let mut ordered = Vec::new();
-        for dispatch_type in [DispatchType::Serial, DispatchType::Concurrent] {
-            let setup = Setup::new(device);
-            let command_buffer = queue.command_buffer().unwrap();
-            setup.writable(&command_buffer);
-            let before = dispatches_indirect(device);
-            let barriers_before = barriers(device);
-            let mut encoder = command_buffer
-                .compute_command_encoder_with_dispatch_type(dispatch_type)
-                .unwrap();
-            setup.resident(&mut encoder);
-            encoder
-                .execute_commands_in_buffer(&setup.icb, 0..COMMANDS)
-                .unwrap();
-            encoder.end_encoding().unwrap();
-            complete(&command_buffer);
+        let passes = [false, true].map(|counted| {
+            [DispatchType::Serial, DispatchType::Concurrent].map(|kind| (counted, kind))
+        });
+        for (counted, dispatch_type) in passes.into_iter().flatten() {
             let at = format!("{dispatch_type:?}");
-            assert_eq!(setup.output(), expected(0..COMMANDS as usize), "{at}");
-            assert!(ran_flat(&command_buffer), "{at}");
-            let states = setup.states.len() as u64;
-            assert_eq!(
-                dispatches_indirect(device) - before,
-                COMMANDS * states,
-                "{at}: one indirect dispatch per command and state"
-            );
-            ordered.push(barriers(device) - barriers_before);
+            let run = || {
+                let setup = Setup::new(device);
+                let command_buffer = queue.command_buffer().unwrap();
+                setup.writable(&command_buffer);
+                let before = dispatches_indirect(device);
+                let barriers_before = barriers(device);
+                let mut encoder = command_buffer
+                    .compute_command_encoder_with_dispatch_type(dispatch_type)
+                    .unwrap();
+                setup.resident(&mut encoder);
+                encoder
+                    .execute_commands_in_buffer(&setup.icb, 0..COMMANDS)
+                    .unwrap();
+                encoder.end_encoding().unwrap();
+                complete(&command_buffer);
+                assert_eq!(setup.output(), expected(0..COMMANDS as usize), "{at}");
+                assert!(ran_flat(&command_buffer), "{at}");
+                let states = setup.states.len() as u64;
+                assert_eq!(
+                    dispatches_indirect(device) - before,
+                    COMMANDS * states,
+                    "{at}: one indirect dispatch per command and state"
+                );
+                barriers(device) - barriers_before
+            };
+            match counted {
+                false => {
+                    run();
+                }
+                true => ordered.push(own_barriers(device, &at, run)),
+            }
         }
         assert_eq!(
-            ordered[0] - ordered[1],
-            COMMANDS - 1,
-            "a barrier between every two commands in the serial encoder alone: {ordered:?}"
+            ordered[0], ordered[1],
+            "no barrier between the commands in the serial encoder, as in the concurrent one: \
+             {ordered:?}"
         );
         announced(device, messages, &[]);
     });
@@ -509,45 +566,56 @@ fn a_copied_record_runs_its_released_state_s_program_on_the_gpu_alone() {
 /// A concurrent encoder's execution recorded with no barrier between its commands is recorded
 /// again with them where the CPU sets a barrier in one of the buffer's records after the commit,
 /// before its batch is submitted (the batch waits for an event the CPU signals after the set): the
-/// commands run on the GPU alone, with as many barriers as the serial encoder's, and write what
-/// Metal computes. Without the set, none.
+/// commands run on the GPU alone, with a barrier between every two, and write what
+/// Metal computes. Without the set, none. A first execution without the set, not counted, records
+/// the queue's kept barrier command buffers ([`kept_recorded`]); the counted ones count a run that
+/// recorded none ([`own_barriers`]), so their barriers are the commands' and their encoder's own.
 #[test]
 fn a_barrier_set_after_the_commit_records_the_commands_again() {
     on_device(|device, messages| {
         let queue = device.new_command_queue().unwrap();
         let mut taken = Vec::new();
-        for set in [false, true] {
-            let setup = Setup::new(device);
-            let event = device.new_shared_event().unwrap();
-            let command_buffer = queue.command_buffer().unwrap();
-            setup.writable(&command_buffer);
-            command_buffer
-                .encode_wait_for_event(EventRef::from(&event), 1)
-                .unwrap();
-            let mut encoder = command_buffer
-                .compute_command_encoder_with_dispatch_type(DispatchType::Concurrent)
-                .unwrap();
-            setup.resident(&mut encoder);
-            encoder
-                .execute_commands_in_buffer(&setup.icb, 0..COMMANDS)
-                .unwrap();
-            encoder.end_encoding().unwrap();
-            let before = barriers(device);
-            command_buffer.commit().unwrap();
-            if set {
-                let command = setup.icb.indirect_compute_command_at(3).unwrap();
-                command.set_barrier().unwrap();
+        for (counted, set) in [(false, false), (true, false), (true, true)] {
+            let at = format!("set {set}");
+            let run = || {
+                let setup = Setup::new(device);
+                let event = device.new_shared_event().unwrap();
+                let command_buffer = queue.command_buffer().unwrap();
+                setup.writable(&command_buffer);
+                command_buffer
+                    .encode_wait_for_event(EventRef::from(&event), 1)
+                    .unwrap();
+                let mut encoder = command_buffer
+                    .compute_command_encoder_with_dispatch_type(DispatchType::Concurrent)
+                    .unwrap();
+                setup.resident(&mut encoder);
+                encoder
+                    .execute_commands_in_buffer(&setup.icb, 0..COMMANDS)
+                    .unwrap();
+                encoder.end_encoding().unwrap();
+                let before = barriers(device);
+                command_buffer.commit().unwrap();
+                if set {
+                    let command = setup.icb.indirect_compute_command_at(3).unwrap();
+                    command.set_barrier().unwrap();
+                }
+                event.set_signaled_value(1);
+                command_buffer.wait_until_completed_for(WAIT).unwrap();
+                assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
+                assert_eq!(
+                    command_buffer.execution_report(),
+                    Some(StatusReport::default())
+                );
+                assert_eq!(setup.output(), expected(0..COMMANDS as usize), "{at}");
+                assert!(ran_flat(&command_buffer), "{at}");
+                barriers(device) - before
+            };
+            match counted {
+                false => {
+                    run();
+                }
+                true => taken.push(own_barriers(device, &at, run)),
             }
-            event.set_signaled_value(1);
-            command_buffer.wait_until_completed_for(WAIT).unwrap();
-            assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
-            assert_eq!(
-                command_buffer.execution_report(),
-                Some(StatusReport::default())
-            );
-            assert_eq!(setup.output(), expected(0..COMMANDS as usize), "set {set}");
-            assert!(ran_flat(&command_buffer), "set {set}");
-            taken.push(barriers(device) - before);
         }
         assert!(
             taken[1] >= taken[0] + COMMANDS - 1,
@@ -617,28 +685,34 @@ fn a_rebind_before_the_first_submission_reaches_the_execution_s_records_as_they_
 /// so both bounds fall below the replay's 64 variants (`bind::MAX_REPLAY_VARIANTS`).
 const BOUNDED: u64 = 2 * COMMANDS;
 
-/// The most live states an execution of [`BOUNDED`] commands runs with on the GPU alone, as
+/// The most live states an execution of [`BOUNDED`] commands runs with on the GPU alone, in an
+/// encoder of its dispatch type, the CPU setting a barrier in a record or not, as
 /// `runtime/gpu_execute.rs`'s `dispatches_run` bounds them: where its commands go with no barrier
-/// between them (a concurrent encoder's, whose records no route could set a barrier in), four
-/// free and 256 dispatches past them (`FREE_STATES_UNORDERED`, `DISPATCHES_PAST_UNORDERED`); where
-/// they go with one (a serial encoder's), twelve and 512.
-const MOST_STATES: [(DispatchType, u64); 2] = [
-    (DispatchType::Concurrent, 4 + 256 / BOUNDED),
-    (DispatchType::Serial, 12 + 512 / BOUNDED),
+/// between them (whose records no route set a barrier in, in either encoder), four free and 256
+/// dispatches past them (`FREE_STATES_UNORDERED`, `DISPATCHES_PAST_UNORDERED`); where they go with
+/// one (a record's barrier set), twelve and 512.
+const MOST_STATES: [(DispatchType, bool, u64); 3] = [
+    (DispatchType::Concurrent, false, 4 + 256 / BOUNDED),
+    (DispatchType::Serial, false, 4 + 256 / BOUNDED),
+    (DispatchType::Serial, true, 12 + 512 / BOUNDED),
 ];
 
 /// An execution whose records may name as many live states as the GPU-alone path takes for its
 /// commands in its encoder's order runs on the GPU alone, one indirect dispatch per command and
 /// state, announcing nothing; with one more state alive, which no record names, the host step
 /// runs it, faster, with no indirect dispatch, announced once. Both write what Metal computes, in
-/// a concurrent and in a serial encoder.
+/// a concurrent and in a serial encoder, and in a serial one with a record's barrier set.
 #[test]
 fn an_execution_of_more_states_than_the_gpu_path_takes_runs_in_the_host_step() {
-    for (dispatch_type, most) in MOST_STATES {
+    for (dispatch_type, barrier, most) in MOST_STATES {
         on_device(|device, messages| {
             let queue = device.new_command_queue().unwrap();
             for states in [most, most + 1] {
                 let setup = Setup::sized(device, BOUNDED);
+                if barrier {
+                    let command = setup.icb.indirect_compute_command_at(3).unwrap();
+                    command.set_barrier().unwrap();
+                }
                 // Alive with `supportIndirectCommandBuffers` past the two the records name.
                 let unnamed = mark_states(device, states - setup.states.len() as u64);
                 let command_buffer = queue.command_buffer().unwrap();
@@ -653,7 +727,7 @@ fn an_execution_of_more_states_than_the_gpu_path_takes_runs_in_the_host_step() {
                     .unwrap();
                 encoder.end_encoding().unwrap();
                 complete(&command_buffer);
-                let at = format!("{dispatch_type:?} of {states} states");
+                let at = format!("{dispatch_type:?}, barrier {barrier}, of {states} states");
                 let mut want = expected(0..COMMANDS as usize);
                 want.resize(BOUNDED as usize * WINDOW, 0);
                 assert_eq!(setup.output(), want, "{at}");
@@ -935,5 +1009,98 @@ fn a_check_given_something_to_see_after_the_commit_takes_the_host_step() {
         let identifiers = [Degradation::UnmeasuredUniqueIdentifier];
         let kinds: Vec<Degradation> = STEPPED.iter().chain(&identifiers).copied().collect();
         announced(device, messages, &kinds);
+    });
+}
+
+/// How a test makes the buffer of [`a_command_s_released_buffer_runs_its_slot_unbound`]
+/// resident: for reading in the executing encoder (`commit` records the CPU's records), for
+/// reading and writing there, or for writing in an earlier encoder of the command buffer (the GPU
+/// may write the records, so the execution runs on the GPU alone).
+#[derive(Clone, Copy, Debug)]
+enum Resident {
+    Read,
+    ReadWrite,
+    EarlierWrite,
+}
+
+/// A command naming a buffer the program released before its execution runs with that slot
+/// unbound, as a nil buffer's slot, however the buffer is made resident ([`Resident`]):
+/// `a4_index_word`'s `out[t] = in[3t + 1]` reads zero through it and writes its four words, and
+/// the command buffer's report counts the miss; a 16-byte and a 1 MiB buffer, nothing announced.
+/// Metal runs the dispatch (the consumer's probe on an M3 Max, a Radeon Pro 5300M and a UHD 630).
+#[test]
+fn a_command_s_released_buffer_runs_its_slot_unbound() {
+    on_device(|device, messages| {
+        let pipeline = indirect_host_steps::state(device, "a4_index_word", true);
+        let writer = indirect_host_steps::state(device, "a4_index_word", false);
+        let scratch = buffer_with(device, &[0; 64]).unwrap();
+        let queue = device.new_command_queue().unwrap();
+        for resident in [Resident::Read, Resident::ReadWrite, Resident::EarlierWrite] {
+            for length in [16u64, 1 << 20] {
+                let words: Vec<u8> = (0..length / 4)
+                    .flat_map(|i| (10 * (i as u32 + 1)).to_le_bytes())
+                    .collect();
+                let input = buffer_with(device, &words).unwrap();
+                let out = buffer_with(device, &[0xee; 16]).unwrap();
+                let mut descriptor = IndirectCommandBufferDescriptor::new();
+                descriptor.command_types = IndirectCommandType::CONCURRENT_DISPATCH_THREADS;
+                descriptor.max_kernel_buffer_bind_count = 2;
+                let icb = device
+                    .new_indirect_command_buffer(&descriptor, 1, ResourceOptions::shared())
+                    .unwrap();
+                let command = icb.indirect_compute_command_at(0).unwrap();
+                command.set_compute_pipeline_state(&pipeline).unwrap();
+                command.set_kernel_buffer(Some(&input), 0, 0).unwrap();
+                command.set_kernel_buffer(Some(&out), 0, 1).unwrap();
+                command
+                    .concurrent_dispatch_threads(Size::new(4, 1, 1), Size::new(4, 1, 1))
+                    .unwrap();
+                drop(input);
+                let command_buffer = queue.command_buffer().unwrap();
+                if let Resident::EarlierWrite = resident {
+                    let mut encoder = command_buffer.compute_command_encoder().unwrap();
+                    encoder.set_compute_pipeline_state(&writer).unwrap();
+                    encoder.set_buffer(Some(&scratch), 0, 0).unwrap();
+                    encoder.set_buffer(Some(&scratch), 32, 1).unwrap();
+                    encoder
+                        .use_resource(icb.as_resource(), ResourceUsage::WRITE)
+                        .unwrap();
+                    let one = Size::new(1, 1, 1);
+                    encoder.dispatch_threads(one, one).unwrap();
+                    encoder.end_encoding().unwrap();
+                }
+                let usage = match resident {
+                    Resident::Read | Resident::EarlierWrite => ResourceUsage::READ,
+                    Resident::ReadWrite => ResourceUsage::READ.union(ResourceUsage::WRITE),
+                };
+                let mut encoder = command_buffer.compute_command_encoder().unwrap();
+                encoder
+                    .use_resource(
+                        out.as_resource(),
+                        ResourceUsage::READ.union(ResourceUsage::WRITE),
+                    )
+                    .unwrap();
+                encoder.use_resource(icb.as_resource(), usage).unwrap();
+                encoder.execute_commands_in_buffer(&icb, 0..1).unwrap();
+                encoder.end_encoding().unwrap();
+                let case = format!("{resident:?}, a {length}-byte buffer");
+                command_buffer.commit().unwrap();
+                command_buffer.wait_until_completed_for(WAIT).unwrap();
+                assert_eq!(
+                    command_buffer.status(),
+                    CommandBufferStatus::Completed,
+                    "{case}"
+                );
+                assert_eq!(
+                    read_buffer(&out, 0, 16).unwrap(),
+                    [0; 16],
+                    "{case}: the dispatch ran with the slot unbound"
+                );
+                let report = command_buffer.execution_report().unwrap();
+                assert!(report.resident_miss, "{case}: {report:?}");
+                assert_eq!(report.resident_misses, 1, "{case}");
+            }
+        }
+        announced(device, messages, &[]);
     });
 }

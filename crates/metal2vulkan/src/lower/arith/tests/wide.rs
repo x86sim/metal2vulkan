@@ -615,7 +615,18 @@ fn float_to_wide_truncates_and_saturates() {
                 &format!("convert saturating f32 -> wide i{bits} signed={signed}"),
                 &[float(32)],
                 to,
-                &|fb, x| w::convert(fb, ConvertKind::ToInt { signed }, float(32), to, x[0]),
+                &|fb, x| {
+                    w::convert(
+                        fb,
+                        ConvertKind::ToInt {
+                            signed,
+                            round: None,
+                        },
+                        float(32),
+                        to,
+                        x[0],
+                    )
+                },
                 &cases,
                 &|c| {
                     let x = f64::from(f32v(arg(c, 0)));
@@ -673,6 +684,34 @@ fn float_to_wide_truncates_and_saturates() {
     );
 }
 
+/// Integer `median3` on wide values (two 32-bit words) answers the middle one of its operands,
+/// signed and unsigned, on scalars and 4-lane vectors of 64 and 40 bits: every ordered triple of
+/// the width's edges, ties and the extremes among them.
+#[test]
+fn wide_integer_median3_answers_the_middle_one_at_ties_and_extremes() {
+    for bits in [64u8, 40] {
+        let edges = width_edges(bits);
+        for s in [Sign::Signed, Sign::Unsigned] {
+            let op = IntFn::Median3(s);
+            for lanes in [1u8, 4] {
+                let f = vec(wide(bits), lanes);
+                check_wide(
+                    &format!("{op:?} wide i{bits} x{lanes}"),
+                    &[f; 3],
+                    f,
+                    &|fb, x| w::int_fn(fb, op, f, x),
+                    &triples(&edges, usize::from(lanes)),
+                    &|c| {
+                        (0..usize::from(lanes))
+                            .map(|l| int_ref(op, bits, &[c[0][l], c[1][l], c[2][l]]))
+                            .collect::<Option<Vec<u64>>>()
+                    },
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn wide_integer_functions_match_metal() {
     let mut rng = Rng(0x1F);
@@ -714,6 +753,7 @@ fn wide_integer_functions_match_metal() {
                 IntFn::Max(s),
                 IntFn::Min3(s),
                 IntFn::Max3(s),
+                IntFn::Median3(s),
                 IntFn::Clamp(s),
                 IntFn::AddSat(s),
                 IntFn::SubSat(s),
@@ -886,7 +926,18 @@ fn wide_bitcasts_and_integer_converts_move_bits() {
             &format!("convert {from:?} -> {to:?} signed={signed}"),
             &[from],
             to,
-            &|fb, v| w::convert(fb, ConvertKind::Int { signed }, from, to, v[0]),
+            &|fb, v| {
+                w::convert(
+                    fb,
+                    ConvertKind::Int {
+                        signed,
+                        saturate: None,
+                    },
+                    from,
+                    to,
+                    v[0],
+                )
+            },
             &cases,
             &|c| {
                 let x = arg(c, 0);
@@ -1074,6 +1125,7 @@ fn wide_integer_function_words_bound_their_emission() {
         ops.extend([
             IntFn::AbsDiff(s),
             IntFn::Min3(s),
+            IntFn::Median3(s),
             IntFn::Clamp(s),
             IntFn::AddSat(s),
             IntFn::SubSat(s),
@@ -1480,5 +1532,107 @@ fn a_fragment_shuffle_bounds_its_emission() {
             "{lane:?}: {} words above the kernel, bound {bound}",
             with - without
         );
+    }
+}
+
+/// The suffixes a pipeline of OpenCL mode honors, with a wide side: a wide integer to `f32`
+/// toward zero, up and down; an `f32` to a wide integer to nearest even, up and down, saturating;
+/// and `.sat` between a wide integer and a 32-bit or another wide one (`convert_suffix.rs` holds
+/// the native forms').
+#[test]
+fn wide_conversions_honor_their_suffixes() {
+    use super::convert_suffix::{
+        clamped, f32_of, integral_of, rounding_floats, rounding_ints, value_of, DIRECTED, INTEGRAL,
+    };
+    let f32f = float(32);
+    for bits in [40u8, 64] {
+        let from = wide(bits);
+        let cases: Vec<Case> = rounding_ints(bits).iter().map(|v| vec![vec![*v]]).collect();
+        for signed in [true, false] {
+            for mode in DIRECTED {
+                check_wide(
+                    &format!("wide i{bits} signed={signed} to f32 {mode:?}"),
+                    &[from],
+                    f32f,
+                    &|fb, x| {
+                        let kind = ConvertKind::ToFloat {
+                            signed,
+                            directed: Some(mode),
+                        };
+                        w::convert(fb, kind, from, f32f, x[0])
+                    },
+                    &cases,
+                    &|c| Some(vec![f32_of(value_of(arg(c, 0), bits, signed), mode)]),
+                );
+            }
+        }
+    }
+    let floats: Vec<Case> = rounding_floats().iter().map(|v| vec![vec![*v]]).collect();
+    for signed in [true, false] {
+        for mode in INTEGRAL {
+            check_wide(
+                &format!("f32 to wide i64 signed={signed} {mode:?}"),
+                &[f32f],
+                wide(64),
+                &|fb, x| {
+                    let kind = ConvertKind::ToInt {
+                        signed,
+                        round: Some(mode),
+                    };
+                    w::convert(fb, kind, f32f, wide(64), x[0])
+                },
+                &floats,
+                &|c| {
+                    let x = f64::from(f32v(arg(c, 0)));
+                    Some(vec![saturated(integral_of(x, mode), 64, signed)])
+                },
+            );
+        }
+    }
+    for (from, to) in [
+        (wide(64), int(32)),
+        (wide(64), int(8)),
+        (wide(64), wide(64)),
+        (int(32), wide(64)),
+        (wide(40), wide(64)),
+    ] {
+        let mut vals = rounding_ints(from.bits());
+        vals.extend([
+            0x7F,
+            0x80,
+            0xFF,
+            0x100,
+            0x7FFF_FFFF,
+            0x8000_0000,
+            0xFFFF_FFFF,
+        ]);
+        let cases: Vec<Case> = vals
+            .iter()
+            .map(|v| vec![vec![*v & mask(from.bits())]])
+            .collect();
+        for (signed, dst) in [
+            (true, Sign::Signed),
+            (true, Sign::Unsigned),
+            (false, Sign::Signed),
+            (false, Sign::Unsigned),
+        ] {
+            check_wide(
+                &format!("{from:?} signed={signed} to {to:?} {dst:?} sat"),
+                &[from],
+                to,
+                &|fb, v| {
+                    let kind = ConvertKind::Int {
+                        signed,
+                        saturate: Some(dst),
+                    };
+                    w::convert(fb, kind, from, to, v[0])
+                },
+                &cases,
+                &|c| {
+                    let v = value_of(arg(c, 0), from.bits(), signed);
+                    Some(vec![clamped(v, to.bits(), dst == Sign::Signed)])
+                },
+            );
+        }
     }
 }

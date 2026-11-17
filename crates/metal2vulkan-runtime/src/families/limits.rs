@@ -838,17 +838,38 @@ impl LimitRow {
             // Argument buffers' buffers, reached by device address (set 1 for dispatches, draws
             // and tile dispatches alike).
             L::ArgumentBufferBuffers => first([addressed(f, Feature::ArgumentBufferPointers)]),
-            // Argument buffers' textures and samplers: the handle table's descriptors.
-            L::ArgumentBufferTextures => first([at_least(
-                Feature::ArgumentBufferTextures,
-                VkLimit::MaxDescriptorSetUpdateAfterBindSampledImages,
-                l.max_descriptor_set_update_after_bind_sampled_images,
-            )]),
-            L::ArgumentBufferSamplers => first([at_least(
-                Feature::ArgumentBufferTextures,
-                VkLimit::MaxDescriptorSetUpdateAfterBindSamplers,
-                l.max_descriptor_set_update_after_bind_samplers,
-            )]),
+            // Argument buffers' textures: those a set-1 sampled-image array holds, at IDs 1 and up
+            // (`resource_ids::texture_arrays`, which texture placements are checked against: the
+            // least of the handle table's reach and the update-after-bind sampled-image limits).
+            L::ArgumentBufferTextures => {
+                let [(elements, _), _] = crate::resource_ids::texture_arrays(f.profile);
+                let available = elements.saturating_sub(1);
+                match need {
+                    Need::AtLeast(required) if available < required => {
+                        RowState::Refused(Refusal::ArgumentBufferTextureCount {
+                            required,
+                            available,
+                        })
+                    }
+                    _ => RowState::Exact,
+                }
+            }
+            // Argument buffers' samplers: the live states the runtime holds for them,
+            // `maxArgumentBufferSamplerCount` as it answers it
+            // (`DeviceProperties::max_argument_buffer_sampler_count`), from the set-1 sampler
+            // array link makes (`pipeline::heap_sampler_capacity`) and the device's live samplers.
+            L::ArgumentBufferSamplers => {
+                let available = f.properties.max_argument_buffer_sampler_count;
+                match need {
+                    Need::AtLeast(required) if available < required => {
+                        RowState::Refused(Refusal::ArgumentBufferSamplerCount {
+                            required,
+                            available,
+                        })
+                    }
+                    _ => RowState::Exact,
+                }
+            }
             // Texture sizes: the device's image limits.
             L::TextureWidth1D => first([at_least(
                 Feature::TextureSize,
@@ -934,7 +955,31 @@ impl LimitRow {
             // may lie along one, up to the 65,535 threadgroups an axis past which Metal draws
             // nothing: `bind::METAL_MESH_GRID_AXIS`, measured on the M3 Max) and in all. Object
             // grids: `taskShader` too, then the device's task group counts likewise. Payloads:
-            // `taskShader`, then `maxTaskPayloadSize`.
+            // `taskShader`, then `maxTaskPayloadSize`. Where the device runs both stages as compute
+            // work (`DeviceProfile::emulates_mesh_shading`): a mesh grid is folded into rows of
+            // `maxComputeWorkGroupCount[0]`, at most `maxComputeWorkGroupCount[1]` of them, which
+            // Vulkan's minimums (65,535 each) put past every count the tables list; an object grid
+            // is a compute dispatch, within `maxComputeWorkGroupCount` along each axis; and the
+            // payload is compute workgroup memory beside the object wrapper's 12 bytes.
+            L::MeshThreadgroupsPerGrid if f.profile.emulates_mesh_shading() => RowState::Exact,
+            L::ObjectThreadgroupsPerGrid if f.profile.emulates_mesh_shading() => {
+                let counts = l.max_compute_work_group_count;
+                let along = |i: u8| {
+                    self::at_least(
+                        need,
+                        Feature::MeshShading,
+                        VkLimit::MaxComputeWorkGroupCount(i),
+                        u64::from(counts[usize::from(i)]),
+                    )
+                };
+                first([along(0), along(1), along(2)])
+            }
+            L::MeshPayload if f.profile.emulates_mesh_shading() => first([self::at_least(
+                need,
+                Feature::MeshShading,
+                VkLimit::MaxComputeSharedMemorySize,
+                u64::from(l.max_compute_shared_memory_size).saturating_sub(12),
+            )]),
             L::MeshThreadgroupsPerGrid => {
                 let counts = l.mesh.max_mesh_work_group_count;
                 let axis = match need {

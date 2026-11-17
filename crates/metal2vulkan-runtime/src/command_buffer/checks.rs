@@ -12,20 +12,34 @@
 //! - **When.** The scheduler holds a batch of a command buffer with a check, as it holds one for
 //!   its host step, once it is otherwise ready: its binary semaphores' signals submitted, every
 //!   event value it waits for reached by the host or by a submitted signal, and its host step
-//!   recorded. It holds it further while a value it waits for is reached only by a GPU signal
-//!   submitted but not yet landed (an `Event`'s, or a `SharedEvent`'s the GPU signals): Metal
-//!   submits the submission, and checks it, once the signal happened, so a resource detached
-//!   meanwhile fails it. A value the host set (or the device reached) needs no wait. On its
-//!   thread, without its own lock or the command buffer's, it then runs the check of each
-//!   submission that begins in the batch, and again of each that a host step of the batch
-//!   recorded commands for (what they reach is known only then), then submits the batch in its
-//!   order. Where the scheduler groups batches (`CompletionPolicy::Grouped` on a driver that
-//!   merges submissions, `group.rs`), it runs the checks of up to three batches right behind a
-//!   head that goes with the head's, in commit order, each once its batch is otherwise ready and
-//!   its events' values reached on the device or by the host, none committed after another
-//!   queue's batch: so they go to the driver together. Such a check runs before the previous
-//!   batch's `vkQueueSubmit`, in the pass that submits its own batch, where alone it runs after
-//!   it. `CompletionPolicy::Exact` checks each head alone.
+//!   recorded. Then the event's kind decides, as Metal's submission does (an M3 Max under macOS
+//!   27.0.1, the conformance case `event-wait-behind-a-running-signal`: a command buffer waiting
+//!   for a value only a signal still running on the GPU reaches, its status and scheduled handler
+//!   read while that signal ran; its `Scheduled` is the proxy for "submitted, and so checked"). An
+//!   `Event`'s value no host call sets, and Metal submits a command buffer whose `MTLEvent` wait
+//!   such a signal meets at once: so a wait the batch hands to its `VkQueue` (a signal submitted
+//!   before it, on its `VkQueue` or one the GPU wait reaches, or reserved by the caller) holds no
+//!   check, which runs at once and the batch goes with the wait on the `VkQueue`, as a batch
+//!   without a check does. Metal holds one whose `MTLSharedEvent` wait such a signal meets until
+//!   the signal lands, as the runtime holds every wait for a value the host may set
+//!   (`event_timeline.rs`): so a `SharedEvent`'s value reached only by a GPU signal submitted but
+//!   not yet landed holds the check until it lands, and a resource detached meanwhile fails the
+//!   submission. A value the host set (or the device reached) needs no wait. On its thread, without
+//!   its own lock or the command buffer's, it then runs the check of each submission that begins in
+//!   the batch, and again of each that a host step of the batch recorded commands for (what they
+//!   reach is known only then), then submits the batch in its order. A thread in
+//!   `CommandBuffer::commit_and_submit` that makes the submission pass itself runs those checks
+//!   instead, the same way, just before it submits the batch, where the batch is the first queue's
+//!   head in commit order ready but for them and behind no earlier commit, with no host step and no
+//!   group, and every value it waits for reached on the device or by the host or one its `VkQueue`
+//!   waits for (`scheduler::claim_check`); the rest are the scheduler thread's. Where the scheduler
+//!   groups batches (`CompletionPolicy::Grouped` on a driver that merges submissions, `group.rs`),
+//!   it runs the checks of up to three batches right behind a head that goes with the head's, in
+//!   commit order, each once its batch is otherwise ready and its events' values reached on the
+//!   device or by the host, none committed after another queue's batch: so they go to the driver
+//!   together. Such a check runs before the previous batch's `vkQueueSubmit`, in the pass that
+//!   submits its own batch, where alone it runs after it. `CompletionPolicy::Exact` checks each
+//!   head alone.
 //! - **Stricter than Metal: the re-check after a host step.** Metal checks a submission once,
 //!   with what it knows as it submits it, and cannot know what the commands the GPU writes into
 //!   an indirect command buffer reach before they run (an earlier encoder of the same submission
@@ -38,7 +52,12 @@
 //!   (`State::fail_part`): every other encoder runs, the event signals fire, the scheduled and
 //!   completed handlers run, and the command buffer completes with status `Error` and
 //!   `CommandBufferError::Injected` of the first failure's code (a `commit_failed`'s before any
-//!   check's). A check that panics fails its submission with code 1 (`Internal`).
+//!   check's). A check that panics fails its submission with code 1 (`Internal`). The commit of
+//!   a command buffer with a check encodes again apart the encoders whose commands a shared
+//!   `VkCommandBuffer` of a group of encoders holds where they lie in more than
+//!   one submission (`encoder_fold.rs`'s **Failed**), so a failed submission's encoders run
+//!   nothing alone; where it cannot encode them again so, a failed submission whose commands
+//!   such a `VkCommandBuffer` holds fails every submission whose commands it holds.
 //! - **Behind a hang** (`hang.rs`). A command buffer committed with an event wait while a hang
 //!   of its queue (a draw of primitive type 9) was in flight is held for this pass too, with or
 //!   without a check: its first batch's pass, once its waits are met and the batches before it
@@ -59,14 +78,16 @@ use std::sync::Arc;
 
 /// A command buffer's submission check ([`CommandBuffer::set_submission_check`]): a runtime
 /// extension, no Metal type. Called with each submission of the command buffer as Metal splits
-/// it, on the device's scheduler thread, it answers `None` for the submission to run, or the
-/// `MTLCommandBufferError` code to fail it with (8, `OutOfMemory`, for one that uses a resource
-/// whose memory was taken away, as Metal fails it).
+/// it, on the device's scheduler thread, or on the thread of a
+/// [`CommandBuffer::commit_and_submit`] that submits it, it answers `None` for the submission to
+/// run, or the `MTLCommandBufferError` code to fail it with (8, `OutOfMemory`, for one that uses
+/// a resource whose memory was taken away, as Metal fails it).
 ///
-/// It runs with no lock of the runtime's held, and holds back the scheduler thread's submissions
-/// while it runs: a commit made meanwhile returns at once, and its batches wait in the inbox for
-/// the thread's next pass, after this check (`scheduler/inbox.rs`). It must not wait for GPU work,
-/// a command buffer or a handler, and should be quick. It may call the runtime otherwise.
+/// It runs with no lock of the runtime's held, and holds back the submissions of the thread that
+/// runs it: a commit made meanwhile returns at once, and its batches wait in the inbox for the
+/// scheduler thread's next pass, after this check (`scheduler/inbox.rs`). It must take no lock a
+/// caller of `commit_and_submit` holds and must not wait for GPU work, a command buffer or a
+/// handler, and should be quick. It may call the runtime otherwise.
 pub type SubmissionCheck = Arc<dyn Fn(&Submission<'_>) -> Option<NonZeroU64> + Send + Sync>;
 
 /// The `MTLCommandBufferError` code a submission whose check panicked fails with: `Internal`.
@@ -179,20 +200,25 @@ pub(crate) fn submission_start(
 }
 
 impl State {
+    /// Metal's submissions of its ended encoders ([`metal_submissions`]).
+    pub(super) fn metal_submissions(&self) -> Vec<(EncoderKind, Range<usize>)> {
+        metal_submissions(self.ended.iter().map(|record| {
+            (
+                record.kind,
+                record.event_waits_before,
+                record.event_signals_before,
+            )
+        }))
+    }
+
     /// Metal's submissions of its ended encoders, for its check, as it commits; nothing without
     /// a check, or a decision of its first batch's submission behind a hang (`hang.rs`).
     pub(super) fn plan_checks(&mut self) {
         if self.check.is_none() && self.behind_hang.is_none() {
             return;
         }
-        let encoders = self.ended.iter().map(|record| {
-            (
-                record.kind,
-                record.event_waits_before,
-                record.event_signals_before,
-            )
-        });
-        let planned = metal_submissions(encoders)
+        let planned = self
+            .metal_submissions()
             .into_iter()
             .map(|(kind, encoders)| Planned {
                 kind,
@@ -244,7 +270,10 @@ impl State {
 
     /// The check of submission `at` (`encoders`) failed it with `code`, before batch `index`
     /// is submitted: its encoders' parts from that batch on run nothing (`fail_part`), and the
-    /// command buffer fails with the code unless it failed already.
+    /// command buffer fails with the code unless it failed already. Where one of them lies in a
+    /// group of encoders recorded into one `VkCommandBuffer` that holds commands of other
+    /// submissions too, which the commit could not split (`State::split_failure`), every
+    /// submission whose commands it holds runs nothing with it (`widened`).
     fn fail_submission(&mut self, index: usize, at: usize, encoders: &Range<usize>, code: u64) {
         if let Some(planned) = self
             .checks
@@ -253,19 +282,52 @@ impl State {
         {
             planned.failed = true;
         }
+        let encoders = self.widened(encoders);
+        // Encoded again after this, by the commit's split of a group or a rebind, they still
+        // run nothing (`reencode.rs`).
+        self.unrunnable.extend(encoders.clone());
         let from = self.batch_range(index).start;
         let State {
-            recorded, retained, ..
+            recorded,
+            retained,
+            ended,
+            ..
         } = self;
         for part in recorded[from..]
             .iter_mut()
             .filter(|part| encoders.contains(&part.encoder))
         {
-            State::fail_part(part, retained);
+            State::fail_part(part, ended, retained);
         }
         if self.failure.is_none() {
             self.failure = Some(CommandBufferError::Injected(code));
         }
+    }
+
+    /// `encoders`, Metal's submission a check failed, with every submission whose commands the
+    /// shared `VkCommandBuffer` of a group one of its encoders' commands lie in holds
+    /// (`State::in_tail`): that `VkCommandBuffer` runs whole or not at all, and each such
+    /// submission whole, so no unit of command predication runs in part.
+    fn widened(&self, encoders: &Range<usize>) -> Range<usize> {
+        let mut groups: Vec<Range<usize>> =
+            (self.ended.get(encoders.clone()).into_iter().flatten())
+                .filter_map(|record| record.group.clone())
+                .collect();
+        groups.dedup();
+        let tail: Vec<usize> = (groups.into_iter())
+            .map(|group| self.in_tail(group))
+            .filter(|tail| tail.iter().any(|encoder| encoders.contains(encoder)))
+            .flatten()
+            .collect();
+        if tail.iter().all(|encoder| encoders.contains(encoder)) {
+            return encoders.clone();
+        }
+        (self.metal_submissions().into_iter())
+            .map(|(_, submission)| submission)
+            .filter(|submission| tail.iter().any(|encoder| submission.contains(encoder)))
+            .fold(encoders.clone(), |failed, submission| {
+                failed.start.min(submission.start)..failed.end.max(submission.end)
+            })
     }
 
     /// Its first batch's submission, batch `index`, found a hang of its queue in flight
@@ -281,10 +343,13 @@ impl State {
         }
         let from = self.batch_range(index).start;
         let State {
-            recorded, retained, ..
+            recorded,
+            retained,
+            ended,
+            ..
         } = self;
         for part in &mut recorded[from..] {
-            State::fail_part(part, retained);
+            State::fail_part(part, ended, retained);
         }
     }
 
@@ -315,7 +380,9 @@ impl CommandBuffer {
     /// nothing, every other submission runs, the event signals fire, the handlers run, and the
     /// command buffer completes with status `Error` and code 8. A check that answers a code
     /// does that to its submission, and [`Submission::used_resources`] says what the submission
-    /// uses and reaches. Setting another check replaces it.
+    /// uses and reaches. Setting another check replaces it. The check runs on the device's
+    /// scheduler thread, or on the thread of a [`commit_and_submit`](Self::commit_and_submit)
+    /// that submits the submission ([`SubmissionCheck`]).
     ///
     /// Refused, changing nothing, once the command buffer is committed (`Invalid`,
     /// `Problem::AlreadyCommitted`).
@@ -340,8 +407,9 @@ impl CommandBufferShared {
                 .is_some_and(|checks| checks.batches <= index)
     }
 
-    /// The submission checks before batch `index` is submitted: on the scheduler's thread,
-    /// without its lock or this command buffer's, inside a section of the exit guard, once the
+    /// The submission checks before batch `index` is submitted: on the scheduler's thread, or a
+    /// committing one that submits the batch next (`scheduler::claim_check`), without the
+    /// scheduler's lock or this command buffer's, inside a section of the exit guard, once the
     /// batch is otherwise ready and its host step recorded. Each due check runs as the program's
     /// code (`exit_guard::program`); a code it answers, or a panic, fails its submission.
     pub(crate) fn run_checks(self: &Arc<Self>, index: usize) {

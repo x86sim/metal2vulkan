@@ -63,8 +63,14 @@ pub struct GraphicsState {
     /// `VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT` and the
     /// pipeline's color blend state with
     /// `VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT`, and
-    /// the pipeline's requirements name the feature. A device without the feature takes no input
-    /// attachment: a fetch there is the interlocked storage form or refused.
+    /// the pipeline's requirements name the feature. A device without the feature but with
+    /// `fragmentShaderPixelInterlock` takes no input attachment: a fetch there is the interlocked
+    /// storage form or refused. A device with neither reads them without this flag: the consumer
+    /// then orders each draw that reads them after the color writes of the earlier draws of its
+    /// subpass, and each draw that writes a color after the input attachment reads of the earlier
+    /// ones, by a barrier of the subpass's dependency on itself (by region) between the two, which
+    /// orders draws but not the overlapping fragments of one draw
+    /// (`PrecisionNote::UnorderedFetchWithinDraw`, which the fragment stage records).
     pub rasterization_order_attachment_access: bool,
     /// Metal's `maxVertexAmplificationCount` (1 without vertex amplification): a draw with this
     /// pipeline amplifies each vertex by a count in `[1, max_vertex_amplification_count]`, or,
@@ -139,6 +145,15 @@ pub struct GraphicsState {
     /// attachment, which Metal fails for every fragment) keeps such a function from running.
     #[cfg_attr(feature = "serde", serde(default))]
     pub early_fragment_tests: bool,
+    /// The fragment function writes the `SampleMask` output (its stage interface's
+    /// `io.builtins` lists `SampleMaskOut`): its own `[[sample_mask]]` return, or the render
+    /// pipeline's private masks it applies itself (`StageIo::sample_mask`). Under
+    /// [`early_fragment_tests`](GraphicsState::early_fragment_tests), Metal's visibility count of
+    /// the private masks keeps every sample the tests pass; Vulkan counts after the mask only
+    /// where the device states it (`earlyFragmentMultisampleCoverageAfterSampleCounting`,
+    /// [`Limits::early_fragment_multisample_coverage_after_sample_counting`](crate::device::Limits::early_fragment_multisample_coverage_after_sample_counting)).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub writes_sample_mask: bool,
     /// A mesh render pipeline on a device without `VK_EXT_mesh_shader`: its mesh function is
     /// the pipeline's `COMPUTE` module, which writes these records, and a synthesized `VERTEX`
     /// module draws them as a list of [`MeshRecords::topology`](MeshRecords::topology)
@@ -146,6 +161,11 @@ pub struct GraphicsState {
     /// every other pipeline.
     #[cfg_attr(feature = "serde", serde(default))]
     pub mesh_records: Option<MeshRecords>,
+    /// A mesh render pipeline's primitive, its mesh function's: its indices, 1 (points), 2
+    /// (lines) or 3 (triangles), whether the device draws the mesh or
+    /// [`mesh_records`](Self::mesh_records) does. `None` for every other pipeline.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub mesh_corners: Option<u32>,
     /// A render pipeline whose vertex function is a post-tessellation vertex function, on a
     /// device without `tessellationShader`: the function is the pipeline's `VERTEX` module, which
     /// draws the tessellator's triangles itself as a `TRIANGLE_LIST` from an emulated draw's
@@ -154,6 +174,17 @@ pub struct GraphicsState {
     /// other pipeline.
     #[cfg_attr(feature = "serde", serde(default))]
     pub emulated_tessellation: Option<EmulatedTessellation>,
+    /// A render pipeline variant that draws its lines as bands of triangles
+    /// (`VariantKey::line_band`, `pipeline::link::band`): its `topology` is `PATCH_LIST` (never
+    /// dynamic), its stages the vertex stage, the band's synthesized tessellation control and
+    /// evaluation stages, then the fragment stage. `None` for every other pipeline.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub line_band: Option<LineBandState>,
+    /// A render pipeline variant that draws a rate-mapped pass's triangles once, fanned out to
+    /// their regions by its triangle class's geometry stage (`VariantKey::region_fan_out`,
+    /// `pipeline::link::fan_out`). `None` for every other pipeline.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub region_fan_out: Option<FanOutState>,
     /// The vertex function writes `[[point_size]]` (as its compiled function's
     /// `writes_point_size` answers; a post-tessellation vertex function's is dropped and
     /// answers `false`). Metal sizes a point
@@ -300,6 +331,14 @@ pub struct GraphicsState {
     /// attachments' states already draw them. `None` with the logic operation off, and for those.
     #[cfg_attr(feature = "serde", serde(default))]
     pub logic_op: Option<vk::LogicOp>,
+    /// The fragment function reads an `interpolant` at a sample it names (`interpolate_at_sample`,
+    /// an input its stage interface samples `Sampling::Interpolant` with `sample`): its module
+    /// uses `GLSL.std.450 InterpolateAtSample`, which Vulkan takes in no
+    /// pipeline made with custom sample locations
+    /// (`VUID-VkGraphicsPipelineCreateInfo-sampleLocationsEnable-01524`), so the consumer draws it
+    /// only at the device's own sample positions.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub interpolates_at_sample: bool,
 }
 
 /// What a consumer and the binder need of a tessellation pipeline.
@@ -344,6 +383,142 @@ pub struct TessellationState {
     /// (`SyntheticBinding::ControlPointIndices`) its control stage reads; `None`, plain patches
     /// only.
     pub control_point_index_type: metal::TessellationControlPointIndexType,
+}
+
+/// What each patch of a render pipeline variant that draws bands is (`VariantKey::line_band`,
+/// `LineBandState::primitive`): Apple's `setLineWidth:` at a width the device's own lines do not
+/// draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum BandPrimitive {
+    /// A line: its two vertices, drawn as the parallelogram Metal draws for it.
+    Lines,
+    /// A triangle Metal draws in fill mode `Lines`: its three vertices, whose three edges are
+    /// each drawn as the parallelogram Metal draws for it.
+    Triangles,
+}
+
+impl BandPrimitive {
+    /// `VkPipelineTessellationStateCreateInfo::patchControlPoints`: the primitive's vertices.
+    pub fn patch_control_points(self) -> u32 {
+        match self {
+            BandPrimitive::Lines => 2,
+            BandPrimitive::Triangles => 3,
+        }
+    }
+}
+
+/// What a fan-out variant of a render pipeline does with a rate-mapped pass's triangles
+/// (`VariantKey::region_fan_out`, `GraphicsState::region_fan_out`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum RegionFanOut {
+    /// Draw each triangle once per region it touches, at most the stage's copies.
+    Draw,
+    /// Draw nothing, and flag the draw whose triangles the draw cannot fan out.
+    Probe,
+    /// [`Draw`](Self::Draw) through a stage of at most `bind::fan_out::FEW_COPIES` copies, for a
+    /// draw the probe found none of whose triangles reaches more pairs of segments.
+    DrawFew,
+    /// Draw the plan's regions region by region, each region's copy of each vertex computed by
+    /// the vertex function as a fanned-out copy's is, the draw's index stored as `ViewportIndex`
+    /// (`LoweringInputs::region_copies`): no geometry stage. A draw of a pass whose triangles a
+    /// draw fans out that is not fanned out itself, so that every route of the pass puts a vertex
+    /// in a region at the same position (`bind::fan_out`, **One route per pass**).
+    RegionCopies,
+}
+
+/// What a consumer and the binder need of a render pipeline variant that draws a rate-mapped
+/// pass's triangles once, its triangle class's geometry stage fanning each out to the regions it
+/// touches (`GraphicsState::region_fan_out`, `pipeline::link::fan_out`, `bind::fan_out` for the
+/// table).
+///
+/// Draw triangles alone, through one Vulkan viewport over the whole target and a scissor over it,
+/// with the region table (`bind::fan_out::table`, `SyntheticBinding::RateMapRegions`) of that
+/// viewport over the plan's regions bound. A draw of [`RegionFanOut::RegionCopies`] records the
+/// plan's regions a box of the table's at a time, `k` of them a recording (one draw of a
+/// `vkCmdDrawMultiEXT` or `vkCmdDrawMultiIndexedEXT` each, or a draw alone), each recording
+/// pushing the index of its box's first region and its box's columns `c` to its vertex
+/// function's `PushField::RegionBox`, at [`push_offset`](Self::push_offset) of its stage
+/// `VERTEX`: the vertex function draws region `first + (DrawIndex / c)·nx + DrawIndex mod c`,
+/// whose clip distances keep its pixels, and stores 0 as `ViewportIndex`. Such a recording sets
+/// the one viewport its pipeline
+/// takes to the one over the whole target, and the scissor of its box's pixels, the union of its
+/// regions' (`bind::fan_out::scissors`, in the table's order). A probe
+/// ([`RegionFanOut::Probe`]) draws nothing. Of
+/// the flags buffer's (`SyntheticBinding::RateMapFlags`) `bind::fan_out::PROBE_DRAW_WORDS`
+/// `u32`s from `PROBE_DRAW_WORDS·i`, `i` its pushed index (`PushField::RegionProbe`, at
+/// [`push_offset`](Self::push_offset) for stage `GEOMETRY`), it writes 1 into the first where a
+/// triangle of the draw touches more regions than [`copies`](Self::copies), or crosses `w = 0`,
+/// and raises the words after those below to that triangle's `PrimitiveId` and adds one into
+/// its flagged count, and sets the bit of its block of `bind::fan_out::BLOCK_TRIANGLES`; the
+/// consumer draws such a draw's blocks that hold a flagged triangle region by region, cut to its
+/// first and last flagged one, the others fanned out, or, where it cannot draw the draw in parts,
+/// the whole draw region by region, and counts its flagged triangles. It
+/// adds the copies the draw emits of each triangle it fans out into one of the
+/// `bind::fan_out::PROBE_COUNT_WORDS` after the flag, which the draw's work counts; and writes 1
+/// into one of the as many after those where a triangle it does not flag touches more regions
+/// than `bind::fan_out::FEW_COPIES`: a draw none of whose such words is 1 draws, or its parts
+/// fanned out draw, through its [`RegionFanOut::DrawFew`] variant. The words' layout is
+/// `bind::fan_out::PROBE_DRAW_WORDS`'s.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FanOutState {
+    /// What the variant does.
+    pub mode: RegionFanOut,
+    /// The most copies of a triangle its stage emits; 0 for [`RegionFanOut::RegionCopies`], which
+    /// emits each vertex once.
+    pub copies: u32,
+    /// Byte offset of the probe's push range (`PipelineLayout::push_constants`, stage
+    /// `GEOMETRY`, [`PUSH_BYTES`](Self::PUSH_BYTES)); of the vertex function's
+    /// `PushField::RegionBox` in its push window for [`RegionFanOut::RegionCopies`]; 0 for a
+    /// draw.
+    pub push_offset: u32,
+}
+
+impl FanOutState {
+    /// The probe's push range's bytes: one `u32`.
+    pub const PUSH_BYTES: u32 = crate::pipeline::link::fan_out::PUSH_BYTES;
+}
+
+/// What a consumer and the binder need of a render pipeline variant that draws its lines, or its
+/// triangles' edges, as bands (`GraphicsState::line_band`): Apple's `setLineWidth:` at a width the
+/// device's own lines do not draw.
+///
+/// Draw each primitive as one patch of [`BandPrimitive::patch_control_points`] control points, its
+/// vertices in order, with primitive restart off: a line list or a triangle list as it is; a strip,
+/// a loop, a fan, Metal's private triangle types or a list under Apple's last provoking vertex as
+/// the list of its primitives the runtime writes. Draw in fill mode. Lines
+/// ([`BandPrimitive::Lines`]): the band's two triangles cover the parallelogram Metal draws for the
+/// line; draw them with no culling and with front face [`FRONT_FACE`](Self::FRONT_FACE), so they
+/// are front-facing as a line is, and without depth bias, which Metal does not apply to lines.
+/// Triangles ([`BandPrimitive::Triangles`]): the band's triangles cover the three parallelograms
+/// Metal draws for the edges, and face as the triangle does; draw them with the draw's own cull
+/// mode, front face and depth bias, which Metal applies to the triangle (its slope and largest
+/// depth's exponent; the device biases each band triangle by its own). Push the band's
+/// `[sx, sy, h, f]` (`f32`s; `PushField::LineBand`) at [`push_offset`](Self::push_offset) for
+/// stage `TESSELLATION_EVALUATION`: the half extent of the draw's Vulkan viewport 0, its height
+/// negative as a Y-flipped viewport's is, half the width in framebuffer pixels, and for triangles
+/// 1 where the draw's front face is `CLOCKWISE` and -1 where it is `COUNTER_CLOCKWISE` (0 for
+/// lines; the binder writes it from `BindState::line_band`). Create the pipeline in Vulkan's
+/// default tessellation domain origin, `UPPER_LEFT`.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct LineBandState {
+    /// Byte offset of the evaluation stage's push range (`PipelineLayout::push_constants`, stage
+    /// `TESSELLATION_EVALUATION`, [`PUSH_BYTES`](Self::PUSH_BYTES)).
+    pub push_offset: u32,
+    /// What each patch is.
+    pub primitive: BandPrimitive,
+}
+
+impl LineBandState {
+    /// The push range's bytes: one `vec4`.
+    pub const PUSH_BYTES: u32 = crate::pipeline::link::band::LineBand::PUSH_BYTES;
+    /// The front face a draw of a band of lines sets, under which its triangles are front-facing.
+    pub const FRONT_FACE: vk::FrontFace = crate::pipeline::link::band::LineBand::FRONT_FACE;
 }
 
 /// What a consumer and the binder need of a tessellation pipeline on a device without
@@ -415,8 +590,12 @@ impl GraphicsState {
             storage_attachments: Vec::new(),
             shadow_stencil: None,
             early_fragment_tests: false,
+            writes_sample_mask: false,
             mesh_records: None,
+            mesh_corners: None,
             emulated_tessellation: None,
+            line_band: None,
+            region_fan_out: None,
             writes_point_size: false,
             flat_fragment_inputs: false,
             clip_distances: 0,
@@ -431,6 +610,7 @@ impl GraphicsState {
             snapshot_reads: false,
             color_group: None,
             logic_op: None,
+            interpolates_at_sample: false,
         }
     }
 
@@ -1153,7 +1333,9 @@ pub enum StandInView {
 
 /// A framebuffer-fetch input: color attachment `color_index` read as input attachment
 /// `input_attachment_index`. The consumer's render pass provides the self-dependency (or
-/// `dynamicRenderingLocalRead` mapping) that the contract names. In a pipeline of more than one
+/// `dynamicRenderingLocalRead` mapping) that the contract names, and, without
+/// [`rasterization_order_attachment_access`](GraphicsState::rasterization_order_attachment_access),
+/// the barriers between draws it states. In a pipeline of more than one
 /// sample the attachment is the pass's multisampled one, of `GraphicsState::rasterization_samples`
 /// samples, which the function reads at each invocation's own sample.
 #[non_exhaustive]

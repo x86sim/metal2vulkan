@@ -13,17 +13,19 @@
 //! dispatches share one heap set per pipeline variant, so 2048 dispatches over textures of their
 //! own each read their own and the process stays small.
 
+use super::apart_writes::{layer_reported_nothing_but_apart_writes, NotedWrites};
 use super::kernel_textures::{absent_read_only, fresh_candidate, refusal};
 use super::{
-    bound_buffers, buffer_with, encode_case, layer_reported_nothing, layer_reported_nothing_at_all,
-    pipeline_state, public_case, public_cases, read_buffer, run_case, validated_device,
-    CaseResources, Messages, ScratchCache,
+    at_plan, bound_buffers, buffer_with, encode_case, layer_reported_nothing,
+    layer_reported_nothing_at_all, pipeline_state, public_case, public_cases, read_buffer,
+    run_case, validated_device_with, CaseResources, Messages, ScratchCache,
 };
 use crate::candidate::engine::ComputeOutput;
 use crate::case::{AuthoredCase, Stage};
 use crate::gpu::{DeviceType, TEST_DEVICE};
 use metal2vulkan::bind::{SamplerDescriptor, StatusReport};
 use metal2vulkan::metal::{PixelFormat, ResourceUsage};
+use metal2vulkan_runtime::DeviceOptions;
 use metal2vulkan_runtime::{
     CommandBuffer, Device, ResourceId, SamplerStateOptions, Size, TextureDescriptor,
 };
@@ -44,11 +46,23 @@ const HANDLE_SAMPLER: &str =
 
 /// Run `test` on a validated device of the lane, then fail on any validation message.
 fn on_device(test: impl FnOnce(&Device)) {
+    on_device_with(|_| {}, test)
+}
+
+/// [`on_device`], `adjust` applied to the options of each device it makes (`at_plan` gives them
+/// their queue plan).
+fn on_device_with(adjust: fn(&mut DeviceOptions), test: impl FnOnce(&Device)) {
+    on_device_with_messages(adjust, |device, _| test(device))
+}
+
+/// [`on_device_with`], the test given the device's message list too, for claims it states as it
+/// goes.
+fn on_device_with_messages(adjust: fn(&mut DeviceOptions), test: impl FnOnce(&Device, &Messages)) {
     let messages = Messages::default();
     let cache = ScratchCache::new().unwrap();
     {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
-        test(&device);
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), adjust).unwrap();
+        test(&device, &messages);
     }
     layer_reported_nothing_at_all(&messages);
 }
@@ -58,7 +72,9 @@ fn on_device(test: impl FnOnce(&Device)) {
 /// executor run afresh on the case, or is refused honestly; the validation layer reports nothing.
 #[test]
 fn kernels_reach_buffers_through_addresses_in_argument_buffers() {
-    let census = census("buffers", |case| !case.argument_buffer_buffers.is_empty());
+    let census = census_with(at_plan, "buffers", |case| {
+        !case.argument_buffer_buffers.is_empty()
+    });
     assert!(census.matched > 0, "no case matched Metal");
 }
 
@@ -67,13 +83,13 @@ fn kernels_reach_buffers_through_addresses_in_argument_buffers() {
 /// members made, their IDs written into their owners, and its textures made resident.
 #[test]
 fn kernels_reach_textures_and_samplers_through_ids_in_argument_buffers() {
-    let census = census("textures and samplers", |case| {
+    let census = census_with(at_plan, "textures and samplers", |case| {
         !case.argument_buffer_textures.is_empty() || !case.argument_buffer_samplers.is_empty()
     });
     assert!(census.matched > 0, "no case matched Metal");
 }
 
-/// What [`census`] saw: how many cases matched Metal.
+/// What [`census_with`] saw: how many cases matched Metal.
 struct Census {
     matched: usize,
 }
@@ -81,7 +97,14 @@ struct Census {
 /// Run every committed public kernel case `select` takes, its argument buffers holding `what`:
 /// each has a clean execution report and Metal's output, or the output of the candidate executor
 /// run afresh on the case, or is refused honestly; the validation layer reports nothing.
-fn census(what: &str, select: impl Fn(&AuthoredCase) -> bool) -> Census {
+///
+/// `adjust` is applied to the options of each device it makes (`at_plan` gives them their
+/// queue plan).
+fn census_with(
+    adjust: fn(&mut DeviceOptions),
+    what: &str,
+    select: impl Fn(&AuthoredCase) -> bool,
+) -> Census {
     let cases = public_cases(|case| {
         case.stage == Stage::Kernel && case.public_source.is_some() && select(case)
     })
@@ -94,7 +117,7 @@ fn census(what: &str, select: impl Fn(&AuthoredCase) -> bool) -> Census {
     let mut differing = Vec::new();
     {
         let cache = ScratchCache::new().unwrap();
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), adjust).unwrap();
         device_name = device.name().to_owned();
         for (name, case) in &cases {
             let run = case
@@ -202,10 +225,12 @@ fn run(command_buffer: &CommandBuffer) {
 /// buffer into the walker's argument buffer, which did not hold it; the walker then reads
 /// through it,
 /// in the same encoder and in the next one of the same command buffer, its buffer made resident
-/// for reading only (`use_resource`). Its output is its run over the CPU's address, Metal's.
+/// for reading only (`use_resource`). Its output is its run over the CPU's address, Metal's. The
+/// two copies write words 4 bytes apart, which the layer, taking each descriptor's range as
+/// written, reports as a write after write ([`layer_reported_nothing_but_apart_writes`]).
 #[test]
 fn addresses_a_kernel_writes_reach_buffers_as_the_cpus_do() {
-    on_device(|device| {
+    on_device_with_messages(at_plan, |device, messages| {
         let queue = device.new_command_queue().unwrap();
         let copier = public_case(WORD_COPIER).unwrap();
         let walker = public_case(POINTER_WALKER).unwrap();
@@ -253,13 +278,14 @@ fn addresses_a_kernel_writes_reach_buffers_as_the_cpus_do() {
             let mut encoder = command_buffer.compute_command_encoder().unwrap();
             encoder.set_compute_pipeline_state(&copy).unwrap();
             encoder.set_buffer(Some(&address), 0, 0).unwrap();
+            let mut writes = NotedWrites::new(messages);
             for word in [0, 4] {
                 encoder.set_buffer_offset(word, 0).unwrap();
-                encoder
-                    .set_buffer(Some(owner), u64::from(field.1) + word, 1)
-                    .unwrap();
+                let at = u64::from(field.1) + word;
+                encoder.set_buffer(Some(owner), at, 1).unwrap();
                 let one = Size::new(1, 1, 1);
                 encoder.dispatch_threads(one, one).unwrap();
+                writes.dispatched(owner, at..at + 4);
             }
             if !one_encoder {
                 encoder.end_encoding().unwrap();
@@ -273,6 +299,7 @@ fn addresses_a_kernel_writes_reach_buffers_as_the_cpus_do() {
             run(&command_buffer);
             let output = read_buffer(&buffers[&binding], offset, length).unwrap();
             assert_eq!(output, expected, "{how}");
+            layer_reported_nothing_but_apart_writes(messages, how, &writes);
         }
     });
 }
@@ -319,10 +346,12 @@ fn resource_ids_are_dense_per_kind_and_reused() {
 /// from a buffer into an argument buffer, which did not hold them; a kernel then samples the
 /// texture through the sampler, both named by the IDs it loads, in the same encoder and in the
 /// next one of the same command buffer, the texture made resident for reading only
-/// (`use_resource`). Its output is its run over the CPU's IDs, Metal's.
+/// (`use_resource`). Its output is its run over the CPU's IDs, Metal's. The copies write words 4
+/// bytes apart, which the layer, taking each descriptor's range as written, reports as writes after
+/// writes ([`layer_reported_nothing_but_apart_writes`]).
 #[test]
 fn resource_ids_a_kernel_writes_name_resources_as_the_cpus_do() {
-    on_device(|device| {
+    on_device_with_messages(at_plan, |device, messages| {
         let queue = device.new_command_queue().unwrap();
         let copier = public_case(WORD_COPIER).unwrap();
         let sampler = public_case(HANDLE_SAMPLER).unwrap();
@@ -377,6 +406,7 @@ fn resource_ids_a_kernel_writes_name_resources_as_the_cpus_do() {
             let mut encoder = command_buffer.compute_command_encoder().unwrap();
             encoder.set_compute_pipeline_state(&copy).unwrap();
             encoder.set_buffer(Some(&source), 0, 0).unwrap();
+            let mut writes = NotedWrites::new(messages);
             for ((field, id), at) in ids.iter().zip((0u64..).step_by(8)) {
                 let owner = &buffers[&field.0];
                 assert_ne!(
@@ -386,11 +416,11 @@ fn resource_ids_a_kernel_writes_name_resources_as_the_cpus_do() {
                 );
                 for word in [0, 4] {
                     encoder.set_buffer_offset(at + word, 0).unwrap();
-                    encoder
-                        .set_buffer(Some(owner), u64::from(field.1) + word, 1)
-                        .unwrap();
+                    let to = u64::from(field.1) + word;
+                    encoder.set_buffer(Some(owner), to, 1).unwrap();
                     let one = Size::new(1, 1, 1);
                     encoder.dispatch_threads(one, one).unwrap();
+                    writes.dispatched(owner, to..to + 4);
                 }
             }
             if !one_encoder {
@@ -412,6 +442,7 @@ fn resource_ids_a_kernel_writes_name_resources_as_the_cpus_do() {
             run(&command_buffer);
             let output = read_buffer(&buffers[&binding], offset, length).unwrap();
             assert_eq!(output, expected, "{how}");
+            layer_reported_nothing_but_apart_writes(messages, how, &writes);
         }
     });
 }

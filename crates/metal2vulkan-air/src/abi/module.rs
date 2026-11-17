@@ -1,7 +1,9 @@
 //! Module-level named metadata and entry-point nodes.
 
 use super::args::Cx;
-use super::md::{abi_error, diag, kept_bytes, kept_diag, node_ops, tok, Ops, Site, Tok};
+use super::md::{
+    abi_error, diag, kept_bytes, kept_diag, node_ops, saw, saw_str, tok, Ops, Site, Tok,
+};
 use super::sampler::decode_global;
 use super::structs::Structs;
 use super::{
@@ -13,7 +15,7 @@ use crate::bitcode::PointeeTable;
 use crate::budget::Meter;
 use crate::error::Error;
 use crate::error::{AbiError, DiagName, Location};
-use crate::ir::{MdId, Module, Type, TypeId, TypeLayouts};
+use crate::ir::{Md, MdId, Module, Type, TypeId, TypeLayouts};
 
 /// The closed set of named metadata lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +38,10 @@ enum Named {
     SourceFileName,
     ModuleFlags,
     Ident,
+    CommandLine,
+    WorkingDirectory,
+    RecordedSources,
+    DebugCompileUnits,
 }
 
 const NAMED: &[(&str, Named)] = &[
@@ -60,6 +66,10 @@ const NAMED: &[(&str, Named)] = &[
     ("air.source_file_name", Named::SourceFileName),
     ("llvm.module.flags", Named::ModuleFlags),
     ("llvm.ident", Named::Ident),
+    ("llvm.commandline", Named::CommandLine),
+    ("llvm_utils.workingdir", Named::WorkingDirectory),
+    ("llvm_utils.sources", Named::RecordedSources),
+    ("llvm.dbg.cu", Named::DebugCompileUnits),
 ];
 
 /// Decode every named list of `m`. Entries are decoded kernel, vertex, fragment, object, mesh,
@@ -140,12 +150,38 @@ pub(super) fn decode(
                     }
                 }
             }
-            Named::SourceFileName => {
+            Named::SourceFileName => strings(m, ops, &site, "air.source_file_name", cx.meter)?,
+            // `-frecord-sources` (Xcode's `MTL_ENABLE_DEBUG_INFO=INCLUDE_SOURCE`) records the
+            // compiler's command line, its working directory, and each source it read as
+            // `!{!"<path>", !"<text>"}`. The linker moves them out of the module, so only an
+            // unlinked `.air` carries them.
+            Named::CommandLine => strings(m, ops, &site, "llvm.commandline", cx.meter)?,
+            Named::WorkingDirectory => {
+                strings(m, ops, &site, "llvm_utils.workingdir", cx.meter)?;
+            }
+            Named::RecordedSources => {
+                let key = Some("llvm_utils.sources");
                 for &id in ops {
                     cx.meter.tick(1)?;
-                    let mut n = Ops::node(m, id, site.clone())?;
-                    n.string(Some("air.source_file_name"))?;
-                    n.finish()?;
+                    let mut files = Ops::node(m, id, site.clone())?;
+                    while !files.is_done() {
+                        cx.meter.tick(1)?;
+                        let mut file = Ops::node(m, files.child(key)?, site.clone())?;
+                        file.string(key)?;
+                        file.string(key)?;
+                        file.finish()?;
+                    }
+                }
+            }
+            // Debug info's compile units (`-gline-tables-only`, which Xcode's
+            // `MTL_ENABLE_DEBUG_INFO` passes): debug-info records, which carry nothing the
+            // translation reads.
+            Named::DebugCompileUnits => {
+                for &id in ops {
+                    cx.meter.tick(1)?;
+                    if !matches!(m.md(id), Some(Md::Debug)) {
+                        return Err(site.err(AbiError::BadValue, Some("llvm.dbg.cu")));
+                    }
                 }
             }
             Named::Kernel | Named::Vertex | Named::Fragment | Named::Object | Named::Mesh => {}
@@ -163,8 +199,9 @@ pub(super) fn decode(
                     cx.meter.tick(1)?;
                     let key = Some("air.sampler_state");
                     let mut n = Ops::node(m, id, site.clone())?;
-                    if n.string(key)? != b"air.sampler_state" {
-                        return Err(site.err(AbiError::UnknownKey, key));
+                    let tag = n.string(key)?;
+                    if tag != b"air.sampler_state" {
+                        return Err(site.unknown(key, saw_str(tag)));
                     }
                     let global = n.global(key)?;
                     n.finish()?;
@@ -195,8 +232,9 @@ pub(super) fn decode(
                     cx.meter.tick(1)?;
                     let key = Some("air.visible_function_reference");
                     let mut n = Ops::node(m, id, site.clone())?;
-                    if n.string(key)? != b"air.visible_function_reference" {
-                        return Err(site.err(AbiError::UnknownKey, key));
+                    let tag = n.string(key)?;
+                    if tag != b"air.visible_function_reference" {
+                        return Err(site.unknown(key, saw_str(tag)));
                     }
                     let target = match n.next(key)? {
                         Tok::Global(g) => VisibleTarget::Global(g),
@@ -249,6 +287,23 @@ pub(super) fn decode(
     Ok(abi)
 }
 
+/// A list of single-string nodes, which carry nothing the translation reads.
+fn strings(
+    m: &Module,
+    ops: &[MdId],
+    site: &Site,
+    key: &'static str,
+    meter: &mut Meter,
+) -> Result<(), Error> {
+    for &id in ops {
+        meter.tick(1)?;
+        let mut n = Ops::node(m, id, site.clone())?;
+        n.string(Some(key))?;
+        n.finish()?;
+    }
+    Ok(())
+}
+
 /// The one node of a single-node list.
 fn single(ops: &[MdId], site: &Site) -> Result<MdId, Error> {
     match ops {
@@ -269,7 +324,10 @@ fn version(m: &Module, id: MdId, site: &Site) -> Result<Version, Error> {
     Ok(v)
 }
 
-/// `!air.compile_options`: a closed set of single-string nodes.
+/// `!air.compile_options`: a closed set of single-string nodes. An option may repeat (a module
+/// Metal links at run time merges its modules' lists, Core Image's kernels among them); a repeat
+/// states nothing new. An option stated both enabled and disabled is refused: the format gives
+/// neither precedence.
 fn compile_options(
     m: &Module,
     ops: &[MdId],
@@ -288,16 +346,16 @@ fn compile_options(
             b"air.compile.fast_math_disable" => (&mut c.fast_math, false),
             b"air.compile.framebuffer_fetch_enable" => (&mut c.framebuffer_fetch, true),
             b"air.compile.framebuffer_fetch_disable" => (&mut c.framebuffer_fetch, false),
-            b"air.compile.denorms_disable" if !c.denorms_disable => {
+            b"air.compile.denorms_disable" => {
                 c.denorms_disable = true;
                 continue;
             }
-            b"air.compile.denorms_disable" => return Err(site.err(AbiError::BadValue, key)),
-            _ => return Err(site.err(AbiError::UnknownKey, key)),
+            _ => return Err(site.unknown(key, saw_str(option))),
         };
-        if slot.replace(value).is_some() {
+        if slot.is_some_and(|stated| stated != value) {
             return Err(site.err(AbiError::BadValue, key));
         }
+        *slot = Some(value);
     }
     Ok(c)
 }
@@ -329,7 +387,7 @@ fn plain_signature(n: &mut Ops<'_>, site: &Site) -> Result<LinkageSignature, Err
     let kind = match n.string(key)? {
         b"air.linked_constants_signature" => LinkageSignatureKind::LinkedConstants,
         b"air.stitching_modules_signature" => LinkageSignatureKind::StitchingModules,
-        _ => return Err(site.err(AbiError::UnknownKey, key)),
+        other => return Err(site.unknown(key, saw_str(other))),
     };
     let operands =
         u32::try_from(n.len().saturating_sub(1)).map_err(|_| site.err(AbiError::BadValue, key))?;
@@ -337,8 +395,8 @@ fn plain_signature(n: &mut Ops<'_>, site: &Site) -> Result<LinkageSignature, Err
 }
 
 /// `!llvm.module.flags`: `!{i32 <behavior>, !"<key>", <value>}`. The `air.max_*` limits are
-/// decoded; `wchar_size`, `frame-pointer`, and `SDK Version` are LLVM's and carry nothing the
-/// translation reads; `air.workaround.sampler_state_variable_length_encoding` (an `i1`) names the
+/// decoded; `wchar_size`, `frame-pointer`, `SDK Version`, and debug info's `Dwarf Version` and
+/// `Debug Info Version` are LLVM's and carry nothing the translation reads; `air.workaround.sampler_state_variable_length_encoding` (an `i1`) names the
 /// form of the module's constexpr sampler words, which each `air.sampler_state` global's own type
 /// states; any other flag is unknown.
 fn module_flags(
@@ -361,7 +419,11 @@ fn module_flags(
             b"air.max_textures" => &mut l.max_textures,
             b"air.max_read_write_textures" => &mut l.max_read_write_textures,
             b"air.max_samplers" => &mut l.max_samplers,
-            b"wchar_size" | b"frame-pointer" | b"SDK Version" => {
+            b"wchar_size"
+            | b"frame-pointer"
+            | b"SDK Version"
+            | b"Dwarf Version"
+            | b"Debug Info Version" => {
                 n.next(key)?;
                 n.finish()?;
                 continue;
@@ -374,7 +436,7 @@ fn module_flags(
                 n.finish()?;
                 continue;
             }
-            _ => return Err(site.err(AbiError::UnknownKey, key)),
+            _ => return Err(site.unknown(key, saw_str(flag))),
         };
         if slot.replace(n.u32(key)?).is_some() {
             return Err(site.err(AbiError::BadValue, key));
@@ -444,6 +506,7 @@ fn entry(cx: &mut Cx<'_, '_>, stage: Named, id: MdId) -> Result<EntryPoint, Erro
     let mut stage = match stage {
         Named::Kernel => Stage::Kernel {
             max_total_threads: None,
+            work_group_size: None,
         },
         Named::Vertex => Stage::Vertex { patch: None },
         Named::Fragment => Stage::Fragment {
@@ -517,12 +580,14 @@ fn entry(cx: &mut Cx<'_, '_>, stage: Named, id: MdId) -> Result<EntryPoint, Erro
 }
 
 /// One trailing entry attribute: `!{"air.max_work_group_size", i32 N}` (kernel, object, mesh),
+/// `!{"air.work_group_size", i32 X, i32 Y, i32 Z}` (kernel, OpenCL C's `reqd_work_group_size`),
 /// `!{"air.max_mesh_work_groups", i32 N}` (object),
 /// `!{"air.patch", !"quad"|"triangle"[, "air.patch_control_point", i32 N]}` (vertex),
 /// `!"early_fragment_tests"` (fragment), or `!{"air.user_annotation", !"text"}` (any stage, kept
 /// in `annotation`, its text charged to `meter`). Any other attribute, or one of these on another
 /// stage, is `UnknownStageAttribute` naming its key; an operand that states no key is
-/// `UnknownKey`; an attribute stated twice is `BadValue`.
+/// `UnknownKey`, its location naming the operand's shape; an attribute stated twice is
+/// `BadValue`.
 fn stage_attribute(
     m: &Module,
     n: &mut Ops<'_>,
@@ -558,7 +623,9 @@ fn stage_attribute(
         (
             Tok::Node(id),
             Some(b"air.max_work_group_size"),
-            Stage::Kernel { max_total_threads }
+            Stage::Kernel {
+                max_total_threads, ..
+            }
             | Stage::Object {
                 max_total_threads, ..
             }
@@ -571,6 +638,23 @@ fn stage_attribute(
                 return Err(site.err(AbiError::BadValue, key));
             }
             a.finish()?;
+        }
+        (
+            Tok::Node(id),
+            Some(b"air.work_group_size"),
+            Stage::Kernel {
+                work_group_size, ..
+            },
+        ) => {
+            let key = Some("air.work_group_size");
+            let mut a = Ops::node(m, id, site.clone())?;
+            a.string(key)?;
+            let size = [a.u32(key)?, a.u32(key)?, a.u32(key)?];
+            a.finish()?;
+            // OpenCL C requires each dimension to be at least 1.
+            if size.contains(&0) || work_group_size.replace(size).is_some() {
+                return Err(site.err(AbiError::BadValue, key));
+            }
         }
         (
             Tok::Node(id),
@@ -634,7 +718,7 @@ fn stage_attribute(
                 site.at(None),
             ))
         }
-        (_, None, _) => return Err(site.err(AbiError::UnknownKey, None)),
+        (_, None, _) => return Err(site.unknown(None, saw(m, Some(attribute)))),
     }
     Ok(())
 }

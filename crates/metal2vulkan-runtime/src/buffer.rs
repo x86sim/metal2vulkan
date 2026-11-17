@@ -14,7 +14,8 @@
 //!
 //! Step 1 makes `Shared` and `Private` buffers, step 2 `Managed` ones (host-coherent memory,
 //! cached where the device has it, and on a device without unified memory a device-local copy
-//! with such a host copy, [`Mirror`]: `managed.rs`), step 4 buffers over host memory and from bytes
+//! with such a host copy, [`Mirror`]: `managed.rs`; a `Managed` no-copy buffer there has the
+//! caller's pages as its host copy, `managed_copy.rs`), step 4 buffers over host memory and from bytes
 //! (`buffer_descriptor.rs`), labels and purgeable state (`attributes.rs`); `Memoryless` is not a
 //! buffer's storage mode in Metal (refused `Invalid`). Step 7 places buffers in heaps
 //! (`heap.rs`): such a buffer is bytes of its heap's own buffer, from its offset there
@@ -24,7 +25,8 @@ use super::address::{AddressPlacement, GpuAddress, Held, KeptToken, Place, Range
 use super::attributes::ResourceAttributes;
 use super::buffer_texture::TexelViews;
 use super::churn_counts::Recycled;
-use super::degradation::Degradation;
+use super::degradation::{Degradation, NoticesFor};
+use super::device::carry::{CallHold, Contents, Left, LostParts, MadeOn, PartsCalls};
 use super::device::{lock, DeviceShared};
 use super::dirty_pages::{DirtySource, PagesLog};
 use super::error::{internal, invalid, nil, vulkan, Error, Problem};
@@ -33,27 +35,33 @@ use super::fresh_pages;
 use super::generated_commands::PREPROCESS_BUFFER;
 use super::heap::{Heap, HeapType};
 use super::host_aliases::Alias;
-use super::host_memory::{HeldBack, KeepAlive, Release};
+use super::host_memory::{HeldBack, HostParts, KeepAlive, Release};
 use super::host_ram::RamOnDevice;
 #[cfg(unix)]
 use super::host_residency::{Again, Residency};
-use super::memory::{Mapped, MemoryClass, Placement, BLOCK_BYTES};
+use super::managed_copy::{CallerCopy, SyncTarget};
+use super::memory::{
+    BoundMemory, Holds, Mapped, MemoryClass, Placement, BLOCK_BYTES, FD_BLOCKS_HANDLE,
+    HOST_PAGES_HANDLE,
+};
 use super::program_objects::ProgramObject;
 use super::rebind::{ImportHold, Unexact};
 use super::recycle::{self, BufferMaking};
 use super::resource::{Identity, ObjectId, ResourceKey};
 use super::retained::HeldBy;
-use super::texture::first_move::Filled;
+use super::submit_failure::{try_lock, Standing, TypeFlags};
+use super::texture::first_move::{Filled, Keeps, Mine};
 use super::values::{CpuCacheMode, HazardTrackingMode, ResourceOptions, StorageMode};
 use super::Device;
 use crate::release;
 use ash::vk;
 use metal2vulkan::bind::ResidentRange;
+use metal2vulkan::device::{IndirectRecordsPolicy, ManagedCopyInPolicy};
 use std::any::Any;
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Instant;
 
@@ -61,6 +69,10 @@ use std::time::Instant;
 /// when they are the same buffer.
 #[derive(Clone)]
 pub struct Buffer(Arc<BufferShared>);
+
+/// The distinct host imports a commit's count of them tells apart in place
+/// ([`Buffer::distinct_host_imports`]) before it lists them.
+const FEW_IMPORTS: usize = 16;
 
 /// A buffer held without keeping it (`used_resources.rs`).
 #[derive(Clone)]
@@ -79,7 +91,12 @@ impl WeakBuffer {
 }
 
 struct BufferShared {
-    device: Device,
+    /// Its generation of the device: let go of once the buffer was carried to the next one and its
+    /// parts there went (`device/carry.rs`).
+    device: MadeOn,
+    /// The address of its generation's `DeviceShared`, which a command buffer's work names
+    /// (`Buffer::carried`), read without the device.
+    generation: usize,
     /// Its identity (`object_id`).
     object_id: ObjectId,
     length: u64,
@@ -90,6 +107,28 @@ struct BufferShared {
     bytes: Bytes,
     /// The encoder core that holds it from an argument table's retain (`retained::HeldBy`).
     held_by: HeldBy,
+    /// Its `VkBuffer` was handed out (`Buffer::vk_buffer`): the caller's own work may write its
+    /// bytes, so no shadow over them keeps a standing across command buffers
+    /// (`shadow_standing.rs`).
+    handed_out: Arc<AtomicBool>,
+    /// Its maker declared that nothing reads the bytes between a texture's rows and slices over
+    /// it (`BufferDescriptor::padding_unobserved`), set as it is made: an image over such a
+    /// texture's memory may hold them (`linear_plan::holding`).
+    padding_unobserved: AtomicBool,
+    /// Work staged for the device's next submission holds what it reads for this buffer: a
+    /// staging buffer (`Buffer::fill_first_from`) or its host copy (`Buffer::upload`), each
+    /// holding the device. Its drop lets that work go with it (`FirstMoves::forget`).
+    staged: AtomicBool,
+    /// The buffer's parts on its device's next generation, where its device's recovery carried it
+    /// (`device/carry.rs`): the same buffer there, its identity, address, range and range token
+    /// this one's, its own parts that generation's (`Buffer::s`). Set once; held by this one
+    /// alone, which the program's handles are.
+    next: OnceLock<Buffer>,
+    /// `next` is set: read at one relaxed load where nothing was carried ([`Buffer::s`]), `next`
+    /// with its own ordering where it was.
+    carried: AtomicBool,
+    /// The calls outside a command buffer's work under way on these parts ([`Buffer::held_parts`]).
+    calls: PartsCalls,
 }
 
 /// Where a buffer's bytes are.
@@ -110,9 +149,9 @@ struct OwnBytes {
     identity: Identity,
     owner: Owner,
     /// A `Managed` buffer's host copy on a device without unified memory: its `VkBuffer` is then
-    /// in device-local memory, and `contents` maps the copy. Shared with the submissions that
-    /// upload from it.
-    mirror: Option<Arc<Mirror>>,
+    /// in device-local memory, and `contents` maps the copy ([`HostCopy`]). Shared with the
+    /// submissions that upload from it.
+    mirror: Option<HostCopy>,
     /// The caller's token for the buffer's range (a buffer's `range_token`, or its heap's when
     /// the buffer is a heap's own), set once as it is made: dropped right after the range is
     /// free and the buffer's teardown leaves its exit section, no runtime lock held, on the
@@ -161,28 +200,66 @@ pub(super) struct HostCell {
     /// `Buffer::exposed_address`), a bit each ([`ReadApart`]): once any is, its import is kept
     /// imported for good (`host_residency.rs`), and a call for a reason noted need not look
     /// again.
-    exposed: AtomicU8,
+    exposed: AtomicU16,
     /// The device whose work counts each look at its pages adds to
-    /// (`WorkCounts::no_copy_lies_read`).
-    device: Device,
+    /// (`WorkCounts::no_copy_lies_read`): its generation, let go of once the buffer was carried
+    /// to the next one and its pages there went (`device/carry.rs`).
+    device: MadeOn,
+    /// Its pages on its lost generation were marked let go of, the buffer carried to the next one
+    /// and that generation at rest ([`LostHost`]): no call takes them from now on
+    /// (`Buffer::held_parts`).
+    released: AtomicBool,
+    /// They went ([`LostHost`]): it lies in none ([`Lying::Gone`]).
+    freed: AtomicBool,
     /// The GPU's writes to the buffer are dropped, as Metal's private option bit 24 drops them:
-    /// its pages are imported through a read-only view of them (`read_only_view.rs`), which a
-    /// rebind's are too.
+    /// its pages are imported through a read-only view of them (`read_only_view.rs`), or copied,
+    /// the copy's GPU writes never written back (`copied.rs`), and a rebind's are too.
     drops_writes: bool,
     /// The deallocator of the pages its last detach let go of (`detach.rs`), held back until its
     /// next rebind or its release, as Metal runs it then ([`Release::hold_back`]).
     held_back: Mutex<Option<Arc<HeldBack>>>,
+    /// Its read twin, where its GPU writes are dropped (`read_twin.rs`): the runtime's buffer over
+    /// the same pages in place, which commands that cannot write the buffer read instead of its
+    /// copy. Let go of as the buffer lies elsewhere ([`HostCell::replace`]).
+    read_twin: Mutex<Option<Buffer>>,
+    /// The read twins of the program's textures over its bytes, while it has a read twin
+    /// (`read_twin.rs`): each the runtime's texture over the read twin's bytes, in place, which
+    /// the slots that only read the texture bind instead. Let go of with the read twin.
+    twin_textures: Mutex<Vec<TextureTwin>>,
+}
+
+/// The read twins a buffer let go of as it came to lie elsewhere ([`HostCell::replace`]): its own
+/// and its textures'. The caller drops them holding no lock of the device's rebinds: a twin's
+/// going forgets its key there (`Rebinds::forget`), so dropping them under that lock, as a rebind
+/// or a detach holds it while the buffer moves, would wait for the lock forever.
+#[must_use]
+pub(super) struct LeftTwins {
+    _buffer: Option<Buffer>,
+    _textures: Vec<TextureTwin>,
+}
+
+/// A texture's read twin, as a no-copy buffer's [`HostCell`] keeps it (`read_twin.rs`): the
+/// texture's `ObjectId`, the texture held weakly, and its twin, a `Texture`, each by type erased
+/// as [`NotedTexture`] holds a texture.
+pub(super) struct TextureTwin {
+    pub(super) of: ObjectId,
+    pub(super) texture: Weak<dyn Any + Send + Sync>,
+    pub(super) twin: Arc<dyn Any + Send + Sync>,
 }
 
 /// An image in place over a buffer's host pages ([`HostCell`], `texture/in_place_image.rs`),
 /// which a rebind makes again over the new pages: the image (`texture.rs`'s `Image`), held weakly
 /// and by type erased as [`NotedTexture`] holds it, where its texels lie in bytes from the pages'
-/// first byte, and how Metal lays them out from there.
+/// first byte, how Metal lays them out from there, whether their rows' padding is the buffer's
+/// own (`in_place::Padding`), and the bytes of one texel (whose width picks the check of a
+/// shader's writes, `in_place::Access::written`).
 #[derive(Clone)]
 pub(super) struct InPlaceWatch {
     pub(super) image: Weak<dyn Any + Send + Sync>,
     pub(super) from_base: u64,
     pub(super) layout: crate::linear_plan::BufferLayout,
+    pub(super) padding_owned: bool,
+    pub(super) texel: u64,
 }
 
 impl InPlaceWatch {
@@ -218,15 +295,19 @@ pub(super) struct NotedTexture {
     /// Whether its image's stand-in has a sink (its plan has `STORAGE` usage): a read through a
     /// storage-class element there reads what an unnamed write left (`Device::note_stale`).
     sink: bool,
+    /// Whether its image keeps its own texels while the bytes are detached, presenting no
+    /// stand-in: a tiled texture's, a copy of the bytes taken at use (`shadow.rs`).
+    keeps: bool,
 }
 
 impl NotedTexture {
-    /// `texture`, whose image is `image`, of object `id`; `exact` and `sink` as the fields say.
+    /// `texture`, whose image is `image`, of object `id`; `exact`, `sink` and `keeps` as the
+    /// fields say.
     pub(super) fn new(
         texture: Weak<dyn Any + Send + Sync>,
         image: Weak<dyn Any + Send + Sync>,
         id: ObjectId,
-        (exact, sink): (bool, bool),
+        (exact, sink, keeps): (bool, bool, bool),
     ) -> NotedTexture {
         NotedTexture {
             texture,
@@ -234,12 +315,19 @@ impl NotedTexture {
             id,
             exact,
             sink,
+            keeps,
         }
     }
 
     /// Whether its image's stand-in has a sink (`NotedTexture::sink`).
     pub(super) fn sink(&self) -> bool {
         self.sink
+    }
+
+    /// Whether its image keeps its own texels while the bytes are detached
+    /// (`NotedTexture::keeps`).
+    pub(super) fn keeps(&self) -> bool {
+        self.keeps
     }
 
     /// Whether the texture lives.
@@ -254,12 +342,13 @@ impl NotedTexture {
 }
 
 impl TexturesOver {
-    /// The images of the live textures, each once, by type erased; and whether a stand-in of
-    /// zero bytes presents each exactly (`NotedTexture::exact`).
+    /// The images of the live textures that present stand-ins while the bytes are detached (all
+    /// but those that keep their own, `NotedTexture::keeps`), each once, by type erased; and
+    /// whether a stand-in of zero bytes presents each exactly (`NotedTexture::exact`).
     pub(super) fn images(&self) -> (Vec<Arc<dyn Any + Send + Sync>>, bool) {
         let mut images: Vec<Arc<dyn Any + Send + Sync>> = Vec::new();
         let mut exact = true;
-        for noted in self.noted.iter().filter(|noted| noted.lives()) {
+        for noted in self.textures().filter(|noted| !noted.keeps) {
             let Some(image) = noted.image.upgrade() else {
                 continue;
             };
@@ -288,6 +377,73 @@ pub(super) fn host_cells_moved() -> u64 {
     HOST_CELLS_MOVED.load(Ordering::Acquire)
 }
 
+/// The most buffers over host pages a [`KeptSpaces`] keeps where they lie.
+const KEPT_SPACES: usize = 4;
+
+/// Where buffers over host pages (no-copy buffers, and no-copy heaps' own buffers, which their
+/// placed buffers lie in) lay as an encoder's binds last read them ([`Buffer::space_kept`]): a
+/// bind reads where a buffer lies at each draw (`binding::rebind_into`), which for one over host
+/// pages locks its pages and takes a hold of them, and a heap's own buffer is one every encoder
+/// of its device's threads reads, as the consumer binds its draws' bytes in a heap over the guest's
+/// RAM. Each is kept while no no-copy buffer of the process moved since ([`host_cells_moved`]): a
+/// buffer lies where it lay until one moves (`HostCell::replace`), and its import, read for a
+/// binding once, stays imported (`HostImport::pages`). A buffer is kept by its cell's address,
+/// held weakly: a cell that goes leaves its allocation, and so its address, to its weak handles, so
+/// no other cell is at the address while it is kept.
+#[derive(Default)]
+pub(super) struct KeptSpaces {
+    kept: Vec<KeptSpace>,
+    /// The entry the next buffer kept takes once every one is taken.
+    next: usize,
+}
+
+/// A buffer over host pages a [`KeptSpaces`] keeps: its cell, the count of moves it was read
+/// under, and what [`HostCell::binding_pages`] read.
+struct KeptSpace {
+    cell: Weak<HostCell>,
+    moved: u64,
+    pages: (vk::Buffer, u64, u64),
+}
+
+impl KeptSpaces {
+    /// [`HostCell::binding_pages`] of `cell`, kept or read (counted,
+    /// `WorkCounts::bind_spaces_read`) and kept.
+    fn of(&mut self, cell: &Arc<HostCell>) -> (vk::Buffer, u64, u64) {
+        // Read before the cell: a move after it makes the next look read the cell again.
+        let moved = host_cells_moved();
+        let at = Arc::as_ptr(cell);
+        let found = (self.kept.iter()).find(|kept| kept.moved == moved && kept.cell.as_ptr() == at);
+        if let Some(kept) = found {
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                kept.pages,
+                cell.binding_pages(),
+                "a buffer kept where it no longer lies"
+            );
+            return kept.pages;
+        }
+        cell.device.shared().counts.thread().bind_space_read();
+        let pages = cell.binding_pages();
+        let entry = KeptSpace {
+            cell: Arc::downgrade(cell),
+            moved,
+            pages,
+        };
+        // A stale entry or this cell's goes first; else the entries in turn.
+        let stale =
+            (self.kept.iter()).position(|kept| kept.moved != moved || kept.cell.as_ptr() == at);
+        match stale {
+            Some(index) => self.kept[index] = entry,
+            None if self.kept.len() < KEPT_SPACES => self.kept.push(entry),
+            None => {
+                self.kept[self.next] = entry;
+                self.next = (self.next + 1) % KEPT_SPACES;
+            }
+        }
+        pages
+    }
+}
+
 /// A texture being made over a buffer's host pages ([`Buffer::making_texture`]): a detach
 /// refuses until it goes, once the texture is noted (`Buffer::note_texture`) or its making
 /// failed.
@@ -308,6 +464,18 @@ pub(super) enum Lying {
     In(Arc<HostPages>),
     /// Detached: in no pages.
     Detached(Arc<Detached>),
+    /// Its pages on a lost generation went at the generation's rest, the buffer carried to the
+    /// next one ([`LostHost`], `device/carry.rs`), where they lay as the [`Shape`] says: no work
+    /// of the generation reads them from then on, and every other reach of the buffer goes to
+    /// where it was carried.
+    Gone(Shape),
+}
+
+/// A read of a carried no-copy buffer's pages on its lost generation after the generation's rest
+/// ([`Lying::Gone`]), which no work makes: none of its command buffers records, and a call that
+/// held them keeps them until it ends (`Buffer::held_parts`).
+pub(super) fn read_gone() -> ! {
+    unreachable!("a carried no-copy buffer's pages read on its lost generation after its rest")
 }
 
 /// What a detached no-copy buffer's commands take of it while it is detached (`detach.rs`): the
@@ -319,6 +487,10 @@ pub(super) struct Detached {
     /// The stand-in, a small buffer of the runtime's own, kept while a buffer is detached.
     _stand_in: Buffer,
     pages: Pages,
+    /// The host address of the first page of the pages it was detached from, the caller's,
+    /// whose pointer `contents` answers meanwhile (at `pages.offset`); nothing of the runtime's
+    /// reads or writes through it.
+    last: Option<Mapped>,
     /// The index of the memory type of the pages it was detached from: a texture made over the
     /// bytes meanwhile takes the route it would over them (`texture/heap.rs`).
     type_index: u32,
@@ -329,7 +501,8 @@ pub(super) struct Detached {
 impl Detached {
     /// What a buffer detached from `from` takes: `stand_in`'s `VkBuffer` and memory, at the
     /// place its bytes had in `from`. No memory is placed for it: the placement names the
-    /// stand-in's, unmapped and freed by none, so `contents` answers `None` while it is detached.
+    /// stand-in's, unmapped and freed by none, so the runtime maps nothing of it while it is
+    /// detached (`Buffer::mapped_contents`); `contents` answers `from`'s pointer.
     /// Refused (an internal error) for a stand-in placed in a heap.
     pub(super) fn new(stand_in: Buffer, from: &HostPages) -> Result<Detached, Error> {
         let Bytes::Own(own) = &stand_in.0.bytes else {
@@ -358,6 +531,7 @@ impl Detached {
         Ok(Detached {
             _stand_in: stand_in,
             pages,
+            last: old.mapped,
             type_index: from.type_index(),
             over_dma_buf: from.over_dma_buf(),
         })
@@ -365,24 +539,41 @@ impl Detached {
 }
 
 impl HostCell {
-    /// Whether the GPU's writes to the buffer are dropped (`read_only_view.rs`).
+    /// Whether the GPU's writes to the buffer are dropped (`read_only_view.rs`, `copied.rs`).
     pub(super) fn drops_writes(&self) -> bool {
         self.drops_writes
     }
 
     /// The pages the buffer lies in now; `None` while it is detached.
     pub(super) fn current(&self) -> Option<Arc<HostPages>> {
-        self.device.shared().counts.no_copy_lie_read();
+        self.device.shared().counts.thread().no_copy_lie_read();
         match &*lock(&self.pages) {
             Lying::In(pages) => Some(Arc::clone(pages)),
-            Lying::Detached(_) => None,
+            Lying::Detached(_) | Lying::Gone(_) => None,
         }
     }
 
     /// Where the buffer lies now.
     pub(super) fn lying(&self) -> Lying {
-        self.device.shared().counts.no_copy_lie_read();
+        self.device.shared().counts.thread().no_copy_lie_read();
         lock(&self.pages).clone()
+    }
+
+    /// The `VkBuffer` its bytes lie in now, where its byte 0 lies there (`Pages::base`), and
+    /// where they start in their first page (`Shape::base`), read for a binding
+    /// (`ReadApart::Binding`): what [`Buffer::space`] and [`Buffer::at_for`] read of it.
+    fn binding_pages(&self) -> (vk::Buffer, u64, u64) {
+        match self.lying() {
+            Lying::In(pages) => {
+                let read = pages.import.pages(ReadApart::Binding);
+                (read.raw, read.base, pages.import.shape.base)
+            }
+            Lying::Detached(detached) => {
+                let pages = &detached.pages;
+                (pages.raw, pages.base, Shape::of(pages).base)
+            }
+            Lying::Gone(_) => read_gone(),
+        }
     }
 
     /// The host addresses of the buffer's bytes, from its byte 0 over the bytes a copy reads,
@@ -395,7 +586,37 @@ impl HostCell {
                 let start = (mapped.as_ptr() as usize).checked_add(shape.offset as usize)?;
                 Some(start..start.checked_add(shape.reach as usize)?)
             }
-            Lying::Detached(_) => None,
+            Lying::Detached(_) | Lying::Gone(_) => None,
+        }
+    }
+
+    /// The `N` bytes at `offset` of the buffer's bytes, as the host reads them now through the
+    /// pages they lie in, which are held while they are read: a detach and a rebind meanwhile let
+    /// none of them go under the read (their deallocator waits for them, `HeldBack`). `None` while
+    /// it is detached. The caller holds `offset + N` inside the buffer's length.
+    fn read<const N: usize>(&self, offset: u64) -> Option<[u8; N]> {
+        let pages = self.current()?;
+        let shape = pages.import.shape;
+        let start = shape.mapped?.as_ptr().wrapping_add(shape.offset as usize);
+        let mut bytes = [0u8; N];
+        // SAFETY: the pages map the buffer's bytes from `start`, and the caller holds the `N`
+        // bytes at `offset` inside its length; `pages` keeps them mapped until the copy ends. A
+        // write to them meanwhile races, as a read of `contents` does on Metal.
+        unsafe {
+            let at = start.wrapping_add(offset as usize);
+            std::ptr::copy_nonoverlapping(at, bytes.as_mut_ptr(), N);
+        }
+        drop(pages);
+        Some(bytes)
+    }
+
+    /// The caller's pointer of the pages the buffer was detached from, while it is detached.
+    fn detached_pointer(&self) -> Option<NonNull<u8>> {
+        match &*lock(&self.pages) {
+            Lying::Detached(detached) => (detached.last).and_then(|mapped| {
+                NonNull::new(mapped.as_ptr().wrapping_add(detached.pages.offset as usize))
+            }),
+            Lying::In(_) | Lying::Gone(_) => None,
         }
     }
 
@@ -409,20 +630,66 @@ impl HostCell {
         match &*lock(&self.pages) {
             Lying::In(pages) => pages.offset(),
             Lying::Detached(detached) => detached.pages.offset,
+            Lying::Gone(shape) => shape.offset,
         }
     }
 
-    /// Lie `lying` from now on: where the buffer lay, which the caller lets go of. Counted in
-    /// [`host_cells_moved`]: a buffer binding that reads where it lies (its base, its device
-    /// address) may change.
-    pub(super) fn replace(&self, lying: Lying) -> Lying {
+    /// Lie `lying` from now on: where the buffer lay, and the read twins it had over those
+    /// pages, which the caller lets go of (the twins holding no lock of the rebinds,
+    /// [`LeftTwins`]). Counted in [`host_cells_moved`]: a buffer binding that reads where it lies
+    /// (its base, its device address) may change.
+    pub(super) fn replace(&self, lying: Lying) -> (Lying, LeftTwins) {
         let lay = {
             let mut pages = lock(&self.pages);
             let lay = std::mem::replace(&mut *pages, lying);
             HOST_CELLS_MOVED.fetch_add(1, Ordering::AcqRel);
             lay
         };
-        lay
+        // Its read twins lie over the pages it lay in: taken now, outside the pages' lock, so the
+        // buffer is its copy alone from now on (`read_twin.rs`), as the copy it lay in is.
+        let twin = lock(&self.read_twin).take();
+        if let (Some(_), Lying::In(pages)) = (&twin, &lay) {
+            pages.set_copy_twinned(false);
+        }
+        let twins = LeftTwins {
+            _buffer: twin,
+            _textures: lock(&self.twin_textures).drain(..).collect(),
+        };
+        (lay, twins)
+    }
+
+    /// Its read twin (`read_twin.rs`), while it lies in the pages the twin was made over.
+    pub(super) fn read_twin(&self) -> Option<Buffer> {
+        lock(&self.read_twin).clone()
+    }
+
+    /// Keep `twin`, its read twin over the pages it lies in now (`read_twin.rs`).
+    pub(super) fn keep_read_twin(&self, twin: Buffer) {
+        let earlier = lock(&self.read_twin).replace(twin);
+        drop(earlier);
+    }
+
+    /// The read twin of the texture of `id` over its bytes (`read_twin.rs`), by type erased,
+    /// while the buffer lies in the pages it was made over.
+    pub(super) fn twin_texture(&self, id: ObjectId) -> Option<Arc<dyn Any + Send + Sync>> {
+        let textures = lock(&self.twin_textures);
+        let found = textures.iter().find(|kept| kept.of == id);
+        found.map(|kept| Arc::clone(&kept.twin))
+    }
+
+    /// Keep `kept`, a texture's read twin over the read twin's bytes, while the buffer has that
+    /// read twin (`read_twin.rs`); those of textures that went are let go of.
+    pub(super) fn keep_twin_texture(&self, kept: TextureTwin) {
+        if lock(&self.read_twin).is_none() {
+            return;
+        }
+        let mut textures = lock(&self.twin_textures);
+        let gone: Vec<TextureTwin> = textures
+            .extract_if(.., |kept| kept.texture.strong_count() == 0)
+            .collect();
+        textures.push(kept);
+        drop(textures);
+        drop(gone);
     }
 
     /// A detach let go of `pages`: their deallocator is held back until the buffer's next rebind
@@ -566,14 +833,197 @@ pub(super) enum MemoryHold {
 /// next buffer of the same making where the recycler noted them (`recycle.rs`), else destroys the
 /// `VkBuffer` (unless it is the caller's, `Owner::Vulkan`) and frees the placement.
 pub(super) struct FixedPages {
-    device: Device,
+    /// Its generation of the device: let go of with the pages on a lost generation
+    /// ([`FixedPages::release_lost`]).
+    device: MadeOn,
     pages: Pages,
     /// The `VkBuffer` is the runtime's to destroy.
     owned: bool,
+    /// Its `VkBuffer` and memory are let go of on its lost generation, its buffer carried to the
+    /// next one ([`LostBuffer`]): no work meets them from now on.
+    released: AtomicBool,
+    /// They went ([`FixedPages::release_lost`]): its drop lets go of nothing.
+    freed: AtomicBool,
+}
+
+impl FixedPages {
+    /// Destroy the `VkBuffer` and free the memory of the pages of a buffer its device's recovery
+    /// carried to the next generation, on the lost one at rest, marked let go of
+    /// ([`LostBuffer`]), and let go of its handle of that generation (`device/carry.rs`). Vulkan
+    /// leaves a lost device's objects to the program to destroy: "When a device is lost, its
+    /// child objects are not implicitly destroyed and their handles are still valid. Those
+    /// objects must still be destroyed before their parents or the device can be destroyed"
+    /// (vkspec 5.2.3). Nothing recycles them. Left to the process's end while it exits.
+    fn release_lost(&self) {
+        let Some(busy) = exit_guard::enter() else {
+            return;
+        };
+        let shared = self.device.shared();
+        if self.owned {
+            // SAFETY: none of the lost generation's command buffers records or is pending, and
+            // every later one's work reaches the carried buffer's own pages.
+            unsafe { release::object(shared.vk(), self.pages.raw) };
+        }
+        lock(&shared.memory).free(shared.vk(), &self.pages.memory.placement);
+        self.freed.store(true, Ordering::Release);
+        drop(busy);
+        // SAFETY: as above; the pages' drop reads nothing once they went.
+        unsafe { self.device.let_go() };
+    }
+}
+
+/// A carried buffer's parts on its device's lost generation (`device/carry.rs`): its pages, held
+/// until they go whether the program keeps the buffer or not, and its handle of the generation.
+struct LostBuffer {
+    pages: Arc<FixedPages>,
+    buffer: Weak<BufferShared>,
+}
+
+impl LostParts for LostBuffer {
+    fn mark(&self) {
+        self.pages.released.store(true, Ordering::Release);
+    }
+
+    fn release(self: Box<Self>) {
+        let Some(buffer) = self.buffer.upgrade() else {
+            // The buffer went, and with it every call on its parts.
+            self.pages.release_lost();
+            return;
+        };
+        // The last call under way on them lets them go (`Buffer::held_parts`).
+        if let Some(lost) = buffer.calls.unless_held(self) {
+            (*lost).release_now(&buffer);
+        }
+    }
+}
+
+impl LostBuffer {
+    /// Let the parts go, no call on them under way, and the buffer's handle of their generation:
+    /// but where their `VkBuffer` or memory was handed out (`Buffer::vk_buffer`,
+    /// `Buffer::vk_host_memory`), which the caller may use while the buffer lives, so they go
+    /// with the buffer, as a refused object's do.
+    fn release_now(self, buffer: &BufferShared) {
+        if buffer.handed_out.load(Ordering::Acquire) {
+            return;
+        }
+        self.pages.release_lost();
+        // SAFETY: its parts on the generation went, no command buffer of the generation records,
+        // no call under way reads them (`Buffer::held_parts`), and every other reach of the
+        // buffer goes to where it was carried (`Buffer::carried`).
+        unsafe { buffer.device.let_go() };
+    }
+}
+
+/// A carried heap buffer's parts on its device's lost generation (`Buffer::carry_placed`): no
+/// Vulkan object of their own (their bytes are their heap's own buffer's, which its carry carried
+/// apart), their entry among the generation's live buffers, and the buffer's handle of the
+/// generation, let go of once none of its command buffers may record.
+struct LostPlaced {
+    buffer: Weak<BufferShared>,
+}
+
+impl LostParts for LostPlaced {
+    fn release(self: Box<Self>) {
+        // The buffer went: its drop on the generation let go of everything there.
+        let Some(buffer) = self.buffer.upgrade() else {
+            return;
+        };
+        // The last call under way on them lets them go (`Buffer::held_parts`).
+        if buffer.calls.unless_held(self).is_none() {
+            return;
+        }
+        let shared = buffer.device.shared();
+        (shared.live_buffers).forget(buffer.address.0, buffer.object_id);
+        // SAFETY: no command buffer of the generation records, no call under way reads its parts
+        // there (`Buffer::held_parts`), and every other reach of the buffer goes to where it was
+        // carried (`Buffer::carried`).
+        unsafe { buffer.device.let_go() };
+    }
+}
+
+/// A carried no-copy buffer's parts on a lost generation (`Buffer::carry`): its hold there on the
+/// caller's pages (`cell`, its pages' import among them) and the buffer's handle of the
+/// generation, let go of once none of the generation's command buffers may record, as a buffer of
+/// the generation's goes there: out of its live buffers and its registries of no-copy buffers,
+/// its pages let go of, whose release tells what waits for every import of them
+/// (`Release::carry_on`).
+struct LostHost {
+    cell: Arc<HostCell>,
+    buffer: Weak<BufferShared>,
+}
+
+impl LostParts for LostHost {
+    fn mark(&self) {
+        self.cell.released.store(true, Ordering::Release);
+    }
+
+    fn release(self: Box<Self>) {
+        // The buffer went: its drop on the generation let go of everything there.
+        let Some(buffer) = self.buffer.upgrade() else {
+            return;
+        };
+        // The last call under way on them lets them go (`Buffer::held_parts`).
+        if let Some(lost) = buffer.calls.unless_held(self) {
+            (*lost).release_now(&buffer);
+        }
+    }
+}
+
+impl LostHost {
+    /// Let the parts go, no call on them under way, as [`LostBuffer::release_now`] does.
+    fn release_now(self, buffer: &BufferShared) {
+        if buffer.handed_out.load(Ordering::Acquire) {
+            return;
+        }
+        // The process is exiting: the parts are left to its end, as every buffer's.
+        let Some(busy) = exit_guard::enter() else {
+            return;
+        };
+        let shared = buffer.device.shared();
+        shared
+            .live_buffers
+            .forget(buffer.address.0, buffer.object_id);
+        if let Bytes::Own(own) = &buffer.bytes {
+            shared.rebinds.forget(own.identity.key);
+            shared.aliases.forget(own.identity.key);
+        }
+        drop(busy);
+        let shape = match self.cell.lying() {
+            Lying::In(pages) => pages.import.shape,
+            Lying::Detached(detached) => Shape::of(&detached.pages),
+            Lying::Gone(shape) => shape,
+        };
+        let (left, twins) = self.cell.replace(Lying::Gone(shape));
+        drop(twins);
+        self.cell.freed.store(true, Ordering::Release);
+        // The pages go where nothing else holds them, their import freed where none holds it:
+        // their release tells what waits for every import of them.
+        drop(left);
+        // SAFETY: its parts on the generation went, no command buffer of the generation records,
+        // no call under way reads them (`Buffer::held_parts`), its cell lies in none of them and
+        // is read no more there (`Lying::Gone`), and every other reach of the buffer goes to
+        // where it was carried (`Buffer::carried`).
+        unsafe {
+            self.cell.device.let_go();
+            buffer.device.let_go();
+        }
+    }
+}
+
+/// A call outside a command buffer's work on a buffer's parts on one generation
+/// ([`Buffer::held_parts`]), until it goes: the parts stay while it lives (`PartsCalls`), and
+/// every read of the buffer's parts on this thread meanwhile answers them.
+pub(super) struct HeldParts<'a> {
+    _call: CallHold<'a>,
+    _scope: NoticesFor,
 }
 
 impl Drop for FixedPages {
     fn drop(&mut self) {
+        // Let go of on its lost generation already (`FixedPages::release_lost`).
+        if *self.freed.get_mut() {
+            return;
+        }
         // The Vulkan teardown is a section of the exit guard.
         let Some(busy) = exit_guard::enter() else {
             // The process is exiting: the buffer and its memory are left to its end.
@@ -584,9 +1034,16 @@ impl Drop for FixedPages {
         // and one whose resident set lists them holds them, until it completed.
         let placement = &self.pages.memory.placement;
         let parked = match self.owned {
-            true => (lock(&shared.recycled_buffers))
-                .park(self.pages.raw, placement.handed_over(), Instant::now())
-                .ok(),
+            true => {
+                let mut recycled = lock(&shared.recycled_buffers);
+                let now = Instant::now();
+                let parked = recycled.park(self.pages.raw, placement.handed_over(), now);
+                // Gone in time where no park or take comes (`idle_sweep.rs`).
+                if let Some(due) = recycled.due() {
+                    shared.idle_sweep.by(due);
+                }
+                parked.ok()
+            }
             false => None,
         };
         match parked {
@@ -642,14 +1099,45 @@ pub(super) struct HostPages {
     /// The guest RAM their caller resolved them to and the runs of it they are, in their byte
     /// order (`HostMemory::with_runs`, `host_ram.rs`), kept until the rebind or the release.
     ram_runs: OnceLock<(Arc<RamOnDevice>, Box<[Range<u64>]>)>,
+    /// The key they named to their copy, where they lie in one ([`HostPages::copied_as`]): its
+    /// naming goes as they go.
+    named: OnceLock<ResourceKey>,
+    /// The caller's memory they were made of, a buffer's (not a heap's own): what its device's
+    /// recovery makes the buffer again of on the next generation (`Buffer::carry`).
+    made_of: OnceLock<HostParts>,
+}
+
+/// How new pages come to lie in an import ([`HostPages::new`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Joining {
+    /// The import was made for them.
+    First,
+    /// A no-copy buffer's, made over the bytes the import's buffers were made over
+    /// (`host_aliases.rs`): it reads the import as they do, through the import, so a releasable
+    /// import stays releasable beside it (`host_residency.rs`).
+    Buffer,
+    /// A no-copy heap's own bytes, over the bytes the import's buffers were made over: its
+    /// placed buffers' addresses are the heap's, handed out with no read of the import noted, so
+    /// the import is kept imported for good.
+    Heap,
+    /// A rebound buffer's (`rebind.rs`): kept imported for good, as a rebind's own import is.
+    Rebound,
 }
 
 impl HostPages {
-    /// New pages lying in `import`, with no release yet.
-    fn new(import: Arc<HostImport>) -> HostPages {
-        if import.lying.fetch_add(1, Ordering::AcqRel) > 0 {
-            // Another buffer lies in it: imported for good (`host_residency.rs`).
-            import.expose(ReadApart::SecondBuffer);
+    /// New pages lying in `import`, with no release yet, `joining` it so.
+    fn new(import: Arc<HostImport>, joining: Joining) -> HostPages {
+        let others = import.lying.fetch_add(1, Ordering::AcqRel) > 0;
+        match (joining, others) {
+            // Imported for good beside the others (`host_residency.rs`).
+            (Joining::Heap, true) => {
+                import.expose(ReadApart::Heap);
+            }
+            (Joining::Rebound, true) => {
+                import.expose(ReadApart::Rebound);
+            }
+            (Joining::Buffer, true) => import.note_joined(),
+            (Joining::First | Joining::Buffer | Joining::Heap | Joining::Rebound, _) => {}
         }
         HostPages {
             parked: Mutex::new(Vec::new()),
@@ -658,12 +1146,22 @@ impl HostPages {
             listed: AtomicUsize::new(0),
             dirty: OnceLock::new(),
             ram_runs: OnceLock::new(),
+            named: OnceLock::new(),
+            made_of: OnceLock::new(),
         }
     }
 
     /// They lie in a copy of the caller's pages, registered as `copied` (`copied.rs`).
     pub(super) fn set_copied(&self, copied: crate::copied::Copied) {
         self.import.set_copied(copied);
+    }
+
+    /// Whether a read twin reads them in place, where they lie in a copy of the caller's pages
+    /// (`copied.rs`'s `Copied::set_twinned`).
+    pub(super) fn set_copy_twinned(&self, twinned: bool) {
+        if let Some(copied) = self.import.copied.get() {
+            copied.set_twinned(twinned);
+        }
     }
 
     /// Keep the caller's log of the writes to them (`dirty_pages.rs`), given with their memory.
@@ -682,10 +1180,13 @@ impl HostPages {
     }
 
     /// Name `key`, a buffer's (or a heap's bytes') lying in them, to their copy, where they are
-    /// one: its merges back compare the copy where a batch wrote that key (`copied.rs`).
+    /// one: its merges back compare the copy where a batch wrote that key (`copied.rs`), until
+    /// they go. Once: a second call names nothing.
     pub(super) fn copied_as(&self, key: ResourceKey) {
         if let Some(copied) = self.import.copied.get() {
-            copied.name(key);
+            if self.named.set(key).is_ok() {
+                copied.name(key);
+            }
         }
     }
 
@@ -701,6 +1202,17 @@ impl HostPages {
         if let Some(log) = import.log.get() {
             import.device.shared().dirty.logged_in_place(key, log);
         }
+    }
+
+    /// Keep `parts`, the caller's memory they were made of ([`HostPages::made_of`]).
+    pub(super) fn keep_made_of(&self, parts: HostParts) {
+        let _kept = self.made_of.set(parts);
+    }
+
+    /// The caller's memory they were made of, a buffer's (not a heap's own), which its device's
+    /// recovery makes the buffer again of on the next generation (`Buffer::carry`).
+    pub(super) fn made_of(&self) -> Option<&HostParts> {
+        self.made_of.get()
     }
 
     /// Keep the guest RAM and the runs of it their caller resolved them to (`host_ram.rs`).
@@ -760,6 +1272,37 @@ impl HostPages {
         self.import.copied()
     }
 
+    /// Where byte `offset` of the bytes lying in them lies in their import's memory, for the
+    /// caller ([`Buffer::vk_host_memory`](crate::Buffer::vk_host_memory)): read apart as the
+    /// buffer's `VkBuffer` is (`ReadApart::VkBuffer`), which keeps a releasable import imported
+    /// for good. `None` where that memory is not one import of the pages themselves by their
+    /// pointer, alone or a guest RAM chunk's: a copy of them, imports of dma-bufs, an import of a
+    /// read-only view of them, or the device's stand-in for an import it could not make again.
+    fn in_import(&self, offset: u64) -> Option<crate::VkHostMemory> {
+        let import = &self.import;
+        if import.copied() || import.drops_writes() || import.shape.over_dma_buf {
+            return None;
+        }
+        let pages = import.pages(ReadApart::VkBuffer);
+        #[cfg(unix)]
+        if matches!(pages, ImportPages::StandIn(_)) {
+            return None;
+        }
+        let placement = &pages.memory.placement;
+        if placement.over_dma_buf() || placement.over_read_only_view() || placement.over_own_pages()
+        {
+            return None;
+        }
+        let at = pages.offset + offset;
+        Some(crate::VkHostMemory {
+            memory: placement.memory,
+            offset: placement.offset + at,
+            size: placement.size().saturating_sub(at),
+            type_index: placement.type_index(),
+            handle_type: vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+        })
+    }
+
     /// Whether they are bound in the device's import of a chunk of a guest RAM (`host_ram.rs`),
     /// with no import of their own.
     pub(super) fn in_ram_chunk(&self) -> bool {
@@ -768,15 +1311,29 @@ impl HostPages {
 
     /// Where they lie as dma-bufs (`dma_buf.rs`): the imports, with the caller's source; the host
     /// address where their bytes start (from which an image over them reckons its texels'); and
-    /// the imports' memory type. `None` for pages imported by their pointer. A read that keeps
-    /// the import imported for good (`host_residency.rs`).
+    /// the imports' memory type. `None` for pages imported by their pointer. Read as a blit reads
+    /// them (`HostImport::blit_pages`): imported again where the device released them while
+    /// idle, and left releasable, for an image over a dma-buf of its own pages
+    /// (`Device::dma_buf_image`), which asks their source and binds none of their memory, so
+    /// neither it nor a command that uses it holds their import (`host_residency.rs`). Refused
+    /// where the device cannot import them again.
     #[cfg(unix)]
-    pub(super) fn dma_buf(&self) -> Option<(Arc<crate::dma_buf::DmaBufPages>, u64, u32)> {
-        let pages = self.import.pages(ReadApart::Texture);
+    pub(super) fn dma_buf(
+        &self,
+    ) -> Result<Option<(Arc<crate::dma_buf::DmaBufPages>, u64, u32)>, Error> {
+        let (pages, _) = self.import.blit_pages()?;
         let placement = &pages.memory.placement;
-        let imports = Arc::clone(placement.dma_buf_pages()?);
-        let start = (placement.mapped?.as_ptr() as u64).checked_add(pages.offset)?;
-        Some((imports, start, placement.type_index()))
+        let (Some(imports), Some(mapped)) = (placement.dma_buf_pages(), placement.mapped) else {
+            return Ok(None);
+        };
+        let start = (mapped.as_ptr() as u64).checked_add(pages.offset);
+        Ok(start.map(|start| {
+            (
+                Arc::clone(imports),
+                placement.dma_buf_address(start),
+                placement.type_index(),
+            )
+        }))
     }
 
     /// As the buffer that lies in them is released (`BufferShared`'s drop, a no-copy heap's own
@@ -836,6 +1393,9 @@ impl HostPages {
                 false => {
                     // Counted before the free can take it.
                     counts.host_keep_alive_kept();
+                    if self.import.held_inside() {
+                        counts.host_release_held_inside();
+                    }
                     *kept = Some(keep_alive);
                     None
                 }
@@ -853,6 +1413,13 @@ impl HostPages {
         // A refused set leaves the deallocator unrun, as a refused call does: never reached,
         // since each pages' release is set once, as they become a buffer's.
         let _ = self.release.set(release);
+    }
+
+    /// Hold back their release's deallocator and keep-alive for a recovery that carries their
+    /// buffer to its device's next generation ([`Release::carry_on`]): `None` where it holds
+    /// neither, or they have none.
+    pub(super) fn carry_release(&self) -> Option<Arc<HeldBack>> {
+        self.release.get().and_then(Release::carry_on)
     }
 
     /// Their import, which a no-copy buffer made over the same bytes shares.
@@ -877,10 +1444,12 @@ pub(super) struct HostImport {
     objects: ManuallyDrop<Objects>,
     /// The [`HostPages`] lying in it.
     lying: AtomicUsize,
+    /// The buffers bound inside its memory now, each with no import of its own ([`Inside`]).
+    inside: AtomicUsize,
     /// The reads other than a blit's that took it, a bit each ([`HostImport::note_read_apart`]):
     /// counted in `WorkCounts::host_imports_read_apart` and the gauge of each reason while it
     /// lives.
-    read_apart: AtomicU8,
+    read_apart: AtomicU16,
     /// Why the device never releases it while idle, for an import it keeps: counted in that
     /// reason's `WorkCounts` gauge while it lives. `None` for a releasable one.
     kept_because: Option<KeptBecause>,
@@ -981,27 +1550,38 @@ pub(crate) enum ReadApart {
     /// A texture over the bytes: an image bound to the memory, or a texel view over the
     /// `VkBuffer`.
     Texture,
-    /// A second buffer lying in the import, or sharing its buffer's range.
-    SecondBuffer,
+    /// A buffer bound inside its memory, with a `VkBuffer` of its own (`host_aliases.rs`, "One
+    /// page, one import").
+    Inside,
+    /// A buffer made to share its buffer's range (`BufferDescriptor::range_of`), its Metal
+    /// address handed to that buffer.
+    SharedRange,
+    /// A no-copy heap's own bytes lying in it ([`Joining::Heap`]).
+    Heap,
+    /// A rebound buffer lying in it ([`Joining::Rebound`]).
+    Rebound,
     /// No thread to release it while idle (`host_residency.rs`).
     Unreleased,
 }
 
 impl ReadApart {
     /// How many reasons there are.
-    pub(crate) const COUNT: usize = 6;
+    pub(crate) const COUNT: usize = 9;
     const ALL: [ReadApart; ReadApart::COUNT] = [
         ReadApart::Address,
         ReadApart::VkBuffer,
         ReadApart::Binding,
         ReadApart::Texture,
-        ReadApart::SecondBuffer,
+        ReadApart::Inside,
+        ReadApart::SharedRange,
+        ReadApart::Heap,
+        ReadApart::Rebound,
         ReadApart::Unreleased,
     ];
 
     /// Its bit in [`HostImport::read_apart`].
-    fn bit(self) -> u8 {
-        1 << self as u8
+    fn bit(self) -> u16 {
+        1 << self as u16
     }
 }
 
@@ -1015,8 +1595,9 @@ pub(crate) enum KeptBecause {
     Heap,
     /// A rebind's import (`rebind.rs`).
     Rebind,
-    /// An import by pointer on a device whose driver is not measured to follow the pointer
-    /// (`DriverFact::PointerImportsFollowTheirAddress`), or off Unix.
+    /// An import by pointer on a device whose submission checks did not find a held pointer
+    /// import to cost every submission (`submit_check.rs`), or made before they answered, or off
+    /// Unix.
     Pointer,
     /// No stand-in buffer for a read of a released one.
     NoStandIn,
@@ -1064,7 +1645,8 @@ impl std::ops::Deref for ImportPages<'_> {
 
 impl HostImport {
     /// The import of `pages`, no pages lying in it yet, which the device keeps imported for
-    /// `because` (`None`: an import of dma-bufs whose descriptors did not fit, counted as such).
+    /// `because` (`None`: an import of dma-bufs whose descriptors did not fit, counted as such,
+    /// or pages bound in a guest RAM's chunk imported as a dma-buf, which the RAM's use keeps).
     fn new(device: &Device, pages: Pages, because: Option<KeptBecause>) -> HostImport {
         if let Some(because) = because {
             device.shared().counts.host_import_kept(because, true);
@@ -1078,7 +1660,8 @@ impl HostImport {
             shape: Shape::of(&pages),
             objects: ManuallyDrop::new(Objects::Fixed(Imported::new(device, pages))),
             lying: AtomicUsize::new(0),
-            read_apart: AtomicU8::new(0),
+            inside: AtomicUsize::new(0),
+            read_apart: AtomicU16::new(0),
             kept_because: because,
             unlisted: AtomicBool::new(unlisted),
             kept: Mutex::new(None),
@@ -1104,7 +1687,8 @@ impl HostImport {
                 device, pages, again, stand_in,
             ))),
             lying: AtomicUsize::new(0),
-            read_apart: AtomicU8::new(0),
+            inside: AtomicUsize::new(0),
+            read_apart: AtomicU16::new(0),
             kept_because: None,
             unlisted: AtomicBool::new(false),
             kept: Mutex::new(None),
@@ -1122,6 +1706,12 @@ impl HostImport {
         }
     }
 
+    /// Whether a buffer bound inside its memory lives now ([`Inside`]): it holds the import past
+    /// the release of the pages lying in it.
+    fn held_inside(&self) -> bool {
+        self.inside.load(Ordering::Acquire) > 0
+    }
+
     /// Its memory is a copy of the caller's pages, registered as `copied` (`copied.rs`), not
     /// their import.
     pub(super) fn set_copied(&self, copied: crate::copied::Copied) {
@@ -1132,6 +1722,26 @@ impl HostImport {
     /// Whether its memory is a copy of the caller's pages (`copied.rs`), not their import.
     pub(super) fn copied(&self) -> bool {
         self.copied.get().is_some()
+    }
+
+    /// Whether it is an import of dma-bufs of the pages (`dma_buf.rs`), not of their pointer nor
+    /// a copy of them.
+    pub(super) fn over_dma_buf(&self) -> bool {
+        self.shape.over_dma_buf && !self.copied()
+    }
+
+    /// Whether its memory is a copy of the caller's pages that drops the GPU's writes, as the
+    /// process cannot write them (`copied.rs`).
+    pub(super) fn copy_drops_writes(&self) -> bool {
+        self.copied
+            .get()
+            .is_some_and(|copied| copied.drops_writes())
+    }
+
+    /// Where the bytes start in its first page: their offset in their host page for an import of
+    /// them, 0 for a copied host buffer's copy, which lays them from its first byte.
+    pub(super) fn offset(&self) -> u64 {
+        self.shape.offset
     }
 
     /// Keep the logs of the writes to its pages (set once, as its first buffer is made), which
@@ -1236,6 +1846,16 @@ impl HostImport {
         }
         counts.host_import_read_apart_for(reason, true);
     }
+
+    /// A no-copy buffer made over its bytes came to lie in it beside another
+    /// ([`Joining::Buffer`]): counted where it is releasable still, which it stays
+    /// (`WorkCounts::host_imports_joined_releasable`, `host_residency.rs`).
+    fn note_joined(&self) {
+        #[cfg(unix)]
+        if self.residency().is_some_and(Residency::releasable) {
+            (self.device.shared().counts).host_import_joined_releasable();
+        }
+    }
 }
 
 impl Device {
@@ -1331,20 +1951,31 @@ impl Drop for HostImport {
         // memory's whole life (`VkImportMemoryHostPointerInfoEXT`), so the free is made here too.
         let posts =
             delayed.is_none() && (kept.is_some() || releases.iter().any(Release::keeps_alive));
+        // A completed command buffer's release that lets go of the import last, while a
+        // deallocator or a keep-alive waits for its free, posts the free to the device's free
+        // thread, which paces it (`free_thread.rs`): NVIDIA's driver holds every other thread's
+        // `vkQueueSubmit` while it frees memory (docs/FAST-PATHS.md, known gaps), and the caller
+        // learns that the pages may go from what waits, which goes there after the free.
+        let waits = delayed.is_some() || posts;
+        let paced = waits && crate::free_thread::posts_imports();
         let left = AfterImport {
             after: Box::new(AfterFree { kept, releases }),
             delayed,
+            waits,
         };
         // SAFETY: taken once, here, as the import goes, and never read again.
         let objects = unsafe { ManuallyDrop::take(&mut self.objects) };
-        let going: Box<dyn Send> = match objects {
+        let (going, frees): (Box<dyn Send>, bool) = match objects {
             // No pending command buffer uses the pages: one whose commands used them holds them
             // until it completed (`rebind.rs`), one that may read a texture's image over them
             // holds the image, which holds the import (`heap_sets.rs`), and every buffer over them
             // let go of them.
-            Objects::Fixed(imported) => {
+            Objects::Fixed(mut imported) => {
                 imported.leave(left);
-                Box::new(imported)
+                if posts || paced {
+                    imported.hold_for_release();
+                }
+                (Box::new(imported), true)
             }
             // Its objects go with their last holder, here or the last command buffer that read
             // them (a blit's, which holds them and not the buffer once a rebind or detach
@@ -1353,23 +1984,53 @@ impl Drop for HostImport {
             // unmapped.
             #[cfg(unix)]
             Objects::Releasable(residency) => match residency.let_go() {
-                Some(held) => {
+                Some(mut held) => {
                     held.leave(left);
-                    Box::new(held)
+                    // Where a command buffer's blit holds them still, that command buffer holds
+                    // the device as the program's, and they go with it.
+                    if posts || paced {
+                        if let Some(imported) = Arc::get_mut(&mut held) {
+                            imported.hold_for_release();
+                        }
+                    }
+                    (Box::new(held), true)
                 }
                 // Released: nothing to free.
-                None => left.after,
+                None => (left.after, false),
             },
+        };
+        let going = match paced && frees {
+            true => match post_free(shared, going) {
+                Ok(()) => return,
+                Err(going) => going,
+            },
+            false => going,
         };
         if posts {
             shared.counts.host_import_release_posted();
-            // A tuple drops in order: the release, then its count.
-            let posted = (going, PostedDone(self.device.clone()));
+            // A tuple drops in order: the release, then its count. The release's own handles of
+            // the device are holders' (the count's, the import's, and its dma-buf imports' where
+            // it alone holds them), which the program's last drop waits for
+            // (`device/holds.rs`): so a program that let go of such a buffer, then of the device,
+            // finds the device gone as that drop returns.
+            let posted = (going, PostedDone(self.device.held_for_release()));
             self.device.let_go_elsewhere(Box::new(posted));
         } else {
             drop(going);
         }
     }
+}
+
+/// Post `objects`, a host import's going at a completed command buffer's release while a
+/// deallocator or a keep-alive waits for their free, each handle of the device they hold a
+/// holder's, to the device of `shared`'s free thread (`free_thread.rs`,
+/// `WorkCounts::host_import_frees_posted`); given back where it refused them.
+fn post_free(shared: &DeviceShared, objects: Box<dyn Send>) -> Result<(), Box<dyn Send>> {
+    let posted = crate::free_thread::PostedImport {
+        objects,
+        holds: Arc::clone(&shared.holds),
+    };
+    (shared.frees.post_import(posted)).map_err(|posted| posted.objects)
 }
 
 /// Counts a host import's release posted to a handler thread (a keep-alive alone waiting for its
@@ -1394,11 +2055,14 @@ pub(super) struct Imported {
 }
 
 /// What a going import leaves with its objects ([`Imported::leave`]): the caller's keep-alive and
-/// deallocators, which go once the memory is freed, and the length of a deallocator's pages,
-/// announced where the free waits for the batches in flight.
+/// deallocators, which go once the memory is freed, the length of a deallocator's pages,
+/// announced where the free waits for the batches in flight, and whether a deallocator or a
+/// keep-alive waits for the free (a completed command buffer that lets go of the objects last
+/// posts their free to the free thread then, `rebind::ImportHold`).
 pub(super) struct AfterImport {
     after: Box<dyn Send>,
     delayed: Option<u64>,
+    waits: bool,
 }
 
 impl Imported {
@@ -1415,6 +2079,38 @@ impl Imported {
     fn leave(&self, left: AfterImport) {
         *lock(&self.after) = Some(left);
     }
+
+    /// Whether the import went, leaving what waits for the free ([`Imported::leave`]), and a
+    /// deallocator or a keep-alive among it: its free may go to the free thread then.
+    pub(super) fn waits_for_free(&mut self) -> bool {
+        let after = self.after.get_mut().unwrap_or_else(PoisonError::into_inner);
+        after.as_ref().is_some_and(|after| after.waits)
+    }
+
+    /// Post the free of `imported`, a completed command buffer's release letting go of it last,
+    /// to its device's free thread where a deallocator or a keep-alive waits for it
+    /// (`rebind::ImportHold`); else, or where the thread refuses it, free it here.
+    pub(super) fn let_go_at_completion(mut imported: Imported) {
+        if !(crate::free_thread::posts_imports() && imported.waits_for_free()) {
+            drop(imported);
+            return;
+        }
+        imported.hold_for_release();
+        let device = imported.device.clone();
+        if let Err(objects) = post_free(device.shared(), Box::new(imported)) {
+            drop(objects);
+        }
+    }
+
+    /// Hold the device through a handle the program's last drop waits for, in place of its own
+    /// ([`Device::held_for_release`]), and so the dma-buf imports its pages lie in where they
+    /// alone hold them: the import going, these objects go in a release posted to a handler
+    /// thread or the free thread.
+    fn hold_for_release(&mut self) {
+        self.device = self.device.held_for_release();
+        #[cfg(unix)]
+        self.pages.memory.placement.hold_dma_buf_for_release();
+    }
 }
 
 impl Drop for Imported {
@@ -1423,7 +2119,7 @@ impl Drop for Imported {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         let (after, delayed) = match left {
-            Some(AfterImport { after, delayed }) => (Some(after), delayed),
+            Some(AfterImport { after, delayed, .. }) => (Some(after), delayed),
             None => (None, None),
         };
         // SAFETY: no pending command buffer uses them: an import's own go as the import goes
@@ -1460,6 +2156,28 @@ fn deallocator_delayed(device: &Device, length: u64) {
     });
 }
 
+/// A buffer's hold on the live import of host pages it is bound inside, with no import of its own
+/// (`host_aliases.rs`, "One page, one import"; `Placement::in_import`, whose clones share
+/// it): counted in the import's `inside` while it lives, so that a release of another buffer's
+/// pages that the import outlives for it is counted (`WorkCounts::host_releases_held_inside`)
+/// and named in its announcement.
+pub(super) struct Inside(Arc<HostImport>);
+
+impl Inside {
+    /// A hold on `import` for a buffer bound inside its memory.
+    pub(super) fn new(import: Arc<HostImport>) -> Inside {
+        import.inside.fetch_add(1, Ordering::AcqRel);
+        Inside(import)
+    }
+}
+
+impl Drop for Inside {
+    fn drop(&mut self) {
+        // Before the hold goes: the import may go with it.
+        self.0.inside.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// What goes once a host import's memory is freed: the keep-alive of the pages that went while it
 /// lived, and the deallocators that waited for the free, each panic caught. It waits with the
 /// memory where that waits for the batches in flight (`freed_memory.rs`).
@@ -1494,6 +2212,10 @@ impl Drop for AfterFree {
 
 impl Drop for HostPages {
     fn drop(&mut self) {
+        // No command writes their copy through them from now on (`copied.rs`).
+        if let (Some(key), Some(copied)) = (self.named.get(), self.import.copied.get()) {
+            copied.unname(*key);
+        }
         // The images and views a rebind or a detach parked go first: they may hold the import.
         lock(&self.parked).clear();
         let others = self.import.lying.fetch_sub(1, Ordering::AcqRel) > 1;
@@ -1523,18 +2245,34 @@ impl Drop for HostPages {
             // where nothing else holds it; else later, announced.
             None => {
                 if release.deallocates() && Arc::strong_count(import) > 1 {
-                    import.device.shared().counts.host_deallocator_delayed();
+                    let counts = &import.device.shared().counts;
+                    counts.host_deallocator_delayed();
+                    let inside = import.held_inside();
+                    if inside {
+                        counts.host_release_held_inside();
+                    }
                     let length = release.length();
                     import
                         .device
                         .degrade_once(Degradation::HostDeallocatorDelayed, || {
+                            let held = match inside {
+                                true => {
+                                    "a buffer bound inside its pages' import, over part of its \
+                                     bytes or the same bytes as memory of another class, still \
+                                     lives as it is released (one live import of a page: \
+                                     VK_EXT_external_memory_host leaves a page imported twice \
+                                     undefined)"
+                                }
+                                false => {
+                                    "its pages' import is still held as it is released (a \
+                                     texture over them may still be read through its resource \
+                                     ID by a command buffer submitted before the texture's \
+                                     release)"
+                                }
+                            };
                             (
                                 format!("a no-copy buffer of {length} bytes"),
-                                "its pages' import is still held as it is released (a texture \
-                                 over them may still be read through its resource ID by a \
-                                 command buffer submitted before the texture's release), and \
-                                 the caller gave no keep-alive"
-                                    .to_owned(),
+                                format!("{held}, and the caller gave no keep-alive"),
                             )
                         });
                 }
@@ -1545,6 +2283,12 @@ impl Drop for HostPages {
 }
 
 impl Pages {
+    /// The placement the pages are bound in: what a buffer bound inside their import binds in
+    /// (`Device::bind_in_import`).
+    pub(super) fn placement(&self) -> &Placement {
+        &self.memory.placement
+    }
+
     /// Destroy the `VkBuffer` of a host import's pages and free their memory, on `device`, once
     /// their sparse binding completed, and note it (`Device::note_import_freed`): an import's
     /// last hold lets go. Left to the process's end while it exits. `after` goes once the memory
@@ -1578,10 +2322,15 @@ impl Pages {
     /// Let `after` go once the pages' memory is freed, their import released
     /// ([`release_import`](Self::release_import)): at once, but where the memory is imports of
     /// the caller's dma-bufs (`dma_buf.rs`), which the placement holds and are freed as their
-    /// last holder lets go of them, then.
+    /// last holder lets go of them, then. Pages bound in a guest RAM's chunk (`host_ram.rs`) free
+    /// no memory of their own, whatever the chunk's import: at once.
     fn after_free(&self, after: Box<dyn Send>) {
+        let placement = &self.memory.placement;
         #[cfg(unix)]
-        if let Some(imports) = self.memory.placement.dma_buf_pages() {
+        if let Some(imports) = placement
+            .dma_buf_pages()
+            .filter(|_| !placement.over_ram_chunk())
+        {
             imports.after_free(after);
             return;
         }
@@ -1606,6 +2355,7 @@ impl OwnBytes {
             Lie::Host(cell) => match cell.lying() {
                 Lying::In(pages) => f(&pages.import.pages(reason)),
                 Lying::Detached(detached) => f(&detached.pages),
+                Lying::Gone(_) => read_gone(),
             },
         }
     }
@@ -1616,7 +2366,7 @@ impl OwnBytes {
             Lie::Fixed(fixed) => Some(f(&fixed.pages)),
             Lie::Host(cell) => match cell.lying() {
                 Lying::In(pages) => Some(f(&pages.import.pages(reason))),
-                Lying::Detached(_) => None,
+                Lying::Detached(_) | Lying::Gone(_) => None,
             },
         }
     }
@@ -1629,8 +2379,55 @@ impl OwnBytes {
             Lie::Host(cell) => match cell.lying() {
                 Lying::In(pages) => pages.import.shape,
                 Lying::Detached(detached) => Shape::of(&detached.pages),
+                Lying::Gone(shape) => shape,
             },
         }
+    }
+}
+
+/// A `Managed` buffer's host copy on a device without unified memory, which `contents` maps and
+/// `did_modify_range` and `synchronize_resource` copy to and from (`managed.rs`): the runtime's
+/// own ([`Mirror`]), for a buffer the runtime makes, or the caller's pages, for a no-copy buffer
+/// (`managed_copy.rs`'s [`CallerCopy`]).
+pub(super) enum HostCopy {
+    Own(Arc<Mirror>),
+    Caller(Arc<CallerCopy>),
+}
+
+/// What a copy from a buffer's host copy into its own bytes replaces, which says the batch that
+/// takes it (`texture/first_move.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Replaces {
+    /// Bytes no command buffer can have read: the buffer's making, or its device copy's making
+    /// on a recovery's new `VkDevice`. Taken as a new buffer's first fill is
+    /// (`FirstMoves::register_bytes`; on a device without a fill queue, by the device's next
+    /// submission, whatever its commands reach), so what it copies from (an import of the
+    /// caller's pages, a staging buffer, the host copy) is held no longer than that.
+    Unread,
+    /// Bytes the program's command buffers may have read already, with the stamp of the commit
+    /// that took the range (`managed.rs`; 0 where none did: a completion's undo, a rebind): only
+    /// a batch whose commands may reach the buffer takes it, of a command buffer committed at or
+    /// after that commit (`FirstMoves::register_upload`).
+    Read(u64),
+}
+
+/// Register with `device`'s first work the copy of `length` bytes of `source` onto `keeper`'s
+/// bytes at `onto` (its `VkBuffer`, and where), `held` until the submission that makes it
+/// completed, for the batch `replaces` says: whether it staged its bytes and the copies staged now
+/// passed their bound (`texture/first_move.rs`, **Bounded**).
+fn register_copy_in(
+    device: &Device,
+    keeper: Weak<BufferShared>,
+    (onto, source): ((vk::Buffer, u64), (vk::Buffer, u64)),
+    length: u64,
+    held: Keeps,
+    replaces: Replaces,
+) -> bool {
+    let keeper: Weak<dyn Filled> = keeper;
+    let moves = &device.shared().textures.first_moves;
+    match replaces {
+        Replaces::Unread => moves.register_bytes(keeper, onto, source, length, held),
+        Replaces::Read(commit) => moves.register_upload(keeper, onto, source, length, held, commit),
     }
 }
 
@@ -1669,8 +2466,10 @@ struct HeapBytes {
     /// The heap's own buffer.
     bytes: Buffer,
     offset: u64,
-    /// `makeAliasable` was called: an automatic heap's range is free for other resources.
-    aliasable: AtomicBool,
+    /// `makeAliasable` was called: an automatic heap's range is free for other resources. Shared
+    /// by the buffer's parts on each generation its device's recovery carried it to
+    /// (`Buffer::carry_placed`).
+    aliasable: Arc<AtomicBool>,
 }
 
 /// Who owns a buffer's bytes.
@@ -1716,17 +2515,200 @@ impl Filled for BufferShared {
         self.memory_hold()
             .map(|memory| Box::new(memory) as Box<dyn Any + Send + Sync>)
     }
+
+    /// Its identity's key (`Buffer::identity`): a buffer placed in a heap has the heap's own
+    /// buffer's.
+    fn key(&self) -> Option<ResourceKey> {
+        Some(match &self.bytes {
+            Bytes::Own(own) => own.identity.key,
+            Bytes::Heap(placed) => placed.bytes.identity().key,
+        })
+    }
+}
+
+impl Buffer {
+    /// What a failed submission's line states of the buffer (`submit_failure.rs`): its identity,
+    /// length and storage mode, whether its `VkBuffer` or memory was handed out, and where its
+    /// bytes lie (a heap's range, its memory with `types`' flags for its type, the caller's
+    /// `VkBuffer`, or a no-copy buffer's host pages and their import), and how that stands: read
+    /// without waiting for any lock and with no import made again.
+    pub(super) fn failure_facts(&self, types: &TypeFlags) -> (String, Standing) {
+        let s = self.s();
+        let mut facts = format!(
+            "buffer #{} of {} bytes, {:?}",
+            s.object_id.get(),
+            s.length,
+            self.storage_mode(),
+        );
+        if s.handed_out.load(Ordering::Relaxed) {
+            facts.push_str(", handed out");
+        }
+        let standing = match &s.bytes {
+            Bytes::Heap(placed) => {
+                let heap = placed.heap.object_id().get();
+                facts.push_str(&format!(", in heap #{heap} at {}", placed.offset));
+                Standing::Held
+            }
+            Bytes::Own(own) => match &own.lie {
+                Lie::Fixed(fixed) => {
+                    facts.push_str(", ");
+                    facts.push_str(&fixed.pages.memory.placement.failure_facts(types));
+                    if matches!(own.owner, Owner::Vulkan) {
+                        facts.push_str(", the caller's VkBuffer");
+                    }
+                    match fixed.released.load(Ordering::Acquire) {
+                        true => {
+                            facts.push_str(", RELEASED with its lost generation");
+                            Standing::Released
+                        }
+                        false => Standing::Held,
+                    }
+                }
+                Lie::Host(cell) => cell.failure_facts(&mut facts, types),
+            },
+        };
+        (facts, standing)
+    }
+}
+
+impl HostCell {
+    /// [`Buffer::failure_facts`] of a no-copy buffer's pages, added to `facts`.
+    fn failure_facts(&self, facts: &mut String, types: &TypeFlags) -> Standing {
+        facts.push_str(", no-copy");
+        if self.drops_writes {
+            facts.push_str(", its GPU writes dropped");
+        }
+        let Some(lying) = try_lock(&self.pages) else {
+            facts.push_str(", its pages busy");
+            return Standing::Held;
+        };
+        match &*lying {
+            Lying::In(pages) => pages.import.failure_facts(facts, types),
+            Lying::Detached(_) => {
+                facts.push_str(", DETACHED");
+                Standing::Released
+            }
+            Lying::Gone(_) => {
+                facts.push_str(", its pages GONE with its lost generation");
+                Standing::Gone
+            }
+        }
+    }
+}
+
+impl HostImport {
+    /// [`Buffer::failure_facts`] of the import a no-copy buffer's pages lie in, added to
+    /// `facts`: what it imported, its memory, and whether it is released now
+    /// (`host_residency.rs`).
+    fn failure_facts(&self, facts: &mut String, types: &TypeFlags) -> Standing {
+        let shape = &self.shape;
+        let what = match (self.copied(), shape.over_dma_buf, shape.in_ram_chunk) {
+            (true, _, _) => "a copy of the caller's pages",
+            (false, true, _) => "the caller's pages as dma-bufs",
+            (false, false, true) => "the caller's pages in a guest RAM chunk's import",
+            (false, false, false) => "the caller's pages by their pointer",
+        };
+        facts.push_str(", over ");
+        facts.push_str(what);
+        match &*self.objects {
+            Objects::Fixed(imported) => {
+                facts.push_str(", imported for good: ");
+                facts.push_str(&imported.pages.memory.placement.failure_facts(types));
+                Standing::Held
+            }
+            #[cfg(unix)]
+            Objects::Releasable(residency) => {
+                facts.push_str(", releasable, memory ");
+                facts.push_str(&types.of(shape.type_index));
+                match residency.held_now() {
+                    Some(true) => {
+                        facts.push_str(", imported now");
+                        Standing::Held
+                    }
+                    Some(false) => {
+                        facts.push_str(", RELEASED now");
+                        Standing::Released
+                    }
+                    None => {
+                        facts.push_str(", its residency busy");
+                        Standing::Held
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl BufferShared {
+    /// Its parts on its lost generation were marked let go of, the buffer carried to the next one
+    /// and that generation at rest (`LostBuffer::mark`): no call takes them from now on
+    /// ([`Buffer::held_parts`]), and they go once none under way holds them.
+    fn released(&self) -> bool {
+        match &self.bytes {
+            Bytes::Own(OwnBytes {
+                lie: Lie::Fixed(fixed),
+                ..
+            }) => fixed.released.load(Ordering::Acquire),
+            Bytes::Own(OwnBytes {
+                lie: Lie::Host(cell),
+                ..
+            }) => cell.released.load(Ordering::Acquire),
+            Bytes::Heap(_) => false,
+        }
+    }
+
+    /// Whether its parts on a lost generation went (`FixedPages::release_lost`, [`LostHost`],
+    /// [`LostPlaced`]).
+    fn freed(&self) -> bool {
+        match &self.bytes {
+            Bytes::Own(OwnBytes {
+                lie: Lie::Fixed(fixed),
+                ..
+            }) => fixed.freed.load(Ordering::Acquire),
+            Bytes::Own(OwnBytes {
+                lie: Lie::Host(cell),
+                ..
+            }) => cell.freed.load(Ordering::Acquire),
+            Bytes::Heap(_) => self.device.gone(),
+        }
+    }
 }
 
 impl Drop for BufferShared {
     fn drop(&mut self) {
+        // Carried to the next generation, its parts on this one went with its handle of it
+        // (`LostBuffer`): its share of its range goes back to the space every generation shares.
+        if self.device.gone() {
+            if let Bytes::Own(own) = &self.bytes {
+                let Some(_busy) = exit_guard::enter() else {
+                    return;
+                };
+                let mut last = &*self;
+                while let Some(next) = last.next.get() {
+                    last = &next.0;
+                }
+                lock(&last.device.shared().addresses).free(own.reserved);
+            }
+            return;
+        }
+        // Its staged work goes with it, and the staging buffer or host copy that work holds,
+        // which hold the device: a device whose program let go of it has no submission to wait
+        // for, and its last handle would otherwise be one of its own.
+        if *self.staged.get_mut() {
+            let at: *const BufferShared = self;
+            self.device.shared().textures.first_moves.forget(at.cast());
+        }
         let own = match &mut self.bytes {
             Bytes::Own(own) => own,
             Bytes::Heap(bytes) => {
-                // An automatic heap's range goes back to it unless `makeAliasable` returned it.
-                bytes
-                    .heap
-                    .release(bytes.offset, self.length, &bytes.aliasable);
+                // An automatic heap's range goes back to it unless `makeAliasable` returned it:
+                // once, by the buffer's parts on the generation it was carried to last
+                // (`Buffer::carry_placed`), which go after these.
+                if self.next.get().is_none() {
+                    bytes
+                        .heap
+                        .release(bytes.offset, self.length, &bytes.aliasable);
+                }
                 let live = &self.device.shared().live_buffers;
                 live.forget(self.address.0, self.object_id);
                 return;
@@ -1793,12 +2775,49 @@ pub(super) struct BufferParts {
     pub(super) release: Option<Release>,
     /// The buffer is a heap's own (`heap.rs`): `Default` hazard tracking resolves to untracked.
     pub(super) of_heap: bool,
+    /// The GPU's writes to a no-copy buffer's pages are dropped, as Metal's private option bit 24
+    /// drops them: they are imported through a read-only view of them (`read_only_view.rs`), or
+    /// copied, the copy's GPU writes never written back (`copied.rs`), and a rebind's are too.
+    pub(super) drops_writes: bool,
     /// A `Managed` buffer's host copy, on a device without unified memory.
-    pub(super) mirror: Option<Arc<Mirror>>,
+    pub(super) mirror: Option<HostCopy>,
     /// What imports a no-copy buffer's dma-bufs again, where the device may release its import
     /// while idle (`host_residency.rs`).
     #[cfg(unix)]
     pub(super) again: Option<Again>,
+    /// A new buffer, or the same buffer on its device's next generation.
+    pub(super) naming: Naming,
+}
+
+/// Who a buffer being made is ([`Device::buffer_of`], `Device::buffer_over_host_parts`): a new
+/// buffer, with an identity and an `ObjectId` of its own, or a buffer its device's recovery
+/// carries (`Buffer::carry`), the same buffer on the next generation, its identity, `ObjectId`
+/// and attributes the buffer's; or the runtime's own buffer over the caller's pages that a
+/// `Managed` no-copy buffer on a device without unified memory copies to and from
+/// (`managed_copy.rs`), new as a new buffer is, which is never a copy of the pages; or the
+/// runtime's read twin of a no-copy buffer whose GPU writes are dropped (`read_twin.rs`), new as
+/// a new buffer is but of a read twin's identity, which is never a copy of the pages either.
+pub(super) enum Naming {
+    New,
+    HostCopy,
+    ReadTwin,
+    Carried {
+        object_id: ObjectId,
+        identity: Identity,
+        attributes: ResourceAttributes,
+    },
+}
+
+impl Naming {
+    /// The buffer's identity: a new one of `hazard` (a heap's own where `of_heap`), or the
+    /// carried buffer's.
+    fn identity(&self, hazard: HazardTrackingMode, of_heap: bool) -> Identity {
+        match self {
+            Naming::New | Naming::HostCopy => Identity::new(hazard, of_heap),
+            Naming::ReadTwin => Identity::read_twin(),
+            Naming::Carried { identity, .. } => *identity,
+        }
+    }
 }
 
 impl std::fmt::Debug for Buffer {
@@ -1856,10 +2875,12 @@ pub(super) const LINEAR_IMAGE_ALIGNMENT: u64 = 256;
 /// pool starts where the last ends: a buffer shorter than the alignment would leave the rest of
 /// its unit free, a gap no buffer takes, and the pool's first-fit search (`range.rs`) walks every
 /// such gap for each later placement, which made each new buffer cost time in proportion to the
-/// buffers before it. A buffer past half a pooled block keeps its own size: it never lies in a
-/// pooled block but takes a block of its own (`memory.rs`'s `place`; a pooled block is
-/// [`BLOCK_BYTES`] on every device, whose `maxMemoryAllocationSize` Vulkan puts at 1 GiB or
-/// more), where nothing follows it.
+/// buffers before it. A buffer past half the largest pooled block keeps its own size: it never
+/// lies in a pooled block but takes a block of its own (`memory.rs`'s `place`; a pooled block is
+/// at most [`BLOCK_BYTES`], and that on every heap of 1 GiB or more,
+/// `memory::pooled_block_bytes`), where nothing follows it. One up to that size takes a block of
+/// its own where its memory type's blocks are smaller (a small heap's), its size rounded as
+/// here.
 /// Rounded up to a heap's 256 KiB (`texture/heap.rs`'s `HEAP_BASE_ALIGNMENT`), the largest heap
 /// would ask past the device's `maxMemoryAllocationSize`: 4 GiB on RADV, whose largest allocation
 /// is 4 GiB less 4 bytes, and 41,747,218,432 bytes on MoltenVK on an M3 Max, whose largest is
@@ -1913,13 +2934,34 @@ impl Device {
     /// answers nil, its validation stopping it), `Memoryless` storage
     /// (`Invalid`).
     pub fn new_buffer(&self, length: u64, options: ResourceOptions) -> Result<Buffer, Error> {
+        self.at_serving(|device| device.new_buffer_now(length, options))
+    }
+
+    /// [`Device::new_buffer`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn new_buffer_now(
+        &self,
+        length: u64,
+        options: ResourceOptions,
+    ) -> Result<Buffer, Error> {
+        self.new_buffer_placed(length, options, AddressPlacement::Any)
+    }
+
+    /// [`Device::new_buffer`] at `placement` in the address space: made, refused, announced and
+    /// kept among the program's resources as that is, at `AddressPlacement::Outside` for a buffer
+    /// whose address Metal shows no program, so that no program buffer's address depends on it
+    /// (`address.rs`).
+    pub(super) fn new_buffer_placed(
+        &self,
+        length: u64,
+        options: ResourceOptions,
+        placement: AddressPlacement,
+    ) -> Result<Buffer, Error> {
         self.keep_room();
         let options = self.own_memory_options("new_buffer", options)?;
+        let placed = (placement.into(), None);
         let (buffer, class) =
-            self.buffer_of_length("new_buffer", length, options, AddressPlacement::Any)?;
-        self.degrade_system_memory(&buffer, class, || {
-            format!("a `Shared` buffer of {length} bytes")
-        });
+            self.buffer_of_length("new_buffer", length, options, placed, false)?;
+        self.degrade_system_memory(&buffer, class, || format!("buffer of {length} bytes"));
         Ok(self.visible(buffer))
     }
 
@@ -1932,8 +2974,9 @@ impl Device {
         length: u64,
         options: ResourceOptions,
     ) -> Result<Buffer, Error> {
+        let placed = (AddressPlacement::Outside.into(), None);
         Ok(self
-            .buffer_of_length("new_buffer", length, options, AddressPlacement::Outside)?
+            .buffer_of_length("new_buffer", length, options, placed, false)?
             .0)
     }
 
@@ -1952,33 +2995,49 @@ impl Device {
     }
 
     /// A buffer of `length` bytes, all zero, with `options`, at `placement` in the address space,
-    /// for `call`, and the memory class it took: refused as [`Device::new_buffer`] refuses it,
-    /// and for a pin the address space cannot honour.
+    /// its byte `aligned` (where given) on a multiple of 256 bytes of its memory, for `call`, and
+    /// the memory class it took: refused as [`Device::new_buffer`] refuses it, and for a pin the
+    /// address space cannot honour. Where `padding_unobserved` (its maker declares the bytes
+    /// between a texture's rows unobserved, `BufferDescriptor::padding_unobserved`), it lies
+    /// where [`NewBufferOf::Unobserved`] says.
     pub(super) fn buffer_of_length(
         &self,
         call: &'static str,
         length: u64,
         options: ResourceOptions,
-        placement: impl Into<Place>,
+        (placement, aligned): (Place, Option<u64>),
+        padding_unobserved: bool,
     ) -> Result<(Buffer, MemoryClass), Error> {
         let modes = Modes::of(options)?;
         let class = buffer_class(call, modes)?;
         if length == 0 || length > self.properties().max_buffer_length {
             return Err(nil(call, Problem::BufferLength { length }));
         }
-        let buffer = self.zeroed_buffer(call, length, modes, class, false, placement)?;
+        let of = match padding_unobserved {
+            true => NewBufferOf::Unobserved,
+            false => NewBufferOf::Runtime(FreshPages::WherePaid),
+        };
+        let buffer =
+            self.zeroed_buffer_of(call, length, (modes, class), of, (placement, aligned))?;
         Ok((buffer, class))
     }
 
-    /// Announce [`Degradation::SharedInSystemMemory`] once where `buffer`, which the program made
-    /// (`what` names it) in memory of `class`, is `Shared` memory a device without unified memory
-    /// placed in system memory (`MemoryClass::Shared`). A heap's buffer is its heap's.
+    /// Announce once each where `buffer`, which the program made (`what` names it, after its
+    /// storage mode) in memory of `class`, lies in system memory: its own bytes overflowed past
+    /// device-local memory ([`Device::degrade_overflow`]), or it is `Shared` memory a device
+    /// without unified memory placed there (`MemoryClass::Shared`,
+    /// [`Degradation::SharedInSystemMemory`]). A heap's buffer is its heap's.
     pub(super) fn degrade_system_memory(
         &self,
         buffer: &Buffer,
         class: MemoryClass,
         what: impl FnOnce() -> String,
     ) {
+        let what = || format!("a `{:?}` {}", buffer.storage_mode(), what());
+        if buffer.own_pages_overflowed() {
+            self.degrade_overflow(what);
+            return;
+        }
         if class != MemoryClass::Shared || self.properties().has_unified_memory {
             return;
         }
@@ -1999,6 +3058,23 @@ impl Device {
         });
     }
 
+    /// Announce [`Degradation::DeviceMemoryOverflow`] once for a resource the program made
+    /// (`what` names it) whose memory overflowed past device-local memory into system memory
+    /// (`memory.rs`'s `overflow_candidates`).
+    pub(super) fn degrade_overflow(&self, what: impl FnOnce() -> String) {
+        self.degrade(Degradation::DeviceMemoryOverflow, || {
+            (
+                what(),
+                format!(
+                    "no device-local memory type of {} that it takes has room for it, so it lies \
+                     in system memory, as Metal makes a resource past a discrete GPU's memory \
+                     rather than refuse it",
+                    self.name()
+                ),
+            )
+        });
+    }
+
     /// A buffer of `length` bytes (above 0), all zero, in memory of `class` with `modes`, at
     /// `placement` in the address space: a heap's own buffer when `of_heap` (`heap.rs`). Its
     /// length is the caller's to check.
@@ -2011,8 +3087,77 @@ impl Device {
         of_heap: bool,
         placement: impl Into<Place>,
     ) -> Result<Buffer, Error> {
-        let (buffer, bytes) =
-            self.placed_new_buffer(call, length, modes, class, of_heap, placement.into())?;
+        let of = match of_heap {
+            true => NewBufferOf::Heap,
+            false => NewBufferOf::Runtime(FreshPages::WherePaid),
+        };
+        self.zeroed_buffer_of(call, length, (modes, class), of, (placement.into(), None))
+    }
+
+    /// A `Shared` buffer of the runtime's own of `length` bytes, all zero, at `placement`, for an
+    /// indirect command buffer's records or the slots past them: in fresh pages of its own at any
+    /// length where the device takes them and [`Device::records_take_own_pages`] says so, so that a
+    /// recovery's carry keeps its pages and its bytes (`FreshPages::Records`); else where
+    /// [`zeroed_buffer`](Device::zeroed_buffer) lays such a buffer ([`Buffer::in_own_pages`]
+    /// tells which). Refused as that is.
+    pub(super) fn records_buffer(
+        &self,
+        call: &'static str,
+        length: u64,
+        modes: Modes,
+        placement: impl Into<Place>,
+    ) -> Result<Buffer, Error> {
+        let of = NewBufferOf::Runtime(FreshPages::Records);
+        let placed = (placement.into(), None);
+        self.zeroed_buffer_of(call, length, (modes, MemoryClass::Shared), of, placed)
+    }
+
+    /// Whether an indirect command buffer's records made now take fresh pages of the runtime's own
+    /// where the device takes them (`DevicePolicy::indirect_records`): under
+    /// `IndirectRecordsPolicy::Untaxed` (the default) only while the device's check has not found
+    /// that a held pointer import costs every submission (`submit_check.rs`, the import tax:
+    /// RADV and ANV on i915 pay one), as such an import is held for the buffer's life; under
+    /// `IndirectRecordsPolicy::Carried` always, so that a recovery keeps them.
+    pub(super) fn records_take_own_pages(&self) -> bool {
+        match self.compile_device().policy().indirect_records {
+            IndirectRecordsPolicy::Carried => true,
+            _ => !self.pointer_imports_tax_submissions(),
+        }
+    }
+
+    /// A `Private` buffer of the runtime's own of `length` bytes at `placement`, for an indirect
+    /// command buffer's records in device-local memory (`indirect_command_buffer/home.rs`): its
+    /// bytes as placed, no fill noted, as the caller sets every byte before any use. Refused as
+    /// [`zeroed_buffer`](Device::zeroed_buffer) is.
+    pub(super) fn device_records_buffer(
+        &self,
+        call: &'static str,
+        length: u64,
+        modes: Modes,
+        placement: impl Into<Place>,
+    ) -> Result<Buffer, Error> {
+        let modes = Modes {
+            storage: StorageMode::Private,
+            ..modes
+        };
+        let of = NewBufferOf::Runtime(FreshPages::WherePaid);
+        let placed = (placement.into(), None);
+        let (buffer, _) =
+            self.placed_new_buffer(call, length, modes, MemoryClass::Private, of, placed)?;
+        Ok(buffer)
+    }
+
+    /// [`zeroed_buffer`](Device::zeroed_buffer) for `of`, its byte `aligned` (where given) on a
+    /// multiple of 256 bytes of its memory ([`Device::placed_new_buffer`]).
+    fn zeroed_buffer_of(
+        &self,
+        call: &'static str,
+        length: u64,
+        (modes, class): (Modes, MemoryClass),
+        of: NewBufferOf,
+        placed: (Place, Option<u64>),
+    ) -> Result<Buffer, Error> {
+        let (buffer, bytes) = self.placed_new_buffer(call, length, modes, class, of, placed)?;
         // Fresh pages read zero as mapped (`fresh_pages.rs`): nothing is written.
         if bytes == NewBytes::Zero {
             return Ok(buffer);
@@ -2020,6 +3165,57 @@ impl Device {
         // Dropping `buffer` on failure releases it.
         buffer.clear_first()?;
         Ok(buffer)
+    }
+
+    /// A `Shared` buffer of `length` bytes (above half a pooled block, `FRESH_PAGES_PAST`), all
+    /// zero, outside the Metal address space, in fresh pages wherever the device takes them, the
+    /// cost of a held import to its submissions aside ([`FreshPages::Wherever`]): the in-place
+    /// check's fresh-pages class (`in_place_check.rs`). Where the device takes no such pages, a
+    /// buffer as ever, not in them (`Buffer::in_fresh_pages`). Refused as [`Device::new_buffer`]
+    /// refuses its length.
+    pub(super) fn fresh_pages_check_buffer(&self, length: u64) -> Result<Buffer, Error> {
+        const CALL: &str = "new_buffer";
+        let modes = Modes::of(ResourceOptions::shared())?;
+        let class = buffer_class(CALL, modes)?;
+        if length == 0 || length > self.properties().max_buffer_length {
+            return Err(nil(CALL, Problem::BufferLength { length }));
+        }
+        let (buffer, bytes) = self.placed_new_buffer(
+            CALL,
+            length,
+            modes,
+            class,
+            NewBufferOf::Runtime(FreshPages::Wherever),
+            (AddressPlacement::Outside.into(), None),
+        )?;
+        if bytes == NewBytes::AsPlaced {
+            buffer.clear_first()?;
+        }
+        Ok(buffer)
+    }
+
+    /// A `Shared` buffer of `length` bytes, all zero, outside the Metal address space, in a
+    /// block of the runtime's pooled memory that holds `holds`, whatever kind of block the
+    /// device's own buffers take: `Holds::Buffers` for the in-place check's class of plain
+    /// pooled memory (`in_place_check.rs`, `PagesClass::Pooled`), whose image names no handle
+    /// type, and `Holds::FdBuffers` for its class of the blocks allocated exportable
+    /// (`PagesClass::FdBlocks`), whose image names their handle type (`memory.rs`'s "Buffers in
+    /// exportable blocks"). Refused as [`Device::new_buffer`] refuses its length.
+    pub(super) fn pooled_check_buffer(&self, length: u64, holds: Holds) -> Result<Buffer, Error> {
+        const CALL: &str = "new_buffer";
+        let modes = Modes::of(ResourceOptions::shared())?;
+        let class = buffer_class(CALL, modes)?;
+        if length == 0 || length > self.properties().max_buffer_length {
+            return Err(nil(CALL, Problem::BufferLength { length }));
+        }
+        let placed = (AddressPlacement::Outside.into(), None);
+        self.zeroed_buffer_of(
+            CALL,
+            length,
+            (modes, class),
+            NewBufferOf::Check(holds),
+            placed,
+        )
     }
 
     /// A `Private` buffer of `length` bytes that the runtime makes for its own use and whose
@@ -2069,36 +3265,56 @@ impl Device {
             length,
             modes,
             class,
-            false,
-            AddressPlacement::Outside.into(),
+            NewBufferOf::Runtime(FreshPages::WherePaid),
+            (AddressPlacement::Outside.into(), None),
         )
     }
 
     /// [`zeroed_buffer`](Device::zeroed_buffer)'s buffer before its bytes are set to zero, and
     /// what they hold: its memory's bytes as placed, or zero where it lies in fresh pages it
-    /// imported (`fresh_pages.rs`). A buffer not of a heap is a parked one of the same making
-    /// where the recycler holds one, and is noted as one it may park as it goes (`recycle.rs`).
+    /// imported (`fresh_pages.rs`), which `of` says where it takes. A buffer of the runtime's own
+    /// made where fresh pages are paid for is a parked one of the same making where the recycler
+    /// holds one, and is noted as one it may park as it goes (`recycle.rs`); one made wherever the
+    /// device takes them is neither: it is the in-place check's, whose import is held only for its
+    /// round.
+    ///
+    /// Where `aligned` names a byte of it (`BufferDescriptor::aligned_byte`) off a multiple of
+    /// [`LINEAR_IMAGE_ALIGNMENT`], its `VkBuffer` is bound where its placement starts, a multiple
+    /// of that alignment, and its bytes start that byte's shortfall from the next multiple into
+    /// both, so that the byte lies on that multiple: the buffer takes that many more bytes, is
+    /// never parked nor taken from the parked, and lies in no fresh pages.
     fn placed_new_buffer(
         &self,
         call: &'static str,
         length: u64,
         modes: Modes,
         class: MemoryClass,
-        of_heap: bool,
-        placement: Place,
+        of: NewBufferOf,
+        (placement, aligned): (Place, Option<u64>),
     ) -> Result<(Buffer, NewBytes), Error> {
+        let (of_heap, fresh) = match of {
+            NewBufferOf::Heap => (true, FreshPages::WherePaid),
+            NewBufferOf::Runtime(fresh) => (false, fresh),
+            NewBufferOf::Unobserved | NewBufferOf::Check(_) => (false, FreshPages::WherePaid),
+        };
+        let plain = matches!(of, NewBufferOf::Check(_));
         if self.is_lost() {
-            return Err(Error::DeviceLost);
+            return Err(self.lost_refusal());
         }
         let shared = self.shared();
         let raw_device = shared.vk();
+        // The bytes before the buffer's own in its `VkBuffer` and placement.
+        let lead = aligned.map_or(0, |byte| {
+            (LINEAR_IMAGE_ALIGNMENT - byte % LINEAR_IMAGE_ALIGNMENT) % LINEAR_IMAGE_ALIGNMENT
+        });
         // Padded to 16 bytes, so a device fill clears every byte too.
         let size = length
-            .checked_next_multiple_of(16)
+            .checked_add(lead)
+            .and_then(|size| size.checked_next_multiple_of(16))
             .ok_or_else(|| nil(call, Problem::BufferLength { length }))?;
         // A heap is never `Managed` (`heap.rs`).
         let mirror = if class == MemoryClass::Managed && !self.properties().has_unified_memory {
-            Some(Arc::new(self.mirror(size)?))
+            Some(HostCopy::Own(Arc::new(self.mirror(size)?)))
         } else {
             None
         };
@@ -2106,20 +3322,83 @@ impl Device {
             Some(_) => MemoryClass::Private,
             None => class,
         };
+        // The kind of block it lies in: one of the runtime's own lies where the device's own
+        // buffers do, whose blocks may be exportable as an opaque file descriptor once the
+        // device's check of them passed, so that its `VkBuffer` names that handle type there
+        // (`VUID-vkBindBufferMemory-memory-02726`; `memory.rs`'s `Holds::FdBuffers`); a
+        // host-visible one in a block of pages the runtime mapped and imported, where the device
+        // takes such blocks for its class, its check found a held import costs its submissions
+        // nothing, and its check of fresh pages passed what a texture over such a buffer takes
+        // that it takes over a plain block's (`in_place.rs`'s `blocks_take`), so that its
+        // `VkBuffer` names host allocations (`VUID-vkBindBufferMemory-memory-02985`;
+        // `memory.rs`'s `Holds::PageBuffers`); one whose maker declares its padding unobserved
+        // in a block of its own kind exportable as a dma-buf too, in which no image is bound,
+        // where the device's own buffers lie in exportable blocks and it takes such blocks, else
+        // in a plain block (`Memory::unobserved_buffers`, `Holds::FdDmaBufs`).
+        let paged = matches!(of, NewBufferOf::Runtime(_)) && {
+            let takes = lock(&shared.memory).page_buffers(class, self.fresh_pages_pay_now());
+            takes && self.page_blocks_taken()
+        };
+        let holds = match of {
+            NewBufferOf::Runtime(_) if paged => Holds::PageBuffers,
+            NewBufferOf::Runtime(_) => {
+                let exportable = lock(&shared.memory).fd_buffer_types.is_ok();
+                let checked = exportable && self.fd_blocks_checked();
+                lock(&shared.memory).own_buffers(checked)
+            }
+            NewBufferOf::Unobserved => {
+                let exportable = lock(&shared.memory).fd_buffer_types.is_ok();
+                let checked = exportable && self.fd_blocks_checked();
+                lock(&shared.memory).unobserved_buffers(checked)
+            }
+            NewBufferOf::Heap => Holds::Buffers,
+            NewBufferOf::Check(holds) => holds,
+        };
+        let handle = match holds {
+            Holds::FdBuffers | Holds::FdDmaBufs => Some(FD_BLOCKS_HANDLE),
+            Holds::PageBuffers => Some(HOST_PAGES_HANDLE),
+            _ => None,
+        };
+        let mut external =
+            vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle.unwrap_or_default());
         // Its device address is its block's (`place_buffer_with`).
-        let info = shared.sharing().buffer(
+        let mut info = shared.sharing().buffer(
             vk::BufferCreateInfo::default()
                 .size(size)
                 .usage(usage(false)),
         );
+        if handle.is_some() {
+            info = info.push_next(&mut external);
+        }
         // A heap's own buffer lies where its textures can too, and is never parked. A long
-        // host-visible one of the runtime's own lies in fresh pages where the device takes them.
-        let wants_fresh =
-            !of_heap && fresh_pages::takes_fresh_pages(size, class) && shared.host_import.is_ok();
-        let making = (!of_heap).then_some(BufferMaking {
+        // host-visible one of the runtime's own lies in fresh pages where the device takes them
+        // and its check found a held import adds nothing to its submissions (`fresh_pages.rs`).
+        // The in-place check's buffer of pooled memory lies in neither.
+        // An indirect command buffer's records lie in them at any length, as the device's policy
+        // says where a held import costs its submissions (`FreshPages::Records`).
+        let (takes, paid) = match fresh {
+            FreshPages::Records => (
+                fresh_pages::class_takes_fresh_pages(class),
+                self.records_take_own_pages(),
+            ),
+            FreshPages::WherePaid => (
+                fresh_pages::takes_fresh_pages(size, class),
+                self.fresh_pages_pay_now(),
+            ),
+            FreshPages::Wherever => (fresh_pages::takes_fresh_pages(size, class), true),
+        };
+        let wants_fresh = !of_heap
+            && !plain
+            && lead == 0
+            && takes
+            && (shared.host_import.as_ref()).is_ok_and(|importer| importer.pointers().is_some())
+            && paid;
+        let parks = matches!(fresh, FreshPages::WherePaid | FreshPages::Records);
+        let making = (!of_heap && !plain && lead == 0 && parks).then_some(BufferMaking {
             size,
             class,
             fresh_pages: wants_fresh,
+            holds,
         });
         let mut taken = making.and_then(|making| self.recycled_buffer(&making));
         let fresh = match (&taken, wants_fresh) {
@@ -2127,13 +3406,25 @@ impl Device {
             _ => None,
         };
         // Where the device took no fresh pages, a parked buffer of its own memory, made so as the
-        // buffer is made below.
-        if let (None, None, Some(making)) = (&taken, &fresh, making.filter(|_| wants_fresh)) {
-            let making = BufferMaking {
+        // buffer is made below; and for one that would lie in a block allocated exportable, a
+        // parked one of a plain block, which any buffer may lie in (the device's buffers lie in
+        // plain blocks until its check answered: `in_place.rs`'s `blocks_take`). Never the
+        // other way: a buffer that lies in a plain block takes no parked one of a block allocated
+        // exportable.
+        if let (None, None, Some(making)) = (&taken, &fresh, making) {
+            let own = BufferMaking {
                 fresh_pages: false,
                 ..making
             };
-            taken = self.recycled_buffer(&making);
+            let plain = BufferMaking {
+                holds: Holds::Buffers,
+                ..own
+            };
+            let asked = [
+                wants_fresh.then_some(own),
+                matches!(holds, Holds::FdBuffers | Holds::FdDmaBufs).then_some(plain),
+            ];
+            taken = (asked.into_iter().flatten()).find_map(|making| self.recycled_buffer(&making));
         }
         let bytes = match fresh {
             Some(_) => NewBytes::Zero,
@@ -2142,7 +3433,7 @@ impl Device {
         // Its range of the address space is a new one, as a new buffer's; the buffer and its
         // memory go again where none is left.
         let place_address = |raw, memory: Placement| {
-            let address = lock(&shared.addresses).place(placement, length);
+            let address = self.address_space_for(placement).place(placement, length);
             match address {
                 Ok(address) => Ok((raw, (memory, address))),
                 Err(error) => {
@@ -2167,7 +3458,7 @@ impl Device {
                 let placed = if of_heap {
                     self.place_heap_buffer(raw, length, class, placement)
                 } else {
-                    self.place_buffer(raw, length, class, placement)
+                    self.place_buffer_in(raw, length, (class, holds), placement)
                 };
                 match placed {
                     Ok(placed) => {
@@ -2194,8 +3485,8 @@ impl Device {
         let buffer = self.buffer_of(BufferParts {
             raw,
             memory: placement,
-            offset: 0,
-            base: 0,
+            offset: lead,
+            base: lead,
             length,
             reach: length,
             modes,
@@ -2204,9 +3495,11 @@ impl Device {
             owner: Owner::Runtime,
             release: None,
             of_heap,
+            drops_writes: false,
             mirror,
             #[cfg(unix)]
             again: None,
+            naming: Naming::New,
         });
         Ok((buffer, bytes))
     }
@@ -2230,6 +3523,60 @@ impl Device {
         let shared = self.shared();
         shared.counts.churn.evicted(Recycled::Buffer, gone.len());
         recycle::destroy(shared.vk(), &mut lock(&shared.memory), gone);
+    }
+
+    /// The device copy of a two-copy buffer (`managed_copy.rs`): a `VkBuffer` of `size` bytes
+    /// bound at the start of device-local memory of the runtime's own, in a plain block, its
+    /// device address its block's (`place_buffer_with`). Refused where no device-local memory has
+    /// room: an allocation refused, or one that overflowed into system memory
+    /// (`memory.rs`'s `overflow_candidates`), which goes again.
+    pub(super) fn managed_device_copy(&self, size: u64) -> Result<(vk::Buffer, Placement), Error> {
+        let shared = self.shared();
+        let raw_device = shared.vk();
+        let info = shared.sharing().buffer(
+            vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(usage(false)),
+        );
+        // SAFETY: the device is live and `info` valid.
+        let raw = unsafe { crate::creation::buffer(raw_device, &info) }.map_err(vulkan)?;
+        shared.counts.buffer_made(info.usage);
+        // SAFETY: `raw` is a live buffer of this device.
+        let requirements = placed(unsafe { raw_device.get_buffer_memory_requirements(raw) });
+        let placement = crate::memory::allocate_addressed_in(
+            &shared.memory,
+            raw_device,
+            &requirements,
+            (MemoryClass::Private, Holds::Buffers),
+            &shared.counts,
+        )
+        .and_then(|placement| match placement.overflowed() {
+            true => {
+                lock(&shared.memory).free(raw_device, &placement);
+                Err(Error::OutOfMemory(crate::error::MemoryKind::Device))
+            }
+            false => Ok(placement),
+        });
+        let bound = placement.and_then(|placement| {
+            // SAFETY: the placement meets the buffer's requirements and is not bound elsewhere.
+            match unsafe {
+                crate::creation::bind_buffer(raw_device, raw, placement.memory, placement.offset)
+            } {
+                Ok(()) => Ok(placement),
+                Err(error) => {
+                    lock(&shared.memory).free(raw_device, &placement);
+                    Err(vulkan(error))
+                }
+            }
+        });
+        match bound {
+            Ok(placement) => Ok((raw, placement)),
+            Err(error) => {
+                // SAFETY: the buffer is unused.
+                unsafe { release::object(raw_device, raw) };
+                Err(error)
+            }
+        }
     }
 
     /// A `Managed` buffer's host copy of `size` bytes (its padded length) on a device without
@@ -2295,7 +3642,7 @@ impl Device {
         required: vk::MemoryRequirements,
     ) -> Result<Buffer, Error> {
         if self.is_lost() {
-            return Err(Error::DeviceLost);
+            return Err(self.lost_refusal());
         }
         let modes = Modes::of(ResourceOptions::private())?;
         let shared = self.shared();
@@ -2324,7 +3671,7 @@ impl Device {
             raw,
             requirements,
             required.size,
-            MemoryClass::Private,
+            (MemoryClass::Private, Holds::Buffers),
             AddressPlacement::Outside.into(),
             false,
         );
@@ -2349,9 +3696,11 @@ impl Device {
             owner: Owner::Runtime,
             release: None,
             of_heap: false,
+            drops_writes: false,
             mirror: None,
             #[cfg(unix)]
             again: None,
+            naming: Naming::New,
         }))
     }
 
@@ -2370,12 +3719,14 @@ impl Device {
             owner,
             release,
             of_heap,
+            drops_writes,
             mirror,
             #[cfg(unix)]
             again,
+            naming,
         } = parts;
         let pages = self.pages_of(raw, memory, offset, base, reach);
-        let identity = Identity::new(modes.hazard, of_heap);
+        let identity = naming.identity(modes.hazard, of_heap);
         let lie = match owner {
             // A no-copy buffer's pages are its until a rebind (`rebind.rs`).
             Owner::Caller => {
@@ -2390,12 +3741,19 @@ impl Device {
                 let import = self.host_import(pages, again, kept);
                 #[cfg(not(unix))]
                 let import = Arc::new(HostImport::new(self, pages, kept));
-                self.host_lie(identity.key, import, release)
+                self.host_lie(
+                    identity.key,
+                    (import, Joining::First),
+                    release,
+                    drops_writes,
+                )
             }
             Owner::Runtime | Owner::Vulkan => Lie::Fixed(Arc::new(FixedPages {
-                device: self.clone(),
+                device: MadeOn::new(self.clone()),
                 pages,
                 owned: matches!(owner, Owner::Runtime),
+                released: AtomicBool::new(false),
+                freed: AtomicBool::new(false),
             })),
         };
         let own = OwnBytes {
@@ -2406,7 +3764,7 @@ impl Device {
             mirror,
             range_token: KeptToken::default(),
         };
-        self.buffer_lying(own, length, modes, address)
+        self.buffer_lying(own, length, modes, address, naming)
     }
 
     /// The import of a no-copy buffer's `pages`: one the device releases while idle where
@@ -2436,34 +3794,45 @@ impl Device {
     }
 
     /// A no-copy buffer of `length` bytes lying in `import`, the import of the same bytes a live
-    /// no-copy buffer lies in (`host_aliases.rs`), at `address`, released to `release` once
-    /// nothing holds it. Dropping the result releases every part but the import, which the last
-    /// buffer over it releases.
+    /// no-copy buffer or heap lies in (`host_aliases.rs`), at `address`, released to `release`
+    /// once nothing holds it: a heap's own buffer where `of_heap`, of a heap's identity. Dropping
+    /// the result releases every part but the import, which the last buffer over it releases.
     pub(super) fn buffer_in_import(
         &self,
         import: Arc<HostImport>,
-        length: u64,
-        modes: Modes,
+        (length, modes, of_heap): (u64, Modes, bool),
         (address, reserved): (GpuAddress, Held),
         release: Option<Release>,
+        naming: Naming,
     ) -> Buffer {
-        let identity = Identity::new(modes.hazard, false);
+        let identity = naming.identity(modes.hazard, of_heap);
+        let joining = match of_heap {
+            true => Joining::Heap,
+            false => Joining::Buffer,
+        };
         let own = OwnBytes {
-            lie: self.host_lie(identity.key, import, release),
+            lie: self.host_lie(identity.key, (import, joining), release, false),
             reserved,
             identity,
             owner: Owner::Caller,
             mirror: None,
             range_token: KeptToken::default(),
         };
-        self.buffer_lying(own, length, modes, address)
+        self.buffer_lying(own, length, modes, address, naming)
     }
 
     /// A no-copy buffer's lie, of `key`: pages of its own in `import`, released to `release`
-    /// once nothing holds them, which a rebind replaces (`rebind.rs`).
-    fn host_lie(&self, key: ResourceKey, import: Arc<HostImport>, release: Option<Release>) -> Lie {
-        let drops_writes = import.drops_writes();
-        let host = HostPages::new(import);
+    /// once nothing holds them, which a rebind replaces (`rebind.rs`); the GPU's writes to it
+    /// dropped where `drops_writes`, or where `import` is of a read-only view of the pages.
+    fn host_lie(
+        &self,
+        key: ResourceKey,
+        (import, joining): (Arc<HostImport>, Joining),
+        release: Option<Release>,
+        drops_writes: bool,
+    ) -> Lie {
+        let drops_writes = drops_writes || import.drops_writes();
+        let host = HostPages::new(import, joining);
         if let Some(release) = release {
             host.release_to(release);
         }
@@ -2472,33 +3841,55 @@ impl Device {
             texels: Mutex::new(Vec::new()),
             textures: Mutex::new(TexturesOver::default()),
             in_place: Mutex::new(Vec::new()),
-            exposed: AtomicU8::new(0),
-            device: self.clone(),
+            exposed: AtomicU16::new(0),
+            device: MadeOn::new(self.clone()),
+            released: AtomicBool::new(false),
+            freed: AtomicBool::new(false),
             drops_writes,
             held_back: Mutex::new(None),
+            read_twin: Mutex::new(None),
+            twin_textures: Mutex::new(Vec::new()),
         });
         self.shared().rebinds.register(key, &cell);
         Lie::Host(cell)
     }
 
-    /// The buffer of `own`'s bytes, `length` long, of `modes`, at `address`.
+    /// The buffer of `own`'s bytes, `length` long, of `modes`, at `address`, named by `naming`.
     fn buffer_lying(
         &self,
         own: OwnBytes,
         length: u64,
         modes: Modes,
         address: GpuAddress,
+        naming: Naming,
     ) -> Buffer {
         let options = ResourceOptions::new(modes.storage, modes.cache, own.identity.mode());
+        let (object_id, attributes) = match naming {
+            Naming::New | Naming::HostCopy | Naming::ReadTwin => {
+                (ObjectId::new(), ResourceAttributes::new())
+            }
+            Naming::Carried {
+                object_id,
+                attributes,
+                ..
+            } => (object_id, attributes),
+        };
         Buffer(Arc::new(BufferShared {
-            device: self.clone(),
-            object_id: ObjectId::new(),
+            device: MadeOn::new(self.clone()),
+            generation: std::ptr::from_ref(self.shared()).addr(),
+            object_id,
             length,
             options,
             address,
-            attributes: ResourceAttributes::new(),
+            attributes,
             bytes: Bytes::Own(own),
             held_by: HeldBy::default(),
+            handed_out: Arc::default(),
+            padding_unobserved: AtomicBool::new(false),
+            staged: AtomicBool::new(false),
+            next: OnceLock::new(),
+            carried: AtomicBool::new(false),
+            calls: PartsCalls::default(),
         }))
     }
 
@@ -2544,14 +3935,14 @@ impl Device {
     ) -> Arc<HostPages> {
         let pages = self.pages_of(raw, memory, offset, base, reach);
         let import = HostImport::new(self, pages, Some(KeptBecause::Rebind));
-        Arc::new(HostPages::new(Arc::new(import)))
+        Arc::new(HostPages::new(Arc::new(import), Joining::First))
     }
 
     /// Host pages a rebind gives a no-copy buffer lying in `import`, the import of the same bytes
     /// a live no-copy buffer was made over (`rebind.rs`, `host_aliases.rs`), without their
     /// release, as [`Device::host_pages`] gives them.
     pub(super) fn pages_in_import(&self, import: Arc<HostImport>) -> Arc<HostPages> {
-        Arc::new(HostPages::new(import))
+        Arc::new(HostPages::new(import, Joining::Rebound))
     }
 
     /// The Vulkan device address of `raw`, where the device enables `bufferDeviceAddress`.
@@ -2578,9 +3969,22 @@ impl Device {
         class: MemoryClass,
         at: Place,
     ) -> Result<(Placement, (GpuAddress, Held)), Error> {
+        self.place_buffer_in(raw, length, (class, Holds::Buffers), at)
+    }
+
+    /// [`place_buffer`](Device::place_buffer) in a block that holds `holds`: `Holds::Buffers`, or
+    /// `Holds::FdBuffers` or `Holds::FdDmaBufs` for a buffer made for `FD_BLOCKS_HANDLE`
+    /// (`memory.rs`).
+    fn place_buffer_in(
+        &self,
+        raw: vk::Buffer,
+        length: u64,
+        (class, holds): (MemoryClass, Holds),
+        at: Place,
+    ) -> Result<(Placement, (GpuAddress, Held)), Error> {
         // SAFETY: `raw` is a live buffer of this device.
         let requirements = unsafe { self.shared().vk().get_buffer_memory_requirements(raw) };
-        self.place_buffer_with(raw, requirements, length, class, at, true)
+        self.place_buffer_with(raw, requirements, length, (class, holds), at, true)
     }
 
     /// [`place_buffer`](Device::place_buffer) for a heap's own buffer: where the heap's textures
@@ -2595,19 +3999,20 @@ impl Device {
         // SAFETY: `raw` is a live buffer of this device.
         let own = unsafe { self.shared().vk().get_buffer_memory_requirements(raw) };
         let requirements = self.heap_requirements(own, class)?;
-        self.place_buffer_with(raw, requirements, length, class, at, true)
+        self.place_buffer_with(raw, requirements, length, (class, Holds::Buffers), at, true)
     }
 
     /// [`place_buffer`](Device::place_buffer) in memory that meets `requirements`, which hold
-    /// the buffer's own. Where `block_address`, `raw` was made without the device-address usage
-    /// and its device address is its block's (`memory::allocate_addressed`, the placement's
-    /// `address`); else its own, where it has the usage.
+    /// the buffer's own, in a block that holds `holds` ([`Device::place_buffer_in`]). Where
+    /// `block_address`, `raw` was made without the device-address usage and its device address
+    /// is its block's (`memory::allocate_addressed`, the placement's `address`); else its own,
+    /// where it has the usage.
     fn place_buffer_with(
         &self,
         raw: vk::Buffer,
         requirements: vk::MemoryRequirements,
         length: u64,
-        class: MemoryClass,
+        (class, holds): (MemoryClass, Holds),
         at: Place,
         block_address: bool,
     ) -> Result<(Placement, (GpuAddress, Held)), Error> {
@@ -2615,22 +4020,22 @@ impl Device {
         let raw_device = shared.vk();
         let requirements = placed(requirements);
         let placement = if block_address {
-            crate::memory::allocate_addressed(
+            crate::memory::allocate_addressed_in(
                 &shared.memory,
                 raw_device,
                 &requirements,
-                class,
+                (class, holds),
                 &shared.counts,
             )?
         } else {
-            crate::memory::allocate(&shared.memory, raw_device, &requirements, class)?
+            crate::memory::allocate_in(&shared.memory, raw_device, &requirements, class, holds)?
         };
         // SAFETY: the placement meets the buffer's requirements and is not bound elsewhere.
         let bound = unsafe {
             crate::creation::bind_buffer(raw_device, raw, placement.memory, placement.offset)
         };
         let address = match bound {
-            Ok(()) => lock(&shared.addresses).place(at, length),
+            Ok(()) => self.address_space_for(at).place(at, length),
             Err(error) => {
                 lock(&shared.memory).free(raw_device, &placement);
                 return Err(vulkan(error));
@@ -2644,6 +4049,62 @@ impl Device {
             }
         }
     }
+}
+
+/// Whose a buffer [`Device::placed_new_buffer`] makes is: a heap's own buffer, one of the
+/// runtime's own, with where it lies in fresh pages, one whose maker declares its padding
+/// unobserved, or the in-place check's of pooled memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NewBufferOf {
+    /// A heap's own buffer (`heap.rs`), never in fresh pages, in a block of `Holds::Buffers`.
+    Heap,
+    /// A buffer of the runtime's own, in fresh pages where it says, else in a block of the kind
+    /// the device's own buffers take (`memory.rs`'s `Memory::own_buffers`).
+    Runtime(FreshPages),
+    /// A buffer of the runtime's own whose maker declares the bytes between a texture's rows and
+    /// slices unobserved (`BufferDescriptor::padding_unobserved`): as
+    /// `Runtime(FreshPages::WherePaid)`, in a block of its own kind exportable as a dma-buf too,
+    /// in which no image is bound, where the device's own buffers lie in exportable blocks and it
+    /// takes such blocks (`Holds::FdDmaBufs`), else in a plain block (`Holds::Buffers`;
+    /// `memory.rs`'s `Memory::unobserved_buffers`): a texture over such a buffer may take a
+    /// `DRM_FORMAT_MOD_LINEAR` image at Metal's pitch, which a block allocated exportable holds
+    /// only through a dedicated import of its dma-buf (`texture.rs`'s `exported_dma_buf_alias`).
+    Unobserved,
+    /// The in-place check's buffer of a class of the runtime's pooled memory
+    /// (`in_place_check.rs`): in a block that holds this, `Holds::Buffers` for
+    /// `PagesClass::Pooled` (exported as no handle type) and `Holds::FdBuffers` for
+    /// `PagesClass::FdBlocks` (allocated exportable, never exported) whatever the class's
+    /// verdicts, never in fresh pages and never parked.
+    Check(Holds),
+}
+
+/// What a buffer's carry carries ([`Buffer::carry`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarryOf {
+    /// A buffer of the program's, kept among the next generation's program resources.
+    Program,
+    /// A heap's own buffer (`Buffer::carry_heap_bytes`).
+    Heap,
+    /// A buffer of the runtime's own whose `contents` pointer no program holds
+    /// (`Buffer::carry_runtime`).
+    Runtime,
+}
+
+/// Where [`Device::placed_new_buffer`] lays a long host-visible buffer of the runtime's own in
+/// fresh pages (`fresh_pages.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreshPages {
+    /// Where the device takes them and its submission checks found that a held import adds
+    /// nothing to its submissions: the product's buffers.
+    WherePaid,
+    /// Wherever the device takes them: the in-place check's buffer of its fresh-pages class,
+    /// which lies where a rebind's copy under an image in place lies whatever that cost
+    /// (`buffer_descriptor.rs`'s `copied_pages`), and whose import lives only for its round.
+    Wherever,
+    /// Where the device takes them, at any length, as [`Device::records_take_own_pages`] says: an
+    /// indirect command buffer's records and slots past them, which a recovery's carry keeps
+    /// only in the runtime's own pages (`indirect_command_buffer/carry.rs`, `fresh_pages.rs`).
+    Records,
 }
 
 /// What a new buffer's bytes hold as [`Device::placed_new_buffer`] makes it.
@@ -2681,7 +4142,8 @@ impl Heap {
         options: ResourceOptions,
     ) -> Buffer {
         Buffer(Arc::new(BufferShared {
-            device: heap_bytes.device().clone(),
+            device: MadeOn::new(heap_bytes.generation().clone()),
+            generation: std::ptr::from_ref(heap_bytes.generation().shared()).addr(),
             object_id: ObjectId::new(),
             length,
             options,
@@ -2692,18 +4154,91 @@ impl Heap {
                 bytes: heap_bytes.clone(),
                 offset,
                 // A placement heap's buffer answers aliasable from the start, as Metal's does.
-                aliasable: AtomicBool::new(self.heap_type() == HeapType::Placement),
+                aliasable: Arc::new(AtomicBool::new(self.heap_type() == HeapType::Placement)),
             }),
             held_by: HeldBy::default(),
+            handed_out: Arc::default(),
+            padding_unobserved: AtomicBool::new(false),
+            staged: AtomicBool::new(false),
+            next: OnceLock::new(),
+            carried: AtomicBool::new(false),
+            calls: PartsCalls::default(),
         }))
     }
 }
 
 impl Buffer {
+    /// The buffer's parts as the work at hand reaches them: its own, where its device's recovery
+    /// never carried it, at one load (`device/carry.rs`). Where it did, inside a command buffer's
+    /// work (`NoticesFor::generation`) those of that command buffer's generation where the
+    /// buffer has some, so the lost generation's command buffers record its own handles alone;
+    /// else those of the generation it was carried to last.
+    #[inline]
+    fn s(&self) -> &Arc<BufferShared> {
+        match self.0.carried.load(Ordering::Relaxed) {
+            false => &self.0,
+            true => self.carried(),
+        }
+    }
+
+    /// [`s`](Self::s) of a buffer its device's recovery carried.
+    #[cold]
+    fn carried(&self) -> &Arc<BufferShared> {
+        let records = crate::degradation::NoticesFor::generation();
+        let mut shared = &self.0;
+        loop {
+            // Not its parts on a lost generation that went: a call under way that holds them
+            // keeps them until it ends (`Buffer::held_parts`), and no command buffer is made there
+            // after its rest (`Carry::refuses`).
+            if records == Some(shared.generation) && !shared.freed() {
+                return shared;
+            }
+            match shared.next.get() {
+                Some(next) => shared = &next.0,
+                None => return shared,
+            }
+        }
+    }
+
+    /// The buffer's parts for a call outside a command buffer's work that reaches their Vulkan
+    /// objects (a texture over its bytes, an export of its memory, an upload, a handle handed
+    /// out), held until the result goes: those [`s`](Self::s) answers, on the generation that
+    /// serves where the buffer was carried there, and every read of its parts on this thread
+    /// meanwhile answers them (`NoticesFor::of_generation`). Where its device's recovery carried
+    /// it from their generation since, and that generation came to rest, their release waits
+    /// for the call to end ([`LostBuffer`]); parts let go of already are never held, the call
+    /// taking those of the generation the buffer was carried to. A call begun on parts of a lost
+    /// generation completes there: what it makes is that generation's, refused where it meets
+    /// the next (`RuntimeGap::MadeBeforeRecovery`), as a call that took its arguments before
+    /// the loss (`Device::at_serving_taking`). Not for command buffers' work, whose queue slot
+    /// holds the generation (`device/carry.rs`).
+    pub(super) fn held_parts(&self) -> HeldParts<'_> {
+        let mut link = self.s();
+        loop {
+            // Parts not marked let go of yet, or whose release a call under way holds back, go
+            // only once this call ends.
+            if let Some(call) = link.calls.hold_unless(|| link.released()) {
+                #[cfg(test)]
+                held_hook();
+                return HeldParts {
+                    _call: call,
+                    _scope: NoticesFor::of_generation(link.generation),
+                };
+            }
+            // Let go of on their lost generation since this thread read them: the generation
+            // the buffer was carried to serves its calls. Parts marked were carried.
+            link = &link
+                .next
+                .get()
+                .expect("a buffer's parts marked let go of were carried")
+                .0;
+        }
+    }
+
     /// Whether the buffer lies in fresh pages it imported (`fresh_pages.rs`), to which no image
     /// is bound: false for a no-copy buffer, a heap's and one over the caller's `VkBuffer`.
     pub(super) fn in_fresh_pages(&self) -> bool {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(OwnBytes {
                 lie: Lie::Fixed(fixed),
                 ..
@@ -2712,12 +4247,59 @@ impl Buffer {
         }
     }
 
+    /// Whether the buffer lies in pages the runtime mapped and imported, fresh pages of its own or
+    /// a block of them ([`in_fresh_pages`](Buffer::in_fresh_pages),
+    /// [`in_page_block`](Buffer::in_page_block)): a recovery's carry of a buffer of the runtime's
+    /// own imports the same pages again, its bytes and `contents` pointer as they are
+    /// ([`carry_runtime`](Buffer::carry_runtime)).
+    pub(super) fn in_own_pages(&self) -> bool {
+        self.in_fresh_pages() || self.in_page_block()
+    }
+
+    /// Whether the buffer lies in a block of pages the runtime mapped and imported, among other
+    /// buffers (`memory.rs`'s `Holds::PageBuffers`): an image over its bytes is made for host
+    /// allocations, as over fresh pages, under their class's verdicts (`texture/route.rs`).
+    pub(super) fn in_page_block(&self) -> bool {
+        match &self.s().bytes {
+            Bytes::Own(OwnBytes {
+                lie: Lie::Fixed(fixed),
+                ..
+            }) => fixed.pages.memory.placement.in_page_block(),
+            Bytes::Own(_) | Bytes::Heap(_) => false,
+        }
+    }
+
+    /// Whether the buffer's own pages, of the runtime's memory, overflowed past device-local memory
+    /// into system memory (`memory.rs`'s `overflow_candidates`): false for a buffer over host
+    /// pages, which are imported, and for a heap's buffer, whose bytes are its heap's.
+    pub(super) fn own_pages_overflowed(&self) -> bool {
+        match &self.s().bytes {
+            Bytes::Own(OwnBytes {
+                lie: Lie::Fixed(fixed),
+                ..
+            }) => fixed.pages.memory.placement.overflowed(),
+            Bytes::Own(_) | Bytes::Heap(_) => false,
+        }
+    }
+
+    /// `f` of the placement the buffer's own pages lie in and of the buffer's first byte's offset
+    /// in it (`exported_memory.rs`); `None` for a heap's buffer, whose bytes are its heap's.
+    pub(super) fn own_placement<R>(&self, f: impl FnOnce(&Placement, u64) -> R) -> Option<R> {
+        match &self.s().bytes {
+            Bytes::Own(own) => Some(own.with(ReadApart::Binding, |pages| {
+                f(&pages.memory.placement, pages.offset)
+            })),
+            Bytes::Heap(_) => None,
+        }
+    }
+
     /// Whether the buffer's own pages, of the runtime's memory, lie in device-local memory; `None`
     /// for a heap's buffer, whose bytes are its heap's. A buffer's pages are its for good.
     pub(super) fn own_pages_device_local(&self) -> Option<bool> {
-        match &self.0.bytes {
+        let s = self.s();
+        match &s.bytes {
             Bytes::Own(own) => own.with(ReadApart::Binding, |pages| {
-                let memory = lock(&self.0.device.shared().memory);
+                let memory = lock(&s.device.shared().memory);
                 Some(memory.is_device_local(&pages.memory.placement))
             }),
             Bytes::Heap(_) => None,
@@ -2726,14 +4308,14 @@ impl Buffer {
 
     /// The length padded to 16 bytes: the bytes the `VkBuffer` holds from [`Buffer::base`].
     pub(super) fn padded_length(&self) -> u64 {
-        self.0.length.next_multiple_of(16)
+        self.s().length.next_multiple_of(16)
     }
 
     /// The bytes of the buffer's memory from its byte 0 ([`Buffer::memory`]'s offset) to the end
     /// of the memory's placement: an import's, for a buffer over host pages (its last page's bytes
     /// past the buffer's among them), or a heap's.
     pub(super) fn memory_room(&self) -> u64 {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(own) => own.with(ReadApart::Texture, |pages| {
                 pages.memory.placement.size().saturating_sub(pages.offset)
             }),
@@ -2746,8 +4328,9 @@ impl Buffer {
     /// for a `Managed` buffer with a host copy ([`Mirror`]). Racing the GPU's use of the buffer
     /// is the caller's to avoid.
     pub(super) fn clear(&self) -> Result<(), Error> {
+        let s = self.s();
         let size = self.padded_length();
-        if let Some(contents) = self.contents() {
+        if let Some(contents) = self.mapped_contents() {
             // SAFETY: the buffer's bytes, its padded length from `contents`, are host-coherent
             // memory (`MemoryClass::Shared` and `Managed`, or imported host memory), so the
             // device sees the writes at the next submission.
@@ -2757,19 +4340,13 @@ impl Buffer {
             }
         }
         let (raw, start) = self.at(0);
-        self.0.device.submit_internal(|device, command_buffer| {
+        s.device.submit_internal(|device, command_buffer| {
             // SAFETY: the internal command buffer is recording; the buffer is live, and its
             // padded length (a multiple of 16) lies in the `VkBuffer` from `start`, a multiple
             // of 4: 0, or a heap buffer's offset in its heap's (a buffer without contents is
             // none over host memory).
             unsafe {
-                crate::word_fill::record(
-                    &self.0.device,
-                    command_buffer,
-                    raw,
-                    start..start + size,
-                    0,
-                );
+                crate::word_fill::record(&s.device, command_buffer, raw, start..start + size, 0);
                 let barrier = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                     .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
@@ -2786,25 +4363,38 @@ impl Buffer {
         })
     }
 
+    /// Note the acquire of the buffer's `VkBuffer`, whole, from `families`' source, a queue family
+    /// reserved for external memory, for its target, for the device's next submission to record
+    /// before any of its commands (`exported_memory.rs`, `Buffer::external_write_done`).
+    pub(super) fn note_acquire(&self, families: (u32, u32)) {
+        let s = self.s();
+        let (raw, _) = self.at(0);
+        let weak: Weak<BufferShared> = Arc::downgrade(s);
+        let keeper: Weak<dyn Filled> = weak;
+        let device = &s.device;
+        (device.shared().textures.first_moves).register_acquire(keeper, raw, families);
+    }
+
     /// Set a new buffer's padded length of bytes to zero as [`clear`](Self::clear) does, without
     /// waiting for the GPU: the host's bytes (`Shared` and `Managed` storage, a `Managed`
     /// buffer's host copy) at once, so `contents` reads zero before any submission, and bytes the
     /// host cannot write (`Private` storage, a `Managed` buffer's device copy) by the device's
     /// next submission, before any of its commands (`texture/first_move.rs`).
-    fn clear_first(&self) -> Result<(), Error> {
+    pub(super) fn clear_first(&self) -> Result<(), Error> {
+        let s = self.s();
         let size = self.padded_length();
-        if let Some(contents) = self.contents() {
+        if let Some(contents) = self.mapped_contents() {
             // SAFETY: as in `clear`: the buffer's host-coherent bytes, which nothing else uses
             // yet.
             unsafe { std::ptr::write_bytes(contents.as_ptr(), 0, size as usize) };
-            self.0.device.shared().counts.new_buffer_cleared(size);
+            s.device.shared().counts.new_buffer_cleared(size);
             if self.mirror().is_none() {
                 return Ok(());
             }
         }
         let (raw, start) = self.at(0);
-        let device = &self.0.device;
-        let weak: Weak<BufferShared> = Arc::downgrade(&self.0);
+        let device = &s.device;
+        let weak: Weak<BufferShared> = Arc::downgrade(s);
         let keeper: Weak<dyn Filled> = weak;
         (device.shared().textures.first_moves).register_fill(
             device,
@@ -2820,8 +4410,10 @@ impl Buffer {
     /// (`texture/first_move.rs`); that submission holds `staging` until it completed. Past the
     /// bound of what is staged, a submission waited for makes it now.
     pub(super) fn fill_first_from(&self, staging: Buffer, length: u64) -> Result<(), Error> {
-        let device = &self.0.device;
-        let weak: Weak<BufferShared> = Arc::downgrade(&self.0);
+        let s = self.s();
+        let device = &s.device;
+        s.staged.store(true, Ordering::Relaxed);
+        let weak: Weak<BufferShared> = Arc::downgrade(s);
         let keeper: Weak<dyn Filled> = weak;
         let source = staging.at(0);
         let past = (device.shared().textures.first_moves).register_bytes(
@@ -2829,7 +4421,7 @@ impl Buffer {
             self.at(0),
             source,
             length,
-            Box::new(staging),
+            Keeps::Staging(Box::new(staging)),
         );
         match past {
             true => device.submit_internal(|_, _| {}),
@@ -2843,11 +4435,14 @@ impl Buffer {
     /// Metal reads the caller's bytes there, current ones, from the pointer to its pages' end
     /// (an M4 under macOS 27.0.1). Past them, and past another buffer's length, its API validation
     /// stops the copy, and plain Metal reads zeros, bytes written past the length, or another
-    /// resource's: refused (`Invalid`).
+    /// resource's: refused (`Invalid`). A read twin's is its length, as its buffer's copy's is
+    /// (`read_twin.rs`), so a copy refused out of the buffer is refused out of the twin too.
     pub(super) fn copy_reach(&self) -> u64 {
-        match &self.0.bytes {
+        let s = self.s();
+        match &s.bytes {
+            Bytes::Own(own) if own.identity.key.is_read_twin() => own.shape().reach.min(s.length),
             Bytes::Own(own) => own.shape().reach,
-            Bytes::Heap(_) => self.0.length,
+            Bytes::Heap(_) => s.length,
         }
     }
 
@@ -2858,10 +4453,69 @@ impl Buffer {
         self.at_for(offset, ReadApart::Binding)
     }
 
+    /// Whether its `VkBuffer` was handed out, shared with what watches it
+    /// (`shadow_standing::StandingAcross`).
+    pub(super) fn handed_out(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.s().handed_out)
+    }
+
+    /// Note that its `VkBuffer` was handed out (`Buffer::vk_buffer`).
+    pub(super) fn hand_out(&self) {
+        self.s().handed_out.store(true, Ordering::Release);
+    }
+
+    /// Make the first work still waiting on its `VkBuffer` `raw` now, by a submission waited for:
+    /// a new buffer's zeros or staged bytes, or a `Managed` buffer's upload (`clear_first`,
+    /// `fill_first_from`, `upload`), which the device's next submission would make before its
+    /// commands (`texture/first_move.rs`), over what the caller's own work wrote through the
+    /// handle meanwhile. Only the work whose destination is `raw`, in the order it was noted: on
+    /// the staging queue where the device reserved one, else on its first `VkQueue`, and after no
+    /// other queue's work (`Device::settle_mine`). Nothing is submitted where none waits: once any
+    /// submission of the device's took it. `raw` is the caller's: a no-copy buffer's import counts
+    /// each read of its `VkBuffer` apart for its reason (`HostImport::note_read_apart`), so this
+    /// reads none.
+    pub(super) fn settle_first_work(&self, raw: vk::Buffer) -> Result<(), Error> {
+        let device = &self.s().device;
+        match device.shared().textures.first_moves.fills_wait(raw) {
+            true => device.settle_mine(
+                Mine {
+                    buffer: Some(raw),
+                    image: None,
+                },
+                false,
+            ),
+            false => Ok(()),
+        }
+    }
+
+    /// Note, as it is made, that its maker declared the bytes between a texture's rows and slices
+    /// over it unobserved (`BufferDescriptor::padding_unobserved`).
+    pub(super) fn declare_padding_unobserved(&self) {
+        self.s().padding_unobserved.store(true, Ordering::Release);
+    }
+
+    /// Whether its maker declared the bytes between a texture's rows and slices over it
+    /// unobserved (`BufferDescriptor::padding_unobserved`).
+    pub(super) fn padding_unobserved(&self) -> bool {
+        self.s().padding_unobserved.load(Ordering::Acquire)
+    }
+
+    /// Whether only the device's commands, in the order the runtime records and submits them,
+    /// write the bytes the GPU uses: a `Private` buffer's, which no CPU maps
+    /// ([`Buffer::mapped_contents`]), and a `Managed` buffer's own on a device without unified
+    /// memory ([`HostCopy`]), which the CPU's writes reach only through the copies the device's
+    /// next submission makes before its commands (`managed.rs`, `managed_copy.rs`). Not one whose
+    /// `VkBuffer` was handed out (`Buffer::vk_buffer`) or whose memory was made exportable
+    /// (`exported_memory.rs`), which work of another API's may write.
+    pub(super) fn gpu_bytes_ordered(&self) -> bool {
+        let own = self.storage_mode() == StorageMode::Private || self.mirror().is_some();
+        own && !self.s().handed_out.load(Ordering::Acquire) && self.exported().is_none()
+    }
+
     /// [`Buffer::at`] for `reason`, which a no-copy buffer's import counts its read apart for
     /// (`HostImport::note_read_apart`).
     pub(super) fn at_for(&self, offset: u64, reason: ReadApart) -> (vk::Buffer, u64) {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(own) => own.with(reason, |pages| (pages.raw, pages.base + offset)),
             Bytes::Heap(bytes) => bytes.bytes.at_for(bytes.offset + offset, reason),
         }
@@ -2871,7 +4525,7 @@ impl Buffer {
     /// they are detached (`detach.rs`), when its `VkBuffer` is the device's stand-in, which holds
     /// none of its bytes.
     pub(super) fn attached_at(&self, offset: u64) -> Option<(vk::Buffer, u64)> {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(own) => {
                 own.with_attached(ReadApart::Binding, |pages| (pages.raw, pages.base + offset))
             }
@@ -2883,7 +4537,7 @@ impl Buffer {
     /// without the `VkBuffer`: a no-copy buffer's [`Buffer::base`], a heap buffer's offset in its
     /// heap's.
     pub(super) fn start(&self) -> u64 {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(own) => own.shape().base,
             Bytes::Heap(bytes) => bytes.bytes.start() + bytes.offset,
         }
@@ -2896,7 +4550,7 @@ impl Buffer {
     pub(super) fn space(&self) -> (vk::Buffer, u64) {
         // `at(0)` less `base()`, from one look at where the buffer lies.
         let space = |pages: &Pages, base: u64| (pages.raw, pages.base - base);
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(own) => match &own.lie {
                 Lie::Fixed(fixed) => space(&fixed.pages, Shape::of(&fixed.pages).base),
                 Lie::Host(cell) => match cell.lying() {
@@ -2907,9 +4561,64 @@ impl Buffer {
                     Lying::Detached(detached) => {
                         space(&detached.pages, Shape::of(&detached.pages).base)
                     }
+                    Lying::Gone(_) => read_gone(),
                 },
             },
             Bytes::Heap(bytes) => bytes.bytes.at_for(bytes.offset, ReadApart::Binding),
+        }
+    }
+
+    /// [`space`](Self::space), where the buffer lies over host pages (or is placed in a heap that
+    /// does) read through `kept`, which keeps where such buffers lie ([`KeptSpaces`]): the same
+    /// answer, with no lock taken and nothing written that other threads read, while no no-copy
+    /// buffer moved since `kept` read it.
+    pub(super) fn space_kept(&self, kept: &mut KeptSpaces) -> (vk::Buffer, u64) {
+        match &self.s().bytes {
+            Bytes::Own(own) => match &own.lie {
+                Lie::Host(cell) => {
+                    let (raw, base, shape_base) = kept.of(cell);
+                    (raw, base - shape_base)
+                }
+                Lie::Fixed(_) => self.space(),
+            },
+            Bytes::Heap(bytes) => bytes.bytes.at_kept(bytes.offset, kept),
+        }
+    }
+
+    /// [`space`](Self::space) for a bind that keeps no [`KeptSpaces`]: counted, where the buffer
+    /// lies over host pages (or is placed in a heap that does), as a read [`KeptSpaces`] did not
+    /// keep (`WorkCounts::bind_spaces_read`).
+    pub(super) fn space_read(&self) -> (vk::Buffer, u64) {
+        if let Some(cell) = self.space_cell() {
+            cell.device.shared().counts.thread().bind_space_read();
+        }
+        self.space()
+    }
+
+    /// The hold on the host pages the buffer's space lies in: a no-copy buffer's own, or the
+    /// no-copy heap's it is placed in; `None` for any other buffer.
+    fn space_cell(&self) -> Option<&Arc<HostCell>> {
+        match &self.s().bytes {
+            Bytes::Own(own) => match &own.lie {
+                Lie::Host(cell) => Some(cell),
+                Lie::Fixed(_) => None,
+            },
+            Bytes::Heap(bytes) => bytes.bytes.space_cell(),
+        }
+    }
+
+    /// [`at_for`](Self::at_for) for a binding, read through `kept` as
+    /// [`space_kept`](Self::space_kept) reads.
+    fn at_kept(&self, offset: u64, kept: &mut KeptSpaces) -> (vk::Buffer, u64) {
+        match &self.s().bytes {
+            Bytes::Own(own) => match &own.lie {
+                Lie::Host(cell) => {
+                    let (raw, base, _) = kept.of(cell);
+                    (raw, base + offset)
+                }
+                Lie::Fixed(_) => self.at_for(offset, ReadApart::Binding),
+            },
+            Bytes::Heap(bytes) => bytes.bytes.at_kept(bytes.offset + offset, kept),
         }
     }
 
@@ -2917,7 +4626,7 @@ impl Buffer {
     /// no-copy buffer whose pointer misses the buffer's memory alignment (bound that many bytes
     /// below it). An alignment Vulkan asks of an offset holds of `base` plus Metal's offset.
     pub(super) fn base(&self) -> u64 {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(own) => own.shape().base,
             Bytes::Heap(_) => 0,
         }
@@ -2929,7 +4638,7 @@ impl Buffer {
     /// each as its own call reads it.
     pub(super) fn base_and_device_address(&self, reason: ReadApart) -> (u64, Option<u64>) {
         let address = |pages: &Pages| Some(pages.memory.device_address? + pages.base);
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(own) => match &own.lie {
                 Lie::Fixed(fixed) => (Shape::of(&fixed.pages).base, address(&fixed.pages)),
                 Lie::Host(cell) => match cell.lying() {
@@ -2940,6 +4649,7 @@ impl Buffer {
                     Lying::Detached(detached) => {
                         (Shape::of(&detached.pages).base, address(&detached.pages))
                     }
+                    Lying::Gone(_) => read_gone(),
                 },
             },
             Bytes::Heap(bytes) => (
@@ -2949,11 +4659,23 @@ impl Buffer {
         }
     }
 
+    /// The external memory the buffer's bytes lie in, from that memory's record, which an image
+    /// bound there names (`Memory::bound_memory`): a heap's buffer's, its heap's.
+    pub(super) fn bound_memory(&self) -> BoundMemory {
+        let s = self.s();
+        match &s.bytes {
+            Bytes::Own(own) => own.with(ReadApart::Texture, |pages| {
+                lock(&s.device.shared().memory).bound_memory(&pages.memory.placement)
+            }),
+            Bytes::Heap(bytes) => bytes.bytes.bound_memory(),
+        }
+    }
+
     /// The memory the buffer's bytes lie in: the `VkDeviceMemory`, the offset of the buffer's
     /// first byte in it, and its memory type's index. A texture over the buffer aliases it there
     /// (`texture.rs`).
     pub(super) fn memory(&self) -> (vk::DeviceMemory, u64, u32) {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(own) => own.with(ReadApart::Texture, |pages| {
                 let placement = &pages.memory.placement;
                 (
@@ -2969,65 +4691,181 @@ impl Buffer {
         }
     }
 
-    /// A `Managed` buffer's host copy, on a device without unified memory ([`Mirror`]).
-    fn mirror(&self) -> Option<&Arc<Mirror>> {
-        match &self.0.bytes {
+    /// A `Managed` buffer's host copy, on a device without unified memory ([`HostCopy`]).
+    pub(super) fn mirror(&self) -> Option<&HostCopy> {
+        match &self.s().bytes {
             Bytes::Own(own) => own.mirror.as_ref(),
             Bytes::Heap(_) => None,
         }
     }
 
-    /// The `VkBuffer` of the buffer's host copy, whose byte 0 is the buffer's, where it has one
-    /// ([`Mirror`]): a blit encoder's `synchronize_resource` copies into it.
-    pub(super) fn host_copy(&self) -> Option<vk::Buffer> {
-        self.mirror().map(|mirror| mirror.raw)
+    /// The caller's pages as the host copy of a `Managed` no-copy buffer on a device without
+    /// unified memory (`managed_copy.rs`), where the buffer is one.
+    pub(super) fn caller_copy(&self) -> Option<&Arc<CallerCopy>> {
+        match self.mirror() {
+            Some(HostCopy::Caller(caller)) => Some(caller),
+            Some(HostCopy::Own(_)) | None => None,
+        }
+    }
+
+    /// Where a blit encoder's `synchronize_resource` copies the buffer's bytes to, where it has a
+    /// host copy ([`HostCopy`]): the runtime's own's `VkBuffer`, whose byte 0 is the buffer's,
+    /// or the caller's pages (`managed_copy.rs`'s [`SyncTarget`]).
+    pub(super) fn host_copy(&self) -> Option<SyncTarget> {
+        match self.mirror()? {
+            HostCopy::Own(mirror) => Some(SyncTarget::Own(mirror.raw)),
+            HostCopy::Caller(caller) => caller.sync_target(),
+        }
     }
 
     /// The CPU address of the bytes the GPU uses: [`Buffer::contents`], but `None` for a buffer
-    /// with a host copy ([`Mirror`]), whose `contents` are that copy. A reader of the GPU's
+    /// with a host copy ([`HostCopy`]), whose `contents` are that copy. A reader of the GPU's
     /// writes takes the bytes from here, else through a device copy.
     pub(super) fn device_contents(&self) -> Option<NonNull<u8>> {
         match self.mirror() {
             Some(_) => None,
-            None => self.contents(),
+            None => self.mapped_contents(),
         }
     }
 
     /// Copy the bytes `range` of a buffer with a host copy ([`Mirror`]) from that copy to the
-    /// buffer's own, by the device's next submission, before any of its commands, after the
-    /// commands before it on its `VkQueue` (`texture/first_move.rs`), which the call does not wait
-    /// for: every command buffer committed after the call reads the bytes. The copy reads the host
-    /// copy as that submission runs, and the submission holds the host copy until it completed.
-    /// Past the bound of what is staged, a submission waited for makes it now. Nothing for a
-    /// buffer without a host copy, nor for an empty range.
-    pub(super) fn upload(&self, range: Range<u64>) -> Result<(), Error> {
-        let Some(mirror) = self.mirror() else {
-            return Ok(());
+    /// buffer's own, by the device's next submission whose commands may reach the buffer (or an
+    /// internal one), before any of its commands, after the commands before it on its `VkQueue`
+    /// (`texture/first_move.rs`'s `register_upload`), which the call does not wait for: every
+    /// command buffer committed after the call reads the bytes, and none submitted before that
+    /// submission on its `VkQueue` sees them land under it. The copy reads the host copy as that
+    /// submission runs, and the submission holds the host copy until it completed. `replaces`
+    /// says which batch takes it ([`Replaces`]): where no command buffer can have read the
+    /// bytes, one that takes a new buffer's first fill (`register_bytes`). The copy stages
+    /// nothing (`texture/first_move.rs`'s `Keeps::HostCopy`), so it makes no submission, however
+    /// many bytes wait; pages no import maps are staged (but those a guest RAM's chunk imports
+    /// hold, which the GPU copies from them), and past the bound of what is staged a submission
+    /// waited for makes them now (`managed_copy.rs`). Nothing for a buffer without a
+    /// host copy, nor for an empty range.
+    pub(super) fn upload(&self, range: Range<u64>, replaces: Replaces) -> Result<(), Error> {
+        let s = self.s();
+        let mirror = match self.mirror() {
+            Some(HostCopy::Own(mirror)) => mirror,
+            // The caller's pages, through their import or staging (`managed_copy.rs`).
+            Some(HostCopy::Caller(caller)) => return caller.copy_in(self, range, true, replaces),
+            None => return Ok(()),
         };
         if range.is_empty() {
             return Ok(());
         }
-        let device = &self.0.device;
-        let weak: Weak<BufferShared> = Arc::downgrade(&self.0);
-        let keeper: Weak<dyn Filled> = weak;
-        let past = (device.shared().textures.first_moves).register_bytes(
-            keeper,
-            self.at(range.start),
-            (mirror.raw, range.start),
+        let device = &s.device;
+        s.staged.store(true, Ordering::Relaxed);
+        let weak: Weak<BufferShared> = Arc::downgrade(s);
+        register_copy_in(
+            device,
+            weak,
+            (self.at(range.start), (mirror.raw, range.start)),
             range.end - range.start,
-            Box::new(Arc::clone(mirror)),
+            Keeps::HostCopy(Box::new(Arc::clone(mirror))),
+            replaces,
         );
-        match past {
+        Ok(())
+    }
+
+    /// Copy the bytes `range` of a buffer with a host copy ([`HostCopy`]) to its own, taken at the
+    /// commit stamped `commit` (`managed.rs`'s `Modified`) for the device's next submission of a
+    /// command buffer committed at or after it that may reach the buffer, before any of its
+    /// commands, as the device's policy says (`DevicePolicy::managed_copy_in`): under
+    /// `ManagedCopyInPolicy::AtSubmission` (the default) the GPU copies them from the host copy as
+    /// that submission runs ([`upload`](Self::upload)), with no copy on the CPU but of pages no
+    /// import maps and no guest RAM's chunk imports hold (`managed_copy.rs`); under `AtCommit` the CPU copies them now, as the host copy
+    /// holds them, into staging memory that submission copies from (`managed_copy::stage_in`),
+    /// and where that memory is not found the GPU copies them from the host copy as under the
+    /// default. Nothing for a buffer without a host copy, nor for an empty range, nor for pages
+    /// detached.
+    pub(super) fn upload_at_commit(&self, range: Range<u64>, commit: u64) {
+        let replaces = Replaces::Read(commit);
+        let policy = self.generation().compile_device().policy().managed_copy_in;
+        let staged = match (policy, self.mirror()) {
+            (ManagedCopyInPolicy::AtCommit, Some(HostCopy::Caller(caller))) => {
+                caller.copy_in_now(self, range.clone(), commit)
+            }
+            (ManagedCopyInPolicy::AtCommit, Some(HostCopy::Own(_))) => {
+                match self.mapped_contents() {
+                    Some(contents) => {
+                        super::managed_copy::stage_in(self, contents, range.clone(), true, replaces)
+                    }
+                    None => Ok(()),
+                }
+            }
+            // Copies from the host copy (or a guest RAM's chunk imports that hold it), which stage
+            // nothing and go with this commit's batch; pages no import maps staged, a failed
+            // submission past the bound failing the device, which the commit's own submission
+            // reports.
+            _ => {
+                let _ = self.upload(range, replaces);
+                return;
+            }
+        };
+        // As above.
+        if staged.is_err() {
+            let _ = self.upload(range, replaces);
+        }
+    }
+
+    /// Copy `range` of the bytes of `source` (a `VkBuffer`, and where the buffer's byte
+    /// `range.start` lies in it) into the buffer's own, by the device's next submission whose
+    /// commands may reach the buffer (or an internal one), before any of its commands, after the
+    /// commands before it on its `VkQueue`, as [`upload`](Self::upload) copies, the submission
+    /// holding `held` until it completed: a two-copy buffer's copy in from the caller's pages
+    /// (`managed_copy.rs`), counted (`WorkCounts::managed_bytes_copied_in`), or from staging
+    /// buffers of a host copy's bytes ([`upload_at_commit`](Self::upload_at_commit)), taken by
+    /// the batch `replaces` says ([`Replaces`]). Where `bounded` and `held` is a staging buffer
+    /// ([`Keeps::Staging`]), past the bound of what is staged, a submission waited for makes it
+    /// now; else it waits for the device's next: a copy from a host copy ([`Keeps::HostCopy`])
+    /// stages nothing and makes none.
+    pub(super) fn copy_in_from(
+        &self,
+        source: (vk::Buffer, u64),
+        range: Range<u64>,
+        held: Keeps,
+        (bounded, replaces): (bool, Replaces),
+    ) -> Result<(), Error> {
+        let s = self.s();
+        let device = &s.device;
+        let bytes = range.end - range.start;
+        s.staged.store(true, Ordering::Relaxed);
+        let weak: Weak<BufferShared> = Arc::downgrade(s);
+        let past = register_copy_in(
+            device,
+            weak,
+            (self.at(range.start), source),
+            bytes,
+            held,
+            replaces,
+        );
+        if self.caller_copy().is_some() {
+            device.shared().counts.managed_copied(bytes, true);
+        }
+        match past && bounded {
             true => device.submit_internal(|_, _| {}),
             false => Ok(()),
         }
+    }
+
+    /// Whether the GPU's writes to the buffer's host pages are dropped (Metal's private option
+    /// bit 24, or a read-only rebind: `read_only_view.rs`, `copied.rs`); false for a buffer over
+    /// no host pages.
+    pub(super) fn drops_writes(&self) -> bool {
+        let Some(cell) = self.pages_cell() else {
+            return false;
+        };
+        cell.drops_writes()
+            || cell.current().is_some_and(|pages| {
+                pages.import.drops_writes() || pages.import.copy_drops_writes()
+            })
     }
 
     /// Keep `token` for the buffer's range, dropped once the range is free (`RangeToken`): a
     /// buffer of its own, as a creator makes it. Internal for a buffer of a heap, which holds no
     /// range of its own, or one that keeps a token already: no creator gives one so.
     pub(super) fn keep_range_token(&self, token: RangeToken) -> Result<(), Error> {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(own) => own.range_token.keep(token),
             Bytes::Heap(_) => Err(internal("a range token for a heap's buffer")),
         }
@@ -3039,14 +4877,23 @@ impl Buffer {
         self.0.clone()
     }
 
+    /// The address of what [`held`](Self::held) refers to, in host memory: no other object's
+    /// while it lives (`retained.rs`).
+    pub(super) fn address(&self) -> usize {
+        Arc::as_ptr(&self.0).cast::<()>().addr()
+    }
+
     /// The encoder core that holds it from an argument table's retain (`retained::HeldBy`).
     pub(super) fn held_by(&self) -> &HeldBy {
+        // The program's buffer's, whatever generation its parts are of: an encoder core's retain
+        // names the buffer, not its parts.
         &self.0.held_by
     }
 
     /// The buffer's identity for hazard tracking: a heap buffer's is its heap's, as Metal tracks
     /// a heap's resources as one ([`Buffer::tracked`]).
     pub(super) fn identity(&self) -> Identity {
+        // Every generation's parts keep the buffer's identity (`Buffer::carry`).
         match &self.0.bytes {
             Bytes::Own(own) => own.identity,
             Bytes::Heap(bytes) => bytes.bytes.identity(),
@@ -3056,9 +4903,10 @@ impl Buffer {
     /// The key of the host memory a no-copy buffer joined, made over the bytes another covers
     /// (`host_aliases.rs`): its uses carry one of that key too. `None` for any other buffer.
     pub(super) fn alias(&self) -> Option<Alias> {
-        match &self.0.bytes {
+        let s = self.s();
+        match &s.bytes {
             Bytes::Own(own) if matches!(own.lie, Lie::Host(_)) => {
-                self.0.device.shared().aliases.of(own.identity.key)
+                s.device.shared().aliases.of(own.identity.key)
             }
             Bytes::Own(_) | Bytes::Heap(_) => None,
         }
@@ -3067,6 +4915,7 @@ impl Buffer {
     /// The bytes `range` of the buffer as hazard tracking keys them: its identity
     /// ([`Buffer::identity`]), and the range in its bytes, or for a heap buffer in its heap's.
     pub(super) fn tracked(&self, range: Range<u64>) -> (Identity, Range<u64>) {
+        // A heap's buffer is never carried (`Buffer::carry`).
         let shift = match &self.0.bytes {
             Bytes::Own(_) => 0,
             Bytes::Heap(bytes) => bytes.offset,
@@ -3077,7 +4926,7 @@ impl Buffer {
     /// The Vulkan device address of the buffer's byte 0, where the device enables
     /// `bufferDeviceAddress`.
     pub(super) fn device_address(&self) -> Option<u64> {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(own) => own.with(ReadApart::Binding, |pages| {
                 let address = pages.memory.device_address?;
                 Some(address + pages.base)
@@ -3094,19 +4943,20 @@ impl Buffer {
     /// a hold on its pages that keeps them while a command buffer may reach them. A buffer placed
     /// in a heap: its own range, as the residency states it, with a hold on the heap's pages.
     pub(super) fn resident(&self) -> Option<(ResidentRange, PagesHold)> {
-        let own = match &self.0.bytes {
+        let s = self.s();
+        let own = match &s.bytes {
             Bytes::Own(own) => own,
             Bytes::Heap(heap) => {
                 let (whole, held) = heap.bytes.resident()?;
-                let guest = self.0.address.0;
+                let guest = s.address.0;
                 let host = whole.host + guest.checked_sub(whole.guest)?;
-                return Some((ResidentRange::new(host, guest, self.0.length), held));
+                return Some((ResidentRange::new(host, guest, s.length), held));
             }
         };
         let range = |pages: &Pages| {
             let host = pages.memory.device_address?;
-            let guest = self.0.address.0.checked_sub(pages.base)?;
-            Some(ResidentRange::new(host, guest, pages.base + self.0.length))
+            let guest = s.address.0.checked_sub(pages.base)?;
+            Some(ResidentRange::new(host, guest, pages.base + s.length))
         };
         match &own.lie {
             Lie::Fixed(fixed) => Some((
@@ -3134,7 +4984,7 @@ impl Buffer {
     /// A hold on the memory the buffer's bytes lie in now, which keeps nothing else of it
     /// ([`MemoryHold`]): a heap's buffer's, its heap's. `None` while its bytes are detached.
     pub(super) fn memory_hold(&self) -> Option<MemoryHold> {
-        self.0.memory_hold()
+        self.s().memory_hold()
     }
 
     /// A handle that does not keep the buffer (`WeakBuffer`).
@@ -3144,23 +4994,23 @@ impl Buffer {
 
     /// The buffer's label and purgeable state.
     pub(super) fn attributes(&self) -> &ResourceAttributes {
-        &self.0.attributes
+        &self.s().attributes
     }
 
     /// What a buffer made over the same host memory shares of this one (`BufferDescriptor::
     /// range_of`): its address, the range it holds, and the first byte of host memory its bytes
     /// are now; `None` but for a no-copy buffer of its own range.
     pub(super) fn sharable_range(&self) -> Option<(GpuAddress, Held, NonNull<u8>)> {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(
                 own @ OwnBytes {
                     owner: Owner::Caller,
                     ..
                 },
             ) => Some((
-                self.exposed_address(ReadApart::SecondBuffer),
+                self.exposed_address(ReadApart::SharedRange),
                 own.reserved,
-                self.contents()?,
+                self.mapped_contents()?,
             )),
             Bytes::Own(_) | Bytes::Heap(_) => None,
         }
@@ -3170,7 +5020,7 @@ impl Buffer {
     /// host pages, or the memory of the caller's `VkBuffer`; a heap buffer's, its heap's (a heap
     /// over host pages, `Device::new_heap_with_bytes_no_copy`).
     pub(super) fn caller_memory(&self) -> Option<CallerMemory> {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(OwnBytes {
                 owner: Owner::Caller,
                 ..
@@ -3189,7 +5039,7 @@ impl Buffer {
     /// `VkBuffer`); `None` for a no-copy buffer and a heap's.
     #[cfg(unix)]
     fn fixed_pages(&self) -> Option<Arc<FixedPages>> {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(OwnBytes {
                 lie: Lie::Fixed(fixed),
                 ..
@@ -3201,7 +5051,7 @@ impl Buffer {
     /// The buffer's hold on its host pages: a no-copy buffer's, or a no-copy heap's own
     /// buffer's; `None` for any other buffer, a heap's buffer among them.
     pub(super) fn host_cell(&self) -> Option<&Arc<HostCell>> {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(OwnBytes {
                 lie: Lie::Host(cell),
                 ..
@@ -3213,7 +5063,7 @@ impl Buffer {
     /// Note `views`, a texture's over the buffer's bytes, where a rebind gives those other host
     /// pages (a no-copy buffer's, or for a heap's buffer its heap's): the rebind empties them.
     pub(super) fn watch_views(&self, views: &Arc<TexelViews>) {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(OwnBytes {
                 lie: Lie::Host(cell),
                 ..
@@ -3223,11 +5073,28 @@ impl Buffer {
         }
     }
 
+    /// Where the buffer's byte `offset` lies in the device's import of the caller's host pages
+    /// it lies in now ([`HostPages::in_import`]): `None` for a buffer over no host pages, a
+    /// detached one, or one whose pages' memory is no such import.
+    pub(super) fn host_memory_at(&self, offset: u64) -> Option<crate::VkHostMemory> {
+        match &self.s().bytes {
+            Bytes::Own(OwnBytes {
+                lie: Lie::Host(cell),
+                ..
+            }) => match cell.lying() {
+                Lying::In(pages) => pages.in_import(offset),
+                Lying::Detached(_) | Lying::Gone(_) => None,
+            },
+            Bytes::Own(_) => None,
+            Bytes::Heap(bytes) => bytes.bytes.host_memory_at(bytes.offset + offset),
+        }
+    }
+
     /// The hold on the host pages the buffer's bytes lie in: a no-copy buffer's own, a buffer
     /// of a no-copy heap its heap's buffer's; `None` for bytes of the runtime's memory or of the
     /// caller's `VkBuffer`.
     pub(super) fn pages_cell(&self) -> Option<&Arc<HostCell>> {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(OwnBytes {
                 lie: Lie::Host(cell),
                 ..
@@ -3240,6 +5107,7 @@ impl Buffer {
     /// The buffer's Metal address, read for the runtime's own bookkeeping (a live-table key, a
     /// lookup), which hands it out to no one: [`Buffer::gpu_address`] without its exposure.
     pub(super) fn metal_address(&self) -> GpuAddress {
+        // Every generation's parts keep it (`Buffer::carry`).
         self.0.address
     }
 
@@ -3259,7 +5127,7 @@ impl Buffer {
             match before {
                 0 => {
                     if pages.import.expose(reason) {
-                        self.device().shared().live_buffers.refresh(self);
+                        self.generation().shared().live_buffers.refresh(self);
                     }
                 }
                 // Kept imported already: the new reason is only counted.
@@ -3281,7 +5149,7 @@ impl Buffer {
         if let Bytes::Own(OwnBytes {
             lie: Lie::Host(cell),
             ..
-        }) = &self.0.bytes
+        }) = &self.s().bytes
         {
             if let Lying::In(pages) = cell.lying() {
                 let (held, hold) = pages.import.blit_pages()?;
@@ -3298,13 +5166,23 @@ impl Buffer {
         self.pages_cell()?.current()
     }
 
+    /// Where the buffer's byte 0 lies from the first byte of the host pages it lies in
+    /// ([`host_pages`](Self::host_pages)), read without their import: 0 for a no-copy buffer's
+    /// own pages, the buffer's offset in its heap for a no-copy heap's buffer.
+    pub(super) fn offset_in_host_pages(&self) -> u64 {
+        match &self.s().bytes {
+            Bytes::Own(_) => 0,
+            Bytes::Heap(bytes) => bytes.bytes.offset_in_host_pages() + bytes.offset,
+        }
+    }
+
     /// The runtime wrote the host addresses `addresses` of the buffer's bytes through its
     /// `contents` itself (a `replaceRegion`, an argument encoder's or a rasterization-rate map's
     /// write): reported to the logs of the writes to its pages, where their memory came with one
     /// (`dirty_pages::PagesLog`, writer 0), so every copy of the pages takes them. The pages are
     /// looked at only on a device some of whose pages came with a log.
     pub(super) fn wrote_host(&self, addresses: Range<u64>) {
-        if !self.0.device.shared().dirty.logged() {
+        if !self.s().device.shared().dirty.logged() {
             return;
         }
         if let Some(log) = self.host_pages().as_ref().and_then(|pages| pages.log()) {
@@ -3314,16 +5192,32 @@ impl Buffer {
 
     /// The host imports `buffers` lie in now, each counted once however many lie in it
     /// (`host_aliases.rs`): a committed command buffer's used buffers'
-    /// (`WorkCounts::host_imports_used`). Buffers over no host pages count none.
+    /// (`WorkCounts::host_imports_used`). Buffers over no host pages count none. The first
+    /// [`FEW_IMPORTS`] distinct imports are told apart in place, with no list made and nothing
+    /// sorted; past them, all of them are listed and sorted. An import lives while a buffer of
+    /// `buffers` holds it, so no two of them share an address.
     pub(super) fn distinct_host_imports(buffers: &[Buffer]) -> u64 {
-        let mut imports: Vec<*const HostImport> = buffers
-            .iter()
-            .filter_map(|buffer| buffer.host_pages())
-            .map(|pages| Arc::as_ptr(&pages.import))
-            .collect();
-        imports.sort_unstable();
-        imports.dedup();
-        imports.len() as u64
+        let imports = || {
+            (buffers.iter())
+                .filter_map(|buffer| buffer.host_pages())
+                .map(|pages| Arc::as_ptr(&pages.import))
+        };
+        let mut few = [std::ptr::null::<HostImport>(); FEW_IMPORTS];
+        let mut seen = 0;
+        for import in imports() {
+            if few[..seen].contains(&import) {
+                continue;
+            }
+            if seen == FEW_IMPORTS {
+                let mut all: Vec<*const HostImport> = imports().collect();
+                all.sort_unstable();
+                all.dedup();
+                return all.len() as u64;
+            }
+            few[seen] = import;
+            seen += 1;
+        }
+        seen as u64
     }
 
     /// Note `noted`, a texture over the buffer's bytes (`TexturesOver`), where they are host
@@ -3334,7 +5228,7 @@ impl Buffer {
             // Made over detached bytes, its stand-in's sink may be read through.
             if noted.sink && cell.detached() {
                 let reached = std::iter::once((noted.texture(), noted.id, Unexact::StorageSink));
-                self.device().note_stale(cell, reached);
+                self.generation().note_stale(cell, reached);
             }
             cell.watch_texture(noted);
         }
@@ -3373,6 +5267,7 @@ impl Buffer {
         match self.pages_cell().map(|cell| cell.lying()) {
             Some(Lying::In(pages)) => pages.type_index(),
             Some(Lying::Detached(detached)) => detached.type_index,
+            Some(Lying::Gone(_)) => read_gone(),
             None => self.memory().2,
         }
     }
@@ -3391,36 +5286,64 @@ impl Buffer {
         match self.pages_cell().map(|cell| cell.lying()) {
             Some(Lying::In(pages)) => pages.over_dma_buf(),
             Some(Lying::Detached(detached)) => detached.over_dma_buf,
-            None => false,
+            Some(Lying::Gone(_)) | None => false,
         }
     }
 
-    /// `device`.
-    pub fn device(&self) -> &Device {
-        &self.0.device
+    /// `device`: a generation handle of the device, owned, as Metal's `device` answers a retained
+    /// device: of the generation the buffer was made on, then of each one the device's recoveries
+    /// carried the buffer to. The handle is the caller's: it keeps meaning that generation while
+    /// held, past a recovery that carries the buffer on, its raw handles that generation's
+    /// `VkDevice`'s, kept alive while held.
+    pub fn device(&self) -> Device {
+        self.generation().clone()
+    }
+
+    /// The generation handle [`device`](Self::device) answers a clone of, borrowed for the
+    /// runtime's own reads: a caller's handle is `device`'s, as a recovery lets go of the
+    /// object's handle of a lost generation at that generation's rest (`device/carry.rs`).
+    pub(crate) fn generation(&self) -> &Device {
+        &self.s().device
     }
 
     /// `length`: the length the buffer was made with.
     pub fn length(&self) -> u64 {
+        // Every generation's parts keep it (`Buffer::carry`).
         self.0.length
     }
 
     /// `contents`: the CPU address of the buffer's bytes, or `None` for `Private` storage. A
     /// no-copy buffer's is the caller's pointer. Reading or writing through it while the GPU
     /// writes those bytes is a data race, as in Metal.
+    ///
+    /// While a no-copy buffer is detached ([`detach_backing`](Buffer::detach_backing); for a
+    /// heap's buffer, its heap), it answers the caller's pointer of the pages it lay in last (its
+    /// making's or its last rebind's), as Metal's does: the pages are the caller's, which the
+    /// runtime reads and writes nothing of until a rebind gives the buffer pages again.
     pub fn contents(&self) -> Option<NonNull<u8>> {
+        self.mapped_contents().or_else(|| self.detached_contents())
+    }
+
+    /// [`contents`](Buffer::contents) where the bytes are mapped now, which the runtime reads and
+    /// writes through: `None` while a no-copy buffer is detached.
+    pub(crate) fn mapped_contents(&self) -> Option<NonNull<u8>> {
         if self.storage_mode() == StorageMode::Private {
             return None;
         }
-        match &self.0.bytes {
+        match &self.s().bytes {
             // A host copy holds the buffer's bytes from its start.
             Bytes::Own(OwnBytes {
-                mirror: Some(mirror),
+                mirror: Some(HostCopy::Own(mirror)),
                 ..
             }) => mirror
                 .placement
                 .mapped
                 .and_then(|mapped| NonNull::new(mapped.as_ptr())),
+            // The caller's pages (`managed_copy.rs`): `None` while they are detached.
+            Bytes::Own(OwnBytes {
+                mirror: Some(HostCopy::Caller(caller)),
+                ..
+            }) => caller.mapped_contents(),
             // The offset is inside the placement, which the mapping covers.
             Bytes::Own(own) => {
                 let shape = own.shape();
@@ -3428,7 +5351,71 @@ impl Buffer {
                 NonNull::new(mapped.as_ptr().wrapping_add(shape.offset as usize))
             }
             // The heap's storage mode is the buffer's, and the offset lies inside the heap.
-            Bytes::Heap(bytes) => bytes.bytes.contents().and_then(|contents| {
+            Bytes::Heap(bytes) => bytes.bytes.mapped_contents().and_then(|contents| {
+                NonNull::new(contents.as_ptr().wrapping_add(bytes.offset as usize))
+            }),
+        }
+    }
+
+    /// Whether the host maps the bytes the GPU reads and writes, through which the runtime may
+    /// read what the GPU wrote once it completed ([`read_mapped`](Buffer::read_mapped)): not a
+    /// `Private` buffer, nor a `Managed` one's host copy on a device without unified memory
+    /// ([`HostCopy`]), nor a copy of the caller's pages ([`copied`](Buffer::copied)), whose
+    /// GPU's bytes are not the pages.
+    pub(super) fn maps_gpu_bytes(&self) -> bool {
+        self.storage_mode() != StorageMode::Private && self.mirror().is_none() && !self.copied()
+    }
+
+    /// The `N` bytes at `offset`, as the host reads them now through the buffer's mapping
+    /// ([`mapped_contents`](Buffer::mapped_contents)): where they lie in host pages (a no-copy
+    /// buffer's, or for a heap's buffer its heap's), read with those pages held, so a detach and
+    /// a rebind meanwhile let none of them go under the read. `None` where nothing maps them now
+    /// (a `Private` buffer, a detached one), or `offset + N` passes the buffer's length.
+    pub(super) fn read_mapped<const N: usize>(&self, offset: u64) -> Option<[u8; N]> {
+        if offset.checked_add(N as u64)? > self.length() {
+            return None;
+        }
+        let contents = match &self.s().bytes {
+            Bytes::Heap(bytes) => return bytes.bytes.read_mapped(bytes.offset + offset),
+            Bytes::Own(OwnBytes {
+                mirror: None,
+                lie: Lie::Host(cell),
+                ..
+            }) => return cell.read(offset),
+            Bytes::Own(_) => self.mapped_contents()?,
+        };
+        let mut bytes = [0u8; N];
+        // SAFETY: the mapping holds the buffer's `length` bytes from `contents`, which its own
+        // memory keeps mapped while the buffer lives, and `offset + N` is at most that. A write
+        // to them meanwhile races, as a read of `contents` does on Metal.
+        unsafe {
+            let at = contents.as_ptr().wrapping_add(offset as usize);
+            std::ptr::copy_nonoverlapping(at, bytes.as_mut_ptr(), N);
+        }
+        Some(bytes)
+    }
+
+    /// The caller's pointer of the pages a detached no-copy buffer lay in last, or for a heap's
+    /// buffer its offset from its detached heap's: what [`contents`](Buffer::contents) answers
+    /// while it is detached. `None` for any other buffer.
+    fn detached_contents(&self) -> Option<NonNull<u8>> {
+        if self.storage_mode() == StorageMode::Private {
+            return None;
+        }
+        match &self.s().bytes {
+            Bytes::Own(OwnBytes {
+                mirror: Some(HostCopy::Caller(caller)),
+                ..
+            }) => caller.contents(),
+            Bytes::Own(OwnBytes {
+                mirror: Some(HostCopy::Own(_)),
+                ..
+            }) => None,
+            Bytes::Own(own) => match &own.lie {
+                Lie::Host(cell) => cell.detached_pointer(),
+                Lie::Fixed(_) => None,
+            },
+            Bytes::Heap(bytes) => bytes.bytes.detached_contents().and_then(|contents| {
                 NonNull::new(contents.as_ptr().wrapping_add(bytes.offset as usize))
             }),
         }
@@ -3438,6 +5425,7 @@ impl Buffer {
     /// pointer; this is unique among the process's buffers, textures and heaps for the buffer's
     /// life and never reused, where a `gpu_address` is taken again once its buffer is freed.
     pub fn object_id(&self) -> ObjectId {
+        // Every generation's parts keep it (`Buffer::carry`).
         self.0.object_id
     }
 
@@ -3457,14 +5445,14 @@ impl Buffer {
     /// counted for that reason.
     pub(super) fn exposed_address(&self, reason: ReadApart) -> GpuAddress {
         self.expose(reason);
-        self.0.address
+        self.s().address
     }
 
     /// `resourceOptions`: the options the buffer was made with, its hazard tracking mode
     /// resolved (`Default` reports `Tracked` for a buffer made outside a heap, as Metal's do, and
     /// a heap buffer reports its heap's).
     pub fn resource_options(&self) -> ResourceOptions {
-        self.0.options
+        self.s().options
     }
 
     /// `cpuCacheMode`.
@@ -3490,7 +5478,7 @@ impl Buffer {
 
     /// `heap`: the heap the buffer is placed in, if it is.
     pub fn heap(&self) -> Option<&Heap> {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(_) => None,
             Bytes::Heap(bytes) => Some(&bytes.heap),
         }
@@ -3499,7 +5487,7 @@ impl Buffer {
     /// The bytes of the heap the buffer is placed in, and where its byte 0 lies among them:
     /// `None` for a buffer outside a heap.
     pub(super) fn heap_bytes(&self) -> Option<(&Buffer, u64)> {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Own(_) => None,
             Bytes::Heap(bytes) => Some((&bytes.bytes, bytes.offset)),
         }
@@ -3508,7 +5496,7 @@ impl Buffer {
     /// `heapOffset`: where the buffer lies in a placement heap. Metal answers 0 for a buffer of an
     /// automatic heap, whatever its place (measured), and for one outside a heap.
     pub fn heap_offset(&self) -> u64 {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Heap(bytes) if bytes.heap.heap_type() == HeapType::Placement => bytes.offset,
             Bytes::Heap(_) | Bytes::Own(_) => 0,
         }
@@ -3522,21 +5510,460 @@ impl Buffer {
     /// A buffer outside a heap stays as it is, not aliasable, as plain Metal leaves it where its
     /// validation stops the call.
     pub fn make_aliasable(&self) -> Result<(), Error> {
-        let Bytes::Heap(bytes) = &self.0.bytes else {
+        let s = self.s();
+        let Bytes::Heap(bytes) = &s.bytes else {
             return Ok(());
         };
         bytes
             .heap
-            .make_aliasable(bytes.offset, self.0.length, &bytes.aliasable);
+            .make_aliasable(bytes.offset, s.length, &bytes.aliasable);
         Ok(())
     }
 
     /// `isAliasable`: whether `make_aliasable` was called on an automatic heap's buffer; true for
     /// a placement heap's from the start, and false outside a heap, as Metal answers.
     pub fn is_aliasable(&self) -> bool {
-        match &self.0.bytes {
+        match &self.s().bytes {
             Bytes::Heap(bytes) => bytes.aliasable.load(Ordering::Acquire),
             Bytes::Own(_) => false,
         }
+    }
+}
+
+impl Buffer {
+    /// Carry the buffer to `to`, its device's next generation, by the recovery that made it or by
+    /// its maker (`device/carry.rs`): its parts there, the same buffer (its `ObjectId`, hazard
+    /// key, Metal address with a share of its range, its range token, label and purgeable state),
+    /// kept among `to`'s program resources and live buffers. A buffer in fresh pages lies in the
+    /// same pages there, imported again, its contents and `contents` pointer as they were, and so
+    /// does one in a block of the runtime's own pages (`memory.rs`'s `Holds::PageBuffers`), at its
+    /// offset in them; a `Private` one in new memory, its contents lost with the `VkDevice` (it
+    /// reads zero), but one in exportable memory over that memory's payload imported again, at its
+    /// offset there, reading what the memory holds (`exported_memory.rs`). Its parts on the
+    /// generation it leaves are let go of once none of that
+    /// generation's command buffers may record. Left the lost generation's, refused where it meets
+    /// the next (`RuntimeGap::MadeBeforeRecovery`): a buffer of pooled host-visible memory the
+    /// device allocated, whose `contents` pointer is its block's mapping (or a `Managed` buffer's
+    /// host copy's), a detached no-copy buffer, a heap's (its heap's carry carries it,
+    /// `Heap::carry`), one over the caller's `VkBuffer`, a `Shared` or `Managed` one in exportable
+    /// memory or one in an opaque descriptor's dedicated allocation, and one whose making there
+    /// fails.
+    pub(crate) fn carry(&self, to: &Device) -> Result<Contents, Left> {
+        self.carry_as(to, CarryOf::Program)
+    }
+
+    /// [`Buffer::carry`] of a heap's own buffer (`heap.rs`), for its heap's carry
+    /// (`Heap::carry`), kept among none of `to`'s program resources or live buffers, as it was
+    /// among none of its lost generation's: a `Private` one in new memory where the heap's
+    /// textures can lie too ([`Device::place_heap_buffer`]), its contents lost with the
+    /// `VkDevice` (it reads zero); one over the caller's host memory made again over the same
+    /// pages, as a no-copy buffer is, its bytes as they are. Left the lost generation's: a
+    /// `Shared` one, of pooled host-visible memory (a heap's own buffer never lies in the
+    /// runtime's own pages), and one over the caller's memory a no-copy buffer's carry leaves.
+    pub(crate) fn carry_heap_bytes(&self, to: &Device) -> Result<Contents, Left> {
+        self.carry_as(to, CarryOf::Heap)
+    }
+
+    /// [`Buffer::carry`] of a buffer of the runtime's own whose `contents` pointer no program
+    /// holds, which its owner reads again after the carry (an indirect command buffer's records,
+    /// a visible function table's words), kept among none of `to`'s program resources or live
+    /// buffers: in the runtime's own pages, the same pages there, its contents and pointer as
+    /// they were; in pooled host-visible memory, new memory of its class there, its contents lost
+    /// with the `VkDevice` (it reads zero) and its pointer that memory's mapping, where a
+    /// program's buffer stays the lost generation's ([`Left::Pooled`]).
+    pub(crate) fn carry_runtime(&self, to: &Device) -> Result<Contents, Left> {
+        self.carry_as(to, CarryOf::Runtime)
+    }
+
+    /// [`Buffer::carry`] of a buffer of `of`.
+    fn carry_as(&self, to: &Device, of: CarryOf) -> Result<Contents, Left> {
+        let of_heap = of == CarryOf::Heap;
+        // The generation it was carried to last: a later recovery carries it on from there.
+        let mut last = &self.0;
+        while let Some(next) = last.next.get() {
+            last = &next.0;
+        }
+        if last.device.same(to) {
+            // Carried already, by its maker.
+            return Ok(Contents::Kept);
+        }
+        let own = match &last.bytes {
+            Bytes::Own(own) => own,
+            Bytes::Heap(_) => return Err(Left::Heap),
+        };
+        let fixed = match (&own.owner, &own.lie) {
+            (Owner::Runtime, Lie::Fixed(fixed)) => fixed,
+            (Owner::Caller, Lie::Host(cell)) => {
+                return self.carry_no_copy(last, own, cell, to, of_heap)
+            }
+            (Owner::Caller, _) => return Err(Left::NoCopy),
+            (Owner::Vulkan, _) | (Owner::Runtime, Lie::Host(_)) => return Err(Left::Caller),
+        };
+        let from = last.device.shared();
+        let placement = &fixed.pages.memory.placement;
+        let bound = lock(&from.memory).bound_memory(placement);
+        let runtime_s = matches!(
+            bound,
+            BoundMemory::Own | BoundMemory::Blocks | BoundMemory::DmaBufBlocks
+        );
+        // Exportable memory, which another API imports (`exported_memory.rs`). A block of the
+        // runtime's own buffers allocated exportable is never exported (`Holds::FdBuffers`,
+        // `Holds::FdDmaBufs`).
+        let exportable = !runtime_s && !placement.over_own_pages() && !placement.in_page_block();
+        let modes = Modes::of(last.options).map_err(|_| Left::Failed)?;
+        let class = buffer_class("carry", modes).map_err(|_| Left::Failed)?;
+        let (length, lead, reach) = (last.length, fixed.pages.offset, fixed.pages.reach);
+        let size = (length + lead).next_multiple_of(16);
+        let at = Place::Shared {
+            address: last.address,
+            held: own.reserved,
+        };
+        // A two-copy buffer's host copy, made again there (`managed_copy.rs`).
+        let mut mirror = None;
+        let (raw, placement, contents) = if exportable {
+            // A `Private` buffer's memory is its block's payload, imported again there, the
+            // buffer at its offset in it: the memory the other API imported before, which it
+            // reaches still, read as it holds it (`exported_memory.rs`). A `Shared` or `Managed`
+            // one's `contents` pointer is its block's mapping, which new memory cannot keep.
+            if modes.storage != StorageMode::Private || own.mirror.is_some() {
+                return Err(Left::Exported);
+            }
+            #[cfg(not(unix))]
+            return Err(Left::Exported);
+            #[cfg(unix)]
+            {
+                let (raw, placement) =
+                    to.buffer_in_carried_export(size, &last.device, placement)?;
+                if to.address_space_for(at).place(at, length).is_err() {
+                    let shared = to.shared();
+                    // SAFETY: the buffer is unused.
+                    unsafe { release::object(shared.vk(), raw) };
+                    lock(&shared.memory).free(shared.vk(), &placement);
+                    return Err(Left::Failed);
+                }
+                (raw, placement, Contents::Kept)
+            }
+        } else if let Some(HostCopy::Caller(caller)) = &own.mirror {
+            let carried = caller.carry(to, length, last.options).ok_or(Left::NoCopy)?;
+            let Ok((raw, placement)) = to.managed_device_copy(carried.device_bytes()) else {
+                return Err(Left::Failed);
+            };
+            if to.address_space_for(at).place(at, length).is_err() {
+                let shared = to.shared();
+                // SAFETY: the buffer is unused.
+                unsafe { release::object(shared.vk(), raw) };
+                lock(&shared.memory).free(shared.vk(), &placement);
+                return Err(Left::Failed);
+            }
+            mirror = Some(HostCopy::Caller(Arc::new(carried)));
+            (raw, placement, Contents::Kept)
+        } else if modes.storage == StorageMode::Private
+            || (of == CarryOf::Runtime && !placement.over_own_pages() && !placement.in_page_block())
+        {
+            // New memory, as a new buffer's: its contents went with the lost `VkDevice`. In a
+            // plain block (`Device::place_buffer`), where any of the device's buffers may lie, as
+            // they do until its check of exportable blocks answered (`Holds::FdBuffers`); a
+            // heap's where its textures can lie too, as its making placed it. A runtime buffer of
+            // pooled host-visible memory too: no program holds its `contents` pointer.
+            let shared = to.shared();
+            let info = shared.sharing().buffer(
+                vk::BufferCreateInfo::default()
+                    .size(size)
+                    .usage(usage(false)),
+            );
+            // SAFETY: the device is live and `info` valid.
+            let raw =
+                unsafe { crate::creation::buffer(shared.vk(), &info) }.map_err(|_| Left::Failed)?;
+            shared.counts.buffer_made(info.usage);
+            let placed = match of_heap {
+                true => to.place_heap_buffer(raw, length, class, at),
+                false => to.place_buffer(raw, length, class, at),
+            };
+            match placed {
+                Ok((placement, _shared_range)) => (raw, placement, Contents::Lost(length)),
+                Err(_) => {
+                    // SAFETY: the buffer is unused.
+                    unsafe { release::object(shared.vk(), raw) };
+                    return Err(Left::Failed);
+                }
+            }
+        } else if placement.over_own_pages() {
+            // The same pages, imported again: the `contents` pointer and the bytes as they are.
+            let pages = lock(&from.memory).own_pages(placement);
+            let Some(pages) = pages else {
+                return Err(Left::Failed);
+            };
+            let Ok(Some((raw, placement))) = to.buffer_over_own_pages(size, class, Some(pages))
+            else {
+                return Err(Left::Failed);
+            };
+            if to.address_space_for(at).place(at, length).is_err() {
+                let shared = to.shared();
+                // SAFETY: the buffer is unused.
+                unsafe { release::object(shared.vk(), raw) };
+                lock(&shared.memory).free(shared.vk(), &placement);
+                return Err(Left::Failed);
+            }
+            (raw, placement, Contents::Kept)
+        } else if placement.in_page_block() {
+            // A block of pages the runtime mapped and imported for the program's buffers
+            // (`memory.rs`'s `Holds::PageBuffers`): the same pages imported again, once for every
+            // buffer carried from the block, the buffer at its offset in them: the `contents`
+            // pointer and the bytes as they are.
+            let pages = lock(&from.memory).page_block_pages(placement);
+            let Some(pages) = pages else {
+                return Err(Left::Failed);
+            };
+            let Ok(Some((raw, placement))) = to.buffer_in_carried_pages(size, pages, placement)
+            else {
+                return Err(Left::Failed);
+            };
+            if to.address_space_for(at).place(at, length).is_err() {
+                let shared = to.shared();
+                // SAFETY: the buffer is unused.
+                unsafe { release::object(shared.vk(), raw) };
+                lock(&shared.memory).free(shared.vk(), &placement);
+                return Err(Left::Failed);
+            }
+            (raw, placement, Contents::Kept)
+        } else {
+            // Pooled host-visible memory the device allocated, or a `Managed` buffer's host copy:
+            // its `contents` pointer is their mapping, which new memory cannot keep (the module
+            // docs of `device/carry.rs`).
+            return Err(Left::Pooled);
+        };
+        let range_token = KeptToken::default();
+        own.range_token.hand_to(&range_token);
+        let carried = Buffer(Arc::new(BufferShared {
+            device: MadeOn::new(to.clone()),
+            generation: std::ptr::from_ref(to.shared()).addr(),
+            object_id: last.object_id,
+            length,
+            options: last.options,
+            address: last.address,
+            attributes: last.attributes.carried(),
+            bytes: Bytes::Own(OwnBytes {
+                lie: Lie::Fixed(Arc::new(FixedPages {
+                    device: MadeOn::new(to.clone()),
+                    pages: to.pages_of(raw, placement, lead, lead, reach),
+                    owned: true,
+                    released: AtomicBool::new(false),
+                    freed: AtomicBool::new(false),
+                })),
+                reserved: own.reserved,
+                identity: own.identity,
+                owner: Owner::Runtime,
+                mirror,
+                range_token,
+            }),
+            held_by: HeldBy::default(),
+            handed_out: Arc::default(),
+            padding_unobserved: AtomicBool::new(last.padding_unobserved.load(Ordering::Acquire)),
+            staged: AtomicBool::new(false),
+            next: OnceLock::new(),
+            carried: AtomicBool::new(false),
+            calls: PartsCalls::default(),
+        }));
+        // A two-copy buffer's device copy takes the pages' bytes, its GPU writes not synchronized
+        // lost with the `VkDevice` (`managed_copy.rs`).
+        if let Some(caller) = carried.caller_copy() {
+            if caller
+                .copy_in(&carried, 0..caller.reach(), true, Replaces::Unread)
+                .is_err()
+            {
+                if let Bytes::Own(parts) = &carried.0.bytes {
+                    parts.range_token.hand_to(&own.range_token);
+                }
+                return Err(Left::Failed);
+            }
+        }
+        // Zero, as a new buffer's. Dropping it on failure lets go of its parts and range share,
+        // and of the range token, which goes back to the buffer left.
+        if let Contents::Lost(_) = contents {
+            if carried.clear_first().is_err() {
+                if let Bytes::Own(parts) = &carried.0.bytes {
+                    parts.range_token.hand_to(&own.range_token);
+                }
+                return Err(Left::Failed);
+            }
+        }
+        let lost = LostBuffer {
+            pages: Arc::clone(fixed),
+            buffer: Arc::downgrade(last),
+        };
+        let _set = last.next.set(carried);
+        // Every link before it is carried already.
+        last.carried.store(true, Ordering::Release);
+        // Its parts on the lost generation go once none of its command buffers may record.
+        from.carry.lost(from, Box::new(lost));
+        // The program's buffer is the next generation's from now on; a heap's own buffer is its
+        // heap's, among no program resources.
+        if of == CarryOf::Program {
+            let _kept = to.visible(self.clone());
+        }
+        Ok(contents)
+    }
+
+    /// Carry a buffer placed in a heap to `to`, the generation the heap's own buffer was carried
+    /// to (`Heap::carry`): the same buffer there (its `ObjectId`, Metal address, label and
+    /// purgeable state, and the aliasable state it shares with its parts on each generation),
+    /// at the same offset of the heap's bytes, which are its bytes there as they were here. Its
+    /// parts on the generation it leaves hold no Vulkan object of their own: their entry among
+    /// that generation's live buffers and their handle of it go once none of its command
+    /// buffers may record ([`LostPlaced`]). Nothing where it was carried there already.
+    pub(crate) fn carry_placed(&self, to: &Device) {
+        let mut last = &self.0;
+        while let Some(next) = last.next.get() {
+            last = &next.0;
+        }
+        let Bytes::Heap(placed) = &last.bytes else {
+            return;
+        };
+        if last.device.same(to) {
+            return;
+        }
+        let carried = Buffer(Arc::new(BufferShared {
+            device: MadeOn::new(to.clone()),
+            generation: std::ptr::from_ref(to.shared()).addr(),
+            object_id: last.object_id,
+            length: last.length,
+            options: last.options,
+            address: last.address,
+            attributes: last.attributes.carried(),
+            bytes: Bytes::Heap(HeapBytes {
+                heap: placed.heap.clone(),
+                bytes: placed.bytes.clone(),
+                offset: placed.offset,
+                aliasable: Arc::clone(&placed.aliasable),
+            }),
+            held_by: HeldBy::default(),
+            handed_out: Arc::default(),
+            padding_unobserved: AtomicBool::new(last.padding_unobserved.load(Ordering::Acquire)),
+            staged: AtomicBool::new(false),
+            next: OnceLock::new(),
+            carried: AtomicBool::new(false),
+            calls: PartsCalls::default(),
+        }));
+        let from = last.device.shared();
+        let _set = last.next.set(carried);
+        // Every link before it is carried already.
+        last.carried.store(true, Ordering::Release);
+        let lost = LostPlaced {
+            buffer: Arc::downgrade(last),
+        };
+        from.carry.lost(from, Box::new(lost));
+    }
+}
+
+impl Buffer {
+    /// [`Buffer::carry`] of a no-copy buffer, or of a no-copy heap's own buffer where `of_heap`
+    /// (`Device::new_heap_with_bytes_no_copy`, among no program resources), whose parts on the
+    /// generation it leaves are `last`, `own` their bytes and `cell` their hold on the caller's
+    /// pages: made again on `to` of the
+    /// caller's memory its pages were made of ([`HostPages::made_of`]), over the same pages, as its
+    /// making or last rebind made it (an import of the pointer or of the source's dma-bufs, a run
+    /// of a guest RAM the device uses, a copy, a read-only view), the caller's gate and resolver
+    /// asked again there, its `contents` pointer and bytes as they are. Its deallocator and
+    /// keep-alive wait for its release, or next rebind, there and for the import on each
+    /// generation to be freed ([`Release::carry_on`]). Left the lost generation's: a buffer
+    /// detached, or whose last detach's deallocator waits for its next rebind (a detach is not
+    /// carried), and one whose making there fails.
+    fn carry_no_copy(
+        &self,
+        last: &Arc<BufferShared>,
+        own: &OwnBytes,
+        cell: &Arc<HostCell>,
+        to: &Device,
+        of_heap: bool,
+    ) -> Result<Contents, Left> {
+        let call = match of_heap {
+            true => "new_heap_with_bytes_no_copy",
+            false => "new_buffer_with_bytes_no_copy",
+        };
+        if lock(&cell.held_back).is_some() {
+            return Err(Left::NoCopy);
+        }
+        let pages = cell.current().ok_or(Left::NoCopy)?;
+        let parts = pages.made_of().cloned().ok_or(Left::NoCopy)?;
+        let pointer = parts.pointer;
+        let naming = Naming::Carried {
+            object_id: last.object_id,
+            identity: own.identity,
+            attributes: last.attributes.carried(),
+        };
+        let at = Place::Shared {
+            address: last.address,
+            held: own.reserved,
+        };
+        let made = (call, last.length, last.options, at);
+        // SAFETY: the caller's pages stay mapped while the buffer lives, as the contract of the
+        // memory it was made or rebound over says (`HostMemory::new`).
+        let carried = unsafe {
+            to.buffer_over_host_parts(made, parts, None, of_heap, cell.drops_writes(), naming)
+        }
+        .map_err(|_| Left::Failed)?;
+        let (Bytes::Own(carried_own), Some(carried_pages)) =
+            (&carried.0.bytes, carried.host_pages())
+        else {
+            return Err(Left::Failed);
+        };
+        // What the caller gave back the pages to waits for the buffer's release there and for
+        // each import of them to be freed.
+        if let Some(held) = pages.release.get().and_then(Release::carry_on) {
+            carried_pages.release_to(Release::carried(pointer, last.length, held));
+        }
+        own.range_token.hand_to(&carried_own.range_token);
+        let unobserved = last.padding_unobserved.load(Ordering::Acquire);
+        carried
+            .0
+            .padding_unobserved
+            .store(unobserved, Ordering::Release);
+        let from = last.device.shared();
+        let lost = LostHost {
+            cell: Arc::clone(cell),
+            buffer: Arc::downgrade(last),
+        };
+        let _set = last.next.set(carried);
+        // Every link before it is carried already.
+        last.carried.store(true, Ordering::Release);
+        // Its parts on the lost generation go once none of its command buffers may record.
+        from.carry.lost(from, Box::new(lost));
+        // The program's buffer is the next generation's from now on; a heap's own buffer is its
+        // heap's, among no program resources.
+        if !of_heap {
+            let _kept = to.visible(self.clone());
+        }
+        Ok(Contents::Kept)
+    }
+
+    /// Whether the buffer's parts on the generation it was made on went, carried from there
+    /// (`FixedPages::release_lost`).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn first_parts_freed(&self) -> bool {
+        match &self.0.bytes {
+            Bytes::Own(OwnBytes {
+                lie: Lie::Fixed(fixed),
+                ..
+            }) => fixed.freed.load(Ordering::Acquire),
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's hook into [`Buffer::held_parts`], run once by this thread's next call that holds
+    /// a buffer's parts after the test set it: the test parks that call there across a recovery
+    /// (`tests/device_recovery_carry.rs`).
+    pub(crate) static HELD_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run this thread's [`HELD_HOOK`], where a test set it.
+#[cfg(test)]
+fn held_hook() {
+    let hook = HELD_HOOK.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
     }
 }

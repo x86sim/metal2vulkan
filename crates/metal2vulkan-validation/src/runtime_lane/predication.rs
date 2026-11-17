@@ -27,11 +27,12 @@
 //!   buffer up to, the heap's bytes past a buffer placed in a heap, and zero, announced, where
 //!   Metal reads memory unrelated to the buffer.
 
+use super::apart_writes::{layer_reported_nothing_but_apart_writes, NotedWrites};
 use super::host_memory::Seen;
 use super::rebind_reach::{buffer_len, buffer_over, deallocated, pages};
 use super::rebinds::rebind;
 use super::{
-    buffer_with, layer_reported_nothing_at_all, read_buffer, validated_device,
+    at_plan, buffer_with, layer_reported_nothing_at_all, read_buffer, validated_device,
     validated_device_with, Messages, ScratchCache, WAIT,
 };
 use crate::air_library::AirLibrary;
@@ -43,6 +44,7 @@ use metal2vulkan::metal::{
 };
 use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
 use metal2vulkan_devtools::llvm_assemble_text;
+use metal2vulkan_runtime::DeviceOptions;
 use metal2vulkan_runtime::{
     BlitOption, Buffer, ClearColor, CommandBuffer, CommandBufferError, CommandBufferStatus,
     ComputeCommandEncoder, ComputePipelineState, Degradation, Device, Error, EventRef,
@@ -229,15 +231,27 @@ fn complete(command_buffer: &CommandBuffer) {
 /// them (`bufferDeviceAddress` withheld), whose step module binds its places
 /// (`PredicationStepForm::Bound`); after each, require that the layer reported nothing.
 fn on_device(test: impl Fn(&Device)) {
-    on_device_noted(|device, _| test(device));
+    on_device_with(|_| {}, test)
+}
+
+/// [`on_device`], `adjust` applied to the options of each device it makes (`at_plan` gives them
+/// their queue plan).
+fn on_device_with(adjust: fn(&mut DeviceOptions), test: impl Fn(&Device)) {
+    on_device_noted_with(adjust, |device, _| test(device));
 }
 
 /// [`on_device`], `test` given the devices' messages too (their degrade notices among them).
 fn on_device_noted(test: impl Fn(&Device, &Messages)) {
+    on_device_noted_with(|_| {}, test)
+}
+
+/// [`on_device_noted`], `adjust` applied to the options of each device it makes (`at_plan` gives them
+/// their queue plan).
+fn on_device_noted_with(adjust: fn(&mut DeviceOptions), test: impl Fn(&Device, &Messages)) {
     let cache = ScratchCache::new().unwrap();
     let messages = Messages::default();
     let addressed = {
-        let device = validated_device(TEST_DEVICE, &messages, cache.path()).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), adjust).unwrap();
         let form = PredicationStepForm::of(device.compile_device());
         println!("PRD device {} {form:?}", device.name());
         test(&device, &messages);
@@ -252,7 +266,11 @@ fn on_device_noted(test: impl Fn(&Device, &Messages)) {
         let without = |options: &mut metal2vulkan_runtime::DeviceOptions| {
             (options.withheld_features).insert(VkFeature::BufferDeviceAddress);
         };
-        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), without).unwrap();
+        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |options| {
+            without(options);
+            adjust(options)
+        })
+        .unwrap();
         let form = PredicationStepForm::of(device.compile_device());
         assert_eq!(form, PredicationStepForm::Bound, "without device addresses");
         println!("PRD device {} {form:?}", device.name());
@@ -297,7 +315,12 @@ impl Streams {
 /// encodes a blit (the next command opens a serial encoder, as one with no encoder open does).
 /// The tags that ran, each once, and the answers, of a command buffer that completed.
 pub(crate) fn run(streams: &Streams, script: &str) -> (Vec<u32>, String) {
-    let ran = run_counted(streams, script);
+    completed(script, run_counted(streams, script), &streams.marks)
+}
+
+/// The tags that ran, each once, and the answers, of `script`'s run `ran` into `marks`, which
+/// completed with nothing refused.
+fn completed(script: &str, ran: Counted, marks: &Marks) -> (Vec<u32>, String) {
     if let Some(error) = ran.refused {
         panic!("{script}: refused {error:?}");
     }
@@ -306,7 +329,7 @@ pub(crate) fn run(streams: &Streams, script: &str) -> (Vec<u32>, String) {
         (CommandBufferStatus::Completed, None),
         "{script}"
     );
-    (streams.marks.ran(), ran.answers)
+    (marks.ran(), ran.answers)
 }
 
 /// What a stream's command buffer ran ([`run_counted`]).
@@ -318,6 +341,10 @@ struct Counted {
     answers: String,
     /// The first record the runtime refused, which recorded nothing.
     refused: Option<Error>,
+    /// The log word each dispatch the stream encodes writes, once per dispatch token, in order:
+    /// `prd_mark` adds 1 to word `offset + t`, `prd_put` writes word `offset`, where `offset` is
+    /// buffer 1's, in words.
+    written: Vec<u64>,
 }
 
 /// [`run`]'s stream, with these for loops that count, as the Metal probe's: `w<n>[@k]` starts a
@@ -333,7 +360,28 @@ fn run_counted(streams: &Streams, script: &str) -> Counted {
     let mut open: Option<ComputeCommandEncoder> = None;
     let mut answers = String::new();
     let mut refused = None;
+    // What a dispatch with the state set writes: whether it is `prd_put`'s, its bytes' value and
+    // buffer 1's offset in words ([`Counted::written`]).
+    let (mut puts, mut value, mut offset) = (false, 0u64, 0u64);
+    let mut written = Vec::new();
     for token in script.split_whitespace() {
+        let tagged = |token: &str| token[1..].parse::<u64>().ok();
+        match token {
+            "t" => written.push(if puts { offset } else { offset + value }),
+            _ if token.starts_with(['T', 'G', 'H', 'b']) => {
+                (puts, value, offset) = (false, tagged(token).unwrap_or(0), 0);
+                if !token.starts_with('b') {
+                    written.push(value);
+                }
+            }
+            _ if token.starts_with('Q') => {
+                (puts, value, offset) = (true, 0, tagged(token).unwrap_or(0));
+                written.push(offset);
+            }
+            _ if token.starts_with('y') => value = tagged(token).unwrap_or(0),
+            _ if token.starts_with('o') => offset = tagged(token).unwrap_or(0),
+            _ => {}
+        }
         match token {
             "|" | "%" => {
                 if let Some(encoder) = open.take() {
@@ -452,6 +500,7 @@ fn run_counted(streams: &Streams, script: &str) -> Counted {
         counts: marks.counts(),
         answers,
         refused,
+        written,
     }
 }
 
@@ -602,16 +651,25 @@ pub(crate) fn measured_streams() -> Vec<(&'static str, &'static str, Vec<u32>, &
 }
 
 /// Every measured stream runs the marks Metal ran, each once, and its Ends answer what Metal's
-/// answered.
+/// answered. Each dispatch token writes its own log word, where the stream names each word once
+/// ([`layer_reported_nothing_but_apart_writes`]: a concurrent encoder's dispatches, which Metal
+/// leaves unordered, writing words of one 16-byte block).
 #[test]
 fn streams_run_what_metal_ran() {
-    on_device(|device| {
+    on_device_noted(|device, messages| {
         let streams = Streams::new(device);
         let measured = measured_streams();
         assert!(measured.len() >= 600, "{}", measured.len());
         let mut wrong = Vec::new();
         for (name, script, ran, answers) in &measured {
-            let got = run(&streams, script);
+            let mut writes = NotedWrites::new(messages);
+            let counted = run_counted(&streams, script);
+            for word in &counted.written {
+                writes.dispatched(&streams.marks.log, 4 * word..4 * word + 4);
+            }
+            let claim = format!("{name} `{script}`");
+            layer_reported_nothing_but_apart_writes(messages, &claim, &writes);
+            let got = completed(script, counted, &streams.marks);
             if got != (ran.clone(), answers.to_string()) {
                 wrong.push(format!(
                     "{name} `{script}`: ran {:?} answered {:?}, Metal ran {ran:?} answered \
@@ -1178,7 +1236,7 @@ fn run_to_end(
 /// once, held, and its End in the next unit is unbalanced there.
 #[test]
 fn loops_span_their_units_encoders() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let cases: [SpanningCase; 6] = [
             (false, &[(0, 3), (5, 3), (6, 1)], |s| {
                 s.start_while(3);
@@ -1383,7 +1441,7 @@ fn put(encoder: &mut ComputeCommandEncoder, put: &ComputePipelineState, marks: &
 /// its Else inside a DoWhile, per pass: Metal's log `3 1 2 1 3 1 3 1`). Every one completes.
 #[test]
 fn loops_run_as_metal_ran() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let ok = (CommandBufferStatus::Completed, None);
         let expect = |got: (CommandBufferStatus, Option<CommandBufferError>, Vec<u32>),
                       want: &[(usize, u32)],
@@ -1536,12 +1594,17 @@ fn loop_streams_run_as_metal_ran() {
 
 /// Every dispatch form inside a loop runs in each pass: the forms of
 /// [`every_dispatch_form_runs_as_its_block_says`] in a DoWhile of three passes mark three times
-/// each.
+/// each. Each piece of work a host step records after the GPU's work before it (the forms' four,
+/// six in the bound step form) is a round trip to the host whether its copy's pass runs or skips,
+/// so the loop's copies hold 16 of them at most, not 64 copies' (256 or 384): the command buffer's
+/// host steps are those and the loop's check.
 #[test]
 fn every_dispatch_form_runs_in_each_pass() {
     on_device(|device| {
         let marks = Marks::new(device);
         let forms = Forms::new(device, &marks);
+        let steps = || device.work_counts().host_steps_recorded;
+        let before = steps();
         let queue = device.new_command_queue().unwrap();
         let command_buffer = queue.command_buffer().unwrap();
         let mut encoder = command_buffer.compute_command_encoder().unwrap();
@@ -1560,25 +1623,31 @@ fn every_dispatch_form_runs_in_each_pass() {
             counts[tag as usize] = 3;
         }
         assert_eq!(marks.counts(), counts);
+        let stepped = steps() - before;
+        assert!(stepped <= 16 + 1, "the loop's {stepped} host steps");
     });
 }
 
 /// Every dispatch form inside a loop that runs past its copies runs in each pass: the forms of
 /// [`every_dispatch_form_runs_as_its_block_says`], whose indirect dispatches of `prd_mark_group`
 /// and whose executions host steps record apart from the loop's command buffers, in a DoWhile of
-/// 100 passes (64 copies, run again once), and in a DoWhile of 20 passes, then one more, inside a
-/// DoWhile of two (16 copies of the inner loop). Each run again records the work apart again where
-/// it lies, as its first run did.
+/// 100 passes, and in a DoWhile of 20 passes, then one more, inside a DoWhile of two. Each run
+/// again records the work apart again where it lies, as its first run did. Each of those host
+/// steps is a round trip to the host in every run, whether its copy's pass runs or skips, so the
+/// copies laid hold 16 of them at most, not those of 64 copies, or of 64 of 16 (4096 host steps,
+/// 6144 in the bound step form, for the 84 or 126 that 21 passes run): the first run's host steps
+/// are those and the loop's check.
 #[test]
 fn every_dispatch_form_runs_in_each_pass_past_the_copies() {
     on_device(|device| {
         let queue = device.new_command_queue().unwrap();
         let base = Forms::command_tag(2) - 6;
         let again = || device.work_counts().predicated_loop_runs_again;
+        let steps = || device.work_counts().host_steps_recorded;
         // One DoWhile of 100 passes.
         let marks = Marks::new(device);
         let forms = Forms::new(device, &marks);
-        let before = again();
+        let (before, stepped) = (again(), steps());
         let command_buffer = queue.command_buffer().unwrap();
         let mut encoder = command_buffer.compute_command_encoder().unwrap();
         forms.resident(&mut encoder, &marks);
@@ -1595,15 +1664,13 @@ fn every_dispatch_form_runs_in_each_pass_past_the_copies() {
             counts[tag as usize] = 100;
         }
         assert_eq!(marks.counts(), counts);
-        assert_eq!(
-            again() - before,
-            1,
-            "the 100 passes ran again past 64 copies"
-        );
+        assert!(again() > before, "the 100 passes ran past their copies");
+        let stepped = steps() - stepped;
+        assert!(stepped <= 16 + 1, "the first run's {stepped} host steps");
         // An inner DoWhile of 20 passes, then of one, in a DoWhile of two.
         let marks = Marks::new(device);
         let forms = Forms::new(device, &marks);
-        let before = again();
+        let (before, stepped) = (again(), steps());
         let command_buffer = queue.command_buffer().unwrap();
         let mut encoder = command_buffer.compute_command_encoder().unwrap();
         forms.resident(&mut encoder, &marks);
@@ -1625,7 +1692,9 @@ fn every_dispatch_form_runs_in_each_pass_past_the_copies() {
             counts[tag as usize] = 21;
         }
         assert_eq!(marks.counts(), counts);
-        assert!(again() > before, "the inner loop ran past its 16 copies");
+        assert!(again() > before, "the inner loop ran past its copies");
+        let stepped = steps() - stepped;
+        assert!(stepped <= 16 + 1, "the first run's {stepped} host steps");
     });
 }
 
@@ -1636,7 +1705,7 @@ fn every_dispatch_form_runs_in_each_pass_past_the_copies() {
 /// the inner count each pass).
 #[test]
 fn a_loop_past_its_copies_runs_on() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let ok = (CommandBufferStatus::Completed, None);
         let again = || device.work_counts().predicated_loop_runs_again;
         for (n, runs) in [(65u32, 1u64), (128, 1), (1000, 15)] {
@@ -1816,6 +1885,35 @@ fn a_loop_without_bound_runs_on_after_its_queue_is_let_go() {
         ran(9);
         assert_eq!(marks.counts()[2], 0, "nothing after the loop ran");
     });
+}
+
+/// Commit on `device` a loop without bound, as
+/// [`a_loop_without_bound_runs_on_after_its_queue_is_let_go`] does, and return once its laying ran
+/// again `times` times; its queue and command buffer let go, it runs on to the process's end
+/// (`runtime_lane::exits`).
+pub(super) fn loop_without_bound(device: &Device, times: u64) {
+    let marks = Marks::new(device);
+    let queue = device.new_command_queue().unwrap();
+    let command_buffer = queue.command_buffer().unwrap();
+    let mut encoder = command_buffer.compute_command_encoder().unwrap();
+    encoder
+        .encode_start_while(Some(&marks.log), 4, NOT_EQUAL, 1)
+        .unwrap();
+    marks.mark(&mut encoder, 0);
+    assert_eq!(encoder.encode_end_while(), Ok(true));
+    encoder.end_encoding().unwrap();
+    let again = || device.work_counts().predicated_loop_runs_again;
+    let before = again();
+    command_buffer.commit().unwrap();
+    let start = std::time::Instant::now();
+    while again() < before + times {
+        assert!(
+            start.elapsed() < WAIT,
+            "its laying ran {} times again",
+            again() - before
+        );
+        std::thread::yield_now();
+    }
 }
 
 /// The shapes of [`a_runs_first_indirect_dispatch_of_another_type_runs_every_dispatch`]: each

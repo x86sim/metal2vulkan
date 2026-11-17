@@ -11,7 +11,9 @@
 //!   probe's tables): per vertex, 8 points, which fixed-function input fetches in the format's
 //!   `USCALED` or `SSCALED` form where the device can (the executed pipeline's vertex input says
 //!   which; printed), and with the constant step, 8 draws of one point bound at each record, which
-//!   the shader pulls and converts. Each row's `float4` is compared bit for bit, but a `half`
+//!   the shader pulls and converts, or fixed-function input fetches in the scaled form by a zero
+//!   divisor on a binding of stride 0 where the device has one (`metal::vertex::attribute_fetch`;
+//!   the NVIDIA RTX 5080 Laptop does). Each row's `float4` is compared bit for bit, but a `half`
 //!   one's where the stage rounds by the device's conversion (`native-half-conversion`, announced):
 //!   within its bound (`half_within`), counted.
 //! - `label_vertex` and `label_fragment`, a text label pipeline's shape (eight attributes, a
@@ -24,6 +26,7 @@
 //! - A 32-bit integer format read into a float attribute refuses the pipeline,
 //!   `InvalidDescriptor(VertexAttribute)`, where Metal refuses it too.
 
+use super::apart_writes::{layer_reported_nothing_but_apart_writes, NotedWrites};
 use super::degrade_notices::{counts, made_render_kinds};
 use super::{
     buffer_with, half_within, layer_reported_nothing_at_all, read_buffer, validated_device,
@@ -187,16 +190,20 @@ fn form(pipeline: &ExecutedPipeline) -> String {
 }
 
 /// The rows each draw of `pipeline` wrote, in a 1x1 pass without attachments: per vertex one
-/// draw of `ROWS` points, constant `ROWS` draws of one point bound at each record; and how the
-/// first executed pipeline fetched the attribute.
+/// draw of `ROWS` points, constant `ROWS` draws of one point bound at each record, each writing
+/// its own row of `out`, bound from there on, which the layer takes as written by each
+/// ([`layer_reported_nothing_but_apart_writes`]); and how the first executed pipeline fetched the
+/// attribute.
 fn drawn(
     queue: &CommandQueue,
+    messages: &Messages,
     pipeline: &RenderPipelineState,
     records: &metal2vulkan_runtime::Buffer,
     constant: bool,
 ) -> (Vec<[u32; 4]>, String) {
     let device = queue.device();
     let out = buffer_with(device, &[0xCD; 16 * ROWS]).unwrap();
+    let mut writes = NotedWrites::new(messages);
     let mut pass = RenderPassDescriptor::new();
     pass.render_target_width = 1;
     pass.render_target_height = 1;
@@ -215,6 +222,7 @@ fn drawn(
             encoder
                 .draw_primitives(PrimitiveType::Point, 0, 1, 1, 0)
                 .unwrap();
+            writes.drew(&out, 16 * r as u64..16 * (r as u64 + 1));
         }
     } else {
         encoder.set_vertex_buffer(Some(&out), 0, 0).unwrap();
@@ -227,6 +235,7 @@ fn drawn(
     command_buffer.commit().unwrap();
     command_buffer.wait_until_completed_for(WAIT).unwrap();
     assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
+    layer_reported_nothing_but_apart_writes(messages, "the conversion's draws", &writes);
     let executions = command_buffer.executions();
     let form = form(executions[0].pipeline());
     let rows = read_buffer(&out, 0, 16 * ROWS as u64)
@@ -243,8 +252,8 @@ fn drawn(
 }
 
 /// Every 8- and 16-bit integer format read into a `float4` and a `half4` attribute, per vertex
-/// and with the constant step, reads Metal's values; the per-vertex fetch is fixed function in
-/// the format's scaled form wherever the device fetches one, and the constant step's is pulled.
+/// and with the constant step, reads Metal's values; each fetch is pulled or fixed function in the
+/// format's scaled form, as the device fetches it.
 #[test]
 fn integer_formats_read_into_float_attributes_take_metal_s_values() {
     let cache = ScratchCache::new().unwrap();
@@ -273,15 +282,13 @@ fn integer_formats_read_into_float_attributes_take_metal_s_values() {
                     let pipeline =
                         conversion(&device, &library, function, format, 16 * i as u32, step)
                             .unwrap_or_else(|e| panic!("{function} {format:?} {step:?}: {e}"));
-                    let (rows, form) = drawn(&queue, &pipeline, &records, constant);
+                    let (rows, form) = drawn(&queue, &messages, &pipeline, &records, constant);
                     println!(
                         "INT-ATTR {}: {function} {format:?} {step:?}: {form}",
                         device.name()
                     );
-                    if constant {
-                        assert_eq!(form, "pulled", "{function} {format:?}");
-                    } else if form != "pulled" {
-                        assert_eq!(form, scaled, "{function} {format:?}");
+                    if form != "pulled" {
+                        assert_eq!(form, scaled, "{function} {format:?} {step:?}");
                         fixed += 1;
                     }
                     for (r, got) in rows.iter().enumerate() {
@@ -305,8 +312,8 @@ fn integer_formats_read_into_float_attributes_take_metal_s_values() {
             println!("INT-ATTR-DIFFERS {}: {line}", device.name());
         }
         println!(
-            "INT-ATTR {}: {} rows checked, {} differ, {native} half rows the device's rounding; per \
-             vertex fixed function in {fixed} of 32 pipelines",
+            "INT-ATTR {}: {} rows checked, {} differ, {native} half rows the device's rounding; \
+             fixed function in {fixed} of 64 pipelines",
             device.name(),
             FORMATS.len() * 2 * 2 * ROWS,
             wrong.len()

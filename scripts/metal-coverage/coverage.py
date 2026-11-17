@@ -26,7 +26,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 TABLE = HERE / "coverage.tsv"
 DOC = ROOT / "docs" / "METAL-COVERAGE.md"
-SDK = "macOS 27.0 SDK (Xcode 27.0, 27A266a)"
+SDK = "macOS 27.2 SDK (Xcode 27.2, 27B52)"
 
 STATUS = OrderedDict([("I", "implemented"), ("M", "missing"), ("O", "out of scope")])
 SIZES = ["S", "M", "L", "XL"]
@@ -37,8 +37,8 @@ SIZES = ["S", "M", "L", "XL"]
 # REFUSALS.md.
 ORDER = [
     "labels", "cmdbuf", "queue", "passdesc", "library", "queries", "barriers", "reflection",
-    "function-handles", "functions", "archive", "events", "visibility", "mesh-descriptor", "sparse",
-    "parallel", "icb-depth-stencil", "lod-bias", "depthbounds", "min-lod", "specialization",
+    "function-handles", "functions", "archive", "events", "mesh-descriptor", "sparse",
+    "parallel", "icb-depth-stencil", "depthbounds", "min-lod", "specialization",
     "sparsebuf", "counters", "residency", "colormap", "viewpool", "logging", "notifications",
     "compression", "capture", "persistent", "shadervalidation", "stitching", "io", "tensor",
     "mtl4", "ml", "access-counters",
@@ -57,12 +57,10 @@ GROUP_NAMES = {
     "functions": "a specialized function's name",
     "archive": "more binary archive entries",
     "events": "the shared event listener",
-    "visibility": "accumulated visibility results",
     "mesh-descriptor": "mesh pipeline descriptor fields",
     "sparse": "placement sparse page sizes",
     "parallel": "parallel render encoding",
     "icb-depth-stencil": "depth/stencil states in argument buffers",
-    "lod-bias": "a sampler's LOD bias",
     "depthbounds": "depth bounds",
     "min-lod": "a texture's minimum LOD (macOS 27)",
     "specialization": "pipeline specialization (macOS 26)",

@@ -5,10 +5,15 @@
 //! queries: the first, copied to the result's offset as every query is, and its continuations,
 //! one per later instance, each copied to a word of a scratch buffer of the consumer's
 //! (`vkCmdCopyQueryPoolResults`). One dispatch of [`visibility_combine_module`] then combines each
-//! result's continuation words into its word. A `Boolean` result ORs them, before its
-//! [`VisibilityResolve`] makes it Metal's 1 or 0: an imprecise query's count is any nonzero value
-//! when a sample passed, and a sum of such counts could wrap to zero. A `Counting` result, of
-//! precise queries, sums them: the samples that passed in every instance.
+//! result's continuation words into its word. A `Boolean` result ORs them: an imprecise query's
+//! count is any nonzero value when a sample passed, and a sum of such counts could wrap to zero, so
+//! the OR is zero exactly where no instance passed a sample. A `Counting` result, of precise
+//! queries, sums them: the samples that passed in every instance. A result that accumulates
+//! (`MTLVisibilityResultTypeAccumulate`) is combined the same way, every one of its queries a
+//! source word and the word as the buffer holds it the start; a `Counting` one is summed into the
+//! word's low 32 bits alone, wrapping there, its high 32 bits kept, as an Apple M3 Max writes it
+//! (macOS 27.0.1: 0xffff_fff8 and 16 samples write 8, 0xffff_ffff_ffff_fff8 and 16 write
+//! 0xffff_ffff_0000_0008).
 //!
 //! **The module** (one per device). One `GLCompute` entry `main` with local size
 //! ([`VisibilityCombineModule::LOCAL_SIZE`], 1, 1), no push constants, and three storage buffers in
@@ -22,20 +27,21 @@
 //!
 //! Invocation `i` below the table's entries takes entry `i`, four words: the index of a result's
 //! 64-bit word inside the bound visibility range, the index of its first continuation word among
-//! the sources, its continuation count, and 1 to sum them (0 to OR them). It combines that many
-//! consecutive source words into the result's word: ORed half by half, or added as 64-bit
-//! integers, wrapping. A word past its bound range is skipped, and the loop stops at the sources'
+//! the sources, its continuation count, and how it combines them: 0 to OR them, 1 to sum them, 2 to
+//! sum them into the low half. It combines that many consecutive source words into the result's
+//! word: ORed half by half, added as 64-bit integers, wrapping, or their low halves added to the
+//! word's low half, wrapping at 32 bits, its high half kept. A word past its bound range is
+//! skipped, and the loop stops at the sources'
 //! end, so a wrongly bound range can never make the combine fault or run past its words. Each
 //! result is one entry, so no two invocations write one word.
 //!
 //! **Synchronization** (consumer): the result and continuation copies' `TRANSFER_WRITE` →
 //! `SHADER_STORAGE_READ` and `SHADER_STORAGE_WRITE` in `COMPUTE_SHADER` before the combine, and
-//! the upload's host write before the submission; then the combine's writes →
-//! `SHADER_STORAGE_READ` and `SHADER_STORAGE_WRITE` before the resolve.
+//! the upload's host write before the submission; the combine's writes are then ordered before the
+//! buffer's later uses as any compute write is.
 
 use std::sync::Arc;
 
-use super::visibility_resolve::{u32_value, windows, words_buffer, VisibilityResolve};
 use crate::bind::instantiate::BufferRange;
 use crate::budget::{Budget, Meter};
 use crate::device::requirements::Requirements;
@@ -45,8 +51,14 @@ use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage, Symbol};
 use crate::spirv::builder::constructs::{ArmEnd, ArmFn, LoopFn, LoopSpec};
 use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
 use crate::spirv::error::BResult;
-use crate::spirv::ids::Value;
-use crate::spirv::ir::{BinOp, ExecMode, ExecModel, IoDir, MemAccess, Type, TypedModule};
+use crate::spirv::ids::{GlobalId, TypeId, Value};
+use crate::spirv::ir::{
+    natural_layout, BinOp, ExecMode, ExecModel, IoDir, LayoutRule, MemAccess, StorageClass, Type,
+    TypedModule,
+};
+
+/// Bytes of one result in the visibility buffer, and of one continuation word.
+const RESULT_BYTES: u64 = 8;
 
 /// One dispatch of [`visibility_combine_module`]: it combines, in place, the continuation words
 /// of the results whose words lie in `dest_range` of the visibility buffer.
@@ -61,7 +73,8 @@ pub struct VisibilityCombine {
     /// The table to upload (little-endian `u32`s) and bind, exactly, at
     /// [`VisibilityCombineModule::TABLE_BINDING`]: per result, ascending by offset, the index of
     /// its 64-bit word inside `dest_range`, the index of its first 64-bit continuation word among
-    /// the sources, its continuation count, and 1 where they are summed (0 where ORed).
+    /// the sources, its continuation count, and 1 where they are summed, 2 where they are summed
+    /// into the word's low half ([`ContinuedResult::low_half`]), 0 where ORed.
     pub table: Vec<u32>,
     /// Workgroups to dispatch along x, each of [`VisibilityCombineModule::LOCAL_SIZE`]
     /// invocations.
@@ -81,6 +94,10 @@ pub struct ContinuedResult {
     /// Whether they are summed (a `Counting` result, of precise queries) rather than ORed (a
     /// `Boolean` one).
     pub sum: bool,
+    /// Whether a sum is taken into the word's low 32 bits alone, wrapping there, its high 32
+    /// bits kept: a `Counting` result that accumulates, as an Apple M3 Max writes it (the module
+    /// docs).
+    pub low_half: bool,
 }
 
 impl ContinuedResult {
@@ -92,6 +109,26 @@ impl ContinuedResult {
             first,
             count,
             sum,
+            low_half: false,
+        }
+    }
+
+    /// The same result, a sum of which is taken into its word's low half alone
+    /// ([`ContinuedResult::low_half`]).
+    #[must_use]
+    pub fn in_low_half(self) -> ContinuedResult {
+        ContinuedResult {
+            low_half: true,
+            ..self
+        }
+    }
+
+    /// How the table states its combine: 0 to OR, 1 to sum, 2 to sum into the low half.
+    fn how(&self) -> u32 {
+        match (self.sum, self.low_half) {
+            (false, _) => 0,
+            (true, false) => 1,
+            (true, true) => 2,
         }
     }
 }
@@ -103,10 +140,13 @@ impl VisibilityCombine {
     /// The dispatches that combine `results` (distinct offsets, any order), each binding the
     /// visibility buffer at an offset aligned to `alignment` (`minStorageBufferOffsetAlignment`)
     /// over at most `max_range` bytes (`maxStorageBufferRange`) and dispatching at most
-    /// `max_groups` workgroups (`maxComputeWorkGroupCount[0]`), as [`VisibilityResolve::plan`]
-    /// does. No dispatch when `results` is empty. `None` where [`VisibilityResolve::plan`] is,
-    /// when two results share an offset, or when a result's continuation words run past
-    /// `max_range` bytes of sources, which the consumer binds from their first word.
+    /// `max_groups` workgroups (`maxComputeWorkGroupCount[0]`). Results too far apart for one
+    /// binding, or too many for one dispatch, take more dispatches. No dispatch when `results` is
+    /// empty. `None` when an offset is not a multiple of 8 (Metal requires it of a visibility
+    /// offset), its word overflows, or one word does not fit `max_range` past its aligned offset,
+    /// or `max_groups` is 0; when two results share an offset; or when a result's continuation
+    /// words run past `max_range` bytes of sources, which the consumer binds from their first
+    /// word.
     pub fn plan(
         results: &[ContinuedResult],
         alignment: u64,
@@ -118,7 +158,7 @@ impl VisibilityCombine {
         if sorted.windows(2).any(|w| w[0].offset == w[1].offset) {
             return None;
         }
-        let source_words = u64::from(max_range) / VisibilityResolve::RESULT_BYTES;
+        let source_words = u64::from(max_range) / RESULT_BYTES;
         if sorted
             .iter()
             .any(|r| u64::from(r.first) + u64::from(r.count) > source_words)
@@ -129,13 +169,13 @@ impl VisibilityCombine {
             u64::from(max_groups).checked_mul(u64::from(VisibilityCombineModule::LOCAL_SIZE))?;
         let items = sorted
             .into_iter()
-            .map(|r| (r.offset, [r.first, r.count, u32::from(r.sum)]));
+            .map(|r| (r.offset, [r.first, r.count, r.how()]));
         windows(items, alignment, max_range, max_entries)?
             .into_iter()
             .map(|(dest_range, entries)| {
                 let table: Vec<u32> = entries
                     .iter()
-                    .flat_map(|&(index, [first, count, sum])| [index, first, count, sum])
+                    .flat_map(|&(index, [first, count, how])| [index, first, count, how])
                     .collect();
                 let groups =
                     (entries.len() as u64).div_ceil(u64::from(VisibilityCombineModule::LOCAL_SIZE));
@@ -152,6 +192,71 @@ impl VisibilityCombine {
     pub fn table_bytes(&self) -> Vec<u8> {
         self.table.iter().flat_map(|t| t.to_le_bytes()).collect()
     }
+}
+
+/// The windows of the visibility buffer that bind `items`, each at Metal's offset of its result
+/// (ascending, each once): each window binds from an offset aligned down to `alignment` (at
+/// least 8) over at most `max_range` bytes, and takes at most `max_items` items, each with the
+/// index of its 64-bit word inside the window. A dispatch per window. `None` when an offset is not
+/// a multiple of 8, its word overflows, or one word does not fit `max_range` past its aligned
+/// offset, or `max_items` is 0 (with an item).
+fn windows<T>(
+    items: impl IntoIterator<Item = (u64, T)>,
+    alignment: u64,
+    max_range: u32,
+    max_items: u64,
+) -> Option<Vec<(BufferRange, Vec<(u32, T)>)>> {
+    let a = alignment.max(RESULT_BYTES);
+    let mut out: Vec<(BufferRange, Vec<(u32, T)>)> = Vec::new();
+    for (offset, item) in items {
+        if !offset.is_multiple_of(RESULT_BYTES) {
+            return None;
+        }
+        let end = offset.checked_add(RESULT_BYTES)?;
+        let joins = out.last().is_some_and(|(range, taken)| {
+            end - range.offset <= u64::from(max_range) && (taken.len() as u64) < max_items
+        });
+        if !joins {
+            let start = offset - offset % a;
+            if end - start > u64::from(max_range) || max_items == 0 {
+                return None;
+            }
+            let range = BufferRange {
+                offset: start,
+                range: 0,
+            };
+            out.push((range, Vec::new()));
+        }
+        let (range, taken) = out.last_mut()?;
+        // Inside `max_range` (a `u32`) of the range's start: the index fits.
+        let index = u32::try_from((offset - range.offset) / RESULT_BYTES).ok()?;
+        taken.push((index, item));
+        range.range = end - range.offset;
+    }
+    Some(out)
+}
+
+/// A `Block { u32 words[]; }` storage buffer bound at `sym`.
+pub(super) fn words_buffer(
+    b: &mut ModuleBuilder,
+    sym: ResourceSlot,
+    u32_: TypeId,
+) -> BResult<GlobalId> {
+    let rta = b.ty(Type::RuntimeArray {
+        elem: u32_,
+        stride: Some(4),
+    })?;
+    let layout = natural_layout(b.types(), LayoutRule::Std430, true, &[rta])?;
+    let block = b.ty(Type::Struct {
+        members: [rta].into(),
+        layout: Some(layout),
+    })?;
+    b.resource(sym, StorageClass::StorageBuffer, block)
+}
+
+fn u32_value(f: &mut FunctionBuilder<'_>, v: u32) -> BResult<Value> {
+    let c = f.u32_const(v)?;
+    f.module().const_value(c)
 }
 
 /// The crate-owned continuation combine module of one device, validated like any output.
@@ -251,8 +356,9 @@ pub fn typed_module() -> BResult<TypedModule> {
         let target = entry(f, zero)?;
         let first = entry(f, one)?;
         let count = entry(f, two)?;
-        let sum = entry(f, three)?;
-        let sum = f.binary(BinOp::INotEqual, sum, zero)?;
+        let how = entry(f, three)?;
+        let sum = f.binary(BinOp::INotEqual, how, zero)?;
+        let low_half = f.binary(BinOp::IEqual, how, two)?;
         let low_index = f.binary(BinOp::ShiftLeftLogical, target, one)?;
         let high_index = f.binary(BinOp::IAdd, low_index, one)?;
         let inside = f.binary(BinOp::ULessThan, high_index, dest_len)?;
@@ -289,7 +395,8 @@ pub fn typed_module() -> BResult<TypedModule> {
                 let high = f.load(high_ptr, MemAccess::default())?;
                 let low_so_far = f.load(low_acc, MemAccess::default())?;
                 let high_so_far = f.load(high_acc, MemAccess::default())?;
-                // ORed half by half, or added with the low half's carry into the high half.
+                // ORed half by half, added with the low half's carry into the high half, or the low
+                // halves added, the high half kept.
                 let low_or = f.binary(BinOp::BitwiseOr, low_so_far, low)?;
                 let high_or = f.binary(BinOp::BitwiseOr, high_so_far, high)?;
                 let low_sum = f.binary(BinOp::IAdd, low_so_far, low)?;
@@ -297,6 +404,7 @@ pub fn typed_module() -> BResult<TypedModule> {
                 let carry = f.select(carried, one, zero)?;
                 let high_sum = f.binary(BinOp::IAdd, high_so_far, high)?;
                 let high_sum = f.binary(BinOp::IAdd, high_sum, carry)?;
+                let high_sum = f.select(low_half, high_so_far, high_sum)?;
                 let low_next = f.select(sum, low_sum, low_or)?;
                 let high_next = f.select(sum, high_sum, high_or)?;
                 f.store(low_acc, low_next, MemAccess::default())?;

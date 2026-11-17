@@ -9,7 +9,8 @@
 //! remap counts the live imports it touches (`host_remaps_over_imports`, `host_imports_remapped`).
 //! A rebind's import counts as made, as covered where bytes a buffer lay over already held its
 //! pages (`host_rebind_imports_made`, `host_rebind_imports_covered`), and as unlisted until a
-//! command buffer that uses it commits (`host_imports_rebound_unlisted`).
+//! command buffer that uses it commits (`host_imports_rebound_unlisted`); a rebind onto bytes a
+//! rebound buffer's import is noted over lies in that import, making none.
 //!
 //! A test that makes a texture over a buffer's host pages first settles the device's check of the
 //! first move in place (`in_place_check.rs`), where its policy takes such textures in place
@@ -31,9 +32,12 @@ use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-/// [`device`], its check of the first move in place settled where it runs one, and the imports
-/// the check read apart gone before the test reads a gauge (the module docs): a device made just
-/// now reads none apart of its own.
+/// [`device`], its check of the first move in place settled where it runs one, and the check's
+/// imports gone before the test reads a gauge (the module docs): a device made just now holds no
+/// import of its own and reads none apart. The check's buffers go before it settles, each
+/// import's read apart counted off as it goes, but the free of one that a keep-alive alone waits
+/// for goes to a handler thread (`host_import_releases_pending`), where `host_imports_live` falls
+/// later.
 fn settled_device(cache: &std::path::Path) -> Device {
     let device = device(cache);
     let settled = device.settle_in_place_checks(std::time::Duration::from_secs(120));
@@ -42,7 +46,9 @@ fn settled_device(cache: &std::path::Path) -> Device {
         device.work_counts().in_place_checks_run
     );
     until("the in-place check's imports went", || {
-        device.work_counts().host_imports_read_apart == 0
+        let counts = device.work_counts();
+        (counts.host_imports_read_apart, counts.host_imports_live) == (0, 0)
+            && counts.host_import_releases_pending == 0
     });
     device
 }
@@ -92,20 +98,20 @@ fn a_command_buffer_counts_each_import_it_uses_once_and_blits_never_read_apart()
     });
     assert_eq!(counts(&device), (used + 3, apart, live));
 
-    // A buffer over exactly `a`'s bytes lies in its import, which a second buffer reads apart; a
-    // command buffer using both counts the import once.
+    // A buffer over exactly `a`'s bytes lies in its import, reading none apart: it reads the
+    // import as `a` does. A command buffer using both counts the import once.
     let d = over_host(&device, &first, &runs).unwrap();
-    assert_eq!(counts(&device), (used + 3, apart + 1, live));
+    assert_eq!(counts(&device), (used + 3, apart, live));
     blits(&queue, |blit| {
         blit.fill_buffer(&a, 0..4096, 2).unwrap();
         blit.fill_buffer(&d, 4096..8192, 3).unwrap();
     });
-    assert_eq!(counts(&device), (used + 4, apart + 1, live));
+    assert_eq!(counts(&device), (used + 4, apart, live));
 
     // Its Metal address handed out reads `b`'s import apart, once however often.
     let _ = b.gpu_address();
     let _ = b.gpu_address();
-    assert_eq!(counts(&device), (used + 4, apart + 2, live));
+    assert_eq!(counts(&device), (used + 4, apart + 1, live));
 
     // The imports that go leave the gauge.
     drop((a, b, c, d));
@@ -115,15 +121,48 @@ fn a_command_buffer_counts_each_import_it_uses_once_and_blits_never_read_apart()
     });
 }
 
+/// A commit's count of the imports its buffers lie in, past the few it tells apart in place
+/// (`Buffer::distinct_host_imports`) as within them: each import once, however many buffers lie in
+/// it and in whatever order they come.
+#[test]
+fn a_commit_counts_each_import_once_past_the_few_it_tells_apart_in_place() {
+    let scratch = Scratch::new("import-counts-many");
+    let hosts: Vec<Host> = (0..18).map(|_| Host::new()).collect();
+    let device = device(&scratch.0);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let Some(first) = over_host(&device, &hosts[0], &runs) else {
+        return;
+    };
+    let mut buffers = vec![first];
+    buffers.extend((hosts[1..].iter()).map(|host| over_host(&device, host, &runs).unwrap()));
+    // A second buffer over exactly the first's bytes lies in its import.
+    let again = over_host(&device, &hosts[0], &runs).unwrap();
+    for imports in [1, 15, 16, 17, 18] {
+        let mut used: Vec<Buffer> = buffers[..imports].to_vec();
+        used.push(again.clone());
+        used.extend(buffers[..imports].iter().rev().cloned());
+        assert_eq!(
+            Buffer::distinct_host_imports(&used),
+            imports as u64,
+            "{imports} imports, each of {} buffers lying in one",
+            used.len()
+        );
+    }
+}
+
 /// The reason gauges: the Metal address, the `VkBuffer`, a binding, a texture over the bytes, a
-/// second buffer, no releasing thread.
-fn reasons(counts: &WorkCounts) -> [u64; 6] {
+/// buffer bound inside, a buffer sharing the range, a heap's bytes, a rebound buffer, no
+/// releasing thread.
+fn reasons(counts: &WorkCounts) -> [u64; 9] {
     [
         counts.host_imports_read_apart_address,
         counts.host_imports_read_apart_vk_buffer,
         counts.host_imports_read_apart_binding,
         counts.host_imports_read_apart_texture,
-        counts.host_imports_read_apart_second_buffer,
+        counts.host_imports_read_apart_inside,
+        counts.host_imports_read_apart_shared_range,
+        counts.host_imports_read_apart_heap,
+        counts.host_imports_read_apart_rebound,
         counts.host_imports_read_apart_unreleased,
     ]
 }
@@ -139,7 +178,7 @@ fn kept_or_resident(counts: &WorkCounts) -> u64 {
 }
 
 /// `base` with `by` added at `reason`.
-fn plus(base: [u64; 6], reason: usize, by: u64) -> [u64; 6] {
+fn plus(base: [u64; 9], reason: usize, by: u64) -> [u64; 9] {
     let mut out = base;
     out[reason] += by;
     out
@@ -179,15 +218,14 @@ fn each_read_apart_counts_for_its_reason_once_and_each_import_for_its_keeping() 
         .unwrap();
     let now = plus(now, 3, 1);
     assert_eq!(reasons(&device.work_counts()), now);
-    // A second buffer over `d`'s bytes lies in its import.
+    // A second buffer over `d`'s bytes lies in its import, reading none apart.
     let e = over_host(&device, &hosts[3], &runs).unwrap();
-    let now = plus(now, 4, 1);
     assert_eq!(reasons(&device.work_counts()), now);
-    // Four imports read apart, each once whatever its reasons; `a`'s again for a second reason.
+    // Three imports read apart, each once whatever its reasons; `a`'s again for a second reason.
     let _ = unsafe { a.vk_buffer() };
     let counts = device.work_counts();
     assert_eq!(reasons(&counts), plus(now, 1, 1));
-    assert_eq!(counts.host_imports_read_apart, apart + 4);
+    assert_eq!(counts.host_imports_read_apart, apart + 3);
 
     // The imports that go leave every gauge.
     drop((texture, a, b, c, d, e));
@@ -358,7 +396,7 @@ fn added(base: [u64; 3], by: [u64; 3]) -> [u64; 3] {
 }
 
 #[test]
-fn a_rebind_s_import_is_unlisted_until_a_command_buffer_uses_it_and_covered_over_bytes_lain_over() {
+fn a_rebind_s_import_is_unlisted_until_a_command_buffer_uses_it_and_shared_over_bytes_it_holds() {
     let scratch = Scratch::new("import-rebinds");
     let hosts = [Host::new(), Host::new(), Host::new()];
     let device = device(&scratch.0);
@@ -373,19 +411,19 @@ fn a_rebind_s_import_is_unlisted_until_a_command_buffer_uses_it_and_covered_over
     // SAFETY: the pages outlive the device, and only the buffers' commands use them.
     unsafe { first.rebind_bytes_no_copy(hosts[2].memory(), None, None) }.unwrap();
     assert_eq!(rebinds(&device), added(before, [1, 0, 1]));
-    // A second buffer rebound onto the same bytes imports them again (only bytes a live buffer
-    // was made over are shared, `host_aliases.rs`): the first one's import covers them.
+    // A second buffer rebound onto the same bytes lies in the first one's import, noted over
+    // them (one page, one import, `host_aliases.rs`): no import is made.
     // SAFETY: as above.
     unsafe { second.rebind_bytes_no_copy(hosts[2].memory(), None, None) }.unwrap();
-    assert_eq!(rebinds(&device), added(before, [2, 1, 2]));
+    assert_eq!(rebinds(&device), added(before, [1, 0, 1]));
     // A command buffer using the first lists its import from its commit on.
     blits(&queue, |blit| blit.fill_buffer(&first, 0..4096, 1).unwrap());
-    assert_eq!(rebinds(&device), added(before, [2, 1, 1]));
-    // Rebound again onto the bytes it lies over: covered by its own import, the new one
-    // unlisted, the old one listed no more but counted as listed.
+    assert_eq!(rebinds(&device), added(before, [1, 0, 0]));
+    // Rebound again onto the bytes it lies over: it lies in the import the second still lies
+    // in, no import made.
     // SAFETY: as above.
     unsafe { first.rebind_bytes_no_copy(hosts[2].memory(), None, None) }.unwrap();
-    assert_eq!(rebinds(&device), added(before, [3, 2, 2]));
+    assert_eq!(rebinds(&device), added(before, [1, 0, 0]));
     // The imports that go leave the gauge.
     drop((first, second));
     until("the rebinds' imports went", || {

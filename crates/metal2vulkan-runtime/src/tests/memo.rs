@@ -3,15 +3,15 @@
 //! stays within its capacity while pipelines come and go. Boundedness checks, not timings: every
 //! step is deterministic.
 
-use crate::pipeline::memo::{Lru, PipelineMemo, Remembered, MEMO_ENTRIES};
+use crate::device::lock;
+use crate::pipeline::memo::{Lru, PipelineMemo, Remembered, Watch, MEMO_ENTRIES};
 use metal2vulkan::cache::{PipelineArtifact, VariantKey};
 use metal2vulkan::device::{Device, DeviceDescription, DevicePolicy};
 use metal2vulkan::library::{CompiledFunction, Library};
 use metal2vulkan::pipeline::{ComputePipelineDescriptor, FunctionDescriptor, Stage, StageSource};
 use metal2vulkan::Budget;
 use std::collections::HashSet;
-use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// A fixed sequence of pseudo-random numbers (xorshift).
 struct Sequence(u64);
@@ -75,6 +75,86 @@ fn the_least_recently_used_goes_first() {
     lru.insert(5, (), 5);
     assert_eq!(lru.footprint(), (9, 3));
     assert!(lru.get(&2).is_none() && lru.get(&3).is_some() && lru.get(&5).is_some());
+}
+
+/// What a watched map told its watch, in order.
+type Told = Arc<Mutex<Vec<(&'static str, u32)>>>;
+
+/// A watch that writes down what it is told.
+struct Log(Told);
+
+impl Watch<u32, ()> for Log {
+    fn kept(&self, key: &u32) {
+        lock(&self.0).push(("kept", *key));
+    }
+
+    fn used(&self, key: &u32) {
+        lock(&self.0).push(("used", *key));
+    }
+
+    fn evicted(&self, key: &u32, _: &()) {
+        lock(&self.0).push(("evicted", *key));
+    }
+
+    fn removed(&self, key: &u32) {
+        lock(&self.0).push(("removed", *key));
+    }
+}
+
+/// A watched map tells its watch of each key as it is kept (a replacement included), used,
+/// removed past its bounds, least recently used first, and removed by its key, a value heavier
+/// than the bound replacing it included; and of nothing else: not a removal of a key it does not
+/// hold.
+#[test]
+fn a_watched_map_tells_each_keep_use_eviction_and_removal() {
+    let told: Told = Arc::default();
+    let mut lru: Lru<u32, ()> = Lru::new(10, 3).watched(Box::new(Log(Arc::clone(&told))));
+    let heard = || {
+        let mut told = lock(&told);
+        let heard = told.clone();
+        told.clear();
+        heard
+    };
+    for key in 0..3 {
+        lru.insert(key, (), 1);
+    }
+    lru.insert(1, (), 1);
+    assert!(lru.get(&0).is_some());
+    lru.remove(&2);
+    lru.remove(&2);
+    assert_eq!(
+        heard(),
+        [
+            ("kept", 0),
+            ("kept", 1),
+            ("kept", 2),
+            ("kept", 1),
+            ("used", 0),
+            ("removed", 2)
+        ],
+        "within the bounds: keeps, a replacement, a use and one removal"
+    );
+    lru.insert(3, (), 1);
+    lru.insert(4, (), 1);
+    assert_eq!(
+        heard(),
+        [("kept", 3), ("kept", 4), ("evicted", 1)],
+        "past the entries' bound: the least recently used"
+    );
+    lru.insert(5, (), 9);
+    assert_eq!(
+        heard(),
+        [("kept", 5), ("evicted", 0), ("evicted", 3)],
+        "past the weight's bound: the two least recently used in one insert"
+    );
+    assert_eq!(lru.footprint(), (10, 2));
+    lru.insert(4, (), 11);
+    assert_eq!(
+        heard(),
+        [("removed", 4)],
+        "a value heavier than the bound is not kept, and the key's entry goes"
+    );
+    assert_eq!(lru.footprint(), (9, 1));
 }
 
 #[test]
@@ -171,12 +251,12 @@ fn using_the_latest_entry_again_keeps_the_order() {
 /// The owned `ob3_texture_array` kernel, from its committed AIR, compiled for the committed
 /// MoltenVK profile, and that device.
 fn texture_array() -> (Device, CompiledFunction) {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let air = root.join("../metal2vulkan-validation/fixtures/public/engine/ob3_texture_array.air");
+    let air = metal2vulkan_devtools::engine_dir().join("ob3_texture_array.air");
     let bitcode = std::fs::read(air).expect("the committed AIR");
-    let text =
-        std::fs::read_to_string(root.join("../metal2vulkan-validation/profiles/moltenvk-m3.json"))
-            .expect("profile");
+    let text = std::fs::read_to_string(
+        metal2vulkan_devtools::validation_dir().join("profiles/moltenvk-m3.json"),
+    )
+    .expect("profile");
     let description = DeviceDescription::from_khronos_json(&text, None).expect("description");
     let device = Device::new(description, DevicePolicy::default()).expect("device");
     let function = Library::from_air(&bitcode)

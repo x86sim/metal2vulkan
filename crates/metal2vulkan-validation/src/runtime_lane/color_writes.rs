@@ -26,7 +26,10 @@
 //!   as a unorm channel of its bits, a tie (a 1-bit channel's 0.5) to even.
 //!
 //! A `half` output (probe 5, an M4) converts as its value does, and a half-float channel stores it
-//! as it is, a NaN's payload included; the half-output cases draw every `half`.
+//! as it is, a NaN's payload included; the half-output cases draw every `half`. Its NaN reaches the
+//! attachment through the device's widening, whose NaN is the device's, so its fragment stage
+//! records `DeviceNanEncoding` on every device (the RTX 5080 Laptop GPU stores every one as
+//! `0x7fff`).
 //!
 //! A packed format the device samples but does not render (the RTX 5080's `A1BGR5Unorm` and
 //! `ABGR4Unorm`) draws through the view of its word, the word the fragment function encodes
@@ -41,7 +44,7 @@
 //! quiets or canonicalizes a `half` NaN; RADV and NVIDIA keep a small float NaN's payload). Such
 //! channels are counted and printed apart, with the codes stored; where the fragment stage does
 //! not record the note (the driver is measured to store Metal's NaN,
-//! `DriverDeviation::MetalFloatColorNans` and `MetalHalfColorNans`), and for every other channel, a
+//! `DriverDeviation::MetalFloatColorNans`), and for every other channel, a
 //! NaN's class included, the lane is exact. The fragment function writes the output as computed and the device converts it: where the
 //! device is measured to convert the kind of channel as Metal does (MoltenVK on Apple's GPUs,
 //! `DriverDeviation::MetalColorWrites`; `MetalSmallFloatColorWrites`, a `float` output to a
@@ -49,7 +52,12 @@
 //! snorm channel) the lane holds the device's conversion to Metal's, the measurement of the
 //! deviation on that device; elsewhere the fragment stage records the device's conversion
 //! (`PrecisionNote::DeviceColorConversion`), and the lane prints the channels that differ from
-//! Metal's without holding them. A word the fragment function encodes is held to Metal's rule.
+//! Metal's without holding them. A packed 16-bit word the fragment function encodes is held to
+//! Metal's rule; an 8-bit sRGB word's codes are the device's encode (the MSL transfer through its
+//! `Pow`, `PrecisionNote::DevicePackConversion`: `metal::format::WordAttachment`), where Metal
+//! encodes through its twelve-bit table, so they are printed against Metal's and not held (the
+//! RTX 5080, which renders neither `R8_SRGB` nor `R8G8_SRGB`, stored 3,170 of the lane's 53,907
+//! `R8Unorm_sRGB` channels otherwise than Metal, each printed example a code apart).
 
 use super::degrade_notices::counts;
 use super::resolves::{lane, quiet, Lane};
@@ -716,7 +724,8 @@ struct Drawn {
     stored: Vec<u8>,
     /// Whether the fragment stage records `PrecisionNote::DeviceNanEncoding`.
     noted: bool,
-    /// Whether the fragment stage records `PrecisionNote::DeviceColorConversion`: the device's own
+    /// Whether the fragment stage records `PrecisionNote::DeviceColorConversion`, or
+    /// `PrecisionNote::DevicePackConversion` for an 8-bit sRGB word it encodes: the device's own
     /// conversion of the attachment's channels, printed against Metal's and not held to it.
     converted: bool,
 }
@@ -778,9 +787,13 @@ fn drawn(
     let noted = fragment
         .precision_notes
         .contains(&PrecisionNote::DeviceNanEncoding);
-    let converted = fragment
-        .precision_notes
-        .contains(&PrecisionNote::DeviceColorConversion);
+    let srgb_word = matches!(
+        WordAttachment::of(case.pf, device.compile_device().profile()),
+        Some(WordAttachment::Srgb8 { .. })
+    );
+    let notes = &fragment.precision_notes;
+    let converted = notes.contains(&PrecisionNote::DeviceColorConversion)
+        || (srgb_word && notes.contains(&PrecisionNote::DevicePackConversion));
     let pipeline = device
         .new_render_pipeline_state(&pipeline, &PipelineOptions::default())
         .map_err(|e| format!("unsupported: the pipeline ({e})"))?;
@@ -827,7 +840,8 @@ fn drawn(
 }
 
 /// Every format, plain and blended, printed against Metal's conversion, and held to it where the
-/// fragment stage does not record the device's own conversion (`DeviceColorConversion`).
+/// fragment stage does not record the device's own conversion (`DeviceColorConversion`, or
+/// `DevicePackConversion` for an 8-bit sRGB word: the module docs).
 #[test]
 fn draws_store_metals_codes() {
     let (messages, _cache, lane) = lane();
@@ -934,8 +948,9 @@ fn draws_store_metals_codes() {
 /// A packed 16-bit or two-channel 8-bit sRGB format's draw under a write mask of some of its
 /// channels, over a pass that clears it: each written channel stores Metal's code of the output
 /// and each kept one the code of the clear (Metal's rule of both), held so where the fragment
-/// stage does not record the device's own conversion (`DeviceColorConversion`). A format the device holds but
-/// does not render must draw so through the view of its word (`metal::format::WordAttachment`),
+/// stage does not record the device's own conversion (`DeviceColorConversion`, or
+/// `DevicePackConversion` for an 8-bit sRGB word's encode). A format the device holds but does
+/// not render must draw so through the view of its word (`metal::format::WordAttachment`),
 /// which the fragment function merges into the texel's, in the pixel interlock or over the
 /// attachment's input attachment on a device that orders fetch through them (lavapipe; an 8-bit
 /// sRGB word), and says so.

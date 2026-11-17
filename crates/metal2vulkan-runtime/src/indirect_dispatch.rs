@@ -204,7 +204,7 @@ pub(super) fn copy_arguments(
     bytes: u64,
 ) -> Result<Buffer, Error> {
     let copy = buffer
-        .device()
+        .generation()
         .own_buffer(COPY_BYTES, ResourceOptions::shared())?;
     let (from, at) = buffer.at(offset);
     let (into, start) = copy.at(0);
@@ -343,7 +343,7 @@ impl ArgumentDispatch {
 /// The first `bytes` of `copy`, a copy of a dispatch's arguments, as words; zero past them.
 fn words(copy: &Buffer, bytes: u64) -> Result<[u32; 6], Error> {
     let contents = copy
-        .contents()
+        .mapped_contents()
         .ok_or_else(|| internal("an indirect dispatch's copy without host bytes"))?;
     let mut read = [0u8; 24];
     let length = bytes.min(24) as usize;
@@ -389,7 +389,7 @@ impl FlatCall<'_> {
         FlatIndirect::new(
             arguments,
             form,
-            flat_local(pipeline.max_total_threads_per_threadgroup()),
+            flat_local(pipeline.pipeline_max_total_threads_per_threadgroup()),
             pipeline.metal_max_total_threads_per_threadgroup(),
         )
     }
@@ -405,7 +405,7 @@ impl FlatCall<'_> {
             return None;
         };
         let arguments = self.buffer.device_address()?.checked_add(self.offset)?;
-        let max_threads = pipeline.max_total_threads_per_threadgroup();
+        let max_threads = pipeline.pipeline_max_total_threads_per_threadgroup();
         let threads: u64 = threads_per_group.iter().map(|&n| u64::from(n)).product();
         if threads == 0 || threads > u64::from(max_threads) {
             return None;

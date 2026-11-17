@@ -9,7 +9,9 @@
 
 use super::degrade_notices::{self as notices, counts};
 use super::host_memory::on_device;
-use super::{buffer_with, read_buffer, Messages, WAIT};
+use super::host_memory::on_device_with;
+use super::indirect_host_steps;
+use super::{at_plan, buffer_with, read_buffer, Messages, WAIT};
 use crate::air_library::AirLibrary;
 use metal2vulkan::bind::indirect_commands::COMMAND_BYTES;
 use metal2vulkan::bind::ArgumentDescriptor;
@@ -28,9 +30,10 @@ use metal2vulkan_runtime::{
     CpuCacheMode, Degradation, Device, DrawPrimitiveType, DrawProblem, EncodedComputeCommand,
     EncodedRenderCommand, Error, EventRef, GpuAddress, HazardTrackingMode, IndirectBufferBinding,
     IndirectCommand, IndirectCommandBuffer, IndirectCommandBufferDescriptor,
-    IndirectCommandBufferProblem, IndirectDispatch, IndirectDraw, Invalid, LoadAction, MetalError,
-    PipelineOptions, Problem, PurgeableState, Region, RenderPassDescriptor, RenderPipelineState,
-    ResourceId, ResourceOptions, RuntimeGap, Size, StorageMode, StoreAction, TextureDescriptor,
+    IndirectCommandBufferProblem, IndirectDispatch, IndirectDraw, IndirectRule, Invalid,
+    LoadAction, MetalError, PipelineOptions, Problem, PurgeableState, Region, RenderPassDescriptor,
+    RenderPipelineState, ResourceId, ResourceOptions, RuntimeGap, Size, StorageMode, StoreAction,
+    TextureDescriptor,
 };
 use std::ops::Range;
 
@@ -464,15 +467,21 @@ fn creation_refuses_what_metal_refuses() {
         // buffer of the device's `max_buffer_length` cannot hold are the gap naming the limit:
         // plain Metal makes such a buffer and lays out no slots in it (16 KiB at 2^31 kernel
         // buffers, whose `setKernelBuffer:atIndex:` at index 2^31 then ends the process), and the
-        // runtime lays out every slot it answers for.
+        // runtime lays out every slot it answers for. The commands are as many as put 2^32 - 1
+        // slots a command past the limit on every device, whatever its `max_buffer_length`: a
+        // slot takes 16 bytes, so `limit / (2^32 - 1) + 1` commands' slots pass it. Two commands'
+        // do not pass 2^40, an NVIDIA RTX 5080 Laptop's limit, and its memory refuses their 128
+        // GiB (`OutOfMemory`, which the runtime documents).
         let [buffers_max, lengths_max, vertex_max, fragment_max] = counts(u32::MAX);
         assert_eq!(icb(device, &lengths_max, 2).size(), 2);
+        let limit = device.properties().max_buffer_length;
+        let past = limit / u64::from(u32::MAX) + 1;
         for descriptor in [buffers_max, vertex_max, fragment_max] {
             assert_eq!(
-                refused(&descriptor, 2, shared),
+                refused(&descriptor, past, shared),
                 Error::NotImplemented(RuntimeGap::IndirectCommandBufferPastMaxBufferLength {
-                    count: 2,
-                    max_buffer_length: device.properties().max_buffer_length,
+                    count: past,
+                    max_buffer_length: limit,
                 })
             );
         }
@@ -1258,10 +1267,12 @@ fn commands_read_back_their_type_and_slots_past_the_record() {
         assert_eq!(
             (
                 after.cmd_copy_buffer - before.cmd_copy_buffer,
-                after.cmd_fill_buffer - before.cmd_fill_buffer
+                after.cmd_fill_buffer - before.cmd_fill_buffer,
+                after.cmd_dispatch - before.cmd_dispatch,
             ),
-            (0, 2),
-            "a GPU reset fills the records and the slots past them, copying nothing"
+            (0, 1, 1),
+            "a GPU reset writes the flagged records by a dispatch and fills the slots past them, \
+             copying nothing"
         );
         let fresh = [Some(0), Some(0), Some(0), None];
         assert_eq!(slots(&command(&made, 1)), fresh, "cleared by a GPU reset");
@@ -1994,7 +2005,7 @@ fn buffer_identifiers_follow_metal_s_encoders() {
     let one = |device: &Device| icb(device, &compute_descriptor(), 1);
 
     // Compute: nothing for an empty encoder or a residency alone; 32 KiB for an execution.
-    notices::on_device(|device, messages| {
+    notices::on_device_with(at_plan, |device, messages| {
         messages.take_notices();
         let (params, out) = (
             params(device),
@@ -2025,7 +2036,7 @@ fn buffer_identifiers_follow_metal_s_encoders() {
         assert_eq!(identifier_notices(messages), []);
     });
     // Blit: 256 KiB at the opening; a fill's 32 KiB as it is scheduled.
-    notices::on_device(|device, messages| {
+    notices::on_device_with(at_plan, |device, messages| {
         messages.take_notices();
         let first = one(device);
         run(device, &|command_buffer| {
@@ -2047,7 +2058,7 @@ fn buffer_identifiers_follow_metal_s_encoders() {
         assert_eq!(identifier_notices(messages), []);
     });
     // Render: 384 KiB at the opening; past the model once its command buffer is scheduled.
-    notices::on_device(|device, messages| {
+    notices::on_device_with(at_plan, |device, messages| {
         messages.take_notices();
         let mut target = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, 64, 64, false);
         target.usage = TextureUsage::RENDER_TARGET;
@@ -2073,7 +2084,7 @@ fn buffer_identifiers_follow_metal_s_encoders() {
         );
     });
     // A released buffer a command buffer executes keeps its range until that completes.
-    notices::on_device(|device, messages| {
+    notices::on_device_with(at_plan, |device, messages| {
         messages.take_notices();
         let (params, out) = (
             params(device),
@@ -2438,7 +2449,9 @@ fn render_setters_refuse_what_metal_refuses() {
         let mut encoder = command_buffer.compute_command_encoder().unwrap();
         assert_eq!(
             encoder.execute_commands_in_buffer(&made, 0..1).unwrap_err(),
-            Error::NotImplemented(RuntimeGap::IndirectRenderCommands)
+            Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                IndirectRule::OtherEncoderKind
+            ))
         );
         encoder.end_encoding().unwrap();
     });
@@ -2943,7 +2956,7 @@ fn indexed_patch_draws_read_back_what_was_set() {
 /// runtime's own consequence of the same reading, not a Metal measurement of its own).
 #[test]
 fn an_indexed_draw_on_a_buffer_of_draws_runs_nothing() {
-    on_device(|device| {
+    on_device_with(at_plan, |device| {
         let state = render_template_state(device, true);
         // The template writes `out[(iid << 4) + vid] = params[1] + iid * 1000 + params[0] *
         // (vid + 1)` per vertex, with rasterization disabled.
@@ -3169,8 +3182,7 @@ fn the_indexed_patch_setter_refuses_what_metal_refuses() {
 #[test]
 fn states_whose_functions_use_a_direct_texture_or_sampler_are_refused_as_metal_refuses_them() {
     on_device(|device| {
-        let ll = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/public/examples/icb_direct_arguments.ll");
+        let ll = metal2vulkan_devtools::fixtures_dir().join("examples/icb_direct_arguments.ll");
         let library = device
             .new_library_with_air(&llvm_assemble(&ll).unwrap())
             .unwrap();
@@ -3303,22 +3315,48 @@ fn states_whose_functions_use_a_direct_texture_or_sampler_are_refused_as_metal_r
     });
 }
 
-/// `IndirectCommandBuffer::gpu_written`: `false` for a fresh buffer, and after a read use of it,
-/// an empty copy into it, an empty reset of it and a copy out of it; `true`, at the call, before
-/// any commit, after a write use of it in a compute encoder, a copy of a command into it, and a
-/// reset of a command of it, each on a fresh buffer.
+/// `IndirectCommandBuffer::gpu_written`: `false` for a fresh buffer, after a read use of it beside
+/// a state that may encode indirect commands, after a write use of it beside no state or beside
+/// states that cannot encode (once its command buffer completed too, its commit counting the
+/// buffer it left unmarked: `WorkCounts::indirect_write_residencies_unmarked`), and after an empty
+/// copy into it, an empty reset of it and a copy out of it; `true` from the call that completes a
+/// route that may write its records, before any commit: a write use after a state that may encode
+/// was set, a state that may encode set after a write use, in its encoder or a later one of its
+/// command buffer, a copy of a command into it, and a reset of a command of it, each on a fresh
+/// buffer.
 #[test]
-fn the_gpu_written_flag_is_set_by_a_write_use_or_a_blit_into_the_buffer() {
+fn the_gpu_written_flag_is_set_by_a_write_use_beside_an_encoding_state_or_a_blit_into_it() {
     on_device(|device| {
         let queue = device.new_command_queue().unwrap();
         let fresh = || icb(device, &compute_descriptor(), 2);
-        let used = |buffer: &IndirectCommandBuffer, usage: ResourceUsage| {
+        let encoding = indirect_host_steps::state(device, "icb_replay_encode", false);
+        let plain = template_state(device, false);
+        // A use of `buffer` with `usage` in a compute encoder that sets `before` first and `after`
+        // after: the flag after the use, after `after`, and once the command buffer completed,
+        // and the buffers its commit left unmarked.
+        let used = |buffer: &IndirectCommandBuffer,
+                    usage: ResourceUsage,
+                    (before, after): (
+            Option<&ComputePipelineState>,
+            Option<&ComputePipelineState>,
+        )| {
             let command_buffer = queue.command_buffer().unwrap();
             let mut encoder = command_buffer.compute_command_encoder().unwrap();
+            if let Some(state) = before {
+                encoder.set_compute_pipeline_state(state).unwrap();
+            }
             encoder.use_resource(buffer.as_resource(), usage).unwrap();
-            let written = buffer.gpu_written();
+            let at_use = buffer.gpu_written();
+            if let Some(state) = after {
+                encoder.set_compute_pipeline_state(state).unwrap();
+            }
+            let at_state = buffer.gpu_written();
             encoder.end_encoding().unwrap();
-            written
+            let counted = device.work_counts().indirect_write_residencies_unmarked;
+            command_buffer.commit().unwrap();
+            command_buffer.wait_until_completed_for(WAIT).unwrap();
+            let unmarked = device.work_counts().indirect_write_residencies_unmarked - counted;
+            (at_use, at_state, buffer.gpu_written(), unmarked)
         };
         let blitted = |blit: &dyn Fn(&mut BlitCommandEncoder) -> Result<(), Error>,
                        buffer: &IndirectCommandBuffer| {
@@ -3329,11 +3367,21 @@ fn the_gpu_written_flag_is_set_by_a_write_use_or_a_blit_into_the_buffer() {
             encoder.end_encoding().unwrap();
             written
         };
+        let write = ResourceUsage::WRITE;
         // Nothing the GPU may write through.
         let buffer = fresh();
         let other = fresh();
         assert!(!buffer.gpu_written());
-        assert!(!used(&buffer, ResourceUsage::READ));
+        let read = used(&buffer, ResourceUsage::READ, (Some(&encoding), None));
+        assert_eq!(read, (false, false, false, 0), "a read use");
+        let alone = used(&buffer, write, (None, None));
+        assert_eq!(alone, (false, false, false, 1), "a write use alone");
+        let plainly = used(&buffer, write, (Some(&plain), Some(&plain)));
+        assert_eq!(
+            plainly,
+            (false, false, false, 1),
+            "a write use beside plain states"
+        );
         assert!(!blitted(
             &|blit| blit.copy_indirect_command_buffer(&other, 0..0, &buffer, 0),
             &buffer
@@ -3346,15 +3394,43 @@ fn the_gpu_written_flag_is_set_by_a_write_use_or_a_blit_into_the_buffer() {
             &|blit| blit.copy_indirect_command_buffer(&buffer, 0..1, &other, 0),
             &buffer
         ));
-        // Each way it is set, at the call, for good.
+        // Each way it is set, at the call that completes the route, for good.
         let buffer = fresh();
-        assert!(used(&buffer, ResourceUsage::WRITE));
-        assert!(buffer.gpu_written());
+        let after_a_state = used(&buffer, write, (Some(&encoding), None));
+        assert_eq!(
+            after_a_state,
+            (true, true, true, 0),
+            "a state, then a write use"
+        );
         let buffer = fresh();
-        assert!(used(
+        let before_a_state = used(&buffer, write, (Some(&plain), Some(&encoding)));
+        assert_eq!(
+            before_a_state,
+            (false, true, true, 0),
+            "a write use, then a state"
+        );
+        let buffer = fresh();
+        let both = used(
             &buffer,
-            ResourceUsage::READ.union(ResourceUsage::WRITE)
-        ));
+            ResourceUsage::READ.union(write),
+            (Some(&encoding), None),
+        );
+        assert_eq!(
+            both,
+            (true, true, true, 0),
+            "a state, then a read and write use"
+        );
+        let buffer = fresh();
+        let command_buffer = queue.command_buffer().unwrap();
+        let mut using = command_buffer.compute_command_encoder().unwrap();
+        using.use_resource(buffer.as_resource(), write).unwrap();
+        using.end_encoding().unwrap();
+        let mut setting = command_buffer.compute_command_encoder().unwrap();
+        assert!(!buffer.gpu_written());
+        setting.set_compute_pipeline_state(&encoding).unwrap();
+        assert!(buffer.gpu_written(), "a state set in a later encoder");
+        setting.end_encoding().unwrap();
+        drop(command_buffer);
         let buffer = fresh();
         assert!(blitted(
             &|blit| blit.copy_indirect_command_buffer(&other, 0..1, &buffer, 1),
@@ -3366,8 +3442,8 @@ fn the_gpu_written_flag_is_set_by_a_write_use_or_a_blit_into_the_buffer() {
             &buffer
         ));
         eprintln!(
-            "CBF-MARK {}: the GPU-written flag was set by a write use and blits into the buffer \
-             alone",
+            "CBF-MARK {}: the GPU-written flag was set by a write use beside a state that may \
+             encode and by blits into the buffer alone",
             device.name()
         );
     });
@@ -3386,8 +3462,7 @@ fn the_gpu_written_flag_is_set_by_a_write_use_or_a_blit_into_the_buffer() {
 #[test]
 fn states_whose_arguments_reflection_is_unmeasured_are_answered_from_their_roles() {
     on_device(|device| {
-        let ll = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/public/examples/icb_direct_arguments.ll");
+        let ll = metal2vulkan_devtools::fixtures_dir().join("examples/icb_direct_arguments.ll");
         let text = std::fs::read_to_string(&ll).unwrap();
         let mut unmeasured = text.clone();
         for (from, to) in [
@@ -3513,8 +3588,7 @@ fn linked_vertex_and_mesh_functions_are_refused_where_metal_keeps_their_texture(
     }
     use Answer::{Made, Refused, Unrasterized};
     on_device(|device| {
-        let ll = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/public/examples/icb_linked_arguments.ll");
+        let ll = metal2vulkan_devtools::fixtures_dir().join("examples/icb_linked_arguments.ll");
         let library = device
             .new_library_with_air(&llvm_assemble(&ll).unwrap())
             .unwrap();
@@ -3763,8 +3837,7 @@ fn fragment_functions_are_refused_where_metal_keeps_their_texture_and_unproven_u
     }
     use Answer::{Made, Refused, Unproven};
     on_device(|device| {
-        let ll = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/public/examples/icb_linked_arguments.ll");
+        let ll = metal2vulkan_devtools::fixtures_dir().join("examples/icb_linked_arguments.ll");
         let library = device
             .new_library_with_air(&llvm_assemble(&ll).unwrap())
             .unwrap();
@@ -4030,8 +4103,7 @@ fn fragment_functions_are_linked_with_or_without_rasterization_as_metal_links_th
     }
     use Answer::{Depth, Made, Refused, Unwritten};
     on_device(|device| {
-        let ll = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/public/examples/icb_linked_arguments.ll");
+        let ll = metal2vulkan_devtools::fixtures_dir().join("examples/icb_linked_arguments.ll");
         let library = device
             .new_library_with_air(&llvm_assemble(&ll).unwrap())
             .unwrap();
@@ -4407,6 +4479,7 @@ fn a_buffer_states_what_its_writers_may_write() {
     let points = W {
         operations: W::DRAW,
         primitive_types: 0b1,
+        kinds: W::RENDER_COMMANDS,
     };
     on_device(|device| {
         let mut descriptor = render_descriptor();
@@ -4424,6 +4497,7 @@ fn a_buffer_states_what_its_writers_may_write() {
             W {
                 operations: W::DRAW | W::PIPELINE,
                 primitive_types: 0b1000,
+                kinds: W::RENDER_COMMANDS,
             }
         );
         assert!(!template.can_encode_indirect_commands());
@@ -4465,6 +4539,7 @@ fn a_buffer_states_what_its_writers_may_write() {
                 W {
                     operations: W::DRAW | W::DRAW_INDEXED,
                     primitive_types: 0b1,
+                    kinds: W::RENDER_COMMANDS,
                 }
             );
             assert!(!buffer.may_name_encoding_states());

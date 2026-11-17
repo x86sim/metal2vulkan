@@ -41,12 +41,16 @@
 mod additions;
 mod attachment_formats;
 pub(super) mod budget;
+pub(super) mod carry;
+pub(super) mod compile_memory;
 pub(super) mod content_keyed;
 pub(super) mod creation_log;
 mod dispatch_making;
+mod dispatch_record;
 pub(super) mod flight;
 mod graphics;
 mod indirect_arguments;
+pub(super) mod interlocked_writes;
 pub(super) mod kept;
 pub(super) mod libraries;
 mod linked_fragment;
@@ -59,6 +63,7 @@ pub(super) mod pool;
 mod predicted;
 mod raster_samples;
 pub(super) mod reaper;
+pub(super) mod region_ledger;
 mod render;
 pub(super) mod shared_layouts;
 mod sources;
@@ -69,7 +74,9 @@ pub(crate) use sources::render_artifacts_encoded;
 pub(super) mod stand_in;
 mod texture_access;
 mod tile;
+mod unit_axes;
 mod unrasterized;
+mod unspecialized;
 
 pub use additions::{
     BinaryFunctionProblem, BinaryFunctionStage, RenderPipelineFunctionsDescriptor,
@@ -81,8 +88,8 @@ pub(super) use graphics::{
     color_write_masks, keyed_assembly, DepthRange, DrawKey, FixedState, GraphicsKey,
 };
 pub(super) use making::Pending;
-pub(super) use objects::ShaderModules;
 pub(super) use objects::{create_set_layout, set_needs, RawPipeline, VariantObjects};
+pub(super) use objects::{ShaderModules, WordsDigests, WORDS_DIGESTS};
 pub use options::{PipelineOption, PipelineOptions};
 /// The general form of a key (`render/residual.rs`), for `tests::general_form`.
 #[cfg(test)]
@@ -96,20 +103,22 @@ pub(super) use render::DrawPipeline;
 pub use render::RenderPipelineState;
 pub(super) use render::RenderProgram;
 pub(super) use render::RenderVariant;
-pub(super) use render::Settled;
 pub(super) use render::WeakRenderPipelineState;
 pub(super) use render::{reads_views_at_bind, residual_form};
 pub(super) use render::{GraphicsState, Kind as RenderStateKind, StateShared as RenderShared};
+pub(super) use render::{ProgramName, Settled};
 pub(super) use tile::TileState;
+pub(super) use unit_axes::Direct;
 
 use super::binary_archive;
+use super::device::carry::{CallHold, LetGo, PartsCalls};
 use super::device::{device_error, lock};
-use super::error::{internal, invalid, ArchivedPipeline, Error, Problem, RuntimeGap};
+use super::error::{internal, invalid, ArchivedPipeline, Error, IndirectRule, Problem, RuntimeGap};
 use super::families::GpuFamily;
 use super::library::Function;
 use super::values::Size;
 use super::Device;
-use crate::argument_table::AtBindViews;
+use crate::argument_table::{AtBindViews, ReadSlots};
 use crate::binary_archive::Used;
 use crate::degradation::{CompiledPipeline, Occurrence};
 use crate::released_programs::KeptProgram;
@@ -121,7 +130,7 @@ use crate::resource_ids::{
 use crate::unique_identifier::UniqueIdentifier;
 use memo::{Lru, Remembered};
 use metal2vulkan::bind::{
-    BindShape, BindingPlan, Dispatch, DispatchCommands, DispatchRegion, IndirectRef,
+    BindShape, BindState, BindingPlan, Dispatch, DispatchCommands, DispatchRegion, IndirectRef,
 };
 use metal2vulkan::cache::{SpecializationKey, VariantKey};
 use metal2vulkan::error::{Feature, Needs, RuntimeInput};
@@ -133,9 +142,24 @@ use metal2vulkan::pipeline::{
 };
 use metal2vulkan::reflection::ComputePipelineReflection;
 use sources::Sources;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+/// The `maxTotalThreadsPerThreadgroup` a compute or tile state answers. `required` is the size
+/// its descriptor requires, `None` where it requires none (Metal's all-zero size), and `compiled`
+/// is the compiled pipeline's answer on this device. Where a size is required, the answer is its
+/// threads, within `compiled`; where none is, it is `compiled`.
+pub(super) fn reported_max_total_threads(required: Option<[u32; 3]>, compiled: u32) -> u32 {
+    match required {
+        Some(required) => required
+            .iter()
+            .try_fold(1u32, |threads, &axis| threads.checked_mul(axis))
+            .unwrap_or(u32::MAX)
+            .min(compiled),
+        None => compiled,
+    }
+}
 
 /// `imageblockMemoryLengthForDimensions:` for an explicit imageblock of `cell_bytes` a cell (the
 /// compile's), none without an imageblock or at a width or height of 0. Otherwise each side rounds
@@ -193,10 +217,36 @@ pub(super) fn specialization_values(
 
 /// The most plans a variant keeps.
 const PLANS: usize = 64;
-/// The most `VkPipeline`s a variant keeps.
+/// The most `VkPipeline`s a render variant keeps, and a tile function's variant of its regions.
 const PIPELINES: usize = 32;
+/// The most region `VkPipeline`s a kernel's variant keeps, the least recently used going first
+/// (`WorkCounts::region_pipelines_evicted` counts those let go), within the device's bound across
+/// every variant (`region_ledger::DEVICE_REGION_PIPELINES`).
+///
+/// A region's local size and `MultiRegion` are specializations, so a kernel takes a `VkPipeline`
+/// per threadgroup width its program's calls ask for, and with `dispatchThreads`, where the
+/// kernel observes its partition (no flat variant runs it, `compute::flat_direct`), one per
+/// remainder that is an edge region and one more per width whose interior has an edge. Measured
+/// on a guest's run on an RX 7900 XTX: one kernel dispatched as `dispatchThreads(n, min(n, 64))`
+/// took 128 keys of one variant (each width from 1 to 64 alone, and the interior of 64 with each
+/// edge from 1 to 63), and with the 32 a variant kept before, each was made again about 6,300 times
+/// in 146 s, every such dispatch's command buffer waiting for a making on the pool. 256 holds that
+/// working set twice over (`tests/region_widths.rs` makes each of the 128 once).
+///
+/// What the bound costs where it is full, measured by `tests/region_widths.rs` across the 128
+/// makings of its one-store kernel: on lavapipe, whose pipelines are JIT-compiled code, about 650
+/// KiB of resident memory each (121,784 to 205,456 KiB), so up to about 160 MiB for a full memo;
+/// on RADV on a Radeon 780M (one run), GTT grew 66,048 KiB and resident memory 6,080 KiB, at most
+/// about 516 KiB and 48 KiB each with the driver's own allocations in the figure (a run that kept
+/// 32 saw GTT shrink 16,256 KiB over the same makings), so up to about 129 MiB of GTT for a full
+/// memo. A variant whose dispatches take no more keys than they did holds no more than before.
+const REGION_PIPELINES: usize = 256;
 /// The most variants besides the first a state keeps.
 const VARIANTS: usize = 8;
+/// The most plans a state keeps of its latest direct dispatches that planned ([`Planned`]): a
+/// dispatch of a shape a later one did not push out takes its plan, so encoders of the state whose
+/// bind states have shapes of their own (other resources made resident) each keep theirs.
+const PLANNED: usize = 4;
 
 /// A Metal compute pipeline state (`MTLComputePipelineState`). Cheap to clone (a retain); `Send +
 /// Sync`.
@@ -211,6 +261,17 @@ impl WeakComputePipelineState {
     /// The state, while the program holds it.
     pub(crate) fn upgrade(&self) -> Option<ComputePipelineState> {
         self.0.upgrade().map(ComputePipelineState)
+    }
+
+    /// Whether the state lives.
+    pub(crate) fn lives(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+
+    /// Whether it names `state`: the very state, not one alike. While it is held, no other state
+    /// lies where it lay, even once the program let it go.
+    pub(crate) fn names(&self, state: &ComputePipelineState) -> bool {
+        std::ptr::eq(Weak::as_ptr(&self.0), Arc::as_ptr(&state.0))
     }
 }
 
@@ -228,7 +289,12 @@ impl ComputeProgram {
             id: None,
             identifier: None,
             _samplers: Vec::new(),
-            program: Arc::clone(&self.0),
+            label: self.0.label.clone(),
+            program: LetGo::new(Arc::clone(&self.0)),
+            next: OnceLock::new(),
+            carried: AtomicBool::new(false),
+            remake_failed: AtomicBool::new(false),
+            calls: PartsCalls::default(),
         }))
     }
 }
@@ -244,13 +310,53 @@ pub(super) struct StateShared {
     /// The sampler IDs the state numbered as it was made (`resource_ids/numbered.rs`), held
     /// while it lives.
     _samplers: Vec<Arc<Numbered>>,
-    program: Arc<Program>,
+    /// `label`: its program's (`PipelineOptions::label`), the state's own, so the borrow its
+    /// `label` answers outlives its program on a lost generation (`pipeline/carry.rs`).
+    label: Option<String>,
+    /// Its program on the generation it was made on, let go of at that generation's rest where a
+    /// recovery carried the state on (`pipeline/carry.rs`'s `LostProgram`).
+    program: LetGo<Arc<Program>>,
+    /// Its program on each generation its device's recoveries carried it to, in turn
+    /// (`pipeline/carry.rs`), which its reaches take from then on ([`StateShared::program`]).
+    next: carry::ProgramLinks<Program>,
+    /// `next` is set: one load before a reach walks it.
+    carried: AtomicBool,
+    /// Its making on the generation a recovery made failed: a bind of it is refused
+    /// (`RuntimeGap::RemadeAfterRecoveryFailed`).
+    remake_failed: AtomicBool,
+    /// The calls outside command buffers' work under way on the state, which hold the programs
+    /// they reach (`pipeline/carry.rs`'s `Programs::calls`).
+    calls: PartsCalls,
+}
+
+impl carry::Programs for StateShared {
+    type Program = Program;
+
+    fn programs(&self) -> (&LetGo<Arc<Program>>, &carry::ProgramLinks<Program>) {
+        (&self.program, &self.next)
+    }
+
+    fn calls(&self) -> &PartsCalls {
+        &self.calls
+    }
 }
 
 impl std::ops::Deref for StateShared {
     type Target = Program;
     fn deref(&self) -> &Program {
-        &self.program
+        self.program()
+    }
+}
+
+impl StateShared {
+    /// The program this reach of the state takes (`pipeline/carry.rs`): the one it was made
+    /// with, until a recovery carried it.
+    #[inline]
+    fn program(&self) -> &Arc<Program> {
+        match self.carried.load(Ordering::Acquire) {
+            false => &self.program,
+            true => carry::reached(&self.program, &self.next),
+        }
     }
 }
 
@@ -261,7 +367,7 @@ impl Drop for StateShared {
         let Some(id) = self.id.as_ref().filter(|id| id.id().0 != 0) else {
             return;
         };
-        let program = &self.program;
+        let program = self.program();
         program
             .device
             .shared()
@@ -293,9 +399,15 @@ pub(super) struct Program {
     stand_in: bool,
     /// The other variants dispatches needed.
     others: Mutex<Lru<VariantKey, Arc<Variant>>>,
+    /// The unit-axes variants its dispatches began and that are not among `others` yet
+    /// (`unit_axes.rs`).
+    unit_axes: unit_axes::Aheads,
     /// The compile layer refused the kernel a flat variant ([`ComputePipelineState::settle_flat`]),
     /// so its indirect dispatches take the host step.
     flat_refused: AtomicBool,
+    /// The compile layer refused the kernel a flat variant of the call's threadgroups
+    /// ([`ComputePipelineState::settle_flat`]), so its direct dispatches of a ragged grid split.
+    call_flat_refused: AtomicBool,
     /// The state has no flat device-replay variant whose plan binds no descriptor
     /// ([`ComputePipelineState::replay_variant`]), so an execution of an indirect command
     /// buffer that may run it takes the host step.
@@ -304,6 +416,9 @@ pub(super) struct Program {
     /// ([`ComputePipelineState::settle_folded`]), so its indirect threadgroup dispatches take the
     /// host step where no flat variant runs them.
     folded_refused: AtomicBool,
+    /// The compile layer refused the kernel a partial-threadgroups variant
+    /// ([`ComputePipelineState::settle_partial`]), so its direct dispatches of a ragged grid split.
+    partial_refused: AtomicBool,
     /// How many of the kernel's last `binary_functions` were added without its descriptor's
     /// `support_adding_binary_functions`
     /// ([`ComputePipelineState::new_compute_pipeline_state_with_additional_binary_functions`]):
@@ -318,8 +433,26 @@ pub(super) struct Program {
     /// Its buffer slots whose bind offset class tells the device's view base alignment apart
     /// (`argument_table::AtBindViews`), of its base's interface.
     at_bind_views: AtBindViews,
-    /// What its last direct dispatch that planned planned ([`Planned`]).
-    planned: Mutex<Option<Arc<Planned>>>,
+    /// What its latest direct dispatches that planned planned ([`Planned`]), the latest used
+    /// first, [`PLANNED`] at most.
+    planned: Mutex<VecDeque<Arc<Planned>>>,
+    /// Its creation and the dispatches it recorded, where the device hands pipeline records over
+    /// (`dispatch_record.rs`): set by the creation, once.
+    dispatch_records: OnceLock<dispatch_record::DispatchRecords>,
+}
+
+/// [`ComputePipelineState::whole_on_partial`] of a state whose base variant is `base` and whose
+/// creation compiled its kernel as `compiled`: what its creation's prediction asks too
+/// (`dispatch_making.rs`).
+fn whole_on_partial(base: &Variant, compiled: &Kernel, one_row: bool) -> bool {
+    if base.pipeline().stage.spirv.len() < compile_memory::COUNTED_WORDS {
+        return false;
+    }
+    let StageSource::Compiled(kernel) = compiled.stage() else {
+        return false;
+    };
+    kernel.observes_threadgroup_partition()
+        && !(one_row && kernel.observes_partition_through_simdgroups_alone())
 }
 
 /// What a direct dispatch of a compute state planned (`compute::settle_dispatch`): the variant
@@ -327,16 +460,34 @@ pub(super) struct Program {
 /// [`ComputePipelineState::settle`] answers them, a function of those three alone; and the
 /// `VkPipeline`s of its regions of those keys, where all were found made. A later dispatch of the
 /// same dispatch and forms whose bind state has the shape takes them, from any encoder, rather
-/// than settling them again (`WorkCounts::dispatches_planned_as_before`).
+/// than settling them again (`WorkCounts::dispatches_planned_as_before`), while the state keeps
+/// them among its latest [`PLANNED`] ([`ComputePipelineState::planned_for`]).
 pub(crate) struct Planned {
     pub(crate) shape: Arc<BindShape>,
     pub(crate) dispatch: Dispatch,
     pub(crate) forms: BufferForms,
     pub(crate) variant: Arc<Variant>,
     pub(crate) plan: Arc<BindingPlan>,
+    /// `variant` is the plain variant for now alone, its unit-axes variant being made meanwhile
+    /// (`unit_axes.rs`): no later dispatch takes this.
+    pub(crate) meanwhile: bool,
     /// Each region's key and its made `VkPipeline`, where all were found made, each its key's own
     /// (none a residual form's, `dispatch_making.rs`).
     pub(crate) made: OnceLock<(Vec<RegionKey>, Vec<Arc<RawPipeline>>)>,
+    /// The slots the plan's dispatches only read (`binding::TwinProofs`), worked out the first
+    /// time a dispatch of it asks on a device with read twins: a function of the plan alone (its
+    /// uses, descriptor writes and vertex buffers), which no call changes while it lives. What a
+    /// command binds there (whether a slot's buffer or texture has a read twin now, and whether
+    /// an earlier command of its command buffer may have written it) is asked at each dispatch
+    /// (`binding::TwinProofs::slots`).
+    pub(crate) twins: crate::binding::TwinProofs,
+}
+
+/// The entry at `at` of a state's kept plans ([`Planned`]), moved first as the one used last.
+fn used(planned: &mut VecDeque<Arc<Planned>>, at: usize) -> Arc<Planned> {
+    let entry = planned.remove(at).expect("a kept plan's position");
+    planned.push_front(Arc::clone(&entry));
+    entry
 }
 
 impl Planned {
@@ -363,6 +514,7 @@ impl Drop for Program {
 
 impl std::fmt::Debug for ComputePipelineState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _held = self.hold();
         f.debug_struct("ComputePipelineState")
             .field("function", &self.0.function.function.info().name)
             .finish()
@@ -374,7 +526,7 @@ impl PartialEq for ComputePipelineState {
     /// command runs once the program released it, `ComputeProgram::state`), not an equal
     /// descriptor: two states made from one descriptor are two states.
     fn eq(&self, other: &ComputePipelineState) -> bool {
-        Arc::ptr_eq(&self.0.program, &other.0.program)
+        Arc::ptr_eq(self.0.program(), other.0.program())
     }
 }
 
@@ -466,7 +618,7 @@ impl Kernel {
     }
 
     /// The lowering inputs of the function's variant `key`: a compute descriptor's stage input
-    /// descriptor, or a tile descriptor's color attachment formats by index and its
+    /// descriptor and OpenCL mode, or a tile descriptor's color attachment formats by index and its
     /// `threadgroupSizeMatchesTileSize`, and either's `maxCallStackDepth` past Metal's default, 1,
     /// as the compile layer compiles a `Function` stage of each.
     fn inputs(&self, key: &VariantKey) -> metal2vulkan::pipeline::LoweringInputs {
@@ -476,6 +628,7 @@ impl Kernel {
                 inputs.stage_input = descriptor.stage_input.clone();
                 inputs.max_call_stack_depth =
                     Some(descriptor.max_call_stack_depth).filter(|&k| k > 1);
+                inputs.open_cl_mode = descriptor.open_cl_mode_enabled;
             }
             Kernel::Tile(descriptor) => {
                 inputs.tile_attachments = Some(
@@ -523,13 +676,24 @@ impl Device {
         function: &Function,
         options: &PipelineOptions,
     ) -> Result<ComputePipelineState, Error> {
-        if !function.device().same(self) {
-            return Err(invalid(
-                "new_compute_pipeline_state_with_function",
-                Problem::ForeignObject,
-            ));
+        self.at_serving(|device| {
+            device.new_compute_pipeline_state_with_function_now(function, options)
+        })
+    }
+
+    /// [`Device::new_compute_pipeline_state_with_function`] on the generation that serves
+    /// (`device/line.rs`).
+    pub(crate) fn new_compute_pipeline_state_with_function_now(
+        &self,
+        function: &Function,
+        options: &PipelineOptions,
+    ) -> Result<ComputePipelineState, Error> {
+        if !function.root_device().same(self) {
+            return Err(function
+                .root_device()
+                .foreign("new_compute_pipeline_state_with_function", self));
         }
-        self.new_compute_pipeline_state(
+        self.new_compute_pipeline_state_now(
             &ComputePipelineDescriptor::new(StageSource::Function(function.function_descriptor())),
             options,
         )
@@ -542,14 +706,24 @@ impl Device {
     /// `MTLComputePipelineDescriptor.linkedFunctions`); every variant compiles under the
     /// descriptor's other fields. A kernel the compile layer already compiled
     /// (`StageSource::Compiled`) is refused (`Invalid(CompiledKernel)`): the state compiles its
-    /// kernel again for each variant a dispatch needs. So is a name `functions` or
-    /// `binary_functions` lists twice, or both lists hold for two different functions
-    /// (`Invalid(DuplicateLinkedFunction)`); one function listed in both is linked once, with one
-    /// handle, as plain Metal takes it where its API validation stops it. So is an archive of
+    /// kernel again for each variant a dispatch needs. So is a name `functions` lists twice
+    /// (`Invalid(DuplicateLinkedFunction)`), as plain Metal's creation fails. A name both
+    /// `functions` and `binary_functions` hold, or `binary_functions` holds twice, is made, as
+    /// plain Metal makes it where its API validation stops it: one function listed twice is linked
+    /// once, with one handle; two different functions are two, each with its handle, and a call
+    /// to the name calls the one of `functions`. No call to a visible function resolves to a
+    /// function `binary_functions` alone holds, which only a visible-function table calls
+    /// (`Compile`, `NeedsInput(LinkedFunction)`, as Metal's creation fails). A function in
+    /// `binary_functions` not made compiled to a binary fails the creation once the kernel
+    /// compiled, [`Error::MetalError`] with `BinaryFunctions(NotPrecompiled)` (code 2), as plain
+    /// Metal's does. So is an archive of
     /// another device (`Invalid(ForeignObject)`). Under `FAIL_ON_BINARY_ARCHIVE_MISS`, a pipeline
     /// no listed archive holds is `BinaryArchiveMiss`. What the compile refuses is `Compile` or
     /// `Unsupported`: constant values that do not fit the function's constants, and a call to a
-    /// visible function no linked function supplies, among it. A kernel that sets a render state on
+    /// visible function no linked function supplies, among it. A kernel made by
+    /// [`Library::new_function_with_name`](crate::Library::new_function_with_name) whose function
+    /// declares function constants is `Invalid(UnspecializedFunction)`, as plain Metal ends its
+    /// process at its creation. A kernel that sets a render state on
     /// a render command is `Unsupported{IndirectRenderState}` with `Needs::MetalGpuFamily` of
     /// Apple10 on a device that does not claim Apple10, as Metal's compiler refuses it on an M4 and
     /// an M3 Max, and `NotImplemented(IndirectRenderCommands)` on one that does.
@@ -562,6 +736,15 @@ impl Device {
     /// `Compile(NeedsInput(DynamicSymbol))`, and `Compile(NeedsInput(DynamicLibrary))` where an
     /// install name loaded nothing, as Metal's creation fails ("Undefined symbols").
     pub fn new_compute_pipeline_state(
+        &self,
+        descriptor: &ComputePipelineDescriptor,
+        options: &PipelineOptions,
+    ) -> Result<ComputePipelineState, Error> {
+        self.at_serving(|device| device.new_compute_pipeline_state_now(descriptor, options))
+    }
+
+    /// [`Device::new_compute_pipeline_state`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn new_compute_pipeline_state_now(
         &self,
         descriptor: &ComputePipelineDescriptor,
         options: &PipelineOptions,
@@ -580,7 +763,19 @@ impl Device {
         descriptor: &ComputePipelineDescriptor,
         options: &PipelineOptions,
     ) -> Result<(ComputePipelineState, Option<ComputePipelineReflection>), Error> {
-        let state = self.new_compute_pipeline_state(descriptor, options)?;
+        self.at_serving(|device| {
+            device.new_compute_pipeline_state_with_reflection_now(descriptor, options)
+        })
+    }
+
+    /// [`Device::new_compute_pipeline_state_with_reflection`] on the generation that serves
+    /// (`device/line.rs`).
+    pub(crate) fn new_compute_pipeline_state_with_reflection_now(
+        &self,
+        descriptor: &ComputePipelineDescriptor,
+        options: &PipelineOptions,
+    ) -> Result<(ComputePipelineState, Option<ComputePipelineReflection>), Error> {
+        let state = self.new_compute_pipeline_state_now(descriptor, options)?;
         // The descriptor the state was made from, with the dynamic libraries its creation loaded
         // (`dynamic_library.rs`).
         let made = match &state.0.descriptor {
@@ -603,13 +798,25 @@ impl Device {
         function: &Function,
         options: &PipelineOptions,
     ) -> Result<(ComputePipelineState, Option<ComputePipelineReflection>), Error> {
-        if !function.device().same(self) {
-            return Err(invalid(
+        self.at_serving(|device| {
+            device.new_compute_pipeline_state_with_function_and_reflection_now(function, options)
+        })
+    }
+
+    /// [`Device::new_compute_pipeline_state_with_function_and_reflection`] on the generation
+    /// that serves (`device/line.rs`).
+    pub(crate) fn new_compute_pipeline_state_with_function_and_reflection_now(
+        &self,
+        function: &Function,
+        options: &PipelineOptions,
+    ) -> Result<(ComputePipelineState, Option<ComputePipelineReflection>), Error> {
+        if !function.root_device().same(self) {
+            return Err(function.root_device().foreign(
                 "new_compute_pipeline_state_with_function_and_reflection",
-                Problem::ForeignObject,
+                self,
             ));
         }
-        self.new_compute_pipeline_state_with_reflection(
+        self.new_compute_pipeline_state_with_reflection_now(
             &ComputePipelineDescriptor::new(StageSource::Function(function.function_descriptor())),
             options,
         )
@@ -653,7 +860,8 @@ impl ComputePipelineState {
     ) -> Result<ComputePipelineState, Error> {
         let requested = descriptor;
         let mut descriptor = descriptor.clone();
-        descriptor.kernel = crate::dynamic_library::stage_with_dependencies(&descriptor.kernel);
+        descriptor.kernel =
+            crate::dynamic_library::stage_with_dependencies(device, &descriptor.kernel);
         let state = ComputePipelineState::of_kernel(
             device,
             Kernel::Compute(descriptor),
@@ -663,11 +871,20 @@ impl ComputePipelineState {
             added_unsupported,
         )?;
         // The creation's record, as the program asked for it (`warm/record.rs`); a binary
-        // archive's add makes none.
+        // archive's add makes none. The state keeps the creation for its dispatches' records
+        // (`dispatch_record.rs`).
         if used.is_none() {
             device.record_pipeline(|| {
-                crate::warm::Pipeline::Compute(requested.clone(), added_unsupported)
+                crate::warm::Pipeline::Compute(requested.clone(), added_unsupported, Vec::new())
             });
+            if device.records_pipelines() {
+                let creation = (requested.clone(), added_unsupported);
+                state
+                    .0
+                    .program
+                    .dispatch_records
+                    .get_or_init(|| dispatch_record::DispatchRecords::new(creation));
+            }
         }
         Ok(state)
     }
@@ -691,7 +908,14 @@ impl ComputePipelineState {
         if let Some(name) = duplicate_linked_name(&function.linked) {
             return Err(invalid(call, Problem::DuplicateLinkedFunction { name }));
         }
-        additions::check_kernel(device, &kernel, function, call)?;
+        unspecialized::check(
+            device,
+            call,
+            Stage::Kernel,
+            kernel.stage(),
+            &options.budget(),
+        )?;
+        additions::check_kernel(device, &kernel, call)?;
         // A tile pipeline's descriptor has no `supportIndirectCommandBuffers`, and no
         // `resourceIndex`.
         let indirect = match &kernel {
@@ -724,7 +948,18 @@ impl ComputePipelineState {
         let ((found, compiled), key) = stand_in::compile_with_stand_ins(profile, |key| {
             Variant::compiled(&sources, function, &kernel, key)
         })
-        .map_err(|error| compile_error(device, error))?;
+        .map_err(|error| {
+            creation_log::compute_refused(device, function, None, &error);
+            compile_error(device, error)
+        })?;
+        additions::check_kernel_maximum(&compiled, call)?;
+        // Metal fails the creation over a binary function not compiled to a binary once the
+        // stage links, after a reference it leaves unresolved (`additions.rs`).
+        let made = match &kernel {
+            Kernel::Compute(_) => additions::Made::Compute,
+            Kernel::Tile(_) => additions::Made::Tile,
+        };
+        additions::check_precompiled(call, made, [kernel.stage()])?;
         // Metal answers nil with an `NSError` for a compute state that supports indirect command
         // buffers whose kernel uses a direct texture or sampler (`indirect_arguments.rs`).
         // Asked of the kernel the compile above produced, which answers from what that compile
@@ -747,7 +982,7 @@ impl ComputePipelineState {
             indirect_arguments::check_compute(call, uses)?;
         }
         let stand_in = !key.storage_images.is_empty();
-        let base = Variant::of(device, key, found)?;
+        let base = Variant::of(device, key, found, function)?;
         // The device's neutrals the base's plan for nothing bound may bind (an unbound texture,
         // sampler or texel slot's), made here, where the creation may wait, so that no dispatch's
         // encoding makes one (`neutral.rs`; `RenderPipelineState::make_neutrals`). One that fails
@@ -766,7 +1001,7 @@ impl ComputePipelineState {
         // stand-in compile is never dispatched.
         let pieces = piece_holds::PieceHolds::new();
         if let (Kernel::Compute(descriptor), false) = (&kernel, stand_in) {
-            base.make_at_creation(device, descriptor, &pieces);
+            base.make_predicted(device, (descriptor, &compiled), &pieces, true);
         }
         device.degrade_absent_reads(&base.shared_pipeline().dependencies, |_| {
             function.function.info().name.to_string()
@@ -793,8 +1028,9 @@ impl ComputePipelineState {
                 indirect,
             )?),
         };
-        let at_bind_views = AtBindViews::new(device, &base.shared_pipeline().interface);
-        Ok(ComputePipelineState(Arc::new_cyclic(|state| {
+        let interface = &base.shared_pipeline().interface;
+        let at_bind_views = AtBindViews::new(device, interface, ReadSlots::every());
+        let state = ComputePipelineState(Arc::new_cyclic(|state| {
             // The state holds its ID's slot, which lists it among the states an indirect
             // command's record can name (`indirect_states`).
             let id = match (&identifier, indirect) {
@@ -806,6 +1042,7 @@ impl ComputePipelineState {
                         StateKind::Compute,
                         identifier.value(),
                     );
+                    device.shared().keepers.taken(id.id().0);
                     Some(id)
                 }
                 _ => None,
@@ -818,22 +1055,37 @@ impl ComputePipelineState {
                 base,
                 stand_in,
                 others: Mutex::new(Lru::counted(VARIANTS)),
+                unit_axes: Arc::default(),
                 flat_refused: AtomicBool::new(false),
+                call_flat_refused: AtomicBool::new(false),
                 replay_refused: AtomicBool::new(false),
                 folded_refused: AtomicBool::new(false),
+                partial_refused: AtomicBool::new(false),
                 added_unsupported,
                 label: options.label.clone(),
                 pieces,
                 at_bind_views,
-                planned: Mutex::new(None),
+                planned: Mutex::new(VecDeque::with_capacity(PLANNED)),
+                dispatch_records: OnceLock::new(),
             };
             StateShared {
                 id,
                 identifier,
                 _samplers: samplers,
-                program: Arc::new(program),
+                label: program.label.clone(),
+                program: LetGo::new(Arc::new(program)),
+                next: OnceLock::new(),
+                carried: AtomicBool::new(false),
+                remake_failed: AtomicBool::new(false),
+                calls: PartsCalls::default(),
             }
-        })))
+        }));
+        // Kept by its generation for a recovery to carry (`pipeline/carry.rs`); a warm pass's
+        // state is no program's.
+        if !crate::warm::warming() && device.shared().carry.compute_state(&state) {
+            device.carry_late(|serving| state.carry(serving).unwrap_or(Ok(())));
+        }
+        Ok(state)
     }
 }
 
@@ -842,15 +1094,25 @@ impl ComputePipelineState {
 /// So its translations reach the shader cache and its `VkPipeline`s the driver's caches under the
 /// very keys and records the program's creation of the same descriptor asks for; what the program
 /// would see of it (an ID, an identifier, sampler numbers, notices, the kept variants' order, a
-/// neutral's memory) each of those paths leaves out on a warm pass's threads. `false` for a mesh
-/// render pipeline, which it does not make: that creation keeps no translation on disk and makes
-/// no `VkPipeline` (`GraphicsState::create_mesh`), so nothing of it outlives the state.
-pub(crate) fn warm(device: &Device, pipeline: &crate::warm::Pipeline) -> Result<bool, Error> {
+/// neutral's memory) each of those paths leaves out on a warm pass's threads. A compute record's
+/// dispatches then make their regions' `VkPipeline`s on the state (`dispatch_record.rs`): the
+/// count made. `None` for a mesh render pipeline, which it does not make: that creation keeps no
+/// translation on disk and makes no `VkPipeline` (`GraphicsState::create_mesh`), so nothing of it
+/// outlives the state.
+pub(crate) fn warm(
+    device: &Device,
+    pipeline: &crate::warm::Pipeline,
+) -> Result<Option<u64>, Error> {
     use crate::warm::Pipeline;
     let options = PipelineOptions::default();
     match pipeline {
-        Pipeline::Compute(descriptor, added) => {
-            ComputePipelineState::create_adding(device, descriptor, &options, None, *added)?;
+        Pipeline::Compute(descriptor, added, dispatches) => {
+            let state =
+                ComputePipelineState::create_adding(device, descriptor, &options, None, *added)?;
+            let made = (dispatches.iter())
+                .map(|dispatch| state.warm_dispatch(dispatch))
+                .sum();
+            return Ok(Some(made));
         }
         Pipeline::Render(descriptor, added) => {
             GraphicsState::create_adding(device, descriptor, &options, None, *added)?;
@@ -858,58 +1120,68 @@ pub(crate) fn warm(device: &Device, pipeline: &crate::warm::Pipeline) -> Result<
         Pipeline::Tile(descriptor, added) => {
             TileState::create_adding(device, descriptor, &options, None, *added)?;
         }
-        Pipeline::Mesh(_) => return Ok(false),
+        Pipeline::Mesh(_) => return Ok(None),
     }
-    Ok(true)
+    Ok(Some(0))
 }
 
-/// The first name `linked` repeats where Metal's pipeline creation fails or was not measured: a
-/// name `functions` lists twice ("error: duplicated symbol", without validation too), or
-/// `binary_functions` twice, and a name both lists hold for two different functions (another
-/// AIR, name or constant values), in that order. Metal's API validation stops every repeat ("All
-/// linked functions must have unique names. Function 'add_one' is a duplicate symbol in
-/// binaryFunctions, symbol first found in functions"), but plain Metal takes one function listed
-/// in both lists, with one handle (a probe, an M3 and an M4), as the compile layer links it once.
-/// Whether validation also counts `private_functions` and `groups` was not measured, so they are
-/// left to it.
+/// The first name `functions` repeats, where plain Metal's pipeline creation fails ("error:
+/// duplicated symbol: add_one", code 3, one function listed twice or two of one name, an M3 Max
+/// under macOS 27.0.1, `binary_function_linking.m`). A function's name is the one it links under
+/// ([`LinkedFunction::name`]): its specialized name where it has one, so one library function
+/// linked under its own name and under a specialized one is no repeat, as Metal links both
+/// (`linked_function_specialized_name.m`, an M3 Max under macOS 27.0.1). Metal's API validation
+/// stops every repeat across the lists too ("All linked functions must have unique names.
+/// Function 'add_one' is a duplicate symbol in binaryFunctions, symbol first found in
+/// functions"), but plain Metal makes a name both `functions` and `binary_functions` hold, or
+/// `binary_functions` holds twice, whether one function or two, and so does the runtime (the
+/// compile layer resolves a reference against `functions` alone of the two, and a table holds
+/// each). Whether a repeat `private_functions` or `groups` holds fails was not measured, so they
+/// are left to the compile layer.
 pub(super) fn duplicate_linked_name(linked: &LinkedFunctions) -> Option<String> {
-    fn name(f: &LinkedFunction) -> &str {
-        f.function.info().name
-    }
-    fn repeated(list: &[LinkedFunction]) -> Option<&str> {
-        let mut seen = HashSet::new();
-        list.iter().map(name).find(|n| !seen.insert(*n))
-    }
-    let same = |a: &LinkedFunction, b: &LinkedFunction| {
-        name(a) == name(b)
-            && a.function.info().air_hash == b.function.info().air_hash
-            && a.constants == b.constants
-    };
-    repeated(&linked.functions)
-        .or_else(|| repeated(&linked.binary_functions))
-        .or_else(|| {
-            linked
-                .binary_functions
-                .iter()
-                .find(|b| {
-                    linked
-                        .functions
-                        .iter()
-                        .any(|f| name(f) == name(b) && !same(f, b))
-                })
-                .map(name)
-        })
+    let mut seen = HashSet::new();
+    linked
+        .functions
+        .iter()
+        .map(LinkedFunction::name)
+        .find(|n| !seen.insert(*n))
         .map(str::to_owned)
 }
 
 impl ComputePipelineState {
-    /// `device`.
-    pub fn device(&self) -> &Device {
+    /// `device`: a generation handle of the device, owned, as Metal's `device` answers a retained
+    /// device: of the generation the state was made on, then of each one the device's recoveries
+    /// carried the state to. The handle is the caller's: it keeps meaning that generation while
+    /// held, past a recovery that carries the state on, its raw handles that generation's
+    /// `VkDevice`'s, kept alive while held.
+    pub fn device(&self) -> Device {
+        let _held = self.hold();
+        self.0.device.clone()
+    }
+
+    /// A call outside command buffers' work on the state, from now until the hold goes: the
+    /// programs it reaches stay, their release at a lost generation's rest waiting for it
+    /// (`pipeline/carry.rs`). A command buffer's work holds none: its queue slot holds its
+    /// generation.
+    pub(crate) fn hold(&self) -> CallHold<'_> {
+        self.0.calls.hold()
+    }
+
+    /// The device of the program this reach of the state takes (`pipeline/carry.rs`): a borrow
+    /// for a command buffer's work, or a call that holds the state ([`hold`](Self::hold)).
+    pub(crate) fn generation(&self) -> &Device {
         &self.0.device
     }
 
+    /// What the layers' messages name the pipelines of the variant its creation compiled by
+    /// (`VariantObjects::pipeline_name`): the device tests.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn pipeline_name(&self) -> String {
+        self.0.base.objects().pipeline_name(None)
+    }
+
     /// The kernel's name.
-    pub(super) fn function_name(&self) -> &str {
+    pub(crate) fn function_name(&self) -> &str {
         self.0.function.function.info().name
     }
 
@@ -981,8 +1253,24 @@ impl ComputePipelineState {
         }
     }
 
-    /// `maxTotalThreadsPerThreadgroup`.
+    /// `maxTotalThreadsPerThreadgroup`. Where the descriptor states a
+    /// `required_threads_per_threadgroup`, it is that size's threads, as Metal answers for a
+    /// compute state compiled for the first time (measured on an M3 Max, macOS 27.0.1). A tile
+    /// state answers the same, where Metal's rounds the threads down to a multiple of 4
+    /// (docs/API.md, accepted differences). It is lowered only where this device holds fewer
+    /// threads than the size. Where the descriptor states no size, it is the compiled pipeline's
+    /// answer.
     pub fn max_total_threads_per_threadgroup(&self) -> u32 {
+        let _held = self.hold();
+        reported_max_total_threads(
+            self.required_threads(),
+            self.pipeline_max_total_threads_per_threadgroup(),
+        )
+    }
+
+    /// The compiled pipeline's `maxTotalThreadsPerThreadgroup` on this device, whatever size the
+    /// descriptor requires: the most threads a threadgroup of the pipeline holds here.
+    pub(crate) fn pipeline_max_total_threads_per_threadgroup(&self) -> u32 {
         self.0
             .base
             .pipeline
@@ -1003,11 +1291,17 @@ impl ComputePipelineState {
 
     /// `threadExecutionWidth` (32).
     pub fn thread_execution_width(&self) -> u32 {
+        let _held = self.hold();
         self.0.base.pipeline.metal_info.thread_execution_width
     }
 
-    /// `staticThreadgroupMemoryLength`.
+    /// `staticThreadgroupMemoryLength`: the kernel's own static threadgroup memory, as Metal
+    /// reports it (rounded up to a multiple of 16 bytes). Where the device runs the kernel's simdgroups emulated, their scratch takes
+    /// threadgroup memory beside it, and a dispatch whose `setThreadgroupMemoryLength:` lengths
+    /// fit beside this length but not beside the scratch is refused
+    /// (`Unsupported(ThreadgroupMemorySize)`), where Metal runs it.
     pub fn static_threadgroup_memory_length(&self) -> u32 {
+        let _held = self.hold();
         self.0
             .base
             .pipeline
@@ -1076,6 +1370,7 @@ impl ComputePipelineState {
     /// `imageblockMemoryLengthForDimensions:` (`imageblock_memory_length`): 0 for a kernel
     /// without an explicit imageblock.
     pub fn imageblock_memory_length_for_dimensions(&self, dimensions: Size) -> u64 {
+        let _held = self.hold();
         imageblock_memory_length(self.imageblock_cell_bytes(), dimensions)
     }
 
@@ -1091,6 +1386,18 @@ impl ComputePipelineState {
                 RuntimeFact::ImageblockSize { cell_bytes } => Some(cell_bytes),
                 _ => None,
             })
+    }
+
+    /// Whether the state is a kernel's whose module is inert
+    /// ([`ModuleStats::inert`](metal2vulkan::pipeline::ModuleStats::inert)): it holds no loop and
+    /// writes nothing but its invocations' own and its threadgroups' memory, so a dispatch of it
+    /// ends and leaves nothing a later command or the program can read. A compute encoder records
+    /// no Vulkan dispatch of it, and names what the dispatch binds alone (`compute::record`). The
+    /// base variant answers for every variant:
+    /// they bind and partition the kernel otherwise, and store what it stores. A tile function's
+    /// state is never inert: its threadgroup memory is the render pass's imageblock.
+    pub(super) fn inert(&self) -> bool {
+        !self.is_tile() && self.0.base.pipeline.stage.stats.inert
     }
 
     /// Whether the kernel reads texture handles from memory (its layout has a handle table): only
@@ -1109,6 +1416,7 @@ impl ComputePipelineState {
     /// (`Unsupported`, `Feature::Reflection`, naming its type, which the kernel's AIR is decoded
     /// again to name).
     pub fn compiled_reflection(&self) -> Result<ComputePipelineReflection, Error> {
+        let _held = self.hold();
         match &self.0.descriptor {
             Kernel::Compute(made) => {
                 self.kernel_reflection(made, &metal2vulkan::Budget::standard())
@@ -1164,6 +1472,7 @@ impl ComputePipelineState {
     /// can encode, reset or copy indirect commands, so `false` is proven; one may answer `true`
     /// and never do so (a command buffer it takes and does not touch).
     pub fn can_encode_indirect_commands(&self) -> bool {
+        let _held = self.hold();
         self.interface().reaches_command_buffers
     }
 
@@ -1171,10 +1480,12 @@ impl ComputePipelineState {
     /// extension, with no Metal counterpart. It is the compiled pipeline's
     /// `PipelineInterface::command_writes`, read from the function's AIR, of the function its
     /// constants specialized ([`CommandWrites`]: the indirect-command operations its body may
-    /// call, and the primitive types its draws may pass, every type where a draw's is not a
-    /// constant). A clear bit is proven: the kernel writes no such record field. Empty where
+    /// call, the primitive types its draws may pass, every type where a draw's is not a
+    /// constant, and the kinds of command they write, render or compute). A clear bit is proven:
+    /// the kernel writes no such record field. Empty where
     /// [`can_encode_indirect_commands`](Self::can_encode_indirect_commands) answers `false`.
     pub fn indirect_command_writes(&self) -> CommandWrites {
+        let _held = self.hold();
         self.interface().command_writes
     }
 
@@ -1193,12 +1504,14 @@ impl ComputePipelineState {
     /// tile function's as
     /// [`RenderPipelineState::tile_writes_textures`](crate::RenderPipelineState::tile_writes_textures).
     pub fn writes_textures(&self) -> bool {
+        let _held = self.hold();
         !self.interface().texture_writing_stages.is_empty()
     }
 
     /// `supportIndirectCommandBuffers` (the descriptor's; false for a state made from a
     /// function).
     pub fn support_indirect_command_buffers(&self) -> bool {
+        let _held = self.hold();
         self.0
             .base
             .pipeline
@@ -1241,8 +1554,9 @@ impl ComputePipelineState {
     /// for one with indirect command buffer support. Such a compute state's first identifier is one
     /// step into Metal's range, `2^36 + 0xc0`, no workload's first.
     pub fn unique_identifier(&self) -> u64 {
+        let _held = self.hold();
         match &self.0.identifier {
-            Some(identifier) => identifier.answer(self.device(), "a compute pipeline state"),
+            Some(identifier) => identifier.answer(self.generation(), "a compute pipeline state"),
             None => 0,
         }
     }
@@ -1275,19 +1589,81 @@ impl ComputePipelineState {
         WeakComputePipelineState(Arc::downgrade(&self.0))
     }
 
+    /// Another reference to the state, which a command buffer holds it by
+    /// (`EncoderCore::retain_shared`).
+    pub(crate) fn held(&self) -> Arc<dyn std::any::Any + Send + Sync> {
+        self.0.clone()
+    }
+
     /// What the state runs, held without its ID (`ComputeProgram`).
     pub(crate) fn program(&self) -> ComputeProgram {
-        ComputeProgram(Arc::clone(&self.0.program))
+        let held = self.hold();
+        self.program_held(&held)
     }
 
-    /// What its last direct dispatch that planned planned ([`Planned`]).
-    pub(super) fn planned(&self) -> Option<Arc<Planned>> {
-        lock(&self.0.planned).clone()
+    /// [`program`](Self::program), under `_held`, the caller's hold of the state
+    /// ([`hold`](Self::hold)): a call that reads more of the state under one hold.
+    pub(crate) fn program_held(&self, _held: &CallHold<'_>) -> ComputeProgram {
+        ComputeProgram(Arc::clone(self.0.program()))
     }
 
-    /// Keep `planned`, a direct dispatch's, in place of what the last planned.
+    /// The shape of `state` among those of what its latest direct dispatches planned
+    /// ([`Planned`]), compared with the state in place (`BindState::position_of_shape`, which makes
+    /// the shape of the resources it lists at most once for all of them): what a dispatch of
+    /// `state` plans for where it has one, found without its shape made (`compute/live.rs`).
+    pub(super) fn planned_shape(&self, state: &BindState) -> Option<Arc<BindShape>> {
+        let planned = lock(&self.0.planned);
+        let at = state.position_of_shape(planned.iter().map(|planned| &*planned.shape))?;
+        Some(Arc::clone(&planned[at].shape))
+    }
+
+    /// What its latest direct dispatches planned for a dispatch of `dispatch` in `forms` of a bind
+    /// state of shape `shape` ([`Planned`]): the very shape looked for first (its encoder's kept
+    /// one, `compute/live.rs`, or one [`planned_shape`](Self::planned_shape) found here), else an
+    /// equal one compared whole. Used now, so it is the last to go.
+    pub(super) fn planned_for(
+        &self,
+        shape: &Arc<BindShape>,
+        dispatch: &Dispatch,
+        forms: BufferForms,
+    ) -> Option<Arc<Planned>> {
+        let mut planned = lock(&self.0.planned);
+        let of = |p: &Arc<Planned>| p.dispatch == *dispatch && p.forms == forms;
+        let at = (planned.iter())
+            .position(|p| of(p) && Arc::ptr_eq(&p.shape, shape))
+            .or_else(|| (planned.iter()).position(|p| of(p) && p.shape == *shape))?;
+        Some(used(&mut planned, at))
+    }
+
+    /// What its latest direct dispatches planned for a dispatch of `dispatch` in `forms` of
+    /// `state`, compared with the state in place ([`planned_shape`](Self::planned_shape)), for a
+    /// dispatch that keeps no state of its own (an indirect command's, a host step's). Used now, so
+    /// it is the last to go.
+    pub(super) fn planned_of(
+        &self,
+        state: &BindState,
+        dispatch: &Dispatch,
+        forms: BufferForms,
+    ) -> Option<Arc<Planned>> {
+        let mut planned = lock(&self.0.planned);
+        let of = (planned.iter()).filter(|p| p.dispatch == *dispatch && p.forms == forms);
+        let found = state.position_of_shape(of.map(|p| &*p.shape))?;
+        let at = (planned.iter())
+            .enumerate()
+            .filter(|(_, p)| p.dispatch == *dispatch && p.forms == forms)
+            .nth(found)
+            .map(|(at, _)| at)?;
+        Some(used(&mut planned, at))
+    }
+
+    /// Keep `planned`, a direct dispatch's, first among what its latest direct dispatches planned,
+    /// in place of the one used least lately where [`PLANNED`] are kept.
     pub(super) fn keep_planned(&self, planned: Arc<Planned>) {
-        *lock(&self.0.planned) = Some(planned);
+        let mut kept = lock(&self.0.planned);
+        if kept.len() == PLANNED {
+            kept.pop_back();
+        }
+        kept.push_front(planned);
     }
 
     /// The variant `dispatch` of a bind state of `shape` runs on in `forms`, and its plan for
@@ -1336,9 +1712,10 @@ impl ComputePipelineState {
     /// Make the variants a dispatch of a bind state of `shape` in `forms` may run on, whatever
     /// its threadgroup size, each with its plan for `shape`: its plan's variant in that form, and
     /// that variant with emulated simdgroups where a threadgroup that is not whole simdgroups
-    /// asks for it. In the large-buffer form every other bind shape of the same bound textures and
-    /// samplers settles on one of them; in the bound form, a dispatch of `shape` whose size its
-    /// host step reads (`indirect_dispatch.rs`) does.
+    /// asks for it, or as the one-row variant where a threadgroup of one row asks for that. In the
+    /// large-buffer form every other bind shape of the same bound textures and samplers settles
+    /// on one of them; in the bound form, a dispatch of `shape` whose size its host step reads
+    /// (`indirect_dispatch.rs`) does.
     pub(super) fn prepare(
         &self,
         shape: &BindShape,
@@ -1361,12 +1738,12 @@ impl ComputePipelineState {
             groups: [1, 1, 1],
             threads_per_group: [1, 1, 1],
         };
-        if plan
-            .dispatch_variant(&partial)
-            .map_err(Error::Bind)?
-            .emulated_simdgroups
-        {
+        let asked = plan.dispatch_variant(&partial).map_err(Error::Bind)?;
+        if asked.emulated_simdgroups {
             key.emulated_simdgroups = true;
+            keys.push(key);
+        } else if asked.one_row {
+            key.one_row = true;
             keys.push(key);
         }
         let mut prepared = Vec::with_capacity(keys.len());
@@ -1429,17 +1806,27 @@ impl ComputePipelineState {
     /// `dispatch` is an indirect dispatch at the group counts a preprocess writes
     /// (`indirect_dispatch.rs`) or a direct `dispatchThreads:` whose grid the variant's one region
     /// covers (`compute::flat_direct`); the variant's plan must run that very dispatch, which the
-    /// check against `key` states. `None` where the compile layer refuses the kernel a flat
-    /// variant, `Unsupported{GpuEncodedIndirectCommands}`: the kernel observes its threadgroup
-    /// partition (`KernelFacts::partition_oblivious`), or the device reaches no memory by device
-    /// address. The state remembers that refusal, which no bind shape changes.
+    /// check against `key` states. With `call`, the variant of the call's threadgroups
+    /// (`VariantKey::call_threadgroups`), for a one-row grid in threadgroups of one row of a
+    /// direct dispatch. `None` where the compile layer refuses the kernel such a variant,
+    /// `Unsupported{GpuEncodedIndirectCommands}`: the kernel observes its threadgroup partition
+    /// (`KernelFacts::partition_oblivious`; with `call`, otherwise than through its simdgroups,
+    /// `KernelFacts::partition_simdgroups`, or its module would hold a workgroup barrier), or the
+    /// device reaches no memory by device address. The state remembers that refusal, which no
+    /// bind shape changes. With `call`, also `None` where `local` asks for emulated simdgroups,
+    /// which no flat variant runs, unremembered: another threadgroup size may not.
     pub(super) fn settle_flat(
         &self,
         shape: &BindShape,
         local: [u32; 3],
         dispatch: &Dispatch,
+        call: bool,
     ) -> Result<Option<(Arc<Variant>, Arc<BindingPlan>)>, Error> {
-        if self.0.flat_refused.load(Ordering::Relaxed) {
+        let refused = match call {
+            false => &self.0.flat_refused,
+            true => &self.0.call_flat_refused,
+        };
+        if refused.load(Ordering::Relaxed) {
             return Ok(None);
         }
         let plan = self.0.base.plan(&self.0.device, shape)?;
@@ -1449,13 +1836,17 @@ impl ComputePipelineState {
         let mut key = plan
             .dispatch_variant(&flat_dispatch(local))
             .map_err(Error::Bind)?;
+        if call && key.emulated_simdgroups {
+            return Ok(None);
+        }
         key.flat_grid = true;
+        key.call_threadgroups = call;
         let variant = match self.variant(&key) {
             Ok(variant) => variant,
             Err(Error::Unsupported(unsupported))
                 if unsupported.feature == Feature::GpuEncodedIndirectCommands =>
             {
-                self.0.flat_refused.store(true, Ordering::Relaxed);
+                refused.store(true, Ordering::Relaxed);
                 return Ok(None);
             }
             Err(error) => return Err(error),
@@ -1506,6 +1897,78 @@ impl ComputePipelineState {
             ));
         }
         Ok(Some((variant, plan)))
+    }
+
+    /// Run the state's direct dispatches without its partial-threadgroups variant, as where the
+    /// compile layer refused it ([`Self::settle_partial`]): a ragged grid split and a whole one on
+    /// the plain pipeline, what `tests::partial_threadgroups` compares the variant's answers with.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn split_ragged_grids(&self) {
+        self.0.partial_refused.store(true, Ordering::Relaxed);
+    }
+
+    /// The partial-threadgroups variant (`VariantKey::partial_threadgroups`) `dispatch`, a direct
+    /// dispatch in threadgroups of `local` threads of a bind state of `shape` (a `dispatchThreads:`
+    /// of a ragged grid, or a large kernel's whole grid, [`Self::whole_on_partial`]), runs on, with
+    /// its plan for `shape`: the variant the first plan names for a threadgroup dispatch of `local`
+    /// threads, with the partial threadgroups, compiled when first needed
+    /// (`compute::partial_direct`); the variant's plan must run that very dispatch, which
+    /// the check against `key` states. `None` where that variant has emulated simdgroups, which no
+    /// partial-threadgroups variant runs, unremembered (another threadgroup size may not); and
+    /// where the compile layer refuses the kernel the variant (a tile function, a stage-input
+    /// region, compute derivatives, simdgroups its lockstep order emulates, or a vote word its
+    /// workgroup memory cannot hold beside its arena), which the state remembers: the refusal
+    /// follows from what the variant adds to a kernel whose own compile stood, which no bind shape
+    /// or threadgroup size changes.
+    pub(super) fn settle_partial(
+        &self,
+        shape: &BindShape,
+        local: [u32; 3],
+        dispatch: &Dispatch,
+    ) -> Result<Option<(Arc<Variant>, Arc<BindingPlan>)>, Error> {
+        if self.0.partial_refused.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let plan = self.0.base.plan(&self.0.device, shape)?;
+        let whole = Dispatch::Threadgroups {
+            groups: [1, 1, 1],
+            threads_per_group: local,
+        };
+        let mut key = plan.dispatch_variant(&whole).map_err(Error::Bind)?;
+        if key.emulated_simdgroups {
+            return Ok(None);
+        }
+        key.partial_threadgroups = true;
+        let variant = match self.variant(&key) {
+            Ok(variant) => variant,
+            Err(Error::Unsupported(_)) => {
+                self.0.partial_refused.store(true, Ordering::Relaxed);
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let plan = variant.plan(&self.0.device, shape)?;
+        if plan.dispatch_variant(dispatch).map_err(Error::Bind)? != key {
+            return Err(internal(
+                "the plan of a partial-threadgroups variant asks for another variant",
+            ));
+        }
+        Ok(Some((variant, plan)))
+    }
+
+    /// Whether the state runs its whole grids, direct dispatches of whole threadgroups, on its
+    /// partial-threadgroups variant too, every thread live (`compute::partial_direct`): where its
+    /// base module holds `compile_memory::COUNTED_WORDS` SPIR-V words or more, whose plain pipeline
+    /// beside the variant's would be a second large compile, and where its ragged grids of the
+    /// dispatch's form run on the variant, as no flat variant runs them (`compute::flat_direct`):
+    /// the kernel observes its threadgroup partition, and, where `one_row` (a grid of one row in
+    /// threadgroups of one row), otherwise than through its simdgroups alone, as the call's flat
+    /// variant runs such a grid of such a kernel. Decided from the state's creation alone: where a
+    /// flat variant the kernel would take is refused (a device that reaches no memory by device
+    /// address, a module that would hold a workgroup barrier there), its ragged grids run on the
+    /// variant and its whole grids keep the plain pipeline.
+    pub(super) fn whole_on_partial(&self, one_row: bool) -> bool {
+        whole_on_partial(&self.0.base, &self.0.compiled, one_row)
     }
 
     /// The variant of `key`: the first one where it is that one's (and not a stand-in's), else
@@ -1598,8 +2061,11 @@ impl Variant {
     ) -> Result<Arc<Variant>, Error> {
         let _noted = NoteEntries(device);
         let (found, _) = Variant::compiled(&Sources::later(device), function, descriptor, &key)
-            .map_err(|error| compile_error(device, error))?;
-        Variant::of(device, key, found)
+            .map_err(|error| {
+                creation_log::compute_refused(device, function, Some(&key), &error);
+                compile_error(device, error)
+            })?;
+        Variant::of(device, key, found, function)
     }
 
     /// The pipeline of `descriptor` with `function` its kernel or tile function, under `key`:
@@ -1640,11 +2106,13 @@ impl Variant {
     }
 
     /// The variant of `key` of what the memo or a compile `found`: the live variant, or one made
-    /// of the pipeline, its objects made, which the memo then knows live.
+    /// of the pipeline, its objects made, which the memo then knows live. `function` is the
+    /// descriptor's, which the pipeline creation log names its pipelines by.
     fn of(
         device: &Device,
         key: VariantKey,
         found: Remembered<ComputePipeline, Variant>,
+        function: &FunctionDescriptor,
     ) -> Result<Arc<Variant>, Error> {
         let pipeline = match found {
             Remembered::Live(variant) if variant.key == key => return Ok(variant),
@@ -1653,7 +2121,7 @@ impl Variant {
         };
         // Before the variant's shader modules, as a render variant's.
         device.degrade_pipeline(CompiledPipeline::Kernel(&pipeline), Occurrence::Made);
-        let (objects, kept) = VariantObjects::kept_or_create(
+        let (mut objects, kept) = VariantObjects::kept_or_create(
             device,
             kept::Compiled::Compute(pipeline.key),
             &pipeline.layout,
@@ -1661,18 +2129,35 @@ impl Variant {
             CompiledPipeline::Kernel(&pipeline),
             None,
         )?;
+        objects.log_kernel(function, &pipeline.stage, key.emulated_simdgroups);
+        objects.name_pipelines(|| function.function.info().name.to_owned());
+        // A tile function's dispatch is one region of its pass's threads per tile; a kernel's
+        // takes the call's threadgroup and its grid's edges (`REGION_PIPELINES`).
+        let tile = (pipeline.dependencies.iter()).any(|d| d.fact == RuntimeFact::TileFunction);
+        let bound = if tile { PIPELINES } else { REGION_PIPELINES };
+        // Listed in the device's ledger under the variant's instance (`region_ledger.rs`).
+        let instance = objects.instance();
+        let ledger = Arc::clone(&device.shared().region_ledger);
+        let watch = move |memo| {
+            Box::new(region_ledger::RegionWatch {
+                instance,
+                ledger,
+                memo,
+            }) as Box<dyn making::KeyWatch<RegionKey, RawPipeline>>
+        };
         let variant = Arc::new(Variant {
             key,
             pipeline,
             objects: Arc::new(objects),
             plans: Mutex::new(Lru::counted(PLANS)),
-            pipelines: making::Making::counted(PIPELINES),
+            pipelines: making::Making::watched(bound, watch),
         });
         for (place, made) in kept {
             if let kept::Place::Region(region) = place {
                 variant.pipelines.seed(region, made);
             }
         }
+        region_ledger::let_go(device.shared());
         // A warm pass's variant is no state's the program holds: the memo does not hand it out
         // (`warm/pass.rs`).
         if !crate::warm::warming() {
@@ -1692,7 +2177,7 @@ impl Variant {
     }
 
     /// The variant's layouts and module.
-    pub(super) fn objects(&self) -> &Arc<VariantObjects> {
+    pub(crate) fn objects(&self) -> &Arc<VariantObjects> {
         &self.objects
     }
 
@@ -1714,6 +2199,12 @@ impl Variant {
     /// Whether the variant is the kernel's emulated-simdgroups one.
     pub(super) fn emulates_simdgroups(&self) -> bool {
         self.key.emulated_simdgroups
+    }
+
+    /// Whether the variant is the kernel's partial-threadgroups one, which runs a ragged grid's
+    /// threadgroups at the call's size (`VariantKey::partial_threadgroups`).
+    pub(super) fn runs_partial_threadgroups(&self) -> bool {
+        self.key.partial_threadgroups
     }
 
     /// The plan for `shape`, from the memo or planned now, both keyed by the shape's projection
@@ -1749,7 +2240,9 @@ impl Variant {
                 .objects
                 .pipeline(&key, graphics::Notices::Now(Some(formats)))?;
             Ok(made.kept_at(&self.objects, kept::Place::Region(key.clone())))
-        })?;
+        });
+        region_ledger::let_go(self.objects.device.shared());
+        let made = made?;
         self.first_use(&made, &key, formats);
         Ok(made)
     }
@@ -1800,15 +2293,17 @@ fn compile_error(device: &Device, error: metal2vulkan::error::Error) -> Error {
             if unsupported.feature == Feature::IndirectRenderState =>
         {
             let apple10 = GpuFamily::Apple10.raw();
-            if device.supports_family(apple10) {
-                return Error::NotImplemented(RuntimeGap::IndirectRenderCommands);
+            if device.supports_family_now(apple10) {
+                return Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                    IndirectRule::CommandRenderStates,
+                ));
             }
             unsupported.needs = Needs::MetalGpuFamily(apple10);
             Error::Unsupported(unsupported)
         }
         metal2vulkan::error::Error::Unsupported(mut unsupported)
             if unsupported.feature == Feature::GlobalBuiltinInFragment
-                && !device.supports_family(GpuFamily::Apple10.raw()) =>
+                && !device.supports_family_now(GpuFamily::Apple10.raw()) =>
         {
             unsupported.needs = Needs::MetalRefuses(GLOBAL_BUILTIN_IN_FRAGMENT_REFUSED_ON);
             Error::Unsupported(unsupported)

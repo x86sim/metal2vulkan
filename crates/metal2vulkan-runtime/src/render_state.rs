@@ -102,6 +102,7 @@ use super::degradation::Degradation;
 use super::depth_stencil::{DepthStencilState, DepthUse};
 use super::error::{internal, invalid, Error, Problem, RuntimeGap};
 use super::pipeline::{DepthRange, FixedState};
+use super::render::LineWidth;
 use super::render_values::{ScissorRect, Viewport};
 use super::Device;
 use ash::vk;
@@ -184,13 +185,35 @@ pub enum RenderStateProblem {
     ViewportNotFinite,
 }
 
-/// The render encoder's state, in Metal's terms.
+/// The render encoder's scissor rectangles (`setScissorRect:`, `setScissorRects:count:`), as
+/// [`EncoderState::scissor_rects`] clipped them. Kept apart from the [`EncoderState`]: a draw's
+/// shape reads none of them but its draw state's Vulkan scissors, which each draw takes from the
+/// rectangles it finds ([`EncoderState::vk_scissors`]), so the draws of a program that sets a
+/// rectangle before each, as a window compositor's do, find their shapes kept
+/// (`render/draw_shape.rs`).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ScissorRects(ViewportList<ScissorRect>);
+
+impl ScissorRects {
+    /// Metal's default: the render area of `extent`.
+    pub(super) fn metal_default([width, height]: [u32; 2]) -> ScissorRects {
+        let area = ScissorRect::new(0, 0, u64::from(width), u64::from(height));
+        ScissorRects(ViewportList::One(area))
+    }
+
+    /// The first rectangle, which a draw of a pipeline that selects no viewport uses.
+    pub(super) fn first(&self) -> &ScissorRect {
+        &self.0[0]
+    }
+}
+
+/// The render encoder's state, in Metal's terms, but for its scissor rectangles
+/// ([`ScissorRects`]).
 #[derive(Clone)]
 pub(super) struct EncoderState {
     /// The render area's width and height.
     extent: [u32; 2],
     viewports: ViewportList<Viewport>,
-    scissors: ViewportList<ScissorRect>,
     cull_mode: CullMode,
     winding: Winding,
     /// `None` is Metal's default state, the default descriptor's.
@@ -210,6 +233,9 @@ pub(super) struct EncoderState {
     /// The mode is past 1, which Metal draws a third way, the runtime as mode 1 but for patches
     /// (`render/provoking.rs`).
     provoking_third: bool,
+    /// Apple's `setLineWidth:`, as Metal quantizes it (`render/line_width.rs`). Metal's default,
+    /// and every new encoder's, is 1.
+    line_width: LineWidth,
 }
 
 impl EncoderState {
@@ -226,12 +252,6 @@ impl EncoderState {
                 0.0,
                 1.0,
             )),
-            scissors: ViewportList::One(ScissorRect::new(
-                0,
-                0,
-                u64::from(width),
-                u64::from(height),
-            )),
             cull_mode: CullMode::None,
             winding: Winding::Clockwise,
             depth_stencil: None,
@@ -247,7 +267,51 @@ impl EncoderState {
             clip_mode: DepthClipMode::Clip,
             provoking_last: false,
             provoking_third: false,
+            line_width: LineWidth::ONE,
         }
+    }
+
+    /// Whether `other` holds the same state: each field equal, a float by its bits (a NaN equal to
+    /// itself, a zero of the other sign not), the depth/stencil state the same object. A draw's
+    /// shape is a function of the state (`render/draw_shape.rs`), so two states equal so give it
+    /// alike.
+    pub(super) fn same_values(&self, other: &EncoderState) -> bool {
+        let EncoderState {
+            extent,
+            viewports,
+            cull_mode,
+            winding,
+            depth_stencil,
+            stencil_reference,
+            depth_bias,
+            blend_color,
+            alpha_test_reference,
+            fill_mode,
+            clip_mode,
+            provoking_last,
+            provoking_third,
+            line_width,
+        } = self;
+        let viewport_bits = |v: &Viewport| {
+            [v.origin_x, v.origin_y, v.width, v.height, v.znear, v.zfar].map(f64::to_bits)
+        };
+        *extent == other.extent
+            && viewports.len() == other.viewports.len()
+            && (viewports.iter().zip(other.viewports.iter()))
+                .all(|(a, b)| viewport_bits(a) == viewport_bits(b))
+            && *cull_mode == other.cull_mode
+            && *winding == other.winding
+            && *depth_stencil == other.depth_stencil
+            && *stencil_reference == other.stencil_reference
+            && depth_bias.same_bits(&other.depth_bias)
+            && blend_color.map(f32::to_bits) == other.blend_color.map(f32::to_bits)
+            && alpha_test_reference.map(f32::to_bits)
+                == other.alpha_test_reference.map(f32::to_bits)
+            && *fill_mode == other.fill_mode
+            && *clip_mode == other.clip_mode
+            && *provoking_last == other.provoking_last
+            && *provoking_third == other.provoking_third
+            && *line_width == other.line_width
     }
 
     /// `setViewports:count:` (one viewport for `setViewport:`), checked as the module says: a
@@ -288,13 +352,13 @@ impl EncoderState {
         Ok(())
     }
 
-    /// `setScissorRects:count:` (one rectangle for `setScissorRect:`), checked as the module
-    /// says.
-    pub(super) fn set_scissors(
-        &mut self,
+    /// The rectangles `setScissorRects:count:` (one rectangle for `setScissorRect:`) sets,
+    /// checked and clipped to the render area as the module says.
+    pub(super) fn scissor_rects(
+        &self,
         call: &'static str,
         scissors: &[ScissorRect],
-    ) -> Result<(), Error> {
+    ) -> Result<ScissorRects, Error> {
         // More than 16 rectangles stop Metal's validation, and plain Metal draws (Metal probe case
         // `scissors_17` on an M4): a draw goes through the rectangles its viewports name
         // (`EncoderState::vk_scissors`). None, unmeasured, is refused.
@@ -310,7 +374,7 @@ impl EncoderState {
             let start = origin.min(end);
             (start, origin.saturating_add(size).min(end) - start)
         };
-        self.scissors = scissors
+        let rects = scissors
             .iter()
             .map(|s| {
                 let (x, width) = clip(s.x, s.width, width);
@@ -318,7 +382,7 @@ impl EncoderState {
                 ScissorRect::new(x, y, width, height)
             })
             .collect();
-        Ok(())
+        Ok(ScissorRects(rects))
     }
 
     pub(super) fn set_cull_mode(&mut self, mode: CullMode) {
@@ -344,6 +408,21 @@ impl EncoderState {
     /// Whether the mode is past 1, which Metal draws a third way.
     pub(super) fn provoking_third(&self) -> bool {
         self.provoking_third
+    }
+
+    /// `setLineWidth:`, as Metal quantizes it (`render/line_width.rs`).
+    pub(super) fn set_line_width(&mut self, width: LineWidth) {
+        self.line_width = width;
+    }
+
+    /// The width the encoder's lines are drawn at.
+    pub(super) fn line_width(&self) -> LineWidth {
+        self.line_width
+    }
+
+    /// `setTriangleFillMode:`'s mode.
+    pub(super) fn fill_mode(&self) -> TriangleFillMode {
+        self.fill_mode
     }
 
     pub(super) fn set_winding(&mut self, winding: Winding) {
@@ -397,7 +476,8 @@ impl EncoderState {
         self.alpha_test_reference = Some(value);
     }
 
-    /// `setTriangleFillMode:`: `Lines` needs `fillModeNonSolid`.
+    /// `setTriangleFillMode:`: `Lines` needs `fillModeNonSolid`, `Points` that and, on a
+    /// portability-subset device, `pointPolygons` (`metal::state::polygon_mode`).
     pub(super) fn set_fill_mode(
         &mut self,
         mode: TriangleFillMode,
@@ -792,11 +872,6 @@ impl EncoderState {
         Ok(biased.then_some(self.depth_bias))
     }
 
-    /// The first scissor rectangle, which a draw of a pipeline that selects no viewport uses.
-    pub(super) fn first_scissor(&self) -> &ScissorRect {
-        &self.scissors[0]
-    }
-
     /// The powers of two `[sx, sy]` a draw of points widens the Vulkan viewports it uses by,
     /// about their centers ([`EncoderState::vk_viewports`]), its vertex stage scaling the
     /// position by their inverses and culling at Metal's guard band ([`guard_points`]): on each
@@ -892,40 +967,50 @@ impl EncoderState {
             .collect()
     }
 
-    /// The draw's scissors in Vulkan's terms: one per viewport it uses, the Metal rectangle of
-    /// its index, the one rectangle where the encoder holds one, and an empty one past two or
-    /// more (the module docs), each clipped to the pixels its viewport overlaps, Metal's implicit
-    /// scissor ([`viewport_pixels`]).
-    pub(super) fn vk_scissors(&self, selects: bool) -> ViewportList<vk::Rect2D> {
-        self.each_vk_scissor(selects).collect()
+    /// The draw's scissors in Vulkan's terms, through the encoder's `scissors`: one per viewport
+    /// it uses, the Metal rectangle of its index, the one rectangle where the encoder holds one,
+    /// and an empty one past two or more (the module docs), each clipped to the pixels its
+    /// viewport overlaps, Metal's implicit scissor ([`viewport_pixels`]).
+    pub(super) fn vk_scissors(
+        &self,
+        scissors: &ScissorRects,
+        selects: bool,
+    ) -> ViewportList<vk::Rect2D> {
+        self.each_vk_scissor(scissors, selects).collect()
     }
 
     /// [`vk_scissors`](Self::vk_scissors) into `rects`, of [`MAX_VIEWPORTS`] (the most a draw
     /// uses), without allocating.
     pub(super) fn vk_scissors_in<'a>(
         &self,
+        scissors: &ScissorRects,
         selects: bool,
         rects: &'a mut [vk::Rect2D; MAX_VIEWPORTS],
     ) -> &'a [vk::Rect2D] {
         let count = rects
             .iter_mut()
-            .zip(self.each_vk_scissor(selects))
+            .zip(self.each_vk_scissor(scissors, selects))
             .map(|(rect, scissor)| *rect = scissor)
             .count();
         &rects[..count]
     }
 
     /// Each of [`vk_scissors`](Self::vk_scissors), in order.
-    fn each_vk_scissor(&self, selects: bool) -> impl Iterator<Item = vk::Rect2D> + '_ {
+    fn each_vk_scissor<'a>(
+        &'a self,
+        scissors: &'a ScissorRects,
+        selects: bool,
+    ) -> impl Iterator<Item = vk::Rect2D> + 'a {
         let extent = self.extent.map(i64::from);
         let none = ScissorRect::new(0, 0, 0, 0);
+        let rects = &scissors.0;
         self.used_viewports(selects)
             .iter()
             .enumerate()
             .map(move |(i, viewport)| {
-                let s = match self.scissors.len() {
-                    1 => &self.scissors[0],
-                    _ => self.scissors.get(i).unwrap_or(&none),
+                let s = match rects.len() {
+                    1 => &rects[0],
+                    _ => rects.get(i).unwrap_or(&none),
                 };
                 // Inside the render area (checked at the setter).
                 let scissor = [
@@ -1092,6 +1177,14 @@ impl EncoderState {
         }
     }
 
+    /// The Vulkan front face of the encoder's front-facing winding.
+    pub(super) fn vk_front_face(&self) -> metal2vulkan::vk::FrontFace {
+        match self.winding {
+            Winding::Clockwise => metal2vulkan::vk::FrontFace::CLOCKWISE,
+            Winding::CounterClockwise => metal2vulkan::vk::FrontFace::COUNTER_CLOCKWISE,
+        }
+    }
+
     /// The state a pipeline takes statically, for `viewports` viewports.
     pub(super) fn fixed(
         &self,
@@ -1110,10 +1203,7 @@ impl EncoderState {
                 CullMode::Front => metal2vulkan::vk::CullModeFlags::FRONT,
                 CullMode::Back => metal2vulkan::vk::CullModeFlags::BACK,
             },
-            front_face: match self.winding {
-                Winding::Clockwise => metal2vulkan::vk::FrontFace::CLOCKWISE,
-                Winding::CounterClockwise => metal2vulkan::vk::FrontFace::COUNTER_CLOCKWISE,
-            },
+            front_face: self.vk_front_face(),
             depth_stencil: self.vk_depth_stencil(),
             polygon_mode: metal2vulkan::metal::state::polygon_mode(self.fill_mode, profile)
                 .map_err(device_error)?,
@@ -1123,6 +1213,7 @@ impl EncoderState {
             depth_range: None,
             masks_color: false,
             provoking_last: false,
+            line_width: 1.0_f32.to_bits(),
         })
     }
 }
@@ -1346,7 +1437,9 @@ impl VertexClamp {
             device.degrade(Degradation::SampleDepthClamp, || {
                 (
                     described(state, v),
-                    "Metal adds the depth bias to each vertex's depth clamped to [0, 1], where                      the device adds it before its clamp of each sample, so a primitive past                      Metal's near or far plane stores otherwise"
+                    "Metal adds the depth bias to each vertex's depth clamped to [0, 1], where \
+                     the device adds it before its clamp of each sample, so a primitive past \
+                     Metal's near or far plane stores otherwise"
                         .to_owned(),
                 )
             });
@@ -2031,6 +2124,32 @@ pub(super) enum DepthBiasEffect {
     Offset(f32),
 }
 
+impl DepthBiasEffect {
+    /// Whether `other` is the same effect, each float by its bits
+    /// (`EncoderState::same_values`).
+    fn same_bits(&self, other: &DepthBiasEffect) -> bool {
+        match (*self, *other) {
+            (
+                DepthBiasEffect::Factors {
+                    constant,
+                    slope,
+                    clamp,
+                },
+                DepthBiasEffect::Factors {
+                    constant: c,
+                    slope: s,
+                    clamp: k,
+                },
+            ) => [constant, slope, clamp].map(f32::to_bits) == [c, s, k].map(f32::to_bits),
+            (DepthBiasEffect::Saturated { high }, DepthBiasEffect::Saturated { high: h }) => {
+                high == h
+            }
+            (DepthBiasEffect::Offset(a), DepthBiasEffect::Offset(b)) => a.to_bits() == b.to_bits(),
+            _ => false,
+        }
+    }
+}
+
 /// Metal's depth bias of `constant`, `slope` and `clamp` factors (`setDepthBias:slopeScale:clamp:`)
 /// as measured (Metal probes on an Apple M3 Max on macOS 26.7 and an Apple M4 on 27.0.1, each case
 /// plain and validated, alike):
@@ -2177,15 +2296,20 @@ mod tests {
             vec![[0.0, 0.0, 4.0, 4.0, 0.0, 1.0]]
         );
         assert_eq!(state.used_viewports(true).len(), 2);
-        assert_eq!(state.vk_scissors(true).len(), 2, "one scissor each");
+        let scissors = ScissorRects::metal_default([8, 4]);
+        assert_eq!(
+            state.vk_scissors(&scissors, true).len(),
+            2,
+            "one scissor each"
+        );
     }
 
     /// The scissor rules (probe 4): inside the render area, an empty one included; past it,
     /// clipped to it, as plain Metal draws it; 1 to 16 of them.
     #[test]
     fn scissors_stay_inside_the_render_area() {
-        let mut state = EncoderState::metal_defaults([4, 4]);
-        let set = |state: &mut EncoderState, s: &[ScissorRect]| state.set_scissors("t", s);
+        let state = EncoderState::metal_defaults([4, 4]);
+        let set = |s: &[ScissorRect]| state.scissor_rects("t", s).map(|rects| rects.0);
         for (given, kept) in [
             (ScissorRect::new(1, 1, 2, 2), ScissorRect::new(1, 1, 2, 2)),
             (ScissorRect::new(0, 0, 0, 0), ScissorRect::new(0, 0, 0, 0)),
@@ -2197,18 +2321,18 @@ mod tests {
                 ScissorRect::new(4, 0, 0, 1),
             ),
         ] {
-            assert_eq!(set(&mut state, &[given]), Ok(()), "{given:?}");
-            assert_eq!(*state.scissors, [kept], "{given:?}");
+            assert_eq!(set(&[given]), Ok(ViewportList::One(kept)), "{given:?}");
         }
         assert_eq!(
-            set(&mut state, &[]),
+            set(&[]),
             Err(invalid(
                 "t",
                 Problem::RenderState(RenderStateProblem::Count { count: 0 })
             ))
         );
         // More than 16, as plain Metal takes them (Metal probe case `scissors_17`).
-        assert_eq!(set(&mut state, &[ScissorRect::new(0, 0, 1, 1); 17]), Ok(()));
+        let many = set(&[ScissorRect::new(0, 0, 1, 1); 17]);
+        assert_eq!(many.map(|rects| rects.len()), Ok(17));
     }
 
     /// A viewport's pixels are those it overlaps (probes 4, 4b and 4c: a 1-pixel viewport at x 4
@@ -2235,7 +2359,8 @@ mod tests {
         state.viewports = [Viewport::new(4.0, 0.0, 0.0, 8.0, 0.0, 1.0)]
             .into_iter()
             .collect();
-        assert_eq!(state.vk_scissors(false)[0].extent.width, 0);
+        let area = ScissorRects::metal_default([8, 8]);
+        assert_eq!(state.vk_scissors(&area, false)[0].extent.width, 0);
         assert_eq!(
             EncoderState::vk_viewports(state.used_viewports(false), None, None)[0].width,
             1.0
@@ -2243,8 +2368,8 @@ mod tests {
         state.viewports = [Viewport::new(2.0, 2.0, 4.0, 4.0, 0.0, 1.0)]
             .into_iter()
             .collect();
-        state.scissors = [ScissorRect::new(3, 0, 5, 8)].into_iter().collect();
-        let clipped = state.vk_scissors(false)[0];
+        let rects = state.scissor_rects("t", &[ScissorRect::new(3, 0, 5, 8)]);
+        let clipped = state.vk_scissors(&rects.unwrap(), false)[0];
         assert_eq!(
             (
                 clipped.offset.x,
@@ -2477,10 +2602,7 @@ mod tests {
         use metal2vulkan::vk::PrimitiveTopology as T;
         use DepthBiasEffect::{Factors, Offset, Saturated};
         // The repository's profile: this test runs only from the workspace checkout.
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../metal2vulkan-validation/profiles/moltenvk-m3.json"
-        );
+        let path = metal2vulkan_devtools::validation_dir().join("profiles/moltenvk-m3.json");
         let text = std::fs::read_to_string(path).unwrap();
         let description =
             metal2vulkan::device::DeviceDescription::from_khronos_json(&text, None).unwrap();
@@ -3122,10 +3244,7 @@ mod tests {
     fn biased_depths_move_the_draw_s_viewports() {
         use metal2vulkan::vk::PrimitiveTopology as T;
         // The repository's profile: this test runs only from the workspace checkout.
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../metal2vulkan-validation/profiles/moltenvk-m3.json"
-        );
+        let path = metal2vulkan_devtools::validation_dir().join("profiles/moltenvk-m3.json");
         let text = std::fs::read_to_string(path).unwrap();
         let description =
             metal2vulkan::device::DeviceDescription::from_khronos_json(&text, None).unwrap();
@@ -3207,10 +3326,8 @@ mod tests {
     fn a_returned_depth_keeps_its_range_under_the_written_clamp_s_compensation() {
         use metal2vulkan::vk::PrimitiveTopology as T;
         // The repository's profile: this test runs only from the workspace checkout.
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../metal2vulkan-validation/profiles/intel-irisxe-rplp-anv.json"
-        );
+        let path =
+            metal2vulkan_devtools::validation_dir().join("profiles/intel-irisxe-rplp-anv.json");
         let text = std::fs::read_to_string(path).unwrap();
         let description =
             metal2vulkan::device::DeviceDescription::from_khronos_json(&text, None).unwrap();

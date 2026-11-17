@@ -4,10 +4,12 @@
 //! each is the runtime's own.
 //!
 //! Exact means one of:
-//! - the call states Metal's default, which every runtime object already has: a line width of
-//!   1, the viewport transform on;
+//! - the call states Metal's default, which every runtime object already has: the viewport
+//!   transform on;
 //! - the call sets encoder state the runtime draws as Metal does: a provoking vertex mode of 0
-//!   or 1, `render/provoking.rs`;
+//!   or 1, `render/provoking.rs`; a line width, `render/line_width.rs` (the device's own lines
+//!   where they differ from Metal's are announced, `device-wide-lines`, and those at the nearest
+//!   width they draw where neither they nor the band draw Metal's, `lines-at-nearest-width`);
 //! - the call acts on state no runtime object has: Vulkan shows no texture compression, so a
 //!   reinterpretation flush has nothing to flush, and after an invalidation Metal leaves the
 //!   contents undefined, so keeping them is one of the outcomes Metal allows;
@@ -29,8 +31,6 @@
 //! otherwise there (`provoking-vertex-unmatched`).
 //!
 //! Every other call is refused, and records nothing:
-//! - a line width other than 1 (Apple's wide-line rule is unmeasured, where Vulkan has
-//!   `wideLines`);
 //! - a vertex amplification mode whose count is 0, which draws a number of copies that changes
 //!   from run to run on Metal, or above 8 (9 draws one copy and 16 and 32 eight, the rest
 //!   unmeasured), and one whose count passes the view mappings kept (unmeasured);
@@ -72,8 +72,6 @@ pub enum AppleOnly {
     /// (`command_buffer/protection.rs`): options changed once an encoder was made under some, or
     /// after options from 0x10 up, and a resource state encoder made under 1, 3 or 7.
     ProtectedContent,
-    /// A line width other than 1 (`setLineWidth:`).
-    LineWidth,
     /// The viewport transform turned off (`setViewportTransformEnabled:NO`).
     ViewportTransformDisabled,
     /// `setVertexAmplificationMode:value:` of a count (the value's set bits in mode 1, else the
@@ -106,7 +104,6 @@ impl AppleOnly {
     pub const fn gap(self) -> AppleOnlyGap {
         match self {
             Self::ProtectedContent
-            | Self::LineWidth
             | Self::ViewportTransformDisabled
             | Self::VertexAmplificationMode
             | Self::SurfaceClientDirection => AppleOnlyGap::Unmeasured,
@@ -175,19 +172,19 @@ impl AppleOnlyCall {
 
     /// The runtime's answer: `Ok` where it takes the call (it states Metal's default, acts on
     /// state no runtime object has, so it records nothing, or sets the encoder's provoking
-    /// vertex, [`RenderCommandEncoder::set_provoking_vertex_mode`]), else the refusal naming the
-    /// missing feature.
+    /// vertex or line width, [`RenderCommandEncoder::set_provoking_vertex_mode`] and
+    /// [`RenderCommandEncoder::set_line_width`]), else the refusal naming the missing feature.
     pub fn check(self) -> Result<(), AppleOnly> {
         match self {
             AppleOnlyCall::InvalidateCompressedTexture
             | AppleOnlyCall::InvalidateCompressedTextureSlice
             | AppleOnlyCall::CompressedTextureReinterpretationFlush
             | AppleOnlyCall::SetAlphaTestReferenceValue(_)
+            | AppleOnlyCall::SetLineWidth(_)
             | AppleOnlyCall::SetPointSize(_)
             | AppleOnlyCall::SetProvokingVertexMode(_)
             | AppleOnlyCall::SetDepthCleared
             | AppleOnlyCall::SetStencilCleared => Ok(()),
-            AppleOnlyCall::SetLineWidth(width) => default_or(width == 1.0, AppleOnly::LineWidth),
             AppleOnlyCall::SetViewportTransformEnabled(enabled) => {
                 default_or(enabled, AppleOnly::ViewportTransformDisabled)
             }
@@ -241,7 +238,7 @@ impl BlitCommandEncoder {
             |_| BlitCall::InvalidateCompressedTexture(texture.clone()),
             |this| {
                 this.core()
-                    .check_device("invalidate_compressed_texture", texture.device())?;
+                    .check_device("invalidate_compressed_texture", texture.generation())?;
                 answer(AppleOnlyCall::InvalidateCompressedTexture)
             },
         )
@@ -261,7 +258,7 @@ impl BlitCommandEncoder {
             |_| BlitCall::InvalidateCompressedTextureSlice(texture.clone(), slice, level),
             |this| {
                 const CALL: &str = "invalidate_compressed_texture_slice";
-                this.core().check_device(CALL, texture.device())?;
+                this.core().check_device(CALL, texture.generation())?;
                 check_slice_level(CALL, texture, slice, level)?;
                 answer(AppleOnlyCall::InvalidateCompressedTextureSlice)
             },
@@ -287,7 +284,9 @@ impl RenderLowering {
     /// The lowering of [`RenderCommandEncoder::set_line_width`].
     pub(crate) fn set_line_width(&mut self, width: f32) -> Result<(), Error> {
         self.log(|_| RenderCall::LineWidth(width));
-        answer(AppleOnlyCall::SetLineWidth(width))
+        answer(AppleOnlyCall::SetLineWidth(width))?;
+        self.set_encoder_line_width(width);
+        Ok(())
     }
 
     /// The lowering of [`RenderCommandEncoder::set_point_size`].
@@ -346,9 +345,27 @@ impl RenderCommandEncoder {
         }
     }
 
-    /// `setLineWidth:` (SPI): accepted at Metal's default width of 1, which every line the
-    /// runtime draws has; any other width is refused ([`AppleOnly::LineWidth`]): Apple's
-    /// wide-line rule is unmeasured.
+    /// `setLineWidth:` (SPI): the width the encoder's lines, and triangles' edges in fill mode
+    /// `Lines`, are drawn at after the call, until the next call or the encoder's end, each encoder
+    /// starting at 1, as Metal draws it (the M3 Max, macOS 27.0.1): `floor(16 width) / 16` clamped
+    /// to `[0, 16]`, NaN and every width not above 0 as 0. At 1 a line is Metal's ordinary one; at
+    /// any other width the parallelogram whose minor-axis edges pass through the endpoints, each
+    /// that width long, a strip's segments and a triangle's edges each their own; at 0 as at 1/16.
+    /// Points and filled triangles do not change. Every width is accepted. A draw at another width
+    /// than 1 runs the device's own lines where they draw it (announced `device-wide-lines` where
+    /// they differ from Metal's, or under `WideLinePolicy::Exact` the band below where they do),
+    /// else the pipeline's band variant, which needs `tessellationShader`: two triangles over each
+    /// line's parallelogram, and each triangle's three edges' parallelograms, which face as the
+    /// triangle does and are culled by the cull mode (announced `wide-edge-depth-bias` under a
+    /// depth bias the device can apply otherwise than Metal). What neither draws runs the device's
+    /// own lines at the width nearest Metal's they draw (1 without `wideLines`), announced
+    /// `lines-at-nearest-width`: a mesh draw and a tessellated patch draw where the device's lines
+    /// do not draw the width, lines and edges without `tessellationShader` or of a pipeline state
+    /// whose band the translator refuses, a line in a rasterization-rate-mapped pass or of an
+    /// execution's command, and a band under vertex amplification above 1. A draw of no complete
+    /// primitive draws nothing, as Metal's. Refused at the draw (`NotImplemented(WideLines)`): a
+    /// strip's band whose list of primitives the runtime cannot draw. The runtime's README states
+    /// the route each device takes.
     pub fn set_line_width(&mut self, width: f32) -> Result<(), Error> {
         match self.lowers_at_call() {
             true => self.at_call(|lowering| lowering.set_line_width(width)),

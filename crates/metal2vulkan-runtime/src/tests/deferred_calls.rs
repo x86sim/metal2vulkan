@@ -11,7 +11,9 @@
 //! the device's lowering thread waits for it at the cap of its encoder's batches, and goes on; an
 //! end and a commit return before the lowering thread lowered the end, the commit's own work
 //! waiting for it, and the commits after it waiting behind it, and one whose own work fails
-//! completing with the refusal.
+//! completing with the refusal; a `commit_and_submit` so left is submitted by the lowering thread
+//! itself, which runs its submission check and handler, and an encoder opened there lowers its
+//! calls at their calls.
 //!
 //! Device tests: compiled only under the validation crate's GPU safety cfgs (`m2v_gpu`,
 //! `m2v_cpu_icd`), on the kind of device the cfg selects. The functions are the owned fixture
@@ -27,7 +29,8 @@ use crate::{
     BlitOption, Buffer, CommandBuffer, CommandBufferError, CommandBufferStatus, Degradation,
     DegradeNotice, Device, DeviceKind, DeviceOptions, EncoderCall, Error, EventRef, FailureOrigin,
     MessageSink, Origin, Problem, RenderCommandEncoder, RenderPipelineState, ResourceOptions,
-    ShaderCacheOptions, Size, Texture, TextureDescriptor, VertexAmplificationViewMapping, Viewport,
+    ShaderCacheOptions, Size, Submission, Texture, TextureDescriptor,
+    VertexAmplificationViewMapping, Viewport,
 };
 use ash::vk;
 use metal2vulkan::device::{PipelineWaitPolicy, RenderLoweringPolicy};
@@ -370,8 +373,9 @@ const POINTS: EncoderCall = EncoderCall {
 };
 
 /// A notice announced while a call is lowered names it under `Worker`, and none under `AtCall`,
-/// where the call lowers itself; with no kind refused (the default) it reaches the sink and the
-/// command buffer runs.
+/// where the call lowers itself, and names the call's command buffer under both
+/// (`DegradeNotice::command_buffer`); with no kind refused (the default) it reaches the sink and
+/// the command buffer runs.
 #[test]
 fn a_notice_announced_as_a_call_is_lowered_names_it() {
     let scratch = Scratch::new("deferred-notice");
@@ -400,7 +404,81 @@ fn a_notice_announced_as_a_call_is_lowered_names_it() {
             _ => None,
         };
         assert_eq!(notice.call, named, "{policy:?}");
+        assert_eq!(
+            notice.command_buffer,
+            Some(command_buffer.object_id()),
+            "{policy:?}"
+        );
     }
+}
+
+/// Under `Worker`, a notice the device's lowering thread announces as it lowers a logged call,
+/// after the encoder's end returned and before the program makes any other call, names the call
+/// and its command buffer (`DegradeNotice::command_buffer`), not another command buffer the program
+/// holds; a notice the device announces between two calls of the encoder, for a resource it makes
+/// (`private-resource-option`, an indirect command buffer of Metal's private option bit), names
+/// none.
+#[test]
+fn a_notice_the_lowering_thread_announces_names_its_command_buffer() {
+    let scratch = Scratch::new("deferred-notice-thread");
+    let heard: Arc<Mutex<Vec<(DegradeNotice, Option<String>)>>> = Arc::default();
+    let device = device_with(&scratch.0, &Heard::default(), |options| {
+        options.policy.render_lowering = RenderLoweringPolicy::Worker;
+        let heard = Arc::clone(&heard);
+        options.messages = Some(MessageSink::new(move |message| {
+            if let Some(notice) = &message.degradation {
+                heard.lock().unwrap().push((notice.clone(), thread_name()));
+            }
+        }));
+    });
+    let state = rectangle_state(&device);
+    let queue = device.new_command_queue().unwrap();
+    let other = queue.command_buffer().unwrap();
+    let command_buffer = queue.command_buffer().unwrap();
+    assert_ne!(other.object_id(), command_buffer.object_id());
+    let target = target(&device);
+    let mut encoder = command_buffer
+        .render_command_encoder(&pass(&target))
+        .unwrap();
+    rectangle(&state, &mut encoder);
+    // A resource made between the encoder's calls: the device's notice, no command buffer's.
+    let options = ResourceOptions::shared().raw() | ResourceOptions::PRIVATE_BIT;
+    let mut commands = crate::IndirectCommandBufferDescriptor::new();
+    commands.command_types = metal2vulkan::metal::IndirectCommandType::CONCURRENT_DISPATCH_THREADS;
+    commands.max_kernel_buffer_bind_count = 1;
+    let _private = device
+        .new_indirect_command_buffer(&commands, 1, ResourceOptions::from_raw(options).unwrap())
+        .unwrap();
+    let color = bytes_of(&COLOR, f32::to_le_bytes);
+    encoder.set_fragment_bytes(&color, 0).unwrap();
+    encoder
+        .draw_primitives(PrimitiveType::Point, 0, 4, 1, 0)
+        .unwrap();
+    encoder.end_encoding().unwrap();
+    // No call of the program's lowers the draw: the lowering thread does.
+    let find = |kind: Degradation| {
+        let heard = heard.lock().unwrap();
+        (heard.iter())
+            .find(|(notice, _)| notice.degradation == kind)
+            .cloned()
+    };
+    let deadline = Instant::now() + WAIT;
+    let (points, on) = loop {
+        if let Some(found) = find(Degradation::UnsizedPoints) {
+            break found;
+        }
+        assert!(Instant::now() < deadline, "no notice of unsized points");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(on.as_deref(), Some("metal2vulkan-lowering"));
+    assert_eq!(points.call, Some(POINTS));
+    assert_eq!(points.command_buffer, Some(command_buffer.object_id()));
+    let (private, _) = find(Degradation::PrivateResourceOption).expect("private-resource-option");
+    assert_eq!(private.command_buffer, None);
+    command_buffer.commit().unwrap();
+    command_buffer.wait_until_completed_for(WAIT).unwrap();
+    assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
+    drop(other);
 }
 
 /// A kind the device refuses while lowering (`lowering_refuses`) refuses the call it is announced
@@ -646,6 +724,12 @@ fn a_call_made_while_a_buffer_is_detached_is_lowered_at_the_call() {
 /// the thread held, the program's calls stop at the cap, its log grows no more, and once the hold
 /// goes every call is lowered once, in order (the last draw's color left): by the thread, and what
 /// it had not taken as the encoder ended on the program's thread.
+///
+/// The thread takes its first turn late, as on a loaded host: the program reaches the cap before
+/// the thread took any batch, and goes on by one batch once it takes one. So the calls made are
+/// read only once the thread lowers a batch, which the hold keeps it at, with the cap handed: the
+/// program then waits until the hold goes. Read at the cap alone, they may be read before the
+/// thread's first turn, and the program's batch after it.
 #[test]
 fn a_program_that_outruns_the_lowering_thread_waits_for_it() {
     let scratch = Scratch::new("deferred-outrun");
@@ -694,10 +778,11 @@ fn a_program_that_outruns_the_lowering_thread_waits_for_it() {
     let [slot] = &slots[..] else {
         panic!("{} encoders' slots taken, not one", slots.len());
     };
+    slot.turn_late(Duration::from_millis(100));
     let (stopped, after, handed) = slot.while_held(|| {
         go.send(()).unwrap();
         until("the program's calls stop at the cap", || {
-            slot.handed() == HANDED_BATCHES
+            slot.handed() == (HANDED_BATCHES, true)
         });
         let stopped = made.load(Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(200));
@@ -709,7 +794,8 @@ fn a_program_that_outruns_the_lowering_thread_waits_for_it() {
         "{stopped} of {draws} draws made at the cap"
     );
     assert_eq!(
-        handed, HANDED_BATCHES,
+        handed,
+        (HANDED_BATCHES, true),
         "batches handed with the thread held"
     );
     let words = encoding.join().unwrap();
@@ -981,6 +1067,144 @@ fn a_commit_after_an_end_in_flight_returns_and_keeps_its_order() {
     }
 }
 
+/// The name of the thread that runs this.
+fn thread_name() -> Option<String> {
+    std::thread::current().name().map(str::to_owned)
+}
+
+/// A command buffer's submission check, submission handler and render encoder as a test of
+/// [`a_commit_and_submit_after_an_end_in_flight_is_submitted_by_the_lowering_thread`] saw them:
+/// which ran on which thread, and the command buffer the handler committed, with whether its
+/// encoder lowered its calls at their calls.
+#[derive(Default)]
+struct RanOn {
+    ran: Vec<(&'static str, Option<String>)>,
+    inner: Option<(bool, CommandBuffer)>,
+}
+
+/// Under `RenderLoweringPolicy::Worker`, a `commit_and_submit` after an end in flight returns
+/// before the end is lowered, as `commit` does, and the device's lowering thread, which then runs
+/// the commit's own work, makes the call's pass too (`CommandBuffer::commit_queued`): one pass at
+/// commit, which runs the command buffer's submission check and then its submission handler on
+/// that thread and submits its batch (`WorkCounts::scheduler_passes_at_commit`,
+/// `batches_submitted_at_commit`, `batches_checked_at_commit`), with no wake of the scheduler's
+/// thread for it; the pass completes. A render encoder the handler opens there lowers its calls
+/// at their calls (`render/deferral.rs`, "At the call"), and the command buffer the handler
+/// commits completes.
+#[test]
+fn a_commit_and_submit_after_an_end_in_flight_is_submitted_by_the_lowering_thread() {
+    let scratch = Scratch::new("deferred-commit-and-submit");
+    let policy = RenderLoweringPolicy::Worker;
+    let device = device(&scratch.0, policy, &[], &Heard::default());
+    let seen = Arc::new(Mutex::new(RanOn::default()));
+    let (opened, open) = mpsc::channel();
+    let (go, going) = mpsc::channel::<()>();
+    let (returned, returns) = mpsc::channel();
+    let (completed, completes) = mpsc::channel();
+    let encoding = std::thread::spawn({
+        let device = device.clone();
+        let seen = Arc::clone(&seen);
+        move || {
+            let state = rectangle_state(&device);
+            let queue = device.new_command_queue().unwrap();
+            let (target, inner_target) = (target(&device), target(&device));
+            let command_buffer = queue.command_buffer().unwrap();
+            let checked = Arc::clone(&seen);
+            command_buffer
+                .set_submission_check(Arc::new(move |_: &Submission<'_>| {
+                    checked.lock().unwrap().ran.push(("check", thread_name()));
+                    None
+                }))
+                .unwrap();
+            let (handled, again) = (Arc::clone(&seen), queue.clone());
+            command_buffer
+                .add_submission_handler(Box::new(move |_: &CommandBuffer| {
+                    handled.lock().unwrap().ran.push(("handler", thread_name()));
+                    let command_buffer = again.command_buffer().unwrap();
+                    let encoder = command_buffer
+                        .render_command_encoder(&pass(&inner_target))
+                        .unwrap();
+                    let at_call = encoder.lowers_at_call();
+                    encoder.end_encoding().unwrap();
+                    command_buffer.commit().unwrap();
+                    handled.lock().unwrap().inner = Some((at_call, command_buffer));
+                }))
+                .unwrap();
+            command_buffer
+                .add_completed_handler(Box::new(move |done: &CommandBuffer| {
+                    let _ = completed.send((done.status(), done.error()));
+                }))
+                .unwrap();
+            let mut encoder = command_buffer
+                .render_command_encoder(&pass(&target))
+                .unwrap();
+            opened.send(()).unwrap();
+            going.recv().unwrap();
+            rectangle(&state, &mut encoder);
+            encoder
+                .set_fragment_bytes(&bytes_of(&COLOR, f32::to_le_bytes), 0)
+                .unwrap();
+            encoder
+                .draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0)
+                .unwrap();
+            encoder.end_encoding().unwrap();
+            command_buffer.commit_and_submit().unwrap();
+            returned.send(command_buffer.status()).unwrap();
+        }
+    });
+    open.recv().unwrap();
+    let slots = device.shared().deferred.taken();
+    let [slot] = &slots[..] else {
+        panic!("{} encoders' slots taken, not one", slots.len());
+    };
+    let status = slot.while_held(|| {
+        go.send(()).unwrap();
+        returns.recv_timeout(WAIT).ok()
+    });
+    assert_eq!(
+        status,
+        Some(CommandBufferStatus::Committed),
+        "commit_and_submit waited for the held lowering, or its command buffer went on"
+    );
+    let done = completes.recv_timeout(WAIT);
+    assert_eq!(
+        done,
+        Ok((CommandBufferStatus::Completed, None)),
+        "the pass completes"
+    );
+    encoding.join().unwrap();
+    let (ran, inner) = {
+        let seen = seen.lock().unwrap();
+        (seen.ran.clone(), seen.inner.clone())
+    };
+    let lowering = Some("metal2vulkan-lowering".to_owned());
+    assert_eq!(
+        ran,
+        [("check", lowering.clone()), ("handler", lowering)],
+        "the check and the handler ran on the lowering thread"
+    );
+    let Some((at_call, inner)) = inner else {
+        panic!("the submission handler committed no command buffer");
+    };
+    assert!(
+        at_call,
+        "an encoder opened on the lowering thread logged its calls"
+    );
+    inner.wait_until_completed_for(WAIT).unwrap();
+    assert_eq!(inner.status(), CommandBufferStatus::Completed);
+    let counts = device.work_counts();
+    let passed = (
+        counts.scheduler_passes_at_commit,
+        counts.batches_submitted_at_commit,
+        counts.batches_checked_at_commit,
+    );
+    assert_eq!(passed, (1, 1, 1), "{counts:?}");
+    assert!(
+        counts.render_log_commits_by_thread >= 1,
+        "the lowering thread ran no commit: {counts:?}"
+    );
+}
+
 /// A commit after an end in flight takes a command buffer one of whose units of command predication
 /// ended with a live block open, under both policies alike: an If whose condition failed, left open
 /// in a compute encoder before the pass, fails the command buffer at its completion with Metal's
@@ -1185,8 +1409,8 @@ fn a_draw_whose_pipeline_was_not_made_runs_nothing_and_its_command_buffer_runs_o
     }
 }
 
-/// The 10 s a guest's FIFO check gives one of its command buffers' executions, past which it ends
-/// the guest's task: no wait for a pipeline's making may hold a command buffer that long.
+/// The 10 s a guest's FIFO check gave one of its command buffers' executions: no program call (a
+/// state's creation, a `commit`) waits that long for a pipeline's making.
 const GUEST_WATCHDOG: Duration = Duration::from_secs(10);
 
 /// A render pass of `state`'s rectangle in [`COLOR`] into `target`, and a copy of `target` after
@@ -1208,21 +1432,51 @@ fn rectangle_pass(
     copy_back(device, command_buffer, target)
 }
 
-/// A draw whose pipeline is still being made at its command buffer's bound runs nothing, under
-/// `PipelineWaitPolicy::Bounded` (the default), the slow compile the pool's test hold
-/// (`pool::held`), which keeps every making waiting, no sleep: the state's creation hands its
-/// predicted key's making to the held pool and returns at its own bound, the policy's creation
-/// wait as set ([`CREATION_WAIT`], before the commit wait), the making still waiting
-/// (`WorkCounts::creations_left_making`), never past the 10 s a guest's FIFO check allows. The
-/// rectangle's draw takes that making, and its command buffer, committed with the pool still held,
-/// completes without error once its own bound passed, the policy's commit wait as set
-/// ([`COMMIT_WAIT`]), within those 10 s: the pass clears its
-/// target and the blit after it copies it, `dropped_draw` names the draw (encoder 0, draw 0,
-/// `VK_TIMEOUT`), `failed_pipeline` nothing, counted `draws_dropped_still_making` (not
-/// `draws_dropped_unmade`) and announced `draw-dropped-still-making`. Once the hold goes the making
-/// lands, and a later command buffer draws the rectangle.
+/// Check that `command_buffer`, committed at `committed` with a making it records held in the
+/// pool, is not completed a second past its bound ([`COMMIT_WAIT`] after its commit), while a
+/// command buffer of another queue of `device`'s, committed meanwhile, fills a buffer of its own
+/// and completes: only the held command buffer's queue waits for the making.
+fn held_past_its_bound(device: &Device, command_buffer: &CommandBuffer, committed: Instant) {
+    let past = (COMMIT_WAIT + Duration::from_secs(1)).saturating_sub(committed.elapsed());
+    assert!(
+        command_buffer.wait_until_completed_for(past).is_err(),
+        "completed with its making held"
+    );
+    let other = device.new_command_queue().unwrap();
+    let buffer = device
+        .new_buffer_with_bytes(&[0; 64], ResourceOptions::shared())
+        .unwrap();
+    let filling = other.command_buffer().unwrap();
+    let mut blit = filling.blit_command_encoder().unwrap();
+    blit.fill_buffer(&buffer, 0..64, 0x5a).unwrap();
+    blit.end_encoding().unwrap();
+    filling.commit().unwrap();
+    filling
+        .wait_until_completed_for(WAIT)
+        .expect("another queue's command buffer completes meanwhile");
+    assert_eq!(filling.status(), CommandBufferStatus::Completed);
+    assert!(words_of(&buffer).iter().all(|&w| w == 0x5a5a_5a5a));
+    assert_ne!(
+        command_buffer.status(),
+        CommandBufferStatus::Completed,
+        "completed with its making held"
+    );
+}
+
+/// A draw whose pipeline is still being made past its command buffer's bound renders once its
+/// making lands, under `PipelineWaitPolicy::Bounded` (the default), the slow compile the pool's
+/// test hold (`pool::held`), which keeps every making waiting, no sleep: the state's creation
+/// hands its predicted key's making to the held pool and returns at its own bound, the policy's
+/// creation wait as set ([`CREATION_WAIT`], before the commit wait), the making still waiting
+/// (`WorkCounts::creations_left_making`), never past the 10 s a guest's FIFO check allowed. The
+/// rectangle's draw takes that making: its command buffer, committed with the pool still held,
+/// is not completed a second past its own bound (the policy's commit wait as set,
+/// [`COMMIT_WAIT`]) while another queue's command buffer completes meanwhile; once the hold goes,
+/// the making lands and the command buffer completes without error, the rectangle drawn,
+/// `dropped_draw` naming nothing, nothing counted in `draws_dropped_unmade` and no
+/// `draw-dropped-unmade` announced.
 #[test]
-fn a_draw_whose_pipeline_is_still_being_made_at_its_bound_runs_nothing() {
+fn a_draw_whose_pipeline_is_still_being_made_past_its_bound_renders_once_made() {
     let scratch = Scratch::new("deferred-making-bound");
     let heard = Heard::default();
     let device = waiting_device(&scratch.0, PipelineWaitPolicy::Bounded, &heard);
@@ -1253,66 +1507,45 @@ fn a_draw_whose_pipeline_is_still_being_made_at_its_bound_runs_nothing() {
     );
     let committing = Instant::now();
     command_buffer.commit().unwrap();
-    command_buffer
-        .wait_until_completed_for(GUEST_WATCHDOG)
-        .expect("the command buffer completes at its bound with its draw's making held");
-    let waited = committing.elapsed();
     assert!(
-        (COMMIT_WAIT..GUEST_WATCHDOG).contains(&waited),
-        "completed after {waited:?}, not its own bound"
+        committing.elapsed() < COMMIT_WAIT,
+        "the commit waited for the making"
     );
+    held_past_its_bound(&device, &command_buffer, committing);
+    drop(hold);
+    command_buffer
+        .wait_until_completed_for(WAIT)
+        .expect("the command buffer completes once its draw's making lands");
     assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
     assert_eq!(command_buffer.error(), None);
     assert!(command_buffer.failed_pipeline().is_none());
-    let dropped = command_buffer
-        .dropped_draw()
-        .expect("the draw dropped is named");
-    assert_eq!((dropped.encoder, dropped.draw), (0, 0));
-    assert_eq!(dropped.error, vulkan(vk::Result::TIMEOUT));
-    assert!(words_of(&back).iter().all(|&w| w == 0), "the draw drew");
-    let after = device.work_counts();
-    assert_eq!(
-        after.draws_dropped_still_making - counts.draws_dropped_still_making,
-        1
+    assert!(command_buffer.dropped_draw().is_none());
+    assert!(
+        words_of(&back).iter().all(|&w| w == PACKED),
+        "the rectangle, drawn"
     );
+    let after = device.work_counts();
     assert_eq!(after.draws_dropped_unmade, counts.draws_dropped_unmade);
     assert!(
-        (heard.lock().unwrap().iter())
-            .any(|notice| notice.degradation == Degradation::DrawDroppedStillMaking),
-        "no notice of the dropped draw"
+        !(heard.lock().unwrap().iter())
+            .any(|notice| notice.degradation == Degradation::DrawDroppedUnmade),
+        "a draw was dropped"
     );
-    drop(hold);
-    // The making lands for the command buffers after it.
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let command_buffer = queue.command_buffer().unwrap();
-        let back = rectangle_pass(
-            &device,
-            &command_buffer,
-            (&state, &target),
-            PrimitiveType::Triangle,
-        );
-        let words = committed(&command_buffer, &back);
-        if command_buffer.dropped_draw().is_none() {
-            assert!(words.iter().all(|&w| w == PACKED), "the rectangle, drawn");
-            break;
-        }
-        assert!(Instant::now() < deadline, "the making never landed");
-    }
 }
 
 /// A draw of an execution's replay whose pipeline is still being made at its command buffer's
-/// bound runs nothing, under `PipelineWaitPolicy::Bounded` (the default), the slow compile the
-/// pool's test hold (`pool::held`), no sleep. The commit replays the records the CPU wrote as it
-/// reads them, so the draw takes no pending recording: it waits for its making, held in the pool,
-/// until the bound, then records nothing. The commit returns once the bound passed, within the
-/// 10 s a guest's FIFO check allows, and the command buffer completes without error, its pass
-/// clearing its target and the blit after it copying it: `dropped_draw` names the draw (its
-/// execution's encoder 0, draw 0, `VK_TIMEOUT`), `failed_pipeline` nothing, counted
-/// `draws_dropped_still_making` and announced `draw-dropped-still-making`. Once the hold goes the
-/// making lands, and a later command buffer draws the rectangle.
+/// bound renders once its making lands, under `PipelineWaitPolicy::Bounded` (the default), the
+/// slow compile the pool's test hold (`pool::held`), no sleep. The commit replays the records the
+/// CPU wrote as it reads them, so the draw takes no pending recording: the replay waits for its
+/// making, held in the pool, until the bound, then leaves the pass to the host step
+/// (`DeferredPass::left_for_makings`). The commit returns once the bound passed, within the 10 s
+/// a guest's FIFO check allows; the command buffer is not completed a second past its bound
+/// while another queue's command buffer completes meanwhile; once the hold goes, the making lands
+/// and the command buffer completes without error, the rectangle drawn and copied by the blit
+/// after its pass, `dropped_draw` and `failed_pipeline` naming nothing, nothing counted in
+/// `draws_dropped_unmade` and no `draw-dropped-unmade` announced.
 #[test]
-fn a_replayed_draw_whose_pipeline_is_still_being_made_at_its_bound_runs_nothing() {
+fn a_replayed_draw_whose_pipeline_is_still_being_made_at_its_bound_renders_once_made() {
     use super::encoder_holds::library;
     use crate::{IndirectCommandBufferDescriptor, PipelineOptions};
     use metal2vulkan::metal::{IndirectCommandType, RenderStages, ResourceUsage};
@@ -1379,59 +1612,44 @@ fn a_replayed_draw_whose_pipeline_is_still_being_made_at_its_bound_runs_nothing(
     let back = replayed(&command_buffer);
     let committing = Instant::now();
     command_buffer.commit().unwrap();
-    command_buffer
-        .wait_until_completed_for(GUEST_WATCHDOG)
-        .expect("the command buffer completes at its bound with its draw's making held");
-    let waited = committing.elapsed();
+    let took = committing.elapsed();
     assert!(
-        (COMMIT_WAIT..GUEST_WATCHDOG).contains(&waited),
-        "completed after {waited:?}, not its own bound"
+        (COMMIT_WAIT..GUEST_WATCHDOG).contains(&took),
+        "the commit took {took:?}, not its own bound"
     );
+    held_past_its_bound(&device, &command_buffer, committing);
+    drop(hold);
+    command_buffer
+        .wait_until_completed_for(WAIT)
+        .expect("the command buffer completes once its replayed draw's making lands");
     assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
     assert_eq!(command_buffer.error(), None);
     assert!(command_buffer.failed_pipeline().is_none());
-    let dropped = command_buffer
-        .dropped_draw()
-        .expect("the replayed draw dropped is named");
-    assert_eq!((dropped.encoder, dropped.draw), (0, 0));
-    assert_eq!(dropped.error, vulkan(vk::Result::TIMEOUT));
-    assert!(words_of(&back).iter().all(|&w| w == 0), "the draw drew");
-    let after = device.work_counts();
-    assert_eq!(
-        after.draws_dropped_still_making - counts.draws_dropped_still_making,
-        1
-    );
+    assert!(command_buffer.dropped_draw().is_none());
     assert!(
-        (heard.lock().unwrap().iter())
-            .any(|notice| notice.degradation == Degradation::DrawDroppedStillMaking),
-        "no notice of the dropped draw"
+        words_of(&back).iter().all(|&w| w == PACKED),
+        "the rectangle, drawn"
     );
-    drop(hold);
-    // The making lands for the command buffers after it.
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let command_buffer = queue.command_buffer().unwrap();
-        let back = replayed(&command_buffer);
-        let words = committed(&command_buffer, &back);
-        if command_buffer.dropped_draw().is_none() {
-            assert!(words.iter().all(|&w| w == PACKED), "the rectangle, drawn");
-            break;
-        }
-        assert!(Instant::now() < deadline, "the making never landed");
-    }
+    let after = device.work_counts();
+    assert_eq!(after.draws_dropped_unmade, counts.draws_dropped_unmade);
+    assert!(
+        !(heard.lock().unwrap().iter())
+            .any(|notice| notice.degradation == Degradation::DrawDroppedUnmade),
+        "a draw was dropped"
+    );
 }
 
-/// A compute dispatch whose pipeline is still being made at its command buffer's bound runs
-/// nothing, under `PipelineWaitPolicy::Bounded` (the default), the slow compile the pool's test
-/// hold (`pool::held`), no sleep. The state requires no threadgroup size, so its creation predicts
-/// nothing; the dispatch hands its region's making to the held pool, and its command buffer,
-/// committed with the pool still held, completes without error once its bound passed, within the
-/// 10 s a guest's FIFO check allows, its output unwritten: `dropped_draw` names the dispatch
-/// (encoder 0, dispatch 0, `VK_TIMEOUT`), `failed_pipeline` nothing, counted
-/// `dispatches_dropped_still_making` and announced `dispatch-dropped-still-making`. Once the hold
-/// goes the making lands, and a later command buffer writes what Metal's writes.
+/// A compute dispatch whose pipeline is still being made past its command buffer's bound runs
+/// once its making lands, under `PipelineWaitPolicy::Bounded` (the default), the slow compile the
+/// pool's test hold (`pool::held`), no sleep. The state requires no threadgroup size, so its
+/// creation predicts nothing; the dispatch hands its region's making to the held pool, and its
+/// command buffer, committed with the pool still held (the commit waits for no making), is not
+/// completed a second past its bound while another queue's command buffer completes meanwhile.
+/// Once the hold goes, the making lands and the command buffer completes without error, its
+/// output written as Metal's dispatch writes it, `dropped_draw` naming nothing: a dispatch is
+/// never dropped for its making's time.
 #[test]
-fn a_dispatch_whose_pipeline_is_still_being_made_at_its_bound_runs_nothing() {
+fn a_dispatch_whose_pipeline_is_still_being_made_past_its_bound_runs_once_made() {
     use super::dispatch_pending::{dispatch, state, Buffers, Grid};
     let scratch = Scratch::new("deferred-dispatch-bound");
     let heard = Heard::default();
@@ -1439,59 +1657,31 @@ fn a_dispatch_whose_pipeline_is_still_being_made_at_its_bound_runs_nothing() {
     let queue = device.new_command_queue().unwrap();
     let state = state(&device);
     let buffers = Buffers::new(&device);
-    let one = || Grid::One(Size::new(64, 1, 1));
-    let counts = device.work_counts();
     let hold = held::hold();
-    let command_buffer = dispatch(&queue, &state, &buffers, one());
+    let command_buffer = dispatch(&queue, &state, &buffers, Grid::One(Size::new(64, 1, 1)));
     let committing = Instant::now();
     command_buffer.commit().unwrap();
-    command_buffer
-        .wait_until_completed_for(GUEST_WATCHDOG)
-        .expect("the command buffer completes at its bound with its dispatch's making held");
-    let waited = committing.elapsed();
     assert!(
-        (COMMIT_WAIT..GUEST_WATCHDOG).contains(&waited),
-        "completed after {waited:?}, not its own bound"
+        committing.elapsed() < COMMIT_WAIT,
+        "the commit waited for the making"
     );
+    held_past_its_bound(&device, &command_buffer, committing);
+    assert!(
+        !buffers.written(2),
+        "the dispatch ran before its making landed"
+    );
+    drop(hold);
+    command_buffer
+        .wait_until_completed_for(WAIT)
+        .expect("the command buffer completes once its dispatch's making lands");
     assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
     assert_eq!(command_buffer.error(), None);
     assert!(command_buffer.failed_pipeline().is_none());
-    let dropped = command_buffer
-        .dropped_draw()
-        .expect("the dispatch dropped is named");
-    assert_eq!((dropped.encoder, dropped.draw), (0, 0));
-    assert_eq!(dropped.error, vulkan(vk::Result::TIMEOUT));
-    assert!(!buffers.written(2), "the dispatch wrote");
-    let after = device.work_counts();
-    assert_eq!(
-        after.dispatches_dropped_still_making - counts.dispatches_dropped_still_making,
-        1
-    );
-    assert_eq!(
-        after.draws_dropped_still_making,
-        counts.draws_dropped_still_making
-    );
+    assert!(command_buffer.dropped_draw().is_none());
     assert!(
-        (heard.lock().unwrap().iter())
-            .any(|notice| notice.degradation == Degradation::DispatchDroppedStillMaking),
-        "no notice of the dropped dispatch"
+        buffers.written(64),
+        "the dispatch wrote what Metal's writes"
     );
-    drop(hold);
-    // The making lands for the command buffers after it.
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let command_buffer = dispatch(&queue, &state, &buffers, one());
-        command_buffer.commit().unwrap();
-        command_buffer.wait_until_completed_for(WAIT).unwrap();
-        if command_buffer.dropped_draw().is_none() {
-            assert!(
-                buffers.written(64),
-                "the dispatch wrote what Metal's writes"
-            );
-            break;
-        }
-        assert!(Instant::now() < deadline, "the making never landed");
-    }
 }
 
 /// A compute state whose descriptor requires a threadgroup size predicts its first dispatch's
@@ -1507,8 +1697,7 @@ fn a_compute_state_s_creation_waits_its_bound_for_its_predicted_making() {
         let scratch = Scratch::new("deferred-compute-creation-bound");
         let heard = Heard::default();
         let device = waiting_device(&scratch.0, waits, &heard);
-        let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll");
+        let ll = metal2vulkan_devtools::fixtures_dir().join("examples/runtime_examples.ll");
         let bitcode = metal2vulkan_devtools::llvm_assemble(&ll).unwrap();
         let function = device
             .new_library_with_compile_library(
@@ -1585,10 +1774,7 @@ fn under_the_exact_wait_a_held_making_holds_its_command_buffer_until_it_lands() 
     assert!(command_buffer.dropped_draw().is_none());
     assert!(words_of(&back).contains(&PACKED), "the line, drawn");
     let after = device.work_counts();
-    assert_eq!(
-        after.draws_dropped_still_making,
-        counts.draws_dropped_still_making
-    );
+    assert_eq!(after.draws_dropped_unmade, counts.draws_dropped_unmade);
     assert!(!(heard.lock().unwrap().iter())
-        .any(|notice| notice.degradation == Degradation::DrawDroppedStillMaking));
+        .any(|notice| notice.degradation == Degradation::DrawDroppedUnmade));
 }

@@ -8,7 +8,18 @@
 //! `D24_UNORM_S8_UINT` for 24-bit. Stencil is 8 bits in every format.
 //!
 //! - **Before the pass**, each aspect loaded with `Load` is copied from its texture into the
-//!   scratch image; `Clear` and `DontCare` load as the scratch's own operations.
+//!   scratch image; `Clear` and `DontCare` load as the scratch's own operations. An aspect loaded
+//!   `DontCare` that the pass does not store, in a pass whose draws reach a tile, takes the answer
+//!   of any attachment so loaded (`clear_reach.rs`, `UnstoredDontCarePolicy`), each aspect apart:
+//!   the scratch's `Clear` to the aspect's clear value, Metal's answer (an M3 Max under macOS
+//!   27.0.1, `runtime_lane::dont_care_unstored`), or its `DONT_CARE`, announced
+//!   `dont-care-unstored-load`. One the pass stores takes the single texture's answer too
+//!   (`clear_reach.rs`, measured alike on the M3 Max under macOS 27.0.1): its texels where the
+//!   draws reach no tile, else the clear value in the tiles the draws touch, where the pass
+//!   writes the aspect, and its texels in the rest. The scratch loads it by the copy in, and its
+//!   tiles are cleared after the copy; where it cannot be copied in ([`copies_in`]: a
+//!   multisampled aspect copied by draws) the scratch clears it over the render area, announced
+//!   `dont-care-load-tiles`.
 //! - **After it**, each aspect stored with `Store`, `StoreAndMultisampleResolve` or
 //!   `CustomSampleDepthStore` is copied back (a resolve of the scratch image into the separate
 //!   resolve textures is `resolve.rs`'s split resolve). An aspect stored `DontCare` is not: its
@@ -51,6 +62,10 @@
 //! - **A layered pass** (`renderTargetArrayLength` 2 or more) renders through a scratch image of
 //!   its layers, each texture's from its slice, and the copies move every layer; the copies' draws,
 //!   each of one layer, run once per layer.
+//!
+//! - **A resolve drawn after the pass** (`depth_stencil_resolve.rs`: a `Min` or `Max` depth on a
+//!   device without the mode) reads the scratch image's samples, so the image is sampled where
+//!   such a resolve may run and the device samples its format (`resolve::may_draw`).
 //!
 //! Refused: a device without the combined format as a depth/stencil attachment that copies both
 //! ways (and, where the scratch image is read back by draws, is sampled), or, for multisampled
@@ -295,13 +310,27 @@ fn by_draws(device: &Device, samples: u32, aspect: ImageAspectFlags) -> bool {
             .is_some()
 }
 
+/// Whether each aspect of `separate` (depth, stencil) can load by a copy into the scratch image
+/// that its load did not ask for: a `DontCare` load of an aspect the pass stores, which loads
+/// the texture's texels and clears the tiles the draws touch (`clear_reach::dont_care_loads`).
+/// A single-sampled aspect, and a multisampled one the colour copies move, which its copy back
+/// already needs; not one copied by draws, whose copy in needs a sampled texture and draws the
+/// store does not.
+pub(super) fn copies_in(device: &Device, separate: &Separate) -> [bool; 2] {
+    let samples = separate.depth.as_ref().unwrap_or(&separate.stencil).samples;
+    [ImageAspectFlags::DEPTH, ImageAspectFlags::STENCIL]
+        .map(|aspect| samples == 1 || !by_draws(device, samples, aspect))
+}
+
 /// The scratch image `separate`'s pass renders into, as its depth/stencil target, whose depth and
-/// stencil aspects load with `loads` and store with `stores`. Refused as the module docs say.
+/// stencil aspects load with `loads` and store with `stores`, and whose samples a resolve drawn
+/// after the pass may read where `drawn` (`resolve::may_draw`). Refused as the module docs say.
 pub(super) fn scratch(
     maker: &CommandBuffer,
     separate: &Separate,
     loads: [LoadAction; 2],
     stores: [StoreAction; 2],
+    drawn: bool,
 ) -> Result<Target, Error> {
     let device = maker.device();
     // The first texture: both have the pass's samples and layers, and the scratch image the
@@ -415,6 +444,14 @@ pub(super) fn scratch(
             FormatUsage::SampledImage,
         )?;
     }
+    // A resolve drawn after the pass reads the samples too, where the device samples the format;
+    // elsewhere that resolve is refused (`depth_stencil_resolve::draws_run`).
+    let sampled = read_scratch
+        || (drawn
+            && multisampled
+            && facts
+                .optimal(format)
+                .contains(FormatFeatureFlags2::SAMPLED_IMAGE));
     let samples = samples_flag;
     let [width, height] = extent;
     // The descriptor states the image's size and samples; its pixel format is the depth
@@ -454,7 +491,7 @@ pub(super) fn scratch(
         usage: ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
             | ImageUsageFlags::TRANSFER_SRC
             | ImageUsageFlags::TRANSFER_DST
-            | if read_scratch {
+            | if sampled {
                 ImageUsageFlags::SAMPLED
             } else {
                 ImageUsageFlags::empty()

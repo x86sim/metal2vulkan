@@ -8,12 +8,18 @@
 //!   (`device/functions.rs`, the exit guard's table among them) and the extension commands it loads
 //!   ([`Slot::route`]) hold the slot's entry points. Each is generic over its slot, so it finds its
 //!   device's command with one load, without a lock or a lookup by handle; a slot is let go of
-//!   with its device, after `vkDestroyDevice`. A source test fails when a file outside this module
-//!   names a command that is not routed.
+//!   with its device, after `vkDestroyDevice`, and never once the process is exiting: then it
+//!   stays with the device the exit leaves to the process's end, whose threads' sections may
+//!   still record through it ([`Slot`]'s drop). A source test fails when a file outside this
+//!   module names a command that is not routed.
 //! - **Counted by kind.** Each command recorded through a slot counts once for its kind, one
 //!   relaxed increment into a fixed array of the slot's indexed by the command, whatever the
-//!   command buffer and the thread (`WorkCounts::commands_recorded`). A device past the slots
-//!   records with its driver's commands, uncounted.
+//!   command buffer (`WorkCounts::commands_recorded`). Each slot keeps its counts in shards, one a
+//!   thread holds (`shards.rs`, the threads that hold none sharing one more), each on cache lines
+//!   of its own, and reads their sums: threads that record at once write apart, where one array
+//!   would take each of their commands' counts in turn. A device past the slots records with its
+//!   driver's commands, uncounted, and says so (`WorkCounts::commands_uncounted`), so that no
+//!   reading takes its empty counts for none recorded.
 
 mod thunks;
 
@@ -112,7 +118,16 @@ impl Slot {
 }
 
 impl Drop for Slot {
+    /// Let go of the slot, its device destroyed: a release, made in a section of the exit guard
+    /// (`exit_guard.rs`). Once the process is exiting the slot is left as it is, its driver's
+    /// entry points stored, as the device is left to the process's end: a device whose teardown
+    /// the exit cut short, or one that drops once the guard closed, leaves its threads' sections
+    /// in progress running (a section started runs to its end), and one of them recording through
+    /// a cleared slot would end the process inside the slot's entry point (`thunks::missing`).
     fn drop(&mut self) {
+        let Some(_busy) = crate::exit_guard::enter() else {
+            return;
+        };
         thunks::clear(self.index);
         TAKEN[self.index].store(false, Ordering::Release);
     }
@@ -148,6 +163,24 @@ pub(crate) unsafe fn route(device: ash::Device) -> (ash::Device, Option<Slot>) {
     (routed, Some(slot))
 }
 
+/// Every slot no device holds, taken as a device takes one ([`route`]) and let go as each
+/// [`Slot`] drops: a device test's stand-in for devices holding them (`tests::recorder_slots`),
+/// so that it makes no more devices than the slots it needs, whatever number of devices a driver
+/// makes in one process.
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) fn take_free_slots() -> Vec<Slot> {
+    let free = (0..SLOTS).filter(|&index| {
+        TAKEN[index]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    });
+    free.map(|index| {
+        thunks::clear_counts(index);
+        Slot { index }
+    })
+    .collect()
+}
+
 /// `real`, a device's command `command`, through `slot` where the device has one
 /// ([`Slot::route`]), else as it is.
 ///
@@ -159,6 +192,142 @@ pub(crate) unsafe fn through<F: Copy>(slot: Option<&Slot>, command: Command, rea
         // SAFETY: the caller's.
         Some(slot) => unsafe { slot.route(command, real) },
         None => real,
+    }
+}
+
+/// `routed`, a device's command `command` as its routed functions hold it, as the device's driver
+/// gave it, where the device has `slot`: recorded through it, a command counts for no slot. Where
+/// the device has none, its functions are its driver's, and `routed` is.
+///
+/// # Safety
+///
+/// `routed` is the command of the device `slot` is of, of `command`'s signature, `F`'s.
+pub(crate) unsafe fn unrouted<F: Copy>(slot: Option<&Slot>, command: Command, routed: F) -> F {
+    assert_eq!(
+        std::mem::size_of::<F>(),
+        std::mem::size_of::<*const c_void>()
+    );
+    let real = slot.map_or(std::ptr::null(), |slot| thunks::real(slot.index, command));
+    if real.is_null() {
+        return routed;
+    }
+    // SAFETY: the driver's entry point of `command`, of `F`'s signature (the caller's).
+    unsafe { std::mem::transmute_copy::<*const c_void, F>(&real) }
+}
+
+/// The extension commands of `VK_EXT_multi_draw` a draw of a rate-mapped pass records its regions
+/// with, several at a time, routed (`render.rs`, `rate_mapped_pass.rs`), and how many regions
+/// one command draws.
+#[derive(Clone, Copy)]
+pub(crate) struct MultiDraws {
+    draw: vk::PFN_vkCmdDrawMultiEXT,
+    indexed: vk::PFN_vkCmdDrawMultiIndexedEXT,
+    /// The regions one command draws at most through their own viewports: the least of the
+    /// device's `maxViewports` and one below its `maxMultiDrawCount` ("drawCount must be less
+    /// than" it, `VUID-vkCmdDrawMultiEXT-drawCount-04934`), at least 2.
+    batch: u32,
+    /// The regions one command draws at most through their region-copy variant, which sets one
+    /// viewport (`render/fan_out.rs`, **Region-copy variant**): one below `maxMultiDrawCount`, at
+    /// least `batch`.
+    copies: u32,
+}
+
+impl MultiDraws {
+    /// The commands of `loaded`, through `slot` where the device has one, drawing `batch`
+    /// regions a command at most through their own viewports and `copies` through their
+    /// region-copy variant.
+    pub(crate) fn new(
+        loaded: &ash::ext::multi_draw::Device,
+        slot: Option<&Slot>,
+        [batch, copies]: [u32; 2],
+    ) -> MultiDraws {
+        let functions = loaded.fp();
+        let (draw, indexed) = (
+            functions.cmd_draw_multi_ext,
+            functions.cmd_draw_multi_indexed_ext,
+        );
+        match slot {
+            // SAFETY: each is the device's command of that name.
+            Some(slot) => unsafe {
+                MultiDraws {
+                    draw: slot.route(Command::CmdDrawMulti, draw),
+                    indexed: slot.route(Command::CmdDrawMultiIndexed, indexed),
+                    batch,
+                    copies,
+                }
+            },
+            None => MultiDraws {
+                draw,
+                indexed,
+                batch,
+                copies,
+            },
+        }
+    }
+
+    /// The regions one command draws at most through their own viewports.
+    pub(crate) fn batch(&self) -> u32 {
+        self.batch
+    }
+
+    /// The regions one command draws at most through their region-copy variant.
+    pub(crate) fn copies(&self) -> u32 {
+        self.copies
+    }
+
+    /// `vkCmdDrawMultiEXT` of `draws`, packed (their stride their size).
+    ///
+    /// # Safety
+    ///
+    /// As the command's.
+    pub(crate) unsafe fn cmd_draw_multi(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        draws: &[vk::MultiDrawInfoEXT],
+        instance_count: u32,
+        first_instance: u32,
+    ) {
+        let stride = std::mem::size_of::<vk::MultiDrawInfoEXT>() as u32;
+        // SAFETY: the caller's; `draws` holds `draws.len()` entries `stride` bytes apart.
+        unsafe {
+            (self.draw)(
+                command_buffer,
+                draws.len() as u32,
+                draws.as_ptr(),
+                instance_count,
+                first_instance,
+                stride,
+            )
+        }
+    }
+
+    /// `vkCmdDrawMultiIndexedEXT` of `draws`, packed (their stride their size), each with its
+    /// own vertex offset.
+    ///
+    /// # Safety
+    ///
+    /// As the command's.
+    pub(crate) unsafe fn cmd_draw_multi_indexed(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        draws: &[vk::MultiDrawIndexedInfoEXT],
+        instance_count: u32,
+        first_instance: u32,
+    ) {
+        let stride = std::mem::size_of::<vk::MultiDrawIndexedInfoEXT>() as u32;
+        // SAFETY: the caller's; `draws` holds `draws.len()` entries `stride` bytes apart, and a
+        // null `pVertexOffset` takes each one's own.
+        unsafe {
+            (self.indexed)(
+                command_buffer,
+                draws.len() as u32,
+                draws.as_ptr(),
+                instance_count,
+                first_instance,
+                stride,
+                std::ptr::null(),
+            )
+        }
     }
 }
 

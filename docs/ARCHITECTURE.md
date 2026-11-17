@@ -10,8 +10,11 @@ metallib | AIR bitcode
   ── parse ───────► Library: the container's functions                  air::container, library
   ── decode ──────► a typed AIR module and its ABI                      air::{bitstream, bitcode, ir, intrinsics, abi}
   ── specialize ──► one inlined entry: function constants baked,        air::canon
-                    constants propagated, linked functions resolved,
-                    pointee types erased
+                    constants propagated, loops of constant trip
+                    count unrolled where that decides a branch and
+                    leaves the entry no larger, private arrays
+                    allocated as far as bounded indices reach,
+                    linked functions resolved, pointee types erased
   ── analyze ─────► MemoryPlan: provenance, one representation          memory
                     per value, slot windows
   ── select ──────► Plan: a strategy per instruction and interface      lower::select, lower::strategy
@@ -19,16 +22,21 @@ metallib | AIR bitcode
                     the output-size estimate (checked here)
   ── structurize ─► a structured tree over the AIR CFG                  structurize
   ── emit ────────► a typed SPIR-V module through the builder           structurize::emit, lower::*, spirv::builder
-  ── tidy ────────► single-store promotion, dead values removed,        structurize::promote, spirv::{dead, roll}
-                    repeated regions of large entries rolled into loops
+  ── tidy ────────► single-store promotion, dead values removed,        structurize::promote, spirv::{dead, roll,
+                    half values held at 16 bits under the 16-bit float   hoist, half_hold}
+                    controls, repeated regions of large entries rolled
+                    into loops, loop-invariant loads of uniform views
+                    moved before their loops
   ── verify ──────► the full verifier; requirements within the profile  spirv::verify, spirv::requirements
   ── serialize ───► SPIR-V 1.5 words with typed relocations             spirv::serialize
   = CompiledFunction, keyed by FunctionCompileKey (the caller may cache it)
   ── link ────────► bindings, Locations, spec ids, the pipeline         pipeline::link
                     layout, pipeline-wide limits, the generated         pipeline::link::geometry
-                    geometry stages (barycentric weights read as
+                    geometry stages (barycentric weights read as        pipeline::link::band
                     varyings, a selected slice or viewport stored
-                    from the first vertex)
+                    from the first vertex), the generated
+                    tessellation stages that draw a wide line as a
+                    band
   ── relocate ────► the final words of each stage                       pipeline::relocate
   = ComputePipeline | RenderPipeline | tile and mesh pipelines
 
@@ -63,13 +71,13 @@ rest is `crates/metal2vulkan/src/`.
 
 | Module | Role |
 |---|---|
-| `air` (`metal2vulkan-air`) | The container (metallib, bitcode wrapper, raw module), the bitstream and bitcode readers, the typed IR, the `air.*` and `llvm.*` intrinsic families, the metadata ABI (`AirAbi`), and canonicalization (`canon`: inlining, function constants, SCCP, devirtualization, linking, pruning, pointee erasure, and the speculation of the short branch arms Metal's backend runs in every lane). Canonicalization also writes the formats the binder and runtime read: the visible-function table's words and the rasterization-rate map's parameter data |
+| `air` (`metal2vulkan-air`) | The container (metallib, bitcode wrapper, raw module), the bitstream and bitcode readers, the typed IR, the `air.*` and `llvm.*` intrinsic families, the metadata ABI (`AirAbi`), and canonicalization (`canon`: inlining (each `byval` argument's copy made at its call first), function constants, SCCP (a value one of a few constants, from a PHI of literal constants or a `select` between two, folded member by member so a branch every member decides alike is decided; reading the integer fields of a constant global whose value is known, folding the integer bit operations `llvm.ctpop`, `llvm.bitreverse` and `llvm.bswap` and the scalar `llvm.umin`, `llvm.umax`, `llvm.smin` and `llvm.smax` on constants, settling the float operations a constant operand decides whatever the others hold (a NaN operand, the first in order: as it is beside a value the run computes, quieted where every operand is a constant; a product by a zero under `nnan` and `nsz`, `+0`), and reading the immediates of an intrinsic call that its function's parameters gave it once inlining makes them its call site's constants), the unrolling of loops whose constant trip count decides a branch where that leaves the entry no larger, the allocation of a private array of nested arrays as far as its indices reach where constants and counted loops bound every one of them (`canon::reach`), a pointer loaded from a constant table at an index only the run knows (a table of constexpr samplers) read as the `select` chain over the table's elements (`canon::const_tables`), each of MSL 4.1's generic pointers made a pointer of the one address space every pointer it may hold comes from, its space queries answered (`canon::generic`), devirtualization, linking, the load of a stack allocation's field that one dominating store wrote read as the stored value (an aggregate holding a pointer excepted), and an allocation no read is left of removed with its stores, so a lambda's closure of captured addresses leaves the captured objects' own (`canon::forward`), pruning, pointee erasure, the speculation of the short branch arms Metal's backend runs in every lane, the split of a whole array's or struct's load or store in buffer or threadgroup memory into its members' accesses, and a kernel of a pipeline of OpenCL mode linked as Metal links it: the three hidden buffers appended, its buffer indices 3 on, OpenCL C's work-item reads made reads of their built-ins or of the first buffer, each image format query a read of the third, and each operation of a 1D image the 2D texture's that Apple's OpenCL binds for it, `canon::opencl` and `canon::opencl_1d`; and OpenCL C's vector data loads and stores made their element accesses, `canon::vector_data`). Canonicalization also writes the formats the binder and runtime read: the visible-function table's words and the rasterization-rate map's parameter data |
 | `graph` | The shared RPO, dominator tree, loop forest and SCC |
 | `budget` | `Budget`, `CancelToken`, and the per-attempt `Meter`: deadline, cancellation, work units, the byte ledger and every structural cap |
 | `memory/` | Pointer provenance, the `MemoryPlan`, leaf access emitters, arenas, root and handle lookups, word composition, atomics |
 | `lower/` | `select` (routing every instruction, intrinsic and parameter into the `Plan`), `strategy`, `push` (push-constant placement), `estimate` (output size), `specialized` (bound-texture values read as push data), and one module per family: `arith` (each float operation in the AIR's order, decorated by its own fast-math flags, so the device's compiler groups and fuses only what they allow; `half_chain`, a fast-math `half` chain held at `float` precision between its roundings where the device has no 16-bit floats), `access`, `texture`, `sampler`, `simd`, `sync`, `fragment`, `stage_io`, `dispatch`, `tessellation`, `mesh`, `raytracing` |
 | `structurize/` | The structurizer over the AIR CFG, the emit walk that drives the families, and single-store promotion |
-| `spirv/` | The typed SPIR-V IR and interners, the module and function builders, dead-value removal, the roll pass, the verifier, requirement derivation and the serializer. `spirv::interp` is a CPU interpreter used only by tests |
+| `spirv/` | The typed SPIR-V IR and interners, the module and function builders, dead-value removal, the roll pass, the move of loop-invariant loads of uniform views out of their loops (`hoist`), the 16-bit holding of `half` values under the 16-bit float controls (`half_hold`), the verifier, requirement derivation and the serializer. `spirv::interp` is a CPU interpreter used only by tests |
 | `spv.rs` | The SPIR-V grammar's opcodes and enumerants the translator names, generated from Khronos's grammar (`scripts/regen-spirv-grammar/`) |
 | `spirv_binary/` | A reader of SPIR-V's binary form over the grammar's instruction table, used only by tests |
 | `device/` | `DeviceDescription` (from a Khronos profile, or from `ash`), `DevicePolicy`, and the derived `DeviceProfile` every decision reads |
@@ -101,9 +109,10 @@ needs an internal item is one of the crate's own tests (`src/tests/`).
 - **Structure, not names.** Families decide from IR types, address spaces, the metadata ABI and the
   `air.*` and `llvm.*` intrinsic contract. No branch keys on a function, type or variable name.
 - **Typed refusals.** An input the device cannot run exactly is `Error::Unsupported`, naming the
-  Metal feature and what would make it translatable. A missing pipeline input (a function-constant
-  value, a stage-input or vertex descriptor, a storage texture's format) is `Error::NeedsInput`,
-  asked for and never guessed. A deterministic cap is `Error::LimitExceeded`. Only a deadline
+  Metal feature and what would make it translatable. A missing pipeline input (a stage-input or
+  vertex descriptor, a storage texture's format, a linked function) is `Error::NeedsInput`, asked
+  for and never guessed; a function constant left undefined is no such input, as in Metal
+  ([API.md](API.md), "Accepted differences"). A deterministic cap is `Error::LimitExceeded`. Only a deadline
   (`Error::Budget`) or a cancellation (`Error::Cancelled`) is transient.
 - **Recorded differences.** Where the output gives a near-equivalent of Metal's answer, the stage
   records a `PrecisionNote`, and `Reconvergence::ImplementationDefined` where the profile lacks

@@ -1,11 +1,14 @@
 //! `exit_guard.rs`: sections end before the hook returns, none starts after it closed, the hook
 //! never waits for the exiting thread's own sections, its wait is bounded, only its first run
 //! waits for a CPU device's work, and it acts only in the process it was registered in. A child's
-//! exit while the driver runs the runtime's work ends at once with its status where the hook learns
-//! it (Linux). Each test uses a guard of its own; only the fork tests use the process's, which
-//! nothing here closes.
+//! exit while the driver runs the runtime's work runs the exit handlers registered before the hook
+//! once that work ended within the bound, and ends at once with its status past the bound where
+//! the hook learns it (Linux). Each test uses a guard of its own; only the fork tests use the
+//! process's, which nothing here closes.
 
-use crate::exit_guard::{self, hook, Busy, Call, Guard, InProcess, InProcessDevices};
+use crate::exit_guard::{
+    self, hook, hook_after_making, After, Busy, Call, Calls, Guard, InProcess, InProcessDevices,
+};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -41,6 +44,41 @@ fn sections_start_until_the_guard_closes_and_never_after() {
     assert!(std::thread::spawn(move || guard.enter().is_none())
         .join()
         .unwrap());
+}
+
+/// Each thread's outermost section in progress keeps its caller's place, which the hook names
+/// once its wait passed half its bound: a nested section keeps none, another thread's keeps its
+/// own, and a section that ended leaves none.
+#[test]
+fn the_sections_in_progress_name_where_they_began() {
+    let guard = guard();
+    assert_eq!(exit_guard::own(), 0);
+    assert!(guard.places_in_progress().is_empty());
+    let (outer, line) = (guard.enter().expect("open"), line!());
+    let nested = guard.enter().expect("open");
+    let here = format!("{}:{line}", file!());
+    assert_eq!(guard.places_in_progress(), std::slice::from_ref(&here));
+    let (entered, done) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+    let worker = {
+        let (entered, done) = (Arc::clone(&entered), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let (busy, line) = (guard.enter().expect("open"), line!());
+            entered.wait();
+            done.wait();
+            drop(busy);
+            line
+        })
+    };
+    entered.wait();
+    let mut places = guard.places_in_progress();
+    done.wait();
+    let there = format!("{}:{}", file!(), worker.join().unwrap());
+    places.sort();
+    let mut expected = vec![here, there];
+    expected.sort();
+    assert_eq!(places, expected);
+    drop((nested, outer));
+    assert!(guard.places_in_progress().is_empty());
 }
 
 /// The hook waits for a section in progress on another thread (a submission, a poll, a device's
@@ -114,10 +152,10 @@ fn the_hook_s_wait_is_bounded() {
 }
 
 /// A section around a driver's making of a `VkPipeline` holds the hook past its bound until it
-/// ends, within the making's own bound (`MAKING_BOUND` where the hook waits, on macOS): a making
-/// outlasts the bound, and the program need not wait for it. Where the making's bound is not
-/// longer (the hook that ends the process at once, on Linux), it holds the hook no longer than the
-/// bound. One run only on a thread in a section takes such a section (`driver_making`).
+/// ends, within the making's own bound (`MAKING_BOUND`): a making outlasts the bound, and the
+/// program need not wait for it. Where the making's bound is not longer, it holds the hook no
+/// longer than the bound. One run only on a thread in a section takes such a section
+/// (`driver_making`).
 #[test]
 fn the_hook_waits_past_its_bound_for_a_making_in_progress() {
     let making = Duration::from_secs(10);
@@ -168,9 +206,49 @@ fn the_hook_waits_past_its_bound_for_a_making_in_progress() {
 
     // `driver_making` takes such a section of the process's guard only on a thread in a section.
     let before = exit_guard::own();
-    assert_eq!(exit_guard::driver_making(exit_guard::own), before);
+    assert_eq!(exit_guard::driver_making(exit_guard::own), Some(before));
     let busy = exit_guard::enter().expect("open");
-    assert_eq!(exit_guard::driver_making(exit_guard::own), before + 2);
+    assert_eq!(exit_guard::driver_making(exit_guard::own), Some(before + 2));
+    drop(busy);
+}
+
+/// The hook's wait on a thread whose thread-locals were destroyed runs no test step and returns:
+/// on macOS `exit` destroys the exiting thread's thread-locals before it runs the exit handlers,
+/// and a wait that read the step's (`exit_guard::BETWEEN_COUNTS`) there panicked, which in the
+/// handler, a function that cannot unwind, aborted every test child that exited from a thread
+/// with a section of the runtime's in progress (the M3's exit probe, 2965 of 5931 children). Here
+/// the wait runs in a thread-local's destructor, after the step's was destroyed: thread-locals
+/// are destroyed in the reverse order of their first use.
+#[test]
+fn the_hook_waits_on_a_thread_whose_thread_locals_are_destroyed() {
+    struct WaitsAtExit(&'static Guard, mpsc::Sender<bool>);
+    impl Drop for WaitsAtExit {
+        fn drop(&mut self) {
+            let ended = self.0.close(0, Duration::from_millis(20), Duration::ZERO);
+            let _ = self.1.send(ended);
+        }
+    }
+    thread_local! {
+        static AT_EXIT: std::cell::RefCell<Option<WaitsAtExit>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+    let guard = guard();
+    // A section in progress on another thread for the wait to wait for.
+    let busy = guard.enter().expect("open");
+    let (sender, waited) = mpsc::channel();
+    std::thread::spawn(move || {
+        AT_EXIT.with(|at_exit| *at_exit.borrow_mut() = Some(WaitsAtExit(guard, sender)));
+        // First used after `AT_EXIT`, so destroyed before it.
+        exit_guard::BETWEEN_COUNTS.with(|step| assert!(step.borrow().is_none()));
+    })
+    .join()
+    .expect("the thread's end");
+    assert_eq!(
+        waited.recv_timeout(Duration::from_secs(5)),
+        Ok(false),
+        "the wait for the section in progress ended at its bound"
+    );
     drop(busy);
 }
 
@@ -617,7 +695,7 @@ fn a_forked_child_s_exit_does_not_wait_for_its_parent_s_sections() {
     // `_exit`, which runs no handler.
     let child = unsafe { libc::fork() };
     if child == 0 {
-        exit_guard::run_on_exit(3);
+        exit_guard::run_on_exit(3, After::Calls);
         // SAFETY: as above.
         unsafe { libc::_exit(0) };
     }
@@ -639,19 +717,23 @@ fn a_forked_child_s_exit_does_not_wait_for_its_parent_s_sections() {
 /// Each entry point has a bit of its own.
 #[test]
 fn every_entry_point_has_a_bit_of_its_own() {
-    let mut bits = 0_u128;
     for &call in Call::ALL {
-        let bit = call.bit();
-        assert_eq!(bit.count_ones(), 1, "{call:?} has no bit of the word");
-        assert_eq!(bits & bit, 0, "{call:?} shares a bit");
-        bits |= bit;
+        let alone = Calls::NONE.with(call);
+        let held: Vec<Call> = Call::ALL
+            .iter()
+            .copied()
+            .filter(|&each| alone.holds(each))
+            .collect();
+        assert_eq!(held, [call], "{call:?} shares a bit");
+        assert!(!Calls::NONE.with(call).without(call).holds(call));
     }
 }
 
 /// The exit status of a child that registers its hook (its first device), then a destructor (a
 /// driver's or a layer's static, made at its first use), then runs `sections`, and exits. The
-/// destructor ends the child with 42 when it sees the guard closed (the hook ran first), and 43
-/// when it ran first.
+/// destructor ends the child with 42 when it sees the guard closed (the hook ran first, after
+/// calls), 44 when it sees the makings ended and the guard open (the hook ran first, after a
+/// making), and 43 when it ran first.
 #[cfg(unix)]
 fn late_destructor_exit(sections: fn()) -> libc::c_int {
     late_destructor_exit_after(|| {}, sections)
@@ -662,7 +744,11 @@ fn late_destructor_exit(sections: fn()) -> libc::c_int {
 #[cfg(unix)]
 fn late_destructor_exit_after(before: fn(), sections: fn()) -> libc::c_int {
     extern "C" fn late_destructor() {
-        let code = if exit_guard::closed() { 42 } else { 43 };
+        let code = match (exit_guard::closed(), exit_guard::makings_ended()) {
+            (true, _) => 42,
+            (false, true) => 44,
+            (false, false) => 43,
+        };
         // SAFETY: ends the child at once, from its exit handlers.
         unsafe { libc::_exit(code) };
     }
@@ -696,8 +782,7 @@ fn a_destructor_registered_after_the_hook_runs_before_it() {
 }
 
 /// A section that ends after the first call of an entry point registers the hook again, so a
-/// destructor registered before it (by that call) runs after the hook. Its count is not a power
-/// of two, so that trigger is the first call's.
+/// destructor registered before it (by that call) runs after the hook.
 #[cfg(unix)]
 #[test]
 fn a_section_after_an_entry_point_s_first_call_registers_the_hook_again() {
@@ -708,10 +793,6 @@ fn a_section_after_an_entry_point_s_first_call_registers_the_hook_again() {
                 .copied()
                 .find(|&call| !exit_guard::was_called(call))
                 .expect("an entry point no section called");
-            // Sections before the destructor, until the next one's count is no power of two.
-            while (exit_guard::sections() + 1).is_power_of_two() {
-                drop(exit_guard::enter());
-            }
             let busy = exit_guard::enter();
             exit_guard::called(call);
             drop(busy);
@@ -721,20 +802,21 @@ fn a_section_after_an_entry_point_s_first_call_registers_the_hook_again() {
     );
 }
 
-/// A section whose count reaches a power of two registers the hook again, for statics made at a
-/// later call of an entry point already called.
+/// Sections that call no entry point for the first time register the hook no more, however many
+/// end: a registration after an exit handler the program registered would run the hook before
+/// it, and the handler's work would find the guard closed. The destructor stands for that
+/// handler.
 #[cfg(unix)]
 #[test]
-fn a_section_at_a_power_of_two_registers_the_hook_again() {
+fn sections_of_entry_points_called_before_register_the_hook_no_more() {
     assert_eq!(
-        late_destructor_exit(|| loop {
-            drop(exit_guard::enter());
-            if exit_guard::sections().is_power_of_two() {
-                break;
+        late_destructor_exit_after(call_the_first_entry_point, || {
+            for _ in 0..1024 {
+                call_the_first_entry_point();
             }
         }),
-        42,
-        "the destructor ran before the hook"
+        43,
+        "a section registered the hook again after the destructor"
     );
 }
 
@@ -748,6 +830,313 @@ fn an_instance_made_registers_the_hook_again() {
         late_destructor_exit(exit_guard::instance_made),
         42,
         "the layer's handler ran before the hook"
+    );
+}
+
+/// A driver's `vkCreate*Pipelines` that returned registers the hook again, so a destructor its
+/// compiler registered in the call (a static made at its first use of a path, or the constructors
+/// of a compiler it loaded only then) runs after the hook: the child's destructor, registered
+/// before the call returned, stands for it, on the program's own thread (no section). That run
+/// ends the makings and leaves the guard open (44).
+#[cfg(unix)]
+#[test]
+fn a_pipeline_making_that_returned_registers_the_hook_again() {
+    assert_eq!(
+        late_destructor_exit(exit_guard::pipelines_made),
+        44,
+        "the compiler's destructor ran before the hook, or the hook closed the guard"
+    );
+}
+
+/// The exit of a child that registers its hook (its device), then an exit handler of its own (as
+/// a program does once its device is made), then makes a pipeline (which registers the hook again
+/// after a making): the hook's run for that registration comes first, and the handler then finds
+/// the guard open, sections starting, and the makings ended (a making answers `None`). Exit
+/// statuses: 42 as expected, 43 the guard closed, 44 a section refused, 45 a making ran.
+#[cfg(unix)]
+#[test]
+fn a_making_s_run_of_the_hook_leaves_the_program_s_handler_the_guard_open() {
+    extern "C" fn program_handler() {
+        let code = if exit_guard::closed() {
+            43
+        } else if exit_guard::enter().is_none() {
+            44
+        } else if exit_guard::driver_making(|| ()).is_some() {
+            45
+        } else {
+            42
+        };
+        // SAFETY: ends the child at once, from its exit handlers.
+        unsafe { libc::_exit(code) };
+    }
+    // SAFETY: the child registers its hook and a handler (atomics and the C library's `atexit`),
+    // and exits.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        exit_guard::register();
+        // SAFETY: `program_handler` is a function with no arguments that never unwinds.
+        unsafe { libc::atexit(program_handler) };
+        exit_guard::pipelines_made();
+        // SAFETY: as above.
+        unsafe { libc::exit(0) };
+    }
+    assert!(child > 0, "fork");
+    let mut status = 0;
+    // SAFETY: `child` is this process's child.
+    let reaped = unsafe { libc::waitpid(child, &mut status, 0) };
+    assert_eq!(reaped, child);
+    assert!(libc::WIFEXITED(status), "the child did not exit: {status}");
+    assert_eq!(libc::WEXITSTATUS(status), 42);
+}
+
+/// After a making's run of the hook and the program's handler, the hook's run for its device's
+/// registration still closes the guard before the destructors registered as the device was made:
+/// a handler registered before the device sees it closed (42; 43 not).
+#[cfg(unix)]
+#[test]
+fn the_device_s_run_of_the_hook_closes_the_guard_after_a_making_s_run() {
+    extern "C" fn before_the_device() {
+        let code = if exit_guard::closed() && exit_guard::makings_ended() {
+            42
+        } else {
+            43
+        };
+        // SAFETY: ends the child at once, from its exit handlers.
+        unsafe { libc::_exit(code) };
+    }
+    extern "C" fn program_handler() {}
+    // SAFETY: the child registers handlers and its hook (atomics and the C library's `atexit`),
+    // and exits.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // SAFETY: both are functions with no arguments that never unwind.
+        unsafe { libc::atexit(before_the_device) };
+        exit_guard::register();
+        // SAFETY: as above.
+        unsafe { libc::atexit(program_handler) };
+        exit_guard::pipelines_made();
+        // SAFETY: as above.
+        unsafe { libc::exit(0) };
+    }
+    assert!(child > 0, "fork");
+    let mut status = 0;
+    // SAFETY: `child` is this process's child.
+    let reaped = unsafe { libc::waitpid(child, &mut status, 0) };
+    assert_eq!(reaped, child);
+    assert!(libc::WIFEXITED(status), "the child did not exit: {status}");
+    assert_eq!(libc::WEXITSTATUS(status), 42);
+}
+
+/// With a device whose queues run in the process (a CPU device, whose queues compile as they run
+/// their work), a making's run of the hook closes the guard, as a device's does: the program's
+/// handler sees it closed (42; 43 open).
+#[cfg(unix)]
+#[test]
+fn a_making_s_run_of_the_hook_closes_the_guard_beside_a_cpu_device() {
+    extern "C" fn program_handler() {
+        let code = if exit_guard::closed() { 42 } else { 43 };
+        // SAFETY: ends the child at once, from its exit handlers.
+        unsafe { libc::_exit(code) };
+    }
+    /// A device with nothing in flight.
+    struct Idle;
+    impl InProcess for Idle {
+        fn drain(&self, _deadline: Option<Instant>) -> bool {
+            true
+        }
+    }
+    // SAFETY: the child registers a device, its hook and a handler (atomics, a lock and the C
+    // library's `atexit`), and exits.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        let device: Arc<dyn InProcess> = Arc::new(Idle);
+        exit_guard::runs_in_process(Arc::downgrade(&device));
+        exit_guard::register();
+        // SAFETY: `program_handler` is a function with no arguments that never unwinds.
+        unsafe { libc::atexit(program_handler) };
+        exit_guard::pipelines_made();
+        // SAFETY: as above; `device` stays live, since `exit` drops nothing of this frame.
+        unsafe { libc::exit(0) };
+    }
+    assert!(child > 0, "fork");
+    let mut status = 0;
+    // SAFETY: `child` is this process's child.
+    let reaped = unsafe { libc::waitpid(child, &mut status, 0) };
+    assert_eq!(reaped, child);
+    assert!(libc::WIFEXITED(status), "the child did not exit: {status}");
+    assert_eq!(libc::WEXITSTATUS(status), 42);
+}
+
+/// Ending the makings waits for those in progress in sections, at most its bound, and none starts
+/// after it: a section's making answers `None` once they ended.
+#[test]
+fn the_makings_end_once_those_in_progress_ended_and_none_starts_after() {
+    let guard = guard();
+    let (entered, release) = (mpsc::channel(), mpsc::channel::<()>());
+    let worker = std::thread::spawn(move || {
+        let _section = guard.enter().expect("open");
+        let _making = guard.enter_making().expect("the makings go on");
+        entered.0.send(()).unwrap();
+        let _ = release.1.recv();
+        std::thread::sleep(Duration::from_millis(50));
+    });
+    entered.1.recv().unwrap();
+    let ender = std::thread::spawn(move || {
+        guard.end_makings(Duration::from_secs(5), Duration::from_secs(10))
+    });
+    let start = Instant::now();
+    while !guard.makings_ended() {
+        std::thread::yield_now();
+    }
+    let section = guard.enter().expect("sections still start");
+    assert!(
+        guard.enter_making().is_none(),
+        "a making started after the end"
+    );
+    drop(section);
+    release.0.send(()).unwrap();
+    assert!(ender.join().unwrap(), "the making in progress did not end");
+    assert!(
+        start.elapsed() >= Duration::from_millis(50),
+        "the end did not wait for the making in progress"
+    );
+    worker.join().unwrap();
+    assert!(!guard.is_closed(), "ending the makings closed the guard");
+}
+
+/// [`hook_after_making`] acts only in the process it was registered in, and beside no device whose
+/// queues run in it ends the makings alone.
+#[test]
+fn a_making_s_run_ends_the_makings_alone_in_its_own_process() {
+    let guard = guard();
+    let devices = none_in_process();
+    let bound = Duration::from_millis(100);
+    assert_eq!(
+        hook_after_making(guard, &devices, 1, 2, 0, bound, bound),
+        None
+    );
+    assert!(
+        !guard.makings_ended(),
+        "another process's run ended the makings"
+    );
+    assert_eq!(
+        hook_after_making(guard, &devices, 2, 2, 0, bound, bound),
+        Some(true)
+    );
+    assert!(guard.makings_ended() && !guard.is_closed());
+    assert!(hook(guard, &devices, 2, 2, 0, bound, bound).unwrap());
+    assert!(guard.is_closed());
+}
+
+/// The exit of a child whose earlier making (on its own thread) left a destructor of the driver's
+/// compiler behind it, while a making of a pool's piece is still in the compiler: the hook runs
+/// first and waits for the making, and the destructor runs once it ended. The destructor ends the
+/// child with 42 when the making had ended, 43 when it ran beside it. That is an exit mid-compile:
+/// on an RTX 5080 a consumer's test process ended with `SIGSEGV` at `0x18` inside
+/// `libnvidia-glvkspirv.so`, the driver's SPIR-V compiler, on a thread the test's had started,
+/// during its exit after its test passed (one test of a whole run under load; it passed alone). The
+/// same fault also comes with no making in progress (`exit_guard.rs`).
+#[cfg(unix)]
+#[test]
+fn an_exit_mid_making_waits_for_it_before_an_earlier_making_s_destructor() {
+    static ENDED: AtomicBool = AtomicBool::new(false);
+    extern "C" fn compiler_static() {
+        let code = if ENDED.load(Ordering::SeqCst) { 42 } else { 43 };
+        // SAFETY: ends the child at once, from its exit handlers.
+        unsafe { libc::_exit(code) };
+    }
+    // SAFETY: the child registers its hook and the destructor, runs a making on a thread of its
+    // own (atomics, a sleep and the C library's `atexit`), and exits.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        exit_guard::register();
+        // The earlier making: its compiler's static, registered in the call, then the call's
+        // return.
+        // SAFETY: `compiler_static` is a function with no arguments that never unwinds.
+        unsafe { libc::atexit(compiler_static) };
+        exit_guard::pipelines_made();
+        // A pool's piece, in its section, its making still in the compiler as the child exits.
+        let (started, start) = mpsc::channel();
+        let piece = exit_guard::spawn(std::thread::Builder::new(), move || {
+            let _busy = exit_guard::enter().expect("the guard is open");
+            exit_guard::driver_making(|| {
+                started.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                ENDED.store(true, Ordering::SeqCst);
+            });
+        });
+        assert!(piece.is_ok(), "the piece's thread started");
+        start.recv_timeout(Duration::from_secs(10)).unwrap();
+        // SAFETY: exits the child; its exit handlers end it.
+        unsafe { libc::exit(0) };
+    }
+    assert!(child > 0, "fork");
+    let mut status = 0;
+    // SAFETY: `child` is this process's child.
+    let reaped = unsafe { libc::waitpid(child, &mut status, 0) };
+    assert_eq!(reaped, child);
+    assert!(libc::WIFEXITED(status), "the child did not exit: {status}");
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        42,
+        "the compiler's destructor ran beside the making"
+    );
+}
+
+/// The exit of a child whose pool's piece, in its section, registers a destructor of the driver's
+/// compiler in its making (a static made at its first use of a path) and is still in the compiler
+/// as the child exits, once the registrar registered the hook again: the hook runs before the
+/// destructor and waits for the making, and the destructor runs once it ended. The destructor ends
+/// the child with 42 when the making had ended, 43 when it ran beside it. Without the registrar no
+/// registration follows the destructor before the exit, and it runs first: measured on lavapipe
+/// (`exit_guard.rs`, "Registered again").
+#[cfg(unix)]
+#[test]
+fn an_exit_mid_making_waits_for_it_before_a_destructor_the_making_registered() {
+    static ENDED: AtomicBool = AtomicBool::new(false);
+    extern "C" fn compiler_static() {
+        let code = if ENDED.load(Ordering::SeqCst) { 42 } else { 43 };
+        // SAFETY: ends the child at once, from its exit handlers.
+        unsafe { libc::_exit(code) };
+    }
+    // SAFETY: the child registers its hook, runs a making on a thread of its own (atomics, sleeps
+    // and the C library's `atexit`), and exits.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        exit_guard::register();
+        // The making outlasts the child's wait for a registration after its destructor, so that
+        // without one the child exits mid-making all the same.
+        let (registered, learn) = mpsc::channel();
+        let piece = exit_guard::spawn(std::thread::Builder::new(), move || {
+            let _busy = exit_guard::enter().expect("the guard is open");
+            exit_guard::driver_making(|| {
+                // SAFETY: `compiler_static` is a function with no arguments that never unwinds.
+                unsafe { libc::atexit(compiler_static) };
+                registered.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(3));
+                ENDED.store(true, Ordering::SeqCst);
+            });
+        });
+        assert!(piece.is_ok(), "the piece's thread started");
+        learn.recv_timeout(Duration::from_secs(10)).unwrap();
+        let before = exit_guard::registrations().during_makings;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while exit_guard::registrations().during_makings == before && Instant::now() < deadline {
+            std::thread::sleep(exit_guard::MAKING_INTERVAL / 2);
+        }
+        // SAFETY: exits the child; its exit handlers end it.
+        unsafe { libc::exit(0) };
+    }
+    assert!(child > 0, "fork");
+    let mut status = 0;
+    // SAFETY: `child` is this process's child.
+    let reaped = unsafe { libc::waitpid(child, &mut status, 0) };
+    assert_eq!(reaped, child);
+    assert!(libc::WIFEXITED(status), "the child did not exit: {status}");
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        42,
+        "the compiler's destructor ran beside the making"
     );
 }
 
@@ -892,29 +1281,190 @@ fn child_exit(child: fn(), status: libc::c_int) -> ChildExit {
     }
 }
 
+/// An exit handler a child registered before the runtime's (a terminal's restore, a VMM's
+/// re-attach of host USB devices): it ends the child with 43, so the parent sees that it ran.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+extern "C" fn registered_before() {
+    // SAFETY: ends the child at once, from its exit handlers.
+    unsafe { libc::_exit(43) };
+}
+
+/// A CPU device whose submitted work never completes.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+struct Stuck;
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+impl InProcess for Stuck {
+    fn drain(&self, deadline: Option<Instant>) -> bool {
+        let deadline = deadline.expect("the hook's bound is a deadline");
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        false
+    }
+}
+
+/// A CPU device whose submitted work completes [`BUSY_FOR`] after it was made.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+struct Finishing(Instant);
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+impl InProcess for Finishing {
+    fn drain(&self, deadline: Option<Instant>) -> bool {
+        let done = self.0 + BUSY_FOR;
+        let until = deadline.map_or(done, |deadline| deadline.min(done));
+        std::thread::sleep(until.saturating_duration_since(Instant::now()));
+        Instant::now() >= done
+    }
+}
+
+/// How long the runtime's work of [`an_exit_runs_the_handlers_before_the_hook_once_the_work_ended`]
+/// runs past the exit's start: far under the hook's bound.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const BUSY_FOR: Duration = Duration::from_millis(100);
+
 /// Where the hook learns the exit's status (Linux with the GNU C library), an exit while the
-/// driver runs the runtime's work (a CPU device's work in flight, a section in progress on another
-/// thread) ends the process at once with that status, says so on standard error in one line, and
-/// runs no handler registered before the hook: Metal's process ends within 2 ms of its `exit`.
-/// Before, the hook waited 2 s, returned, and the handler ran.
+/// driver runs the runtime's work (a section in progress on another thread, a CPU device's work in
+/// flight) that ends within the hook's bound waits for it, and then returns: the exit handlers
+/// registered before the hook run, as Metal's exit runs them, and no notice is written. Before, the
+/// hook waited for nothing, ended the process at once with the exit's status and the notice, and
+/// the handler did not run (a VMM's re-attach of host USB devices to their drivers skipped at a
+/// quit while a pipeline was made).
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[test]
-fn a_busy_exit_ends_at_once_with_its_status() {
-    /// An exit handler the program registered before the runtime's (a terminal's restore): it
-    /// ends the child with 43.
-    extern "C" fn registered_before() {
-        // SAFETY: ends the child at once, from its exit handlers.
-        unsafe { libc::_exit(43) };
+fn an_exit_runs_the_handlers_before_the_hook_once_the_work_ended() {
+    fn section_ending() {
+        // SAFETY: a function with no arguments that never unwinds.
+        unsafe { libc::atexit(registered_before) };
+        exit_guard::register();
+        let (entered, held) = mpsc::channel();
+        std::thread::spawn(move || {
+            let busy = exit_guard::enter().expect("the child is not exiting");
+            entered.send(()).unwrap();
+            std::thread::sleep(BUSY_FOR);
+            drop(busy);
+            loop {
+                std::thread::park();
+            }
+        });
+        held.recv().unwrap();
     }
-    /// A CPU device whose submitted work never completes.
-    struct Stuck;
-    impl InProcess for Stuck {
-        fn drain(&self, deadline: Option<Instant>) -> bool {
-            let deadline = deadline.expect("the hook's bound is a deadline");
-            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
-            false
-        }
+    fn work_finishing() {
+        // SAFETY: as above.
+        unsafe { libc::atexit(registered_before) };
+        let device: Arc<dyn InProcess> = Arc::new(Finishing(Instant::now()));
+        exit_guard::runs_in_process(Arc::downgrade(&device));
+        // Live through the exit, as a device the program holds.
+        std::mem::forget(device);
+        exit_guard::register();
     }
+    let children: [(&str, fn()); 2] = [
+        ("a section", section_ending),
+        ("a CPU device's work", work_finishing),
+    ];
+    for (busy, child) in children {
+        let exit = child_exit(child, 0);
+        assert_eq!(
+            exit.status, 43,
+            "{busy} in progress, ending within the bound: the handler registered before the hook \
+             did not run; its standard error: {}",
+            exit.stderr
+        );
+        assert!(
+            exit.stderr.is_empty(),
+            "{busy} in progress: {}",
+            exit.stderr
+        );
+        assert!(
+            exit.took < BUSY_FOR + Duration::from_secs(1),
+            "{busy} in progress: the exit took {:?}",
+            exit.took
+        );
+    }
+}
+
+/// A device's slot among those its commands go through (`recorder`), let go of once the process
+/// is exiting, stays as it was: a command recorded through it after reaches the driver's entry
+/// point. A device whose last handle drops once the guard closed (or whose teardown the exit cut
+/// short) leaves its threads' sections in progress running, and one recording through its slot
+/// meanwhile (the queue-switch check's thread making its objects) once found the slot's driver
+/// entry points cleared, its entry point ended the process (`SIGABRT`, a panic that cannot unwind
+/// out of an `extern "system"` function) after a GPU recovery's test failed (RTX 5080 Laptop GPU,
+/// NVIDIA 615.71.09). The child routes a stand-in device's functions through a slot, registers the
+/// hook, and from an exit handler that runs after it lets go of the slot and records through it.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn a_slot_let_go_of_while_the_process_exits_keeps_its_commands() {
+    use ash::vk;
+    /// The routed functions and their slot, until the exit handler takes them.
+    static ROUTED: Mutex<Option<(ash::Device, crate::recorder::Slot)>> = Mutex::new(None);
+    /// The stand-in's resets recorded.
+    static RESETS: AtomicUsize = AtomicUsize::new(0);
+    unsafe extern "system" fn reset(_: vk::CommandBuffer, _: vk::QueryPool, _: u32, _: u32) {
+        RESETS.fetch_add(1, Ordering::SeqCst);
+    }
+    /// After the hook: the guard closed, the slot let go of, a reset recorded through it; 44 where
+    /// it reached the stand-in, 45 where the guard was open.
+    extern "C" fn after_the_hook() {
+        let taken = ROUTED.lock().map(|mut routed| routed.take());
+        let Ok(Some((routed, slot))) = taken else {
+            // SAFETY: ends the child at once, from its exit handlers.
+            unsafe { libc::_exit(46) };
+        };
+        let closed = exit_guard::closed();
+        drop(slot);
+        // SAFETY: the stand-in reads none of its parameters.
+        unsafe {
+            routed.cmd_reset_query_pool(vk::CommandBuffer::null(), vk::QueryPool::null(), 0, 1)
+        };
+        let status = match closed && RESETS.load(Ordering::SeqCst) == 2 {
+            true => 44,
+            false => 45,
+        };
+        // SAFETY: as above.
+        unsafe { libc::_exit(status) };
+    }
+    fn child() {
+        let none = |_: &std::ffi::CStr| std::ptr::null::<std::ffi::c_void>();
+        let mut v1_0 = ash::DeviceFnV1_0::load(none);
+        v1_0.cmd_reset_query_pool = reset;
+        let device = ash::Device::from_parts_1_3(
+            vk::Device::null(),
+            v1_0,
+            ash::DeviceFnV1_1::load(none),
+            ash::DeviceFnV1_2::load(none),
+            ash::DeviceFnV1_3::load(none),
+        );
+        // SAFETY: the stand-in's functions are not routed yet; no Vulkan call reaches a device.
+        let (routed, slot) = unsafe { crate::recorder::route(device) };
+        let slot = slot.expect("a slot free in the child");
+        // SAFETY: as above.
+        unsafe {
+            routed.cmd_reset_query_pool(vk::CommandBuffer::null(), vk::QueryPool::null(), 0, 1)
+        };
+        assert_eq!(RESETS.load(Ordering::SeqCst), 1, "the routed reset");
+        *ROUTED.lock().unwrap() = Some((routed, slot));
+        // Registered before the hook, so it runs after it.
+        // SAFETY: a function with no arguments that never unwinds (it ends the child).
+        unsafe { libc::atexit(after_the_hook) };
+        exit_guard::register();
+    }
+    let exit = child_exit(child, 0);
+    assert_eq!(
+        exit.status, 44,
+        "45: the guard was open after the hook; 46: nothing to let go of; its standard error: {}",
+        exit.stderr
+    );
+}
+
+/// Where the hook learns the exit's status, an exit while the driver still runs the runtime's work
+/// once the hook's wait reached its bound (a section that never ends: a driver deadlocked inside a
+/// submission, as the GPU-assisted validation layer 1.4.357 was; a CPU device's work that never
+/// completes) ends the process at once with that status, says so on standard error in one line,
+/// and runs no handler registered before the hook, so that no destructor runs beside the driver's
+/// work: after [`BOUND`](exit_guard::BOUND), not later. A section in progress is named on the line
+/// before, where it began, once the wait passed half the bound.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn a_busy_exit_past_the_bound_ends_at_once_with_its_status() {
     fn work_in_flight() {
         // SAFETY: a function with no arguments that never unwinds.
         unsafe { libc::atexit(registered_before) };
@@ -952,16 +1502,46 @@ fn a_busy_exit_ends_at_once_with_its_status() {
                 exit.stderr
             );
             assert!(
-                exit.took < Duration::from_millis(100),
-                "{busy} in progress: the exit took {:?}",
-                exit.took
+                exit.took >= exit_guard::BOUND
+                    && exit.took < exit_guard::BOUND + Duration::from_secs(1),
+                "{busy} in progress: the exit took {:?}, for a bound of {:?}",
+                exit.took,
+                exit_guard::BOUND
             );
-            assert_eq!(
-                exit.stderr,
-                exit_guard::AT_ONCE_NOTICE,
-                "{busy} in progress"
-            );
+            // Past half the bound, a section in progress is named where it began, once.
+            let named = exit.stderr.strip_suffix(exit_guard::AT_ONCE_NOTICE);
+            let named = named.unwrap_or_else(|| panic!("{busy} in progress: {}", exit.stderr));
+            match busy {
+                "a section" => {
+                    let place = format!("begun at: {}:", file!());
+                    assert!(
+                        named.starts_with("metal2vulkan: the exit has waited ")
+                            && named.contains(&place)
+                            && named.ends_with('\n')
+                            && named.lines().count() == 1,
+                        "{busy} in progress: {named}"
+                    );
+                }
+                _ => assert_eq!(named, "", "{busy} in progress"),
+            }
         }
+    }
+}
+
+/// The notice names the hook's bounds.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn the_at_once_notice_names_the_bounds() {
+    let named = [
+        format!("wait of {} s", exit_guard::BOUND.as_secs()),
+        format!("({} s while", exit_guard::MAKING_BOUND.as_secs()),
+    ];
+    for named in named {
+        assert!(
+            exit_guard::AT_ONCE_NOTICE.contains(&named),
+            "{named:?} in {}",
+            exit_guard::AT_ONCE_NOTICE
+        );
     }
 }
 
@@ -1062,6 +1642,8 @@ fn the_threads_that_take_command_buffers_to_their_handlers_run_at_the_user_inter
     /// A pool's item.
     struct Item(Box<dyn FnOnce() + Send>);
     impl Run for Item {
+        type Held = ();
+
         fn run(self) {
             (self.0)();
         }
@@ -1133,7 +1715,7 @@ fn the_threads_that_take_command_buffers_to_their_handlers_run_at_the_user_inter
             reaper.start().unwrap().reap(Box::new(Reaped(dropped)));
             let reaped = drops.recv_timeout(WAIT).unwrap();
             reaper.stop();
-            let plain = exit_guard::spawn(std::thread::Builder::new(), || qos_class_self())
+            let plain = exit_guard::spawn(std::thread::Builder::new(), qos_class_self)
                 .unwrap()
                 .join()
                 .unwrap();
@@ -1205,6 +1787,8 @@ fn the_threads_that_take_command_buffers_to_their_handlers_run_with_the_utilizat
     /// A pool's item.
     struct Item(Box<dyn FnOnce() + Send>);
     impl Run for Item {
+        type Held = ();
+
         fn run(self) {
             (self.0)();
         }
@@ -1384,18 +1968,24 @@ fn a_runtime_thread_reaching_the_device_outside_a_section_aborts() {
 #[cfg(all(unix, debug_assertions))]
 #[test]
 fn a_release_of_the_program_s_on_a_thread_completion_depends_on_aborts() {
-    let mut ran = 0;
-    exit_guard::program_release(|| ran += 1);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let runs = Arc::clone(&ran);
+    exit_guard::program_release(move || {
+        runs.fetch_add(1, Ordering::SeqCst);
+    });
     let in_program = exit_guard::spawn(std::thread::Builder::new(), || {
         exit_guard::serves_completion();
-        let mut ran = false;
-        exit_guard::program(|| exit_guard::program_release(|| ran = true));
-        ran
+        let ran = Arc::new(AtomicBool::new(false));
+        let runs = Arc::clone(&ran);
+        exit_guard::program(|| {
+            exit_guard::program_release(move || runs.store(true, Ordering::SeqCst));
+        });
+        ran.load(Ordering::SeqCst)
     })
     .unwrap()
     .join()
     .unwrap();
-    assert_eq!((ran, in_program), (1, true));
+    assert_eq!((ran.load(Ordering::SeqCst), in_program), (1, true));
     // SAFETY: the child starts one thread, which releases and aborts, and otherwise exits.
     let child = unsafe { libc::fork() };
     if child == 0 {
@@ -1443,7 +2033,7 @@ fn runtime_sources() -> Vec<(String, String)> {
             }
         }
     }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let root = metal2vulkan_devtools::workspace_dir().join("crates/metal2vulkan-runtime/src");
     let mut sources = Vec::new();
     walk(&root, &root, &mut sources);
     assert!(sources.len() > 50, "the runtime's sources were not found");
@@ -1649,7 +2239,7 @@ fn the_device_s_functions_are_reached_through_checked_accessors() {
 /// tuple field, a type argument or a by-value parameter) fails
 /// `only_the_listed_modules_keep_the_device_s_functions`; so does a listed module that keeps none
 /// any more.
-const KEEPERS: [(&str, &str); 23] = [
+const KEEPERS: [(&str, &str); 32] = [
     (
         "binding.rs",
         "the push command (vkCmdPushDescriptorSet), a call's parameter (`push_set`) and the \
@@ -1693,6 +2283,20 @@ const KEEPERS: [(&str, &str); 23] = [
         "the device's extended dynamic state commands (DeviceShared)",
     ),
     (
+        "exported_memory.rs",
+        "the device's export of buffers' memory as opaque fds (DeviceShared)",
+    ),
+    (
+        "exported_semaphore.rs",
+        "the device's export of events' semaphores as opaque fds (DeviceShared)",
+    ),
+    (
+        "free_thread.rs",
+        "the frees of the runtime's own blocks, posted to the free thread, which frees each \
+         inside a section; the teardown stops the thread, which frees every block posted, and \
+         joins it before vkDestroyDevice",
+    ),
+    (
         "freed_memory.rs",
         "the watch of the program's marks and the release of freed memory, posted to the handler \
          threads; the teardown closes the parking first and waits for those threads, and one that \
@@ -1708,6 +2312,11 @@ const KEEPERS: [(&str, &str); 23] = [
         "the device's host-memory importer (DeviceShared)",
     ),
     (
+        "idle_sweep.rs",
+        "the idle sweep of the device's kept blocks and parked objects, on a thread of its own \
+         inside a section; the teardown stops and joins it before vkDestroyDevice",
+    ),
+    (
         "index_bounds.rs",
         "a draw's recording (vkCmd*), held by what holds its command buffer",
     ),
@@ -1716,8 +2325,23 @@ const KEEPERS: [(&str, &str); 23] = [
         "a draw's recording (vkCmd*), held by what holds its command buffer",
     ),
     (
+        "memory.rs",
+        "a creation call's parameter, handed to the making of a block ahead (`keep_room`)",
+    ),
+    (
+        "memory/ready.rs",
+        "a pooled block's making ahead, on a thread of its own inside a section; the teardown \
+         stops or joins it as it destroys the memory (`Memory::destroy`), before vkDestroyDevice",
+    ),
+    (
         "pipeline/creation_log.rs",
         "MoltenVK's statistics call, inside a call that borrows the device",
+    ),
+    (
+        "queue_switch_check.rs",
+        "the check's parts (`Parts`), which its thread holds in place of the device; the \
+         teardown stops the check and waits for it to release its objects and drop its parts \
+         before it goes on (`QueueSwitch::stop`)",
     ),
     (
         "recorder/mod.rs",
@@ -1732,6 +2356,11 @@ const KEEPERS: [(&str, &str); 23] = [
         "a draw's recording (vkCmd*), held by what holds its command buffer",
     ),
     (
+        "render/draw_again/rebound.rs",
+        "a kept draw's recording (vkCmd*), held by its encoder's bind state (a spare one by the \
+         device's) and recorded again only by the encoder that kept it",
+    ),
+    (
         "render/inline_splits.rs",
         "an inline instance's draws' recordings, kept until its group ends, held by its encoder",
     ),
@@ -1743,6 +2372,12 @@ const KEEPERS: [(&str, &str); 23] = [
         "scheduler/mod.rs",
         "the scheduler's nudge, signalled and waited for only while its thread waits on the \
          GPU, a thread the teardown stops first",
+    ),
+    (
+        "submit_check.rs",
+        "the submission checks' parts (`Parts`), which their thread holds in place of the \
+         device; the teardown stops the checks and waits for their thread to release its \
+         objects and drop its parts before it goes on (`SubmitChecks::stop`)",
     ),
 ];
 
@@ -2101,26 +2736,28 @@ fn the_priming_check_names_what_was_not_made() {
         sized_index_bind: true,
         ycbcr_conversion: true,
     };
-    let all = Call::ALL.iter().fold(0, |bits, call| bits | call.bit());
+    let all = Call::ALL
+        .iter()
+        .fold(Calls::NONE, |bits, &call| bits.with(call));
     assert!(missing(all, has(true, true)).is_empty());
     let made = Call::ALL
         .iter()
         .filter(|call| !UNPRIMED.contains(call))
-        .fold(0, |bits, call| bits | call.bit());
+        .fold(Calls::NONE, |bits, &call| bits.with(call));
     assert!(missing(made, has(true, true)).is_empty());
     assert_eq!(
-        missing(0, has(true, true)).len(),
+        missing(Calls::NONE, has(true, true)).len(),
         Call::ALL.len() - UNPRIMED.len()
     );
     for &call in Call::ALL {
         if !UNPRIMED.contains(&call) {
-            assert_eq!(missing(made & !call.bit(), has(true, true)), [call]);
+            assert_eq!(missing(made.without(call), has(true, true)), [call]);
         }
     }
     // Without timestamps, their commands are neither made nor missed, nor is their reset on the
     // host.
     let untimed = (TIMESTAMP_CALLS.iter().chain(&HOST_QUERY_RESET_CALLS))
-        .fold(made, |bits, call| bits & !call.bit());
+        .fold(made, |bits, &call| bits.without(call));
     assert!(missing(untimed, has(false, true)).is_empty());
     let mut timed = TIMESTAMP_CALLS.to_vec();
     timed.extend(HOST_QUERY_RESET_CALLS);
@@ -2129,7 +2766,7 @@ fn the_priming_check_names_what_was_not_made() {
     // Without `hostQueryReset`, nor is the reset on the host.
     let unreset = HOST_QUERY_RESET_CALLS
         .iter()
-        .fold(made, |bits, call| bits & !call.bit());
+        .fold(made, |bits, &call| bits.without(call));
     let without = Has {
         host_query_reset: false,
         ..has(true, true)
@@ -2139,13 +2776,13 @@ fn the_priming_check_names_what_was_not_made() {
     // Without device addresses, nor is a buffer's address.
     let unaddressed = DEVICE_ADDRESS_CALLS
         .iter()
-        .fold(made, |bits, call| bits & !call.bit());
+        .fold(made, |bits, &call| bits.without(call));
     assert!(missing(unaddressed, has(true, false)).is_empty());
     assert_eq!(missing(unaddressed, has(true, true)), DEVICE_ADDRESS_CALLS);
     // Without generated commands, nor is the release of their objects.
     let ungenerated = GENERATED_COMMANDS_CALLS
         .iter()
-        .fold(made, |bits, call| bits & !call.bit());
+        .fold(made, |bits, &call| bits.without(call));
     let without = Has {
         generated_commands: false,
         ..has(true, true)
@@ -2158,7 +2795,7 @@ fn the_priming_check_names_what_was_not_made() {
     // Without sparse binding, nor is a batch's bind.
     let unbound = SPARSE_CALLS
         .iter()
-        .fold(made, |bits, call| bits & !call.bit());
+        .fold(made, |bits, &call| bits.without(call));
     let without = Has {
         sparse_binding: false,
         ..has(true, true)
@@ -2168,7 +2805,7 @@ fn the_priming_check_names_what_was_not_made() {
     // Without the push command, nor is a host step's push.
     let unpushed = PUSH_DESCRIPTOR_CALLS
         .iter()
-        .fold(made, |bits, call| bits & !call.bit());
+        .fold(made, |bits, &call| bits.without(call));
     let without = Has {
         push_descriptor: false,
         ..has(true, true)
@@ -2178,7 +2815,7 @@ fn the_priming_check_names_what_was_not_made() {
     // Without calibrated timestamps, nor is a completion turn's calibration reading.
     let uncalibrated = CALIBRATION_CALLS
         .iter()
-        .fold(made, |bits, call| bits & !call.bit());
+        .fold(made, |bits, &call| bits.without(call));
     let without = Has {
         calibration: false,
         ..has(true, true)
@@ -2188,7 +2825,7 @@ fn the_priming_check_names_what_was_not_made() {
     // Without messages reported, nor is a pipeline's debug name.
     let unnamed = NAMING_CALLS
         .iter()
-        .fold(made, |bits, call| bits & !call.bit());
+        .fold(made, |bits, &call| bits.without(call));
     let without = Has {
         object_names: false,
         ..has(true, true)
@@ -2220,7 +2857,7 @@ fn the_priming_check_names_what_was_not_made() {
         }),
     ];
     for (calls, without) in groups {
-        let unmade = calls.iter().fold(made, |bits, call| bits & !call.bit());
+        let unmade = calls.iter().fold(made, |bits, &call| bits.without(call));
         assert!(missing(unmade, without(has(true, true))).is_empty());
         assert_eq!(missing(unmade, has(true, true)), calls);
     }
@@ -2307,18 +2944,6 @@ fn call_the_first_entry_point() {
     drop(busy);
 }
 
-/// The call before the layer's load, then empty sections until the next section's count is no
-/// power of two. Those sections run before the destructor's registration: one ending at a power
-/// of two registers the hook again, and after it that would pass the tests below for that
-/// trigger's reason, not the first call's.
-#[cfg(unix)]
-fn call_the_first_entry_point_then_skip_powers_of_two() {
-    call_the_first_entry_point();
-    while (exit_guard::sections() + 1).is_power_of_two() {
-        drop(exit_guard::enter());
-    }
-}
-
 /// The gap this closes: a layer loaded again registers a destructor at an entry point's first call
 /// since (after the hook's registration at the device), and a section calling that entry point,
 /// called before the load, registers nothing, so the destructor runs before the hook.
@@ -2326,10 +2951,7 @@ fn call_the_first_entry_point_then_skip_powers_of_two() {
 #[test]
 fn a_call_made_before_a_load_registers_nothing_again_unforgotten() {
     assert_eq!(
-        late_destructor_exit_after(
-            call_the_first_entry_point_then_skip_powers_of_two,
-            call_the_first_entry_point
-        ),
+        late_destructor_exit_after(call_the_first_entry_point, call_the_first_entry_point),
         43
     );
 }
@@ -2341,12 +2963,174 @@ fn a_call_made_before_a_load_registers_nothing_again_unforgotten() {
 #[test]
 fn a_section_after_an_entry_point_s_first_call_since_a_load_registers_the_hook_again() {
     assert_eq!(
-        late_destructor_exit_after(call_the_first_entry_point_then_skip_powers_of_two, || {
+        late_destructor_exit_after(call_the_first_entry_point, || {
             exit_guard::forget_calls();
             call_the_first_entry_point();
         }),
         42,
         "the destructor ran before the hook"
+    );
+}
+
+/// A device's priming makes the first call of each entry point since a load, before the device's
+/// registration of the hook: so a later section calling one of them (after an exit handler the
+/// program registered once its device was made, which the destructor stands for) registers
+/// nothing again, and the handler runs before the hook (43). Forgetting the calls at the device's
+/// registration instead, after its priming, registered the hook again there, closing the guard
+/// before the handler (42): seen in the exits lane's `handler_work_exit`, where the program's
+/// first making after its device called three entry points the priming had called.
+#[cfg(unix)]
+#[test]
+fn a_device_s_priming_makes_the_first_calls_since_a_load() {
+    extern "C" fn program_handler() {
+        let code = if exit_guard::closed() { 42 } else { 43 };
+        // SAFETY: ends the child at once, from its exit handlers.
+        unsafe { libc::_exit(code) };
+    }
+    // SAFETY: the child primes and registers a device (atomics, locks and the C library's
+    // `atexit`), registers a handler, runs a section, and exits.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // A forked child's first device is the first after a load, and primed.
+        if !exit_guard::before_priming(&[1]) {
+            // SAFETY: ends the child at once.
+            unsafe { libc::_exit(44) };
+        }
+        call_the_first_entry_point();
+        exit_guard::register_device(vec![1], true);
+        // SAFETY: `program_handler` is a function with no arguments that never unwinds.
+        unsafe { libc::atexit(program_handler) };
+        call_the_first_entry_point();
+        // SAFETY: as above.
+        unsafe { libc::exit(0) };
+    }
+    assert!(child > 0, "fork");
+    let mut status = 0;
+    // SAFETY: `child` is this process's child.
+    let reaped = unsafe { libc::waitpid(child, &mut status, 0) };
+    assert_eq!(reaped, child);
+    assert!(libc::WIFEXITED(status), "the child did not exit: {status}");
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        43,
+        "a section of an entry point the priming called registered the hook again"
+    );
+}
+
+/// The calls a device's priming made outside sections, reported to the guard
+/// (`exit_guard::primed`), count as the first since the load: a later section calling one of them
+/// (after an exit handler the program registered once its device was made, which the destructor
+/// stands for) registers nothing again, and the handler runs before the hook (43; 42 unreported).
+#[cfg(unix)]
+#[test]
+fn a_device_s_primed_calls_register_the_hook_no_more() {
+    extern "C" fn program_handler() {
+        let code = if exit_guard::closed() { 42 } else { 43 };
+        // SAFETY: ends the child at once, from its exit handlers.
+        unsafe { libc::_exit(code) };
+    }
+    // SAFETY: the child primes and registers a device (atomics, locks and the C library's
+    // `atexit`), registers a handler, runs a section, and exits.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        exit_guard::before_priming(&[1]);
+        exit_guard::primed(Calls::NONE.with(Call::ALL[0]));
+        exit_guard::register_device(vec![1], true);
+        // SAFETY: `program_handler` is a function with no arguments that never unwinds.
+        unsafe { libc::atexit(program_handler) };
+        call_the_first_entry_point();
+        // SAFETY: as above.
+        unsafe { libc::exit(0) };
+    }
+    assert!(child > 0, "fork");
+    let mut status = 0;
+    // SAFETY: `child` is this process's child.
+    let reaped = unsafe { libc::waitpid(child, &mut status, 0) };
+    assert_eq!(reaped, child);
+    assert!(libc::WIFEXITED(status), "the child did not exit: {status}");
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        43,
+        "a section of an entry point the priming called registered the hook again"
+    );
+}
+
+/// A device that registers the hook unprimed (its priming left out as it registered nothing when
+/// asked, then a load or another device changed that before its registration) made no first call
+/// since: the calls primed before are forgotten, so a later section calling one of them (after an
+/// exit handler the program registered, which the destructor stands for) registers the hook again,
+/// and the hook runs before the handler (42; 43 where the calls stayed primed).
+#[cfg(unix)]
+#[test]
+fn a_device_registered_unprimed_forgets_the_primed_calls() {
+    extern "C" fn program_handler() {
+        let code = if exit_guard::closed() { 42 } else { 43 };
+        // SAFETY: ends the child at once, from its exit handlers.
+        unsafe { libc::_exit(code) };
+    }
+    // SAFETY: the child primes and registers a device, registers another unprimed (atomics,
+    // locks and the C library's `atexit`), registers a handler, runs a section, and exits.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        exit_guard::before_priming(&[1]);
+        exit_guard::primed(Calls::NONE.with(Call::ALL[0]));
+        exit_guard::register_device(vec![1], true);
+        exit_guard::register_device(vec![2], false);
+        // SAFETY: `program_handler` is a function with no arguments that never unwinds.
+        unsafe { libc::atexit(program_handler) };
+        call_the_first_entry_point();
+        // SAFETY: as above.
+        unsafe { libc::exit(0) };
+    }
+    assert!(child > 0, "fork");
+    let mut status = 0;
+    // SAFETY: `child` is this process's child.
+    let reaped = unsafe { libc::waitpid(child, &mut status, 0) };
+    assert_eq!(reaped, child);
+    assert!(libc::WIFEXITED(status), "the child did not exit: {status}");
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        42,
+        "a section's first call after a device registered unprimed registered nothing"
+    );
+}
+
+/// Whether a device registers the hook is answered before its priming (`Devices::admits`), noting
+/// nothing, as its registration then answers it: so a device made again on what stays loaded is
+/// not primed, and each one that registers is.
+#[test]
+fn whether_a_device_registers_is_answered_before_its_priming() {
+    use crate::exit_guard::Devices;
+    let mut devices = Devices::new();
+    let cases = [
+        (false, Some(7), 1),
+        (true, Some(7), 1),
+        (true, Some(7), 2),
+        (true, Some(7), 1),
+        (true, Some(7), 2),
+        (true, Some(8), 2),
+        (true, Some(8), 1),
+        (true, Some(8), 2),
+        (false, Some(8), 1),
+        (true, None, 1),
+        (true, None, 1),
+    ];
+    let mut primed = 0;
+    for (registered, loads, identity) in cases {
+        let kept = devices.kept();
+        let primes = devices.admits(registered, loads, &[identity]);
+        assert_eq!(devices.kept(), kept, "the answer noted an identity");
+        let admitted = devices.admit(registered, loads, vec![identity]);
+        assert_eq!(
+            primes,
+            admitted.is_some(),
+            "registered {registered}, loads {loads:?}, identity {identity}"
+        );
+        primed += usize::from(primes);
+    }
+    assert_eq!(
+        primed, 7,
+        "four of the eleven made again on what stays loaded"
     );
 }
 

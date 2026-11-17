@@ -3,14 +3,15 @@
 //!
 //! - **When.** As a compute encoder's (`indirect_execute.rs`), an execution runs the records as
 //!   they stand when its batch is submitted: Metal's reads them as it runs, so it sees CPU writes
-//!   made after the call, and the GPU's writes before it where an encoder made the buffer
-//!   resident for writing. `commit` records the CPU's records as they stand then; where the CPU
-//!   writes them again before the pass's batch is ready to submit (an event wait holds it), the
-//!   host step records the pass again from the records as they stand then, waiting for no work
-//!   on the GPU and announcing nothing. A CPU write after the batch was submitted races the GPU,
-//!   as on Metal. So the call records nothing for the commands:
+//!   made after the call, and the GPU's writes before it where a route that may write the records
+//!   met the buffer (`write_routes.rs`). `commit` records the CPU's records as they stand then, a chunk at a
+//!   time as a compute execution reads them (`kept_commands::pieces`); where the CPU writes them
+//!   again before the pass's batch is ready to submit (an event wait holds it), the host step
+//!   records the pass again from the records as they stand then, waiting for no work on the GPU
+//!   and announcing nothing. A CPU write after the batch was submitted races the GPU, as on
+//!   Metal. So the call records nothing for the commands:
 //!   the instance it is encoded in ends its secondary command buffer there and goes on in a new
-//!   one, the execution's own secondary standing between the two ([`Piece`](super::Piece)).
+//!   one, the execution's own secondary standing between the two ([`Piece`]).
 //!   A secondary command buffer must be recorded before a primary executes it, so a pass with an
 //!   execution leaves its whole pass to record later ([`DeferredPass`]), as a segment of its
 //!   encoder (`encoder.rs`, `deferred.rs`): its begin, every instance's secondaries and the
@@ -21,20 +22,24 @@
 //!   (`render/pass_steps.rs`: the shadowed textures' copies, the sample planes', the shader-side
 //!   stencil's, the draws' steps before their instances, the tile dispatches, and the instances
 //!   of no draws that resolve after the last). `commit` records the segment from the CPU's
-//!   records; where an
-//!   encoder made a buffer the pass executes resident for writing
+//!   records; where a route
+//!   that may write the records met a buffer the pass executes
 //!   (`IndirectCommandBuffer::gpu_written`), `commit` records it for good where every such
 //!   execution of the pass runs on the GPU alone (`executions/gpu.rs`, which states which do and
 //!   when the decision is taken again), and otherwise the scheduler's host step records it once
 //!   the work before it completed, which the device announces once
-//!   (`Degradation::HostReplayedIndirectCommands`). The step draws in the large-buffer form,
-//!   whose variant no command's buffer lengths change (`BufferForms::Large`), and the commit
-//!   settles what it will draw (the step compiled each draw's variant and `VkPipeline` as it met
-//!   them, after the commit returned): for each state a record may name (the inherited one, else
-//!   every live state made with `supportIndirectCommandBuffers`), the variant and the `VkPipeline`
-//!   of a draw of each primitive type of its topology class, indexed or not, in the execution's
-//!   instance under the encoder's state at the call ([`DeferredPass::settle`]). The variant is the
-//!   one the state's creation compiled in the large-buffer form, which the commit looks up (the
+//!   (`Degradation::HostReplayedIndirectCommands`). At a host step that fans a rate-mapped pass's
+//!   triangles out, an execution kept from the GPU alone by the rate map alone has its records
+//!   decoded on the GPU there, and the host reads its commands' draw arguments and none of its
+//!   records, drawing each command in its replay variant (`executions/gpu_route.rs`). The step draws in the large-buffer form, whose
+//!   variant no command's buffer lengths change (`BufferForms::Large`), and the commit settles what
+//!   it will draw (the step compiled each draw's variant and `VkPipeline` as it met them, after the
+//!   commit returned): for each state the records name as the CPU wrote them (the inherited one,
+//!   else each live state the CPU set on a command the execution may run, not the program's other
+//!   states made with `supportIndirectCommandBuffers`), the variant and the `VkPipeline` of a draw
+//!   of each primitive type of its topology class, indexed or not, in the execution's instance
+//!   under the encoder's state at the call ([`DeferredPass::settle`]). The variant is the one the
+//!   state's creation compiled in the large-buffer form, which the commit looks up (the
 //!   coordinator's ruling of 2026-10-07: where Metal compiles); the commit makes the `VkPipeline`s,
 //!   which the pass's instance and the encoder's state key. The step still makes what that leaves:
 //!   a tessellation or mesh pipeline's draws; the `VkPipeline` of a draw that fetches attachments,
@@ -42,12 +47,12 @@
 //!   or binds per-bind strides that are not dynamic state; a draw in a run of another shape; a
 //!   command whose buffers ask another variant all the same (the commit compiles that variant where
 //!   the encoder's state asks it, an inherited buffer slot bound with bytes among it); and a state
-//!   made after the commit. The commit makes the neutrals of the plans it settles, a state made
-//!   with `supportIndirectCommandBuffers` made, at its creation, those its variants' plans may bind
-//!   with nothing bound (`GraphicsState::make_neutrals`), and the commit makes the runs' passes
-//!   and memoryless backings ahead (`ahead.rs`), so the step, a serial point of the command
-//!   buffers' stream, seldom makes one; what nothing made before it, the step makes itself
-//!   (`neutral.rs`, `creation.rs`).
+//!   made after the commit or named by a record the GPU wrote. The commit makes the neutrals of the
+//!   plans it settles, a state made with `supportIndirectCommandBuffers` made, at its creation,
+//!   those its variants' plans may bind with nothing bound (`GraphicsState::make_neutrals`), and
+//!   the commit makes the runs' passes and memoryless backings ahead (`ahead.rs`), so the step, a
+//!   serial point of the command buffers' stream, seldom makes one; what nothing made before it,
+//!   the step makes itself (`neutral.rs`, `creation.rs`).
 //! - **Each command** draws as the encoder's `draw_primitives`, `draw_indexed_primitives` or
 //!   `draw_patches` would, through the same steps (`RenderCommandEncoder::draw`; part 5c for the
 //!   indexed and patch draws), into the instance the execution was encoded in, with the
@@ -218,11 +223,14 @@
 //!   execution after one from the commands.
 //! - **A range read from a buffer** (`execute_commands_in_buffer_indirect`, a probe on an M3 Max
 //!   and an M4: a render encoder's execution takes its range as a compute encoder's does,
-//!   `indirect_execute::ExecutionRange::commands`). The encoder copies the range's 8 bytes where
-//!   the execution is encoded, behind a barrier from everything before and before the pass, and a
-//!   host step records the pass from the copy once the work before it completed. A draw of the same
-//!   pass that writes the range before the execution is read by Metal's; the copy would not see it,
-//!   so a range a draw of the encoder before the call may write is refused.
+//!   `indirect_execute::ExecutionRange::commands`). The encoder reads the range's 8 bytes where
+//!   the execution is encoded, before the pass (`indirect_execute::range_from`): in place where
+//!   the host maps the bytes the GPU writes, else from a copy behind a barrier from everything
+//!   before. An execution in the GPU form whose commands merge reads them on the GPU before its
+//!   preprocess (`gpu.rs`); otherwise a host step records the pass from them once the work that
+//!   wrote them completed. A draw of the same pass that writes the range before the execution is
+//!   read by Metal's; neither read would see it, so a range a draw of the encoder before the call
+//!   may write is refused.
 //! - **Metal's private primitive types** (`DrawPrimitiveType`, which the CPU's draws take; a
 //!   kernel writes points for them, as Metal's encoding does). A command's draw of types 5 to 8
 //!   draws as the encoder's draw of the type does, the list its program writes. One of type 9
@@ -261,14 +269,14 @@
 //!   (above): Metal lets a program write the records until it commits. A command's vertex buffer
 //!   set without an attribute stride, where its pipeline state's layout of
 //!   `MTLBufferLayoutStrideDynamic` reads the stride, on a buffer whose descriptor supports
-//!   dynamic attribute strides, is the runtime's own gap, as a compute encoder's kernel buffer is
-//!   (`NotImplemented(RuntimeGap::IndirectCommandUnstridedBuffer)`): plain Metal takes the command
-//!   and completes it, and its fetch reads the buffer at stride 2^32 - 1, which the 32-bit fetch
-//!   cannot place (the gap's doc). On a buffer without that support the records hold no stride
-//!   word and Metal reads stride 0, which the plan path gives exactly, so the command is taken, as
-//!   the encoder's own draw reads such a buffer at stride 0 (`render/vertex_strides.rs`).
+//!   dynamic attribute strides, is read at stride 2^32 - 1, as plain Metal's fetch reads it and as
+//!   a compute encoder's kernel buffer is (`indirect_execute::unstrided_stride`): vertex 0's
+//!   element, and zero for one past the buffer. On a buffer without that support the records hold
+//!   no stride word and Metal reads stride 0, which the plan path gives exactly, as the encoder's
+//!   own draw reads such a buffer at stride 0 (`render/vertex_strides.rs`).
 
 use super::bound::Bound;
+use super::fan_out::{self, FanOutDraw, FanOutRoutes, FanOutRun, Part, Probe, Probed};
 use super::mesh::MeshGrid;
 use super::pass_start_reads::{PassStartReads, PassStartTables};
 use super::pass_steps::PassSteps;
@@ -276,6 +284,7 @@ use super::pending_tile::TilePipelines;
 use super::provoking::ProvokingForms;
 use super::replay::SharedCheck;
 use super::shadows::InstanceShadows;
+use super::snapshot;
 use super::tile_memory::TileMemory;
 use super::RenderCall;
 use super::RenderCommandEncoder;
@@ -289,28 +298,33 @@ use crate::argument_table::ArgumentTable;
 use crate::attachment_stand_in::{self, Cause, StandIn, StandInCopies};
 use crate::blit::reads;
 use crate::buffer::Buffer;
+use crate::command_buffer::rerun::Fenced;
 use crate::command_buffer::CommandBuffer;
-use crate::degradation::{Degradation, SplitCauses};
+use crate::degradation::{Degradation, HostStepKey, SplitCauses};
 use crate::device::functions::Vk;
 use crate::device::lock;
 use crate::encoder::{EncoderCore, RecordedSegment};
-use crate::error::{internal, invalid, vulkan, CommandBufferError, Error, Problem, RuntimeGap};
+use crate::error::{
+    internal, invalid, vulkan, CommandBufferError, Error, IndirectRule, Problem, RuntimeGap,
+};
 use crate::executed_commands::{ExecutedCommand, RecordsRead};
 use crate::fragment_imageblock::PassImageblock;
 use crate::indirect_command_buffer::{
     IndirectCommandBuffer, IndirectCommandCheck, IndirectCommandCheckNeeds, NineDraw, Reader,
+    WrittenRecords,
 };
-use crate::indirect_dispatch;
-use crate::indirect_execute::{self, unstrided_buffer, ExecutionRange};
+use crate::indirect_execute::{self, unstrided_stride, ExecutionRange};
+use crate::kept_commands;
+use crate::live_bind::LiveBind;
 use crate::pipeline::budget::Urgency;
 use crate::pipeline::RenderPipelineState;
 use crate::pipeline::Settled;
 use crate::pipeline::{
     BufferForms, DrawPipeline, FixedState, GraphicsKey, Pending, RawPipeline, RenderVariant,
 };
-use crate::rate_mapped_pass::RateMappedPass;
+use crate::rate_mapped_pass::{self, RateMappedPass};
 use crate::render_pass::{ColorTarget, PassLayout, Target};
-use crate::render_state::EncoderState;
+use crate::render_state::{EncoderState, ScissorRects};
 use crate::render_target::{self, Feedback, PassShape, Position, RenderPassObject};
 use crate::render_values::DrawPrimitiveType;
 use crate::residency::{every_render_stage, Residency};
@@ -325,19 +339,25 @@ use crate::tracker::{
 };
 use crate::versioned::Versioned;
 use crate::visibility::{Lent, Visibility};
-use crate::written_commands::{Writers, WrittenCommands};
+use crate::work_counts::Unprobed;
+use crate::write_routes::replay_why;
+use crate::written_commands::WrittenCommands;
 use crate::Device;
 use ahead::Ahead;
 use ash::vk;
-use cause::HostStepCause;
+use cause::{HostStepCause, Passed};
 use gpu::GpuForm;
-pub(super) use gpu::ReplayedDraws;
+pub(super) use gpu::{CommandTables, ReplayedDraws};
+use gpu_route::RoutedDraw;
 use metal2vulkan::bind::indirect_commands::{Action, BufferStage, CommandRecord};
-use metal2vulkan::bind::{DrawCall, ReplayFaults, ViewSetup};
+use metal2vulkan::bind::{
+    draw_replay_merges, fan_out::PROBE_DRAW_WORDS, DrawCall, RateMapRegions, ReplayFaults,
+    ViewSetup,
+};
 use metal2vulkan::metal::{
     IndexType, IndirectCommandType, PrimitiveTopologyClass, PrimitiveType, VertexStepFunction,
 };
-use metal2vulkan::pipeline::{CommandWrites, VertexStride};
+use metal2vulkan::pipeline::{CommandWrites, RegionFanOut, VertexStride};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -348,9 +368,17 @@ use std::time::Instant;
 mod ahead;
 mod cause;
 mod gpu;
+mod gpu_route;
+mod kept;
+
+use kept::Keeps;
 
 /// The call an execution's refusals name.
 const CALL: &str = "execute_commands_in_buffer";
+
+/// The most rules past the first that a host step's notice names ([`DeferredPass::rules_past`]):
+/// more than the GPU form has, so it bounds the decision's rounds alone.
+const RULES_PAST: usize = 64;
 
 /// The pipeline state an execution runs with (`RenderCommandEncoder::inherited_pipeline`).
 enum Inherited {
@@ -393,10 +421,12 @@ impl RenderLowering {
         check: Option<(IndirectCommandCheck, IndirectCommandCheckNeeds)>,
     ) -> Result<(), Error> {
         self.log(|_| RenderCall::Execute(icb.clone(), range.clone()));
-        self.core.check_device(CALL, icb.device())?;
+        self.core.check_device(CALL, icb.generation())?;
         if !icb.is_render() {
             if !icb.runs_nothing_in_a_pass() {
-                return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
+                return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                    IndirectRule::OtherEncoderKind,
+                )));
             }
             icb.command_range(CALL, range)?;
             return Ok(());
@@ -460,11 +490,13 @@ impl RenderLowering {
     ) -> Result<(), Error> {
         self.log(|_| RenderCall::ExecuteIndirect(icb.clone(), range_buffer.clone(), offset));
         const CALL_INDIRECT: &str = indirect_execute::CALL_INDIRECT;
-        self.core.check_device(CALL_INDIRECT, icb.device())?;
+        self.core.check_device(CALL_INDIRECT, icb.generation())?;
         self.core
-            .check_device(CALL_INDIRECT, range_buffer.device())?;
+            .check_device(CALL_INDIRECT, range_buffer.generation())?;
         if !icb.is_render() {
-            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
+            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                IndirectRule::OtherEncoderKind,
+            )));
         }
         indirect_execute::check_range_buffer(range_buffer.length(), offset)?;
         // Not in a pass of several color groups (`render/color_groups.rs`).
@@ -479,15 +511,12 @@ impl RenderLowering {
             offset..offset + indirect_execute::RANGE_BYTES,
         )];
         if self.core.uses().written(&read) {
-            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
+            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                IndirectRule::RangeWrittenByDraw,
+            )));
         }
-        let copy = indirect_dispatch::copy_arguments(
-            &mut self.core,
-            range_buffer,
-            offset,
-            indirect_execute::RANGE_BYTES,
-        )?;
-        self.defer_execution(icb, ExecutionRange::Indirect(copy), pipeline, check)
+        let range = indirect_execute::range_from(&mut self.core, range_buffer, offset)?;
+        self.defer_execution(icb, range, pipeline, check)
     }
 
     /// The pipeline state an execution of `icb` here runs with (`Inherited`). Where the
@@ -527,7 +556,7 @@ impl RenderLowering {
                 {
                     Some(earlier.len())
                 }
-                ExecutionRange::Fixed(_) | ExecutionRange::Indirect(_) => None,
+                ExecutionRange::Fixed(_) | ExecutionRange::Indirect { .. } => None,
             });
         if let Some(earlier) = earlier {
             degrade_repeated_start(self.core.device(), icb, range, earlier);
@@ -543,10 +572,15 @@ impl RenderLowering {
         pipeline: Option<RenderPipelineState>,
         check: Option<(IndirectCommandCheck, IndirectCommandCheckNeeds)>,
     ) -> Result<(), Error> {
+        if let Some(trail) = self.core.trail() {
+            trail.execution(range.given());
+        }
         self.sync_heaps();
+        // Its commands bind the heap sets as they record, later.
+        self.core.command_buffer().state().heaps.executes_later();
         // Its commands run the states their records name, where it inherits none.
         if !icb.descriptor().inherit_pipeline_state {
-            self.writers.runs(icb.written().named().writes);
+            self.core.routes.executed(icb);
         }
         // An execution keeps an extended-range, padded or bfloat attachment's texels as a draw
         // does, of reset commands too, and a signed normalized one's minimum codes, and an
@@ -570,7 +604,7 @@ impl RenderLowering {
         // read from a buffer runs at most every command of the buffer.
         let commands = match &range {
             ExecutionRange::Fixed(range) => u64::from(range.end - range.start),
-            ExecutionRange::Indirect(_) => icb.size(),
+            ExecutionRange::Indirect { .. } => icb.size(),
         };
         let (depth, _) = self.layout.aspects();
         let metal_depth = depth
@@ -599,7 +633,8 @@ impl RenderLowering {
         // a new one that continues it, where it would have taken them. Nor one whose colors are
         // in the feedback loop layout, which runs as one render pass instance and whose
         // descriptors of those colors name that layout (`render/snapshot.rs`): the commands read
-        // the attachments in place, in `GENERAL`.
+        // the attachments in place, in `GENERAL`. Nor one its first draw's snapshots lead, which
+        // runs as one render pass instance after theirs.
         let continues = self.current.inline
             && self.takes_current(
                 (&[], &[], &[]),
@@ -607,12 +642,14 @@ impl RenderLowering {
                 ViewSetup::default(),
                 hidden.is_some(),
             );
-        let apart = self.current.inline || self.current.feedback != Feedback::NONE;
+        let apart = self.current.inline
+            || self.current.feedback != Feedback::NONE
+            || self.current.leading.is_some();
         let (mut next, stood) = self.next_instance(
             (&[], None),
             (false, false),
             ViewSetup::default(),
-            apart,
+            (apart, false),
             hidden,
             &[],
             &[],
@@ -665,6 +702,7 @@ impl RenderLowering {
         let snapshot = Snapshot {
             layout: self.layout.clone(),
             state,
+            scissors: self.scissors.clone(),
             vertex: if inherited {
                 self.vertex.clone()
             } else {
@@ -718,6 +756,8 @@ impl RenderLowering {
         .map(|texture| (texture, true));
         let mut shadows = Vec::new();
         for (texture, writes) in tables.chain(snapshot.residency.textures_written()) {
+            // A shadow left unmade is made here: a command may bind it (`texture/lazy_shadow.rs`).
+            texture.made_for_use()?;
             if let Some(copies) = texture.shadow() {
                 let used = ShadowUse {
                     copies: Arc::clone(copies),
@@ -727,6 +767,7 @@ impl RenderLowering {
                     area: None,
                     loads: None,
                     tile_stores: false,
+                    cleared: None,
                 };
                 shadow::join(&mut shadows, &used);
             }
@@ -749,6 +790,7 @@ impl RenderLowering {
             self.gathering().add_bytes(buffer, write);
         }
         self.core.retain(icb.clone());
+        icb.hold_records(&mut self.core, false);
         self.executions.push(RenderExecution {
             icb: icb.clone(),
             range,
@@ -761,7 +803,6 @@ impl RenderLowering {
                 .map_or(IndirectCommandCheckNeeds::ALL, |(_, needs)| *needs),
             check: check.map(|(check, _)| Mutex::new(check)),
             read_at: AtomicU64::new(indirect_execute::NOT_READ),
-            encoder: self.core.command_buffer().state().open_encoder_place(),
         });
         // Its commands may name any pipeline state, reading handles in any stage.
         self.command_encoded(every_render_stage());
@@ -772,8 +813,11 @@ impl RenderLowering {
 impl RenderCommandEncoder {
     /// `executeCommandsInBuffer:withRange:`: run render commands `range` of `icb` here, as their
     /// records stand when the command buffer's batch that executes them is submitted (the commit
-    /// reads them, and the batch's submission again where the CPU wrote them since), or, where an
-    /// encoder made `icb` resident for writing, once the work before them completed (a host step
+    /// reads them, and the batch's submission again where the CPU wrote them since), or, where a
+    /// route that may write `icb`'s records met it (`IndirectCommandBuffer::gpu_written`: its
+    /// command buffer made it resident for writing and runs a function that may call an
+    /// indirect-command operation, or a blit copied or reset commands into it), once the work
+    /// before them completed (a host step
     /// the device announces once, `Degradation::HostReplayedIndirectCommands`). Each draws as this
     /// encoder's `draw_primitives`, `draw_indexed_primitives` or `draw_patches` would, with the
     /// encoder's state as it is now, and its own pipeline state and buffers, or the encoder's
@@ -786,7 +830,7 @@ impl RenderCommandEncoder {
     /// For a range that is not empty, an inherited state made without
     /// `supportIndirectCommandBuffers` faults Metal's GPU at the encoder: the call is taken, the
     /// encoder runs nothing, not even its load, clear or store actions, and the command buffer
-    /// completes with [`CommandBufferError::PageFault`](crate::CommandBufferError::PageFault), the
+    /// completes with [`CommandBufferError::PageFault`], the
     /// other encoders run and every event signal fires. A buffer of no command types, or of
     /// dispatches beside draws of primitives, runs nothing, as plain Metal's; one of dispatches
     /// alone, or beside other draws (unmeasured in a pass), is
@@ -808,7 +852,7 @@ impl RenderCommandEncoder {
     /// [`execute_commands_in_buffer`](Self::execute_commands_in_buffer) with a check of the
     /// commands it runs (a runtime extension; Metal has none), which looks for `needs`: where the
     /// commit records the pass from the CPU's records, or a host step from the records as the GPU
-    /// and the CPU left them (an encoder made `icb` resident for writing,
+    /// and the CPU left them (a route that may write `icb`'s records met it,
     /// `IndirectCommandBuffer::gpu_written`), it first calls `check` with each command of the range
     /// it will record, in order, before it records any of them ([`IndirectCommandCheck`]). Neither
     /// calls it where what `icb`'s records may hold rules out every kind `needs` names
@@ -842,10 +886,12 @@ impl RenderCommandEncoder {
     /// location, clamped at the buffer's size, so a length of 0 or a location at the size runs
     /// nothing and a length past it runs to its end; a location past the size, or a range past
     /// `2^32 - 1`, at which Metal's GPU faults the command buffer, runs nothing, and the command
-    /// buffer's execution report states `ReplayFaults::RANGE`. The encoder copies the range where
-    /// it is encoded, behind a barrier from everything before, so the range a kernel of an earlier
-    /// encoder wrote is read; a host step records the pass once the work before it completed, which
-    /// the device announces once (`Degradation::HostReplayedIndirectCommands`).
+    /// buffer's execution report states `ReplayFaults::RANGE`. A host step records the pass once
+    /// the work that wrote its records and the range completed (a kernel of an earlier encoder, a
+    /// blit), which the device announces once (`Degradation::HostReplayedIndirectCommands`). The
+    /// step reads the range in place where the host maps the bytes of `range_buffer` the GPU
+    /// writes (a `Shared` buffer, a `Managed` one on unified memory); else the encoder copies it
+    /// where it is encoded, behind a barrier from everything before, and the step reads the copy.
     ///
     /// A range plain Metal takes and the runtime has no exact answer for is its own gap, not
     /// misuse: 8 bytes that run past `range_buffer`, which Metal reads from whatever follows it
@@ -857,8 +903,8 @@ impl RenderCommandEncoder {
     /// [`execute_commands_in_buffer`](Self::execute_commands_in_buffer) refuses but a range (an
     /// unset inherited state whatever the range), and a range buffer of another device. A range a draw of the
     /// encoder before the call may write is `NotImplemented(IndirectRenderCommands)`: Metal's
-    /// execution reads that draw's write, where the runtime's copy, made before the pass, would
-    /// not; as for the index bounds pass, an untracked buffer's writes are not seen. Under an
+    /// execution reads that draw's write, where the runtime's read, before the pass, would not; as
+    /// for the index bounds pass, an untracked buffer's writes are not seen. Under an
     /// inherited state made without `supportIndirectCommandBuffers`, whatever the range, `{0, 0}`
     /// included, the encoder faults as `execute_commands_in_buffer`'s does.
     pub fn execute_commands_in_buffer_indirect(
@@ -964,9 +1010,6 @@ pub(crate) struct RenderExecution {
     /// read them after (`IndirectCommandBuffer::cpu_writes`); `indirect_execute::NOT_READ` until
     /// then ([`rewritten`](Self::rewritten)).
     read_at: AtomicU64,
-    /// Its encoder's place among the command buffer's ended encoders, which names a draw of its
-    /// commands that its replay drops (`CommandBuffer::drop_late_draw`).
-    encoder: usize,
 }
 
 /// The encoder's state an execution's draws take: as the call found it, its tables only where
@@ -974,6 +1017,7 @@ pub(crate) struct RenderExecution {
 struct Snapshot {
     layout: PassLayout,
     state: EncoderState,
+    scissors: ScissorRects,
     vertex: ArgumentTable,
     fragment: ArgumentTable,
     object: ArgumentTable,
@@ -1006,16 +1050,289 @@ struct Snapshot {
 }
 
 /// A command to run: its record, and the render pipeline state it names (`None`: none).
-type Command = (CommandRecord, Option<RenderPipelineState>);
+pub(super) type Command = (CommandRecord, Option<RenderPipelineState>);
+
+/// The commands of an execution a host step's probe and routes record (`render/fan_out.rs`):
+/// those the host read, `None` where a record runs nothing for a fault; or those of its GPU route
+/// that draw, each its draw as the GPU decoded it, the type they draw and where their slot tables
+/// lie (`executions/gpu_route.rs`).
+pub(super) enum StepDraws {
+    Read(Vec<Option<Command>>),
+    Routed(Vec<RoutedDraw>, PrimitiveType, CommandTables),
+}
+
+impl StepDraws {
+    /// The commands.
+    pub(super) fn len(&self) -> usize {
+        match self {
+            StepDraws::Read(commands) => commands.len(),
+            StepDraws::Routed(draws, ..) => draws.len(),
+        }
+    }
+
+    /// Whether they are a GPU route's, whose draws run in the replay variant.
+    pub(super) fn routed(&self) -> bool {
+        matches!(self, StepDraws::Routed(..))
+    }
+
+    /// Of the commands `range`, those that run, as the replay loop records them.
+    fn replayed(&self, range: Range<usize>) -> Vec<Replayed<'_>> {
+        match self {
+            StepDraws::Read(commands) => (commands[range].iter().flatten())
+                .map(Replayed::Record)
+                .collect(),
+            StepDraws::Routed(draws, primitive_type, tables) => (draws[range].iter())
+                .map(|draw| Replayed::Routed(draw, *primitive_type, tables))
+                .collect(),
+        }
+    }
+}
+
+/// A command the replay loop records ([`RenderExecution::replay`]): a record and the state it
+/// names, or a GPU route's command, its draw, the type it draws and where its slot tables lie.
+#[derive(Clone, Copy)]
+pub(super) enum Replayed<'c> {
+    Record(&'c Command),
+    Routed(&'c RoutedDraw, PrimitiveType, &'c CommandTables),
+}
+
+impl<'c> From<&'c Command> for Replayed<'c> {
+    fn from(command: &'c Command) -> Replayed<'c> {
+        Replayed::Record(command)
+    }
+}
+
+/// An execution's probe at a host step that fans the pass's triangles out, of all its parts
+/// ([`DeferredPass::probe_parts`]): the index of each command's draw among the probe's draws, by
+/// its place among the commands that run, where it was probed; `None` where its commands are drawn
+/// region by region.
+type ProbeRun = Option<Vec<Option<u32>>>;
+
+/// The fewest commands a part of a host step's probe holds, and the most parts it is recorded in
+/// ([`DeferredPass::probe_parts`]): each part is submitted once it is recorded, so the GPU runs it
+/// while the host records the next, and the host waits once, after the last.
+const PROBE_PART_COMMANDS: usize = 32;
+const PROBE_PARTS: usize = 8;
+
+/// A part of a host step's probe as [`DeferredPass::submit_probe`] submitted it: its fence
+/// (`None` where nothing was submitted), its recording, its command buffers taken out, and its GPU
+/// time's slot.
+type SubmittedPart = (
+    Option<Fenced>,
+    RecordedSegment,
+    Option<rate_mapped_pass::PieceTimes>,
+);
+
+/// The host step's commands of an execution, read once for its probe and its recording
+/// ([`RenderExecution::step_commands`]), or its GPU route's (`executions/gpu_route.rs`): the
+/// commands, `None` where a record runs nothing for a fault, the command they start at, and the
+/// faults the range and the records hold.
+type StepCommands = (StepDraws, u32, ReplayFaults);
+
+/// The buffer forms of a host step's draws of an execution's commands, whose variants `commit`
+/// settled (`RenderExecution::settle`): the large-buffer form; the replay form for its GPU
+/// route's (`routed`, `executions/gpu_route.rs`).
+fn step_forms(routed: bool) -> BufferForms {
+    match routed {
+        true => BufferForms::Replay,
+        false => BufferForms::Large,
+    }
+}
+
+/// What [`RenderExecution::probe`] recorded of a part of an execution's commands.
+struct ProbedPart {
+    /// The index the next part's draws take.
+    next: u32,
+    /// Its secondary, ended, where its commands recorded in one run of the instance's shape and
+    /// it probed a draw.
+    draws: Option<vk::CommandBuffer>,
+    /// The index of each command's draw among the probe's draws, by its place among the part's
+    /// commands that run, where it was probed.
+    slots: Vec<Option<u32>>,
+    /// Its commands recorded in more than one run, or not in the instance's shape: the
+    /// execution's commands are drawn region by region.
+    apart: bool,
+    /// A command's barrier or a draw that writes memory stopped the probe: no later command of
+    /// the execution is probed.
+    stopped: bool,
+}
+
+/// A host step's probe as its parts are submitted ([`DeferredPass::probe_parts`]): each part's
+/// fence, its recording, its command buffers taken out, and its GPU time's slot; the parts; and
+/// whether a part was left unsubmitted, the process exiting.
+#[derive(Default)]
+struct ProbeParts {
+    fenced: Vec<Fenced>,
+    recorded: Vec<RecordedSegment>,
+    times: Vec<rate_mapped_pass::PieceTimes>,
+    parts: u64,
+    unsubmitted: bool,
+}
+
+impl ProbeParts {
+    /// Take part `fenced`, recorded as `recorded`, timed by `times`: `None` where it was not
+    /// submitted.
+    fn add(&mut self, (fenced, recorded, times): SubmittedPart) {
+        match fenced {
+            Some(fenced) => self.fenced.push(fenced),
+            None => self.unsubmitted = true,
+        }
+        self.recorded.push(recorded);
+        self.times.extend(times);
+        self.parts += 1;
+    }
+}
 
 /// What an execution's recording found: resident-set misses and faults, and the runs its draws
-/// that reach the tile threadgroup memory began, and those its commands' barriers began.
+/// that reach the tile threadgroup memory began, those its draws that reach interlocked storage
+/// an earlier draw of the run wrote began where the driver's such draws race under load, and
+/// those its commands' barriers began; and, in a rate-mapped pass, the work of the commands
+/// recorded since the last piece began (`rate_mapped_pass.rs`, **Pieces**), carried from one
+/// execution of the pass to the next.
 #[derive(Default)]
 struct Found {
     misses: u32,
     faults: ReplayFaults,
     tile_memory_splits: usize,
+    interlocked_splits: usize,
     barrier_splits: usize,
+    /// The work recorded since the last piece began.
+    piece_work: u64,
+    /// That work reached the piece's (`rate_mapped_pass::piece_work`): the next command that
+    /// draws begins the next piece.
+    piece_due: bool,
+}
+
+impl Found {
+    /// Before a command's draw, or a range of its indices (`rate_mapped_pass.rs`, **Pieces**):
+    /// where the work before holds a piece's, the draw records into the execution's next run,
+    /// which begins the next piece; but where the run so far is one the execution began with
+    /// nothing in it, that run begins it.
+    fn piece_before(&self, encoder: &mut RenderLowering) {
+        if self.piece_due {
+            match encoder.current.recorded || encoder.earlier.is_empty() {
+                true => encoder.piece_split = true,
+                false => encoder.current.piece = true,
+            }
+        }
+    }
+
+    /// After it: its work added to the piece's, and the region draws its recordings made (0
+    /// outside a rate-mapped pass). A draw that recorded nothing leaves the next piece to the
+    /// next that draws.
+    fn piece_after(&mut self, encoder: &mut RenderLowering) -> u64 {
+        self.piece_due = encoder.piece_split;
+        self.piece_work = self.piece_work.saturating_add(encoder.piece_work);
+        encoder.piece_work = 0;
+        if self.piece_work >= rate_mapped_pass::piece_work() {
+            self.piece_due = true;
+            self.piece_work = 0;
+        }
+        let regions = encoder.piece_regions;
+        encoder.piece_regions = 0;
+        regions
+    }
+}
+
+/// A draw `action` asks for, as the encoder trail notes it (`encoder_trail.rs`, **Host steps**):
+/// whether indexed, its primitive type's raw value, its vertices or indices, and its instances;
+/// `None` for any other command.
+fn trail_draw(action: &Action) -> Option<(bool, u32, u32, u32)> {
+    match *action {
+        Action::DrawPrimitives {
+            primitive_type,
+            vertex_count,
+            instance_count,
+            ..
+        } => Some((false, primitive_type, vertex_count, instance_count)),
+        Action::DrawIndexedPrimitives {
+            primitive_type,
+            index_count,
+            instance_count,
+            ..
+        } => Some((true, primitive_type, index_count, instance_count)),
+        _ => None,
+    }
+}
+
+/// The vertices of each primitive of `draw` of `pipeline`, where its indices may be drawn as
+/// consecutive ranges, each a draw of its own, as Metal draws the whole (`rate_mapped_pass.rs`,
+/// **Pieces**): [`list_vertices`]'s.
+fn index_ranges_of(pipeline: &RenderPipelineState, draw: &IndexedDraw) -> Option<u32> {
+    list_vertices(pipeline, draw.primitive_type, draw.instance_count)
+}
+
+/// The triangles of `draw` of `pipeline`, and whether its parts begin at even ones, where a draw
+/// the probe flagged is drawn in parts (`render/fan_out.rs`, **Parts**): a list of triangles whose
+/// vertices or indices may be drawn as consecutive ranges ([`list_vertices`]), its parts of a
+/// 16-bit index list beginning at even triangles. `None` for any other, drawn region by region
+/// whole.
+fn in_parts<B>(pipeline: &RenderPipelineState, draw: &Draw<B>) -> Option<(u32, bool)> {
+    let triangle = DrawPrimitiveType::Public(PrimitiveType::Triangle);
+    match draw {
+        Draw::Primitives(
+            Assembly::Primitives(PrimitiveType::Triangle),
+            DrawCall::Primitives {
+                vertex_count,
+                instance_count,
+                ..
+            },
+        ) => (list_vertices(pipeline, triangle, *instance_count) == Some(3))
+            .then_some((vertex_count / 3, false)),
+        Draw::Indexed(draw, _) => (draw.primitive_type == triangle
+            && index_ranges_of(pipeline, draw) == Some(3))
+        .then_some((draw.index_count / 3, index_size(draw.index_type) == 2)),
+        _ => None,
+    }
+}
+
+/// The draw of `part` of a draw without indices `whole` (`render/fan_out.rs`, **Parts**): its
+/// triangles' vertices, from the part's first.
+fn part_call(whole: DrawCall, part: Part) -> DrawCall {
+    match whole {
+        DrawCall::Primitives {
+            vertex_start,
+            instance_count,
+            base_instance,
+            ..
+        } => DrawCall::Primitives {
+            vertex_start: vertex_start + 3 * part.first,
+            vertex_count: 3 * part.count,
+            instance_count,
+            base_instance,
+        },
+        other => other,
+    }
+}
+
+/// The vertices of each primitive of a draw of `primitive_type` and `instance_count` instances of
+/// `pipeline`, where its vertices or indices may be drawn as consecutive ranges, each a draw of
+/// its own, as Metal draws the whole: a list of points, lines or triangles, which Metal never
+/// restarts, of one instance, whose pipeline reads no `[[primitive_id]]` and writes no memory.
+/// `None` for any other.
+fn list_vertices(
+    pipeline: &RenderPipelineState,
+    primitive_type: DrawPrimitiveType,
+    instance_count: u32,
+) -> Option<u32> {
+    let RenderStateKind::Graphics(state) = pipeline.kind() else {
+        return None;
+    };
+    let graphics = &state.base().graphics;
+    if instance_count != 1
+        || graphics.reads_primitive_id
+        || graphics.vertex_writes_memory
+        || graphics.fragment_writes_memory
+        || crate::tessellation::patches(graphics).is_some()
+    {
+        return None;
+    }
+    match primitive_type {
+        DrawPrimitiveType::Public(PrimitiveType::Point) => Some(1),
+        DrawPrimitiveType::Public(PrimitiveType::Line) => Some(2),
+        DrawPrimitiveType::Public(PrimitiveType::Triangle) => Some(3),
+        _ => None,
+    }
 }
 
 /// An execution's recording: the encoder core back, with what the draws noted, retained and
@@ -1134,7 +1451,11 @@ impl Rendered {
         maker: &CommandBuffer,
         run: &mut PassLayout,
     ) -> Result<(), Error> {
-        let refused = || Error::NotImplemented(RuntimeGap::IndirectRenderCommands);
+        let refused = || {
+            Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                IndirectRule::MemorylessReadPastPass,
+            ))
+        };
         let mut backed = Vec::new();
         for (index, color) in self.layout.colors.iter().enumerate() {
             let Some(color) = color.as_ref().filter(|color| color.stand_in.is_none()) else {
@@ -1360,11 +1681,12 @@ pub(super) struct PassStorage {
     pub(super) shadow: Option<ShadowStencil>,
 }
 
-/// One run of an execution's commands: the secondary command buffer its draws recorded into,
-/// and the shape and views of the render pass instance it runs in where a command's draw needed
-/// another than its instance's (attachments it fetches as storage images, views of its own).
+/// One run of an execution's commands: the secondary command buffers its draws recorded into, in
+/// order (one, but for the chunks of a kept execution's: `kept.rs`), and the shape and views of
+/// the render pass instance it runs in where a command's draw needed another than its instance's
+/// (attachments it fetches as storage images, views of its own).
 struct Run {
-    draws: vk::CommandBuffer,
+    draws: Vec<vk::CommandBuffer>,
     other: Option<(PassShape, ViewSetup)>,
     /// Its draws test and write the stencil in the shader: the shadow is filled before it and
     /// copied back after it, as around an encoder's instance of such draws.
@@ -1381,6 +1703,9 @@ struct Run {
     /// earlier draw's stages before its fragments touched (`RenderCommandEncoder::draw_resident`).
     /// A command's barrier begins every run that has them.
     before: Vec<Before>,
+    /// It begins a piece of a rate-mapped pass's submission (`rate_mapped_pass.rs`,
+    /// **Pieces**): the pass's recording goes on in a new `VkCommandBuffer` before it.
+    piece: bool,
 }
 
 impl Run {
@@ -1803,15 +2128,26 @@ impl RenderLowering {
     /// class), the variant in the large-buffer form and the `VkPipeline` of the draw in the
     /// execution's instance, an indexed draw's alike ([`settle_draw_of`](Self::settle_draw_of)).
     /// A tessellation or mesh pipeline's draws, and a state the pass refuses, are left to the
-    /// step, which meets them as they are then. Announces nothing: it draws nothing.
-    fn settle_draws(&mut self, pipeline: &RenderPipelineState, made: &mut Vec<SettledDraw>) {
+    /// step, which meets them as they are then. Announces nothing: it draws nothing. The draws
+    /// settle with the bind state `live`. Under the encoder's fan-out (`render/fan_out.rs`), the
+    /// probe's or the fanned-out draw's variant of each draw it takes (a command the step boxes
+    /// makes its region-copy variant there), none of another; outside it, a draw's region-copy
+    /// variant where the device fans out.
+    fn settle_draws(
+        &mut self,
+        live: &mut LiveBind,
+        pipeline: &RenderPipelineState,
+        made: &mut Vec<SettledDraw>,
+    ) {
         let RenderStateKind::Graphics(state) = pipeline.kind() else {
             return;
         };
         let vertex = state.descriptor().vertex();
         if crate::tessellation::patches(&state.base().graphics).is_some()
             || vertex.is_none()
-            || self.shape_inputs().check_pipeline(CALL, pipeline).is_err()
+            || (self.shape_inputs())
+                .check_pipeline(CALL, pipeline, &self.layout)
+                .is_err()
         {
             return;
         }
@@ -1831,8 +2167,11 @@ impl RenderLowering {
         };
         // The encoder's pipeline state, which its bind state reads, as a command's draw sets it.
         self.pipeline = Some(pipeline.clone());
-        for &primitive_type in types {
-            if let Ok(settled) = self.settle_draw_of(state, primitive_type) {
+        // A GPU route, whose draws the replay form's are at a host step, draws lists alone
+        // (`gpu_route.rs`).
+        let routed = self.forms == BufferForms::Replay;
+        for &primitive_type in types.iter().filter(|&&t| !routed || draw_replay_merges(t)) {
+            if let Ok(Some(settled)) = self.settle_draw_of(live, state, primitive_type) {
                 made.push(settled);
             }
         }
@@ -1849,33 +2188,53 @@ impl RenderLowering {
     /// slots); here none is made where the draw records into a run of another shape than the
     /// instance's (it fetches attachments, tests the stencil in the shader, renders views of its
     /// own, or places its colors elsewhere), or a command's own vertex strides key the pipeline
-    /// (a layout of per-bind strides that are not dynamic state).
+    /// (a layout of per-bind strides that are not dynamic state). Under the encoder's fan-out,
+    /// its variant of the draw, `None` where the fan-out does not take the draw
+    /// (`fan_out_asked`).
     fn settle_draw_of(
-        &self,
+        &mut self,
+        live: &mut LiveBind,
         state: &DrawingState,
         primitive_type: PrimitiveType,
-    ) -> Result<SettledDraw, Error> {
+    ) -> Result<Option<SettledDraw>, Error> {
         let assembly = Assembly::Primitives(primitive_type);
+        // A command's lines at a width other than 1 are the device's own at the nearest width they
+        // draw, never the band (`render/line_width.rs`).
         let settings = self.draw_settings(CALL, state, assembly, false)?;
         let mut argument_samplers = ArgumentSamplers::taken(self.core.device());
         let function_tables = state.function_tables();
-        let live = Arc::clone(&self.live);
         let pass_start = PassStartTables::default();
         let sampler_maps = self.sampler_maps(state, &pass_start)?;
+        // The commands' own arguments, which decide the layouts a draw pulls past 4 GiB
+        // (`render/vertex_reach.rs`), are the step's: none here. A command's draw is direct, and
+        // draws a rate-mapped pass's regions as the encoder's direct draw would.
+        let region_viewports = self.draws_region_batches(state, &settings, true);
+        // Outside the encoder's fan-out, the region-copy variant the step records where the device
+        // fans out (`render/fan_out.rs`, **Region-copy variant**), else its region by region
+        // variant.
+        let region_fan_out = match self.fan_out {
+            None => self.fan_out_asked(state, &settings, assembly, None)?,
+            Some(_) => match self.fan_out_asked(state, &settings, assembly, None)? {
+                Some(fan) => Some(fan),
+                None => return Ok(None),
+            },
+        };
         let settled = self.settle_draw(
-            &mut lock(&live),
+            live,
             (
                 state,
                 &settings,
                 None,
                 PrivateForm::default(),
                 ProvokingForms::default(),
+                &BTreeSet::new(),
+                (region_viewports, region_fan_out),
             ),
             (&pass_start, &sampler_maps),
             (&mut argument_samplers, &mut None),
             (&function_tables, &mut None),
         )?;
-        let Settled { variant, plan, .. } = settled;
+        let (Settled { variant, plan, .. }, _) = settled;
         let device = self.core.device();
         let stages = &variant.pipeline().stages;
         device.degrade_argument_pixel_samplers(stages, argument_samplers.take(device));
@@ -1900,7 +2259,7 @@ impl RenderLowering {
             || *self.current.shape.locations != *settings.routing.locations
             || own_strides
         {
-            return Ok((variant, None));
+            return Ok(Some((variant, None)));
         }
         let (_, stencil) = self.layout.aspects();
         let failing = match &settings.failing_state {
@@ -1924,6 +2283,18 @@ impl RenderLowering {
         );
         self.shape_inputs()
             .clamp_draw_depth(&mut fixed, graphics, clamp)?;
+        // As many viewports as each of the step's commands sets where the variant records the
+        // regions several at a time, as the step's draw keys it.
+        if let Some(batch) = super::region_batch(&variant, self.core.device())? {
+            fixed.viewports = batch as u32;
+        }
+        // And the one its draw through its region-copy variant sets (`render/fan_out.rs`,
+        // **Region-copy variant**).
+        if variant.key().region_fan_out == Some(RegionFanOut::RegionCopies)
+            && !graphics.vertex_writes_memory
+        {
+            fixed.viewports = 1;
+        }
         // The class's list topology where the pipeline makes the topology dynamic.
         let (topology, primitive_restart) = crate::pipeline::keyed_assembly(
             settings.topology,
@@ -1934,10 +2305,12 @@ impl RenderLowering {
             specialization: plan.specialization.clone(),
             topology,
             primitive_restart,
-            pass: self.current.shape.clone(),
+            pass: self.current.shape.keyed(),
             strides: Vec::new(),
             fixed: FixedState::without_dynamic(fixed, &graphics.dynamic_states),
             sample_positions: self.layout.sample_positions.clone(),
+            // An execution's command reads no attachment in place (`render/snapshot.rs`).
+            feedback_loop: false,
         };
         // The formats the encoder's tables bind, which are the command's own.
         let stages = [
@@ -1962,11 +2335,31 @@ impl RenderLowering {
         if let DrawPipeline::Made(raw) = &drawn {
             variant.first_use(raw, &key.specialization, &formats);
         }
-        Ok((variant, Some(drawn)))
+        Ok(Some((variant, Some(drawn))))
     }
 }
 
 impl RenderExecution {
+    /// What its commands reach of the encoder's bindings at the call, where the buffer inherits
+    /// its buffers (`ArgumentTable::bound_uses` of each stage's table the snapshot holds; none
+    /// otherwise): `None` where a table binds a visible-function table.
+    fn inherited_uses(&self) -> Option<Vec<Use<ResourceKey>>> {
+        if !self.icb.descriptor().inherit_buffers {
+            return Some(Vec::new());
+        }
+        let snapshot = &self.snapshot;
+        let mut uses = Vec::new();
+        for table in [
+            &snapshot.vertex,
+            &snapshot.fragment,
+            &snapshot.object,
+            &snapshot.mesh,
+        ] {
+            uses.extend(table.bound_uses()?);
+        }
+        Some(uses)
+    }
+
     /// Whether the commands may reach the pass's tile threadgroup memory: the encoder set an
     /// argument of it at the call (`render/tile_memory.rs`).
     pub(super) fn reaches_tile_memory(&self) -> bool {
@@ -1987,61 +2380,54 @@ impl RenderExecution {
     /// part `None` where no draw made it yet), in a pass whose instances `rendered` lays out,
     /// with `residency`, the command buffer's (`residency.rs`): from the CPU's records as they
     /// stand now, or, for the host step (`step`), from the records as the GPU and the CPU left
-    /// them; or in its GPU form (`gpu`), whose records the host never reads (`gpu.rs`). Commands
-    /// that run as several back the pass's memoryless attachments (`Rendered::back_memoryless`).
+    /// them; or in its GPU form (`gpu`), whose records the host never reads (`gpu.rs`); or, at a
+    /// host step that fans the pass's triangles out, from the records it read once (`routes`,
+    /// [`record_routes`](Self::record_routes)). Commands that run as several back the pass's
+    /// memoryless attachments (`Rendered::back_memoryless`).
     fn record(
         &self,
         core: EncoderCore,
         (command_buffer, residency): (&CommandBuffer, &Residency),
-        (step, gpu): (bool, Option<&GpuForm>),
+        (step, gpu, routes): (bool, Option<&GpuForm>, Option<Arc<FanOutRoutes>>),
         found: &mut Found,
         (storage, rendered): (PassStorage, &mut Rendered),
     ) -> Result<Recorded, Error> {
         let snapshot = &self.snapshot;
         let device = command_buffer.device().clone();
         if let Some(form) = gpu {
-            let encoder =
-                self.record_gpu(core, (command_buffer, residency), form, (storage, rendered))?;
+            let at = (command_buffer, residency);
+            let encoder = self.record_gpu(core, at, (form, step), (storage, rendered))?;
             return self.finish(encoder, found, rendered, &device);
         }
-        let (commands, faults) = self.commands(&device, step)?;
-        found.faults = ReplayFaults(found.faults.0 | faults.0);
-        // What the commands run, for the command buffer's handlers (`executed_commands.rs`).
-        let read = match step {
-            true => RecordsRead::HostStep,
-            false => RecordsRead::Commit,
+        if let Some(routes) = routes {
+            let at = (command_buffer, residency);
+            return self.record_routes(core, at, routes, found, (storage, rendered));
+        }
+        // Commands their chunks' kept recordings may run (`kept.rs`): the CPU's records at
+        // commit, and at the host step those the GPU may write.
+        let reads = match self.keeping(command_buffer, residency, rendered, step) {
+            Keeps::Kept(keeping) => {
+                let rendering = (storage, rendered);
+                let at = (command_buffer, residency);
+                return self.record_kept(core, at, *keeping, found, rendering);
+            }
+            Keeps::Inline(reads) => reads,
         };
-        command_buffer.report_executed(&self.icb, read, residency, || {
-            let first = self
-                .range
-                .commands(self.icb.size())
-                .map_or(0, |(range, _)| u64::from(range.start));
-            let commands = commands
-                .iter()
-                .enumerate()
-                .filter_map(|(at, command)| {
-                    let (record, own) = command.as_ref()?;
-                    let Asked::Draw(_) = Asked::of(&record.action, &self.icb) else {
-                        return None;
-                    };
-                    let pipeline = self.pipeline.as_ref().or(own.as_ref())?;
-                    Some(ExecutedCommand {
-                        index: first + at as u64,
-                        can_encode_indirect_commands: pipeline.can_encode_indirect_commands(),
-                    })
-                })
-                .collect();
-            (commands, false)
-        });
-        let draws = command_buffer.begin_draws(&snapshot.compatible)?;
-        let raw = device.shared().vk();
-        // The query the commands' draws count in, begun here and ended after the last of them.
-        let visibility = Visibility::borrowing(
-            snapshot.layout.visibility.clone(),
-            self.lent.clone(),
-            raw,
-            draws,
-        );
+        let (range, faults) = self.range.commands(self.icb.size());
+        if !step && self.range.indirect() {
+            return Err(internal(
+                "a range read from a buffer recorded before its host step",
+            ));
+        }
+        self.trail_range(command_buffer, &range);
+        found.faults = ReplayFaults(found.faults.0 | faults.0);
+        // The caller's check sees each command the execution will record, before it records any,
+        // where it may see something; so do the command buffer's executed-commands handlers,
+        // which hear of the execution once. `commit` reads the rest a chunk at a time
+        // (`kept_commands::pieces`), the host step the records as the GPU and the CPU left them.
+        let check = self.check.as_ref().filter(|_| self.check_sees_now());
+        let reports = command_buffer.reports_executed();
+        let whole = step || check.is_some() || reports;
         // The host step's draws take the large-buffer form, whose variants `commit` settled
         // (`RenderExecution::settle`).
         let forms = match step {
@@ -2051,14 +2437,300 @@ impl RenderExecution {
         // The call's layout, its memoryless attachments in the backings an earlier execution's
         // runs gave the pass.
         let layout = rendered.backing(&snapshot.layout)?;
-        let mut encoder = self.replay_encoder(
+        let lent = (command_buffer, self.lent.clone());
+        let mut encoder = self.begin_replay(core, lent, (storage, layout, residency), forms)?;
+        // The commands' draws start from an empty bind state, as an encoder's first draw may.
+        let mut live = LiveBind::default();
+        if !step {
+            // Counted before the records are read: a write meanwhile records it again.
+            self.read_at.store(self.icb.cpu_writes(), Ordering::Release);
+        }
+        // A host step that keeps its chunks, recording inline: its records read once, into the
+        // copies the next step compares with (`kept::StepReads`), the whole range at once as a
+        // step reads it, with no check and no handler to hear of them (`keeping`).
+        if let Some(reads) = reads.filter(|reads| step && reads.range() == range) {
+            let (written, copies) = reads.read(&self.icb)?;
+            let (commands, written, _) = self.named_commands(&device, range.start, written);
+            found.faults = ReplayFaults(found.faults.0 | written.0);
+            let replaying = (&mut encoder, &mut live);
+            self.replay(replaying, commands.iter().flatten(), residency, found)?;
+            copies.keep(&self.icb);
+            return self.finish(encoder, found, rendered, &device);
+        }
+        for piece in kept_commands::pieces(range, whole) {
+            let start = piece.start;
+            if step {
+                let (commands, written) = self.written_commands(&device, piece, check)?;
+                found.faults = ReplayFaults(found.faults.0 | written.0);
+                if reports {
+                    let executed = commands.iter().map(Option::as_ref);
+                    let read = (RecordsRead::HostStep, residency);
+                    self.report(command_buffer, read, start, executed);
+                }
+                let commands = commands.iter().flatten();
+                self.replay((&mut encoder, &mut live), commands, residency, found)?;
+                continue;
+            }
+            let (commands, released) = self.icb.render_records(piece, Reader::Commit)?;
+            // The execution announces the commands it runs otherwise than Metal's may, as it
+            // records them.
+            self.icb.degrade_released(&released);
+            if let Some(check) = check {
+                let read = commands.iter().map(|(record, _)| record);
+                self.icb.check_read(check, start, read);
+            }
+            if reports {
+                let executed = commands.iter().map(Some);
+                let read = (RecordsRead::Commit, residency);
+                self.report(command_buffer, read, start, executed);
+            }
+            self.replay((&mut encoder, &mut live), &commands, residency, found)?;
+        }
+        self.finish(encoder, found, rendered, &device)
+    }
+
+    /// Note, for the encoder trail, the range a host step read from a buffer and the commands
+    /// `ran` of it (`encoder_trail.rs`, **Host steps**): nothing where the trail is off, the
+    /// range was given, or no step is under way.
+    pub(super) fn trail_range(&self, command_buffer: &CommandBuffer, ran: &Range<u32>) {
+        if !command_buffer.device().shared().encoder_trail {
+            return;
+        }
+        if let Some(raw) = self.range.raw() {
+            let mut notes = crate::encoder_trail::Notes::default();
+            notes.range_read(raw, ran.clone());
+            command_buffer.trail_step(notes);
+        }
+    }
+
+    /// An encoder of `core` that replays the commands into a secondary of `command_buffer` begun
+    /// against the execution's instance, its draws counting in the query `lent` lends, over the
+    /// pass's `storage`, in `layout`, with `residency`, the command buffer's, its draws' variants
+    /// in `forms` ([`replay_encoder`](Self::replay_encoder)).
+    fn begin_replay(
+        &self,
+        core: EncoderCore,
+        (command_buffer, lent): (&CommandBuffer, Option<Lent>),
+        (storage, layout, residency): (PassStorage, PassLayout, &Residency),
+        forms: BufferForms,
+    ) -> Result<RenderLowering, Error> {
+        let snapshot = &self.snapshot;
+        let draws = command_buffer.begin_draws(&snapshot.compatible)?;
+        let raw = command_buffer.device().shared().vk();
+        // The query the commands' draws count in, begun here and ended after the last of them.
+        let layout_visibility = snapshot.layout.visibility.clone();
+        let visibility = Visibility::borrowing(layout_visibility, lent, raw, draws);
+        let replaying = (storage, layout, residency.clone());
+        Ok(self.replay_encoder(core, (draws, visibility), replaying, forms))
+    }
+
+    /// The host step's commands where it fans the pass's triangles out, read once for the probe
+    /// and for the recording (`render/fan_out.rs`), as [`record`](Self::record) reads them at the
+    /// step, each seen by the check before any is recorded: the commands, `None` where a record
+    /// runs nothing for a fault, the command they start at, and the faults the range and the
+    /// records hold.
+    fn step_commands(&self, device: &Device) -> Result<StepCommands, Error> {
+        let (range, faults) = self.range.commands(self.icb.size());
+        let check = self.check.as_ref().filter(|_| self.check_sees_now());
+        let start = range.start;
+        let (commands, written) = self.written_commands(device, range, check)?;
+        let commands = StepDraws::Read(commands);
+        Ok((commands, start, ReplayFaults(faults.0 | written.0)))
+    }
+
+    /// Record the probe of `commands`, a part of the host step's
+    /// ([`step_commands`](Self::step_commands)), or of its GPU route's (`routed`,
+    /// `executions/gpu_route.rs`), through an encoder of `core` into a
+    /// secondary begun against the execution's instance, over the pass's `storage`, with
+    /// `residency`, the command buffer's, its draws taking indices of `flags` from `from`
+    /// (`render/fan_out.rs`): the core back, and what it recorded ([`ProbedPart`]): where its
+    /// commands recorded in more than one run, or not in the instance's shape, every command of
+    /// the execution is drawn region by region.
+    fn probe(
+        &self,
+        core: EncoderCore,
+        (command_buffer, residency): (&CommandBuffer, &Residency),
+        (commands, routed): (&[Replayed<'_>], bool),
+        (flags, from, storage): (vk::DescriptorBufferInfo, u32, PassStorage),
+    ) -> Result<(EncoderCore, ProbedPart), Error> {
+        let snapshot = &self.snapshot;
+        let layout = snapshot.layout.clone();
+        let lent = (command_buffer, None);
+        let forms = step_forms(routed);
+        let mut encoder = self.begin_replay(core, lent, (storage, layout, residency), forms)?;
+        encoder.fan_run = Some(FanOutRun::Probe(Probe::new(flags, from)));
+        let mut found = Found::default();
+        let mut live = LiveBind::default();
+        let replaying = (&mut encoder, &mut live);
+        self.replay(replaying, commands.iter().copied(), residency, &mut found)?;
+        let raw = command_buffer.device().shared().vk();
+        encoder.visibility.end(raw, encoder.current.draws);
+        encoder.visibility.close_spares(raw, encoder.current.draws);
+        let RenderLowering {
             core,
-            (draws, visibility),
-            (storage, layout, residency),
-            forms,
-        );
+            earlier,
+            current,
+            fan_run,
+            ..
+        } = encoder;
+        for run in earlier.iter().chain([&current]) {
+            // SAFETY: only this recording records the secondary command buffers.
+            unsafe { core.command_buffer().end_raw(run.draws) }.map_err(vulkan)?;
+        }
+        let core = EncoderCore::unboxed(core);
+        // A probe that stopped probes no later command (`FanOutRun::begin`).
+        let stopped = fan_run.as_ref().is_some_and(|run| run.begin(0).is_none());
+        let Some(FanOutRun::Probe(probe)) = fan_run else {
+            return Err(internal("a probe's recording without its probe"));
+        };
+        let (next, slots) = probe.finish();
+        let one = earlier.is_empty()
+            && !current.shadow
+            && current.before.is_empty()
+            && *current.shape == snapshot.shape
+            && current.views == ViewSetup::default();
+        let part = match one {
+            true => ProbedPart {
+                next,
+                draws: (next > from).then_some(current.draws),
+                slots,
+                apart: false,
+                stopped,
+            },
+            false => ProbedPart {
+                next: from,
+                draws: None,
+                slots: Vec::new(),
+                apart: true,
+                stopped,
+            },
+        };
+        Ok((core, part))
+    }
+
+    /// [`record`](Self::record) at a host step that fans the pass's triangles out, of the commands
+    /// `routes` holds, read once for the probe and for this recording, or its GPU route's
+    /// (`render/fan_out.rs`, `executions/gpu_route.rs`): each command's draw the probe probed and
+    /// flagged none of the triangles of, fanned out, and the others region by region, in order.
+    fn record_routes(
+        &self,
+        core: EncoderCore,
+        (command_buffer, residency): (&CommandBuffer, &Residency),
+        routes: Arc<FanOutRoutes>,
+        found: &mut Found,
+        (storage, rendered): (PassStorage, &mut Rendered),
+    ) -> Result<Recorded, Error> {
+        let device = command_buffer.device().clone();
+        found.faults = ReplayFaults(found.faults.0 | routes.faults.0);
+        let routed = routes.commands.routed();
+        match (routed, &self.pipeline) {
+            // The GPU reads the records: the handlers learn the state their commands run, as of
+            // the GPU form's (`gpu.rs`).
+            (true, Some(pipeline)) => {
+                command_buffer.report_executed(&self.icb, RecordsRead::Gpu, residency, || {
+                    (Vec::new(), pipeline.can_encode_indirect_commands())
+                })
+            }
+            (true, None) => return Err(internal("a GPU route without its pipeline state")),
+            (false, _) if command_buffer.reports_executed() => {
+                if let StepDraws::Read(commands) = &routes.commands {
+                    let executed = commands.iter().map(Option::as_ref);
+                    let read = (RecordsRead::HostStep, residency);
+                    self.report(command_buffer, read, routes.start, executed);
+                }
+            }
+            (false, _) => {}
+        }
+        let layout = rendered.backing(&self.snapshot.layout)?;
+        let lent = (command_buffer, self.lent.clone());
+        let forms = step_forms(routed);
+        let mut encoder = self.begin_replay(core, lent, (storage, layout, residency), forms)?;
+        encoder.fan_run = Some(FanOutRun::Route(Arc::clone(&routes)));
+        let mut live = LiveBind::default();
+        let commands = routes.commands.replayed(0..routes.commands.len());
+        self.replay((&mut encoder, &mut live), commands, residency, found)?;
+        self.finish(encoder, found, rendered, &device)
+    }
+
+    /// Hand the command buffer's executed-commands handlers the draws `executed` runs, commands
+    /// from `start` (`None` where a record runs nothing for a fault), read at `read` under
+    /// `residency`, the command buffer's (`executed_commands.rs`).
+    fn report<'c>(
+        &self,
+        command_buffer: &CommandBuffer,
+        (read, residency): (RecordsRead, &Residency),
+        start: u32,
+        executed: impl Iterator<Item = Option<&'c Command>>,
+    ) {
+        command_buffer.report_executed(&self.icb, read, residency, || {
+            let commands = (u64::from(start)..)
+                .zip(executed)
+                .filter_map(|(index, command)| {
+                    let (record, own) = command?;
+                    let Asked::Draw(_) = Asked::of(&record.action, &self.icb) else {
+                        return None;
+                    };
+                    let pipeline = self.pipeline.as_ref().or(own.as_ref())?;
+                    Some(ExecutedCommand {
+                        index,
+                        can_encode_indirect_commands: pipeline.can_encode_indirect_commands(),
+                    })
+                })
+                .collect();
+            (commands, false)
+        });
+    }
+
+    /// Replay `commands` through `encoder` (`record`'s), resolving against `residency`, the
+    /// command buffer's, what their draws found noted into `found`. A mesh or patch draw is no
+    /// plain draw (`RenderLowering::replay_plain`). A GPU route's command draws as the GPU decoded
+    /// it, with the encoder's tables at the call as the GPU form's draw has them, its draws
+    /// pushing its own slot tables (`executions/gpu_route.rs`).
+    fn replay<'c, C: Into<Replayed<'c>>>(
+        &self,
+        (encoder, live): (&mut RenderLowering, &mut LiveBind),
+        commands: impl IntoIterator<Item = C>,
+        residency: &Residency,
+        found: &mut Found,
+    ) -> Result<(), Error> {
         let inherited = self.icb.descriptor().inherit_buffers;
-        for (record, own) in commands.into_iter().flatten() {
+        // In a rate-mapped pass, the most region draws any draw's recordings made (each draws
+        // every index of the draw), which the next command's draw is cut into ranges of its
+        // indices by (`rate_mapped_pass.rs`, **Pieces**); before any, the most a plan holds. The
+        // encoder's viewport and scissor, which the regions follow, stand through the commands.
+        let mut measured: Option<u64> = None;
+        let mut note = |made: u64| {
+            if made > 0 {
+                measured = Some(measured.map_or(made, |most| most.max(made)));
+            }
+            measured.unwrap_or(RateMapRegions::MAX_REGIONS as u64)
+        };
+        let mut regions = note(0);
+        // The probe's run of the commands at a host step that fans the pass's triangles out
+        // records its probes alone, in one run, before the pass (`render/fan_out.rs`): it begins
+        // no piece and cuts no draw into ranges.
+        let probing = encoder.fan_run.as_ref().is_some_and(FanOutRun::probes);
+        // The states the commands name, for the encoder trail, where it is on: each run of one
+        // state noted once (`encoder_trail.rs`, **Host steps**).
+        let mut trail = (encoder.core.device().shared().encoder_trail)
+            .then(|| (crate::encoder_trail::Notes::default(), None));
+        for (place, command) in commands.into_iter().enumerate() {
+            let command: Replayed<'c> = command.into();
+            let (record, own) = match command {
+                Replayed::Record((record, own)) => (Some(record), own.as_ref()),
+                Replayed::Routed(..) => (None, None),
+            };
+            // A GPU route's command's draws read its own slot tables.
+            encoder.command_tables = match command {
+                Replayed::Routed(routed, _, tables) => Some((*tables, routed.command)),
+                Replayed::Record(_) => None,
+            };
+            if let (Some((notes, last)), Some(own)) = (&mut trail, own) {
+                if *last != Some(own) {
+                    notes.render(own);
+                    *last = Some(own);
+                }
+            }
             // A command's barrier: its draw records into the execution's next run, which its
             // pass runs in a render pass instance of its own after a barrier from everything
             // before, so it sees the earlier draws' writes as plain Metal's does; but where the
@@ -2068,15 +2740,34 @@ impl RenderExecution {
             // those the commit made ahead or the recording makes (`record_forms`), for a barrier
             // the CPU set later. A barrier neither may have set is a record the runtime does not
             // write, a fault, as before.
-            if record.barrier {
+            let barrier = record.is_some_and(|record| record.barrier);
+            if barrier {
                 if !self.icb.may_hold_barriers() {
                     found.faults = ReplayFaults(found.faults.0 | ReplayFaults::RECORD.0);
                     continue;
                 }
-                encoder.run_barrier |= encoder.current.recorded || encoder.earlier.is_empty();
+                // The probe probes no command from a barrier on, which the routes' run draws
+                // region by region.
+                match encoder.fan_run.as_mut().filter(|run| run.probes()) {
+                    Some(run) => run.barrier(),
+                    None => {
+                        encoder.run_barrier |=
+                            encoder.current.recorded || encoder.earlier.is_empty()
+                    }
+                }
             }
-            encoder.command_barrier = record.barrier;
-            let asked = Asked::of(&record.action, &self.icb);
+            encoder.command_barrier = barrier;
+            // What the command's draw records where the host step fans the pass's triangles out.
+            encoder.fan_out = encoder.fan_run.as_ref().and_then(|run| run.begin(place));
+            encoder.fanned = (false, false);
+            encoder.boxed = false;
+            let asked = match (command, record) {
+                (Replayed::Routed(routed, primitive_type, _), _) => {
+                    Asked::Draw(routed.draw(primitive_type))
+                }
+                (_, Some(record)) => Asked::of(&record.action, &self.icb),
+                (_, None) => continue,
+            };
             let draw = match asked {
                 Asked::Draw(draw) => draw,
                 Asked::Nothing => continue,
@@ -2085,7 +2776,7 @@ impl RenderExecution {
                     continue;
                 }
             };
-            let Some(pipeline) = self.pipeline.clone().or(own) else {
+            let Some(pipeline) = self.pipeline.as_ref().or(own).cloned() else {
                 continue;
             };
             let draw = match draw.resolve(residency, pipeline_point_index_size(&pipeline)) {
@@ -2099,6 +2790,27 @@ impl RenderExecution {
                     continue;
                 }
             };
+            if let (Some((notes, _)), false) = (&mut trail, probing) {
+                let drew = match (command, record) {
+                    (Replayed::Routed(routed, primitive_type, _), _) => {
+                        let (indexed, count, instances) = routed.traced();
+                        Some((indexed, primitive_type.as_raw(), count, instances))
+                    }
+                    (_, Some(record)) => trail_draw(&record.action),
+                    (_, None) => None,
+                };
+                if let Some((indexed, primitive, count, instances)) = drew {
+                    notes.drew(indexed, primitive, count, instances);
+                }
+            }
+            // The probe probes no mesh or patch draw, nor a command after one: its functions run in
+            // dispatches before the pass, which may write what a later vertex function reads.
+            if probing && matches!(draw, Draw::Mesh(..) | Draw::Patches { .. }) {
+                if let Some(run) = &mut encoder.fan_run {
+                    run.barrier();
+                }
+                continue;
+            }
             // A patch draw that scales its factors runs on its state's factor-scaling twin, the
             // encoder's scale the command's.
             let scale = match &draw {
@@ -2110,22 +2822,40 @@ impl RenderExecution {
                 None => pipeline,
             };
             encoder.factors.scale = scale;
-            encoder.shape_inputs().check_pipeline(CALL, &pipeline)?;
+            (encoder.shape_inputs()).check_pipeline(CALL, &pipeline, &encoder.layout)?;
             // A mesh draw's object function takes the command's threadgroup memory lengths, 0
             // where it set none, never the encoder's (the M3 Max); a patch draw's take none.
-            encoder.object_threadgroup_lengths = match &draw {
-                Draw::Mesh(..) => object_threadgroup_lengths(&record),
-                Draw::Primitives(..) | Draw::Indexed(..) | Draw::Patches { .. } => BTreeMap::new(),
+            encoder.object_threadgroup_lengths = match (&draw, record) {
+                (Draw::Mesh(..), Some(record)) => object_threadgroup_lengths(record),
+                (Draw::Mesh(..), None)
+                | (Draw::Primitives(..) | Draw::Indexed(..) | Draw::Patches { .. }, _) => {
+                    BTreeMap::new()
+                }
             };
             let control_points = pipeline_control_points(&pipeline);
             encoder.pipeline = Some(pipeline);
-            if !inherited {
+            if let (false, Some(record)) = (inherited, record) {
                 let descriptor = self.icb.descriptor();
                 let misses = &mut found.misses;
                 let mut table =
-                    |stage, count| self.buffers(&record, (stage, count), residency, misses);
+                    |stage, count| self.buffers(record, (stage, count), residency, misses);
                 encoder.vertex =
                     table(BufferStage::Vertex, descriptor.max_vertex_buffer_bind_count);
+                // A vertex buffer set without a stride that a layout of
+                // `MTLBufferLayoutStrideDynamic` reads is read at `unstrided_stride`'s, as plain
+                // Metal's fetch reads it; one no such layout reads takes no stride, as the
+                // encoder's own draw binds it.
+                let unstrided = unstrided_stride(descriptor.support_dynamic_attribute_stride);
+                if let (Some(stride), Some(pipeline)) = (unstrided, encoder.pipeline.as_ref()) {
+                    let vertex = &mut encoder.vertex;
+                    let read: Vec<u32> = (vertex.buffers.keys().copied())
+                        .filter(|index| !vertex.attribute_strides.contains_key(index))
+                        .filter(|&index| reads_vertex_stride(pipeline, index))
+                        .collect();
+                    for index in read {
+                        vertex.attribute_strides.insert(index, stride);
+                    }
+                }
                 encoder.fragment = table(
                     BufferStage::Fragment,
                     descriptor.max_fragment_buffer_bind_count,
@@ -2133,36 +2863,142 @@ impl RenderExecution {
                 encoder.object =
                     table(BufferStage::Object, descriptor.max_object_buffer_bind_count);
                 encoder.mesh = table(BufferStage::Mesh, descriptor.max_mesh_buffer_bind_count);
-                // A vertex buffer set without a stride that a dynamic layout reads, on a buffer
-                // that supports dynamic attribute strides: Metal takes the command and its fetch
-                // reads at stride 2^32 - 1, which the 32-bit fetch cannot place
-                // (`unstrided_buffer`). Without that support Metal reads stride 0, which the plan
-                // path gives exactly.
-                let table = &encoder.vertex;
-                let unstrided = encoder.pipeline.as_ref().and_then(|pipeline| {
-                    let bound = table
-                        .buffers
-                        .keys()
-                        .copied()
-                        .filter(|index| !table.attribute_strides.contains_key(index));
-                    unstrided_buffer(
-                        descriptor.support_dynamic_attribute_stride,
-                        bound,
-                        |index| reads_vertex_stride(pipeline, index),
-                    )
-                });
-                if let Some(refusal) = unstrided {
-                    return Err(refusal);
-                }
             }
+            // A command after the work its piece holds begins the next piece of a rate-mapped
+            // pass (`rate_mapped_pass.rs`, **Pieces**).
+            if !probing {
+                found.piece_before(encoder);
+            }
+            // A draw the probe flagged: drawn in parts where it can be, its runs of blocks that
+            // hold a flagged triangle region by region and the others fanned out, each part a draw
+            // a piece may begin before; else region by region whole (`render/fan_out.rs`,
+            // **Parts**).
+            let fan = encoder.fan_out;
+            let parts = match fan.and_then(|fan| fan.flagged) {
+                Some(flagged) => {
+                    let parts = (encoder.pipeline.as_ref())
+                        .and_then(|pipeline| in_parts(pipeline, &draw))
+                        .map(|(triangles, even)| fan_out::parts(&flagged, triangles, even));
+                    if parts.is_none() {
+                        encoder.fan_out = None;
+                    }
+                    parts
+                }
+                None => None,
+            };
+            // A run's bounds, of the draw's blocks' the probe found: the regions it is drawn
+            // into (`fan_out::run_bounds`).
+            let bounds = (fan.filter(|_| parts.is_some()))
+                .and_then(|fan| encoder.fan_run.as_ref()?.bounds(fan.index));
+            // A fanned part reaches the buckets its own blocks' triangles reach.
+            let part_fan = |part: &Part| {
+                (fan.filter(|_| part.fanned)).map(|fan| FanOutDraw {
+                    flagged: None,
+                    reach: (bounds.as_deref()).map_or(u32::MAX, |b| fan_out::run_bounds(b, part)),
+                    ..fan
+                })
+            };
+            let part_bounds = |part: &Part| match part.fanned {
+                true => None,
+                false => Some(
+                    bounds
+                        .as_deref()
+                        .map_or(u32::MAX, |b| fan_out::run_bounds(b, part)),
+                ),
+            };
+            // Each part's triangles, whether its draw ran its fan-out variant, and whether it was
+            // boxed instead (`render/fan_out.rs`, **Boxed draws**).
+            let mut drawn = Vec::new();
             match draw {
-                Draw::Primitives(assembly, draw) => {
-                    encoder.draw(CALL, assembly, draw, DrawBuffers::default(), false)?
+                Draw::Primitives(assembly, whole) => {
+                    let draws: Vec<(Option<FanOutDraw>, DrawCall, u32, Option<u32>)> = match &parts
+                    {
+                        None => vec![(encoder.fan_out, whole, 0, None)],
+                        Some(parts) => (parts.iter())
+                            .map(|part| {
+                                let call = part_call(whole, *part);
+                                (part_fan(part), call, part.count, part_bounds(part))
+                            })
+                            .collect(),
+                    };
+                    for (at, (fan_out, draw, triangles, bounds)) in draws.into_iter().enumerate() {
+                        if at > 0 {
+                            regions = note(found.piece_after(encoder));
+                            found.piece_before(encoder);
+                        }
+                        encoder.fan_out = fan_out;
+                        encoder.run_bounds = bounds;
+                        encoder.draw(live, CALL, assembly, draw, DrawBuffers::default(), false)?;
+                        encoder.run_bounds = None;
+                        drawn.push((triangles, encoder.fanned.0, encoder.boxed));
+                    }
                 }
-                Draw::Indexed(draw, (buffer, offset)) => {
-                    encoder.draw_indexed(CALL, draw, &buffer, offset)?;
+                Draw::Indexed(whole, (buffer, whole_offset)) => {
+                    let size = index_size(whole.index_type);
+                    let draws: Vec<(Option<FanOutDraw>, IndexedDraw, u64, Option<u32>)> =
+                        match &parts {
+                            None => vec![(encoder.fan_out, whole, whole_offset, None)],
+                            Some(parts) => (parts.iter())
+                                .map(|part| {
+                                    let draw = IndexedDraw {
+                                        index_count: 3 * part.count,
+                                        ..whole
+                                    };
+                                    let offset = whole_offset + 3 * u64::from(part.first) * size;
+                                    (part_fan(part), draw, offset, part_bounds(part))
+                                })
+                                .collect(),
+                        };
+                    for (at, (fan_out, mut draw, mut offset, bounds)) in
+                        draws.into_iter().enumerate()
+                    {
+                        if at > 0 {
+                            regions = note(found.piece_after(encoder));
+                            found.piece_before(encoder);
+                        }
+                        encoder.fan_out = fan_out;
+                        encoder.run_bounds = bounds;
+                        let triangles = draw.index_count / 3;
+                        // A draw that would hold more than a piece's work, drawn as consecutive
+                        // ranges of its indices, each a draw a piece may begin before; the last
+                        // below. A fanned-out draw, and a probe, is drawn whole.
+                        let cut =
+                            encoder.rate_map.is_some() && !probing && encoder.fan_out.is_none();
+                        let per_primitive = cut
+                            .then(|| index_ranges_of(encoder.pipeline.as_ref()?, &draw))
+                            .flatten();
+                        if let Some(per_primitive) = per_primitive {
+                            let mut ranges = 0u64;
+                            loop {
+                                let most = rate_mapped_pass::index_range(regions, per_primitive);
+                                if draw.index_count <= most {
+                                    break;
+                                }
+                                let range = IndexedDraw {
+                                    index_count: most,
+                                    ..draw
+                                };
+                                encoder.draw_indexed(live, CALL, range, &buffer, offset)?;
+                                regions = note(found.piece_after(encoder));
+                                found.piece_before(encoder);
+                                draw.index_count -= most;
+                                offset += u64::from(most) * size;
+                                ranges += 1;
+                            }
+                            if ranges > 0 {
+                                let counts = &encoder.core.device().shared().counts;
+                                counts.rate_map_index_ranges(ranges);
+                            }
+                        }
+                        encoder.draw_indexed(live, CALL, draw, &buffer, offset)?;
+                        encoder.run_bounds = None;
+                        drawn.push((triangles, encoder.fanned.0, encoder.boxed));
+                    }
                 }
-                Draw::Mesh(grid, object, mesh) => encoder.draw_mesh(CALL, grid, object, mesh)?,
+                Draw::Mesh(grid, object, mesh) => {
+                    encoder.replay_plain = false;
+                    encoder.draw_mesh(live, CALL, grid, object, mesh)?
+                }
                 Draw::Patches {
                     mut draw,
                     patch_indices,
@@ -2170,6 +3006,7 @@ impl RenderExecution {
                     factors,
                     scale: _,
                 } => {
+                    encoder.replay_plain = false;
                     // Metal draws a command's patches with its pipeline's control points, whatever
                     // the record holds (measured).
                     draw.control_points = control_points.unwrap_or(draw.control_points);
@@ -2191,11 +3028,57 @@ impl RenderExecution {
                         PointIndices::Zero => zeros.as_ref().map(|zero| (zero, 0)),
                         PointIndices::Buffer((b, offset)) => Some((b, *offset)),
                     };
-                    encoder.draw_patch_range(CALL, draw, patch_indices, points)?;
+                    encoder.draw_patch_range(live, CALL, draw, patch_indices, points)?;
+                }
+            }
+            if let Some(run) = &mut encoder.fan_run {
+                let (fanned, writes) = encoder.fanned;
+                run.end(place, fanned, writes);
+                let counts = &encoder.core.device().shared().counts;
+                match parts.is_some() {
+                    true => {
+                        // Its runs: its parts neither fanned out nor boxed.
+                        let by_regions =
+                            drawn.iter().filter(|(_, fanned, boxed)| !fanned && !boxed);
+                        counts.rate_map_drawn_in_parts(
+                            by_regions.clone().map(|&(t, ..)| u64::from(t)).sum(),
+                            by_regions.count() as u64,
+                        )
+                    }
+                    false if fanned && !probing => {
+                        let few =
+                            (encoder.fan_out).is_some_and(|fan| fan.mode == RegionFanOut::DrawFew);
+                        counts.rate_map_fanned_draw(few);
+                    }
+                    false => {}
+                }
+            }
+            if !probing {
+                regions = note(found.piece_after(encoder));
+            }
+            if let Some((notes, _)) = &mut trail {
+                use crate::encoder_trail::Route;
+                // Each part's route, or the whole draw's (a draw without parts drew once, or a
+                // mesh or patch draw none above).
+                let routes = match drawn.is_empty() {
+                    true => vec![encoder.fanned.0],
+                    false => drawn.iter().map(|&(_, fanned, _)| fanned).collect(),
+                };
+                for fanned in routes {
+                    notes.routed(match (probing, fanned, encoder.rate_map.is_some()) {
+                        (true, _, _) => Route::Probe,
+                        (false, true, _) => Route::FannedOut,
+                        (false, false, true) => Route::RegionByRegion,
+                        (false, false, false) => Route::Plain,
+                    });
                 }
             }
         }
-        self.finish(encoder, found, rendered, &device)
+        encoder.command_tables = None;
+        if let Some((notes, _)) = trail {
+            encoder.core.command_buffer().trail_step(notes);
+        }
+        Ok(())
     }
 
     /// The recording `encoder` made of the commands, its runs ended (`record`'s): what its draws
@@ -2220,6 +3103,7 @@ impl RenderExecution {
             current,
             tile_memory,
             tile_memory_splits,
+            interlocked_splits,
             barrier_splits,
             imageblock,
             shadow,
@@ -2227,6 +3111,7 @@ impl RenderExecution {
             ..
         } = encoder;
         found.tile_memory_splits += tile_memory_splits;
+        found.interlocked_splits += interlocked_splits;
         found.barrier_splits += barrier_splits;
         // Commands that ran as several keep the pass's memoryless attachments across their runs,
         // in the backings of the instances that run them.
@@ -2275,20 +3160,21 @@ impl RenderExecution {
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
             runs.push(Run {
-                draws: run.draws,
+                draws: vec![run.draws],
                 other,
                 shadow: run.shadow,
                 steps,
                 framed,
                 before: run.before,
+                piece: run.piece,
             });
         }
-        for run in &runs {
+        for raw in runs.iter().flat_map(|run| &run.draws) {
             // SAFETY: only this recording records the secondary command buffers.
-            unsafe { core.command_buffer().end_raw(run.draws) }.map_err(vulkan)?;
+            unsafe { core.command_buffer().end_raw(*raw) }.map_err(vulkan)?;
         }
         Ok(Recorded {
-            core,
+            core: EncoderCore::unboxed(core),
             runs,
             storage: PassStorage {
                 tile_memory: tile_memory.into_buffer(),
@@ -2308,7 +3194,7 @@ impl RenderExecution {
         &self,
         core: EncoderCore,
         (draws, visibility): (vk::CommandBuffer, Visibility),
-        (storage, layout, residency): (PassStorage, PassLayout, &Residency),
+        (storage, layout, residency): (PassStorage, PassLayout, Residency),
         forms: BufferForms,
     ) -> RenderLowering {
         let snapshot = &self.snapshot;
@@ -2316,7 +3202,7 @@ impl RenderExecution {
         let mut shadows = InstanceShadows::default();
         shadows.add(&self.shadows, &[]);
         RenderLowering {
-            core,
+            core: core.boxed(),
             earlier: Vec::new(),
             current: Instance {
                 draws,
@@ -2351,12 +3237,15 @@ impl RenderExecution {
                 kept: None,
                 planned: false,
                 feedback: Feedback::NONE,
-                storage_colors: 0,
+                general_colors: 0,
+                leading: None,
+                piece: false,
             },
             layout: Versioned::new(layout),
             passes: vec![(snapshot.shape.clone(), Arc::clone(&snapshot.compatible))],
             render_target_array_length: snapshot.render_target_array_length,
             state: Versioned::new(snapshot.state.clone()),
+            scissors: snapshot.scissors.clone(),
             pipeline: None,
             routed: None,
             vertex: snapshot.vertex.clone(),
@@ -2366,6 +3255,8 @@ impl RenderExecution {
             // Each command's mesh draw takes its own (`object_threadgroup_lengths`).
             object_threadgroup_lengths: BTreeMap::new(),
             visibility,
+            // A replay measures no reader (`render/coverage.rs`).
+            readers: super::coverage::Readers::default(),
             tile: ArgumentTable::default(),
             dispatches: Vec::new(),
             dispatched: false,
@@ -2382,28 +3273,45 @@ impl RenderExecution {
             rate_map: snapshot.rate_map.clone(),
             amplification: Versioned::new(snapshot.amplification.clone()),
             barrier: false,
+            loads_ordered: false,
             barrier_splits: 0,
+            attached_read_splits: 0,
             driver_restarts: false,
             tile_memory_splits: 0,
+            interlocked_splits: 0,
             // The pass's buffer of every tile's memory, with the arguments the encoder set at the
             // call (`render/tile_memory.rs`).
             tile_memory: snapshot
                 .tile_memory
                 .arguments()
                 .with_buffer(storage.tile_memory),
-            residency: residency.clone(),
-            writers: Writers::default(),
+            residency,
             executions: Vec::new(),
             pending: Vec::new(),
             draw_calls: 0,
+            last_draw_empty: false,
             tile_dispatch_calls: 0,
             replaying: true,
-            executing_encoder: Some(self.encoder),
+            replay_plain: true,
+            plain_drawn: false,
+            snapshots_alone: false,
+            split_alone: false,
+            replayed_heaps: Vec::new(),
             rerouting: false,
             forms,
             replayed: None,
+            command_tables: None,
             drawn_before: snapshot.drawn.clone(),
             run_barrier: false,
+            piece_split: false,
+            piece_work: 0,
+            piece_regions: 0,
+            fan_run: None,
+            fan_out: None,
+            fanned: (false, false),
+            boxed: false,
+            run_bounds: None,
+            fan_table: None,
             command_barrier: false,
             unordered: UnorderedWrites::new(),
             zero_indices: None,
@@ -2429,40 +3337,67 @@ impl RenderExecution {
             pass_start: snapshot.pass_start.notes(),
             // An execution's draws restart at the all-ones index whatever the encoder's call.
             restart: None,
-            live: Arc::default(),
             log: None,
-            quiet_bound_values: None,
+            quiet_bound_values: Default::default(),
+            attached: Default::default(),
             bind_memo: crate::binding::BindMemo::default(),
             shape_memo: Default::default(),
             last_retained: Default::default(),
             heaps_noted: None,
+            resident_again: None,
+            unreadable: Default::default(),
             inline: super::inline_first::Inline::Never,
             held_bound: Default::default(),
+            again: Default::default(),
             // No pass of several color groups executes render commands
             // (`render/color_groups.rs`).
             grouped: None,
+            // The commands' draws pin no color: no instance of theirs records inline
+            // (`render/snapshot.rs`).
+            pinned_through: 0,
+            pins_frozen: false,
+            // The replay is no pass of the program's: the pass log's line is the executing
+            // encoder's (`pass_log.rs`).
+            pass_notes: None,
         }
     }
 
     /// Settle at commit, through an encoder of `core` that records nothing, what the host step's
-    /// draws of the commands compile ([`RenderCommandEncoder::settle_draws`]) for each state a
-    /// record may name, into `made`: the encoder's where the buffer inherits it, else each of
-    /// `states`, those made with `supportIndirectCommandBuffers` alive at the commit; over the
-    /// pass's `storage`, with `residency`, the command buffer's. Nothing where the buffer holds
-    /// no draw of primitives. Returns the core.
+    /// draws of the commands compile ([`RenderLowering::settle_draws`]) for each state the
+    /// records name as the CPU wrote them, into `made`: the encoder's where the buffer inherits
+    /// it, else each live state the CPU set on a command the execution may run
+    /// (`IndirectCommandBuffer::set_render_states`: of its range, or of the buffer for a range
+    /// read from a buffer); over the pass's `storage`, with `residency`, the command buffer's.
+    /// A state a record the GPU wrote names, the step meets as it is then. Nothing where the
+    /// buffer holds no draw of primitives. In `forms`, the buffer forms the step's draws take:
+    /// the large-buffer form of the commands it reads, or the replay form of those its GPU route
+    /// takes (`gpu_route.rs`), whose lists alone it draws. Returns the core.
     fn settle(
         &self,
         core: EncoderCore,
         (storage, residency): (PassStorage, &Residency),
-        states: &[RenderPipelineState],
-        made: &mut Vec<SettledDraw>,
+        (made, fanned): (&mut Vec<SettledDraw>, Option<&mut Vec<SettledDraw>>),
+        forms: BufferForms,
     ) -> EncoderCore {
         let draws = IndirectCommandType::DRAW.union(IndirectCommandType::DRAW_INDEXED);
+        if !self.icb.descriptor().command_types.intersects(draws) {
+            return core;
+        }
+        let set;
         let named = match &self.pipeline {
             Some(pipeline) => std::slice::from_ref(pipeline),
-            None => states,
+            None => {
+                let commands = match &self.range {
+                    ExecutionRange::Fixed(range) => range.clone(),
+                    ExecutionRange::Indirect { .. } => {
+                        0..u32::try_from(self.icb.size()).unwrap_or(u32::MAX)
+                    }
+                };
+                set = self.icb.set_render_states(commands);
+                &set[..]
+            }
         };
-        if !self.icb.descriptor().command_types.intersects(draws) || named.is_empty() {
+        if named.is_empty() {
             return core;
         }
         let snapshot = &self.snapshot;
@@ -2471,14 +3406,36 @@ impl RenderExecution {
         let mut encoder = self.replay_encoder(
             core,
             (vk::CommandBuffer::null(), visibility),
-            (storage, snapshot.layout.clone(), residency),
-            BufferForms::Large,
+            (storage, snapshot.layout.clone(), residency.clone()),
+            forms,
         );
+        let mut live = LiveBind::default();
         for pipeline in named {
-            encoder.settle_draws(pipeline, made);
+            encoder.settle_draws(&mut live, pipeline, made);
+        }
+        // Where the host step fans the pass's triangles out, the probe's and the fanned-out
+        // draws' variants of the same draws, into `fanned` (`render/fan_out.rs`).
+        let fans = self.snapshot.rate_map.is_some() && self.shadows.is_empty();
+        if let Some(fanned) = fanned.filter(|_| fans) {
+            for mode in [
+                RegionFanOut::Probe,
+                RegionFanOut::Draw,
+                RegionFanOut::DrawFew,
+            ] {
+                encoder.fan_out = Some(FanOutDraw {
+                    mode,
+                    index: 0,
+                    copies: 0,
+                    flagged: None,
+                    reach: 0,
+                });
+                for pipeline in named {
+                    encoder.settle_draws(&mut live, pipeline, fanned);
+                }
+            }
         }
         let RenderLowering { core, .. } = encoder;
-        core
+        EncoderCore::unboxed(core)
     }
 
     /// What its check, if any, may see among commands whose records may hold `written`
@@ -2512,62 +3469,41 @@ impl RenderExecution {
         points || encodes
     }
 
-    /// The commands of the range, in order, `None` where a record runs nothing for a fault, and
-    /// the faults: the CPU's records, or for the host step the records as the GPU and the CPU
-    /// left them, each naming its state among the live ones made with
-    /// `supportIndirectCommandBuffers`.
-    fn commands(
+    /// For the host step, the commands of `range`, the execution's, in order, `None` where a
+    /// record runs nothing for a fault, and the faults: the records as the GPU and the CPU left
+    /// them, each naming its state among the live ones made with
+    /// `supportIndirectCommandBuffers`, each seen by `check` before any is recorded.
+    fn written_commands(
         &self,
         device: &Device,
-        step: bool,
+        range: Range<u32>,
+        check: Option<&Mutex<IndirectCommandCheck>>,
     ) -> Result<(Vec<Option<Command>>, ReplayFaults), Error> {
-        let (range, faults) = self.range.commands(self.icb.size())?;
-        if !step {
-            if self.range.indirect() {
-                return Err(internal(
-                    "a range read from a buffer recorded before its host step",
-                ));
-            }
-            // The execution announces the commands it runs otherwise than Metal's may, as it
-            // records them.
-            let start = range.start;
-            // Counted before the records are read: a write meanwhile records it again.
-            self.read_at.store(self.icb.cpu_writes(), Ordering::Release);
-            let (commands, released) = self.icb.render_records(range, Reader::Commit)?;
-            self.icb.degrade_released(&released);
-            // The caller's check sees each command `commit` will record, before it records any,
-            // where it may see something.
-            if let Some(check) = self.check.as_ref().filter(|_| self.check_sees_now()) {
-                let read = commands.iter().map(|(record, _)| record);
-                self.icb.check_read(check, start, read);
-            }
-            return Ok((
-                commands.into_iter().map(Some).collect(),
-                ReplayFaults::default(),
-            ));
-        }
         let written = self.icb.written_records(range.clone())?;
-        // The caller's check sees each command the step will record, before it records any,
-        // where it may see something.
-        if let Some(check) = self.check.as_ref().filter(|_| self.check_sees_now()) {
+        if let Some(check) = check {
             self.icb
                 .check_recorded(check, range.start, &written.records);
         }
+        let (commands, faults, _) = self.named_commands(device, range.start, written);
+        Ok((commands, faults))
+    }
+
+    /// The commands of `written`, the records of commands from `start` as the GPU and the CPU
+    /// left them, each with the state it names, their faults, and whether one named a state the
+    /// program released.
+    fn named_commands(
+        &self,
+        device: &Device,
+        start: u32,
+        mut written: WrittenRecords<RenderPipelineState>,
+    ) -> (Vec<Option<Command>>, ReplayFaults, bool) {
         let states = RenderPipelineState::indirect_states(device);
         // A record naming the ID of the state the CPU set runs its program, else the state of its
-        // ID among `states` (`IndirectCommandBuffer::step_render_states`); the commands it runs
-        // otherwise than Metal's may are announced, as the CPU's records' are.
-        let (named, released) = self
-            .icb
-            .step_render_states(range.start, &written.records, &states);
+        // ID among `states` (`IndirectCommandBuffer::step_render_states`), named in place; the
+        // commands it runs otherwise than Metal's may are announced, as the CPU's records' are.
+        let released = (self.icb).step_render_states(start, &mut written.records, &states);
         self.icb.degrade_released(&released);
-        let commands = written
-            .records
-            .into_iter()
-            .zip(named)
-            .map(|(record, state)| record.map(|record| (record, state)))
-            .collect();
-        Ok((commands, ReplayFaults(written.faults.0 | faults.0)))
+        (written.records, written.faults, !released.is_empty())
     }
 
     /// The command's own buffers of `stage`, below the descriptor's `count` of it, resolved
@@ -2585,7 +3521,7 @@ impl RenderExecution {
                 continue;
             };
             if !binding.names_buffer() {
-                indirect_execute::degrade_nil_offset(self.icb.device(), binding, index);
+                indirect_execute::degrade_nil_offset(self.icb.generation(), binding, index);
                 continue;
             }
             let Some(bound) = residency.resolve(binding.address) else {
@@ -2593,6 +3529,8 @@ impl RenderExecution {
                 continue;
             };
             table.buffers.insert(index, bound);
+            // A vertex buffer set without a stride takes `unstrided_stride`'s where a dynamic
+            // layout reads it, once the command's state is known (`replay`).
             if let Some(stride) = binding.attribute_stride {
                 table
                     .attribute_strides
@@ -2652,9 +3590,15 @@ pub(crate) struct DeferredPass {
     /// What the commit made ahead for the host step that records it (`ahead.rs`), once made.
     ahead: OnceLock<Arc<Ahead>>,
     /// The makings its executions' settle at commit handed to the device's pool
-    /// ([`settle`](Self::settle)), which its host step waits for, until its command buffer's bound
-    /// at most, as for its draws' pipelines.
+    /// ([`settle`](Self::settle)), and those its replay at commit began and found still being
+    /// made at its command buffer's bound ([`left_for_makings`](Self::left_for_makings)): its
+    /// host step records the pass once they are made, as for its draws' pipelines.
     settled: Mutex<Vec<Pending<RawPipeline>>>,
+    /// The makings of the probe's and the fanned-out draws' pipelines its executions' settle at
+    /// commit handed to the device's pool ([`settle`](Self::settle)): the host step that fans
+    /// the pass's triangles out takes them made, or waits for them, as it would for a making of
+    /// its own ([`fan_out_routes`](Self::fan_out_routes)); one that does not leaves them.
+    fan_settled: Mutex<Vec<Pending<RawPipeline>>>,
     /// Where `commit` recorded the pass with executions in their GPU form (`gpu.rs`), what each
     /// such execution's buffer's records may hold as the decision found it: a route encoded
     /// since that adds to it sends the pass to the host step ([`outgrown`](Self::outgrown)),
@@ -2664,6 +3608,9 @@ pub(crate) struct DeferredPass {
     /// does not record it on the GPU alone, and where a route outgrew that decision. Its notice
     /// names it.
     cause: Mutex<Option<HostStepCause>>,
+    /// The rules past [`cause`](Self::cause) that `commit` found the pass breaks too, where its
+    /// notice was to be announced ([`rules_past`](Self::rules_past)), which the notice names.
+    also: Mutex<Vec<HostStepCause>>,
 }
 
 /// One render pass instance of a [`DeferredPass`].
@@ -2735,8 +3682,10 @@ impl DeferredPass {
             shadows,
             ahead: OnceLock::new(),
             settled: Mutex::new(Vec::new()),
+            fan_settled: Mutex::new(Vec::new()),
             on_gpu: Mutex::new(Vec::new()),
             cause: Mutex::new(None),
+            also: Mutex::new(Vec::new()),
         }
     }
 
@@ -2752,13 +3701,26 @@ impl DeferredPass {
         let _ = self.ahead.set(Arc::new(ahead));
     }
 
-    /// Whether the GPU may write what an execution of the pass reads: its records, where an
-    /// encoder made its buffer resident for writing (`IndirectCommandBuffer::gpu_written`, for
-    /// good), or the range it reads from a buffer.
+    /// Whether the GPU may write what an execution of the pass reads: its records, where a route
+    /// that may write them met its buffer (`IndirectCommandBuffer::gpu_written`, for good), or the
+    /// range it reads from a buffer.
     pub(crate) fn gpu_written(&self) -> bool {
         self.executions
             .iter()
             .any(|execution| execution.icb.gpu_written() || execution.range.indirect())
+    }
+
+    /// What its host step reads on the host of what the GPU may write (`Deferred::host_reads`):
+    /// each execution's records and range (`ExecutionRange::host_reads`).
+    pub(crate) fn host_reads(&self) -> Vec<Use<ResourceKey>> {
+        (self.executions.iter())
+            .flat_map(|execution| execution.range.host_reads(&execution.icb))
+            .collect()
+    }
+
+    /// The indirect command buffers its executions run.
+    pub(crate) fn executed(&self) -> impl Iterator<Item = &IndirectCommandBuffer> {
+        self.executions.iter().map(|execution| &execution.icb)
     }
 
     /// Whether a pipeline one of its draws or tile dispatches records is still being made, or one
@@ -2777,6 +3739,14 @@ impl DeferredPass {
     pub(crate) fn failed(&self) -> bool {
         self.pending.iter().any(PendingDraw::failed)
             || self.steps.tile_pipelines().any(TilePipelines::failed)
+    }
+
+    /// Whether it was left for the pipelines of its draws or tile dispatches alone, made since or
+    /// not: it has such draws or dispatches (`render/pending.rs`, `render/pending_tile.rs`) and
+    /// executes no render commands.
+    pub(crate) fn left_for_pipelines(&self) -> bool {
+        !self.executes()
+            && (!self.pending.is_empty() || self.steps.tile_pipelines().next().is_some())
     }
 
     /// Whether it executes render commands, whose records its recording reads: everything else it
@@ -2810,9 +3780,52 @@ impl DeferredPass {
         Some(uses.finish())
     }
 
+    /// What its host step's recording may use that Metal orders, where the GPU may write what
+    /// its executions read, for the scheduler's order across queues
+    /// (`CommandBufferShared::footprint`), with `residency`, its command buffer's: its attachments'
+    /// and steps' uses, as [`known_summary`](Self::known_summary) states them; every resource
+    /// made resident, with its usage (`Residency::bound_uses`); and what the step reads on the
+    /// host of each execution (`ExecutionRange::host_reads`); and what an execution that inherits
+    /// the encoder's buffers reaches of the bindings it inherits
+    /// ([`inherited_uses`](RenderExecution::inherited_uses)). `None` where its commands may reach
+    /// more that Metal orders: an inherited visible-function table, the pass's tile threadgroup
+    /// memory, a visibility result's query, or a shadowed texture's copies.
+    pub(crate) fn bound(
+        &self,
+        device: &Device,
+        residency: &Residency,
+    ) -> Option<Summary<ResourceKey>> {
+        let reaches_more = |execution: &RenderExecution| {
+            execution.reaches_tile_memory() || execution.lent.is_some()
+        };
+        if !self.shadows.is_empty() || self.executions.iter().any(reaches_more) {
+            return None;
+        }
+        let mut inherited = Vec::new();
+        for execution in &self.executions {
+            inherited.extend(execution.inherited_uses()?);
+        }
+        let aliases = &device.shared().aliases;
+        let aliased = aliases.augment(&self.uses);
+        let mut uses = EncoderUses::new(false);
+        uses.record(
+            render_target::ATTACHMENT_STAGES,
+            aliased.as_deref().unwrap_or(&self.uses),
+            None,
+        );
+        let mut reached = residency.bound_uses();
+        for execution in &self.executions {
+            reached.extend(execution.range.host_reads(&execution.icb));
+        }
+        reached.extend(aliases.augment(&inherited).unwrap_or(inherited));
+        uses.record(vk::PipelineStageFlags2::ALL_COMMANDS, &reached, None);
+        Some(uses.finish())
+    }
+
     /// Wait until every pipeline its draws and tile dispatches record is made, or failed, each
     /// making hastened first (`pipeline/pool.rs`), until `deadline` at most, its command buffer's
-    /// bound, past which its recording drops the draw or tile dispatch (`render/pending.rs`,
+    /// bound: the program's `commit` waits no longer, and leaves a pass whose makings are still in
+    /// flight then to its host step, which waits for them until made (`render/pending.rs`,
     /// `render/pending_tile.rs`).
     pub(crate) fn wait_made(&self, deadline: Option<Instant>) {
         self.hasten(Urgency::Committed);
@@ -2833,6 +3846,20 @@ impl DeferredPass {
                 None => drop(pending.wait()),
             }
         }
+    }
+
+    /// Take the makings `command_buffer`'s recording of the pass at commit left unmade
+    /// (`CommandBuffer::leave_unmade`): its executions' replay began them and found them still
+    /// being made at the command buffer's bound, so the pass is left to its host step, which
+    /// records it from the records as they stand then once they are made
+    /// ([`making`](Self::making), [`when_made`](Self::when_made)), as `commit` leaves a pass whose
+    /// settled makings it found still being made. Whether it took any: a recording that took
+    /// none failed for another cause.
+    pub(crate) fn left_for_makings(&self, command_buffer: &CommandBuffer) -> bool {
+        let unmade = command_buffer.take_unmade();
+        let left = !unmade.is_empty();
+        lock(&self.settled).extend(unmade);
+        left
     }
 
     /// Run the makings of the pipelines its draws and tile dispatches record before the
@@ -2876,7 +3903,7 @@ impl DeferredPass {
         // The first length each buffer (by its resource ID) was executed with from each command.
         let mut first: BTreeMap<(u64, u32), usize> = BTreeMap::new();
         for execution in &self.executions {
-            let (range, _) = execution.range.commands(execution.icb.size())?;
+            let (range, _) = execution.range.commands(execution.icb.size());
             if range.is_empty() {
                 continue;
             }
@@ -2913,40 +3940,37 @@ impl DeferredPass {
             *lock(&self.cause) = Some(cause);
             Ok(None)
         };
-        if self.executions.iter().any(|e| e.range.indirect()) {
-            let rule = "an execution of the pass reads its range from a buffer";
-            return declined(HostStepCause::Rule(rule));
-        }
-        // A pass with a shadowed texture runs as any other, its copies around its instances
-        // (`render/shadows.rs`), unless its commands may reach a shadow's truth past what their
-        // calls gathered, which the host step refuses too (`record_forms`).
         let residency = command_buffer.residency()?;
-        if self.reaches_past_its_copies(command_buffer.device(), &residency) {
-            let rule = "the command buffer made resident, past an execution's call, what meets \
-                        the truth of a shadowed texture the pass copies";
-            return declined(HostStepCause::Rule(rule));
-        }
-        let mut core = EncoderCore::segment(command_buffer, false)?;
-        let mut forms = Vec::with_capacity(self.executions.len());
-        for execution in &self.executions {
-            if !execution.icb.gpu_written() {
-                forms.push(None);
-                continue;
+        let forms = match self.decide(command_buffer, &residency, &Passed::default())? {
+            Ok(forms) => forms,
+            Err(cause) => {
+                // Where the notice of its cause is to be announced, the rules past it that the
+                // pass breaks too, which the notice names; a decision that fails names none.
+                let device = command_buffer.device();
+                let also = match device.announces_host_step(cause.key()) {
+                    true => {
+                        (self.rules_past(command_buffer, &residency, &cause)).unwrap_or_default()
+                    }
+                    false => Vec::new(),
+                };
+                *lock(&self.also) = also;
+                return declined(cause);
             }
-            let (back, form) = execution.gpu_form(core, (self.storage.clone(), &residency));
-            core = back;
-            match form {
-                Ok(form) => forms.push(Some(form)),
-                Err(cause) => return declined(cause),
-            }
-        }
-        drop(core);
+        };
         self.wait_made(command_buffer.making_deadline());
         if self.making() || self.failed() {
             let rule = "a pipeline state the pass draws with is being made or failed to make";
             return declined(HostStepCause::Rule(rule));
         }
-        let recorded = self.record_forms(command_buffer, false, &forms)?;
+        let recorded = match self.record_forms(command_buffer, false, &forms) {
+            Ok(recorded) => recorded,
+            Err(_) if self.left_for_makings(command_buffer) => {
+                let rule = "a pipeline state the pass's executions draw with was still being made \
+                            at the command buffer's bound";
+                return declined(HostStepCause::Rule(rule));
+            }
+            Err(error) => return Err(error),
+        };
         let decided = (self.executions.iter().zip(&forms)).filter_map(|(execution, form)| {
             Some((Arc::clone(execution.icb.written()), form.as_ref()?.decided))
         });
@@ -2955,6 +3979,81 @@ impl DeferredPass {
         // the committing thread, as for any pass a host step records.
         self.make_ahead(command_buffer);
         Ok(Some(recorded))
+    }
+
+    /// Whether every execution of the pass whose records the GPU may write takes its GPU form
+    /// (`gpu.rs`) in `command_buffer`, with `residency`, its own: their forms by index (`None`
+    /// for one whose records the CPU alone writes), else the first rule that keeps the pass from
+    /// it, past those the decision `passed` over (`cause.rs`).
+    fn decide(
+        &self,
+        command_buffer: &CommandBuffer,
+        residency: &Residency,
+        passed: &Passed,
+    ) -> Result<Result<Vec<Option<GpuForm>>, HostStepCause>, Error> {
+        // A range read from a buffer is read on the GPU by an execution's GPU form alone.
+        let cpu_range = |e: &RenderExecution| e.range.indirect() && !e.icb.gpu_written();
+        let rule = "an execution of the pass whose records the CPU alone writes reads its range \
+                    from a buffer";
+        if let Err(cause) = passed.rule(
+            self.executions.iter().any(cpu_range),
+            HostStepCause::Rule(rule),
+        ) {
+            return Ok(Err(cause));
+        }
+        // A pass with a shadowed texture runs as any other, its copies around its instances
+        // (`render/shadows.rs`), unless its commands may reach a shadow's truth past what their
+        // calls gathered, which the host step refuses too (`record_forms`).
+        let rule = "the command buffer made resident, past an execution's call, what meets the \
+                    truth of a shadowed texture the pass copies";
+        if let Err(cause) = passed.rule(
+            self.reaches_past_its_copies(command_buffer.device(), residency),
+            HostStepCause::Rule(rule),
+        ) {
+            return Ok(Err(cause));
+        }
+        let mut core = EncoderCore::segment(command_buffer, false)?;
+        let mut forms = Vec::with_capacity(self.executions.len());
+        for execution in &self.executions {
+            if !execution.icb.gpu_written() {
+                forms.push(None);
+                continue;
+            }
+            let storage = self.storage.clone();
+            let (back, form) = execution.gpu_form(core, (storage, residency), (passed, false));
+            core = back;
+            match form {
+                Ok(form) => forms.push(Some(form)),
+                Err(cause) => return Ok(Err(cause)),
+            }
+        }
+        Ok(Ok(forms))
+    }
+
+    /// The rules past `first` that the pass breaks too, in `command_buffer` with `residency`
+    /// (`cause.rs`): the decision again, passing over each rule once named, until it takes the
+    /// GPU form or meets a rule it does not pass over. At most [`RULES_PAST`] of them.
+    fn rules_past(
+        &self,
+        command_buffer: &CommandBuffer,
+        residency: &Residency,
+        first: &HostStepCause,
+    ) -> Result<Vec<HostStepCause>, Error> {
+        let mut passed = Passed::default();
+        passed.pass(first);
+        let mut also = Vec::new();
+        while also.len() < RULES_PAST {
+            match self.decide(command_buffer, residency, &passed)? {
+                Ok(_) => break,
+                // A rule the rest takes its answer from, met again.
+                Err(cause) if passed.over(&cause) => break,
+                Err(cause) => {
+                    passed.pass(&cause);
+                    also.push(cause);
+                }
+            }
+        }
+        Ok(also)
     }
 
     /// Whether a route encoded since `commit` recorded the pass with executions in their GPU form
@@ -3006,6 +4105,7 @@ impl DeferredPass {
             let mut on_gpu = lock(&self.on_gpu);
             if !on_gpu.is_empty() {
                 *lock(&self.cause) = Some(HostStepCause::Outgrown);
+                lock(&self.also).clear();
             }
             on_gpu.clear();
             drop(on_gpu);
@@ -3018,11 +4118,19 @@ impl DeferredPass {
         // texture's truth is refused.
         let residency = command_buffer.residency()?;
         if self.reaches_past_its_copies(command_buffer.device(), &residency) {
-            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
+            return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                IndirectRule::ResidencyPastCopies,
+            )));
         }
         // Its tile dispatches' pipelines, waiting for those being made; a failed one fails the
         // command buffer (`render/pending_tile.rs`).
         let tiles = self.steps.tiles_made(command_buffer)?;
+        // At the host step, the executions' commands read once, and their draws probed, the probe
+        // submitted and waited for, where it fans the pass's triangles out (`render/fan_out.rs`).
+        let (routes, probed) = match step {
+            true => self.fan_out_routes(command_buffer, &residency)?,
+            false => (Vec::new(), None),
+        };
         let mut core = EncoderCore::segment(command_buffer, false)?;
         let mut found = Found::default();
         let mut recorded = Vec::with_capacity(self.executions.len());
@@ -3034,14 +4142,15 @@ impl DeferredPass {
             layout: self.layout.clone(),
             bare: self.bare.clone(),
             backed: Vec::new(),
-            queue: command_buffer.command_queue().id(),
+            queue: command_buffer.queue_place().id(),
         };
         for (at, execution) in self.executions.iter().enumerate() {
             let gpu = forms.get(at).and_then(Option::as_ref);
+            let routes = routes.get(at).cloned().flatten();
             let back = execution.record(
                 core,
                 (command_buffer, &residency),
-                (step, gpu),
+                (step, gpu, routes),
                 &mut found,
                 (storage, &mut rendered),
             )?;
@@ -3134,6 +4243,27 @@ impl DeferredPass {
             Some(made) if backed && made.backs(&rendered.backed)? => Some(made),
             Some(_) | None => None,
         };
+        // The secondaries of the snapshots that lead each instance (`render/snapshot.rs`, leading
+        // snapshots), a pending draw's recorded once its pipeline is made: no execution joins
+        // such an instance, which runs as one.
+        let mut leads = Vec::with_capacity(self.instances.len());
+        for (index, instance) in self.instances.iter().enumerate() {
+            let draws = match self.steps.leading(index + self.first) {
+                Some(snapshot::Leading::Recorded(draws)) => Some(draws),
+                Some(snapshot::Leading::Pending(at)) => {
+                    let draw = self.pending.get(at).ok_or_else(|| {
+                        internal("the leading snapshots of a pending draw the pass does not hold")
+                    })?;
+                    draw.leading(command_buffer)?
+                }
+                None => None,
+            };
+            let executes = (instance.pieces.iter()).any(|p| matches!(p, Piece::Execution(_)));
+            if draws.is_some() && executes {
+                return Err(internal("an execution in an instance its snapshots lead"));
+            }
+            leads.push(draws);
+        }
         for (index, instance) in self.instances.iter().enumerate() {
             // Each run: an execution's past its first (its shape and views where they are
             // another's, whether its draws test the stencil in the shader, its steps, and the
@@ -3141,14 +4271,14 @@ impl DeferredPass {
             let mut runs: Vec<(Option<&Run>, Vec<vk::CommandBuffer>)> = vec![(None, Vec::new())];
             for piece in &instance.pieces {
                 let (first, later) = match *piece {
-                    Piece::Draws(draws) => (draws, &[][..]),
+                    Piece::Draws(draws) => (vec![draws], &[][..]),
                     // A draw's own secondary, recorded once its pipeline is made.
                     Piece::Pending(index) => {
                         let draw = self
                             .pending
                             .get(index)
                             .ok_or_else(|| internal("a pending draw the pass does not hold"))?;
-                        (draw.record(command_buffer)?, &[][..])
+                        (vec![draw.record(command_buffer)?], &[][..])
                     }
                     Piece::Execution(index) => match recorded[index].split_first() {
                         // An execution's first run shares its instance's render pass instance
@@ -3156,15 +4286,15 @@ impl DeferredPass {
                         Some((first, _)) if !first.before.is_empty() => {
                             return Err(internal("an execution's first run with steps before it"))
                         }
-                        Some((first, later)) => (first.draws, later),
+                        Some((first, later)) => (first.draws.clone(), later),
                         None => return Err(internal("an execution of no runs")),
                     },
                 };
                 match runs.last_mut() {
-                    Some((last, run)) if last.is_none_or(Run::takes_more) => run.push(first),
-                    _ => runs.push((None, vec![first])),
+                    Some((last, run)) if last.is_none_or(Run::takes_more) => run.extend(first),
+                    _ => runs.push((None, first)),
                 }
-                runs.extend(later.iter().map(|run| (Some(run), vec![run.draws])));
+                runs.extend(later.iter().map(|run| (Some(run), run.draws.clone())));
             }
             let count = runs.len();
             let run_passes = instance
@@ -3233,7 +4363,10 @@ impl DeferredPass {
                         "a run with steps around it first or last in its instance",
                     ));
                 }
-                objects.push((pass, framebuffer, run, (shadowed, steps, before)));
+                // A run that begins a piece of a rate-mapped pass's submission (`rate_mapped_pass.rs`,
+                // **Pieces**): the pass's first run begins its first.
+                let piece = of.is_some_and(|of| of.piece);
+                objects.push((pass, framebuffer, run, (shadowed, steps, before), piece));
             }
             instances.push(objects);
         }
@@ -3249,76 +4382,136 @@ impl DeferredPass {
         let steps = &self.steps;
         let first = self.first;
         let shadow_copies = shadow_copies.as_ref();
-        core.command(render_target::ATTACHMENT_STAGES, &uses, |raw, cb| {
-            // SAFETY: the segment's command buffer is recording outside a render pass; the
-            // passes, framebuffers and attachments are live until the command buffer completes
-            // (its encoder retained them), as are the steps' objects (held with the pass, which
-            // the encoder retained) and the shadowed textures the copies name (retained with the
-            // draws, the executions and the attachments that use them); each secondary was
-            // recorded against a pass compatible with its instance's and ended; every image rests
-            // in `GENERAL`, and each step is recorded between two instances, as the encoder's own
-            // pass records it; the shadow's copies, around a run that is neither its instance's
-            // first nor its last, name the shadow and the stencil, held so too; the steps before a
-            // run past an execution's first are held with the runs, each recorded between barriers
-            // outside a render pass.
-            unsafe {
-                // The tile dispatches after the instances the encoder recorded inline, which the
-                // command buffer it handed over, placed before these, leaves out
-                // (`render/pending_tile.rs`).
-                if let Some(last) = first.checked_sub(1) {
-                    steps.dispatches_after(raw, cb, last, &tiles);
-                }
-                let runs = instances.iter().enumerate().flat_map(|(at, runs)| {
-                    let last = runs.len() - 1;
-                    runs.iter()
-                        .enumerate()
-                        .map(move |(run, (pass, framebuffer, cbs, around))| {
-                            (at, run, run == last, (*framebuffer, *pass), cbs, *around)
-                        })
-                });
-                for (index, (at, run_index, last_run, (framebuffer, pass), run, around)) in
-                    runs.enumerate()
-                {
-                    let (shadowed, run_steps, before) = around;
-                    // Each instance after the first sees everything the one before wrote.
-                    if index > 0 {
-                        Barrier::everything().record(raw, cb);
-                    }
-                    // Its steps before its first run, and after its last (`render/pass_steps.rs`).
-                    if run_index == 0 {
-                        steps.before(raw, cb, at + first);
-                    }
-                    let copies = shadow_copies.filter(|_| shadowed);
-                    if let Some(copies) = copies {
-                        copies.record_in(raw, cb, false);
-                    }
-                    for step in before {
-                        step.record_in(raw, cb);
-                    }
-                    if let Some(run_steps) = run_steps {
-                        run_steps.before(raw, cb);
-                    }
-                    steps.begin(raw, cb, at + first, pass, framebuffer);
-                    raw.cmd_execute_commands(cb, run);
-                    raw.cmd_end_render_pass(cb);
-                    steps.ended(raw, cb, at + first);
-                    if let Some(run_steps) = run_steps {
-                        run_steps.after(raw, cb);
-                    }
-                    if let Some(copies) = copies {
-                        copies.record_out(raw, cb);
-                    }
-                    if last_run {
-                        steps.after(raw, cb, at + first, &tiles);
-                    }
-                }
-                steps.end(raw, cb);
+        // The runs in order, each with its instance's index, its place among the instance's runs,
+        // whether it is the instance's last, its pass and framebuffer, its secondaries, the steps
+        // around it, and whether it begins a piece of a rate-mapped pass's submission.
+        let runs: Vec<_> = (instances.iter().enumerate())
+            .flat_map(|(at, runs)| {
+                let last = runs.len() - 1;
+                runs.iter().enumerate().map(
+                    move |(run, (pass, framebuffer, cbs, around, piece))| {
+                        (
+                            at,
+                            run,
+                            run == last,
+                            (*framebuffer, *pass),
+                            cbs,
+                            *around,
+                            *piece,
+                        )
+                    },
+                )
+            })
+            .collect();
+        // The pieces (`rate_mapped_pass.rs`, **Pieces**): each from a run that begins one, the
+        // first run's aside, to the next; each ends a `VkCommandBuffer` its batch's submission
+        // submits apart from what follows (`EncoderCore::cut_piece`), timed in a rate-mapped pass
+        // where the device writes timestamps, a pass of one piece included.
+        let starts: Vec<usize> = (runs.iter().enumerate())
+            .filter(|&(at, run)| at > 0 && run.6)
+            .map(|(at, _)| at)
+            .collect();
+        let pieces: Vec<(usize, usize)> = (std::iter::once(0).chain(starts.iter().copied()))
+            .zip(starts.iter().copied().chain([runs.len()]))
+            .collect();
+        let mapped = (self.executions.iter()).any(|e| e.snapshot.rate_map.is_some());
+        let times = (mapped)
+            .then(|| rate_mapped_pass::PieceTimes::take(command_buffer.device(), pieces.len()))
+            .flatten();
+        for (piece, &(from, to)) in pieces.iter().enumerate() {
+            if piece > 0 {
+                core.cut_piece()?;
             }
-        });
+            // The pass's uses are noted once, with its first piece's commands: the later pieces
+            // begin with a barrier from everything before.
+            let noted = match piece {
+                0 => &uses[..],
+                _ => &[],
+            };
+            let last_piece = piece + 1 == pieces.len();
+            let times = times.as_ref();
+            let runs = &runs[from..to];
+            core.command(render_target::ATTACHMENT_STAGES, noted, |raw, cb| {
+                // SAFETY: the segment's command buffer is recording outside a render pass; the
+                // passes, framebuffers and attachments are live until the command buffer
+                // completes (its encoder retained them), as are the steps' objects (held with the
+                // pass, which the encoder retained) and the shadowed textures the copies name
+                // (retained with the draws, the executions and the attachments that use them);
+                // each secondary was recorded against a pass compatible with its instance's and
+                // ended; every image rests in `GENERAL`, and each step is recorded between two
+                // instances, as the encoder's own pass records it; the shadow's copies, around a
+                // run that is neither its instance's first nor its last, name the shadow and the
+                // stencil, held so too; the steps before a run past an execution's first are held
+                // with the runs, each recorded between barriers outside a render pass; the
+                // pieces' times are held with the segment until the command buffer completes.
+                unsafe {
+                    // The tile dispatches after the instances the encoder recorded inline, which
+                    // the command buffer it handed over, placed before these, leaves out
+                    // (`render/pending_tile.rs`).
+                    if let (0, Some(last)) = (piece, first.checked_sub(1)) {
+                        steps.dispatches_after(raw, cb, last, &tiles);
+                    }
+                    if let Some(times) = times {
+                        times.begin(raw, cb, piece);
+                    }
+                    let runs = runs.iter().enumerate();
+                    for (offset, &(at, run_index, last_run, (framebuffer, pass), run, around, _)) in
+                        runs
+                    {
+                        let (shadowed, run_steps, before) = around;
+                        // Each instance after the first sees everything the one before wrote.
+                        if from + offset > 0 {
+                            Barrier::everything().record(raw, cb);
+                        }
+                        // Its steps before its first run, and after its last
+                        // (`render/pass_steps.rs`).
+                        if run_index == 0 {
+                            steps.before(raw, cb, at + first);
+                            if let Some(&Some(draws)) = leads.get(at) {
+                                steps.lead(raw, cb, at + first, framebuffer, draws);
+                            }
+                        }
+                        let copies = shadow_copies.filter(|_| shadowed);
+                        if let Some(copies) = copies {
+                            copies.record_in(raw, cb, false);
+                        }
+                        for step in before {
+                            step.record_in(raw, cb);
+                        }
+                        if let Some(run_steps) = run_steps {
+                            run_steps.before(raw, cb);
+                        }
+                        steps.begin(raw, cb, at + first, pass, framebuffer);
+                        raw.cmd_execute_commands(cb, run);
+                        raw.cmd_end_render_pass(cb);
+                        steps.ended(raw, cb, at + first);
+                        if let Some(run_steps) = run_steps {
+                            run_steps.after(raw, cb);
+                        }
+                        if let Some(copies) = copies {
+                            copies.record_out(raw, cb);
+                        }
+                        if last_run {
+                            steps.after(raw, cb, at + first, &tiles);
+                        }
+                    }
+                    if last_piece {
+                        steps.end(raw, cb);
+                    }
+                    if let Some(times) = times {
+                        times.end(raw, cb, piece);
+                    }
+                }
+            });
+        }
+        if let Some(times) = times {
+            core.retain(times);
+        }
         if shapes.len() > self.instances.len() {
             let causes = SplitCauses {
                 shadow: shadow_runs > 0,
                 tile_memory: found.tile_memory_splits,
+                interlocked_writes: found.interlocked_splits,
                 barriers: found.barrier_splits,
                 viewed,
                 ..SplitCauses::default()
@@ -3337,20 +4530,329 @@ impl DeferredPass {
         let mut segment = core.end_segment()?;
         segment.resident_misses = found.misses;
         segment.faults = found.faults;
+        // The probe's recording, which ran: what it used and took, held with the pass's.
+        if let Some(probed) = probed {
+            segment.join(probed);
+        }
         Ok(segment)
+    }
+
+    /// Where the host step fans the pass's triangles out (`render/fan_out.rs`: the device's policy
+    /// and features), in a pass of no memoryless attachment and no shadowed texture: each
+    /// execution's routes, by index, its commands read once here (`None` for one recorded as
+    /// without: over no rate map, or using a shadowed texture), and the probe of their draws,
+    /// recorded, submitted and waited for, its command buffers taken out of it, which the pass's
+    /// segment joins. Nothing where it does not.
+    fn fan_out_routes(
+        &self,
+        command_buffer: &CommandBuffer,
+        residency: &Residency,
+    ) -> Result<(Vec<Option<Arc<FanOutRoutes>>>, Option<RecordedSegment>), Error> {
+        let device = command_buffer.device();
+        // Where the pass is rate-mapped, why it probes nothing, if it does not.
+        let rate_mapped = (self.executions.iter()).any(|e| e.snapshot.rate_map.is_some());
+        let unprobed = |why| {
+            if rate_mapped {
+                device.shared().counts.rate_map_step_unprobed(why);
+            }
+        };
+        if !self.fans_out(device) {
+            unprobed(Unprobed::Unfanned);
+            return Ok((Vec::new(), None));
+        }
+        // The probe's and the fanned-out draws' pipelines the settle at commit began: made by
+        // now, or waited for here, hastened, as the step's own makings are; then the draws find
+        // them made.
+        let fan_settled = lock(&self.fan_settled).clone();
+        for pending in &fan_settled {
+            let ready = pending.outcome().is_some();
+            device
+                .shared()
+                .counts
+                .rate_map_fan_out_pipeline_taken(ready);
+            if !ready {
+                // Its outcome is the draw's to read.
+                drop(pending.wait());
+            }
+        }
+        // Each execution's instance, by index.
+        let mut homes = vec![None; self.executions.len()];
+        for (at, instance) in self.instances.iter().enumerate() {
+            for piece in &instance.pieces {
+                if let Piece::Execution(index) = *piece {
+                    if let Some(home) = homes.get_mut(index) {
+                        *home = Some(at);
+                    }
+                }
+            }
+        }
+        // Each execution over the map: its GPU route's commands, where it takes one, which ran
+        // before the probe (`executions/gpu_route.rs`); else its commands read once.
+        let (gpu_routes, prework) = self.gpu_routes(command_buffer, residency)?;
+        let mut reads = Vec::with_capacity(self.executions.len());
+        for (execution, gpu_route) in self.executions.iter().zip(gpu_routes) {
+            let fans = execution.snapshot.rate_map.is_some() && execution.shadows.is_empty();
+            reads.push(match (fans, gpu_route) {
+                (true, Some(gpu_route)) => Some(gpu_route.step_commands()),
+                (true, None) => Some(execution.step_commands(device)?),
+                (false, _) => None,
+            });
+        }
+        // `PROBE_DRAW_WORDS` words a probed draw, at most one a command.
+        let commands: usize = (reads.iter().flatten())
+            .map(|(commands, ..)| commands.len())
+            .sum();
+        let draw_words = u64::from(PROBE_DRAW_WORDS);
+        let mut probes: Vec<ProbeRun> = Vec::with_capacity(reads.len());
+        let mut found_draws: Arc<[Probed]> = Arc::from([]);
+        // The GPU routes' recording, which ran: what it used and took, held with the pass's.
+        let mut probed = prework;
+        if commands > 0 {
+            let len = 4 * draw_words * commands as u64;
+            let flags = command_buffer.state().uploads.upload(device, &[], len)?;
+            let info = vk::DescriptorBufferInfo::default()
+                .buffer(flags.raw())
+                .offset(flags.offset())
+                .range(flags.len());
+            // The probe in parts, each submitted once it is recorded; then one wait for them
+            // all, every part submitted waited for, a failed recording's too: what a part uses
+            // lives until it completed.
+            let part = commands.div_ceil(PROBE_PARTS).max(PROBE_PART_COMMANDS);
+            let mut parts = ProbeParts::default();
+            let recorded = self.probe_parts(
+                command_buffer,
+                (residency, &reads, &homes),
+                (info, part),
+                (&mut probes, &mut parts),
+            );
+            let started = Instant::now();
+            let what = "the rasterization-rate map's fan-out probe";
+            let completed = command_buffer.wait_fenced(&parts.fenced, what);
+            if parts.parts > 0 {
+                let counts = &device.shared().counts;
+                counts.rate_map_probe_waited(started.elapsed());
+                counts.rate_map_probe_parts(parts.parts);
+            }
+            // Their times read and counted, their submissions done.
+            drop(parts.times);
+            let next = recorded?;
+            let completed = completed? && !parts.unsubmitted;
+            if next > 0 && completed {
+                let read = draw_words * u64::from(next);
+                let mut read_words = vec![0u32; read as usize];
+                // SAFETY: the probe's parts that wrote the flags completed, the writes of each made
+                // visible to the host by its last barrier; the words are writable and apart from
+                // the region.
+                unsafe { flags.copy_out(0, read_words.as_mut_ptr().cast(), 4 * read) };
+                // What the probe found of each draw (`fan_out::Probed`).
+                let draws: Vec<Probed> = (read_words.chunks(PROBE_DRAW_WORDS as usize))
+                    .map(Probed::of)
+                    .collect();
+                let flagged = draws.iter().filter(|draw| draw.flagged.is_some()).count();
+                let triangles = draws.iter().map(|d| u64::from(d.flagged_triangles));
+                let straddling = draws.iter().map(|d| u64::from(d.straddling_triangles));
+                (device.shared().counts).rate_map_probe(
+                    flagged as u64,
+                    triangles.sum(),
+                    straddling.sum(),
+                );
+                found_draws = draws.into();
+            } else {
+                unprobed(Unprobed::ProbingNone);
+            }
+            // The parts' recordings, which ran: what they used and took, held with the pass's.
+            probed = (probed.into_iter().chain(parts.recorded)).reduce(|mut joined, part| {
+                joined.join(part);
+                joined
+            });
+        } else {
+            unprobed(Unprobed::NothingToProbe);
+        }
+        let routes = (reads.into_iter().enumerate())
+            .map(|(at, read)| {
+                let (commands, start, faults) = read?;
+                let slots = probes.get(at).cloned().flatten().unwrap_or_default();
+                Some(Arc::new(FanOutRoutes {
+                    commands,
+                    start,
+                    faults,
+                    slots,
+                    probed: Arc::clone(&found_draws),
+                }))
+            })
+            .collect();
+        Ok((routes, probed))
+    }
+
+    /// Record the probes of the pass's executions' commands, `reads` (each execution in its
+    /// instance among `homes`), with `residency`, the command buffer's, their draws taking indices
+    /// of `flags` from 0, in parts of `part` commands, each part submitted once it is recorded
+    /// ([`submit_probe`](Self::submit_probe)) and added to `parts`, so the GPU runs it while the
+    /// host records the next; and push each execution's run onto `probes`. The index past the
+    /// last draw probed. A part holds the commands of one execution or of several, and its flags
+    /// lie where one recording of every command would put them, so the probe's words are the
+    /// same in any parts.
+    fn probe_parts(
+        &self,
+        command_buffer: &CommandBuffer,
+        (residency, reads, homes): (&Residency, &[Option<StepCommands>], &[Option<usize>]),
+        (flags, part): (vk::DescriptorBufferInfo, usize),
+        (probes, parts): (&mut Vec<ProbeRun>, &mut ProbeParts),
+    ) -> Result<u32, Error> {
+        let mut next = 0;
+        let mut core = EncoderCore::segment(command_buffer, false)?;
+        // The part's draws, each with its instance, and the commands it holds.
+        let mut draws: Vec<(usize, vk::CommandBuffer)> = Vec::new();
+        let mut held = 0;
+        for ((execution, read), home) in self.executions.iter().zip(reads).zip(homes) {
+            let (Some((commands, _, _)), Some(home)) = (read, home) else {
+                probes.push(None);
+                continue;
+            };
+            let mut slots = Vec::new();
+            let mut placed = 0;
+            let mut apart = false;
+            let mut at = 0;
+            while at < commands.len() {
+                let take = (part - held).min(commands.len() - at);
+                let these = commands.replayed(at..at + take);
+                let probing = (flags, next, self.storage.clone());
+                let at_step = (command_buffer, residency);
+                let routed = (&these[..], commands.routed());
+                let (back, probed) = execution.probe(core, at_step, routed, probing)?;
+                core = back;
+                if probed.apart {
+                    apart = true;
+                    break;
+                }
+                next = probed.next;
+                // Each command's draw by its place among the execution's commands that run.
+                slots.resize(placed, None);
+                slots.extend(probed.slots);
+                placed += these.len();
+                draws.extend(probed.draws.map(|draws| (*home, draws)));
+                at += take;
+                held += take;
+                if held >= part {
+                    held = 0;
+                    if !draws.is_empty() {
+                        parts.add(self.submit_probe(core, command_buffer, &draws)?);
+                        draws.clear();
+                        core = EncoderCore::segment(command_buffer, false)?;
+                    }
+                }
+                if probed.stopped {
+                    break;
+                }
+            }
+            probes.push((!apart).then_some(slots));
+        }
+        if !draws.is_empty() {
+            parts.add(self.submit_probe(core, command_buffer, &draws)?);
+        }
+        Ok(next)
+    }
+
+    /// Record a part of the probes of the pass's executions, `draws` (each secondary with its
+    /// instance), into `core`, each instance's in a render pass instance of its instance's
+    /// framebuffer that loads and stores every attachment, then submit it with a fence, for the
+    /// host to wait for later (`render/fan_out.rs`): its fence (`None` where the process is
+    /// exiting, and nothing was submitted), its recording, its command buffers taken out, and its
+    /// GPU time's slot, which counts that time once it is let go of after the wait.
+    fn submit_probe(
+        &self,
+        mut core: EncoderCore,
+        command_buffer: &CommandBuffer,
+        draws: &[(usize, vk::CommandBuffer)],
+    ) -> Result<SubmittedPart, Error> {
+        let device = command_buffer.device();
+        let mut passes = Vec::new();
+        let mut runs = Vec::new();
+        for (index, instance) in self.instances.iter().enumerate() {
+            let draws: Vec<vk::CommandBuffer> = (draws.iter())
+                .filter(|(home, _)| *home == index)
+                .map(|(_, draws)| *draws)
+                .collect();
+            if draws.is_empty() {
+                continue;
+            }
+            let own = super::instance_layout(&self.layout, self.bare.as_ref(), &instance.shape);
+            let between = Position {
+                first: false,
+                last: false,
+            };
+            let (none, general) = (Feedback::NONE, vk::ImageLayout::GENERAL);
+            let pass =
+                render_target::final_pass(device, own, &instance.shape, between, none, general)?;
+            runs.push((pass.raw, instance.framebuffer, draws));
+            passes.push(pass);
+        }
+        let times = rate_mapped_pass::PieceTimes::probe(device);
+        let render_area = self.steps.render_area;
+        core.command(render_target::ATTACHMENT_STAGES, &[], |raw, cb| {
+            // SAFETY: the segment's command buffer is recording outside a render pass; the passes
+            // are held with it, and each framebuffer and its attachments with the pass's
+            // instances, until the command buffer completes; each secondary was recorded against
+            // a pass compatible with its instance's and ended; every image rests in `GENERAL`
+            // before the pass, which loads and stores each attachment and draws no fragment; the
+            // probe's times are held until it completed.
+            unsafe {
+                if let Some(times) = &times {
+                    times.begin(raw, cb, 0);
+                }
+                for (pass, framebuffer, draws) in &runs {
+                    let begin = vk::RenderPassBeginInfo::default()
+                        .render_pass(*pass)
+                        .framebuffer(*framebuffer)
+                        .render_area(render_area);
+                    let contents = vk::SubpassContents::SECONDARY_COMMAND_BUFFERS;
+                    raw.cmd_begin_render_pass(cb, &begin, contents);
+                    raw.cmd_execute_commands(cb, draws);
+                    raw.cmd_end_render_pass(cb);
+                }
+                Barrier::to_host().record(raw, cb);
+                if let Some(times) = &times {
+                    times.end(raw, cb, 0);
+                }
+            }
+        });
+        core.retain(passes);
+        let mut recorded = core.end_segment()?;
+        // SAFETY: the segment's command buffers, of the command buffer's pool, ended and
+        // recorded for this submission alone; what they use the segment holds, which the pass's
+        // joins, and the host waits for the submission before the step ends.
+        let what = "the rasterization-rate map's fan-out probe";
+        let fenced = unsafe { command_buffer.submit_fenced(&recorded.raws, what) }?;
+        recorded.raws.clear();
+        recorded.piece_ends.clear();
+        recorded.executions.clear();
+        Ok((fenced, recorded, times))
+    }
+
+    /// Whether the host step that records it fans its triangles out, where its executions' draws
+    /// take the fan-out (`render/fan_out.rs`): the device's policy and features ask it, and the
+    /// pass has no memoryless attachment and uses no shadowed texture.
+    fn fans_out(&self, device: &Device) -> bool {
+        let layout = &self.layout;
+        let memoryless = (layout.colors.iter().flatten().map(|color| &color.target))
+            .chain(layout.depth_stencil.iter().map(|ds| &ds.target))
+            .any(super::memoryless);
+        fan_out::fans_out(device) && self.shadows.is_empty() && !memoryless
     }
 
     /// Settle at commit what the host step that records the pass would compile
     /// ([`RenderExecution::settle`]): for each execution, the variants and `VkPipeline`s of the
-    /// draws of each state its records may name, the encoder's where its buffer inherits it,
-    /// else those made with `supportIndirectCommandBuffers` alive now. Each such state's creation
-    /// compiled its variant in the large-buffer form, which the commit looks up, and the commit
-    /// begins the `VkPipeline`s: under `PipelineWaitPolicy::Bounded` (the default) each making is
-    /// handed to the device's pool (`RenderVariant::settle_graphics_pipeline`), kept here for the
-    /// host step to wait for until its command buffer's bound at most, so the commit compiles none
-    /// on the program's thread; under `Exact` made now. It compiles a variant only where the
-    /// encoder's state asks for another, and the step only where a command's own buffers or
-    /// strides ask for another, or the draw records into a run of another shape. Returns what it
+    /// draws of each state its records name as the CPU wrote them, the encoder's where its buffer
+    /// inherits it, else the live states the CPU set on the commands it may run, in the forms the
+    /// step draws them in: the replay form for an execution the step's GPU route takes, which the
+    /// decision finds again here (`gpu_route.rs`), else the large-buffer form. Each such state's
+    /// creation compiled its variant in the large-buffer form, which the commit looks up, and the
+    /// commit begins the `VkPipeline`s: under `PipelineWaitPolicy::Bounded` (the default) each
+    /// making is handed to the device's pool (`RenderVariant::settle_graphics_pipeline`), kept here
+    /// for the host step to wait for until it is made, so the commit compiles none on the
+    /// program's thread; under `Exact` made now. It compiles a variant only
+    /// where the encoder's state asks for another, and the step only where a command's own buffers
+    /// or strides ask for another, or the draw records into a run of another shape. Returns what it
     /// made, which the command buffer holds until it completes; what it cannot settle, the step
     /// meets as it is then.
     pub(crate) fn settle(&self, command_buffer: &CommandBuffer) -> Vec<SettledDraw> {
@@ -3365,19 +4867,44 @@ impl DeferredPass {
         let Ok(mut core) = EncoderCore::segment(command_buffer, false) else {
             return made;
         };
-        let states = match self.executions.iter().any(|e| e.pipeline.is_none()) {
-            true => RenderPipelineState::indirect_states(command_buffer.device()),
-            false => Vec::new(),
+        let mut fanned = Vec::new();
+        let fans = self.fans_out(command_buffer.device());
+        // Where the step fans the pass out, the executions its GPU route takes draw in their
+        // replay forms (`gpu_route.rs`); the others in the large-buffer form, from their records.
+        let routed: Vec<bool> = match fans {
+            true => {
+                let (back, forms) = self.route_forms(core, &residency);
+                core = back;
+                forms.iter().map(Option::is_some).collect()
+            }
+            false => vec![false; self.executions.len()],
         };
-        for execution in &self.executions {
+        for (execution, routed) in self.executions.iter().zip(routed) {
             let inputs = (self.storage.clone(), &residency);
-            core = execution.settle(core, inputs, &states, &mut made);
+            let into = (&mut made, fans.then_some(&mut fanned));
+            core = execution.settle(core, inputs, into, step_forms(routed));
         }
-        // The makings handed to the pool, which the host step waits for.
-        lock(&self.settled).extend(made.iter().filter_map(|(_, drawn)| match drawn {
-            Some(DrawPipeline::Making(pending)) => Some(pending.clone()),
-            _ => None,
-        }));
+        let makings = |made: &[SettledDraw]| -> Vec<Pending<RawPipeline>> {
+            (made.iter())
+                .filter_map(|(_, drawn)| match drawn {
+                    Some(DrawPipeline::Making(pending)) => Some(pending.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The makings handed to the pool: the host step waits for the draws' before it records
+        // the pass, and takes the fan-out's where it fans the pass out.
+        lock(&self.settled).extend(makings(&made));
+        // Each making once: a strip's draw and a list's settle to one key where the pipeline
+        // makes the topology dynamic.
+        let mut fan_settled = lock(&self.fan_settled);
+        for pending in makings(&fanned) {
+            if !fan_settled.iter().any(|kept| kept.same(&pending)) {
+                fan_settled.push(pending);
+            }
+        }
+        drop(fan_settled);
+        made.extend(fanned);
         made
     }
 
@@ -3395,8 +4922,10 @@ impl DeferredPass {
             })
     }
 
-    /// Announce, once per device, that a host step records the pass, naming the rule that kept
-    /// it from the GPU alone where one did ([`HostStepCause`]).
+    /// Announce, once per device and cause (`Device::degrade_host_step`), that a host step
+    /// records the pass, naming the rule that kept it from the GPU alone where one did
+    /// ([`HostStepCause`]), and the rules past it the pass breaks too, where `commit` found them
+    /// ([`rules_past`](Self::rules_past)).
     pub(crate) fn degrade(&self, device: &Device) {
         let Some(execution) = self
             .executions
@@ -3405,19 +4934,32 @@ impl DeferredPass {
         else {
             return;
         };
-        let why = if execution.icb.gpu_written() {
-            "an encoder made it resident for writing, so the GPU may write the render commands an \
-             execution runs: its render pass is recorded once the work before it completed"
-        } else {
-            "an execution reads its range from a buffer \
-             (executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:), which the GPU may \
-             write: its render pass is recorded once the work before it completed"
-        };
+        let written = execution.icb.gpu_written();
         let cause = lock(&self.cause).clone();
-        device.degrade(Degradation::HostReplayedIndirectCommands, || {
+        let also = lock(&self.also).clone();
+        let key = cause
+            .as_ref()
+            .map_or(HostStepKey::Render, HostStepCause::key);
+        device.degrade_host_step(key, || {
+            // The buffer's records, which a route that may write them met, named
+            // (`write_routes.rs`).
+            let why = match written {
+                true => format!(
+                    "{}: its render pass is recorded once the work before it completed",
+                    replay_why(&execution.icb, "the render commands an execution runs")
+                ),
+                false => "an execution reads its range from a buffer \
+                          (executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:), which \
+                          the GPU may write: its render pass is recorded once the work before it \
+                          completed"
+                    .to_owned(),
+            };
             let why = match cause {
-                Some(cause) => format!("{why}, not on the GPU alone, as {cause}"),
-                None => why.to_owned(),
+                Some(cause) => format!(
+                    "{why}, not on the GPU alone, as {}",
+                    cause::named(&cause, &also)
+                ),
+                None => why,
             };
             (
                 format!(

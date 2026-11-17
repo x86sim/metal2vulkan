@@ -1,11 +1,12 @@
 //! What `heapTextureSizeAndAlignWithDescriptor:` counts, for the formats this crate holds no
-//! image of.
+//! image of, or holds for copies alone.
 //!
 //! The heap size query is **arithmetic over a descriptor**: how many bytes Metal's own layout
 //! takes for a texture of that shape, and at what alignment. It makes nothing and reads nothing.
 //! So a format can have a footprint this crate answers exactly while having no image this crate
-//! can make a texture, a view or a copy in: the two are different questions, and
-//! `repr`'s `NotImplemented` answers only the second.
+//! can make a texture, a view or a copy in, or an image of its bytes for copies alone
+//! ([`copies_only`](super::copies_only)) laid out otherwise than Metal's: the two are different
+//! questions, and `repr` answers only the second.
 //!
 //! [`footprint`] is the first question for the formats whose answer the format's own structure
 //! decides — its block's bytes and texel extent, and how many planes Metal lays its bytes in —
@@ -20,12 +21,8 @@
 //! over all 33 formats, and the probe sweep these rules were fitted against, which the runtime's
 //! `tests::heap_footprint_formats` replays.
 
-use super::block_extent;
 use super::packed_codes;
 use crate::metal::PixelFormat;
-
-/// The bytes of one ASTC block, whatever its texel extent.
-const ASTC_BLOCK: u32 = 16;
 
 /// How Metal lays out the bytes `heapTextureSizeAndAlignWithDescriptor:` counts for a texture of
 /// a format whose footprint the format's own structure decides ([`footprint`]).
@@ -42,7 +39,7 @@ pub enum Footprint {
     Tiled {
         /// The bytes of one element: a texel, or a compressed format's block.
         bytes: u32,
-        /// The texels one element covers ([`block_extent`]).
+        /// The texels one element covers ([`block_extent`](super::block_extent)).
         block: [u32; 2],
     },
     /// One linear plane of `bytes`-byte texels, packed: no row padding, no tiles and no
@@ -77,33 +74,16 @@ pub enum Footprint {
 }
 
 /// Metal's footprint layout of `pf`, where the format's own structure decides it and no image of
-/// this crate does: the 32 formats Metal answers `heapTextureSizeAndAlignWithDescriptor:` for
-/// that `repr` holds no Vulkan candidate of (`astc_without_a_vulkan_block!` and
-/// `formats_named_not_held!`). `None` for every other format, whose footprint its image decides.
+/// this crate does: the 26 formats Metal answers `heapTextureSizeAndAlignWithDescriptor:` for
+/// that `repr` holds no Vulkan candidate of (`formats_named_not_held!`) or holds for copies alone
+/// ([`copies_only`](super::copies_only)). `None` for every other format, whose footprint its
+/// image decides.
 ///
-/// This is **not** support for the format. A texture, a view, a copy, a read and a write of one
-/// stay refused `NotImplemented(Format)`, because this crate holds no image of it; a footprint is
-/// counted bytes, which needs none.
+/// This is **not** support for the format. A view, a read and a write of one stay refused
+/// `NotImplemented(Format)`, and a texture and a copy are refused too where this crate holds no
+/// image of it; a footprint is counted bytes, which needs none.
 pub fn footprint(pf: PixelFormat) -> Option<Footprint> {
     use PixelFormat as P;
-    // ASTC's 4x2 and 8x4 footprints, LDR, sRGB and HDR: an ASTC block is 16 bytes whatever its
-    // texel extent, and `block_extent` already answers theirs, so their footprint is the block
-    // layout every other ASTC format's is. That no Vulkan ASTC block has either extent is why
-    // the crate holds no image of them, not a reason Metal cannot count their bytes.
-    if matches!(
-        pf,
-        P::ASTC4x2LDR
-            | P::ASTC4x2SRGB
-            | P::ASTC4x2HDR
-            | P::ASTC8x4LDR
-            | P::ASTC8x4SRGB
-            | P::ASTC8x4HDR
-    ) {
-        return Some(Footprint::Tiled {
-            bytes: ASTC_BLOCK,
-            block: block_extent(pf)?,
-        });
-    }
     let tiled = |bytes| {
         Some(Footprint::Tiled {
             bytes,

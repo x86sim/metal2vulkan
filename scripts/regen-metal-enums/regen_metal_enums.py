@@ -73,9 +73,9 @@ EXHAUSTIVE = {
 }
 
 # Enumerators the SDK headers do not declare but Metal makes on Apple GPUs, appended after a type's
-# header enumerators: each name is the one Metal prints in a texture's description for the raw
-# value (an Apple M3 Max on macOS 26.7 and an Apple M4 on macOS 27.0.1). Programs that page Core
-# Video surfaces create textures in them.
+# header enumerators: each name is the one Metal prints in an object's description for the raw
+# value, where it prints one (an Apple M3 Max on macOS 26.7 and an Apple M4 on macOS 27.0.1).
+# Programs that page Core Video surfaces create textures in the pixel formats.
 PRIVATE = {
     "MTLPixelFormat": [
         ("MTLPixelFormatARGB8Unorm", 84),
@@ -246,6 +246,11 @@ PRIVATE = {
     # a sampler state of it, and samples through it with its bicubic filter. The
     # descriptor keeps two bits; 3 stops the process in `newSamplerStateWithDescriptor:`.
     "MTLSamplerMinMagFilter": [("MTLSamplerMinMagFilterCubic", 2)],
+    # The `functionType` Metal answers for a Core Image kernel library's extern function (`TYPE` 5,
+    # from `newFunctionWithName:` or `newExternFunctionWithName:`), whose description prints
+    # "Unknown" (an Apple M3 Max on macOS 27.0.1): the name is the one Metal's
+    # `newExternFunctionWithName:` and `externFunctionNames` give the kind.
+    "MTLFunctionType": [("MTLFunctionTypeExtern", 4)],
     # Every texture creator takes these bits and the texture's usage keeps them, its views' and
     # shared opens' too; the names are the ones its description prints (an Apple
     # M4 on macOS 27.0.1, plain and validated).
@@ -253,6 +258,24 @@ PRIVATE = {
         ("MTLTextureUsageNoConcurrentAccess", 0x4000),
         ("MTLTextureUsageVideo", 0x8000),
         ("MTLTextureUsageBlockWritesOnly", 0x10000),
+    ],
+    # `setTriangleFillMode:`'s raw value 2, which Apple's GL renderer sends for
+    # `glPolygonMode(GL_POINT)` under its Intel and Apple-silicon capability tables. Metal takes it
+    # and draws each triangle's vertices as points of one pixel: an Apple M3 Max on macOS 27.0.1
+    # (whatever `[[point_size]]` the vertex function writes, after culling) and an Intel UHD
+    # Graphics 630 on macOS 26.7.1; a Radeon Pro 5300M fills the triangle. No object carries the
+    # mode, so Metal prints no name for it: the name is this tree's.
+    "MTLTriangleFillMode": [("MTLTriangleFillModePoints", 2)],
+}
+
+# A doc comment for a `PRIVATE` enumerator, emitted on its variant after the enumerator's name, for
+# a value whose meaning a consumer of the variant needs.
+PRIVATE_DOCS = {
+    "MTLTriangleFillModePoints": [
+        "Not declared by the SDK headers: the raw value 2, which Apple's GL renderer sends",
+        "for `glPolygonMode(GL_POINT)`. Metal draws each triangle's vertices as points of one",
+        "pixel on an Apple M3 Max and an Intel UHD Graphics 630, where a Radeon Pro 5300M",
+        "fills the triangle.",
     ],
 }
 
@@ -302,6 +325,7 @@ TABLE_ONLY = [
     "MTLStoreAction",
     "MTLStoreActionOptions",
     "MTLVisibilityResultMode",
+    "MTLVisibilityResultType",
 ]
 
 # NS_OPTIONS types, emitted as bit-set newtypes (`metal_flags!`).
@@ -511,6 +535,7 @@ def render(found, sdk_version, enums, options):
         "// Regenerate with scripts/regen-metal-enums/regen_metal_enums.py; do not edit.",
         "",
     ]
+    documented = set()
     for name, flags in [(n, False) for n in enums] + [(n, True) for n in options]:
         if name not in found:
             raise ValueError(f"{name} not found in the SDK headers")
@@ -532,6 +557,13 @@ def render(found, sdk_version, enums, options):
         out.append(f'    {name[3:]} = "{name}" {{')
         for rust, ident, value in entries:
             shown = f"0x{value:x}" if flags else str(value)
+            doc = PRIVATE_DOCS.get(ident)
+            if doc is not None:
+                if flags or ident not in dict(PRIVATE.get(name, [])):
+                    raise ValueError(f"{ident} has a doc, but no private value")
+                documented.add(ident)
+                out.append("        ///")
+                out.extend(f"        /// {line}" for line in doc)
             out.append(f'        {rust} = {shown}, "{ident}";')
         out.append("    }")
         out.append("    aliases {")
@@ -547,6 +579,10 @@ def render(found, sdk_version, enums, options):
             out.append("    }")
         out.append("}")
         out.append("")
+    owned = {ident for name in enums for ident, _ in PRIVATE.get(name, [])}
+    undocumented = (set(PRIVATE_DOCS) & owned) - documented
+    if undocumented:
+        raise ValueError(f"no variant took the docs of {sorted(undocumented)}")
     return "\n".join(out).rstrip("\n") + "\n"
 
 

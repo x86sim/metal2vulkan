@@ -14,7 +14,9 @@
 //!   memory, and a vertex-heavy draw's GPU time the same (28.19 ms against 28.18). A region is
 //!   never reused while the command buffer lives: every command reads data no other command wrote,
 //!   and the host writes it before the command's batch is submitted (a host step's, after the
-//!   batches before it). The regions the GPU writes: where a pass's visibility results land before
+//!   batches before it). The regions the GPU writes: a staged scatter's staging, which a host
+//!   step takes and the GPU's copy writes, and which a host step of a later batch reads once
+//!   that copy completed (`host_ram/copy.rs`); where a pass's visibility results land before
 //!   they are copied on into a no-copy buffer (`visibility.rs`), within one command of barriers,
 //!   and an index bounds pass's bounds words and the command buffer's index pool
 //!   (`index_bounds.rs`), written before the pass between barriers; and a flat dispatch's region
@@ -22,7 +24,11 @@
 //!   preprocess writes before the dispatch between barriers; and an execution's device replay
 //!   scratch on the GPU alone (its slot tables, region records, arguments or sequences and counts,
 //!   and the sink; `gpu_execute.rs`), which the replay's preprocess writes before the commands
-//!   between barriers; and an emulated tessellation draw's work buffer, whose first words an
+//!   between barriers; and, with the encoder trail on, the copy of the words its line reads of
+//!   a render execution's draw replay scratch, which the GPU makes before the pass's draws
+//!   (`render/executions/gpu.rs`; the scratch itself lies in device memory, and the arena holds
+//!   only the head the host writes and a copy carries in); and an
+//!   emulated tessellation draw's work buffer, whose first words an
 //!   indirect draw's copy of its arguments and whose header and chunk slots its scan write before
 //!   its draws between barriers (`render/tessellation_scan.rs`): every chunk carries indirect and
 //!   storage usage and, where the device has them, a device address. The command buffer releases
@@ -42,8 +48,11 @@
 //!   and the storage and uniform buffer offset alignments), so it can be bound at its offset and
 //!   its device address is 16-aligned. A root table and the resident set it searches start at a
 //!   device address that is a multiple of 32 too (`upload_aligned`). A region's bytes past the data
-//!   are zero: [`Uploads::upload`] sets them, since the chunk holds no value as it is made. The
-//!   bytes an alignment leaves between two regions belong to no region, and nothing reads them.
+//!   are zero: [`Uploads::upload`] sets them, since the chunk holds no value as it is made; but an
+//!   unset region's ([`Uploads::unset`]: a staged gather's pages, which a host step writes before
+//!   its batch is submitted, every byte its command reads among them; a staged scatter's bytes,
+//!   which its copy writes, every byte the host reads after it among them). The bytes an alignment
+//!   leaves between two regions belong to no region, and nothing reads them.
 
 use super::buffer::{Buffer, NewBytes};
 use super::device::lock;
@@ -144,8 +153,28 @@ impl Uploads {
         len: u64,
         address_alignment: u64,
     ) -> Result<Upload, Error> {
+        self.place(device, bytes, (len, address_alignment), true)
+    }
+
+    /// A region of `len` bytes whose bytes hold no value until written ([`Upload::write_at`]):
+    /// the caller writes every byte a command reads before the batch that reads them is
+    /// submitted (a host step's, a staged gather's pages, `host_ram/copy.rs`), or every byte the
+    /// host reads by a command that completed before (a staged scatter's copy).
+    pub(super) fn unset(&mut self, device: &Device, len: u64) -> Result<Upload, Error> {
+        self.place(device, &[], (len, 1), false)
+    }
+
+    /// A region of `len` bytes (at least `bytes.len()`) holding `bytes`, at a device address
+    /// that is a multiple of `address_alignment`, its bytes past them zero where `clear` says.
+    fn place(
+        &mut self,
+        device: &Device,
+        bytes: &[u8],
+        (len, address_alignment): (u64, u64),
+        clear: bool,
+    ) -> Result<Upload, Error> {
         if let Some(lent) = &self.lent {
-            return lock(lent).upload_aligned(device, bytes, len, address_alignment);
+            return lock(lent).place(device, bytes, (len, address_alignment), clear);
         }
         let len = len.max(bytes.len() as u64);
         let alignment = device.shared().upload_alignment;
@@ -223,7 +252,7 @@ impl Uploads {
             }
         };
         let chunk = &mut self.chunks[index];
-        let Some(mapped) = chunk.buffer.contents() else {
+        let Some(mapped) = chunk.buffer.mapped_contents() else {
             unreachable!("upload chunks are Shared buffers")
         };
         // SAFETY: `[offset, offset + bytes.len())` is inside the chunk's mapping (`fits`, or a
@@ -245,7 +274,7 @@ impl Uploads {
         // scratch of tens of MiB, whose head alone is uploaded and whose rest the GPU writes,
         // would pay a memset its creation never paid (`fresh_pages.rs`).
         let tail = len - bytes.len() as u64;
-        if tail > 0 && !chunk.zero_unwritten {
+        if clear && tail > 0 && !chunk.zero_unwritten {
             let at = offset + bytes.len() as u64;
             // SAFETY: `[at, at + tail)` is the rest of the region, inside the chunk's mapping as
             // above, and no region overlaps it.
@@ -298,7 +327,7 @@ impl Upload {
     /// submitted: as the command buffer commits (a function-table snapshot). A write longer than
     /// the region is cut to it.
     pub(super) fn write(&self, bytes: &[u8]) {
-        let Some(mapped) = self.buffer.contents() else {
+        let Some(mapped) = self.buffer.mapped_contents() else {
             unreachable!("upload chunks are Shared buffers")
         };
         let len = bytes.len().min(self.len as usize);
@@ -317,7 +346,7 @@ impl Upload {
     /// [`write`](Self::write) at byte `at` of the region: a root table's resident-set fields as
     /// the command buffer commits, or as a host step uploads it. A write past the region is cut.
     pub(super) fn write_at(&self, at: u64, bytes: &[u8]) {
-        let Some(mapped) = self.buffer.contents() else {
+        let Some(mapped) = self.buffer.mapped_contents() else {
             unreachable!("upload chunks are Shared buffers")
         };
         let len = (bytes.len() as u64).min(self.len.saturating_sub(at)) as usize;
@@ -332,6 +361,58 @@ impl Upload {
         }
     }
 
+    /// Copy the `len` bytes at `from` into the region from its byte `at`, before any batch that
+    /// reads the region is submitted: a staged gather's pages, by a host step (`host_ram/copy.rs`).
+    /// A copy past the region is cut to it.
+    ///
+    /// # Safety
+    ///
+    /// The `len` bytes at `from` stay mapped and readable while the call runs, and lie outside
+    /// the region.
+    pub(super) unsafe fn copy_in(&self, at: u64, from: *const u8, len: u64) {
+        let Some(mapped) = self.buffer.mapped_contents() else {
+            unreachable!("upload chunks are Shared buffers")
+        };
+        let len = len.min(self.len.saturating_sub(at)) as usize;
+        // SAFETY: `[offset + at, offset + at + len)` is inside the region, which no other region
+        // overlaps and no submitted command reads (the caller writes it before the batches that
+        // read it are submitted); the bytes at `from` are readable and apart from it (the
+        // caller's contract). A raw copy, as another thread may write those bytes meanwhile.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                from,
+                mapped.as_ptr().add((self.offset + at) as usize),
+                len,
+            );
+        }
+    }
+
+    /// Copy the `len` bytes of the region from its byte `at` to `to`: a staged scatter's bytes
+    /// into the pages, by a host step (`host_ram/copy.rs`). A copy past the region is cut to it.
+    ///
+    /// # Safety
+    ///
+    /// The `len` bytes at `to` stay mapped and writable while the call runs, and lie outside the
+    /// region; every command that writes those bytes of the region completed, and their writes
+    /// are visible to the host (its batch's end, `tracker::Barrier::to_host`).
+    pub(super) unsafe fn copy_out(&self, at: u64, to: *mut u8, len: u64) {
+        let Some(mapped) = self.buffer.mapped_contents() else {
+            unreachable!("upload chunks are Shared buffers")
+        };
+        let len = len.min(self.len.saturating_sub(at)) as usize;
+        // SAFETY: `[offset + at, offset + at + len)` is inside the region, which no other region
+        // overlaps and no command writes any more (the caller's contract), in host-coherent
+        // memory; the bytes at `to` are writable and apart from it (the caller's contract). A raw
+        // copy, as another thread may read or write those bytes meanwhile.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                mapped.as_ptr().add((self.offset + at) as usize),
+                to,
+                len,
+            );
+        }
+    }
+
     /// The region's Vulkan device address, where the device has device addresses.
     pub(super) fn device_address(&self) -> Option<u64> {
         self.buffer
@@ -339,10 +420,36 @@ impl Upload {
             .map(|address| address + self.offset)
     }
 
+    /// Up to `words` little-endian `u32`s of the region from its byte `at` (a multiple of 4), cut
+    /// to the region, as they stand now, while commands may still write them: the encoder trail's
+    /// view of a pending execution's scratch (`encoder_trail.rs`, **GPU forms**). Each word is
+    /// read once, volatile, from the chunk's mapping, which is host-coherent and lives while the
+    /// region does; a word a command writes meanwhile reads either value. It writes nothing,
+    /// takes no lock and waits for nothing.
+    pub(super) fn glimpse(&self, at: u64, words: usize) -> Vec<u32> {
+        let Some(mapped) = self.buffer.mapped_contents() else {
+            unreachable!("upload chunks are Shared buffers")
+        };
+        let fit = (self.len.saturating_sub(at) / 4).min(words as u64) as usize;
+        let start = (self.offset + at) as usize;
+        (0..fit)
+            .map(|word| {
+                // SAFETY: word `word` lies inside the region (`fit`), inside the chunk's mapping,
+                // which the region's buffer keeps mapped; the region starts 16-aligned and `at`
+                // is a multiple of 4, so the word is aligned. A volatile read of memory the GPU
+                // may write, which the host only reads.
+                let bytes = unsafe {
+                    std::ptr::read_volatile(mapped.as_ptr().add(start + 4 * word).cast::<[u8; 4]>())
+                };
+                u32::from_le_bytes(bytes)
+            })
+            .collect()
+    }
+
     /// The region's first `N` bytes as the device left them. The caller has waited for every
     /// command that writes them, and made their writes visible to the host.
     pub(super) fn read<const N: usize>(&self) -> [u8; N] {
-        let Some(mapped) = self.buffer.contents() else {
+        let Some(mapped) = self.buffer.mapped_contents() else {
             unreachable!("upload chunks are Shared buffers")
         };
         assert!(N as u64 <= self.len, "a read past the region");

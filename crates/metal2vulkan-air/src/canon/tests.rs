@@ -8,22 +8,37 @@ use crate::abi::{
     FunctionConstantDecl, ModuleLimits, ParamBinding, ParamRole, Predicate, Slot, Stage,
 };
 use crate::budget::{Budget, Meter};
+use crate::error::Limit;
 use crate::error::{CanonError, InputErrorKind};
-use crate::error::{Limit, MissingInput};
 use crate::intrinsics::{AbsentAccess, AirIntrinsic, Elem, FunctionConstant, NumTy, TexOp};
 use crate::ir::build::{FunctionBuilder, ModuleBuilder};
 use crate::ir::print::print;
 use crate::ir::{
-    AddrSpace, Align, BinOp, Call, CastOp, Const, ConstExpr, FastMath, Global, IntPredicate,
-    Linkage, Section, TailKind, Value,
+    AddrSpace, Align, BinOp, Call, CastOp, Const, ConstExpr, FastMath, Global, InstId,
+    IntPredicate, Linkage, Section, TailKind, Value,
 };
 
+mod aggregates;
 mod command_buffers;
+mod constant_fields;
+mod constant_sets;
+mod conversions;
+mod float_compares;
+mod float_folds;
+mod forwarding;
+mod generic_pointers;
 mod global_builtins;
+mod opencl;
 mod private_memory;
+mod private_reach;
+mod sampler_tables;
+mod static_divisions;
 mod table_copies;
 mod texture_writes;
+mod unbound_immediates;
 mod unobserved;
+mod unrolling;
+mod vector_data;
 
 fn meter() -> Meter {
     Meter::new(&Budget::default())
@@ -74,6 +89,7 @@ fn kernel(func: FuncId, params: Vec<ParamBinding>) -> EntryPoint {
         func,
         stage: Stage::Kernel {
             max_total_threads: None,
+            work_group_size: None,
         },
         params,
         outputs: Vec::new(),
@@ -164,6 +180,7 @@ fn int(v: u32) -> ConstValue {
 fn request(constants: &[(u32, ConstValue)]) -> SpecRequest {
     SpecRequest {
         call_stack_depth: 1,
+        open_cl_mode: false,
         entry: "k".into(),
         constants: constants.iter().cloned().collect::<BTreeMap<_, _>>(),
     }
@@ -316,8 +333,10 @@ fn unguarded(use_mode: impl FnOnce(&mut FunctionBuilder<'_>, Value, TypeId)) -> 
     (module, abi)
 }
 
+/// A value computed from an unsupplied constant is undefined, and where it survives (here a store)
+/// it is its type's zero, one of the values plain Metal's reads of an undefined constant give.
 #[test]
-fn a_surviving_value_use_of_an_unsupplied_constant_needs_input() {
+fn a_surviving_value_of_an_unsupplied_constant_is_zero() {
     let stored = |f: &mut FunctionBuilder<'_>, v: Value, i32t: TypeId| {
         let one = f.module().const_int(i32t, 1);
         let w = f.bin(BinOp::Add, v, one);
@@ -325,14 +344,17 @@ fn a_surviving_value_use_of_an_unsupplied_constant_needs_input() {
         f.ret(None);
     };
     let (module, abi) = unguarded(stored);
-    let err = specialize(module, &abi, &request(&[]), &mut meter()).unwrap_err();
-    assert_eq!(
-        err,
-        Error::NeedsInput(MissingInput::FunctionConstant { index: 3 })
+    let e = specialize(module, &abi, &request(&[]), &mut meter()).unwrap();
+    let text = body_text(&e);
+    assert!(
+        text.contains("store i32 zeroinitializer, %a0") && !text.contains("add i32"),
+        "{text}"
     );
+    assert_eq!(e.undefined_reads, [3]);
     // Supplying it bakes the value and folds the arithmetic.
     let (module, abi) = unguarded(stored);
     let e = specialize(module, &abi, &request(&[(3, int(41))]), &mut meter()).unwrap();
+    assert!(e.undefined_reads.is_empty());
     assert!(
         body_text(&e).contains("store i32 42, %a0"),
         "{}",
@@ -340,10 +362,143 @@ fn a_surviving_value_use_of_an_unsupplied_constant_needs_input() {
     );
 }
 
+/// An `and` with zero, an `or` with all ones and a `mul` by zero are that constant whatever the
+/// unsupplied constant holds; an `or` with another constant is undefined, its type's zero.
 #[test]
-fn a_branch_on_an_unsupplied_constant_needs_input() {
+fn a_constant_that_decides_an_operation_on_an_unsupplied_constant_is_its_value() {
     let (module, abi) = unguarded(|f, v, i32t| {
         let zero = f.module().const_int(i32t, 0);
+        let ones = f.module().const_int(i32t, u32::MAX.into());
+        let one = f.module().const_int(i32t, 1);
+        let ops = [
+            (BinOp::And, zero),
+            (BinOp::Mul, zero),
+            (BinOp::Or, ones),
+            (BinOp::Or, one),
+        ];
+        for (op, k) in ops {
+            let w = f.bin(op, v, k);
+            store(f, w, arg(0));
+        }
+        f.ret(None);
+    });
+    let e = specialize(module, &abi, &request(&[]), &mut meter()).unwrap();
+    let text = body_text(&e);
+    assert_eq!(text.matches("store i32 0, %a0").count(), 2, "{text}");
+    assert_eq!(
+        text.matches("store i32 4294967295, %a0").count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("store i32 zeroinitializer, %a0").count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(e.undefined_reads, [3]);
+}
+
+/// Where a run's own value meets an unsupplied constant's (an operation on both, a PHI, a
+/// `select` on a condition the run decides), the run computes it, with zero for the constant: a
+/// way that does not read the constant keeps its value, and a loop that counts from the constant
+/// still counts.
+#[test]
+fn a_value_the_run_computes_keeps_its_way_past_an_unsupplied_constant() {
+    let ran = |use_mode: fn(&mut FunctionBuilder<'_>, Value, TypeId)| {
+        let (module, abi) = unguarded(use_mode);
+        body_text(&specialize(module, &abi, &request(&[]), &mut meter()).unwrap())
+    };
+    let text = ran(|f, v, i32t| {
+        let r = load(f, i32t, arg(0));
+        let w = f.bin(BinOp::Or, r, v);
+        store(f, w, arg(0));
+        f.ret(None);
+    });
+    assert!(text.contains("or i32"), "{text}");
+    let text = ran(|f, v, i32t| {
+        let i1 = f.module().int(1);
+        let seven = f.module().const_int(i32t, 7);
+        let r = load(f, i32t, arg(0));
+        let c = f.push(
+            i1,
+            InstKind::Cast {
+                op: CastOp::Trunc,
+                v: r,
+            },
+        );
+        let s = f.push(
+            i32t,
+            InstKind::Select {
+                c,
+                t: v,
+                f: seven,
+                fmf: FastMath::NONE,
+            },
+        );
+        store(f, s, arg(0));
+        let (a, b, join) = (f.block(), f.block(), f.block());
+        f.cond_br(c, a, b);
+        f.switch_to(a);
+        f.br(join);
+        f.switch_to(b);
+        f.br(join);
+        f.switch_to(join);
+        let p = f.push(
+            i32t,
+            InstKind::Phi {
+                incoming: Box::new([(v, a), (seven, b)]),
+                fmf: FastMath::NONE,
+            },
+        );
+        store(f, p, arg(0));
+        f.ret(None);
+    });
+    assert!(
+        text.contains("select i32 %i1, i32 zeroinitializer, i32 7")
+            && text.contains("phi i32 [i32 zeroinitializer, bb1], [i32 7, bb2]"),
+        "{text}"
+    );
+    let text = ran(|f, v, i32t| {
+        let i1 = f.module().int(1);
+        let one = f.module().const_int(i32t, 1);
+        let (head, body, exit) = (f.block(), f.block(), f.block());
+        f.br(head);
+        f.switch_to(head);
+        // The PHI's back edge carries the add after it.
+        let i = f.push(
+            i32t,
+            InstKind::Phi {
+                incoming: Box::new([(v, BlockId::new(0)), (Value::Inst(InstId::new(6)), body)]),
+                fmf: FastMath::NONE,
+            },
+        );
+        let r = load(f, i32t, arg(0));
+        let c = f.push(
+            i1,
+            InstKind::Cast {
+                op: CastOp::Trunc,
+                v: r,
+            },
+        );
+        f.cond_br(c, body, exit);
+        f.switch_to(body);
+        let n = f.bin(BinOp::Add, i, one);
+        assert_eq!(n, Value::Inst(InstId::new(6)));
+        store(f, i, arg(0));
+        f.br(head);
+        f.switch_to(exit);
+        f.ret(None);
+    });
+    assert!(text.contains("add i32"), "{text}");
+}
+
+/// A branch on a value computed from an unsupplied constant takes its false way: its condition
+/// is zero.
+#[test]
+fn a_branch_on_an_unsupplied_constant_takes_its_false_way() {
+    let (module, abi) = unguarded(|f, v, i32t| {
+        let zero = f.module().const_int(i32t, 0);
+        let (seven, nine) = (f.module().const_int(i32t, 7), f.module().const_int(i32t, 9));
         let i1 = f.module().int(1);
         let c = f.push(
             i1,
@@ -356,15 +511,16 @@ fn a_branch_on_an_unsupplied_constant_needs_input() {
         let (t, e) = (f.block(), f.block());
         f.cond_br(c, t, e);
         f.switch_to(t);
+        store(f, seven, arg(0));
         f.ret(None);
         f.switch_to(e);
+        store(f, nine, arg(0));
         f.ret(None);
     });
-    let err = specialize(module, &abi, &request(&[]), &mut meter()).unwrap_err();
-    assert_eq!(
-        err,
-        Error::NeedsInput(MissingInput::FunctionConstant { index: 3 })
-    );
+    let e = specialize(module, &abi, &request(&[]), &mut meter()).unwrap();
+    let text = body_text(&e);
+    assert!(text.contains("store i32 9, %a0"), "{text}");
+    assert!(!text.contains("store i32 7"), "{text}");
 }
 
 #[test]
@@ -706,7 +862,6 @@ fn an_inlined_body_is_charged_exactly_its_footprint() {
         &mut parts.consts,
         k,
         &mut ledger,
-        |_, _| Ok(()),
     )
     .unwrap()
     .expect("the helper is inlined");
@@ -786,7 +941,6 @@ fn an_inlined_body_of_erased_functions_is_not_copied_to_erase_it() {
         &mut parts.consts,
         k,
         &mut ledger,
-        |_, _| Ok(()),
     )
     .unwrap()
     .expect("the helper is inlined");
@@ -930,33 +1084,66 @@ fn the_inline_cap_is_hit_before_the_body_is_built() {
     assert!(meter.ledger_peak() < 64 * 1024, "{}", meter.ledger_peak());
 }
 
-#[test]
-fn a_byval_callee_is_refused_typed() {
+/// A kernel `k` passing `helper` a pointer `byval(i32)`: an `alloca` where `space` is thread
+/// memory, else a null pointer into `space`.
+fn byval_module(space: AddrSpace) -> (Module, AirAbi) {
     let mut m = ModuleBuilder::new();
     let void = m.void();
     let i32t = m.int(32);
-    let thread = m.ptr(AddrSpace::Thread);
-    let hty = m.fn_ty(void, &[thread]);
+    let ptr = m.ptr(space);
+    let hty = m.fn_ty(void, &[ptr]);
     let mut h = m.define("helper", hty);
     h.ret(None);
     let helper = h.finish();
     m.func_mut(helper).unwrap().params[0].attrs.byval = Some(i32t);
     let fty = m.fn_ty(void, &[]);
     let one = m.const_int(i32t, 1);
+    let null = Value::Const(m.constant(ptr, Const::Null));
     let mut f = m.define("k", fty);
-    let slot = f.push(
-        thread,
-        InstKind::Alloca {
-            ty: i32t,
-            count: one,
-            align: None,
-        },
-    );
-    call(&mut f, void, Callee::Direct(helper), &[slot]);
+    let arg = if space == AddrSpace::Thread {
+        f.push(
+            ptr,
+            InstKind::Alloca {
+                ty: i32t,
+                count: one,
+                align: None,
+            },
+        )
+    } else {
+        null
+    };
+    call(&mut f, void, Callee::Direct(helper), &[arg]);
     f.ret(None);
     let k = f.finish();
     let module = m.finish().unwrap();
-    let abi = abi(vec![kernel(k, Vec::new())], Vec::new());
+    (module, abi(vec![kernel(k, Vec::new())], Vec::new()))
+}
+
+/// A callee's `byval` parameter is its own copy of the argument's bytes: the call makes it (an
+/// `alloca` and an `llvm.memcpy`, `byval::explicit`) and the inliner then takes the call.
+#[test]
+fn a_byval_argument_is_copied_at_its_call_and_inlined() {
+    let (module, abi) = byval_module(AddrSpace::Thread);
+    let e = specialize(module, &abi, &request(&[]), &mut meter()).expect("inlined");
+    let body = e
+        .module
+        .func(e.func)
+        .and_then(|f| f.body.as_ref())
+        .expect("the entry's body");
+    assert!(
+        !body
+            .insts
+            .values()
+            .any(|i| matches!(&i.kind, InstKind::Call(c) if matches!(c.callee, Callee::Direct(_)))),
+        "{}",
+        print(&e.module)
+    );
+}
+
+/// A `byval` argument outside thread memory gets no copy, and the call stays refused, typed.
+#[test]
+fn a_byval_argument_outside_thread_memory_is_refused_typed() {
+    let (module, abi) = byval_module(AddrSpace::Device);
     let Error::Unsupported(u) = specialize(module, &abi, &request(&[]), &mut meter()).unwrap_err()
     else {
         panic!();
@@ -966,7 +1153,7 @@ fn a_byval_callee_is_refused_typed() {
     assert_eq!(u.symbol, Some(DiagName::new("helper")));
     assert_eq!(
         u.location,
-        Some(Location::function(DiagName::new("k"), Some(0), Some(1)))
+        Some(Location::function(DiagName::new("k"), Some(0), Some(0)))
     );
 }
 
@@ -1239,7 +1426,7 @@ fn static_values_resolve_abi_globals_without_canonicalizing_a_body() {
         &mut meter(),
     );
     assert_eq!(off.unwrap(), [Ok(0)]);
-    // The predicate of an unsupplied constant is 0; the constant itself needs input.
+    // The predicate of an unsupplied constant is 0, and so is the constant itself.
     let unsupplied = static_values(
         module.clone(),
         &abi,
@@ -1247,15 +1434,7 @@ fn static_values_resolve_abi_globals_without_canonicalizing_a_body() {
         &[pred, flag],
         &mut meter(),
     );
-    assert_eq!(
-        unsupplied.unwrap(),
-        [
-            Ok(0),
-            Err(Error::NeedsInput(MissingInput::FunctionConstant {
-                index: 0
-            }))
-        ]
-    );
+    assert_eq!(unsupplied.unwrap(), [Ok(0), Ok(0)]);
     // Without globals only the constants are checked; nothing is evaluated.
     assert_eq!(
         static_values(
@@ -1393,13 +1572,14 @@ fn an_unevaluated_float_operation_leaves_only_the_globals_it_reaches_unknown() {
 #[test]
 fn an_unsupplied_constant_normalizes_to_a_false_predicate() {
     // The predicate of an undefined constant is 0, so the gated parameter is absent; the kernel's
-    // value use of the copy still needs the constant.
+    // branch on the copy, undefined too, takes its false way.
     let (module, flag_abi) = copied_flag();
-    let err = specialize(module, &flag_abi, &request(&[]), &mut meter()).unwrap_err();
-    assert_eq!(
-        err,
-        Error::NeedsInput(MissingInput::FunctionConstant { index: 0 })
-    );
+    let e = specialize(module, &flag_abi, &request(&[]), &mut meter()).unwrap();
+    assert_eq!(e.ep.params.len(), 1, "the gated parameter is absent");
+    let text = body_text(&e);
+    assert!(!text.contains("store i32 7"), "{text}");
+    // The branch was decided on the undefined copy; the gate reads no value.
+    assert_eq!(e.undefined_reads, [0]);
 
     let mut m = ModuleBuilder::new();
     let void = m.void();
@@ -1679,7 +1859,17 @@ fn a_deeply_nested_written_global_is_rebuilt_on_a_small_stack() {
         static_init(&mut m, "init", |f| store(f, five, gaddr));
         let fty = m.fn_ty(void, &[dev]);
         let mut f = m.define("k", fty);
-        let v = load(&mut f, i32t, gaddr);
+        // A volatile read keeps the global: SCCP reads a plain one as the initializer's leaf.
+        let v = f.push(
+            i32t,
+            InstKind::Load {
+                ptr: gaddr,
+                align: Align::from_bytes(4),
+                volatile: true,
+                atomic: None,
+                range: None,
+            },
+        );
         store(&mut f, v, arg(0));
         f.ret(None);
         let k = f.finish();
@@ -2108,13 +2298,10 @@ fn a_static_initializer_copies_a_float_or_vector_constant_through_an_integer() {
     let bytes = [0x34, 0x12, 0xcd, 0xab];
     let e = punned_copy(short2, 32, Some((DataType::Short2, &bytes))).unwrap();
     assert_eq!(stored_lanes(&e), [0x1234, 0xabcd]);
-    // Unsupplied, the copy is undefined as before: the global is derived from the constant.
-    let err = punned_copy(float, 32, None).unwrap_err();
-    assert_eq!(
-        err,
-        Error::NeedsInput(MissingInput::FunctionConstant { index: 0 }),
-        "{err:?}"
-    );
+    // Unsupplied, the copy is undefined: the global is derived from the constant, and the kernel
+    // stores its zero.
+    let e = punned_copy(float, 32, None).unwrap();
+    assert_eq!(stored_lanes(&e), [0]);
     // Through an integer narrower than the constant, a copy covers the global's float only in
     // part, and the rest of an `undef` float has no bytes to keep.
     let err = punned_copy(float, 16, Some((DataType::Float, &1f32.to_le_bytes()))).unwrap_err();
@@ -2383,11 +2570,9 @@ fn a_pointer_loaded_from_a_constant_globals_field_is_the_fields_constant() {
     // A field of any other type is left to the memory plan: its load stays.
     let text = body_text(&picked_field(Some(1), 1).unwrap());
     assert!(text.contains("getelementptr"), "{text}");
-    // Unsupplied, the select stays undecided, as before.
-    assert_eq!(
-        picked_field(None, 0).unwrap_err(),
-        Error::NeedsInput(MissingInput::FunctionConstant { index: 0 })
-    );
+    // Unsupplied, the select on the undefined constant takes its false arm, as with it false.
+    let text = body_text(&picked_field(None, 0).unwrap());
+    assert!(text.contains("222") && !text.contains("111"), "{text}");
 }
 
 #[test]
@@ -2444,8 +2629,10 @@ fn an_unevaluable_static_initializer_is_refused_typed() {
     assert_eq!(u.feature, Feature::Recursion);
 }
 
+/// A static initializer's branch on an unsupplied constant takes its false way: the store it
+/// guards does not run.
 #[test]
-fn a_static_initializer_branch_on_an_unsupplied_constant_needs_input() {
+fn a_static_initializer_branch_on_an_unsupplied_constant_takes_its_false_way() {
     let mut m = ModuleBuilder::new();
     let void = m.void();
     let i1 = m.int(1);
@@ -2478,16 +2665,99 @@ fn a_static_initializer_branch_on_an_unsupplied_constant_needs_input() {
     let k = f.finish();
     let module = m.finish().unwrap();
     let abi = abi(vec![kernel(k, Vec::new())], vec![fc_decl(3, flag, i8t)]);
-    assert_eq!(
-        specialize(module.clone(), &abi, &request(&[]), &mut meter()).unwrap_err(),
-        Error::NeedsInput(MissingInput::FunctionConstant { index: 3 })
+    specialize(module.clone(), &abi, &request(&[]), &mut meter()).unwrap();
+    let unsupplied = static_values(module.clone(), &abi, &BTreeMap::new(), &[g], &mut meter());
+    assert_eq!(unsupplied.unwrap(), [Ok(0)]);
+    let on = static_values(
+        module.clone(),
+        &abi,
+        &[(3, boolean(1))].into(),
+        &[g],
+        &mut meter(),
     );
+    assert_eq!(on.unwrap(), [Ok(1)]);
     let r = SpecRequest {
         call_stack_depth: 1,
+        open_cl_mode: false,
         entry: "k".into(),
         constants: [(3, boolean(1))].into_iter().collect(),
     };
     specialize(module, &abi, &r, &mut meter()).unwrap();
+}
+
+/// The static initializer derives `has = generic || (layout == 0 && count != 0)` from three
+/// `uchar` constants (indices 0, 1 and 2), and the kernel stores `has` to its buffer.
+fn derived_or() -> (Module, AirAbi, GlobalId) {
+    let mut m = ModuleBuilder::new();
+    let void = m.void();
+    let i1 = m.int(1);
+    let i8t = m.int(8);
+    let dev = m.ptr(AddrSpace::Device);
+    let fcs = ["generic", "layout", "count"].map(|n| fc_global(&mut m, n, i8t));
+    let zero = m.constant(i8t, Const::Int(0));
+    let has = m.simple_global("has", i8t, AddrSpace::Constant, Some(zero));
+    let addrs = fcs.map(|g| m.global_addr(g));
+    let has_addr = m.global_addr(has);
+    static_init(&mut m, "init", |f| {
+        let [generic, layout, count] = addrs.map(|a| load(f, i8t, a));
+        let z = Value::Const(zero);
+        let cmp =
+            |f: &mut FunctionBuilder<'_>, pred, a| f.push(i1, InstKind::ICmp { pred, a, b: z });
+        let flat = cmp(f, IntPredicate::Eq, layout);
+        let counted = cmp(f, IntPredicate::Ne, count);
+        let both = f.bin(BinOp::And, flat, counted);
+        let g = f.push(
+            i1,
+            InstKind::Cast {
+                op: CastOp::Trunc,
+                v: generic,
+            },
+        );
+        let either = f.bin(BinOp::Or, g, both);
+        let w = f.push(
+            i8t,
+            InstKind::Cast {
+                op: CastOp::ZExt,
+                v: either,
+            },
+        );
+        store(f, w, has_addr);
+    });
+    let fty = m.fn_ty(void, &[dev]);
+    let mut f = m.define("k", fty);
+    let v = load(&mut f, i8t, has_addr);
+    store(&mut f, v, arg(0));
+    f.ret(None);
+    let k = f.finish();
+    let module = m.finish().unwrap();
+    let decls = (0..3).map(|i| fc_decl(i, fcs[i as usize], i8t)).collect();
+    let abi = abi(vec![kernel(k, vec![buffer(0, 0)])], decls);
+    (module, abi, has)
+}
+
+/// A supplied `generic` decides `generic || ...` over the unsupplied `count`; unset, the `or` is
+/// undefined, and its global reads zero.
+#[test]
+fn a_supplied_operand_decides_an_or_over_an_unsupplied_one() {
+    let (module, abi, has) = derived_or();
+    for generic in [1, 0] {
+        let supplied = [(0, boolean(generic)), (1, boolean(0))];
+        let got = static_values(
+            module.clone(),
+            &abi,
+            &supplied.clone().into(),
+            &[has],
+            &mut meter(),
+        );
+        assert_eq!(got.unwrap(), [Ok(u64::from(generic))]);
+        let e = specialize(module.clone(), &abi, &request(&supplied), &mut meter()).unwrap();
+        let (want, reads) = match generic {
+            1 => ("store i8 1, %a0", vec![]),
+            _ => ("store i8 zeroinitializer, %a0", vec![2]),
+        };
+        assert!(body_text(&e).contains(want), "{}", body_text(&e));
+        assert_eq!(e.undefined_reads, reads);
+    }
 }
 
 /// A PHI in a live block keeps no entry, and no value, from a block SCCP deleted, even when the
@@ -2802,26 +3072,19 @@ fn switch_on_derived(call_first: bool) -> (Module, AirAbi) {
 }
 
 #[test]
-fn an_entry_block_refusal_comes_before_the_inlined_body() {
-    let run = |call_first| {
+fn a_switch_on_an_undefined_derived_value_takes_its_default() {
+    // Unsupplied, `@unroll` is undefined: the switch takes its default way (no case is 0), and
+    // neither case's calls are kept, whether or not a call comes first.
+    for call_first in [false, true] {
         let (module, abi) = switch_on_derived(call_first);
-        let mut meter = meter();
-        let err = specialize(module, &abi, &request(&[]), &mut meter).unwrap_err();
-        (err, meter.work(), meter.ledger_peak())
-    };
-    let needs = Error::NeedsInput(MissingInput::FunctionConstant { index: 3 });
-    let inlined = (WIDE * CALLS) as u64;
-    // The entry block's switch on the derived global is refused before anything proportional to
-    // the inlined body is built or visited.
-    let (early, work, peak) = run(false);
-    assert_eq!(early, needs);
-    assert!(work < inlined / 8, "{work} work units");
-    // Behind a call, SCCP over the inlined body refuses the same switch, with the same error,
-    // after the work the early refusal does not do.
-    let (late, late_work, late_peak) = run(true);
-    assert_eq!(late, needs);
-    assert!(late_work > inlined, "{late_work} work units");
-    assert!(peak * 8 < late_peak, "ledger peaks {peak} and {late_peak}");
+        let e = specialize(module, &abi, &request(&[]), &mut meter()).unwrap();
+        let stores = body_text(&e).matches("store i32 1, %a0").count();
+        assert_eq!(
+            stores,
+            if call_first { WIDE } else { 0 },
+            "call_first {call_first}"
+        );
+    }
     // Supplied, the switch folds and the taken case is inlined.
     let (module, abi) = switch_on_derived(false);
     let e = specialize(module, &abi, &request(&[(3, int(2))]), &mut meter()).unwrap();
@@ -2860,14 +3123,14 @@ fn entry_block(
 }
 
 #[test]
-fn the_entry_block_refusal_defers_what_it_does_not_decide() {
-    let needs = Error::NeedsInput(MissingInput::FunctionConstant { index: 3 });
-    // A certain refusal: a store of the undefined value.
-    let err = entry_block(|m| wide_helper(m, 1), |f, v, _| store(f, v, arg(0))).unwrap_err();
-    assert_eq!(err, needs);
+fn an_undefined_value_in_an_inlined_entry_is_zero_and_other_refusals_stand() {
+    // A store of the undefined value stores zero.
+    let e = entry_block(|m| wide_helper(m, 1), |f, v, _| store(f, v, arg(0))).unwrap();
+    let text = body_text(&e);
+    assert!(text.contains("store i32 zeroinitializer, %a0"), "{text}");
 
-    // The inliner's own refusals come first: a call cycle through the entry (the kernel `k`,
-    // defined next).
+    // The inliner's refusals stand: a call cycle through the entry (the kernel `k`, defined
+    // next).
     let recursive = |m: &mut ModuleBuilder| {
         let void = m.void();
         let dev = m.ptr(AddrSpace::Device);
@@ -2889,7 +3152,7 @@ fn the_entry_block_refusal_defers_what_it_does_not_decide() {
     };
     assert_eq!(u.feature, Feature::Recursion);
 
-    // An earlier `BadValue` in the block is SCCP's first refusal.
+    // So does SCCP's: a `BadValue` in the block.
     let err = entry_block(
         |m| wide_helper(m, 1),
         |f, v, _| {
@@ -3682,7 +3945,7 @@ fn absent_threadgroup_memory_used_another_way_is_refused() {
 }
 
 /// What sits between an absent texture and the store of its sample in [`absent_sample`].
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SampleUse {
     /// The sample's color is stored.
     Stored,
@@ -3690,8 +3953,12 @@ enum SampleUse {
     Dropped,
     /// The texture is also compared with null, a use that is no texture call.
     Compared,
-    /// The texture is stored into a stack slot and sampled as loaded back from it.
+    /// The texture is stored twice into a stack slot, so no one store decides what the slot holds,
+    /// and sampled as loaded back from it.
     Parked,
+    /// The texture is stored once into a stack slot and sampled as loaded back from it, which
+    /// thread-memory forwarding reads as the texture itself.
+    ParkedOnce,
 }
 
 /// `kernel k(texture2d tex, sampler smp, device float4* out)` sampling `tex` through `smp` and
@@ -3721,7 +3988,7 @@ fn absent_sample(gone: u32, how: SampleUse) -> Result<Entry, Error> {
     let one = m.const_int(i32t, 1);
     let mut f = m.define("k", fty);
     let tex = match how {
-        SampleUse::Parked => {
+        SampleUse::Parked | SampleUse::ParkedOnce => {
             let slot = f.push(
                 thread,
                 InstKind::Alloca {
@@ -3731,6 +3998,9 @@ fn absent_sample(gone: u32, how: SampleUse) -> Result<Entry, Error> {
                 },
             );
             store(&mut f, arg(0), slot);
+            if how == SampleUse::Parked {
+                store(&mut f, arg(0), slot);
+            }
             load(&mut f, dev, slot)
         }
         SampleUse::Stored | SampleUse::Dropped | SampleUse::Compared => arg(0),
@@ -3742,7 +4012,7 @@ fn absent_sample(gone: u32, how: SampleUse) -> Result<Entry, Error> {
         &[tex, arg(1), half, yes, zero2, yes, zf, zf, z],
     );
     match how {
-        SampleUse::Stored | SampleUse::Parked => {
+        SampleUse::Stored | SampleUse::Parked | SampleUse::ParkedOnce => {
             let color = f.push(
                 v4f,
                 InstKind::ExtractValue {
@@ -3873,9 +4143,13 @@ fn an_absent_texture_read_beyond_texture_calls_stays_for_lowering() {
         assert!(text.contains("air.sample_texture_2d"), "{text}");
         assert!(text.contains("%a0"), "{text}");
     }
-    // Read only by its call, it is rewritten as before and not listed.
-    let e = absent_sample(0, SampleUse::Stored).unwrap();
-    assert!(e.absent_handles.is_empty());
+    // Read only by its call, it is rewritten as before and not listed; so is one a stack slot held
+    // that one store wrote, read as the texture itself.
+    for how in [SampleUse::Stored, SampleUse::ParkedOnce] {
+        let e = absent_sample(0, how).unwrap();
+        assert!(e.absent_handles.is_empty(), "{how:?}");
+        assert_eq!(absent_read_ops(&e).len(), 1, "{how:?}");
+    }
 }
 
 /// An output gated off leaves the entry point; the outputs that stay name their field of the
@@ -4308,6 +4582,210 @@ fn argument_table_slots_past_metal_s_tables_are_invalid_input() {
         AddrSpace::Thread,
         0
     )));
+}
+
+/// The specialization of a kernel `k(p0, p1)` of address spaces `spaces` whose parameters have
+/// roles `first` and `second`, each given the global of function constant 0 (`n`, supplied as
+/// `n`); `gated` puts parameter 0 behind a predicate that is false.
+fn pair_spec(
+    first: impl FnOnce(GlobalId) -> ParamRole,
+    second: impl FnOnce(GlobalId) -> ParamRole,
+    spaces: [AddrSpace; 2],
+    n: u32,
+    gated: bool,
+) -> Result<(), Error> {
+    let mut m = ModuleBuilder::new();
+    let void = m.void();
+    let i8t = m.int(8);
+    let i32t = m.int(32);
+    let off = m.constant(i8t, Const::Int(0));
+    let p_off = m.simple_global("p_off", i8t, AddrSpace::Constant, Some(off));
+    let at = fc_global(&mut m, "n", i32t);
+    let (p0, p1) = (m.ptr(spaces[0]), m.ptr(spaces[1]));
+    let fty = m.fn_ty(void, &[p0, p1]);
+    let mut f = m.define("k", fty);
+    f.ret(None);
+    let k = f.finish();
+    let module = m.finish().unwrap();
+    let (mut a, mut b) = (buffer(0, 0), buffer(1, 0));
+    a.role = first(at);
+    b.role = second(at);
+    if gated {
+        a.predicate = Some(Predicate {
+            global: p_off,
+            name: DiagName::new("p"),
+        });
+    }
+    let abi = abi(vec![kernel(k, vec![a, b])], vec![fc_decl(0, at, i32t)]);
+    specialize(module, &abi, &request(&[(0, int(n))]), &mut meter()).map(|_| ())
+}
+
+/// Two parameters that remain in one argument table at overlapping slots, one slot a function
+/// constant sets, are an invalid request naming the later parameter, its index and its count, as
+/// Metal refuses the function when it makes it ("argument has invalid location (<index,count>)",
+/// measured on an M3 Max for each case here): two buffers, a buffer and a threadgroup memory
+/// argument apart, two textures, a texture and a texture array, two samplers, two threadgroup
+/// memory arguments, and an acceleration structure and an intersection function table (both bind
+/// at buffer indices). Slots apart, arguments of two tables at one index, a count of 0, and a
+/// parameter gated off overlap nothing.
+#[test]
+fn arguments_at_overlapping_slots_of_one_table_are_an_invalid_request() {
+    use crate::abi::{AccelerationStructureKind, ObjectArg, TextureArg};
+    use crate::error::RequestError;
+    let fixed = |index: u32, count: u32| Slot {
+        index: AbiInt::Const(index),
+        count: AbiInt::Const(count),
+    };
+    let set = |g: GlobalId, count: u32| Slot {
+        index: AbiInt::Global(g),
+        count: AbiInt::Const(count),
+    };
+    let buf = |location: Slot, space: AddrSpace| match buffer(0, 0).role {
+        ParamRole::Buffer(b) => ParamRole::Buffer(BufferArg {
+            location,
+            space,
+            ..b
+        }),
+        other => other,
+    };
+    let tg = |location: Slot| match buffer(0, 0).role {
+        ParamRole::Buffer(b) => ParamRole::Threadgroup(BufferArg {
+            location,
+            space: AddrSpace::Threadgroup,
+            ..b
+        }),
+        other => other,
+    };
+    let tex = |location: Slot, access: Access| {
+        ParamRole::Texture(TextureArg {
+            location,
+            access,
+            raster_order_group: None,
+        })
+    };
+    let refused = |r: Result<(), Error>, index: u32, count: u32| {
+        r == Err(Error::InvalidRequest(RequestError::OverlappingArgument {
+            param: 1,
+            index,
+            count,
+        }))
+    };
+    let (dev, cst, thr) = (AddrSpace::Device, AddrSpace::Constant, AddrSpace::Thread);
+    let tgs = AddrSpace::Threadgroup;
+    // Two buffers: buffer(0) and buffer(n).
+    let buffers = |n: u32| {
+        pair_spec(
+            |_| buf(fixed(0, 1), dev),
+            |g| buf(set(g, 1), cst),
+            [dev, cst],
+            n,
+            false,
+        )
+    };
+    assert!(refused(buffers(0), 0, 1));
+    assert_eq!(buffers(1), Ok(()));
+    // A buffer and threadgroup memory at one index: two tables.
+    assert_eq!(
+        pair_spec(
+            |_| buf(fixed(0, 1), dev),
+            |g| tg(set(g, 1)),
+            [dev, tgs],
+            0,
+            false
+        ),
+        Ok(())
+    );
+    // Two threadgroup memory arguments.
+    let tgmem = |n: u32| pair_spec(|_| tg(fixed(0, 1)), |g| tg(set(g, 1)), [tgs, tgs], n, false);
+    assert!(refused(tgmem(0), 0, 1));
+    assert_eq!(tgmem(1), Ok(()));
+    // A write texture at texture(0) and a sampled one at texture(n).
+    let textures = |n: u32| {
+        pair_spec(
+            |_| tex(fixed(0, 1), Access::Write),
+            |g| tex(set(g, 1), Access::Sample),
+            [dev, dev],
+            n,
+            false,
+        )
+    };
+    assert!(refused(textures(0), 0, 1));
+    assert_eq!(textures(1), Ok(()));
+    // A texture at texture(n) and an array of two at texture(1): the array is the later.
+    let arrays = |n: u32| {
+        pair_spec(
+            |g| tex(set(g, 1), Access::Write),
+            |_| tex(fixed(1, 2), Access::Sample),
+            [dev, thr],
+            n,
+            false,
+        )
+    };
+    assert_eq!(arrays(0), Ok(()));
+    assert!(refused(arrays(1), 1, 2));
+    assert!(refused(arrays(2), 1, 2));
+    assert_eq!(arrays(3), Ok(()));
+    // Two samplers.
+    let samplers = |n: u32| {
+        pair_spec(
+            |_| ParamRole::Sampler {
+                location: fixed(0, 1),
+            },
+            |g| ParamRole::Sampler {
+                location: set(g, 1),
+            },
+            [cst, cst],
+            n,
+            false,
+        )
+    };
+    assert!(refused(samplers(0), 0, 1));
+    assert_eq!(samplers(1), Ok(()));
+    // An acceleration structure at buffer(1) and an intersection function table at buffer(n).
+    let objects = |n: u32| {
+        pair_spec(
+            |_| ParamRole::AccelerationStructure {
+                kind: AccelerationStructureKind::Primitive,
+                arg: ObjectArg {
+                    location: fixed(1, 1),
+                    access: None,
+                },
+            },
+            |g| {
+                ParamRole::IntersectionTable(ObjectArg {
+                    location: set(g, 1),
+                    access: None,
+                })
+            },
+            [dev, dev],
+            n,
+            false,
+        )
+    };
+    assert!(refused(objects(1), 1, 1));
+    assert_eq!(objects(2), Ok(()));
+    // A buffer table of count 0 binds no slot.
+    assert_eq!(
+        pair_spec(
+            |_| buf(fixed(0, 0), thr),
+            |g| buf(set(g, 1), dev),
+            [thr, dev],
+            0,
+            false
+        ),
+        Ok(())
+    );
+    // A texture gated off at texture(0) binds no slot.
+    assert_eq!(
+        pair_spec(
+            |_| tex(fixed(0, 1), Access::Write),
+            |g| tex(set(g, 1), Access::Sample),
+            [dev, dev],
+            0,
+            true
+        ),
+        Ok(())
+    );
 }
 
 /// A site of the `matmul2d` lowering calls a `matmul2d` ABI declaration or a tensor intrinsic, so

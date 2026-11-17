@@ -1,6 +1,7 @@
 //! `BindState::has_shape` answers `state.shape() == *shape` without making the shape: over states
 //! that each differ from a base in one field of the shape (and some in fields the shape leaves
-//! out, or in two ways that give one shape), for every pair of them.
+//! out, or in two ways that give one shape), for every pair of them. `BoundBuffer::same_shape`
+//! answers as two bindings' shapes compare, over every pair of a set of bindings.
 
 use crate::bind::{
     ArgumentFunctionTable, ArgumentSampler, BindState, BoundBuffer, BoundSampler, BoundTexture,
@@ -279,6 +280,30 @@ fn a_state_has_exactly_the_shape_it_makes() {
     assert_eq!(same, 9 * 8 + 2, "pairs of one shape");
 }
 
+/// A state's shape key is its shape's, and the key of every shape it has beside its used
+/// resources: a consumer that compares whole only the shapes of its key finds every one it would
+/// find comparing all. The fixture's states of other shapes beside their used resources have other
+/// keys too, so the key spares their comparisons.
+#[test]
+fn a_state_s_shape_key_is_the_key_of_every_shape_it_has() {
+    let states = states();
+    let shapes: Vec<_> = states.iter().map(BindState::shape).collect();
+    let mut apart = 0;
+    for (at, state) in states.iter().enumerate() {
+        let key = state.shape_key_beside_used();
+        assert_eq!(key, shapes[at].key_beside_used(), "state {at}: {state:?}");
+        for (of, shape) in shapes.iter().enumerate() {
+            if state.has_shape_beside_used(shape) {
+                assert_eq!(key, shape.key_beside_used(), "state {at}, shape {of}");
+            } else {
+                assert_ne!(key, shape.key_beside_used(), "state {at}, shape {of}");
+                apart += 1;
+            }
+        }
+    }
+    assert!(apart > 0, "no state of another shape in the fixture");
+}
+
 /// A buffer's bind offset cycling through the multiples of 16 up to 256 at a view base alignment
 /// of 64 keeps one shape where its slot tells no alignment past 4 apart (vertex data, or a view
 /// a runtime left out), and takes two where the slot tells it apart (a uniform view: 64 divides
@@ -354,4 +379,133 @@ fn a_state_s_shape_is_found_among_many_with_its_used_resources_made_once() {
     other.render_target_array_length = 2;
     let (found, made) = allocations_during(|| other.position_of_shape(&shapes));
     assert_eq!((found, made), (None, 0), "a state of another field");
+}
+
+/// A state that lists its used resources in token order (`BindState::used_in_token_order`)
+/// compares them with a shape's in place, making nothing: over listings that differ in a token, a
+/// usage, a stage, a class, a token listed twice (whose entries union, the first's class kept) or
+/// one listed more or less, each answers as the same listing in no order does, against the shape
+/// of every other, and is found among them all without allocating.
+#[test]
+fn a_state_listed_in_token_order_compares_its_used_resources_in_place() {
+    use super::constant_blob_footprint::allocations_during;
+    let entry = |class, token, usage, stages| {
+        let mut used = UsedResource::new(class, token);
+        used.usage = usage;
+        used.stages = stages;
+        used
+    };
+    let buffer = ResourceClass::Buffer;
+    let read = |token| entry(buffer, token, ResourceUsage::READ, RenderStages::FRAGMENT);
+    let listing = |change: &dyn Fn(&mut Vec<UsedResource>)| {
+        let mut state = base();
+        state.used_resources = (0..16).map(read).collect();
+        change(&mut state.used_resources);
+        state
+    };
+    let facts = |format| ResourceClass::Texture(TextureFacts::new(TextureType::Type2D, format));
+    let unorm = facts(PixelFormat::RGBA8Unorm);
+    let states = [
+        listing(&|_| {}),
+        listing(&|used| used[15].token = 40),
+        listing(&|used| used[5].usage = ResourceUsage::WRITE),
+        listing(&|used| used[5].stages = RenderStages::VERTEX),
+        listing(&|used| used[7].class = unorm),
+        listing(&|used| used[7].class = facts(PixelFormat::R32Float)),
+        listing(&|used| used.insert(8, read(8))),
+        listing(&|used| {
+            used.insert(
+                9,
+                entry(buffer, 8, ResourceUsage::WRITE, RenderStages::VERTEX),
+            )
+        }),
+        listing(&|used| {
+            used.insert(
+                9,
+                entry(unorm, 8, ResourceUsage::WRITE, RenderStages::VERTEX),
+            )
+        }),
+        listing(&|used| {
+            used[8].usage = ResourceUsage::READ | ResourceUsage::WRITE;
+            used[8].stages = RenderStages::VERTEX | RenderStages::FRAGMENT;
+        }),
+        listing(&|used| {
+            used.remove(10);
+        }),
+        listing(&|used| used.push(read(16))),
+        listing(&|used| used.truncate(1)),
+    ];
+    let shapes: Vec<_> = states.iter().map(BindState::shape).collect();
+    let mut same = 0;
+    for (at, state) in states.iter().enumerate() {
+        let mut ordered = state.clone();
+        ordered.used_in_token_order = true;
+        for (of, shape) in shapes.iter().enumerate() {
+            let equal = shapes[at] == *shape;
+            same += usize::from(equal && at != of);
+            let (has, made) = allocations_during(|| ordered.has_shape(shape));
+            assert_eq!(has, equal, "state {at} in token order, shape {of}");
+            assert_eq!(
+                has,
+                state.has_shape(shape),
+                "state {at} in no order, shape {of}"
+            );
+            assert_eq!(made, 0, "state {at} in token order, shape {of}: made");
+        }
+        let (found, made) = allocations_during(|| ordered.position_of_shape(&shapes));
+        assert_eq!(found, state.position_of_shape(&shapes), "state {at}: found");
+        assert_eq!(made, 0, "state {at}: found among them all, made");
+    }
+    // A token listed twice with the same usage and stages is the listing's shape (one pair); one
+    // listed again with a vertex write, as a buffer or as a texture, is the one listed once that
+    // reads and writes it in both stages (three of one shape).
+    assert_eq!(same, 2 + 3 * 2, "pairs of one shape");
+}
+
+/// `BoundBuffer::same_shape` answers `a.shape(x) == b.shape(x)` for every pair of bindings over
+/// lengths of one length class and of others, bind offsets of one alignment class and of others,
+/// with and without a device address and a stride, and inline bytes, at view base alignments that
+/// tell no offset class past the vertex fetch's apart and one that does.
+#[test]
+fn a_buffer_binding_has_the_shape_of_another_exactly_where_their_shapes_compare_equal() {
+    let mut bindings = Vec::new();
+    for length in [1, 16, 17, 4096, u64::MAX] {
+        for offset in [0, 2, 4, 6, 64, 96] {
+            for device_address in [None, Some(0x2000)] {
+                for attribute_stride in [None, Some(4), Some(6)] {
+                    bindings.push(BoundBuffer::Buffer {
+                        length,
+                        offset,
+                        gpu_address: 0x1000,
+                        device_address,
+                        attribute_stride,
+                    });
+                }
+            }
+        }
+    }
+    for len in [4, 8] {
+        for attribute_stride in [None, Some(4)] {
+            bindings.push(BoundBuffer::Bytes {
+                len,
+                attribute_stride,
+            });
+        }
+    }
+    let (mut alike, mut apart) = (0, 0);
+    for alignment in [0, 4, 64] {
+        for (at, binding) in bindings.iter().enumerate() {
+            for (of, other) in bindings.iter().enumerate() {
+                let equal = binding.shape(alignment) == other.shape(alignment);
+                assert_eq!(
+                    binding.same_shape(other, alignment),
+                    equal,
+                    "binding {at} against binding {of} at alignment {alignment}"
+                );
+                alike += usize::from(equal && at != of);
+                apart += usize::from(!equal);
+            }
+        }
+    }
+    assert!(alike > 0 && apart > 0, "{alike} pairs alike, {apart} apart");
 }

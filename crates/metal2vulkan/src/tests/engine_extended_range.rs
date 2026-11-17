@@ -46,6 +46,7 @@ use crate::spirv::interp::{run_with_images, Buffer, Config, Image, Order, Resour
 use crate::spirv::ir::TypedModule;
 
 mod bicubic;
+mod blended_pipelines;
 mod heap;
 mod levels;
 mod planes_volumes;
@@ -648,9 +649,10 @@ fn argb8_storage_slots_rotate_their_bytes() {
 /// NaN is Metal's `0x7e00` where it takes `DriverDeviation::MetalHalfStorageNans` (MoltenVK's: the
 /// module requires its property), else the device's (`PrecisionNote::DeviceNanEncoding`); a
 /// formatless slot's notes hold under the format bound there (`tests::engine_half_storage_notes`).
-/// A formatless slot may also reach a packed small float image, whose NaN is the device's on every
-/// profile (noted too), or a normalized one, whose conversion is the device's on every profile
-/// (noted too). The held lanes cover every tie between neighbouring halves and its
+/// A formatless slot may also reach a packed small float image, whose NaN is the device's (noted
+/// too) but where the profile takes `DriverDeviation::MetalSmallFloatNans` (the module requires
+/// its property), or a normalized one, whose conversion is the device's on every profile (noted
+/// too). The held lanes cover every tie between neighbouring halves and its
 /// neighbours, past the largest, the infinities and NaNs.
 #[test]
 fn half_float_storage_slots_leave_their_writes_to_the_device() {
@@ -756,9 +758,15 @@ fn half_float_storage_slots_leave_their_writes_to_the_device() {
                 nans,
                 "{what}"
             );
+            let small = p.takes_driver_deviation(DriverDeviation::MetalSmallFloatNans);
+            assert_eq!(
+                relied.contains(&VkProperty::MetalSmallFloatNans),
+                formatless && small,
+                "{what}"
+            );
             assert_eq!(
                 a.precision.contains(&PrecisionNote::DeviceNanEncoding),
-                !nans || formatless,
+                !nans || (formatless && !small),
                 "{what}: {:?}",
                 a.precision
             );
@@ -1089,6 +1097,70 @@ fn ycbcr_write_slots_store_each_texel_s_bits_and_mark() {
             }
             Err(other) => panic!("{stem}: {other}"),
             Ok(_) => panic!("{stem}: a YCbCr write slot that reads is lowered"),
+        }
+    }
+}
+
+/// A `half` read of a slot bound in an extended-range form decodes the texel's codes and rounds
+/// the decoded `f32` through the device's conversion (`narrow::round_texel`). On `moltenvk-m3`,
+/// which takes `DriverDeviation::MetalHalfConversion`, the module records no
+/// `NativeHalfConversion` for it and requires `VkProperty::MetalHalfConversion`; it records
+/// `DevicePackConversion`, which states the decoded `half` against Metal's. Without the deviation
+/// (the same profile with it dropped) it records the note and requires nothing.
+#[test]
+fn decoded_half_texels_round_by_the_measured_conversion() {
+    use crate::device::requirements::VkProperty;
+    use crate::error::DriverDeviation;
+    use crate::pipeline::artifact::PrecisionNote;
+    let Some(bc) = assemble("decoded-halves", &kernel(Source::Read, true, 0)) else {
+        return;
+    };
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../metal2vulkan-validation/profiles/moltenvk-m3.json");
+    let text = std::fs::read_to_string(&path).expect("profile");
+    for form in FORMS {
+        let i = inputs(form, Source::Read);
+        for taken in [true, false] {
+            let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
+            let p = Device::with_deviation(
+                desc,
+                DevicePolicy::default(),
+                DriverDeviation::MetalHalfConversion,
+                taken,
+            )
+            .expect("device")
+            .profile()
+            .clone();
+            let what = format!("{form:?}, the deviation taken: {taken}");
+            let a = compile_bitcode(
+                &bc,
+                EntryRef::Name("k"),
+                &FunctionConstantValues::defaults(),
+                &p,
+                &i,
+                &mut meter(),
+                SPIRV_WORDS,
+            )
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+            link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
+            assert_eq!(
+                a.precision.contains(&PrecisionNote::NativeHalfConversion),
+                !taken,
+                "{what}: {:?}",
+                a.precision
+            );
+            assert!(
+                a.precision.contains(&PrecisionNote::DevicePackConversion),
+                "{what}: {:?}",
+                a.precision
+            );
+            assert_eq!(
+                a.requirements
+                    .properties
+                    .contains(&VkProperty::MetalHalfConversion),
+                taken,
+                "{what}"
+            );
         }
     }
 }

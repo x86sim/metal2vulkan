@@ -42,7 +42,9 @@
 //! - **At the call.** A call the checks do not cover is lowered inside the call, the calls logged
 //!   before it first (`Checked::Now`), and from some calls on every call of the encoder is; so is
 //!   every call of an encoder whose pass the device draws in color groups
-//!   (`render/color_groups.rs`), whose checks follow the groups.
+//!   (`render/color_groups.rs`), whose checks follow the groups, and of one opened on the
+//!   lowering thread itself (by a submission check or handler it runs for a commit that waited,
+//!   `render/queued_commits.rs`), whose hand-offs and waits for room would wait for that thread.
 //! - **Detachment.** A logged call is lowered as one made while no buffer of the device was
 //!   detached (`EncoderCore::judges_unattached`), as it was: none is logged while one is
 //!   (`render/call_checks.rs`). A detach after the call refuses nothing of it, and its command
@@ -66,14 +68,15 @@
 //!   drop gives back for the device's next encoder, its batches' room kept.
 
 use super::call_checks::{CallChecks, Checked};
-use super::lowering_worker::LoweringWorker;
+use super::lowering_worker::{self, LoweringWorker};
 use super::queued_commits::QueuedCommits;
 use super::replay::{render, DrawIndexed};
-use super::{RenderCall, RenderCommandEncoder, RenderLowering};
+use super::{Lowering, RenderCall, RenderCommandEncoder, RenderLowering};
 use crate::command_buffer::{CommandBuffer, WeakCommandBuffer};
 use crate::device::{lock, Device};
 use crate::error::{internal, EncoderCall, Error};
 use crate::exit_guard;
+use crate::live_bind::LiveBind;
 use crate::replay::CallLog;
 use metal2vulkan::device::RenderLoweringPolicy;
 use std::collections::VecDeque;
@@ -139,6 +142,7 @@ impl Batch {
         if self.calls.calls.is_empty() || *refused {
             return;
         }
+        let _for = lowering.core.notices_for();
         let counts = &lowering.core.device().shared().counts;
         counts.render_log_batch_lowered(by_thread);
         lowering.core.judges_unattached(true);
@@ -197,10 +201,42 @@ const _: () = {
     sent::<Lowerer>();
 };
 
+/// An encoder's own lowering (`RenderLoweringPolicy::AtCall`), with its bind state, each boxed
+/// where it is made ([`RenderLowering::assemble`]).
+pub(super) struct OwnLowering(Lowering);
+
+// SAFETY: an `OwnLowering` is `Send` exactly when `Lowering` is, its one field being one; the
+// constant below makes the compiler prove that. Written out, as `LoweringSlot`'s are, the
+// impl ends a program's crate's walk of an encoder's fields there: the walk from a
+// `RenderCommandEncoder` through its own lowering ran past rustc's default recursion limit
+// (`tests/consumer_auto_traits.rs`).
+unsafe impl Send for OwnLowering {}
+
+// The compiler's proof of what `OwnLowering`'s `Send` impl rests on.
+const _: () = {
+    const fn sent<T: Send>() {}
+    sent::<Lowering>();
+};
+
+impl std::ops::Deref for OwnLowering {
+    type Target = Lowering;
+
+    fn deref(&self) -> &Lowering {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for OwnLowering {
+    fn deref_mut(&mut self) -> &mut Lowering {
+        &mut self.0
+    }
+}
+
 /// A slot's lowering, and whether it refused a call.
 struct Lowerer {
-    /// Its encoder's lowering: `None` once the encoder ended, and in a slot not taken.
-    lowering: Option<Box<RenderLowering>>,
+    /// Its encoder's lowering, with its bind state: `None` once the encoder ended, and in a slot
+    /// not taken.
+    lowering: Option<Lowering>,
     /// A call was refused as it was lowered: no later call is lowered.
     refused: bool,
 }
@@ -230,6 +266,10 @@ struct SlotState {
     /// Batches lowered, their calls still held until the program's thread empties them as it
     /// takes them to fill (the module docs).
     lowered: Vec<Batch>,
+    /// How long the lowering thread waits before its next turn at the slot: a device test's
+    /// thread run late ([`LoweringSlot::turn_late`]).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    late: Option<std::time::Duration>,
 }
 
 /// What the lowering thread takes of a slot: a batch handed, or, once none is, the encoder's end
@@ -324,6 +364,8 @@ impl LoweringSlot {
     /// program's thread drains the slot.
     pub(super) fn lower_handed(&self) {
         loop {
+            #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+            self.wait_late();
             let (turn, ended) = {
                 let Some(_section) = exit_guard::enter() else {
                     // The process exits: the program's thread lowers what is handed.
@@ -496,7 +538,7 @@ pub(crate) struct DeferredEncoders {
 impl DeferredEncoders {
     /// A slot for `lowering`'s encoder, which logs its calls, with its checks at the call: one
     /// kept, its checks' room reused, else a new one.
-    fn take(&self, lowering: Box<RenderLowering>) -> Arc<LoweringSlot> {
+    fn take(&self, lowering: Lowering) -> Arc<LoweringSlot> {
         let mut slots = lock(&self.slots);
         let kept = slots.iter().find(|slot| !lock(&slot.state).taken).cloned();
         let slot = match kept {
@@ -515,6 +557,8 @@ impl DeferredEncoders {
                         panicked: false,
                         ending: None,
                         lowered: Vec::new(),
+                        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+                        late: None,
                     }),
                     lowerer: Mutex::new(Lowerer {
                         lowering: None,
@@ -606,9 +650,29 @@ impl LoweringSlot {
         f()
     }
 
-    /// The batches of the slot handed to the lowering thread and not taken.
-    pub(crate) fn handed(&self) -> usize {
-        lock(&self.state).handed.len()
+    /// The batches of the slot handed to the lowering thread and not taken, and whether that
+    /// thread lowers one of its batches now, read together. While [`while_held`](Self::while_held)
+    /// holds the slot, a thread that lowers one takes no other, so the batches handed can only
+    /// grow, and at [`HANDED_BATCHES`] the program's thread waits for room until the hold goes.
+    pub(crate) fn handed(&self) -> (usize, bool) {
+        let state = lock(&self.state);
+        (state.handed.len(), state.busy)
+    }
+
+    /// The lowering thread waits `by` before its next turn at the slot, as a thread a loaded host
+    /// runs late.
+    pub(crate) fn turn_late(&self, by: std::time::Duration) {
+        lock(&self.state).late = Some(by);
+    }
+
+    /// The lowering thread's wait before its turn at the slot where [`turn_late`](Self::turn_late)
+    /// asked for one: taken under the slot's lock and waited without it, so the program's calls
+    /// go on meanwhile.
+    fn wait_late(&self) {
+        let late = lock(&self.state).late.take();
+        if let Some(late) = late {
+            std::thread::sleep(late);
+        }
     }
 }
 
@@ -649,12 +713,13 @@ impl EndInFlight {
 impl RenderCommandEncoder {
     /// The program's encoder over `lowering`, which lowers its calls as the device's policy says
     /// (the module docs).
-    pub(super) fn new(lowering: Box<RenderLowering>) -> RenderCommandEncoder {
+    pub(super) fn new(lowering: Lowering) -> RenderCommandEncoder {
         let device = lowering.core.device();
         let logs = device.compile_device().policy().render_lowering == RenderLoweringPolicy::Worker
-            && lowering.grouped.is_none();
+            && lowering.grouped.is_none()
+            && !lowering_worker::on_the_thread();
         let (own, logged) = match logs {
-            false => (Some(lowering), None),
+            false => (Some(OwnLowering(lowering)), None),
             true => {
                 let device = device.clone();
                 let command_buffer = lowering.core.command_buffer().downgrade();
@@ -677,6 +742,16 @@ impl RenderCommandEncoder {
         }
     }
 
+    /// Its command buffer: its lowering's, or, where its slot holds the lowering, the command
+    /// buffer the slot was taken for, which lives while the encoder is open.
+    pub(crate) fn command_buffer(&self) -> Option<CommandBuffer> {
+        match (&self.own, &self.logged) {
+            (Some(own), _) => Some(own.0.core.command_buffer().clone()),
+            (None, Some(logged)) => logged.command_buffer.upgrade(),
+            (None, None) => None,
+        }
+    }
+
     /// Whether the encoder lowers each call inside it (the module docs).
     pub(crate) fn lowers_at_call(&self) -> bool {
         self.logged.as_ref().is_none_or(|logged| logged.at_call)
@@ -686,7 +761,7 @@ impl RenderCommandEncoder {
     /// as it began lowering its calls at the call.
     pub(crate) fn at_call<T>(
         &mut self,
-        f: impl FnOnce(&mut RenderLowering) -> Result<T, Error>,
+        f: impl FnOnce(&mut Lowering) -> Result<T, Error>,
     ) -> Result<T, Error> {
         self.next += 1;
         match (&mut self.own, &self.logged) {
@@ -701,15 +776,31 @@ impl RenderCommandEncoder {
         }
     }
 
+    /// Run `f`, a draw, on the lowering now, as [`at_call`](Self::at_call) does, with the bind
+    /// state its draws bring in place beside it (`Lowering::parts`).
+    pub(crate) fn draw_at_call(
+        &mut self,
+        f: impl FnOnce(&mut RenderLowering, &mut LiveBind) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.at_call(|lowering| {
+            let (lowering, live) = lowering.parts();
+            f(lowering, live)
+        })
+    }
+
     /// Run `f`, a call that returns nothing, on the lowering now, as [`at_call`](Self::at_call)
     /// does.
-    pub(crate) fn at_call_unit(&mut self, f: impl FnOnce(&mut RenderLowering)) {
+    pub(crate) fn at_call_unit(&mut self, f: impl FnOnce(&mut Lowering)) {
         self.next += 1;
+        let lowered = |lowering: &mut Lowering| {
+            let _for = lowering.core.notices_for();
+            f(lowering);
+        };
         match (&mut self.own, &self.logged) {
-            (Some(lowering), _) => f(lowering),
+            (Some(lowering), _) => lowered(lowering),
             (None, Some(logged)) => {
                 if let Some(lowering) = lock(&logged.slot.lowerer).lowering.as_mut() {
-                    f(lowering);
+                    lowered(lowering);
                 }
             }
             (None, None) => {}
@@ -845,7 +936,7 @@ impl RenderCommandEncoder {
     /// the end of an encoder that logged its calls name it as `endEncoding`, after its calls.
     pub(super) fn end(self) -> Result<(), Error> {
         let logged = match (self.own, self.logged) {
-            (Some(lowering), _) => return lowering.end_encoding(),
+            (Some(lowering), _) => return lowering.0.end_encoding(),
             (None, Some(logged)) => logged,
             (None, None) => return Err(internal("an encoder without its lowering")),
         };
@@ -938,16 +1029,26 @@ pub(crate) mod lowering {
         LOWERING.with(Cell::get)
     }
 
-    /// Refuse the call being lowered for `notice`, a kind the device refuses while lowering: the
-    /// first such notice of the call is kept.
+    /// Whether a call is being lowered on this thread and a refusal of it can be kept: past the
+    /// thread's thread-locals' end (a program's exit handler, `this_thread.rs`) none can, and a
+    /// notice is announced as anywhere else.
+    pub(crate) fn refusing() -> bool {
+        current().is_some() && REFUSED.try_with(|_| ()).is_ok()
+    }
+
+    /// Refuse the call being lowered for `notice`, a kind the device refuses while lowering, where
+    /// [`refusing`]: the first such notice of the call is kept.
     pub(crate) fn refuse(notice: DegradeNotice) {
-        REFUSED.with(|refused| {
+        let _ = REFUSED.try_with(|refused| {
             refused.borrow_mut().get_or_insert(notice);
         });
     }
 
     /// The notice that refused the call being lowered, if one did, let go of here.
     pub(crate) fn take_refusal() -> Option<DegradeNotice> {
-        REFUSED.with(|refused| refused.borrow_mut().take())
+        REFUSED
+            .try_with(|refused| refused.borrow_mut().take())
+            .ok()
+            .flatten()
     }
 }

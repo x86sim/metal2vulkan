@@ -2,8 +2,9 @@
 //! decode (`metal2vulkan::bind::AstcDecode`, matched bit for bit against an Apple M3 Max by its
 //! own tests).
 //!
-//! On a device without a format's ASTC block ([`decodes_astc`]) the texture holds its blocks in a
-//! carrier and its reads go through a decoded twin, announced `carried-decoded-twin` once and
+//! On a device without a format's ASTC block ([`decodes_astc`]; on every device for Apple's 4x2 and
+//! 8x4 footprints, which no Vulkan format holds) the texture holds its blocks in a carrier and its
+//! reads go through a decoded twin, announced `carried-decoded-twin` once and
 //! `decoded-texel-precision` once ([`ASTC_TWINS`]). Every format's texels read as Metal's after
 //! every kind of write ([`astc_texels_read_as_metal_s`]): an LDR form's within 1/510, an sRGB
 //! form's as the device decodes its twin's 8-bit codes, Metal's own 8-bit codes (through Metal's
@@ -30,9 +31,10 @@
 //! ([`astc_cpu_writes_decode_on_the_cpu`], announced `cpu-block-decode`: [`CPU_DECODES`]).
 
 use super::compressed_decode::{read_after, Behind};
+use super::degrade_notices::on_device_with;
 use super::degrade_notices::{counts, on_device};
 use super::first_use::{read_mark, release, scheduled, Busy, ENDED};
-use super::{buffer_with, read_buffer, WAIT};
+use super::{at_plan, buffer_with, read_buffer, WAIT};
 use crate::air_library::AirLibrary;
 use metal2vulkan::bind::{AstcDecode, AstcTexels};
 use metal2vulkan::device::FormatUsage;
@@ -58,12 +60,14 @@ pub(super) const ASTC_TWINS: [Degradation; 2] = [
 pub(super) const CPU_DECODES: [Degradation; 1] = [Degradation::CpuBlockDecode];
 
 /// Every ASTC LDR format, linear and sRGB.
-const FORMATS: [PixelFormat; 28] = [
+const FORMATS: [PixelFormat; 32] = [
     PixelFormat::ASTC4x4LDR,
+    PixelFormat::ASTC4x2LDR,
     PixelFormat::ASTC5x4LDR,
     PixelFormat::ASTC5x5LDR,
     PixelFormat::ASTC6x5LDR,
     PixelFormat::ASTC6x6LDR,
+    PixelFormat::ASTC8x4LDR,
     PixelFormat::ASTC8x5LDR,
     PixelFormat::ASTC8x6LDR,
     PixelFormat::ASTC8x8LDR,
@@ -74,10 +78,12 @@ const FORMATS: [PixelFormat; 28] = [
     PixelFormat::ASTC12x10LDR,
     PixelFormat::ASTC12x12LDR,
     PixelFormat::ASTC4x4SRGB,
+    PixelFormat::ASTC4x2SRGB,
     PixelFormat::ASTC5x4SRGB,
     PixelFormat::ASTC5x5SRGB,
     PixelFormat::ASTC6x5SRGB,
     PixelFormat::ASTC6x6SRGB,
+    PixelFormat::ASTC8x4SRGB,
     PixelFormat::ASTC8x5SRGB,
     PixelFormat::ASTC8x6SRGB,
     PixelFormat::ASTC8x8SRGB,
@@ -90,7 +96,7 @@ const FORMATS: [PixelFormat; 28] = [
 ];
 
 /// The side, in texels, of every texture the lane reads.
-const SIDE: u32 = 16;
+pub(super) const SIDE: u32 = 16;
 
 /// The most an 8-bit code is off Metal's value (`decoded-texel-precision`), with room for `f32`.
 const UNORM8_BOUND: f32 = 1.0 / 510.0 + 1e-6;
@@ -146,7 +152,7 @@ pub(super) fn reader(device: &Device) -> ComputePipelineState {
 }
 
 /// `bytes` as `float4` texels.
-fn texels_of(bytes: &[u8]) -> Vec<[f32; 4]> {
+pub(super) fn texels_of(bytes: &[u8]) -> Vec<[f32; 4]> {
     bytes
         .as_chunks::<16>()
         .0
@@ -209,24 +215,24 @@ pub(super) fn texture(device: &Device, pf: PixelFormat, usage: TextureUsage) -> 
 }
 
 /// The blocks across and down a level of `width` x `height` texels of `decode`'s.
-fn blocks_of(decode: AstcDecode, width: u64, height: u64) -> [u64; 2] {
+pub(super) fn blocks_of(decode: AstcDecode, width: u64, height: u64) -> [u64; 2] {
     let [bw, bh] = decode.block_extent().map(u64::from);
     [width.div_ceil(bw), height.div_ceil(bh)]
 }
 
 /// The bytes of a row of `decode`'s blocks across a `SIDE`-texel level.
-fn row_bytes(decode: AstcDecode) -> u64 {
+pub(super) fn row_bytes(decode: AstcDecode) -> u64 {
     blocks_of(decode, SIDE.into(), SIDE.into())[0] * u64::from(AstcDecode::BLOCK_BYTES)
 }
 
 /// The blocks of a `SIDE` x `SIDE` level of `decode`.
-fn block_count(decode: AstcDecode) -> usize {
+pub(super) fn block_count(decode: AstcDecode) -> usize {
     let [across, down] = blocks_of(decode, SIDE.into(), SIDE.into());
     (across * down) as usize
 }
 
 /// Metal's texels of `blocks`, a `SIDE` x `SIDE` level of `decode`.
-fn metal_texels(decode: AstcDecode, blocks: &[u8]) -> Vec<[f32; 4]> {
+pub(super) fn metal_texels(decode: AstcDecode, blocks: &[u8]) -> Vec<[f32; 4]> {
     texels_of(&decode.decode(AstcTexels::Float, blocks, [SIDE, SIDE, 1]))
 }
 
@@ -294,7 +300,7 @@ pub(super) fn download(
 /// another texture, the blocks of each coming back unchanged.
 #[test]
 fn astc_texels_read_as_metal_s() {
-    on_device(|device, messages| {
+    on_device_with(at_plan, |device, messages| {
         let name = device.name().to_owned();
         let state = reader(device);
         let mut wrong = Vec::new();
@@ -493,7 +499,7 @@ fn astc_cpu_writes_decode_on_the_cpu() {
             target.replace_region(whole, 0, 0, &blocks, row, 0).unwrap();
             let after = device.work_counts();
             let routed = after.host_texel_copies > before.host_texel_copies
-                || after.staging_submissions > before.staging_submissions;
+                || after.staging_copies_queued > before.staging_copies_queued;
             let out = buffer_with(device, &[0; 16 * 16 * 16]).unwrap();
             let reads = read_after(&queue, &state, &target, &out, None);
             reads.wait_until_completed_for(WAIT).unwrap();
@@ -633,7 +639,7 @@ fn other_space(pf: PixelFormat) -> PixelFormat {
 /// (`WorkCounts::second_twin_checks`, `second_twin_decodes`); one after the view records one.
 #[test]
 fn astc_views_in_the_other_colour_space_read_as_metal_s() {
-    on_device(|device, _messages| {
+    on_device_with(at_plan, |device, _messages| {
         let name = device.name().to_owned();
         let state = reader(device);
         let mut wrong = Vec::new();
@@ -642,6 +648,8 @@ fn astc_views_in_the_other_colour_space_read_as_metal_s() {
             PixelFormat::ASTC6x5LDR,
             PixelFormat::ASTC12x12SRGB,
             PixelFormat::ASTC8x8LDR,
+            PixelFormat::ASTC4x2SRGB,
+            PixelFormat::ASTC8x4LDR,
         ];
         for (f, pf) in formats.into_iter().enumerate() {
             if decodes_astc(device, pf) {
@@ -794,18 +802,21 @@ fn astc_views_in_the_other_colour_space_read_as_metal_s() {
 }
 
 /// Every level and slice of a mipmapped 2D array (two slices) and cube of sides no multiple of the
-/// block, of a square, an oblong and an sRGB footprint: blocks blitted in from a buffer at the
-/// level's texel size come back bit for bit from blits into a buffer and from `get_bytes` (the
-/// module docs).
+/// block, of square, oblong and sRGB footprints, Apple's 4x2 and 8x4 among them (one HDR): blocks
+/// blitted in from a buffer at the level's texel size come back bit for bit from blits into a
+/// buffer and from `get_bytes` (the module docs).
 #[test]
 fn astc_blocks_round_trip_at_every_level_and_slice() {
-    on_device(|device, _messages| {
+    on_device_with(at_plan, |device, _messages| {
         let name = device.name().to_owned();
         let mut wrong = Vec::new();
         let formats = [
             PixelFormat::ASTC8x8LDR,
             PixelFormat::ASTC6x5LDR,
             PixelFormat::ASTC12x10SRGB,
+            PixelFormat::ASTC4x2LDR,
+            PixelFormat::ASTC8x4SRGB,
+            PixelFormat::ASTC8x4HDR,
         ];
         for (f, pf) in formats.into_iter().enumerate() {
             let decode = AstcDecode::of(pf).unwrap();

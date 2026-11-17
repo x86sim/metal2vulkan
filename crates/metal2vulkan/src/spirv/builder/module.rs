@@ -82,6 +82,9 @@ pub struct ModuleBuilder {
     invariant: BTreeSet<GlobalId>,
     /// User varyings decorated `PerPrimitiveEXT` (`ModuleBuilder::per_primitive`).
     per_primitive: BTreeSet<GlobalId>,
+    /// The module's `InterpolateAtOffset` offsets are Metal's moved by 7/16
+    /// (`ModuleBuilder::offsets_from_seven_sixteenths`).
+    offsets_from_seven_sixteenths: bool,
     /// Every storage buffer and storage image resource is decorated `Coherent`
     /// (`ModuleBuilder::coherent_resources`).
     coherent: bool,
@@ -89,6 +92,8 @@ pub struct ModuleBuilder {
     coherent_images: BTreeSet<GlobalId>,
     /// Storage-image resources decorated `Volatile` (`ModuleBuilder::volatile`).
     volatile: BTreeSet<GlobalId>,
+    /// Buffer bindings whose memory nothing in the module writes (`ModuleBuilder::unwritten_buffer`).
+    unwritten_buffers: BTreeSet<ResourceSlot>,
     /// The enabling capability lowering chose for a builtin whose registry offers alternatives
     /// (`requirements::builtin_enablers`).
     enabling: BTreeMap<GlobalId, crate::spv::Capability>,
@@ -98,6 +103,16 @@ pub struct ModuleBuilder {
     /// Every result that carries a non-uniform descriptor element (`Inst::carries_non_uniform`):
     /// decorated `NonUniform`, and refused where it would reach an undecorated operand.
     pub(super) non_uniform: BTreeSet<Value>,
+    /// The narrowings to 16 bits of the conversion pairs that round a `half` in a form measured
+    /// to answer Metal's on the devices whose driver takes `DriverDeviation::MetalHalfConversion`
+    /// (`ModuleBuilder::note_measured_rounding`). Nothing emitted depends on it: the compile
+    /// reads it to decide `PrecisionNote::NativeHalfConversion`.
+    pub(super) measured_roundings: BTreeSet<Value>,
+    /// The texels the texture family's writes store (`ModuleBuilder::note_stored_texel`), whose
+    /// stored NaN the write's own notes account for (`lower::texture::half_write_nans` and
+    /// `half_storage_facts`). Nothing emitted depends on it: the compile reads it to decide
+    /// `PrecisionNote::NativeNanEncoding` (`lower::arith::narrow::moves_unfolded`).
+    pub(super) stored_texels: BTreeSet<Value>,
     /// The `Function` variables the emitter holds workgroup uniform by construction
     /// (`FunctionBuilder::note_uniform_var`). Nothing emitted depends on it: a record for the
     /// checks of `spirv::testing::barriers`, kept only where they build.
@@ -121,6 +136,14 @@ pub struct ModuleBuilder {
     /// The vector, lane value, and lane index of each narrow lane insert the lowering noted
     /// (`FunctionBuilder::note_insert`).
     pub(super) inserts: HashMap<Value, (Value, Value, u32)>,
+    /// How each struct the builder made holds its members, and what each extract from a struct
+    /// reads (`FunctionBuilder::member_source`): every `OpCompositeConstruct` and
+    /// `OpCompositeInsert` of a struct type and every `OpCompositeExtract` from one, by result.
+    /// Nothing here changes the IR.
+    pub(super) structs: HashMap<Value, StructOp>,
+    /// The heap bytes of [`ModuleBuilder::structs`]' parts and paths, for
+    /// [`ModuleBuilder::footprint`].
+    pub(super) struct_bytes: usize,
     /// The 16-bit integer each zero extension to 32 bits the lowering noted widens
     /// (`FunctionBuilder::note_widened16`).
     pub(super) widened16: HashMap<Value, Value>,
@@ -157,11 +180,15 @@ pub struct ModuleBuilder {
     /// Whether a `half`'s NaN bits are the device's conversion's under the float controls
     /// ([`ModuleBuilder::native_half_nans`]).
     native_half_nans: bool,
+    /// Whether the module computes `half` under the 16-bit float controls
+    /// ([`ModuleBuilder::half_controls`]).
+    half_controls: bool,
 }
 
 /// How a float multiply the device must round on its own and never fuse is emitted
-/// ([`FunctionBuilder::binary_no_contraction`]). Lowering takes it from the profile's `float`
-/// functions fact (`ArithPlan::product`).
+/// ([`FunctionBuilder::binary_no_contraction`]), and an `f32` product by a constant with a `-0.0`
+/// component. Lowering takes it from the profile's `float` functions fact and its driver
+/// workarounds (`ArithPlan::product`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ProductForm {
     /// `OpFMul` decorated `NoContraction`, for a device whose driver compiles the SPIR-V itself:
@@ -177,6 +204,15 @@ pub enum ProductForm {
     /// as Metal treats its own multiply. `a · b + (-0.0)` is `a · b` exactly whether the device
     /// fuses it or not.
     NegativeZeroFma,
+    /// [`ProductForm::Multiply`], but every `f32` product (`OpFMul`, `OpVectorTimesScalar`, with
+    /// or without contraction) by a constant with a `-0.0` component multiplies by `+0.0` there
+    /// and negates that component of the product: `OpFNegate`, and an `OpVectorShuffle` of the
+    /// product and its negation where only some components are `-0.0`. For a driver whose
+    /// compiler keeps one multiply for products of one value by zeros of opposite sign
+    /// (`DriverWorkaround::OppositeZeroProductsMerged`), so no product it compiles has a `-0.0`
+    /// factor beside a `+0.0` one. `-(a · +0)` is `a · (−0)` for every `a`; a NaN's sign is the
+    /// device's either way.
+    PositiveZeroFactors,
 }
 
 /// How the lowering clears the bits above a narrow integer's width `N` in a 32-bit container
@@ -224,6 +260,25 @@ pub enum NarrowFmt {
     BFloat,
 }
 
+/// How a struct value holds its members, or which member of a struct a value reads
+/// ([`ModuleBuilder::structs`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum StructOp {
+    /// An `OpCompositeConstruct` of the struct from these members.
+    Construct(Box<[Value]>),
+    /// An `OpCompositeInsert` of `object` at `indices` into struct `composite`.
+    Insert {
+        object: Value,
+        composite: Value,
+        indices: Box<[u32]>,
+    },
+    /// An `OpCompositeExtract` of the member at `indices` of struct `composite`.
+    Extract {
+        composite: Value,
+        indices: Box<[u32]>,
+    },
+}
+
 /// Noted format bits of a value: each lane's low 16 bits are the format bits of that lane of
 /// the value (the bits above them are zero but in the lanes `dirty` has a bit for), valid
 /// wherever the value is when `at` is `None`, else only in block `at`.
@@ -240,9 +295,10 @@ impl ModuleBuilder {
         ModuleBuilder::default()
     }
 
-    /// Emit every float multiply the device must round on its own in `form`. Emission sets it
-    /// before any instruction, from the profile's `float` functions fact; a builder that never sets
-    /// it emits [`ProductForm::Multiply`].
+    /// Emit every float multiply the device must round on its own, and every `f32` product by a
+    /// constant with a `-0.0` component, in `form`. Emission sets it before any instruction, from
+    /// the profile's `float` functions fact and driver workarounds; a builder that never sets it
+    /// emits [`ProductForm::Multiply`].
     pub fn product_form(&mut self, form: ProductForm) {
         self.product_form = form;
     }
@@ -278,6 +334,19 @@ impl ModuleBuilder {
         self.native_half = native;
     }
 
+    /// Record `narrowed`, the narrowing to 16 bits of a conversion pair that rounds a `half` in a
+    /// form measured to answer Metal's where the driver takes
+    /// `DriverDeviation::MetalHalfConversion` (`narrow::round_measured`).
+    pub fn note_measured_rounding(&mut self, narrowed: Value) {
+        self.measured_roundings.insert(narrowed);
+    }
+
+    /// Record `texel`, a texel a texture write stores, whose stored NaN the write's own notes
+    /// account for (`lower::texture::emit`).
+    pub fn note_stored_texel(&mut self, texel: Value) {
+        self.stored_texels.insert(texel);
+    }
+
     /// Whether the module's `half` rounding is the device's own
     /// ([`ModuleBuilder::set_native_half`]).
     pub fn native_half(&self) -> bool {
@@ -296,6 +365,21 @@ impl ModuleBuilder {
     /// ([`ModuleBuilder::set_native_half_nans`]).
     pub fn native_half_nans(&self) -> bool {
         self.native_half_nans
+    }
+
+    /// Set whether the module computes `half` under the 16-bit float controls
+    /// (`lower::arith::narrow::half_controls`): a `half` `/` and `sqrt` are then the device's
+    /// 16-bit instructions. Emission sets it from the profile; a builder that never sets it
+    /// computes them in `f32`.
+    pub fn set_half_controls(&mut self, controls: bool) {
+        self.half_controls = controls;
+    }
+
+    /// Whether the module computes `half` under the 16-bit float controls
+    /// ([`ModuleBuilder::set_half_controls`]), whatever its [`QuantizeForm`]: a driver may fold
+    /// the conversion's round trip yet keep its 16-bit instructions' rounding.
+    pub fn half_controls(&self) -> bool {
+        self.half_controls
     }
 
     /// The heap bytes the builder holds, for the byte ledger: every input-scaled container's
@@ -335,13 +419,21 @@ impl ModuleBuilder {
             + tree_bytes(self.invariant.len(), std::mem::size_of::<GlobalId>())
             + tree_bytes(self.volatile.len(), std::mem::size_of::<GlobalId>())
             + tree_bytes(
+                self.unwritten_buffers.len(),
+                std::mem::size_of::<ResourceSlot>(),
+            )
+            + tree_bytes(
                 self.enabling.len(),
                 std::mem::size_of::<(GlobalId, crate::spv::Capability)>(),
             )
             + tree_bytes(self.non_uniform.len(), std::mem::size_of::<Value>())
+            + tree_bytes(self.measured_roundings.len(), std::mem::size_of::<Value>())
+            + tree_bytes(self.stored_texels.len(), std::mem::size_of::<Value>())
             + map_bytes(&self.bits)
             + map_bytes(&self.lanes)
             + map_bytes(&self.inserts)
+            + map_bytes(&self.structs)
+            + self.struct_bytes
             + map_bytes(&self.widened16)
             + map_bytes(&self.widened_halves)
             + self.narrowed_floats.capacity() * std::mem::size_of::<Value>()
@@ -577,6 +669,13 @@ impl ModuleBuilder {
                     }) if !matches!(dim, Dim::Buffer | Dim::SubpassData)
                 ),
                 ResourceKind::SeparateSampler(_) => matches!(self.types.get(ty)?, Type::Sampler),
+                // A constexpr sampler array is exactly a sized array of samplers.
+                ResourceKind::SamplerArray { .. } => match self.types.get(ty)? {
+                    Type::Array {
+                        elem, stride: None, ..
+                    } => matches!(self.types.get(*elem)?, Type::Sampler),
+                    _ => false,
+                },
                 _ => true,
             };
         if !ok {
@@ -803,14 +902,16 @@ impl ModuleBuilder {
 
     /// Decorate builtin output `g` `Invariant`: SPIR-V's "expressions computing its value be
     /// computed invariantly with respect to other shaders computing the same expressions". Only
-    /// the `Position` output (Metal's `[[invariant]]` position) and a fragment's per-fragment
-    /// outputs, `FragDepth`, `SampleMask` and `FragStencilRefEXT` (the variants of one render
-    /// pipeline's color groups, `LoweringInputs::color_group`), can be invariant.
+    /// the `Position` output (Metal's `[[invariant]]` position), the `ClipDistance` output (a
+    /// rate-mapped pass's copies of its triangles, `pipeline::link::fan_out`) and a fragment's
+    /// per-fragment outputs, `FragDepth`, `SampleMask` and `FragStencilRefEXT` (the variants of
+    /// one render pipeline's color groups, `LoweringInputs::color_group`), can be invariant.
     pub fn invariant(&mut self, g: GlobalId) -> BResult<()> {
         use crate::spv::BuiltIn as B;
         match self.global(g)?.kind {
             GlobalKind::BuiltIn {
-                builtin: B::Position | B::FragDepth | B::SampleMask | B::FragStencilRefEXT,
+                builtin:
+                    B::Position | B::ClipDistance | B::FragDepth | B::SampleMask | B::FragStencilRefEXT,
                 dir: IoDir::Output,
             } => {
                 self.invariant.insert(g);
@@ -818,6 +919,15 @@ impl ModuleBuilder {
             }
             _ => Err(BuildError::Global(GlobalRule::InvariantTarget)),
         }
+    }
+
+    /// Mark the module's `GLSL.std.450 InterpolateAtOffset` offsets as Metal's offsets moved by
+    /// 7/16, for a device whose instruction reads Metal's `interpolate_at_offset` at its offset
+    /// plus 7/16: the module then requires
+    /// `VkProperty::InterpolateAtOffsetFromSevenSixteenths`, where every other use of the
+    /// instruction requires `VkProperty::InterpolateAtOffsetCentered`.
+    pub fn offsets_from_seven_sixteenths(&mut self) {
+        self.offsets_from_seven_sixteenths = true;
     }
 
     /// Decorate user varying `g` `PerPrimitiveEXT`: a mesh entry's primitive output, or a fragment
@@ -831,6 +941,14 @@ impl ModuleBuilder {
             }
             _ => Err(BuildError::Global(GlobalRule::PerPrimitiveTarget)),
         }
+    }
+
+    /// State that nothing in the module writes the memory bound at buffer binding `sym`: no other
+    /// binding or address reaches it (its Metal argument is unaliased), and no store or atomic of
+    /// the module reaches it through its own views. The serializer decorates its storage views
+    /// `NonWritable` where its own walk of the module agrees (`spirv::serialize`).
+    pub fn unwritten_buffer(&mut self, sym: ResourceSlot) {
+        self.unwritten_buffers.insert(sym);
     }
 
     /// Decorate every storage buffer and storage image resource of the module `Coherent`, those
@@ -1290,6 +1408,7 @@ impl ModuleBuilder {
             entry: &entry,
             enabling: &self.enabling,
             per_primitive: &self.per_primitive,
+            offsets_from_seven_sixteenths: self.offsets_from_seven_sixteenths,
         };
         let interface = requirements::interface(&view)?;
         let subgroup = self.subgroup.unwrap_or(SubgroupRequirement::NONE);
@@ -1328,10 +1447,14 @@ impl ModuleBuilder {
             subgroup,
             invariant: self.invariant,
             per_primitive: self.per_primitive,
+            offsets_from_seven_sixteenths: self.offsets_from_seven_sixteenths,
             coherent,
             volatile: self.volatile,
+            unwritten_buffers: self.unwritten_buffers,
             enabling: self.enabling,
             non_uniform: self.non_uniform,
+            measured_roundings: self.measured_roundings,
+            stored_texels: self.stored_texels,
             #[cfg(test)]
             uniform_vars: self.uniform_vars,
         })

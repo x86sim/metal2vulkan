@@ -23,18 +23,18 @@
 //! buffer.
 
 use super::ycbcr_planes::PlanesImage;
-use super::{image_error, IdUse, Image, Storage, Texture};
+use super::{image_error, IdUse, Image, Storage, StorageCell, Stored, Texture};
 use crate::address_map::AddressModeMap;
 use crate::binding_view::VkView;
 use crate::buffer_texture::{view_usage, Texels};
 use crate::device::lock;
-use crate::error::{internal, Error};
+use crate::error::{internal, Error, RuntimeGap};
 use crate::image_plan::plan_image;
 use crate::resource::ResourceKey;
 use crate::shadow::{ShadowBuffer, ShadowCopies, ShadowSource};
 use crate::shadow_merge::ScratchSpares;
 use crate::texture_descriptor::{TextureDescriptor, TextureLayout};
-use crate::tracker::{Access, Use, UseRange};
+use crate::tracker::{Access, ImagePlace, Use, UseRange};
 use crate::values::ResourceOptions;
 use crate::view_plan::ViewRecord;
 use crate::ycbcr::{YCbCrConversion, YCbCrWriteBack};
@@ -100,6 +100,13 @@ fn ycbcr_modes(codes: YCbCrCodes) -> AddressModeMap {
 fn codes_alone(pf: PixelFormat, planes: &YCbCrPlanes) -> bool {
     planes.codes.output == YCbCrOutput::Codes
         && ycbcr_format(pf).is_some_and(|f| f.reads != YCbCrReads::Codes)
+}
+
+/// Whether a render pass that loads a texture of `pf` over `planes` loads nothing measured: one
+/// whose planes read each code alone ([`codes_alone`]), and an `_sRGB` twin's (Metal's load of
+/// one is not measured: whether its tile holds the texels' linear values or their encoding).
+fn load_unmeasured(pf: PixelFormat, planes: &YCbCrPlanes) -> bool {
+    codes_alone(pf, planes) || planes.codes.output == YCbCrOutput::Srgb
 }
 
 /// The code-reading format of `codes`' bits and subsampling, unpacked (`RGB8_420_2P` to
@@ -269,7 +276,7 @@ impl Device {
             }
             let storage =
                 self.converted_storage(call, texels, &descriptor, layout, (planes, span))?;
-            let made = (storage, in_place.ok());
+            let made = (StorageCell::Made(storage), in_place.ok(), None);
             return Ok(Texture::made_with_planes(self, made, record, None, id_use));
         }
         // Over a surface of a P3 matrix: an image of the codes of the code-reading format, its
@@ -366,7 +373,7 @@ impl Device {
             usage: ImageUsageFlags::STORAGE,
         })?;
         let (raw, at) = texels.buffer.at(span.start);
-        let conversion = YCbCrConversion::new(self, (planes, span.clone()), (raw, at), view)?;
+        let conversion = YCbCrConversion::new(self, (planes, span.clone()), (raw, at), view);
         let (bytes, tracked) = texels.buffer.tracked(span);
         let copies = ShadowCopies {
             source: ShadowSource::Converted {
@@ -382,15 +389,21 @@ impl Device {
                 aspects: vk::ImageAspectFlags::COLOR,
                 levels: 0..1,
                 layers: 0..1,
+                place: ImagePlace::WHOLE,
             },
             tracked: texels.tracked(),
             // Metal drops a function's writes to the texture.
             drops_writes: true,
+            levels: None,
             backing: texels.backing(),
             merge_scratch: ScratchSpares::default(),
-            touched: AtomicU64::new(0),
             stood: AtomicU64::new(0),
+            standing: Default::default(),
         };
+        let why = "a YCbCr texture's converted image: Metal samples the surface's two planes \
+                   converted, which an image of the converted texels holds, made from the planes \
+                   by its copy in";
+        crate::shadow_log::made(self, call, (descriptor, layout), &texels, why);
         Ok(Storage::Shadow {
             image: image.shared(),
             texels,
@@ -403,7 +416,7 @@ impl Texture {
     /// The uniform texel buffer view of the texture's planes read in place (the module docs), made
     /// at its first bind and kept with the texels. Internal for a texture whose planes are not.
     pub(crate) fn planes_view(&self) -> Result<vk::BufferView, Error> {
-        let (Some(p), Some(texels)) = (&self.0.planes_in_place, self.buffer_texels()) else {
+        let (Some(p), Some(texels)) = (&self.s().planes_in_place, self.buffer_texels()) else {
             return Err(internal(
                 "a planes view of a texture without planes in place",
             ));
@@ -433,7 +446,7 @@ impl Texture {
     /// them makes, through their texel buffer or their image (the module docs). Internal for a
     /// texture whose planes are not.
     pub(crate) fn planes_use(&self, read: Access) -> Result<Use<ResourceKey>, Error> {
-        let (Some(p), Some(texels)) = (&self.0.planes_in_place, self.buffer_texels()) else {
+        let (Some(p), Some(texels)) = (&self.s().planes_in_place, self.buffer_texels()) else {
             return Err(internal(
                 "a planes use of a texture without planes in place",
             ));
@@ -461,7 +474,7 @@ impl Texture {
         call: &'static str,
         record: &ViewRecord,
     ) -> Option<Result<Storage, Error>> {
-        let Storage::Shadow { texels, copies, .. } = &self.0.storage else {
+        let Stored::Made(Storage::Shadow { texels, copies, .. }) = self.stored() else {
             return None;
         };
         let ShadowSource::Converted { conversion, .. } = &copies.source else {
@@ -494,7 +507,7 @@ impl Texture {
         descriptor.resource_options = texels.options();
         descriptor.alpha_reads_one = true;
         descriptor.address_mode_map = ycbcr_modes(codes);
-        let device = self.device();
+        let device = self.generation();
         Some(
             descriptor
                 .check_over_surface(device.properties().texture_rules())
@@ -535,7 +548,7 @@ impl Texture {
         call: &'static str,
         record: &ViewRecord,
     ) -> Option<Result<(Storage, (PixelFormat, TextureSwizzleChannels)), Error>> {
-        let Storage::Shadow { texels, copies, .. } = &self.0.storage else {
+        let Stored::Made(Storage::Shadow { texels, copies, .. }) = self.stored() else {
             return None;
         };
         let ShadowSource::Converted { conversion, .. } = &copies.source else {
@@ -578,7 +591,7 @@ impl Texture {
             _ => [S::Green, S::Zero, S::Zero],
         };
         let swizzle = over_read(luma, record.swizzle);
-        let device = self.device();
+        let device = self.generation();
         Some(
             descriptor
                 .check_over_surface(device.properties().texture_rules())
@@ -598,26 +611,30 @@ impl Texture {
 }
 
 impl Texture {
-    /// Whether this two-plane YCbCr texture reads each code alone, over a surface of a P3 matrix
-    /// (`ycbcr.rs`): a pass that loads it loads nothing measured.
-    pub(crate) fn ycbcr_codes_alone(&self) -> bool {
-        let Storage::Shadow { copies, .. } = &self.0.storage else {
+    /// Whether a pass that loads this two-plane YCbCr texture loads nothing measured: one that
+    /// reads each code alone, over a surface of a P3 matrix, and an `_sRGB` twin (`ycbcr.rs`).
+    pub(crate) fn ycbcr_load_unmeasured(&self) -> bool {
+        let Stored::Made(Storage::Shadow { copies, .. }) = self.stored() else {
             return false;
         };
         let ShadowSource::Converted { conversion, .. } = &copies.source else {
             return false;
         };
-        codes_alone(self.0.record.pixel_format, &conversion.source().0)
+        load_unmeasured(self.0.record.pixel_format, &conversion.source().0)
     }
 
     /// The write shadow of a 4:4:4 two-plane YCbCr texture whose writes Metal stores into its
     /// planes (`metal::format::ycbcr_writes_stored`), for Metal's `call`: an `RGBA32Uint` image of
     /// the texture's size, which a function writes each texel to as its red, green and blue bits
-    /// and the mark 1 (`StorageImageClass::YCbCrWrite`), and its copies, a clear in and the
+    /// and the mark 1 (`StorageImageClass::YCbCrWrite`), or, through a heap's float storage
+    /// element (`bind::heap`), as its `R32G32B32A32_SFLOAT` view's red, green and blue and the
+    /// mark 1.0, where the device stores that format, and its copies, a clear in and the
     /// encoding of the marked texels' codes back into the planes (`ShadowSource::YCbCrWrite`,
     /// `ycbcr.rs`). Refused (`Unsupported`, `NotImplemented`, `Feature::Format`, naming the
     /// format) for a texture over plane 1 of its surface, whose writes are not measured, and one
-    /// whose texels are no conversion of planes; as `new_texture` refuses the image.
+    /// whose texels are no conversion of planes; `NotImplemented(OverlappingSurfaceRows)` for one
+    /// whose rows of codes share bytes (`rows_apart`), where which row's codes Metal leaves is not
+    /// measured; as `new_texture` refuses the image.
     pub(super) fn ycbcr_write_shadow(
         &self,
         call: &'static str,
@@ -625,7 +642,7 @@ impl Texture {
         let pf = self.0.record.pixel_format;
         let gap =
             || Error::Unsupported(Unsupported::not_implemented(Feature::Format).naming_format(pf));
-        let Storage::Shadow { texels, copies, .. } = &self.0.storage else {
+        let Stored::Made(Storage::Shadow { texels, copies, .. }) = self.stored() else {
             return Err(gap());
         };
         let ShadowSource::Converted { conversion, .. } = &copies.source else {
@@ -633,10 +650,14 @@ impl Texture {
         };
         let (planes, span) = conversion.source();
         // Over a surface of a P3 matrix the writes are not measured.
-        if conversion.reads_zeros() || !rows_apart(&planes) || codes_alone(pf, &planes) {
+        if conversion.reads_zeros() || codes_alone(pf, &planes) {
             return Err(gap());
         }
-        let device = self.device();
+        // Rows of codes that share bytes: which row's codes Metal leaves there is not measured.
+        if !rows_apart(&planes) {
+            return Err(Error::NotImplemented(RuntimeGap::OverlappingSurfaceRows));
+        }
+        let device = self.generation();
         let [width, height] = planes.size;
         let layout = TextureLayout {
             texture_type: TextureType::Type2D,
@@ -658,6 +679,20 @@ impl Texture {
         if plan.format != Format::R32G32B32A32_UINT || !plan.usage.contains(needed) {
             return Err(gap());
         }
+        // A heap's float storage element views it as floats too (`bind::heap`), where the device
+        // stores them; elsewhere a heap write reaches none of it, and only a slot's bits do.
+        let floats = Format::R32G32B32A32_SFLOAT;
+        let plan = match facts
+            .optimal(floats)
+            .contains(FormatFeatureFlags2::STORAGE_IMAGE)
+        {
+            true => crate::image_plan::ImagePlan {
+                flags: plan.flags | ImageCreateFlags::MUTABLE_FORMAT,
+                view_formats: vec![plan.format, floats],
+                ..plan
+            },
+            false => plan,
+        };
         let [w, h] = planes.size.map(u64::from);
         let mut descriptor = TextureDescriptor::texture_2d(PixelFormat::RGBA32Uint, w, h, false);
         descriptor.usage = usage;
@@ -696,13 +731,15 @@ impl Texture {
                 aspects: vk::ImageAspectFlags::COLOR,
                 levels: 0..1,
                 layers: 0..1,
+                place: ImagePlace::WHOLE,
             },
             tracked: texels.tracked(),
             drops_writes: false,
+            levels: None,
             backing: texels.backing(),
             merge_scratch: ScratchSpares::default(),
-            touched: AtomicU64::new(0),
             stood: AtomicU64::new(0),
+            standing: Default::default(),
         };
         Ok((image, copies))
     }
@@ -719,10 +756,12 @@ impl Texture {
     /// which leaves the texture's converted texels stale. Refused
     /// (`Unsupported`, `NotImplemented`, `Feature::Format`, naming the format) for a texture
     /// over plane 1 of its surface, one of a size its chroma blocks do not tile, and one whose
-    /// texels are no conversion of planes, none of whose stores is measured; as `new_texture`
-    /// refuses the image.
+    /// texels are no conversion of planes, none of whose stores is measured;
+    /// `NotImplemented(OverlappingSurfaceRows)` for one whose rows of codes share bytes
+    /// (`rows_apart`), where which row's codes Metal's store leaves is not measured; as
+    /// `new_texture` refuses the image.
     pub(crate) fn ycbcr_render_shadow(&self, call: &'static str) -> Result<Texture, Error> {
-        let mut held = lock(&self.0.render_shadow);
+        let mut held = lock(&self.s().render_shadow);
         if let Some(shadow) = held.as_ref() {
             return Ok(shadow.clone());
         }
@@ -736,19 +775,25 @@ impl Texture {
         let pf = self.0.record.pixel_format;
         let gap =
             || Error::Unsupported(Unsupported::not_implemented(Feature::Format).naming_format(pf));
-        let Storage::Shadow { texels, copies, .. } = &self.0.storage else {
+        let Stored::Made(Storage::Shadow { texels, copies, .. }) = self.stored() else {
             return Err(gap());
         };
         let ShadowSource::Converted { conversion, .. } = &copies.source else {
             return Err(gap());
         };
         let (planes, span) = conversion.source();
-        if !ycbcr_renders(pf) || conversion.reads_zeros() || !rows_apart(&planes) {
+        if !ycbcr_renders(pf) || conversion.reads_zeros() {
             return Err(gap());
         }
+        // Rows of codes that share bytes: which row's codes Metal's store leaves there is not
+        // measured.
+        if !rows_apart(&planes) {
+            return Err(Error::NotImplemented(RuntimeGap::OverlappingSurfaceRows));
+        }
         // Over a surface of a P3 matrix the pass stores by BT.601 as the format's codes (the
-        // planes' matrix), where the texture reads the codes alone; it loads nothing measured.
-        let loads = !codes_alone(pf, &planes);
+        // planes' matrix), where the texture reads the codes alone; it loads nothing measured, nor
+        // does an `_sRGB` twin's.
+        let loads = !load_unmeasured(pf, &planes);
         let codes = ycbcr_format(pf).and_then(YCbCrCodes::of).ok_or_else(gap)?;
         let planes = YCbCrPlanes::new(
             planes.size,
@@ -762,7 +807,7 @@ impl Texture {
         if (across && width % 2 != 0) || (down && height % 2 != 0) {
             return Err(gap());
         }
-        let device = self.device();
+        let device = self.generation();
         let profile = device.compile_device().profile();
         let float = TextureLayout {
             texture_type: TextureType::Type2D,
@@ -864,14 +909,19 @@ impl Texture {
                 aspects: vk::ImageAspectFlags::COLOR,
                 levels: 0..1,
                 layers: 0..1,
+                place: ImagePlace::WHOLE,
             },
             tracked: texels.tracked(),
             drops_writes: false,
+            levels: None,
             backing: texels.backing(),
             merge_scratch: ScratchSpares::default(),
-            touched: AtomicU64::new(0),
             stood: AtomicU64::new(0),
+            standing: Default::default(),
         };
+        let why = "a YCbCr texture's render shadow: a pass renders into an image of floats, and \
+                   the encoders store each stored texel's codes into the surface's planes";
+        crate::shadow_log::made(device, call, (&descriptor, &layout), texels, why);
         let storage = Storage::Shadow {
             image: image.shared(),
             texels: Arc::clone(texels),
