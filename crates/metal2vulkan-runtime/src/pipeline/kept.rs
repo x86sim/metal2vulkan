@@ -430,9 +430,12 @@ impl Kept {
         // The pipelines released since the last variant made, not yet applied: an idle program
         // makes none, so they would wait for good.
         self.arrived.retain(|arrival| match arrival {
-            Arrival::Pipeline(_, pipeline) => {
-                // SAFETY: released by its last holder, so no pending command uses it.
-                unsafe { release::object(shared.vk(), pipeline.raw) };
+            Arrival::Pipeline(instance, pipeline) => {
+                if let Place::Region(key) = &pipeline.place {
+                    shared.region_ledger.forget_destroyed(*instance, key);
+                }
+                // A linked pipeline is the device's map's (`libraries.rs`): only its share goes.
+                pipeline.destroy(shared);
                 destroyed += 1;
                 false
             }
