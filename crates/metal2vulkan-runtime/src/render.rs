@@ -653,6 +653,11 @@ fn draws(
             // the `SpecKey::SampleCount` constant, which the state's creation sets to its
             // `rasterSampleCount`, the count of every pass it draws in (`renders_into`).
             RuntimeFact::SampleCount => {}
+            // x86Sim: `[[amplification_count]]`: the `SpecKey::AmplificationCount` constant, which
+            // the state's creation sets to 1, the one count it builds (`refuse` turns away a
+            // `maxVertexAmplificationCount` past 1). visionOS's RealityKit and Core Animation
+            // shaders read it in every vertex function; refusing them left its display black.
+            RuntimeFact::AmplificationCount => {}
             // The pulled attributes and their layouts' strides of a post-tessellation function and
             // of a state made for indirect command buffers, which pulls every attribute: the
             // content's own descriptor, whose projection link checked. A stride set per bind is
