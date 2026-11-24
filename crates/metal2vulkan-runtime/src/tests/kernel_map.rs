@@ -58,19 +58,24 @@ fn the_map_forgets_entries_unused_since_a_time() {
     std::thread::sleep(std::time::Duration::from_millis(20));
     map.keep(3, "three");
     assert_eq!(map.get(&1), Some("one"), "a lookup is a use");
-    let mut gone = map.forget_unused_since(between);
+    let mut gone = map.forget_unused_since(between, |_| true);
     gone.sort();
     assert_eq!(gone, ["two"]);
     assert_eq!(map.len(), 2);
     assert_eq!(map.get(&2), None);
     assert_eq!(
-        map.forget_unused_since(between).len(),
+        map.forget_unused_since(between, |_| true).len(),
         0,
         "nothing older is left"
     );
     let later = std::time::Instant::now();
-    assert_eq!(map.forget_unused_since(later).len(), 2);
-    assert_eq!(map.len(), 0);
+    assert_eq!(
+        map.forget_unused_since(later, |v| *v != "three"),
+        ["one"],
+        "what `forget` refuses stays"
+    );
+    assert_eq!(map.len(), 1);
+    assert_eq!(map.get(&3), Some("three"));
 }
 
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
@@ -345,9 +350,9 @@ mod on_device {
         });
     }
 
-    /// x86Sim: `Device::forget_idle_contents` forgets the map's entries; a content no state holds
-    /// goes with its entry, one a state holds lives until the state goes, and a forgotten content
-    /// compiles again.
+    /// x86Sim: `Device::forget_idle_contents` forgets the map's idle entries no state holds, which
+    /// go at once; an entry a state holds stays and is shared by a later state of its content; a
+    /// forgotten content compiles again.
     #[test]
     fn every_device_forgets_idle_contents_and_frees_those_no_state_holds() {
         let Some(constant) = products() else {
@@ -372,12 +377,28 @@ mod on_device {
             );
             assert_eq!(
                 device.forget_idle_contents(std::time::Duration::ZERO),
-                2,
+                1,
+                "{name}: the one no state holds"
+            );
+            assert_eq!(
+                gauges(),
+                (1, 1),
+                "{name}: 2 went, 1 stays held by its state"
+            );
+            let one_again = state(name, &device, &vector(&constant, 1));
+            assert!(
+                shared(&one, &one_again),
+                "{name}: a held content is shared, not compiled again"
+            );
+            assert_eq!(lowered() - start, 2 * each, "{name}");
+            drop((one, one_again));
+            assert_eq!(gauges(), (1, 1), "{name}: the map still holds 1");
+            assert_eq!(
+                device.forget_idle_contents(std::time::Duration::ZERO),
+                1,
                 "{name}"
             );
-            assert_eq!(gauges(), (1, 0), "{name}: 2 went, 1 lives in its state");
-            drop(one);
-            assert_eq!(gauges(), (0, 0), "{name}: 1 went with its state");
+            assert_eq!(gauges(), (0, 0), "{name}: 1 went once no state held it");
             let _again = state(name, &device, &vector(&constant, 2));
             assert_eq!(
                 lowered() - start,

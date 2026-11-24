@@ -133,9 +133,10 @@ impl KernelMap {
         drop(held);
     }
 
-    /// x86Sim: forgets every entry no state creation looked up or kept for `idle`, for a
-    /// long-lived consumer's trim. Each goes once no state holds it, as one the cap forgot; a later
-    /// state of its content compiles it again from the cache directory. Answers the entries
+    /// x86Sim: forgets every entry no state creation looked up or kept for `idle` and no state
+    /// holds, for a long-lived consumer's trim: it goes now, and a later state of its content
+    /// compiles it again from the cache directory. An entry a live state holds stays, so a later
+    /// state of its content shares it rather than compiling a second. Answers the entries
     /// forgotten. The map otherwise keeps its last [`KERNEL_ENTRIES`] contents, with their
     /// `VkPipeline`s and shader modules, for as long as the device lives, though every state of
     /// them is gone (a phone's apps that ended).
@@ -143,7 +144,12 @@ impl KernelMap {
         let Some(before) = Instant::now().checked_sub(idle) else {
             return 0;
         };
-        let gone = lock(&self.map).forget_unused_since(before);
+        // The map's own reference is the only one: no state holds the content.
+        let unheld = |content: &Content| match content {
+            Content::Kernel(compiled) => Arc::strong_count(compiled) == 1,
+            Content::Render(compiled) => Arc::strong_count(compiled) == 1,
+        };
+        let gone = lock(&self.map).forget_unused_since(before, unheld);
         for _ in &gone {
             counters.fall(Gauge::KernelEntries);
         }
@@ -220,10 +226,14 @@ impl<K: Eq + Hash + Clone, V: Clone> Lru<K, V> {
             .collect()
     }
 
-    /// x86Sim: every value last used before `before`, forgotten.
-    pub(crate) fn forget_unused_since(&mut self, before: Instant) -> Vec<V> {
+    /// x86Sim: every value last used before `before` that `forget` takes, forgotten.
+    pub(crate) fn forget_unused_since(
+        &mut self,
+        before: Instant,
+        forget: impl Fn(&V) -> bool,
+    ) -> Vec<V> {
         let old: Vec<K> = (self.entries.iter())
-            .filter(|(_, (_, _, at))| *at < before)
+            .filter(|(_, (value, _, at))| *at < before && forget(value))
             .map(|(key, _)| key.clone())
             .collect();
         old.iter()

@@ -1016,10 +1016,11 @@ impl Device {
     }
 
     /// No Metal counterpart (x86Sim): forgets the compiled contents, compute and render, that no
-    /// pipeline state's creation looked up for `idle`, from the device's map of the last 1,024
-    /// contents used. Each goes, with its `VkPipeline`s and shader modules, once no state holds
-    /// it; a later state of its content compiles it again, from the cache directory where it
-    /// holds the lowerings. For a long-lived consumer whose programs come and go (a simulator's
+    /// pipeline state holds and no state's creation looked up for `idle`, from the device's map
+    /// of the last 1,024 contents used. Each goes at once, with its `VkPipeline`s and shader
+    /// modules; a later state of its content compiles it again, from the cache directory where it
+    /// holds the lowerings. A content a live state holds stays in the map, so a later state of it
+    /// shares it rather than compiling a second. For a long-lived consumer whose programs come and go (a simulator's
     /// apps), whose map otherwise keeps every content its ended programs made, up to the cap, for
     /// the device's life. Answers the entries forgotten (`Gauges::kernel_entries` falls by as
     /// many).
